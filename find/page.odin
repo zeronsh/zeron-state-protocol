@@ -8,7 +8,6 @@ package find
 
 import "base:runtime"
 import "core:crypto"
-import "core:crypto/aead"
 import "core:crypto/aegis"
 import "../zsp"
 
@@ -54,8 +53,8 @@ Pager :: struct {
 	disk:    Disk,
 	key:     zsp.Key32,
 	salt:    [16]byte, // of this index, and never of another
-	cipher:  aead.Context, // of headers,
-	pages:   aead.Context, // and of everything else
+	cipher:  aegis.Context, // of headers,
+	pages:   aegis.Context, // and of everything else
 	marks:   [dynamic]u32, // of each page as it was last written: one that was written before is not it
 	altered: map[u32]bool, // stretches of those since they were last kept
 	open:    map[u32]^Frame, // as they rest on the disk
@@ -75,7 +74,7 @@ pager_open :: proc(p: ^Pager, disk: Disk, key: zsp.Key32) {
 	key := key
 	p.disk = disk
 	p.key = key
-	aead.init(&p.cipher, .AEGIS_128L, key[:aegis.KEY_SIZE_128L])
+	aegis.init(&p.cipher, key[:aegis.KEY_SIZE_128L])
 	p.next = HEADERS
 	pager_salt(p)
 }
@@ -89,8 +88,8 @@ pager_salt :: proc(p: ^Pager, salt: Maybe([16]byte) = nil) {
 	}
 	p.salt = s
 	key := zsp.hkdf256(p.salt[:], p.key[:], transmute([]byte)string("zsp-pages"))
-	aead.reset(&p.pages)
-	aead.init(&p.pages, .AEGIS_128L, key[:aegis.KEY_SIZE_128L])
+	aegis.reset(&p.pages)
+	aegis.init(&p.pages, key[:aegis.KEY_SIZE_128L])
 	crypto.zero_explicit(&key, size_of(key))
 	clear(&p.marks)
 	clear(&p.altered)
@@ -112,8 +111,8 @@ pager_close :: proc(p: ^Pager) {
 	delete(p.free)
 	delete(p.pending)
 	set_destroy(&p.fresh)
-	aead.reset(&p.cipher)
-	aead.reset(&p.pages)
+	aegis.reset(&p.cipher)
+	aegis.reset(&p.pages)
 	delete(p.marks)
 	delete(p.altered)
 	if p.disk.close != nil {
@@ -174,7 +173,7 @@ page_read :: proc(p: ^Pager, no: u32, mark: Maybe(u32), into: ^Page) -> bool {
 	if m, given := mark.?; ok && given {
 		ok = zsp.get_u32(rests) == m && m != 0
 	}
-	if !ok || !aead.open(&p.pages if no >= HEADERS else &p.cipher, body, rests[:NONCE], bind[:], rests[NONCE + TAG:], rests[NONCE:][:TAG]) {
+	if !ok || !aegis.open(&p.pages if no >= HEADERS else &p.cipher, body, rests[:NONCE], bind[:], rests[NONCE + TAG:], rests[NONCE:][:TAG]) {
 		into^ = {}
 		return false
 	}
@@ -193,7 +192,7 @@ page_write :: proc(p: ^Pager, no: u32, pg: ^Page) -> (mark: u32, ok: bool) {
 	bytes := ([^]byte)(sealed)[:PAGE_SIZE]
 	bind := page_bind(no)
 	body := bytes[NONCE + TAG:]
-	aead.seal(&p.pages if no >= HEADERS else &p.cipher, body, sealed.tag[:], sealed.nonce[:], bind[:], body)
+	aegis.seal(&p.pages if no >= HEADERS else &p.cipher, body, sealed.tag[:], sealed.nonce[:], bind[:], body)
 	if !p.disk.write(p.disk.data, no, bytes) {
 		p.failed, p.unwritten = true, true
 		return 0, false

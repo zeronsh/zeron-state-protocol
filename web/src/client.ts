@@ -1691,9 +1691,9 @@ export class Client {
     return row ? this.#text(row, slot) : undefined;
   }
 
-  /** What is held, for tests: rows and questions, by the ids this client and its node call them. */
-  static internals(c: Client): { rows: ReadonlyMap<string, Stored>; asked: ReadonlyMap<number, unknown> } {
-    return { rows: c.#rows, asked: c.#asked };
+  /** What is held, for tests: rows, questions, windows and pages, by what this client and its node call them. */
+  static internals(c: Client): { rows: ReadonlyMap<string, Stored>; asked: ReadonlyMap<number, unknown>; windows: ReadonlyMap<string, unknown>; pages: ReadonlyMap<number, unknown> } {
+    return { rows: c.#rows, asked: c.#asked, windows: c.#windows, pages: c.#pages };
   }
 
   // ---------------------------------------------------------------- writing
