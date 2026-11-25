@@ -48,6 +48,7 @@ test)
 	lune run luau/tests/vectors.luau vectors/vectors.json
 	lune run luau/tests/client.luau
 	lune run luau/tests/mirror_model.luau
+	lune run luau/tests/mirror_model.luau 30 plain
 	node examples/relay/test.mjs
 	$PYTHON examples/apps/test.py
 	$PYTHON examples/organization.py

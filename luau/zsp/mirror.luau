@@ -39,6 +39,13 @@ local WINDOW = table.freeze({ [W] = WHERE_COLUMN }) -- one shape, so that all wh
 
 local mirror = {}
 
+-- For tests: every shortcut off, so that what is read and written is read and written the long way, to be held to the
+-- same as the short.
+local plain = false
+function mirror._plain(on: boolean)
+	plain = on
+end
+
 -- ---------------------------------------------------------------- schemas
 
 -- Named columns, and whatever is nested under other names. Each column has a slot of its own, from 16 to 254, as has
@@ -489,7 +496,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 	-- A map: the same table as before if nothing in it is other than it was.
 	local function build_map(s: Schema, id: string): any
 		local was = nodes[id]
-		if was and not dirty_node[id] and schema_of[id] == s then
+		if was and not dirty_node[id] and schema_of[id] == s and not plain then
 			return was
 		end
 		dirty_node[id] = nil
@@ -571,10 +578,10 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		local key = key_of(owner, field)
 		local st = boxes[key]
 		local d = dirty_box[key]
-		if st and d == nil then
+		if st and d == nil and not plain then
 			return st.out
 		end
-		local structural = d == true or st == nil
+		local structural = d == true or st == nil or plain
 		dirty_box[key] = nil
 		if b.kind == "map" then
 			local id = derive(owner, field)
@@ -612,7 +619,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 				local mine = members[key] or {}
 				local again = remade[owner .. string.char(b.slot)]
 				remade[owner .. string.char(b.slot)] = nil
-				if st and st.living == living and not again then
+				if st and st.living == living and not again and not plain then
 					-- What did not move keeps its order, for the order of what is there never changes; what came,
 					-- moved, or had nowhere to be yet, is taken out and put in its place, in arrays as they were.
 					for id in hidden do
@@ -1132,7 +1139,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			local write_box: any
 
 			write_map = function(s: Schema, old: any, new: any, id: string, made: boolean, where: string?)
-				if rawequal(old, new) and not made and not where then
+				if rawequal(old, new) and not made and not where and not plain then
 					return -- the very table that was read: nothing in it has changed
 				end
 				new = new or {}
@@ -1181,7 +1188,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			end
 
 			write_box = function(b: Schema, old: any, new: any, owner: string, field: string)
-				if rawequal(old, new) and old ~= nil then
+				if rawequal(old, new) and old ~= nil and not plain then
 					return
 				end
 				local key = key_of(owner, field)
@@ -1209,7 +1216,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					-- The very same tables first, which is most of them when a state is built from the last.
 					local a, z = 0, 0
 					local nn, no = #new, #old_ids
-					local least = if shared then 0 else math.min(nn, no)
+					local least = if shared or plain then 0 else math.min(nn, no)
 					while a < least and rawequal(new[a + 1], oldl[a + 1]) do
 						a += 1
 					end
@@ -1241,7 +1248,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					end
 					-- One moved from one end of what is between to the other: it alone moves.
 					local mid_old, mid_new = #old_ids - z - a, #new - z - a
-					if mid_old == mid_new and mid_old >= 2 and next(garbage[key] or {}) == nil and not shared then
+					if mid_old == mid_new and mid_old >= 2 and next(garbage[key] or {}) == nil and not shared and not plain then
 						local first = same_at(a + mid_new, a + 1) -- the first went last
 						local last = same_at(a + 1, a + mid_old) -- the last went first
 						for k = 1, mid_old - 1 do
@@ -1485,7 +1492,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 								seq[i] = `\1{i}`
 							end
 						end
-						local same = gone[row] == nil and #seq == #siblings
+						local same = not plain and gone[row] == nil and #seq == #siblings
 						for i, id in seq do
 							same = same and before[id] == i
 						end

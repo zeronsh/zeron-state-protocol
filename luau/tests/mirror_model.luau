@@ -676,6 +676,10 @@ end
 
 local failures = 0
 local SEEDS = tonumber(require("@lune/process").args[1] or "") or 60
+-- And with every shortcut off, held to the same.
+if require("@lune/process").args[2] == "plain" then
+	m._plain(true)
+end
 for seed = 1, SEEDS do
 	math.randomseed(seed)
 	local n = 2 + seed % 2
