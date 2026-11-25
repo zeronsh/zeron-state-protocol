@@ -105,6 +105,45 @@ set_add :: proc(s: ^Set, v: u32) -> bool {
 	return true
 }
 
+// Everything below `n`, in an empty set.
+set_fill :: proc(s: ^Set, n: u32) {
+	resize(&s.chunks, int((n + 0xffff) >> 16))
+	for &c, i in s.chunks {
+		c.count = int(min(n - u32(i) << 16, 1 << 16))
+		c.dense = new([1024]u64)
+		for &w, j in c.dense {
+			have := c.count - j * 64
+			w = max(u64) if have >= 64 else (1 << uint(have) - 1 if have > 0 else 0)
+		}
+		chunk_thin(&c)
+	}
+	s.count = int(n)
+}
+
+// As set_add, for many: counts are not kept until set_settle.
+@(private)
+set_put :: #force_inline proc(s: ^Set, v: u32) #no_bounds_check {
+	if int(v >> 16) < len(s.chunks) {
+		c := &s.chunks[v >> 16]
+		if c.dense != nil {
+			c.dense[u16(v) >> 6] |= 1 << (v & 63)
+			return
+		}
+	}
+	set_add(s, v)
+}
+
+@(private)
+set_settle :: proc(s: ^Set) {
+	s.count = 0
+	for &c in s.chunks {
+		if c.dense != nil {
+			chunk_count(&c)
+		}
+		s.count += c.count
+	}
+}
+
 // Whether it was there.
 set_remove :: proc(s: ^Set, v: u32) -> bool {
 	if int(v >> 16) >= len(s.chunks) {

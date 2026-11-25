@@ -23,7 +23,8 @@ CACHE :: 256 // pages kept open, at most, besides those being written
 // Where pages rest. Nothing need survive: what is lost is made again.
 Disk :: struct {
 	data:  rawptr,
-	read:  proc(data: rawptr, no: u32, into: []byte) -> bool,
+	// A page as it rests, good until the next write; or nil.
+	view:  proc(data: rawptr, no: u32) -> []byte,
 	write: proc(data: rawptr, no: u32, bytes: []byte) -> bool,
 	sync:  proc(data: rawptr) -> bool,
 	close: proc(data: rawptr),
@@ -57,6 +58,8 @@ Pager :: struct {
 	next:    u32, // the first page never used
 	free:    [dynamic]u32, // may be used now,
 	pending: [dynamic]u32, // and once the next commit is made
+	fresh:   Set, // made since the last: nothing that was committed leads to them
+	spare:   [dynamic]^Frame, // to be had again
 	failed:  bool,
 }
 
@@ -77,8 +80,13 @@ pager_close :: proc(p: ^Pager) {
 		}
 		delete(frames)
 	}
+	for f in p.spare {
+		free(f)
+	}
+	delete(p.spare)
 	delete(p.free)
 	delete(p.pending)
+	set_destroy(&p.fresh)
 	aead.reset(&p.cipher)
 	if p.disk.close != nil {
 		p.disk.close(p.disk.data)
@@ -109,17 +117,17 @@ page_get :: proc(p: ^Pager, no: u32) -> ^Page {
 	}
 	f: ^Frame
 	if len(p.open) < CACHE {
-		f = new(Frame)
+		f = frame_new(p)
 	} else {
 		f = p.oldest
 		frame_unlink(p, f)
 		delete_key(&p.open, f.no)
 	}
 	f.no = no
-	bytes := ([^]byte)(&f.page)[:PAGE_SIZE]
 	bind := page_bind(no)
-	body := bytes[NONCE + TAG:]
-	if !p.disk.read(p.disk.data, no, bytes) || !aead.open(&p.cipher, body, f.page.nonce[:], bind[:], body, f.page.tag[:]) {
+	body := ([^]byte)(&f.page)[NONCE + TAG:PAGE_SIZE]
+	rests := p.disk.view(p.disk.data, no)
+	if len(rests) != PAGE_SIZE || !aead.open(&p.cipher, body, rests[:NONCE], bind[:], rests[NONCE + TAG:], rests[NONCE:][:TAG]) {
 		p.failed = true
 		f.page = {}
 	}
@@ -154,11 +162,21 @@ frame_unlink :: proc(p: ^Pager, f: ^Frame) {
 }
 
 @(private)
+frame_new :: proc(p: ^Pager) -> ^Frame {
+	if len(p.spare) == 0 {
+		return new(Frame)
+	}
+	f := pop(&p.spare)
+	f^ = {}
+	return f
+}
+
+@(private)
 frame_free :: proc(p: ^Pager, no: u32) {
 	if f, ok := p.open[no]; ok {
 		frame_unlink(p, f)
 		delete_key(&p.open, no)
-		free(f)
+		append(&p.spare, f)
 	}
 }
 
@@ -171,22 +189,24 @@ page_new :: proc(p: ^Pager) -> (no: u32, pg: ^Page) {
 		p.next += 1
 	}
 	frame_free(p, no) // what it was before it was given up
-	f := new(Frame)
+	f := frame_new(p)
 	f.no = no
 	p.dirty[no] = f
+	set_add(&p.fresh, no)
 	return no, &f.page
 }
 
 @(private)
 page_drop :: proc(p: ^Pager, no: u32) {
 	if f, ok := p.dirty[no]; ok {
-		// Never written, so nothing that was committed points to it.
 		delete_key(&p.dirty, no)
-		free(f)
-		append(&p.free, no)
-		return
+		append(&p.spare, f)
 	}
-	append(&p.pending, no)
+	if set_remove(&p.fresh, no) {
+		append(&p.free, no)
+	} else {
+		append(&p.pending, no)
+	}
 }
 
 // Writes what is new. The caller then says where it begins.
@@ -206,10 +226,9 @@ pager_write :: proc(p: ^Pager) -> bool {
 		}
 	}
 	for _, f in p.dirty {
-		free(f)
+		append(&p.spare, f)
 	}
 	clear(&p.dirty)
-	shrink(&p.dirty)
 	return true
 }
 
@@ -223,10 +242,9 @@ Memory_Disk :: struct {
 memory_disk :: proc(m: ^Memory_Disk) -> Disk {
 	return {
 		data = m,
-		read = proc(data: rawptr, no: u32, into: []byte) -> bool {
-			pg := (^Memory_Disk)(data).pages[no] or_return
-			copy(into, pg[:])
-			return true
+		view = proc(data: rawptr, no: u32) -> []byte {
+			pg, ok := (^Memory_Disk)(data).pages[no]
+			return pg[:] if ok else nil
 		},
 		write = proc(data: rawptr, no: u32, bytes: []byte) -> bool {
 			m := (^Memory_Disk)(data)

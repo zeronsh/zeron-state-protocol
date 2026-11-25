@@ -76,6 +76,7 @@ tree_matches_model :: proc(t: ^testing.T) {
 				testing.expect(t, pager_write(&p))
 				append(&p.free, ..p.pending[:])
 				clear(&p.pending)
+				set_destroy(&p.fresh)
 			}
 			if batch % 10 != 0 && batch < 195 {
 				continue

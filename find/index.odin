@@ -2,6 +2,7 @@ package find
 
 import "base:runtime"
 import "core:math/bits"
+import "core:mem/virtual"
 import "core:slice"
 import "core:strings"
 import "../zsp"
@@ -62,8 +63,9 @@ Held :: struct {
 	built: bool, // every row is in it
 	by_row: Tree, // number and value
 	by_key: Tree, // value, number
-	// For words: by_key is word, text; by_row is number, text; texts is text, number and a hash of it.
-	texts: Tree,
+	// For words: by_key is word, text; by_row is number, a hash of the text, and text; texts says whose each is.
+	texts: Array, // how many words a text has, and one more than the row it is of
+	alive: int, // texts that are of a row
 	lexicon: Tree, // every word there has been
 	next_text: u32,
 	length: u64, // words in all the texts there are
@@ -130,6 +132,7 @@ index_reset :: proc(x: ^Index) {
 	x.newest, x.oldest = nil, nil
 	clear(&x.free)
 	clear(&x.pending)
+	set_destroy(&x.fresh)
 	clear(&x.blob)
 	x.next = HEADERS
 	x.upto, x.serial, x.tailing, x.failed = 0, x.n.roster.serial, false, false
@@ -170,7 +173,7 @@ held_free :: proc(h: ^Held) {
 
 @(private)
 held_trees :: proc(h: ^Held) -> [4]^Tree {
-	return {&h.by_row, &h.by_key, &h.texts, &h.lexicon}
+	return {&h.by_row, &h.by_key, &h.texts.blocks, &h.lexicon}
 }
 
 // ---------------------------------------------------------------- resting
@@ -203,6 +206,7 @@ index_save :: proc(x: ^Index) -> bool {
 			zsp.write_varint(&w, u64(h.next_text))
 			zsp.write_varint(&w, h.length)
 			zsp.write_varint(&w, u64(h.dead))
+			zsp.write_varint(&w, u64(h.alive))
 		}
 	}
 	for no in x.blob {
@@ -238,6 +242,7 @@ index_save :: proc(x: ^Index) -> bool {
 	}
 	append(&x.free, ..x.pending[:])
 	clear(&x.pending)
+	set_destroy(&x.fresh)
 	x.unsaved = 0
 	return true
 }
@@ -282,14 +287,19 @@ catalogue_read :: proc(x: ^Index, best: ^Header) -> bool {
 			h.next_text = u32(zsp.read_varint(&r))
 			h.length = zsp.read_varint(&r)
 			h.dead = int(zsp.read_varint(&r))
+			h.alive = int(zsp.read_varint(&r))
 			append(&s.columns, h)
 			if r.bad {
 				return false
 			}
 		}
-		rows_each(s, proc(s: ^Scope, row: u32) {
-			set_add(&s.all, row)
-		})
+		if tree_total(x, s.rows).count == int(s.next) {
+			set_fill(&s.all, s.next)
+		} else {
+			rows_each(s, proc(s: ^Scope, row: u32) {
+				set_add(&s.all, row)
+			})
+		}
 	}
 	return !r.bad && !x.failed
 }
@@ -334,6 +344,12 @@ free_find :: proc(x: ^Index) {
 		for h in s.columns {
 			for t in held_trees(h) {
 				mark(x, used, t.root)
+			}
+			pages := make([dynamic]u32)
+			defer delete(pages)
+			array_pages(x, h.texts, &pages)
+			for no in pages {
+				used[min(int(no), len(used) - 1)] = true
 			}
 		}
 	}
@@ -461,6 +477,7 @@ tree_first :: proc(p: ^Pager, t: Tree, key: Key, sub: u32 = 0) -> (e: Entry, ok:
 held_shape :: proc(h: ^Held) {
 	if h.kind == .Words {
 		h.by_key.width = .Byte
+		h.texts.blocks.width = .Varint
 		return
 	}
 	h.by_row.width = .Byte
@@ -506,9 +523,7 @@ index_want :: proc(x: ^Index, scope: zsp.Scope, c: ^Column) -> ^Held {
 
 index_drop :: proc(x: ^Index, h: ^Held) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	for t in held_trees(h) {
-		tree_clear(x, t)
-	}
+	held_clear(h)
 	for other, i in h.scope.columns {
 		if other == h {
 			unordered_remove(&h.scope.columns, i)
@@ -518,9 +533,23 @@ index_drop :: proc(x: ^Index, h: ^Held) {
 	held_free(h)
 }
 
+@(private)
+held_clear :: proc(h: ^Held) {
+	array_clear(h.scope.x, &h.texts)
+	for t, i in held_trees(h) {
+		if i != 2 {
+			tree_clear(h.scope.x, t)
+		}
+	}
+}
+
 // Numbers every row there is. The index must be level with the store.
 @(private)
 scope_fill :: proc(s: ^Scope) {
+	bulk := new([2]Bulk)
+	defer free(bulk)
+	bulk_begin(&bulk[0], s.x, &s.ids)
+	bulk_begin(&bulk[1], s.x, &s.rows)
 	last: zsp.Id
 	scan := zsp.tree_scan(&s.x.n.store, s.x.n.cells, {u64(s.id) << 32, 0, 0, 0, 0}, {(u64(s.id) + 1) << 32, 0, 0, 0, 0})
 	for leaf in zsp.tree_next(&scan) {
@@ -532,18 +561,31 @@ scope_fill :: proc(s: ^Scope) {
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		if row_there(s, id) {
 			row_admit(s, id)
-		}
-		if len(s.edits[0]) > BATCH {
-			scope_flush(s)
+			for &edits, i in s.edits {
+				for x in edits {
+					bulk_add(&bulk[i], x.entry)
+				}
+				clear(&edits)
+			}
 		}
 	}
-	scope_flush(s)
+	for &b in bulk {
+		bulk_end(&b)
+	}
+	index_relieve(s.x)
 }
 
-// Reads a column of every row.
+// Reads a column of every row. Its trees must be empty.
 @(private)
 held_fill :: proc(h: ^Held) {
 	s := h.scope
+	bulk := new([4]Bulk)
+	defer free(bulk)
+	for t, i in held_trees(h) {
+		if i != 2 {
+			bulk_begin(&bulk[i], s.x, t)
+		}
+	}
 	c := cursor_make(s.x, s.rows, context.allocator)
 	defer cursor_destroy(&c)
 	cursor_seek(&c, KEY_MIN)
@@ -551,11 +593,24 @@ held_fill :: proc(h: ^Held) {
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		row := Row{n = s.x.n, id = {u64(s.id) << 32 | e.key.hi & 0xffff_ffff, e.key.lo}}
 		held_read(h, u32(e.key.hi >> 32), &row, fresh = true)
-		if len(h.edits[0]) + len(h.edits[1]) > BATCH {
-			held_flush(h)
+		for &edits, i in h.edits {
+			if i == 2 {
+				texts_make(h)
+				index_relieve(s.x)
+				continue
+			}
+			for x in edits {
+				bulk_add(&bulk[i], x.entry)
+			}
+			clear(&edits)
 		}
 	}
-	held_flush(h)
+	for &b, i in bulk {
+		if i != 2 {
+			bulk_end(&b)
+		}
+	}
+	index_relieve(s.x)
 	h.built = true
 }
 
@@ -714,31 +769,34 @@ held_text :: proc(h: ^Held, row: u32) -> (text: u32, ok: bool) {
 	return e.sub, e.key.hi >> 32 == u64(row)
 }
 
+@(private)
+held_text_hash :: proc(h: ^Held, row: u32) -> (text: u32, hash: u64, ok: bool) {
+	e := tree_first(h.scope.x, h.by_row, {u64(row) << 32, 0}) or_return
+	return e.sub, e.key.lo, e.key.hi >> 32 == u64(row)
+}
+
 Text_Entry :: struct {
 	row:    u32,
 	length: u32,
-	hash:   u64,
 }
 
 @(require_results)
 text_entry :: proc(h: ^Held, text: u32) -> (t: Text_Entry, ok: bool) {
-	e := tree_first(h.scope.x, h.texts, {u64(text) << 32, 0}) or_return
-	if u32(e.key.hi >> 32) != text {
-		return
-	}
-	return {u32(e.key.hi), e.sub, e.key.lo}, true
+	v := array_get(h.scope.x, h.texts, text)
+	return {u32(v) - 1, u32(v >> 32)}, v != 0
 }
 
 @(private)
 text_bury :: proc(h: ^Held, row: u32) {
-	text, ok := held_text(h, row)
+	text, hash, ok := held_text_hash(h, row)
 	if !ok {
 		return
 	}
 	t, _ := text_entry(h, text)
-	append(&h.edits[0], Edit{entry = {{u64(row) << 32, 0}, text, 0}, gone = true})
-	append(&h.edits[2], Edit{entry = {{u64(text) << 32 | u64(row), t.hash}, t.length, 0}, gone = true})
+	append(&h.edits[0], Edit{entry = {{u64(row) << 32, hash}, text, 0}, gone = true})
+	append(&h.edits[2], Edit{entry = {key = {u64(text), 0}}, gone = true})
 	h.dead += 1
+	h.alive -= 1
 	h.length -= min(h.length, u64(t.length))
 }
 
@@ -761,8 +819,8 @@ words_read :: proc(h: ^Held, row: u32, r: ^Row, fresh: bool) {
 	}
 	hash := bytes_hash(bytes)
 	if !fresh {
-		if text, ok := held_text(h, row); ok {
-			if t, _ := text_entry(h, text); have && t.hash == hash {
+		if _, old, ok := held_text_hash(h, row); ok {
+			if have && old == hash {
 				return
 			}
 			text_bury(h, row)
@@ -795,12 +853,19 @@ words_read :: proc(h: ^Held, row: u32, r: ^Row, fresh: bool) {
 			j += 1
 		}
 		append(&h.edits[1], Edit{entry = {all[i].key, text, u64(min(j - i, 255))}})
-		append(&h.edits[3], Edit{entry = {key = all[i].key}})
+		if !fresh {
+			if _, known := tree_get(h.scope.x, h.lexicon, all[i].key, 0); !known {
+				append(&h.edits[3], Edit{entry = {key = all[i].key}})
+			}
+		} else {
+			append(&h.edits[3], Edit{entry = {key = all[i].key}})
+		}
 		i = j
 	}
 	h.length += u64(len(all))
-	append(&h.edits[0], Edit{entry = {{u64(row) << 32, 0}, text, 0}})
-	append(&h.edits[2], Edit{entry = {{u64(text) << 32 | u64(row), hash}, u32(len(all)), 0}})
+	append(&h.edits[0], Edit{entry = {{u64(row) << 32, hash}, text, 0}})
+	append(&h.edits[2], Edit{entry = {{u64(text), u64(len(all)) << 32 | u64(row + 1)}, 0, 0}})
+	h.alive += 1
 }
 
 @(private)
@@ -856,7 +921,15 @@ edits_sort :: proc(edits: []Edit) {
 			run[j] = e
 		}
 	}
-	spare := make([]Edit, n, context.temp_allocator)
+	// Not from the heap when it is much: that would be kept.
+	arena: virtual.Arena
+	mapped := n > 4096 && virtual.arena_init_static(&arena, uint(n + 64) * size_of(Edit), 1 << 16) == nil
+	spare := make([]Edit, n, virtual.arena_allocator(&arena) if mapped else context.allocator)
+	defer if mapped {
+		virtual.arena_destroy(&arena)
+	} else {
+		delete(spare)
+	}
 	from, to := edits, spare
 	for width := SMALL; width < n; width *= 2 {
 		for at := 0; at < n; at += 2 * width {
@@ -885,20 +958,33 @@ edits_sort :: proc(edits: []Edit) {
 
 @(private)
 edits_make :: proc(x: ^Index, t: ^Tree, edits: ^[dynamic]Edit) {
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	tree_apply(x, t, edits_settle(edits[:]))
-	clear(edits)
-	if cap(edits) > 4096 {
-		shrink(edits, 4096)
+	all := edits_settle(edits[:])
+	for at := 0; at < len(all); at += 1024 {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		tree_apply(x, t, all[at:min(at + 1024, len(all))])
+		index_relieve(x)
 	}
+	clear(edits)
+}
+
+@(private)
+texts_make :: proc(h: ^Held) {
+	for e in h.edits[2] {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		array_set(h.scope.x, &h.texts, u32(e.key.hi), 0 if e.gone else e.key.lo)
+	}
+	clear(&h.edits[2])
 }
 
 @(private)
 held_flush :: proc(h: ^Held) {
 	for t, i in held_trees(h) {
-		edits_make(h.scope.x, t, &h.edits[i])
+		if i != 2 {
+			edits_make(h.scope.x, t, &h.edits[i])
+		}
 	}
-	if h.dead > 4096 && h.dead > tree_total(h.scope.x, h.texts).count {
+	texts_make(h)
+	if h.dead > 4096 && h.dead > h.alive {
 		words_renew(h)
 	}
 	index_relieve(h.scope.x)
@@ -909,11 +995,9 @@ held_flush :: proc(h: ^Held) {
 words_renew :: proc(h: ^Held) {
 	{
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		for t in held_trees(h) {
-			tree_clear(h.scope.x, t)
-		}
+		held_clear(h)
 	}
-	h.next_text, h.length, h.dead, h.built = 0, 0, 0, false
+	h.next_text, h.length, h.dead, h.alive, h.built = 0, 0, 0, 0, false
 	held_fill(h)
 }
 
@@ -931,7 +1015,7 @@ scope_flush :: proc(s: ^Scope) {
 // points, so it does not matter what becomes of them.
 @(private)
 index_relieve :: proc(x: ^Index) {
-	if len(x.dirty) > 4 * CACHE {
+	if len(x.dirty) > 2 * CACHE {
 		pager_write(x)
 	}
 }

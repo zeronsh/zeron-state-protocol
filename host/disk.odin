@@ -8,6 +8,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
+import "../find"
 import "../zsp"
 
 // Segments are files named by number; pages live in one file, mapped for reading so that the
@@ -243,4 +244,86 @@ clock_of :: proc(dir: string) -> u64 {
 	disk := file_disk(&d)
 	defer disk.close(disk.data)
 	return zsp.store_clock(disk)
+}
+
+// Where an index rests. It can always be made again, so nothing about it need be careful.
+Pages_File :: struct {
+	path:   string, // owned
+	file:   ^os.File,
+	mapped: []byte,
+	size:   int, // as far as it has been written
+}
+
+pages_file :: proc(p: ^Pages_File, dir: string) -> find.Disk {
+	p.path, _ = filepath.join({dir, "find"})
+	return {
+		data = p,
+		view = proc(data: rawptr, no: u32) -> []byte {
+			p := (^Pages_File)(data)
+			if p.file == nil && (!os.exists(p.path) || !pages_make(p)) {
+				return nil
+			}
+			end := (int(no) + 1) * find.PAGE_SIZE
+			if end > p.size {
+				return nil
+			}
+			if end > len(p.mapped) {
+				if p.mapped != nil {
+					virtual.unmap_file(p.mapped)
+				}
+				err: virtual.Map_File_Error
+				p.mapped, err = virtual.map_file_from_file(p.file, {.Read})
+				if err != .None {
+					p.mapped = nil
+					return nil
+				}
+			}
+			return p.mapped[end - find.PAGE_SIZE:end] if end <= len(p.mapped) else nil
+		},
+		write = proc(data: rawptr, no: u32, bytes: []byte) -> bool {
+			p := (^Pages_File)(data)
+			if p.file == nil && !pages_make(p) {
+				return false
+			}
+			at := int(no) * find.PAGE_SIZE
+			when ODIN_OS == .Windows {
+				// A file does not grow there while it is mapped.
+				if at + len(bytes) > p.size && p.mapped != nil {
+					virtual.unmap_file(p.mapped)
+					p.mapped = nil
+				}
+			}
+			n, err := os.write_at(p.file, bytes, i64(at))
+			p.size = max(p.size, at + n)
+			return err == nil && n == len(bytes)
+		},
+		sync = proc(data: rawptr) -> bool {
+			p := (^Pages_File)(data)
+			return p.file == nil || os.sync(p.file) == nil
+		},
+		close = proc(data: rawptr) {
+			p := (^Pages_File)(data)
+			if p.mapped != nil {
+				virtual.unmap_file(p.mapped)
+			}
+			if p.file != nil {
+				os.close(p.file)
+			}
+			delete(p.path)
+			p^ = {}
+		},
+	}
+}
+
+@(private)
+pages_make :: proc(p: ^Pages_File) -> bool {
+	err: os.Error
+	p.file, err = os.open(p.path, {.Read, .Write, .Create}, os.Permissions{.Read_User, .Write_User})
+	if err != nil {
+		p.file = nil
+		return false
+	}
+	size, serr := os.file_size(p.file)
+	p.size = int(size)
+	return serr == nil
 }

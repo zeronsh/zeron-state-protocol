@@ -288,9 +288,7 @@ pred_rows :: proc(s: ^Scope, p: ^Pred) -> (out: Set) {
 			for row in set_next(&it) {
 				id, _ := row_id(other, row)
 				key := Key{id[0], id[1]}
-				tree_each(x, p.held.by_key, key, key_next(key), &out, proc(data: rawptr, e: ^Entry) {
-					set_add((^Set)(data), e.sub)
-				})
+				tree_subs(x, p.held.by_key, key, key_next(key), &out)
 			}
 			return
 		}
@@ -396,7 +394,25 @@ leaf_rows :: proc(s: ^Scope, p: ^Pred) -> Set {
 		}
 	} else {
 		lo, hi := leaf_span(p)
-		tree_each(x, p.held.by_key, lo, hi, &g, each)
+		if p.op == .Range || p.op == .Exists {
+			// Only what lies at a bound needs judging; all that lies between holds.
+			inner_lo, inner_hi := lo, hi
+			if p.range.has_lo && lo != KEY_MAX {
+				inner_lo = key_next(lo)
+				tree_each(x, p.held.by_key, lo, inner_lo, &g, each)
+			}
+			if p.range.has_hi && hi != KEY_MAX {
+				inner_hi = p.range.hi.key
+				if !key_less(inner_hi, inner_lo) {
+					tree_each(x, p.held.by_key, inner_hi, hi, &g, each)
+				}
+			}
+			if key_less(inner_lo, inner_hi) && !(p.range.has_lo && lo == KEY_MAX) {
+				tree_subs(x, p.held.by_key, inner_lo, inner_hi, &g.out)
+			}
+		} else {
+			tree_each(x, p.held.by_key, lo, hi, &g, each)
+		}
 	}
 	for row in g.perhaps {
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -568,9 +584,7 @@ word_sure :: proc(h: ^Held, w: ^Word_Query, i: int, keys: []Key) -> bool {
 word_texts :: proc(h: ^Held, keys: []Key) -> Set {
 	out: Set
 	for k in keys {
-		tree_each(h.scope.x, h.by_key, k, key_next(k), &out, proc(data: rawptr, e: ^Entry) {
-			set_add((^Set)(data), e.sub)
-		})
+		tree_subs(h.scope.x, h.by_key, k, key_next(k), &out)
 	}
 	return out
 }
@@ -639,14 +653,7 @@ match_rows :: proc(s: ^Scope, p: ^Pred) -> (out: Set) {
 	}
 	texts, sure := match_texts(s, p)
 	defer set_destroy(&texts)
-	Both :: struct {
-		texts: ^Set,
-		out:   ^Set,
-	}
-	b := Both{&texts, &out}
-	texts_rows(p.held, &texts, &b, proc(data: rawptr, text: u32, t: Text_Entry) {
-		set_add((^Both)(data).out, t.row)
-	})
+	array_rows(s.x, p.held.texts, &texts, &out)
 	if !sure {
 		gone: [dynamic]u32
 		defer delete(gone)
@@ -662,33 +669,6 @@ match_rows :: proc(s: ^Scope, p: ^Pred) -> (out: Set) {
 		}
 	}
 	return
-}
-
-// Which rows texts are of, leaving out those that are gone.
-@(private)
-texts_rows :: proc(h: ^Held, texts: ^Set, data: rawptr, each: proc(data: rawptr, text: u32, t: Text_Entry)) {
-	it := set_iterator(texts)
-	if texts.count * 8 < tree_total(h.scope.x, h.texts).count {
-		for text in set_next(&it) {
-			if t, ok := text_entry(h, text); ok {
-				each(data, text, t)
-			}
-		}
-		return
-	}
-	// So many that it is quicker to read them all.
-	Walk :: struct {
-		texts: ^Set,
-		data:  rawptr,
-		each:  proc(data: rawptr, text: u32, t: Text_Entry),
-	}
-	w := Walk{texts, data, each}
-	tree_each(h.scope.x, h.texts, KEY_MIN, KEY_MAX, &w, proc(data: rawptr, e: ^Entry) {
-		w := (^Walk)(data)
-		if text := u32(e.key.hi >> 32); set_has(w.texts, text) {
-			w.each(w.data, text, {u32(e.key.hi), e.sub, e.key.lo})
-		}
-	})
 }
 
 @(private)
@@ -741,32 +721,69 @@ rows_scores :: proc(s: ^Scope, q: ^Query, rows: ^Set, scores: ^map[u32]f32) {
 	pred_matches(&q.where_, &matches)
 	for p in matches {
 		h := p.held
-		docs := f64(max(tree_total(s.x, h.texts).count, 1))
-		mean := f64(h.length) / docs
-		worth := make(map[u32]f32)
-		defer delete(worth)
+		docs := f64(max(h.alive, 1))
+		mean := max(f64(h.length) / docs, 1)
+		keys := make([dynamic]Key, context.temp_allocator)
+		postings := 0
 		for i in 0 ..< len(p.words.words) {
 			for k in word_keys(h, &p.words, i) {
-				have := f64(tree_between(s.x, h.by_key, k, key_next(k)).count)
-				rarity := f32(math.ln(1 + (docs - min(have, docs) + 0.5) / (have + 0.5)))
-				Add :: struct {
-					worth:  ^map[u32]f32,
-					rarity: f32,
-				}
-				a := Add{&worth, rarity}
-				tree_each(s.x, h.by_key, k, key_next(k), &a, proc(data: rawptr, e: ^Entry) {
-					a := (^Add)(data)
-					// The text's length is folded in below; often said is worth less each time.
-					a.worth[e.sub] += a.rarity * (f32(e.val) * 2.2 / (f32(e.val) + 1.2))
-				})
+				append(&keys, k)
+				postings += tree_between(s.x, h.by_key, k, key_next(k)).count
 			}
 		}
-		for text, w in worth {
-			if t, ok := text_entry(h, text); ok && set_has(rows, t.row) {
-				scores[t.row] += w * f32(1.25 / (0.75 + 0.5 * f64(t.length) / max(mean, 1)))
+		// A word asked for twice counts twice; one that answers two ways, once for each.
+		one := rows.count * len(keys) * 8 < postings
+		texts := make(map[u32]Scored)
+		defer delete(texts)
+		it := set_iterator(rows)
+		for row in set_next(&it) {
+			if text, ok := held_text(h, row); ok {
+				t, _ := text_entry(h, text)
+				texts[text] = {row, f32(0.25 + 0.75 * f64(t.length) / mean), 0}
+			}
+		}
+		for k in keys {
+			have := f64(tree_between(s.x, h.by_key, k, key_next(k)).count)
+			rarity := f32(math.ln(1 + (docs - min(have, docs) + 0.5) / (have + 0.5)))
+			if one {
+				for text, &t in texts {
+					if often, says := tree_get(s.x, h.by_key, k, text); says {
+						t.worth += rarity * worth(often, t.size)
+					}
+				}
+				continue
+			}
+			Add :: struct {
+				texts:  ^map[u32]Scored,
+				rarity: f32,
+			}
+			a := Add{&texts, rarity}
+			tree_each(s.x, h.by_key, k, key_next(k), &a, proc(data: rawptr, e: ^Entry) {
+				a := (^Add)(data)
+				if t := &a.texts[e.sub]; t != nil {
+					t.worth += a.rarity * worth(e.val, t.size)
+				}
+			})
+		}
+		for _, t in texts {
+			if t.worth > 0 {
+				scores[t.row] += t.worth
 			}
 		}
 	}
+}
+
+@(private)
+Scored :: struct {
+	row:   u32,
+	size:  f32, // how long the text is, against the others
+	worth: f32,
+}
+
+@(private)
+worth :: proc(often: u64, size: f32) -> f32 {
+	n := f32(often)
+	return n * 2.2 / (n + 1.2 * size)
 }
 
 // ---------------------------------------------------------------- in what order
@@ -883,9 +900,9 @@ rank :: proc(s: ^Scope, q: ^Query, all: []Sorted) {
 	})
 }
 
-// With fewer than this many rows it is quicker to put them in order than to look for them in one.
+// So few rows are best put in order.
 @(private)
-WALK :: #config(ZSP_FIND_WALK, 256)
+WALK :: #config(ZSP_FIND_WALK, 64)
 
 // A stretch of the rows, in order. Temporary memory.
 @(require_results)
@@ -917,7 +934,9 @@ query_page :: proc(s: ^Scope, q: ^Query, rows: ^Set) -> []Hit {
 	}
 
 	lead := q.order[0] if len(q.order) > 0 else Sort{by = .Created}
-	walk := !relevance && rows.count > WALK && (lead.by == .Created || lead.held == nil || lead.held.built)
+	// Looking for them in order reads all that lies between; having them all reads each.
+	between := (skip + count) * s.all.count / max(rows.count, 1)
+	walk := !relevance && rows.count > WALK && between / ASK < rows.count
 	if !walk {
 		// All of them, put in order.
 		all := make([]Sorted, rows.count, context.temp_allocator)

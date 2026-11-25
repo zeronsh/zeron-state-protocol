@@ -1,5 +1,9 @@
 package find
 
+import "base:runtime"
+import "core:encoding/endian"
+import "core:mem/virtual"
+import "core:slice"
 import "../zsp"
 
 // One structure for everything: an ordered set of (key, sub), each with a value, in leaves that write each entry
@@ -124,7 +128,7 @@ reader_next :: #force_inline proc(r: ^Reader) -> bool #no_bounds_check {
 	case:
 		shared, n := int(h - FRESH), int(d[r.pos])
 		r.pos += 1
-		r.key = key_join(r.key, shared, d[r.pos:][:n])
+		r.key = key_join(r.key, shared, d[r.pos:], n)
 		r.pos += n
 		r.sub = u32(read_varint(d[:], &r.pos))
 	}
@@ -155,15 +159,23 @@ read_varint :: #force_inline proc(d: []byte, pos: ^int) -> (v: u64) #no_bounds_c
 
 // The first `shared` bytes of a key, then others, then zeroes.
 @(private)
-key_join :: proc(k: Key, shared: int, rest: []byte) -> Key #no_bounds_check {
-	b: [16]byte = ---
-	zsp.put_u64(b[:], k.hi)
-	zsp.put_u64(b[8:], k.lo)
-	copy(b[shared:], rest)
-	for i in shared + len(rest) ..< 16 {
-		b[i] = 0
+key_join :: #force_inline proc(k: Key, shared: int, d: []byte, n: int) -> Key #no_bounds_check {
+	rest: u128
+	if n == 0 {
+		rest = 0
+	} else if len(d) >= 16 {
+		rest = u128(endian.unchecked_get_u64be(d)) << 64 | u128(endian.unchecked_get_u64be(d[8:]))
+		rest = rest >> uint(128 - 8 * n) << uint(128 - 8 * n)
+	} else {
+		for b, i in d[:n] {
+			rest |= u128(b) << uint(120 - 8 * i)
+		}
 	}
-	return {zsp.get_u64(b[:]), zsp.get_u64(b[8:])}
+	if shared > 0 {
+		keep := ~u128(0) << uint(128 - 8 * shared)
+		rest = (u128(k.hi) << 64 | u128(k.lo)) & keep | rest >> uint(8 * shared)
+	}
+	return {u64(rest >> 64), u64(rest)}
 }
 
 @(private)
@@ -190,28 +202,12 @@ write_varint :: #force_inline proc(d: []byte, pos: int, v: u64) -> int #no_bound
 	return pos + 1
 }
 
+// Writes an entry after another, or at a restart after none.
 @(private)
-writer_put :: proc(w: ^Writer, e: Entry) #no_bounds_check {
-	if w.pg != nil && int(w.pg.used) + ENTRY_MAX + 2 * (int(w.pg.count) + 1) > LEAF_ROOM {
-		writer_end(w)
-	}
-	if w.pg == nil {
-		w.no, w.pg = page_new(w.p)
-		append(w.out, Child{key = e.key, sub = e.sub, child = w.no})
-		w.next_restart = 0
-		w.total = {}
-	}
-	pg := w.pg
-	d := pg.data[:]
-	pos := int(pg.used)
-	fresh := pos >= w.next_restart
-	if fresh {
-		(^u16)(&pg.data[LEAF_ROOM - 2 * (int(pg.count) + 1)])^ = u16(pos)
-		pg.count += 1
-		w.next_restart = pos + RESTART
-	}
-	if !fresh && e.key == w.last.key {
-		step := e.sub - w.last.sub
+entry_write :: proc(d: []byte, pos: int, last, e: ^Entry, fresh: bool, width: Width) -> int #no_bounds_check {
+	pos := pos
+	if !fresh && e.key == last.key {
+		step := e.sub - last.sub
 		if step <= SAME_LONG {
 			d[pos] = byte(step - 1)
 			pos += 1
@@ -225,8 +221,8 @@ writer_put :: proc(w: ^Writer, e: Entry) #no_bounds_check {
 		zsp.put_u64(b[8:], e.key.lo)
 		shared := 0
 		if !fresh {
-			zsp.put_u64(was[:], w.last.key.hi)
-			zsp.put_u64(was[8:], w.last.key.lo)
+			zsp.put_u64(was[:], last.key.hi)
+			zsp.put_u64(was[8:], last.key.lo)
 			for shared < 15 && b[shared] == was[shared] {
 				shared += 1
 			}
@@ -239,7 +235,7 @@ writer_put :: proc(w: ^Writer, e: Entry) #no_bounds_check {
 		copy(d[pos + 2:], b[shared:end])
 		pos = write_varint(d, pos + 2 + end - shared, u64(e.sub))
 	}
-	switch w.t.width {
+	switch width {
 	case .None:
 	case .Byte:
 		d[pos] = byte(e.val)
@@ -247,6 +243,30 @@ writer_put :: proc(w: ^Writer, e: Entry) #no_bounds_check {
 	case .Varint:
 		pos = write_varint(d, pos, e.val)
 	}
+	return pos
+}
+
+@(private)
+writer_put :: proc(w: ^Writer, e: Entry) {
+	e := e
+	if w.pg != nil && int(w.pg.used) + ENTRY_MAX + 2 * (int(w.pg.count) + 1) > LEAF_ROOM {
+		writer_end(w)
+	}
+	if w.pg == nil {
+		w.no, w.pg = page_new(w.p)
+		append(w.out, Child{key = e.key, sub = e.sub, child = w.no})
+		w.next_restart = 0
+		w.total = {}
+	}
+	pg := w.pg
+	pos := int(pg.used)
+	fresh := pos >= w.next_restart
+	if fresh {
+		(^u16)(&pg.data[LEAF_ROOM - 2 * (int(pg.count) + 1)])^ = u16(pos)
+		pg.count += 1
+		w.next_restart = pos + RESTART
+	}
+	pos = entry_write(pg.data[:], pos, &w.last, &e, fresh, w.t.width)
 	pg.used = u16(pos)
 	w.last = e
 	w.total.count += 1
@@ -272,6 +292,148 @@ tree_apply :: proc(p: ^Pager, t: ^Tree, edits: []Edit) {
 	if len(edits) == 0 {
 		return
 	}
+	if len(edits) <= FEW {
+		for &e, i in edits {
+			if !edit_place(p, t, &e) {
+				edits_place(p, t, edits[i:i + 1])
+			}
+		}
+		return
+	}
+	edits_place(p, t, edits)
+}
+
+@(private)
+FEW :: 64
+
+// A page that may be written to, perhaps under another number.
+@(private)
+page_own :: proc(p: ^Pager, no: u32) -> (u32, ^Page) {
+	if f, ok := p.dirty[no]; ok {
+		return no, &f.page
+	}
+	copied := page_get(p, no)^
+	page_drop(p, no)
+	fresh, pg := page_new(p)
+	pg^ = copied
+	return fresh, pg
+}
+
+// Makes one edit where it belongs, rewriting no more than the few hundred bytes around it. False, and nothing
+// done, when there is no room, or a leaf would be left with nothing.
+@(private)
+edit_place :: proc(p: ^Pager, t: ^Tree, e: ^Edit) -> bool {
+	if t.root == 0 {
+		return false
+	}
+	path: [8]struct {
+		no: u32,
+		at: int,
+	}
+	depth := 0
+	no := t.root
+	pg := page_get(p, no)
+	for pg.level > 0 {
+		cs := children(pg)
+		at := child_find(cs, e.key, e.sub)
+		path[depth] = {no, at}
+		depth += 1
+		no = cs[at].child
+		pg = page_get(p, no)
+	}
+	if pg.count == 0 {
+		return false
+	}
+
+	// The block it belongs in, written again with it.
+	lo, hi := 1, int(pg.count)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		r := reader(pg, t.width, mid)
+		reader_next(&r)
+		if entry_less(e.key, e.sub, r.key, r.sub) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	block := lo - 1
+	r := reader(pg, t.width, block)
+	if block + 1 < int(pg.count) {
+		r.stop = restart_at(pg, block + 1)
+	}
+	from, stop := r.pos, r.stop
+	out: [3 * RESTART]byte = ---
+	pos, n := 0, 0
+	last: Entry
+	delta := 0
+	done := false
+	put :: #force_inline proc(out: []byte, pos, n: ^int, last, e: ^Entry, width: Width) {
+		pos^ = entry_write(out, pos^, last, e, n^ == 0, width)
+		last^ = e^
+		n^ += 1
+	}
+	for reader_next(&r) {
+		if pos > 2 * RESTART {
+			return false
+		}
+		if !done && !entry_less(r.key, r.sub, e.key, e.sub) {
+			done = true
+			same := r.key == e.key && r.sub == e.sub
+			if !e.gone {
+				put(out[:], &pos, &n, &last, &e.entry, t.width)
+				delta += 1
+			}
+			if same {
+				delta -= 1
+				continue
+			}
+		}
+		put(out[:], &pos, &n, &last, &r.at, t.width)
+	}
+	if !done && !e.gone {
+		put(out[:], &pos, &n, &last, &e.entry, t.width)
+		delta += 1
+	}
+	grown := pos - (stop - from)
+	if n == 0 || pos > 2 * RESTART || int(pg.used) + grown + 2 * int(pg.count) > LEAF_ROOM {
+		return false
+	}
+
+	no, pg = page_own(p, no)
+	copy(pg.data[stop + grown:], pg.data[stop:pg.used])
+	copy(pg.data[from:], out[:pos])
+	for i in block + 1 ..< int(pg.count) {
+		at := (^u16)(&pg.data[LEAF_ROOM - 2 * (i + 1)])
+		at^ = u16(int(at^) + grown)
+	}
+	pg.used = u16(int(pg.used) + grown)
+	sum: f64
+	if t.sums {
+		all := reader(pg, t.width)
+		for reader_next(&all) {
+			sum += key_number(all.key)
+		}
+	}
+	#reverse for step in path[:depth] {
+		up, over := page_own(p, step.no)
+		c := &children(over)[step.at]
+		c.child, c.count = no, u32(int(c.count) + delta)
+		if t.sums {
+			c.sum = sum
+			sum = 0
+			for x in children(over) {
+				sum += x.sum
+			}
+		}
+		no = up
+	}
+	t.root = no
+	return true
+}
+
+@(private)
+edits_place :: proc(p: ^Pager, t: ^Tree, edits: []Edit) {
 	top := make([dynamic]Child, context.temp_allocator)
 	if t.root == 0 {
 		w := Writer{p = p, t = t, out = &top}
@@ -292,11 +454,11 @@ tree_apply :: proc(p: ^Pager, t: ^Tree, edits: []Edit) {
 // Puts branches over nodes until there is one.
 @(private)
 tree_grow :: proc(p: ^Pager, t: ^Tree, nodes: ^[dynamic]Child, level: int) {
-	nodes, level := nodes^, level
+	nodes, level := nodes[:], level
 	for len(nodes) > 1 {
 		up := make([dynamic]Child, context.temp_allocator)
-		branch_write(p, nodes[:], level, &up)
-		nodes = up
+		branch_write(p, nodes, level, &up)
+		nodes = up[:]
 		level += 1
 	}
 	t.root = 0
@@ -765,4 +927,314 @@ tree_each :: proc(p: ^Pager, t: Tree, lo, hi: Key, data: rawptr, each: proc(data
 	if t.root != 0 {
 		walk(p, &t, t.root, lo, hi, data, each)
 	}
+}
+
+// The subs of every entry of keys from `lo` up to, and not including, `hi`.
+tree_subs :: proc(p: ^Pager, t: Tree, lo, hi: Key, out: ^Set) {
+	// `within`: all of this node lies between them, and its keys need not be made out.
+	walk :: proc(p: ^Pager, t: ^Tree, no: u32, lo, hi: Key, within: bool, out: ^Set) {
+		pg := page_get(p, no)
+		if pg.level > 0 {
+			cs := make([]Child, int(pg.count), context.temp_allocator)
+			copy(cs, children(pg))
+			for c, i in cs {
+				if within {
+					walk(p, t, c.child, lo, hi, true, out)
+					continue
+				}
+				if !key_less(c.key, hi) && hi != KEY_MAX {
+					return
+				}
+				last := i + 1 == len(cs)
+				if !last && key_less(cs[i + 1].key, lo) {
+					continue
+				}
+				inner := i > 0 && !key_less(c.key, lo) && !last && (hi == KEY_MAX || key_less(cs[i + 1].key, hi))
+				walk(p, t, c.child, lo, hi, inner || (lo == KEY_MIN && hi == KEY_MAX), out)
+			}
+			return
+		}
+		if within || (lo == KEY_MIN && hi == KEY_MAX) {
+			leaf_subs(pg, t.width, out)
+			return
+		}
+		r := leaf_seek(pg, t.width, lo, 0)
+		key: Key
+		inside, begun := false, false
+		for reader_next(&r) {
+			if !begun || r.key != key {
+				key, begun = r.key, true
+				if !key_less(key, hi) && hi != KEY_MAX {
+					return
+				}
+				inside = !key_less(key, lo)
+			}
+			if inside {
+				set_put(out, r.sub)
+			}
+		}
+	}
+	t := t
+	if t.root != 0 {
+		walk(p, &t, t.root, lo, hi, false, out)
+		set_settle(out)
+	}
+}
+
+// Every sub in a leaf, and nothing else of it.
+@(private)
+leaf_subs :: proc(pg: ^Page, width: Width, out: ^Set) #no_bounds_check {
+	d := pg.data[:]
+	pos, stop := 0, int(pg.used)
+	sub: u32
+	for pos < stop {
+		h := d[pos]
+		pos += 1
+		switch {
+		case h < SAME_LONG:
+			sub += u32(h) + 1
+		case h == SAME_LONG:
+			sub += u32(read_varint(d, &pos))
+		case:
+			pos += 1 + int(d[pos])
+			sub = u32(read_varint(d, &pos))
+		}
+		switch width {
+		case .None:
+		case .Byte:
+			pos += 1
+		case .Varint:
+			_ = read_varint(d, &pos)
+		}
+		set_put(out, sub)
+	}
+}
+
+// ---------------------------------------------------------------- making a tree of much at once
+
+// Entries are gathered, put in order, and laid down as trees of their own, which are then read side by side into
+// one. Nothing is written over and over, however many there are.
+Bulk :: struct {
+	p:     ^Pager,
+	t:     ^Tree,
+	edits: [dynamic]Edit,
+	runs:  [dynamic]Tree,
+	arena: virtual.Arena,
+}
+
+@(private)
+RUN :: 1 << 17
+@(private)
+RUNS :: 48 // read side by side
+
+bulk_begin :: proc(b: ^Bulk, p: ^Pager, t: ^Tree) {
+	b.p, b.t = p, t
+	if virtual.arena_init_static(&b.arena, (RUN + 64) * size_of(Edit), 1 << 16) == nil {
+		b.edits = make([dynamic]Edit, 0, RUN, virtual.arena_allocator(&b.arena))
+	}
+}
+
+bulk_add :: #force_inline proc(b: ^Bulk, e: Entry) {
+	if len(b.edits) == RUN {
+		bulk_run(b)
+	}
+	append(&b.edits, Edit{entry = e})
+}
+
+@(private)
+bulk_run :: proc(b: ^Bulk) {
+	if len(b.edits) == 0 {
+		return
+	}
+	run := Tree{width = b.t.width, sums = b.t.sums}
+	l: Laying
+	laying_begin(&l, b.p, &run)
+	for e in edits_settle(b.edits[:]) {
+		laying_put(&l, e.entry)
+	}
+	laying_end(&l)
+	append(&b.runs, run)
+	clear(&b.edits)
+}
+
+// The tree must be empty.
+bulk_end :: proc(b: ^Bulk) {
+	bulk_run(b)
+	b.edits = {}
+	if b.arena.curr_block != nil {
+		virtual.arena_destroy(&b.arena)
+	}
+	for len(b.runs) > 1 {
+		merged: [dynamic]Tree
+		for at := 0; at < len(b.runs); at += RUNS {
+			append(&merged, runs_merge(b.p, b.runs[at:min(at + RUNS, len(b.runs))]))
+		}
+		delete(b.runs)
+		b.runs = merged
+	}
+	if len(b.runs) == 1 {
+		b.t.root = b.runs[0].root
+	}
+	delete(b.runs)
+	b^ = {}
+}
+
+@(private)
+runs_merge :: proc(p: ^Pager, runs: []Tree) -> Tree {
+	if len(runs) == 1 {
+		return runs[0]
+	}
+	out := Tree{width = runs[0].width, sums = runs[0].sums}
+	l: Laying
+	laying_begin(&l, p, &out)
+	from := make([]Run_Reader, len(runs))
+	defer delete(from)
+	heap := make([dynamic]int, 0, len(runs))
+	defer delete(heap)
+	less :: #force_inline proc(a, b: ^Run_Reader) -> bool {
+		return entry_less(a.at.key, a.at.sub, b.at.key, b.at.sub)
+	}
+	sift :: proc(heap: []int, from: []Run_Reader, at: int) {
+		at := at
+		for {
+			kid := 2 * at + 1
+			if kid >= len(heap) {
+				return
+			}
+			if kid + 1 < len(heap) && less(&from[heap[kid + 1]], &from[heap[kid]]) {
+				kid += 1
+			}
+			if !less(&from[heap[kid]], &from[heap[at]]) {
+				return
+			}
+			heap[at], heap[kid] = heap[kid], heap[at]
+			at = kid
+		}
+	}
+	for &r, i in from {
+		run_begin(&r, p, runs[i])
+		if run_next(&r) {
+			append(&heap, i)
+		}
+	}
+	for i := len(heap) / 2 - 1; i >= 0; i -= 1 {
+		sift(heap[:], from, i)
+	}
+	last: Entry
+	begun := false
+	for len(heap) > 0 {
+		r := &from[heap[0]]
+		// One that is in several is the same in all.
+		if !begun || r.at.key != last.key || r.at.sub != last.sub {
+			laying_put(&l, r.at)
+			last, begun = r.at, true
+		}
+		if !run_next(r) {
+			heap[0] = heap[len(heap) - 1]
+			pop(&heap)
+		}
+		sift(heap[:], from, 0)
+	}
+	laying_end(&l)
+	for &r, i in from {
+		run_end(&r)
+		_ = i
+	}
+	return out
+}
+
+// Reads a tree from end to end, giving up its pages behind it.
+@(private)
+Run_Reader :: struct {
+	p:      ^Pager,
+	width:  Width,
+	leaves: [dynamic]u32, // yet to be read, last first
+	page:   ^Page,
+	no:     u32,
+	r:      Reader,
+	at:     Entry,
+}
+
+@(private)
+run_begin :: proc(r: ^Run_Reader, p: ^Pager, t: Tree) {
+	r.p, r.width = p, t.width
+	gather :: proc(r: ^Run_Reader, no: u32) {
+		pg := page_get(r.p, no)
+		if pg.level == 0 {
+			append(&r.leaves, no)
+			return
+		}
+		below := make([]u32, int(pg.count))
+		defer delete(below)
+		for c, i in children(pg) {
+			below[i] = c.child
+		}
+		for c in below {
+			gather(r, c)
+		}
+		page_drop(r.p, no)
+	}
+	if t.root != 0 {
+		gather(r, t.root)
+	}
+	slice.reverse(r.leaves[:])
+	r.page = new(Page)
+}
+
+@(private)
+run_next :: proc(r: ^Run_Reader) -> bool {
+	for !reader_next(&r.r) {
+		if r.no != 0 {
+			page_drop(r.p, r.no)
+			r.no = 0
+		}
+		if len(r.leaves) == 0 {
+			return false
+		}
+		r.no = pop(&r.leaves)
+		r.page^ = page_get(r.p, r.no)^
+		r.r = reader(r.page, r.width)
+	}
+	r.at = r.r.at
+	return true
+}
+
+@(private)
+run_end :: proc(r: ^Run_Reader) {
+	delete(r.leaves)
+	free(r.page)
+}
+
+// Lays a tree down from entries in order.
+@(private)
+Laying :: struct {
+	w:     Writer,
+	leaves: [dynamic]Child,
+}
+
+@(private)
+laying_begin :: proc(l: ^Laying, p: ^Pager, t: ^Tree) {
+	l.w = Writer{p = p, t = t}
+}
+
+@(private)
+laying_put :: #force_inline proc(l: ^Laying, e: Entry) {
+	l.w.out = &l.leaves
+	writer_put(&l.w, e)
+	if l.w.pg != nil && int(l.w.pg.used) < ENTRY_MAX + 8 && len(l.w.p.dirty) > 2 * CACHE {
+		// Just begun: all the others may go.
+		kept := l.w.p.dirty[l.w.no]
+		delete_key(&l.w.p.dirty, l.w.no)
+		pager_write(l.w.p)
+		l.w.p.dirty[l.w.no] = kept
+	}
+}
+
+@(private)
+laying_end :: proc(l: ^Laying) {
+	writer_end(&l.w)
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	tree_grow(l.w.p, l.w.t, &l.leaves, 1)
+	delete(l.leaves)
+	l^ = {}
 }
