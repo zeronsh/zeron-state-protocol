@@ -88,6 +88,8 @@ Post :: enum u8 {
 	Second = 2,
 	Out    = 3, // tunnel data from whoever dialled it
 	Back   = 4, // and to them
+	No_Out = 5, // data came in a tunnel unknown here, dialled by whoever this is for,
+	No_Back = 6, // or by whoever says so
 }
 
 rpc_destroy :: proc(n: ^Node) {
@@ -603,8 +605,21 @@ tunnel_input :: proc(s: ^Session, from: Key32, kind: Post, blob: []byte) {
 			tunnel_send(n, t, p)
 		}
 		delete(pending)
+	case .No_Out, .No_Back:
+		// Whoever it was begun with has begun again. Nothing of it is lost but what was already.
+		#reverse for &x, i in n.tunnels {
+			if x.relay == s.id && x.peer == from && x.mine == (kind == .No_Out) && x.open {
+				calls_lost(n, s.id, x.id)
+				tunnel_free(&x)
+				unordered_remove(&n.tunnels, i)
+			}
+		}
 	case .Out, .Back:
-		if t == nil || len(blob) < 8 {
+		if t == nil {
+			post(s, from, .No_Out if kind == .Out else .No_Back, nil)
+			return
+		}
+		if len(blob) < 8 {
 			return
 		}
 		number := get_u64(blob)

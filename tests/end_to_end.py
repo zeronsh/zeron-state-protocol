@@ -183,38 +183,8 @@ def test_direct_links():
     cb.until(lambda: cb.lives and cb.lives[0][4] == b"direct")
 
 
-def probe_broadcast():
-    import select
-
-    listeners = []
-    for _ in range(2):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        s.bind(("", 9084))
-        listeners.append(s)
-    t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    t.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    u.connect(("8.8.8.8", 53))
-    mine = u.getsockname()[0]
-    for to in (mine.rsplit(".", 1)[0] + ".255", "127.255.255.255", "255.255.255.255", mine, "127.0.0.1"):
-        try:
-            t.sendto(to.encode(), (to, 9084))
-        except OSError as e:
-            print("probe", to, e)
-    time.sleep(0.5)
-    for i, s in enumerate(listeners):
-        while select.select([s], [], [], 0)[0]:
-            print("probe listener", i, s.recvfrom(100))
-    print(subprocess.run("ps ax | grep -c zspd; lsof -nP -iUDP:9083; sudo lsof -nP -iUDP:9083; netstat -an -p udp | grep 908", shell=True, capture_output=True, text=True).stdout)
-
-
 def test_lan_without_relay():
     import threading
-
-    if sys.platform == "darwin":
-        probe_broadcast()
 
     a, b = Node("g"), Node("h")
     sid = zspd("create", a.dir)
@@ -222,7 +192,6 @@ def test_lan_without_relay():
     zspd("peer", b.dir, os.path.join(a.dir, sid, "roster"))
     a.start(), b.start()
     eventually("beacons meet", lambda: "linked directly" in a.log() and "linked directly" in b.log())
-    print(a.log(), end="")
     ca, cb = a.client(), b.client()
     cb.watch(1, 1, "x")
     cb.until(lambda: 1 in cb.windows)

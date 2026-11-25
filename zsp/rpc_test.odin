@@ -121,14 +121,6 @@ calls_between_devices :: proc(t: ^testing.T) {
 		ca, cb := Caller{s = sim_client(&s, a)}, Caller{s = sim_client(&s, b)}
 		defer caller_destroy(&ca)
 		defer caller_destroy(&cb)
-		settle :: proc(s: ^Sim, cs: ..^Caller) {
-			for _ in 0 ..< 3 {
-				sim_settle(s)
-				for c in cs {
-					caller_read(c)
-				}
-			}
-		}
 		testing.expect(t, caller_serve(&cb, 1, "echo"))
 		settle(&s, &ca, &cb)
 		testing.expect_value(t, ca.reach, 2)
@@ -219,6 +211,16 @@ calls_between_devices :: proc(t: ^testing.T) {
 	}
 }
 
+@(private)
+settle :: proc(s: ^Sim, cs: ..^Caller) {
+	for _ in 0 ..< 3 {
+		sim_settle(s)
+		for c in cs {
+			caller_read(c)
+		}
+	}
+}
+
 // What a relay saw, it cannot say again.
 @(test)
 tunnels_refuse_replay :: proc(t: ^testing.T) {
@@ -272,6 +274,50 @@ tunnels_refuse_replay :: proc(t: ^testing.T) {
 	round(&s, &heard)
 	caller_read(&cb)
 	testing.expect_value(t, len(cb.calls), 2)
+	session_close(ca.s)
+	session_close(cb.s)
+}
+
+// Whoever is called begins again, and the relay between never notices.
+@(test)
+tunnels_are_begun_again :: proc(t: ^testing.T) {
+	state := seeded(23)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
+	defer sim_destroy(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	ca, cb := Caller{s = sim_client(&s, a)}, Caller{s = sim_client(&s, b)}
+	defer caller_destroy(&ca)
+	defer caller_destroy(&cb)
+	caller_serve(&cb, 1, "echo")
+	forget :: proc(x: ^Sim_Node) {
+		for &u in x.node.tunnels {
+			tunnel_free(&u)
+		}
+		clear(&x.node.tunnels)
+		clear(&x.node.calls)
+	}
+	caller_call(&ca, 1, b.keys.device, 1, "echo", "once")
+	settle(&s, &ca, &cb)
+	testing.expect_value(t, len(cb.calls), 1)
+	forget(b)
+	// What is said in it now tells this end that it is no more, and the next call goes through.
+	caller_flow(&ca, 1, CALLER, .Data, "more")
+	settle(&s, &ca, &cb)
+	testing.expect(t, len(ca.faults) == 1 && ca.faults[0] == .Lost && len(a.node.calls) == 0)
+	caller_call(&ca, 2, b.keys.device, 1, "echo", "twice")
+	settle(&s, &ca, &cb)
+	testing.expect_value(t, len(cb.calls), 2)
+	testing.expect_value(t, string(cb.first[:]), "twice")
+	// And the other way about: what is served to one who has forgotten asking comes to an end.
+	forget(a)
+	caller_flow(&cb, cb.calls[1], CALLEE, .Data, "answer")
+	settle(&s, &ca, &cb)
+	testing.expect(t, cb.faults[len(cb.faults) - 1] == .Lost && len(b.node.calls) == 0 && len(b.node.tunnels) == 0)
 	session_close(ca.s)
 	session_close(cb.s)
 }

@@ -3,6 +3,7 @@ package find
 import "base:runtime"
 import "core:mem/virtual"
 import "core:slice"
+import "core:time"
 import "../zsp"
 
 // Questions that stay asked. Each remembers which rows it holds for, so that a change costs no more than asking
@@ -35,6 +36,8 @@ Finder :: struct {
 	settled: bool, // this node is a full replica
 	again:   [dynamic]^zsp.Session, // to be told everything afresh
 	calls:   [dynamic]Called, // questions from partial replicas, not yet looked at
+	pace:    bool, // an answer dear to find is not found again at once
+	wake:    Maybe(time.Tick), // when one held back will be
 }
 
 @(private)
@@ -48,6 +51,7 @@ Called :: struct {
 @(private)
 Far :: struct {
 	call:   u64, // under way, if not 0
+	before: u64, // by which what this replaces was asked, until this is
 	device: zsp.Key32,
 	source: []byte, // the question
 	tried:  [dynamic]zsp.Key32, // and would not
@@ -91,6 +95,7 @@ Live :: struct {
 	shown:   [dynamic]zsp.Id, // in order
 	lives:   [dynamic][2]zsp.Key, // where those are, so that what is typed there comes here
 	moved:   bool, // one of those may be elsewhere
+	due:     time.Tick, // it may be found again
 	first:   int,
 	said:    []byte, // the last answer
 	stale:   bool, // the page may have changed
@@ -148,15 +153,23 @@ finder_asked :: proc(f: ^Finder, s: ^zsp.Session, type: u8, payload: []byte) -> 
 	}
 	switch type {
 	case ASK:
-		if l := live_find(f, s, id); l != nil {
-			live_free(l)
-		}
-		if finder_many(f, s, {}) >= 1024 {
+		old := live_find(f, s, id)
+		if finder_many(f, s, {}) >= 1024 && old == nil {
 			return false
 		}
 		l := new(Live)
 		l.f, l.id, l.session = f, id, s
-		live_start(l, r.buf[r.pos:])
+		if live_start(l, r.buf[r.pos:]) && old != nil {
+			// The client holds what was shown until it is answered anew.
+			l.shown, old.shown = old.shown, nil
+			l.lives, old.lives = old.lives, nil
+			l.far.keys, old.far.keys = old.far.keys, nil
+			l.far.before, old.far.call = old.far.call, 0
+			l.moved = true
+		}
+		if old != nil {
+			live_free(old)
+		}
 	case UNASK:
 		// Said back, since until then its rows are held, and an answer may count on that.
 		if l := live_find(f, s, id); l != nil {
@@ -171,7 +184,7 @@ finder_asked :: proc(f: ^Finder, s: ^zsp.Session, type: u8, payload: []byte) -> 
 }
 
 @(private)
-live_start :: proc(l: ^Live, source: []byte) {
+live_start :: proc(l: ^Live, source: []byte) -> bool {
 	f := l.f
 	append(&f.live, l)
 	ok: bool
@@ -179,12 +192,12 @@ live_start :: proc(l: ^Live, source: []byte) {
 	if !ok {
 		answer_flag(l, {faulty = true})
 		live_free(l)
-		return
+		return false
 	}
 	if !live_allowed(l) {
 		answer_flag(l, {denied = true})
 		live_free(l)
-		return
+		return false
 	}
 	if l.session != nil && !f.settled {
 		l.far.source = slice.clone(source)
@@ -194,6 +207,17 @@ live_start :: proc(l: ^Live, source: []byte) {
 	query_uses(&l.q, 1)
 	live_place(l)
 	l.renew = true
+	if query_ready(&f.x, &l.q) {
+		// Where another asks the same, in whatever order and whatever part of it, it is known already which.
+		for other in f.live {
+			if other != l && other.ready && !other.renew && !other.far.have && string(other.q.which) == string(l.q.which) {
+				l.rows = set_clone(&other.rows)
+				l.ready, l.renew, l.stale, l.moved = true, false, true, true
+				break
+			}
+		}
+	}
+	return true
 }
 
 // A partial replica asks. It is answered, later, by a full one.
@@ -626,6 +650,10 @@ finder_backs :: proc(f: ^Finder) {
 	}
 }
 
+PACE :: 9 // an answer that took so long is let be for so many times as long,
+PACE_OVER :: time.Millisecond // if it took that,
+PACE_MOST :: 2 * time.Second // and for no longer
+
 // Does some of what there is to do, and says whatever follows from it. True when there is nothing left.
 finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 	for c in f.calls {
@@ -654,6 +682,7 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 			clear(&l.shown)
 			delete(l.said)
 			l.said, l.stale, l.far.due = nil, true, l.far.due || l.far.have
+			l.due = {}
 		}
 	}
 	clear(&f.again)
@@ -676,8 +705,16 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 		// A column may be being made again, and what was asked of it meanwhile means nothing.
 		l.renew ||= l.ready && !query_ready(&f.x, &l.q)
 	}
+	f.wake = nil
+	now := time.tick_now()
 	for l in f.live {
 		if l.far.have {
+			continue
+		}
+		if f.pace && (l.stale || l.renew) && time.tick_diff(now, l.due) > 0 {
+			if w, some := f.wake.?; !some || time.tick_diff(l.due, w) > 0 {
+				f.wake = l.due
+			}
 			continue
 		}
 		if !l.ready || l.renew {
@@ -694,6 +731,11 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 		if l.stale {
 			l.stale = false
 			answer_send(l)
+			then := time.tick_now()
+			if took := time.tick_diff(now, then); took > PACE_OVER {
+				l.due = time.tick_add(then, min(PACE * took, PACE_MOST))
+			}
+			now = then
 		}
 	}
 	return level
@@ -870,6 +912,7 @@ far_run :: proc(l: ^Live) {
 			}
 		}
 	}
+	far_past(l)
 	if far.call != 0 && far.spent > zsp.CALL_WINDOW / 2 {
 		w := make([dynamic]byte, context.temp_allocator)
 		zsp.write_varint(&w, u64(far.spent))
@@ -970,10 +1013,20 @@ far_say :: proc(l: ^Live) {
 	answer_say(l, ids, w[:])
 }
 
+// Only now that what replaces it has been asked: it may be answered from what was found for that.
+@(private)
+far_past :: proc(l: ^Live) {
+	if l.far.before != 0 {
+		zsp.node_flow(l.f.n, l.far.before, .Cancel)
+		l.far.before = 0
+	}
+}
+
 // What was answered from afar is no longer known to be so.
 @(private)
 far_drop :: proc(l: ^Live) {
 	far := &l.far
+	far_past(l)
 	if far.call != 0 {
 		zsp.node_flow(l.f.n, far.call, .Cancel)
 		far.call = 0

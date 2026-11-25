@@ -98,6 +98,7 @@ Aggregate :: struct {
 Query :: struct {
 	scope:  zsp.Scope,
 	where_: Pred,
+	which:  []byte, // what says so, and of which scope
 	order:  []Sort,
 	from_end: bool,
 	offset: int,
@@ -119,6 +120,7 @@ query_parse :: proc(source: []byte, allocator := context.temp_allocator) -> (q: 
 	q.scope = zsp.Scope(zsp.read_varint(&r))
 	left := MAX_PREDS
 	q.where_ = pred_parse(&r, 0, &left)
+	q.which = q.source[:r.pos]
 	orders := zsp.read_count(&r)
 	if orders > 8 {
 		return

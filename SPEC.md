@@ -381,6 +381,7 @@ is a relay is never the peer's to say: it is one whose key was dialled as a rela
 | 0 | stamp (16) ‖ XChaCha20-Poly1305 under derive(X25519 of the two devices, "zsp-signal"), nonce stamp ‖ 0 ‖ 0x41 ‖ 0 (6), associated data from ‖ to |
 | 1, 2 | a tunnel's Noise messages, as §7, the caller dialling |
 | 3, 4 | tunnel data, from the caller and to it: counter (8) ‖ Noise ciphertext with that counter. A counter not above the last is dropped |
+| 5, 6 | nothing. Data came, of kind 3 or 4, in a tunnel that is unknown here. An end that has it open drops it, and its calls are *lost* |
 
 Tunnel plaintexts are single Call and Flow frames. A relay keeps nothing for a tunnel. A new first message does not replace a live tunnel until data
 arrives under it.

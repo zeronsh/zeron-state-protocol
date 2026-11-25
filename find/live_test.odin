@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:math/rand"
 import "core:slice"
 import "core:testing"
+import "core:time"
 import "../zsp"
 
 // A client that asks, believes what it is told, and is held against the cells.
@@ -819,4 +820,106 @@ words_renewed_beneath_a_question :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, renewed > 5)
+}
+
+// What is dear to answer is answered no more often than it is worth, but is in the end.
+@(test)
+dear_answers_are_paced :: proc(t: ^testing.T) {
+	state := rand.create(95)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	f: Finder
+	pages: Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+	f.settled, f.pace = true, true
+	c := client_open(&w, &f)
+	defer {
+		zsp.session_close(c.session)
+		finder_close(&f)
+		client_free(&c)
+		memory_disk_destroy(&pages)
+	}
+	q := []byte{1, 0, 1, 2, 1, 0, 0, 50, 0}
+	client_ask(t, &c, 1, q)
+	for !finder_run(&f) {
+	}
+	finder_run(&f)
+	client_hear_out(t, &c, &f)
+	testing.expect(t, answer_check(t, &w, &f, &c, 1, q) && f.wake == nil)
+	// As if it had been dear.
+	l := f.live[0]
+	l.due = time.tick_add(time.tick_now(), 60 * time.Millisecond)
+	for _ in 0 ..< 20 {
+		world_write(t, &w)
+	}
+	finder_run(&f)
+	client_hear_out(t, &c, &f)
+	testing.expect(t, c.answers[1].total == 0 && f.wake == l.due)
+	time.accurate_sleep(70 * time.Millisecond)
+	finder_run(&f)
+	client_hear_out(t, &c, &f)
+	testing.expect(t, answer_check(t, &w, &f, &c, 1, q) && f.wake == nil)
+}
+
+// A question asked again for another part of the same, or by another, is not gone over again, nor are its rows
+// said again.
+@(test)
+what_is_known_is_not_found_again :: proc(t: ^testing.T) {
+	state := rand.create(97)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	f: Finder
+	pages: Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+	f.settled = true
+	c := client_open(&w, &f)
+	defer {
+		zsp.session_close(c.session)
+		finder_close(&f)
+		client_free(&c)
+		memory_disk_destroy(&pages)
+	}
+	for _ in 0 ..< 100 {
+		world_write(t, &w)
+	}
+	q := []byte{1, 0, 1, 2, 1, 0, 0, 5, 0}
+	moved := []byte{1, 0, 1, 2, 1, 0, 3, 5, 0}
+	other := []byte{1, 3, 0, 1, 2, 1, 0, 0, 5, 0}
+	client_ask(t, &c, 1, q)
+	testing.expect(t, !f.live[0].ready)
+	for !finder_run(&f) {
+	}
+	finder_run(&f)
+	client_hear_out(t, &c, &f)
+	client_ask(t, &c, 2, other)
+	testing.expect(t, !f.live[1].ready)
+	client_ask(t, &c, 1, moved)
+	testing.expect(t, len(f.live) == 2 && live_find(&f, c.session, 1).ready)
+	finder_run(&f)
+	before := len(c.cells)
+	for _, m in c.cells {
+		for _, b in m {
+			delete(b)
+		}
+		delete(m)
+	}
+	clear(&c.cells)
+	shown := slice.clone(c.answers[1].ids[:], context.temp_allocator)
+	for id in shown {
+		c.cells[id] = {} // as good as held
+	}
+	testing.expect(t, before == 5)
+	client_hear_out(t, &c, &f)
+	testing.expect(t, len(c.answers[1].ids) == 5 && c.answers[1].ids[0] == shown[3])
+	for id, i in shown {
+		testing.expect_value(t, len(c.cells[id]) == 0, true)
+		_ = i
+	}
+	for id in c.answers[1].ids[2:] {
+		testing.expect(t, len(c.cells[id]) > 0)
+	}
 }

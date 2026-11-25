@@ -98,9 +98,7 @@ udp_open :: proc(h: ^Host, port: int) -> bool {
 	if !h.relay {
 		if u.beacon, err = nbio.create_udp_socket(.IP4); err == nil {
 			net.set_option(u.beacon, .Reuse_Address, true)
-			when ODIN_OS != .Windows {
-				net.set_option(u.beacon, .Reuse_Port, true)
-			}
+			port_share(u.beacon)
 			if berr := net.bind(u.beacon, {net.IP4_Any, BEACON_PORT}); berr == nil {
 				net.set_blocking(u.beacon, false)
 				u.have_beacon = true
@@ -511,7 +509,9 @@ beacon_send :: proc(s: ^Space, to: Maybe(pipe.Address) = nil) {
 	}
 	say :: proc(u: ^Udp, packet: []byte, at: net.IP4_Address) {
 		_, err := net.send_udp(u.socket, packet, {at, BEACON_PORT})
-		report(.Debug, "announcing to ", net.address_to_string(at, context.temp_allocator), ": ", fmt.tprint(err))
+		if err != nil {
+			report(.Debug, "cannot announce to ", net.address_to_string(at, context.temp_allocator), ": ", fmt.tprint(err))
+		}
 	}
 	say(u, packet, {255, 255, 255, 255})
 	// And on interfaces that are not the default one.

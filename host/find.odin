@@ -58,6 +58,7 @@ space_finder :: proc(s: ^Space) -> ^find.Finder {
 		key := zsp.hkdf256(s.node.space[:], s.keys.secret[:], transmute([]byte)string("zsp-find"))
 		find.finder_open(&s.found.finder, &s.node, pages_file(&s.found.file, s.dir), key)
 		s.found.finder.settled = s.node.full
+		s.found.finder.pace = true
 	}
 	s.found.more = true
 	return &s.found.finder
@@ -109,6 +110,8 @@ found_deadline :: proc(s: ^Space, now: time.Tick) -> (due: time.Tick, ok: bool) 
 		return
 	case f.more:
 		return now, true
+	case f.finder.wake != nil:
+		return f.finder.wake.?, true
 	case f.resting:
 		return time.tick_add(f.idle, FIND_LINGER + time.Millisecond), true
 	}
