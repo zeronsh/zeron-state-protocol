@@ -431,6 +431,28 @@ def test_questions_passed_on():
         cb.unask(1), cb.unask(2)
 
 
+def test_questions_fallen_behind():
+    """A client that does not listen while much changes is told, once it does, how things have come to be."""
+    relay, (a, b) = space("bg", "bh")
+    ca, cb = a.client(), b.client()
+    rows = [ca.put(1, "people", i, [b"person %d" % i]) for i in range(20)]
+    name = zsp.column(zsp.FOLD, 16)
+    cb.ask(1, 1, zsp.begins(name, "p"), [zsp.by(name)], limit=50)
+    cb.until(lambda: cb.answers.get(1, {}).get("total") == 20)
+    for i in range(1500):
+        ca.write(*((r, 17, zsp.VALUE, b"%d" % i + b"x" * 1000) for r in rows))
+    ca.write((rows[0], 16, zsp.VALUE, b"person last"))
+    ca.until(lambda: ca.acked == ca.seq, 60)
+    time.sleep(1.5)
+    cb.until(lambda: len(cb.rows) == 20 and all(b"1499" + b"x" * 1000 in r.values() for r in cb.rows.values()), 20)
+    cb.until(lambda: cb.answers[1]["rows"][-1] == rows[0])
+    # All at once, so that nothing else happens there afterwards; and none of it changes the answer.
+    for n in range(5):
+        ca.write(*((r, 17 + i, zsp.VALUE, b"at once %d" % n) for r in rows for i in range(1, 30)))
+        cb.until(lambda: all(list(r.values()).count(b"at once %d" % n) == 29 for r in cb.rows.values()), 5)
+        time.sleep(0.2)
+
+
 def test_knocking_leaves_no_trace():
     relay = Node("y-relay", "serve", "--no-udp").start()
     ks = [knock(relay.address, "/" + os.urandom(32).hex()) for _ in range(5)]
