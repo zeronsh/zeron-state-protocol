@@ -188,6 +188,7 @@ Writer :: struct {
 	next_restart: int,
 	last:  Entry,
 	total: Total,
+	laying: bool, // and so nothing else is being written
 }
 
 @(private)
@@ -251,6 +252,9 @@ writer_put :: proc(w: ^Writer, e: Entry) {
 	e := e
 	if w.pg != nil && int(w.pg.used) + ENTRY_MAX + 2 * (int(w.pg.count) + 1) > LEAF_ROOM {
 		writer_end(w)
+		if w.laying && len(w.p.dirty) > 2 * CACHE {
+			pager_write(w.p)
+		}
 	}
 	if w.pg == nil {
 		w.no, w.pg = page_new(w.p)
@@ -1020,10 +1024,11 @@ Bulk :: struct {
 	edits: [dynamic]Edit,
 	runs:  [dynamic]Tree,
 	arena: virtual.Arena,
+	merging: Merging,
 }
 
 @(private)
-RUN :: 1 << 17
+RUN :: 1 << 15
 @(private)
 RUNS :: 48 // read side by side
 
@@ -1048,99 +1053,147 @@ bulk_run :: proc(b: ^Bulk) {
 	}
 	run := Tree{width = b.t.width, sums = b.t.sums}
 	l: Laying
-	laying_begin(&l, b.p, &run)
+	laying_begin(&l, b.p)
 	for e in edits_settle(b.edits[:]) {
-		laying_put(&l, e.entry)
+		laying_put(&l, &run, e.entry)
 	}
-	laying_end(&l)
+	laying_end(&l, &run)
 	append(&b.runs, run)
 	clear(&b.edits)
 }
 
-// The tree must be empty.
-bulk_end :: proc(b: ^Bulk) {
-	bulk_run(b)
-	b.edits = {}
-	if b.arena.curr_block != nil {
-		virtual.arena_destroy(&b.arena)
-	}
-	for len(b.runs) > 1 {
-		merged: [dynamic]Tree
-		for at := 0; at < len(b.runs); at += RUNS {
-			append(&merged, runs_merge(b.p, b.runs[at:min(at + RUNS, len(b.runs))]))
+// Goes on putting it all together, for about so many entries. True once it is done, and the tree, which must have
+// been empty, is whole.
+bulk_end :: proc(b: ^Bulk, budget := max(int)) -> bool {
+	if b.merging.p == nil {
+		bulk_run(b)
+		b.edits = {}
+		if b.arena.curr_block != nil {
+			virtual.arena_destroy(&b.arena)
 		}
-		delete(b.runs)
-		b.runs = merged
+	}
+	left := budget
+	for {
+		if b.merging.p != nil {
+			if !merging_step(&b.merging, &left) {
+				return false
+			}
+			append(&b.runs, b.merging.out)
+			b.merging = {}
+		}
+		if len(b.runs) <= 1 {
+			break
+		}
+		// The first so many, which are the smallest, for what they come to goes to the end.
+		n := min(RUNS, len(b.runs))
+		merging_begin(&b.merging, b.p, b.runs[:n])
+		remove_range(&b.runs, 0, n)
 	}
 	if len(b.runs) == 1 {
 		b.t.root = b.runs[0].root
 	}
 	delete(b.runs)
 	b^ = {}
+	return true
+}
+
+// Gives it up.
+bulk_abandon :: proc(b: ^Bulk) {
+	if b.arena.curr_block != nil {
+		virtual.arena_destroy(&b.arena)
+	}
+	if b.merging.p != nil {
+		for &r in b.merging.from {
+			run_end(&r)
+		}
+		delete(b.merging.from)
+		delete(b.merging.heap)
+		delete(b.merging.l.leaves)
+	}
+	// What was laid down is found to be nobody's when the index is next opened.
+	delete(b.runs)
+	b^ = {}
 }
 
 @(private)
-runs_merge :: proc(p: ^Pager, runs: []Tree) -> Tree {
-	if len(runs) == 1 {
-		return runs[0]
-	}
-	out := Tree{width = runs[0].width, sums = runs[0].sums}
-	l: Laying
-	laying_begin(&l, p, &out)
-	from := make([]Run_Reader, len(runs))
-	defer delete(from)
-	heap := make([dynamic]int, 0, len(runs))
-	defer delete(heap)
-	less :: #force_inline proc(a, b: ^Run_Reader) -> bool {
-		return entry_less(a.at.key, a.at.sub, b.at.key, b.at.sub)
-	}
-	sift :: proc(heap: []int, from: []Run_Reader, at: int) {
-		at := at
-		for {
-			kid := 2 * at + 1
-			if kid >= len(heap) {
-				return
-			}
-			if kid + 1 < len(heap) && less(&from[heap[kid + 1]], &from[heap[kid]]) {
-				kid += 1
-			}
-			if !less(&from[heap[kid]], &from[heap[at]]) {
-				return
-			}
-			heap[at], heap[kid] = heap[kid], heap[at]
-			at = kid
+Merging :: struct {
+	p:    ^Pager,
+	out:  Tree,
+	l:    Laying,
+	from: []Run_Reader,
+	heap: [dynamic]int,
+	last: Entry,
+	begun: bool,
+}
+
+@(private)
+run_less :: #force_inline proc(a, b: ^Run_Reader) -> bool {
+	return entry_less(a.at.key, a.at.sub, b.at.key, b.at.sub)
+}
+
+@(private)
+heap_sift :: proc(heap: []int, from: []Run_Reader, at: int) {
+	at := at
+	for {
+		kid := 2 * at + 1
+		if kid >= len(heap) {
+			return
 		}
+		if kid + 1 < len(heap) && run_less(&from[heap[kid + 1]], &from[heap[kid]]) {
+			kid += 1
+		}
+		if !run_less(&from[heap[kid]], &from[heap[at]]) {
+			return
+		}
+		heap[at], heap[kid] = heap[kid], heap[at]
+		at = kid
 	}
-	for &r, i in from {
+}
+
+@(private)
+merging_begin :: proc(m: ^Merging, p: ^Pager, runs: []Tree) {
+	m.p = p
+	m.out = {width = runs[0].width, sums = runs[0].sums}
+	laying_begin(&m.l, p)
+	m.from = make([]Run_Reader, len(runs))
+	for &r, i in m.from {
 		run_begin(&r, p, runs[i])
 		if run_next(&r) {
-			append(&heap, i)
+			append(&m.heap, i)
 		}
 	}
-	for i := len(heap) / 2 - 1; i >= 0; i -= 1 {
-		sift(heap[:], from, i)
+	for i := len(m.heap) / 2 - 1; i >= 0; i -= 1 {
+		heap_sift(m.heap[:], m.from, i)
 	}
-	last: Entry
-	begun := false
-	for len(heap) > 0 {
-		r := &from[heap[0]]
+}
+
+@(private)
+merging_step :: proc(m: ^Merging, left: ^int) -> bool {
+	for len(m.heap) > 0 {
+		if left^ <= 0 {
+			writer_end(&m.l.w) // a page is not held on to while others are written
+			return false
+		}
+		left^ -= 1
+		r := &m.from[m.heap[0]]
 		// One that is in several is the same in all.
-		if !begun || r.at.key != last.key || r.at.sub != last.sub {
-			laying_put(&l, r.at)
-			last, begun = r.at, true
+		if !m.begun || r.at.key != m.last.key || r.at.sub != m.last.sub {
+			laying_put(&m.l, &m.out, r.at)
+			m.last, m.begun = r.at, true
 		}
 		if !run_next(r) {
-			heap[0] = heap[len(heap) - 1]
-			pop(&heap)
+			m.heap[0] = m.heap[len(m.heap) - 1]
+			pop(&m.heap)
 		}
-		sift(heap[:], from, 0)
+		heap_sift(m.heap[:], m.from, 0)
 	}
-	laying_end(&l)
-	for &r, i in from {
+	laying_end(&m.l, &m.out)
+	for &r in m.from {
 		run_end(&r)
-		_ = i
 	}
-	return out
+	delete(m.from)
+	delete(m.heap)
+	return true
 }
 
 // Reads a tree from end to end, giving up its pages behind it.
@@ -1208,33 +1261,26 @@ run_end :: proc(r: ^Run_Reader) {
 // Lays a tree down from entries in order.
 @(private)
 Laying :: struct {
-	w:     Writer,
+	w:      Writer,
 	leaves: [dynamic]Child,
 }
 
 @(private)
-laying_begin :: proc(l: ^Laying, p: ^Pager, t: ^Tree) {
-	l.w = Writer{p = p, t = t}
+laying_begin :: proc(l: ^Laying, p: ^Pager) {
+	l.w = Writer{p = p, laying = true}
 }
 
 @(private)
-laying_put :: #force_inline proc(l: ^Laying, e: Entry) {
-	l.w.out = &l.leaves
+laying_put :: #force_inline proc(l: ^Laying, t: ^Tree, e: Entry) {
+	l.w.out, l.w.t = &l.leaves, t
 	writer_put(&l.w, e)
-	if l.w.pg != nil && int(l.w.pg.used) < ENTRY_MAX + 8 && len(l.w.p.dirty) > 2 * CACHE {
-		// Just begun: all the others may go.
-		kept := l.w.p.dirty[l.w.no]
-		delete_key(&l.w.p.dirty, l.w.no)
-		pager_write(l.w.p)
-		l.w.p.dirty[l.w.no] = kept
-	}
 }
 
 @(private)
-laying_end :: proc(l: ^Laying) {
+laying_end :: proc(l: ^Laying, t: ^Tree) {
 	writer_end(&l.w)
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	tree_grow(l.w.p, l.w.t, &l.leaves, 1)
+	tree_grow(l.w.p, t, &l.leaves, 1)
 	delete(l.leaves)
 	l^ = {}
 }

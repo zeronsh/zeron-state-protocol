@@ -21,6 +21,10 @@ Index :: struct {
 	generation: u64,
 	upto:       u64, // the log has been read this far
 	serial:     u64, // under this roster
+	forgot:     u64, // and the store had forgotten so much
+	checking:   bool, // for rows that were forgotten: in this scope, from this row on
+	check_scope: int,
+	check_row:  u32,
 	cursor:     u64, // into the node's recent changes
 	tailing:    bool, // which are all that has happened since
 	unsaved:    int, // rows gone over since it was last written
@@ -42,7 +46,7 @@ EVERY_SLOT :: Slots{max(u64), max(u64), max(u64), max(u64)}
 Watcher :: struct {
 	data:   rawptr,
 	before: proc(data: rawptr, s: ^Scope, row: u32),
-	after:  proc(data: rawptr, s: ^Scope, row: u32, gone: bool),
+	after:  proc(data: rawptr, s: ^Scope, row: u32, slots: ^Slots, gone: bool),
 	done:   proc(data: rawptr),
 }
 
@@ -55,12 +59,26 @@ Scope :: struct {
 	columns: [dynamic]^Held,
 	edits:   [2][dynamic]Edit, // of ids and rows
 	all:     Set, // every row
+	built:   bool, // every row is in it
+	filling: ^Filling, // until then
+}
+
+// Going over everything, a little at a time.
+@(private)
+Filling :: struct {
+	bulk:  [4]Bulk,
+	id:    zsp.Id, // gone over so far
+	row:   u32, // the next
+	ended: int, // trees that are whole
+	again: map[zsp.Id]Slots, // what has changed meanwhile,
+	gone:  map[u32]bool, // and rows that are no more
 }
 
 Held :: struct {
 	using column: Column, // the path is owned
 	scope: ^Scope,
 	built: bool, // every row is in it
+	filling: ^Filling,
 	by_row: Tree, // number and value
 	by_key: Tree, // value, number
 	// For words: by_key is word, text; by_row is number, a hash of the text, and text; texts says whose each is.
@@ -95,7 +113,7 @@ Header :: struct {
 }
 
 index_open :: proc(x: ^Index, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
-	x.n = n
+	x.n, x.forgot = n, n.forgot
 	pager_open(x, disk, key)
 	best: Header
 	for no in u32(0) ..< HEADERS {
@@ -110,6 +128,9 @@ index_open :: proc(x: ^Index, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
 	x.generation = best.generation
 	if best.generation > 0 && catalogue_read(x, &best) {
 		x.upto, x.serial, x.next = best.upto, best.serial, best.next
+		if x.serial != n.roster.serial {
+			x.serial = max(u64) // what the roster has changed is not known
+		}
 		free_find(x)
 	} else {
 		index_reset(x)
@@ -151,6 +172,7 @@ index_close :: proc(x: ^Index) {
 
 @(private)
 scope_free :: proc(s: ^Scope) {
+	filling_free(&s.filling)
 	for h in s.columns {
 		held_free(h)
 	}
@@ -163,7 +185,22 @@ scope_free :: proc(s: ^Scope) {
 }
 
 @(private)
+filling_free :: proc(f: ^^Filling) {
+	if f^ == nil {
+		return
+	}
+	for &b in f^.bulk {
+		bulk_abandon(&b)
+	}
+	delete(f^.again)
+	delete(f^.gone)
+	free(f^)
+	f^ = nil
+}
+
+@(private)
 held_free :: proc(h: ^Held) {
+	filling_free(&h.filling)
 	for e in h.edits {
 		delete(e)
 	}
@@ -190,13 +227,24 @@ index_save :: proc(x: ^Index) -> bool {
 		zsp.write_varint(w, u64(t.root))
 	}
 	for s in x.scopes {
+		if !s.built {
+			return false // not yet
+		}
 		zsp.write_varint(&w, u64(s.id))
 		zsp.write_varint(&w, u64(s.next))
 		put_tree(&w, s.ids)
 		put_tree(&w, s.rows)
-		zsp.write_varint(&w, u64(len(s.columns)))
+		whole := 0
 		for h in s.columns {
-			append(&w, u8(h.kind), u8(h.slot), 1 if h.built else 0)
+			whole += 1 if h.built else 0
+		}
+		zsp.write_varint(&w, u64(whole))
+		for h in s.columns {
+			if !h.built {
+				continue
+			}
+			append(&w, u8(h.kind), u8(h.slot))
+			zsp.write_varint(&w, h.asked)
 			zsp.write_bytes(&w, transmute([]byte)h.path)
 			zsp.write_varint(&w, h.list[0])
 			zsp.write_varint(&w, h.list[1])
@@ -267,6 +315,7 @@ catalogue_read :: proc(x: ^Index, best: ^Header) -> bool {
 	scopes := int(zsp.read_varint(&r))
 	for _ in 0 ..< scopes {
 		s := scope_make(x, zsp.Scope(zsp.read_varint(&r)))
+		s.built = true
 		s.next = u32(zsp.read_varint(&r))
 		s.ids.root = u32(zsp.read_varint(&r))
 		s.rows.root = u32(zsp.read_varint(&r))
@@ -276,7 +325,8 @@ catalogue_read :: proc(x: ^Index, best: ^Header) -> bool {
 			h.scope = s
 			h.kind = Kind(zsp.read_u8(&r))
 			h.slot = zsp.Slot(zsp.read_u8(&r))
-			h.built = zsp.read_u8(&r) != 0
+			h.built = true
+			h.asked = zsp.read_varint(&r)
 			h.path = strings.clone(string(zsp.read_bytes(&r)))
 			h.list[0] = zsp.read_varint(&r)
 			h.list[1] = zsp.read_varint(&r)
@@ -499,15 +549,22 @@ index_column :: proc(x: ^Index, scope: zsp.Scope, c: ^Column) -> ^Held {
 	return nil
 }
 
-// Makes a column for a scope, unless it is there, and everything it needs.
-index_want :: proc(x: ^Index, scope: zsp.Scope, c: ^Column) -> ^Held {
-	s := index_scope(x, scope)
+// Has a scope kept, if it is not.
+index_want_scope :: proc(x: ^Index, id: zsp.Scope) -> ^Scope {
+	s := index_scope(x, id)
 	if s == nil {
-		s = scope_make(x, scope)
-		scope_fill(s)
+		s = scope_make(x, id)
+		scope_begin(s)
 	}
+	return s
+}
+
+// Has a column of a scope kept, if it is not. It may not be whole for a while: see index_step.
+index_want :: proc(x: ^Index, scope: zsp.Scope, c: ^Column) -> ^Held {
+	s := index_want_scope(x, scope)
 	for h in s.columns {
 		if column_same(h, c) {
+			h.asked = x.n.now / 1000
 			return h
 		}
 	}
@@ -515,15 +572,18 @@ index_want :: proc(x: ^Index, scope: zsp.Scope, c: ^Column) -> ^Held {
 	h.column = c^
 	h.path = strings.clone(c.path)
 	h.scope = s
+	h.asked = x.n.now / 1000
 	held_shape(h)
 	append(&s.columns, h)
-	held_fill(h)
+	held_begin(h)
 	return h
 }
 
 index_drop :: proc(x: ^Index, h: ^Held) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	held_clear(h)
+	if h.built {
+		held_clear(h)
+	}
 	for other, i in h.scope.columns {
 		if other == h {
 			unordered_remove(&h.scope.columns, i)
@@ -543,75 +603,131 @@ held_clear :: proc(h: ^Held) {
 	}
 }
 
-// Numbers every row there is. The index must be level with the store.
 @(private)
-scope_fill :: proc(s: ^Scope) {
-	bulk := new([2]Bulk)
-	defer free(bulk)
-	bulk_begin(&bulk[0], s.x, &s.ids)
-	bulk_begin(&bulk[1], s.x, &s.rows)
-	last: zsp.Id
-	scan := zsp.tree_scan(&s.x.n.store, s.x.n.cells, {u64(s.id) << 32, 0, 0, 0, 0}, {(u64(s.id) + 1) << 32, 0, 0, 0, 0})
-	for leaf in zsp.tree_next(&scan) {
-		id := zsp.Id{leaf.key[0], leaf.key[1]}
-		if id == last {
-			continue
+scope_begin :: proc(s: ^Scope) {
+	s.filling = new(Filling)
+	s.filling.id = {u64(s.id) << 32, 0}
+	bulk_begin(&s.filling.bulk[0], s.x, &s.ids)
+	bulk_begin(&s.filling.bulk[1], s.x, &s.rows)
+}
+
+// Numbers rows, for about so many. True once every one has been.
+@(private)
+scope_step :: proc(s: ^Scope, budget: int) -> bool {
+	f := s.filling
+	n := s.x.n
+	left := budget
+	if f.ended == 0 {
+		scan := zsp.tree_scan(&n.store, n.cells, {f.id[0], f.id[1], max(u64), max(u64), max(u64)}, {(u64(s.id) + 1) << 32, 0, 0, 0, 0})
+		for leaf in zsp.tree_next(&scan) {
+			id := zsp.Id{leaf.key[0], leaf.key[1]}
+			if id == f.id {
+				continue
+			}
+			if left <= 0 {
+				return false
+			}
+			left -= 1
+			f.id = id
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			if row_there(s, id) {
+				row_admit(s, id)
+				bulk_add(&f.bulk[0], s.edits[0][0].entry)
+				bulk_add(&f.bulk[1], s.edits[1][0].entry)
+				clear(&s.edits[0])
+				clear(&s.edits[1])
+			}
 		}
-		last = id
+	}
+	for f.ended < 2 {
+		if !bulk_end(&f.bulk[f.ended], left * 16) {
+			f.ended = max(f.ended, 0)
+			return false
+		}
+		f.ended += 1
+	}
+	index_relieve(s.x)
+	s.filling = nil
+	s.built = true
+	for id, slots in f.again {
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		if row_there(s, id) {
-			row_admit(s, id)
-			for &edits, i in s.edits {
+		slots := slots
+		row_reread(s, id, &slots)
+	}
+	scope_flush(s)
+	delete(f.again)
+	free(f)
+	return true
+}
+
+@(private)
+held_begin :: proc(h: ^Held) {
+	h.filling = new(Filling)
+	for t, i in held_trees(h) {
+		if i != 2 {
+			bulk_begin(&h.filling.bulk[i], h.scope.x, t)
+		}
+	}
+}
+
+// Reads a column of rows, for about so many. True once it has been read of every one. Its scope must be built.
+@(private)
+held_step :: proc(h: ^Held, budget: int) -> bool {
+	s, f := h.scope, h.filling
+	left := budget
+	if f.row < s.next {
+		c := cursor_make(s.x, s.rows, context.allocator)
+		defer cursor_destroy(&c)
+		cursor_seek(&c, {u64(f.row) << 32, 0})
+		for e in cursor_next(&c) {
+			if left <= 0 {
+				return false
+			}
+			left -= 1
+			number := u32(e.key.hi >> 32)
+			f.row = number + 1
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			row := Row{n = s.x.n, id = {u64(s.id) << 32 | e.key.hi & 0xffff_ffff, e.key.lo}}
+			held_read(h, number, &row, fresh = true)
+			for &edits, i in h.edits {
+				if i == 2 {
+					texts_make(h)
+					index_relieve(s.x)
+					continue
+				}
 				for x in edits {
-					bulk_add(&bulk[i], x.entry)
+					bulk_add(&f.bulk[i], x.entry)
 				}
 				clear(&edits)
 			}
 		}
+		f.row = s.next
 	}
-	for &b in bulk {
-		bulk_end(&b)
+	for f.ended < 4 {
+		if f.ended != 2 && !bulk_end(&f.bulk[f.ended], left * 16) {
+			return false
+		}
+		f.ended += 1
 	}
 	index_relieve(s.x)
-}
-
-// Reads a column of every row. Its trees must be empty.
-@(private)
-held_fill :: proc(h: ^Held) {
-	s := h.scope
-	bulk := new([4]Bulk)
-	defer free(bulk)
-	for t, i in held_trees(h) {
-		if i != 2 {
-			bulk_begin(&bulk[i], s.x, t)
-		}
-	}
-	c := cursor_make(s.x, s.rows, context.allocator)
-	defer cursor_destroy(&c)
-	cursor_seek(&c, KEY_MIN)
-	for e in cursor_next(&c) {
-		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		row := Row{n = s.x.n, id = {u64(s.id) << 32 | e.key.hi & 0xffff_ffff, e.key.lo}}
-		held_read(h, u32(e.key.hi >> 32), &row, fresh = true)
-		for &edits, i in h.edits {
-			if i == 2 {
-				texts_make(h)
-				index_relieve(s.x)
-				continue
-			}
-			for x in edits {
-				bulk_add(&bulk[i], x.entry)
-			}
-			clear(&edits)
-		}
-	}
-	for &b, i in bulk {
-		if i != 2 {
-			bulk_end(&b)
-		}
-	}
-	index_relieve(s.x)
+	h.filling = nil
 	h.built = true
+	for id in f.again {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		if row, ok := row_number(s, id); ok {
+			r := Row{n = s.x.n, id = id}
+			held_read(h, row, &r, fresh = false)
+		}
+	}
+	for row in f.gone {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		held_unread(h, row)
+	}
+	held_flush(h)
+	delete(f.again)
+	delete(f.gone)
+	free(f)
+	return true
 }
 
 // A row is there to be found while it has a place, and is not in its grave.
@@ -637,6 +753,12 @@ row_admit :: proc(s: ^Scope, id: zsp.Id) -> u32 {
 // Goes over a row again, in so far as these slots can have changed it.
 @(private)
 row_reread :: proc(s: ^Scope, id: zsp.Id, slots: ^Slots) {
+	if s.filling != nil {
+		again := s.filling.again[id]
+		again |= slots^
+		s.filling.again[id] = again
+		return
+	}
 	row, known := row_number(s, id)
 	there := row_there(s, id)
 	if !there && !known {
@@ -652,6 +774,14 @@ row_reread :: proc(s: ^Scope, id: zsp.Id, slots: ^Slots) {
 	}
 	r := Row{n = x.n, id = id}
 	for h in s.columns {
+		if f := h.filling; f != nil {
+			if !there && f.row > row {
+				f.gone[row] = true
+			} else if known || there {
+				f.again[id] = {}
+			}
+			continue
+		}
 		if !there {
 			held_unread(h, row)
 			continue
@@ -673,7 +803,7 @@ row_reread :: proc(s: ^Scope, id: zsp.Id, slots: ^Slots) {
 	}
 	x.unsaved += 1
 	for w in x.watchers {
-		w.after(w.data, s, row, !there)
+		w.after(w.data, s, row, slots, !there)
 	}
 }
 
@@ -998,7 +1128,7 @@ words_renew :: proc(h: ^Held) {
 		held_clear(h)
 	}
 	h.next_text, h.length, h.dead, h.alive, h.built = 0, 0, 0, 0, false
-	held_fill(h)
+	held_begin(h)
 }
 
 @(private)
@@ -1006,7 +1136,9 @@ scope_flush :: proc(s: ^Scope) {
 	edits_make(s.x, &s.ids, &s.edits[0])
 	edits_make(s.x, &s.rows, &s.edits[1])
 	for h in s.columns {
-		held_flush(h)
+		if h.filling == nil {
+			held_flush(h)
+		}
 	}
 	index_relieve(s.x)
 }
@@ -1022,45 +1154,62 @@ index_relieve :: proc(x: ^Index) {
 
 // ---------------------------------------------------------------- following the store
 
-// Brings the index level with the store. Costs nothing when nothing has happened.
-index_follow :: proc(x: ^Index) {
+// Does some of what there is to do: following the store, and going over what is wanted and not yet kept. True
+// when there is nothing left. Costs nothing when nothing has happened.
+index_step :: proc(x: ^Index, budget := 2000) -> bool {
+	if !index_follow(x, budget) {
+		return false
+	}
+	for s in x.scopes {
+		if s.filling != nil {
+			scope_step(s, budget)
+			return false
+		}
+		for h in s.columns {
+			if h.filling != nil {
+				held_step(h, budget)
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// Until there is nothing left.
+index_finish :: proc(x: ^Index) {
+	for !index_step(x, 1 << 16) {}
+}
+
+@(private)
+Dirty :: struct {
+	x:    ^Index,
+	rows: map[zsp.Id]Slots,
+}
+
+// Brings the index level with the store, or so far towards it. True when it is.
+index_follow :: proc(x: ^Index, budget := max(int) / 1024) -> bool {
 	n := x.n
 	if len(x.scopes) == 0 {
 		// Nothing is kept, so there is nothing to bring up.
 		x.upto, x.serial = zsp.store_tail(&n.store), n.roster.serial
 		x.cursor, x.tailing = n.events.next, true
-		return
+		return true
 	}
-	if x.serial != n.roster.serial {
-		index_check(x)
-		x.serial = n.roster.serial
+	if x.forgot != n.forgot || x.serial == max(u64) {
+		// Rows may be gone that nothing said were.
+		x.forgot, x.checking, x.check_scope, x.check_row = n.forgot, true, 0, 0
+	}
+	x.serial = n.roster.serial
+	if x.checking {
+		index_check(x, budget)
+		return false
 	}
 	if x.tailing && x.cursor == n.events.next {
-		return
-	}
-	Dirty :: struct {
-		x:    ^Index,
-		rows: map[zsp.Id]Slots,
+		return true
 	}
 	d := Dirty{x = x}
 	defer delete(d.rows)
-	flush :: proc(d: ^Dirty) {
-		for id, slots in d.rows {
-			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-			slots := slots
-			if s := index_scope(d.x, zsp.row_scope(id)); s != nil {
-				row_reread(s, id, &slots)
-			}
-		}
-		clear(&d.rows)
-		for s in d.x.scopes {
-			scope_flush(s)
-		}
-		for w in d.x.watchers {
-			w.done(w.data)
-		}
-	}
-	tail := zsp.store_tail(&n.store)
+	level := true
 	if x.tailing && x.cursor >= n.events.first {
 		for i in x.cursor ..< n.events.next {
 			c := zsp.ring_at(&n.events, i)
@@ -1068,43 +1217,87 @@ index_follow :: proc(x: ^Index) {
 			slots_add(&slots, c.slot)
 			d.rows[c.row] = slots
 		}
+		x.upto = zsp.store_tail(&n.store)
 	} else {
 		// More than is remembered: what the log says, in pieces.
+		x.tailing = false
 		zsp.store_flush(&n.store)
-		zsp.store_since(&n.store, x.upto, &d, proc(data: rawptr, c: ^zsp.Cell) {
+		x.upto = zsp.store_since(&n.store, x.upto, budget * 1024, &d, proc(data: rawptr, c: ^zsp.Cell) {
 			d := (^Dirty)(data)
 			slots := d.rows[c.row]
 			slots_add(&slots, c.slot)
 			d.rows[c.row] = slots
 			if len(d.rows) >= 1 << 14 {
-				flush(d)
+				dirty_flush(d)
 			}
 		})
+		level = x.upto == zsp.store_tail(&n.store)
 	}
-	flush(&d)
-	x.upto, x.cursor, x.tailing = tail, n.events.next, true
+	dirty_flush(&d)
+	if level {
+		x.cursor, x.tailing = n.events.next, true
+	}
+	return level
 }
 
-// Looks for rows the store no longer has without having said so, as when a roster made them unlawful.
 @(private)
-index_check :: proc(x: ^Index) {
-	for s in x.scopes {
-		gone: [dynamic]zsp.Id
-		defer delete(gone)
-		c := cursor_make(x, s.rows, context.allocator)
-		defer cursor_destroy(&c)
-		cursor_seek(&c, KEY_MIN)
-		for e in cursor_next(&c) {
-			append(&gone, zsp.Id{u64(s.id) << 32 | e.key.hi & 0xffff_ffff, e.key.lo})
+dirty_flush :: proc(d: ^Dirty) {
+	for id, slots in d.rows {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		slots := slots
+		if s := index_scope(d.x, zsp.row_scope(id)); s != nil {
+			row_reread(s, id, &slots)
 		}
-		every := EVERY_SLOT
-		for id in gone {
-			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-			row_reread(s, id, &every)
-			if len(s.edits[1]) > BATCH {
-				scope_flush(s)
+	}
+	clear(&d.rows)
+	for s in d.x.scopes {
+		if s.filling == nil {
+			scope_flush(s)
+		}
+	}
+	for w in d.x.watchers {
+		w.done(w.data)
+	}
+}
+
+// Looks for rows the store no longer has, or has otherwise, without its having been said: a roster may make cells
+// unlawful, and damage take them.
+@(private)
+index_check :: proc(x: ^Index, budget: int) {
+	left := budget
+	for x.check_scope < len(x.scopes) {
+		s := x.scopes[x.check_scope]
+		if s.filling != nil {
+			// It begins again: what it has gone over may be gone too.
+			filling_free(&s.filling)
+			s.next = 0
+			set_destroy(&s.all)
+			scope_begin(s)
+		} else {
+			c := cursor_make(x, s.rows, context.allocator)
+			defer cursor_destroy(&c)
+			some := make([dynamic]zsp.Id)
+			defer delete(some)
+			cursor_seek(&c, {u64(x.check_row) << 32, 0})
+			for e in cursor_next(&c) {
+				if left <= 0 {
+					break
+				}
+				left -= 1
+				x.check_row = u32(e.key.hi >> 32) + 1
+				append(&some, zsp.Id{u64(s.id) << 32 | e.key.hi & 0xffff_ffff, e.key.lo})
+			}
+			d := Dirty{x = x}
+			defer delete(d.rows)
+			for id in some {
+				d.rows[id] = EVERY_SLOT
+			}
+			dirty_flush(&d)
+			if left <= 0 {
+				return
 			}
 		}
-		scope_flush(s)
+		x.check_scope, x.check_row = x.check_scope + 1, 0
 	}
+	x.checking = false
 }

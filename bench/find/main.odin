@@ -63,6 +63,13 @@ ask :: proc(b: ^Bench, name: string, source: []byte, times := 50) {
 	find.index_follow(&b.x)
 	t := time.tick_now()
 	find.query_prepare(&b.x, &q)
+	worst := 0.0
+	for {
+		slice := time.tick_now()
+		done := find.index_step(&b.x)
+		worst = max(worst, time.duration_milliseconds(time.tick_since(slice)))
+		if done do break
+	}
 	built := time.duration_milliseconds(time.tick_since(t))
 	s := find.index_scope(&b.x, 1)
 	least := max(f64)
@@ -77,7 +84,7 @@ ask :: proc(b: ^Bench, name: string, source: []byte, times := 50) {
 		free_all(context.temp_allocator)
 	}
 	if built > 1 {
-		fmt.printfln("    (built what it needs in %.0f ms; %d KB of memory)", built, own_kb())
+		fmt.printfln("    (built what it needs in %.0f ms, %.1f ms at most at a time; %d KB of memory)", built, worst, own_kb())
 	}
 	fmt.printfln("  %-62s %10.1f µs   %7d rows, %d shown", name, least, count, shown)
 }

@@ -22,17 +22,33 @@ query_prepare :: proc(x: ^Index, q: ^Query) {
 			a.held = index_want(x, q.scope, &a.col)
 		}
 	}
-	scope_want(x, q.scope)
+	index_want_scope(x, q.scope)
 }
 
-@(private)
-scope_want :: proc(x: ^Index, id: zsp.Scope) -> ^Scope {
-	s := index_scope(x, id)
-	if s == nil {
-		s = scope_make(x, id)
-		scope_fill(s)
+// Whether all that a question needs is whole.
+@(require_results)
+query_ready :: proc(x: ^Index, q: ^Query) -> bool {
+	ready :: proc(x: ^Index, scope: zsp.Scope, p: ^Pred) -> bool {
+		if s := index_scope(x, scope); s == nil || !s.built || (p.held != nil && !p.held.built) {
+			return false
+		}
+		for &k in p.kids {
+			ready(x, p.scope if p.op == .Ref || p.op == .Back else scope, &k) or_return
+		}
+		return true
 	}
-	return s
+	ready(x, q.scope, &q.where_) or_return
+	for o in q.order {
+		if o.held != nil && !o.held.built {
+			return false
+		}
+	}
+	for a in q.totals {
+		if a.held != nil && !a.held.built {
+			return false
+		}
+	}
+	return true
 }
 
 @(private)
@@ -49,10 +65,10 @@ pred_prepare :: proc(x: ^Index, scope: zsp.Scope, p: ^Pred) {
 		}
 	case .Ref:
 		p.held = index_want(x, scope, &p.col)
-		scope_want(x, p.scope)
+		index_want_scope(x, p.scope)
 		pred_prepare(x, p.scope, &p.kids[0])
 	case .Back:
-		scope_want(x, p.scope)
+		index_want_scope(x, p.scope)
 		p.held = index_want(x, p.scope, &p.col)
 		pred_prepare(x, p.scope, &p.kids[0])
 	}

@@ -41,6 +41,7 @@ Store :: struct {
 	synced:      u64, // durable up to here
 	serial:      u64, // of the roster this was last held against
 	serial_kept: u64,
+	forgot:      u64, // cells forgotten since it was opened, of which nothing is said in the log
 	failed:      bool,
 
 	// Recent changes, for tailing. See events.odin.
@@ -157,23 +158,61 @@ store_header :: proc(disk: Disk) -> (best: Header) {
 	return
 }
 
-// Every cell written to the log from an offset on, living or dead, some perhaps twice. Flush first.
-store_since :: proc(s: ^Store, from: u64, data: rawptr, each: proc(data: rawptr, c: ^Cell)) {
-	Both :: struct {
-		data: rawptr,
-		each: proc(data: rawptr, c: ^Cell),
-	}
-	b := Both{data, each}
-	log_scan(s.disk, from, &b, proc(data: rawptr, _: u64, body: []byte) {
-		b := (^Both)(data)
-		r := Reader{buf = body}
-		row: Id
-		for r.pos < len(r.buf) {
-			c := read_cell(&r, row) or_break
-			row = c.row
-			b.each(b.data, &c)
+// Every cell written to the log from an offset on, living or dead, some perhaps twice, for about so many bytes.
+// Returns where to go on from. Flush first.
+store_since :: proc(s: ^Store, from: u64, budget: int, data: rawptr, each: proc(data: rawptr, c: ^Cell)) -> u64 {
+	WINDOW :: 1 << 20
+	end := store_tail(s)
+	at := from
+	for at < end && at - from < u64(budget) {
+		limit := min(end, (at / SEGMENT + 1) * SEGMENT)
+		size := min(limit - at, WINDOW)
+		for {
+			got := size
+			part := make([]byte, size)
+			defer delete(part)
+			if !s.disk.log_read(s.disk.data, at, part) {
+				got = log_size(s.disk, at, size)
+				if got > 0 && !s.disk.log_read(s.disk.data, at, part[:got]) {
+					got = 0
+				}
+			}
+			pos := 0
+			for pos < int(got) {
+				n := record_at(part[pos:got])
+				if n == 0 {
+					break
+				}
+				r := Reader{buf = part[pos + RECORD_HEAD:][:n]}
+				row: Id
+				for r.pos < len(r.buf) {
+					c := read_cell(&r, row) or_break
+					row = c.row
+					each(data, &c)
+				}
+				pos += RECORD_HEAD + n
+			}
+			if pos > 0 {
+				at += u64(pos)
+				break
+			}
+			if got == size && size < limit - at {
+				size = limit - at // a record that does not fit
+				continue
+			}
+			// No record begins here: where one next does, or else in the next segment.
+			next := limit
+			for p in 1 ..< int(got) {
+				if record_at(part[p:got]) > 0 {
+					next = at + u64(p)
+					break
+				}
+			}
+			at = next
+			break
 		}
-	})
+	}
+	return min(at, end)
 }
 
 // The latest stamp time a store has seen, without opening it.
@@ -806,6 +845,7 @@ forget :: proc(s: ^Store, lost: []Leaf) {
 	if len(lost) == 0 {
 		return
 	}
+	s.forgot += u64(len(lost))
 	rows := make(map[Id]bool, context.temp_allocator) // to whether its places are in doubt
 	doubt := false
 	for leaf in lost {

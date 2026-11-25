@@ -793,6 +793,13 @@ check_query :: proc(t: ^testing.T, w: ^World, source: []byte) -> bool {
 	testing.expect(t, ok)
 	index_follow(&w.x)
 	query_prepare(&w.x, &q)
+	// Going over everything may be in the middle of being changed.
+	for !index_step(&w.x, 1 + rand.int_max(40)) {
+		if rand.int_max(6) == 0 {
+			world_write(t, w)
+		}
+	}
+	testing.expect(t, query_ready(&w.x, &q))
 	s := index_scope(&w.x, q.scope)
 	got := pred_rows(s, &q.where_)
 	defer set_destroy(&got)
@@ -931,11 +938,11 @@ answers_match_the_cells :: proc(t: ^testing.T) {
 			}
 			switch rand.int_max(25) {
 			case 0:
-				index_follow(&w.x)
+				index_finish(&w.x)
 				check_index(t, &w)
 			case 1:
 				testing.expect(t, zsp.store_sync(&w.node.store))
-				index_follow(&w.x)
+				index_finish(&w.x)
 				testing.expect(t, index_save(&w.x))
 			case 2:
 				// A stop, and a start from what was last saved, whenever that was.
@@ -959,7 +966,7 @@ answers_match_the_cells :: proc(t: ^testing.T) {
 				return
 			}
 		}
-		index_follow(&w.x)
+		index_finish(&w.x)
 		check_index(t, &w)
 	}
 }
