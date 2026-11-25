@@ -3,3 +3,6 @@ relay/node_modules/
 relay/src/relay.wasm
 .wrangler/
 __pycache__/
+web/node_modules/
+web/dist/
+web/src/node.wasm

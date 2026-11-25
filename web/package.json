@@ -1,0 +1,15 @@
+{
+  "name": "zsp",
+  "version": "0.1.0",
+  "description": "A Zeron State Protocol device in a browser or Node: the node compiled to WebAssembly, and a client in TypeScript",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.4",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
+  }
+}

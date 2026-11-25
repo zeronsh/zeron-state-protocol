@@ -1,7 +1,6 @@
 package find
 
 import "base:runtime"
-import "core:mem/virtual"
 import "core:slice"
 import "core:time"
 import "../zsp"
@@ -89,7 +88,7 @@ Live :: struct {
 	call:    u64, // the call a partial replica does by,
 	device:  zsp.Key32, // and which
 	far:     Far,
-	arena:   virtual.Arena, // the question
+	arena:   Arena, // the question
 	q:       Query,
 	anchor:  Maybe(Anchor),
 	once:    bool, // is to be answered, and no more
@@ -194,7 +193,7 @@ live_start :: proc(l: ^Live, source: []byte) -> bool {
 	f := l.f
 	append(&f.live, l)
 	ok: bool
-	l.q, ok = query_parse(source, virtual.arena_allocator(&l.arena))
+	l.q, ok = query_parse(source, arena_allocator(&l.arena))
 	if !ok {
 		answer_flag(l, {faulty = true})
 		live_free(l)
@@ -433,7 +432,7 @@ live_free :: proc(l: ^Live) {
 	delete(l.far.keys)
 	delete(l.shown)
 	delete(l.said)
-	virtual.arena_destroy(&l.arena)
+	arena_destroy(&l.arena)
 	free(l)
 }
 

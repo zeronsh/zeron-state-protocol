@@ -2,7 +2,6 @@ package find
 
 import "base:runtime"
 import "core:encoding/endian"
-import "core:mem/virtual"
 import "core:slice"
 import "../zsp"
 
@@ -1023,7 +1022,7 @@ Bulk :: struct {
 	t:     ^Tree,
 	edits: [dynamic]Edit,
 	runs:  [dynamic]Tree,
-	arena: virtual.Arena,
+	arena: Arena,
 	merging: Merging,
 }
 
@@ -1034,8 +1033,8 @@ RUNS :: 48 // read side by side
 
 bulk_begin :: proc(b: ^Bulk, p: ^Pager, t: ^Tree) {
 	b.p, b.t = p, t
-	if virtual.arena_init_static(&b.arena, (RUN + 64) * size_of(Edit), 1 << 16) == nil {
-		b.edits = make([dynamic]Edit, 0, RUN, virtual.arena_allocator(&b.arena))
+	if arena_reserve(&b.arena, (RUN + 64) * size_of(Edit)) {
+		b.edits = make([dynamic]Edit, 0, RUN, arena_allocator(&b.arena))
 	}
 }
 
@@ -1068,8 +1067,8 @@ bulk_end :: proc(b: ^Bulk, budget := max(int)) -> bool {
 	if b.merging.p == nil {
 		bulk_run(b)
 		b.edits = {}
-		if b.arena.curr_block != nil {
-			virtual.arena_destroy(&b.arena)
+		if arena_used(&b.arena) {
+			arena_destroy(&b.arena)
 		}
 	}
 	left := budget
@@ -1099,8 +1098,8 @@ bulk_end :: proc(b: ^Bulk, budget := max(int)) -> bool {
 
 // Gives it up.
 bulk_abandon :: proc(b: ^Bulk) {
-	if b.arena.curr_block != nil {
-		virtual.arena_destroy(&b.arena)
+	if arena_used(&b.arena) {
+		arena_destroy(&b.arena)
 	}
 	if b.merging.p != nil {
 		for &r in b.merging.from {

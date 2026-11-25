@@ -1,3 +1,4 @@
+#+build !js
 package find
 
 import "core:math/rand"

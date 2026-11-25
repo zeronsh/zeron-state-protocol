@@ -2,7 +2,6 @@ package find
 
 import "base:runtime"
 import "core:math/bits"
-import "core:mem/virtual"
 import "core:slice"
 import "core:strings"
 import "../zsp"
@@ -1182,11 +1181,11 @@ edits_sort :: proc(edits: []Edit) {
 		}
 	}
 	// Not from the heap when it is much: that would be kept.
-	arena: virtual.Arena
-	mapped := n > 4096 && virtual.arena_init_static(&arena, uint(n + 64) * size_of(Edit), 1 << 16) == nil
-	spare := make([]Edit, n, virtual.arena_allocator(&arena) if mapped else context.allocator)
+	arena: Arena
+	mapped := n > 4096 && arena_reserve(&arena, uint(n + 64) * size_of(Edit))
+	spare := make([]Edit, n, arena_allocator(&arena) if mapped else context.allocator)
 	defer if mapped {
-		virtual.arena_destroy(&arena)
+		arena_destroy(&arena)
 	} else {
 		delete(spare)
 	}
