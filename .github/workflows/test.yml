@@ -15,6 +15,9 @@ jobs:
       - uses: laytan/setup-odin@v2
         with:
           release: dev-2026-11
+        env:
+          # Odin's vendor libraries are kept in LFS, which fails often and which nothing here uses.
+          GIT_LFS_SKIP_SMUDGE: "1"
       - uses: actions/setup-node@v4
         with:
           node-version: 24
