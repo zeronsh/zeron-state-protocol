@@ -757,3 +757,66 @@ questions_are_passed_on_in_all_weathers :: proc(t: ^testing.T) {
 	client_hear_out(t, &c, &g)
 	testing.expect(t, c.answers[1].flags == 0 && len(w.node.calls) == 0 && len(p.node.calls) == 0)
 }
+
+// The words of a column are read afresh while a question is asked of them, and rows change meanwhile.
+@(test)
+words_renewed_beneath_a_question :: proc(t: ^testing.T) {
+	state := rand.create(93)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	f: Finder
+	pages: Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+	f.settled = true
+	c := client_open(&w, &f)
+	defer {
+		zsp.session_close(c.session)
+		finder_close(&f)
+		client_free(&c)
+		memory_disk_destroy(&pages)
+	}
+	write :: proc(t: ^testing.T, w: ^World, id: zsp.Id, text: string) {
+		w.node.now += 10
+		testing.expect(t, zsp.node_write(&w.node, {{id, 20, .Value, zsp.node_stamp(&w.node), transmute([]byte)text}}))
+	}
+	for _ in 0 ..< 40 {
+		id := zsp.node_id(&w.node, 1)
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(1, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+		write(t, &w, id, "band apple")
+	}
+	q := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&q, 1)
+	append(&q, u8(Op.Match), u8(Kind.Words), 20, 0, 0, 0, 4)
+	append(&q, "band")
+	append(&q, 1, 2, 1, 0, 0, 50, 0)
+	client_ask(t, &c, 1, q[:])
+	renewed := 0
+	for round in 0 ..< 400 {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		many := 1 + rand.int_max(6)
+		for _ in 0 ..< many {
+			write(t, &w, rand.choice(w.rows[:]), rand.choice([]string{"band apple", "band fig", "fig", "grape"}))
+		}
+		finder_run(&f, 1 + rand.int_max(12))
+		h := f.live[0].q.where_.held
+		renewed += 1 if h != nil && round > 40 && h.filling != nil else 0
+		if round % 4 == 3 {
+			for !finder_run(&f) {
+			}
+			finder_run(&f)
+			client_hear_out(t, &c, &f)
+			if !answer_check(t, &w, &f, &c, 1, q[:]) {
+				fmt.println("round", round)
+				return
+			}
+		}
+	}
+	testing.expect(t, renewed > 5)
+}
