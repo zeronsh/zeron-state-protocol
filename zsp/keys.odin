@@ -73,22 +73,27 @@ aead_nonce :: proc(stamp: Stamp, slot: Slot, kind: u8) -> (iv: [24]byte) {
 	return
 }
 
-// Appends epoch, ciphertext and tag.
+// Appends which key, ciphertext and tag.
 @(private)
 seal_append :: proc(w: ^[dynamic]byte, k: ^Scope_Keys, iv: ^[24]byte, bind, plain: []byte, epoch := 0) {
 	epoch := epoch if epoch != 0 else len(k.epochs)
-	write_varint(w, u64(epoch))
+	write_u32(w, k.ids[epoch - 1])
 	aead_append(w, k.epochs[epoch - 1], iv, bind, plain)
 }
 
 @(private)
 open_append :: proc(w: ^[dynamic]byte, k: ^Scope_Keys, iv: ^[24]byte, bind, sealed: []byte) -> bool {
 	r := Reader{buf = sealed}
-	epoch := read_varint(&r)
-	if r.bad || epoch == 0 || epoch > u64(len(k.epochs)) {
+	id := read_u32(&r)
+	if r.bad {
 		return false
 	}
-	return aead_open(w, k.epochs[epoch - 1], iv, bind, sealed[r.pos:])
+	#reverse for other, i in k.ids {
+		if other == id && k.epochs[i] != {} {
+			return aead_open(w, k.epochs[i], iv, bind, sealed[r.pos:])
+		}
+	}
+	return false
 }
 
 @(private)
@@ -151,7 +156,7 @@ cell_signed :: proc(c: ^Cell, body: []byte) -> []byte {
 cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, epoch := 0) -> bool {
 	scope := row_scope(c.row)
 	keys, info := keyring_scope(k, scope), roster_scope(r, scope)
-	if keys == nil || info == nil {
+	if keys == nil || info == nil || keys.epochs[(epoch if epoch != 0 else len(keys.epochs)) - 1] == {} {
 		return false
 	}
 	n := clear_size(c.kind, c.body)
@@ -218,15 +223,35 @@ cell_lawful :: proc(r: ^Roster, c: ^Cell) -> bool {
 		return false
 	}
 	rd := Reader{buf = c.body, pos = clear_size(c.kind, c.body)}
-	if .Signed not_in info.flags {
-		epoch := read_varint(&rd)
-		if rd.bad || epoch == 0 || epoch > u64(info.epoch) {
+	if .Signed in info.flags {
+		author := read_varint(&rd)
+		if rd.bad || len(c.body) - rd.pos < SIGNATURE || !author_allowed(r, author, scope, c.stamp) {
 			return false
 		}
-		return epoch == u64(info.epoch) || c.stamp.time <= info.closed[epoch - 1]
 	}
-	author := read_varint(&rd)
-	return !rd.bad && len(c.body) - rd.pos >= SIGNATURE && author_allowed(r, author, scope, c.stamp)
+	epoch := key_epoch(info, read_u32(&rd))
+	if rd.bad || epoch == 0 || epoch_void(info, epoch) {
+		return false
+	}
+	return .Signed in info.flags || epoch == int(info.epoch) || c.stamp.time <= info.closed[epoch - 1]
+}
+
+// The epoch, counted from one, whose key this names; or zero.
+@(private)
+key_epoch :: proc(info: ^Scope_Info, id: u32) -> int {
+	#reverse for c, i in info.commits {
+		if key_id(c) == id {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// What a cell calls its key by: rosters drawn up at once may number theirs alike.
+@(private)
+key_id :: proc(commit: Key32) -> u32 {
+	commit := commit
+	return get_u32(commit[:])
 }
 
 @(private)

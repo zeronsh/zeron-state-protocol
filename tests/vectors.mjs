@@ -82,9 +82,9 @@ for (const c of v.cells) {
     assert.equal(sealed[0], 0);
     sealed = body.subarray(clear + 1);
   }
-  assert.equal(sealed[0], 1); // epoch
+  assert.deepEqual(sealed.subarray(0, 4), hkdf(null, bytes(c.key), "zsp-commit").subarray(0, 4)); // which key
   const nonce = Buffer.concat([s.stamp, Buffer.from([s.slot, s.kind, 0, 0, 0, 0, 0, 0])]);
-  const plain = xopen(bytes(c.key), nonce, Buffer.concat([id, s.body.subarray(0, clear)]), sealed.subarray(1));
+  const plain = xopen(bytes(c.key), nonce, Buffer.concat([id, s.body.subarray(0, clear)]), sealed.subarray(4));
   assert.deepEqual(Buffer.concat([s.body.subarray(0, clear), plain]), o.body);
 }
 

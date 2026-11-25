@@ -372,6 +372,16 @@ def test_limits():
         c.send(zsp.CELLS, zsp.varint(c.seq) + graves[: (1 << 22) - 100])
         time.sleep(0.5)
     assert a.p.poll() is None
+    # Whoever is sent away hears why, after all that was being said.
+    c = a.client()
+    c.watch(1, 1, "x")
+    c.send(zsp.WATCH, b"\xff")
+    time.sleep(0.5)
+    try:
+        c.drain(5)
+        raise SystemExit("not told")
+    except PermissionError as e:
+        assert str(e) == "fault 1", e
     # A message in several frames is a message.
     c = a.client()
     body = zsp.frame(zsp.UNWATCH, zsp.varint(1)) + zsp.frame(zsp.WATCH, zsp.varint(7) + b"\1" + zsp.put_key(c.tag(1, "x").ljust(40, b"\0")) + zsp.put_key(zsp.key_after(c.tag(1, "x"))) + b"\0")

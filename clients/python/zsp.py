@@ -253,8 +253,8 @@ class Client:
 
     def new_id(self, scope):
         now = int(time.time() * 1000)
-        self.clock = max(self.clock, now << 16)  # a row is no younger than its cells, should the clock be set back
-        return struct.pack(">II", scope, now // 1000) + os.urandom(8)
+        self.clock = max(self.clock, now << 16)  # as late as anything heard of: so, than any right known to have ended
+        return struct.pack(">II", scope, (self.clock >> 16) // 1000) + os.urandom(8)
 
     def write(self, *cells):
         """cells: (row, slot, kind, body). Applied here at once, acknowledged when durable."""

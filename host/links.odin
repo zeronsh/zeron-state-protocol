@@ -60,7 +60,7 @@ Peer :: struct {
 	next_knock: time.Tick,
 	tried:      time.Tick, // when candidates were last sent
 	ever_tried: bool,
-	heard:      time.Tick, // a beacon, and knocked for it
+	heard:      time.Tick, // a beacon, last answered
 	owed:       bool, // candidates are to be sent once the outside address is known
 }
 
@@ -347,8 +347,8 @@ peer_wire :: proc(p: ^Peer, l: ^pipe.Link) {
 	l.on_stream = proc(l: ^pipe.Link, bytes: []byte) {
 		p := (^Peer)(l.data)
 		peer_opened(p, l)
-		if l == p.link && p.session != nil && !zsp.session_input(p.session, bytes) {
-			pipe.link_close(l)
+		if l == p.link && p.session != nil {
+			zsp.session_input(p.session, bytes) // links_run closes it, once it has heard why
 		}
 	}
 	l.on_datagram = proc(l: ^pipe.Link, bytes: []byte) {
@@ -524,17 +524,15 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 		at := from
 		at.port = u16(port)
 		if p.knocks > 0 {
-			// Heard by another road, which may be the one that works.
-			if slice.contains(p.candidates[:], at) || len(p.candidates) >= MAX_CANDIDATES {
-				return
+			// Heard by another road, which may be the one that works; or again, our answer having been lost.
+			new := !slice.contains(p.candidates[:], at)
+			if new && len(p.candidates) < MAX_CANDIDATES {
+				append(&p.candidates, at)
 			}
-			append(&p.candidates, at)
-			if !peer_dials(p) {
+			if !peer_dials(p) && (new || time.tick_since(p.heard) >= ANNOUNCE_AFTER / 2) {
+				p.heard = time.tick_now()
 				beacon_send(s, from)
 			}
-			return
-		}
-		if p.heard != {} && time.tick_since(p.heard) < RETRY_AFTER {
 			return
 		}
 		p.heard = time.tick_now()
@@ -602,7 +600,7 @@ links_run :: proc(h: ^Host) {
 			peer_drop(p)
 		}
 		if p.session != nil {
-			if p.session.closing {
+			if p.session.closing && len(zsp.session_output(p.session)) == 0 && pipe.link_quiet(p.link) {
 				pipe.link_close(p.link)
 			}
 			if p.far && time.tick_diff(p.used, now) > NAT_IDLE {
@@ -677,7 +675,7 @@ links_deadline :: proc(h: ^Host) -> (due: pipe.Time) {
 		nearer(&due, at(u.asked, STUN_WAIT + time.Millisecond))
 	}
 	if u.announces > 0 {
-		nearer(&due, at(u.announce, 0))
+		nearer(&due, at(u.announce, time.Millisecond))
 	}
 	for p in u.links {
 		if p.session != nil {

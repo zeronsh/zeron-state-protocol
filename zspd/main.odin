@@ -247,7 +247,13 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 		return false
 	}
 	a.roster = zsp.roster_parse(data, space) or_return
-	zsp.roster_unwrap(&a.keys, &a.roster) or_return
+	if kept, kerr := os.read_entire_file(in_dir(in_dir(dir, name), "keys"), context.temp_allocator); kerr == nil {
+		zsp.keyring_load(&a.keys, kept)
+	}
+	if !zsp.roster_unwrap(&a.keys, &a.roster) {
+		say(os.stderr, "this device does not belong to the space\n")
+		return false
+	}
 	if !zsp.keyring_rules(&a.keys, &a.roster) {
 		say(os.stderr, "this device is not an admin of the space\n")
 		return false
@@ -263,6 +269,7 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 		say(os.stderr, "that would make an unsound roster: only signed scopes may have readers who do not write\n")
 		return false
 	}
+	host.save(in_dir(in_dir(dir, name), "roster.old"), data) or_return
 	host.save(path, bytes) or_return
 	announce(dir, bytes)
 	return true

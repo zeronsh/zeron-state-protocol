@@ -1,6 +1,7 @@
 #+build !js
 package zsp
 
+import "base:runtime"
 import "core:hash/xxhash"
 import "core:math/rand"
 import "core:slice"
@@ -99,7 +100,7 @@ Census :: struct {
 }
 
 @(private)
-census :: proc(s: ^Store, shelved := false) -> (c: Census) {
+census :: proc(s: ^Store, shelved := false, reader: ^Sim_Node = nil) -> (c: Census) {
 	c.shelf = store_range(s, KEY_MIN, KEY_MAX)
 	scan := tree_scan(s, s.cells, KEY_MIN, KEY_MAX)
 	for leaf in tree_next(&scan) {
@@ -107,8 +108,12 @@ census :: proc(s: ^Store, shelved := false) -> (c: Census) {
 		if shelved && row_places(s, cell.row).count == 0 {
 			continue // it is nowhere, and may differ there
 		}
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		cell.body = log_bytes(s, at.off, at.len)
 		c.cells.print += cell_print(&cell)
+		if reader != nil {
+			_ = cell_open(&reader.keys, &reader.node.roster, &cell) // what it says, however it was sealed
+		}
 		c.bodies += xxhash.XXH64(cell.body) * cell.stamp.salt
 		c.cells.count += 1
 	}

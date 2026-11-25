@@ -138,6 +138,19 @@ read_take :: proc(r: ^Reader, n: int) -> []byte {
 	return r.buf[r.pos:][:n]
 }
 
+@(private, require_results)
+read_u32 :: proc(r: ^Reader) -> u32 {
+	b := read_take(r, 4)
+	return get_u32(b) if b != nil else 0
+}
+
+@(private)
+write_u32 :: proc(w: ^[dynamic]byte, v: u32) {
+	b: [4]byte
+	put_u32(b[:], v)
+	append(w, ..b[:])
+}
+
 @(require_results)
 read_u8 :: proc(r: ^Reader) -> u8 {
 	b := read_take(r, 1)

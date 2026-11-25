@@ -1322,12 +1322,12 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	end
 	f({
 		insert = function(schema, list, order, values)
-			-- No later than its cells, should the clock be set back between.
+			-- As late as anything heard of: later, then, than any right that is known to have ended.
 			local ms = math.floor(self.host.now() * 1000)
 			if ms > self.clock_ms then
 				self.clock_ms, self.clock_n = ms, 0
 			end
-			local id = string.pack(">I4I4", scope, ms // 1000) .. self.host.random(8)
+			local id = string.pack(">I4I4", scope, self.clock_ms // 1000) .. self.host.random(8)
 			fresh[id] = true
 			place(id, list, order)
 			set(id, schema, values)

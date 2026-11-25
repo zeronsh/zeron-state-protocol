@@ -51,8 +51,19 @@ Scope_Info :: struct {
 	id:    Scope,
 	flags: Scope_Flags,
 	epoch: u32,
-	// When each earlier epoch ended, as stamp times. A key that was given up cannot seal what is later.
+	// When each earlier epoch ended, as stamp times. A key that was given up cannot seal what is later. One that
+	// ended no later than the epoch before is void: nothing sealed under it is taken.
 	closed: []u64, // owned
+	commits: []Key32, // owned; to each epoch's key, so that nobody can be handed another unawares
+}
+
+// Whether an epoch, counted from one, is void.
+@(require_results)
+epoch_void :: proc(info: ^Scope_Info, epoch: int) -> bool {
+	if epoch > len(info.closed) {
+		return false
+	}
+	return info.closed[epoch - 1] <= (info.closed[epoch - 2] if epoch > 1 else 0)
 }
 
 Relay :: struct {
@@ -90,13 +101,15 @@ Keyring :: struct {
 	seed:   Key32, // its Ed25519 seed, derived from the secret
 	signer: Key32,
 	scopes: [dynamic]Scope_Keys,
+	before: [dynamic]Scope_Keys, // as they were under the last roster, while what was sealed then is looked over
 	root:   Maybe(Key32), // the space's signing seed, on owners' devices
 }
 
 Scope_Keys :: struct {
 	scope:    Scope,
 	list_key: Key32,
-	epochs:   [dynamic]Key32, // sealing keys, by epoch - 1
+	epochs:   [dynamic]Key32, // sealing keys, by epoch - 1; zero where one was never learnt
+	ids:      [dynamic]u32, // what cells call each by: see scope_keys_index
 }
 
 keyring_init :: proc(k: ^Keyring, secret: Key32) {
@@ -107,9 +120,26 @@ keyring_init :: proc(k: ^Keyring, secret: Key32) {
 }
 
 keyring_destroy :: proc(k: ^Keyring) {
+	keyring_forget(k)
 	keyring_clear(k)
 	delete(k.scopes)
 	crypto.zero_explicit(k, size_of(Keyring))
+}
+
+// To be called once the keys are in place.
+scope_keys_index :: proc(k: ^Scope_Keys) {
+	resize(&k.ids, len(k.epochs))
+	for e, i in k.epochs {
+		k.ids[i] = key_id(key_commit(e))
+	}
+}
+
+@(private)
+keyring_forget :: proc(k: ^Keyring) {
+	old := Keyring{scopes = k.before}
+	k.before = {}
+	keyring_clear(&old)
+	delete(old.scopes)
 }
 
 @(private)
@@ -117,6 +147,7 @@ keyring_clear :: proc(k: ^Keyring) {
 	for &s in k.scopes {
 		crypto.zero_explicit(raw_data(s.epochs), len(s.epochs) * size_of(Key32))
 		delete(s.epochs)
+		delete(s.ids)
 	}
 	clear(&k.scopes)
 }
@@ -202,6 +233,18 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 				return
 			}
 		}
+		if int(s.epoch) > (len(rd.buf) - rd.pos) / 32 {
+			return
+		}
+		s.commits = make([]Key32, s.epoch)
+		for &c, i in s.commits {
+			c = read_key32(&rd)
+			for other in s.commits[:i] {
+				if key_id(other) == key_id(c) {
+					return
+				}
+			}
+		}
 		last = s.id
 		history += int(s.epoch - 1)
 	}
@@ -210,12 +253,15 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 		m.device = read_key32(&rd)
 		m.signer = read_key32(&rd)
 		for other in r.members[:i] {
-			if other.device == m.device {
+			if other.device == m.device || other.signer == m.signer {
 				return
 			}
 		}
 		m.admin = slice.contains(r.admins, m.signer)
 		for &o in r.owners {
+			if (o.device == m.device) != (o.signer == m.signer) {
+				return
+			}
 			m.owner ||= o.device == m.device
 		}
 		m.subject = read_bytes(&rd)
@@ -238,6 +284,18 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 						return
 					}
 				}
+			}
+		}
+	}
+	// An owner may read and write everywhere, whoever signs.
+	for &o in r.owners {
+		m := roster_member(&r, o.device)
+		if m == nil {
+			return
+		}
+		for s in r.scopes {
+			if member_rights(m, s.id) & {.Read, .Write} != {.Read, .Write} {
+				return
 			}
 		}
 	}
@@ -298,9 +356,10 @@ COUNT_SHIFT :: 20
 
 // The charter's term, then a count, then chance: of two rosters drawn up at once, all agree which it is.
 @(private)
-serial_next :: proc(term, last: u64) -> (serial: u64, ok: bool) {
+serial_next :: proc(d: ^Draft, term: u64) -> (serial: u64, ok: bool) {
+	last := d.last
 	salt: [4]byte
-	crypto.rand_bytes(salt[:])
+	draft_random(d, salt[:])
 	count := (last >> COUNT_SHIFT) & (1 << (TERM_SHIFT - COUNT_SHIFT) - 1) if last >> TERM_SHIFT == term else 0
 	count += 1
 	serial = term << TERM_SHIFT | count << COUNT_SHIFT | u64(get_u32(salt[:])) >> (32 - COUNT_SHIFT)
@@ -313,6 +372,7 @@ roster_destroy :: proc(r: ^Roster) {
 	}
 	for s in r.scopes {
 		delete(s.closed)
+		delete(s.commits)
 	}
 	delete(r.bytes)
 	delete(r.scopes)
@@ -341,6 +401,43 @@ roster_member :: proc(r: ^Roster, device: Key32) -> ^Member {
 		}
 	}
 	return nil
+}
+
+// Whether a roster only adds to another, as one drawn up from it does.
+@(private, require_results)
+roster_extends :: proc(old, new: ^Roster) -> bool {
+	for &was in old.scopes {
+		info := roster_scope(new, was.id)
+		if info == nil || info.flags != was.flags || len(info.commits) < len(was.commits) {
+			return false
+		}
+		for c, i in was.commits {
+			if info.commits[i] != c {
+				return false
+			}
+		}
+		for c, i in was.closed {
+			if info.closed[i] != c {
+				return false
+			}
+		}
+	}
+	if len(new.members) < len(old.members) {
+		return false
+	}
+	for &was, i in old.members {
+		m := &new.members[i]
+		if m.device != was.device || m.signer != was.signer || len(m.grants) < len(was.grants) {
+			return false
+		}
+		for g, j in was.grants {
+			now := m.grants[j]
+			if now.scope != g.scope || (now.until != g.until && g.until != 0) || g.rights - now.rights != {} {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 @(require_results)
@@ -375,6 +472,7 @@ Draft :: struct {
 	owners:  []Owner,
 	admins:  []Key32,
 	now:     u64, // stamp time at which this takes effect
+	random:  proc(into: []byte), // defaults to the operating system
 	scopes:  [dynamic]Draft_Scope,
 	members: [dynamic]Member,
 	relays:  [dynamic]Relay,
@@ -385,7 +483,9 @@ Draft_Scope :: struct {
 	flags:  Scope_Flags,
 	rotate: bool, // draw a new sealing key
 	closed: []u64,
+	commits: []Key32,
 	known:  bool, // there is one already
+	keys:   []Key32, // by epoch, as far as the signer has them
 }
 
 // The current roster as a draft, in temporary memory. `now` should be no less than any stamp the admin
@@ -398,7 +498,7 @@ draft_from :: proc(r: ^Roster, now: u64, allocator := context.temp_allocator) ->
 	d.members = make([dynamic]Member, allocator)
 	d.relays = make([dynamic]Relay, allocator)
 	for s in r.scopes {
-		append(&d.scopes, Draft_Scope{s.id, s.flags, false, s.closed, true})
+		append(&d.scopes, Draft_Scope{id = s.id, flags = s.flags, closed = s.closed, commits = s.commits, known = true})
 	}
 	for m in r.members {
 		m := m
@@ -435,6 +535,10 @@ draft_grant :: proc(d: ^Draft, device, signer: Key32, scope: Scope, rights: Righ
 		append(&d.members, Member{device = device, signer = signer})
 		m = &d.members[len(d.members) - 1]
 	}
+	rights := rights
+	if m.owner {
+		rights += {.Read, .Write}
+	}
 	for &g in m.grants {
 		if g.scope != scope || g.until != 0 {
 			continue
@@ -453,11 +557,10 @@ draft_grant :: proc(d: ^Draft, device, signer: Key32, scope: Scope, rights: Righ
 	return m
 }
 
-// Ends a device's rights in a scope, or everywhere, and rotates what it could read. An owner can be left
-// with no rights, but still owns the space.
+// Ends a device's rights in a scope, or everywhere, and rotates what it could read. An owner's do not end.
 draft_revoke :: proc(d: ^Draft, device: Key32, scope: Scope = 0) {
 	for &m in d.members {
-		if m.device != device {
+		if m.device != device || m.owner {
 			continue
 		}
 		if scope == 0 {
@@ -484,16 +587,48 @@ keyring_rules :: proc(k: ^Keyring, r: ^Roster) -> bool {
 }
 
 // Signs a draft: as an owner, given the space's seed, and otherwise as an admin. Only an owner may change
-// who are owners and admins. The keyring must hold every existing scope's keys.
+// who are owners and admins. An admin must hold every existing scope's keys. An owner need not: an epoch whose
+// key was kept from it is declared void, and those who can open what was sealed under it seal that again.
 @(require_results)
 roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := context.allocator) -> (bytes: []byte, ok: bool) {
-	for s in d.scopes {
+	seed, owner := root.?
+	for &s in d.scopes {
+		if !s.known {
+			continue
+		}
 		held := keyring_scope(k, s.id)
-		if s.known && (held == nil || len(held.epochs) != len(s.closed) + 1) {
-			return
+		keys := make([]Key32, len(s.closed) + 1, context.temp_allocator)
+		if held != nil {
+			copy(keys, held.epochs[:])
+		}
+		s.closed = slice.clone(s.closed, context.temp_allocator)
+		last: u64
+		for key, i in keys {
+			if key != {} {
+				last = s.closed[i] if i < len(s.closed) else last
+				continue
+			}
+			if !owner {
+				return
+			}
+			if i < len(s.closed) {
+				s.closed[i] = last
+			} else {
+				closed := make([]u64, i + 1, context.temp_allocator)
+				copy(closed, s.closed)
+				closed[i] = last
+				s.closed = closed
+			}
+		}
+		s.keys = keys
+	}
+	for i in 0 ..< len(d.members) {
+		if d.members[i].owner {
+			for s in d.scopes {
+				draft_grant(d, d.members[i].device, d.members[i].signer, s.id, member_rights(&d.members[i], s.id))
+			}
 		}
 	}
-	seed, owner := root.?
 	if !owner {
 		seed = k.seed
 	}
@@ -502,7 +637,7 @@ roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := con
 	defer ed25519.private_key_clear(&sk)
 	space, signer, eph_secret: Key32
 	ed25519.private_key_public_bytes(&sk, signer[:])
-	crypto.rand_bytes(eph_secret[:])
+	draft_random(d, eph_secret[:])
 	defer crypto.zero_explicit(&eph_secret, 32)
 	eph := x25519_public(eph_secret)
 
@@ -523,7 +658,7 @@ roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := con
 		by = u64(i) + 1
 		space = d.space
 	}
-	serial := serial_next(term, d.last) or_return
+	serial := serial_next(d, term) or_return
 
 	current := make(map[Scope]Key32, context.temp_allocator)
 	w := make([dynamic]byte, allocator)
@@ -536,15 +671,14 @@ roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := con
 	write_varint(&w, serial)
 	write_varint(&w, u64(len(d.scopes)))
 	for s in d.scopes {
-		held := keyring_scope(k, s.id)
-		epochs := len(held.epochs) if held != nil else 0
-		if epochs == 0 || s.rotate {
+		epochs := len(s.keys)
+		if epochs == 0 || s.rotate || len(s.closed) == epochs {
 			fresh: Key32
-			crypto.rand_bytes(fresh[:])
+			draft_random(d, fresh[:])
 			current[s.id] = fresh
 			epochs += 1
 		} else {
-			current[s.id] = held.epochs[epochs - 1]
+			current[s.id] = s.keys[epochs - 1]
 		}
 		write_varint(&w, u64(s.id))
 		write_u8(&w, transmute(u8)s.flags)
@@ -555,7 +689,11 @@ roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := con
 			last = c
 		}
 		if len(s.closed) < epochs - 1 {
-			write_varint(&w, max(d.now, last))
+			write_varint(&w, max(d.now, last + 1))
+		}
+		for i in 0 ..< epochs {
+			commit := s.commits[i] if i < len(s.commits) else key_commit(current[s.id])
+			append(&w, ..commit[:])
 		}
 	}
 	write_varint(&w, u64(len(d.members)))
@@ -590,14 +728,11 @@ roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := con
 		}
 	}
 	for s in d.scopes {
-		held := keyring_scope(k, s.id)
-		if held == nil {
-			continue
-		}
 		key := history_key(current[s.id])
-		n := len(held.epochs) if s.rotate else len(held.epochs) - 1
-		for old, i in held.epochs[:n] {
-			append_sealed(&w, key, u64(i), old)
+		for old, i in s.keys {
+			if old != current[s.id] {
+				append_sealed(&w, key, u64(i), old)
+			}
 		}
 	}
 	write_varint(&w, by)
@@ -605,6 +740,15 @@ roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := con
 	ed25519.sign(&sk, w[:], sig[:])
 	append(&w, ..sig[:])
 	return w[:], true
+}
+
+@(private)
+draft_random :: proc(d: ^Draft, into: []byte) {
+	if d.random != nil {
+		d.random(into)
+	} else {
+		crypto.rand_bytes(into)
+	}
 }
 
 @(private)
@@ -634,7 +778,7 @@ draft_recharters :: proc(d: ^Draft) -> bool {
 @(private)
 charter_sign :: proc(sk: ^ed25519.Private_Key, space, root: Key32, d: ^Draft, term: u64) -> (bytes: []byte, admins: []Key32, ok: bool) {
 	eph_secret: Key32
-	crypto.rand_bytes(eph_secret[:])
+	draft_random(d, eph_secret[:])
 	defer crypto.zero_explicit(&eph_secret, 32)
 	eph := x25519_public(eph_secret)
 	w := make([dynamic]byte, context.temp_allocator)
@@ -698,12 +842,16 @@ roster_unwrap :: proc(k: ^Keyring, r: ^Roster) -> bool {
 			at += 48 if g.until == 0 else 0
 		}
 	}
-	keyring_clear(k)
+	// What was learnt before is not unlearnt because someone garbles it now.
+	keyring_forget(k)
+	before := k.scopes
+	k.before = before
+	k.scopes = {}
 	for g in me.grants {
 		if g.until != 0 {
 			continue
 		}
-		current := open_key(wrap, u64(g.scope), r.wraps[at:][:48]) or_return
+		wrapped := r.wraps[at:][:48]
 		at += 48
 		sealed := 0
 		for s in r.scopes {
@@ -712,18 +860,94 @@ roster_unwrap :: proc(k: ^Keyring, r: ^Roster) -> bool {
 				continue
 			}
 			keys := Scope_Keys{scope = s.id}
-			key := history_key(current)
-			for i in 0 ..< int(s.epoch - 1) {
-				append(&keys.epochs, open_key(key, u64(i), r.history[sealed + i * 48:][:48]) or_return)
+			resize(&keys.epochs, int(s.epoch))
+			for old in before {
+				if old.scope != s.id {
+					continue
+				}
+				keys.list_key = old.list_key
+				for e, i in old.epochs {
+					if i < int(s.epoch) && e != {} && key_commit(e) == s.commits[i] {
+						keys.epochs[i] = e
+					}
+				}
 			}
-			append(&keys.epochs, current)
+			last := int(s.epoch) - 1
+			if current, ok := open_key(wrap, u64(g.scope), wrapped); ok && key_commit(current) == s.commits[last] {
+				keys.epochs[last] = current
+			}
+			if keys.epochs[last] != {} {
+				key := history_key(keys.epochs[last])
+				for &e, i in keys.epochs[:last] {
+					if e == {} {
+						old, ok := open_key(key, u64(i), r.history[sealed + i * 48:][:48])
+						if ok && key_commit(old) == s.commits[i] {
+							e = old
+						}
+					}
+				}
+			}
 			// List tags outlive rotation: they hang off the first epoch.
-			keys.list_key = derive(keys.epochs[0], "zsp-list")
+			if keys.epochs[0] != {} {
+				keys.list_key = derive(keys.epochs[0], "zsp-list")
+			}
+			scope_keys_index(&keys)
 			append(&k.scopes, keys)
 			break
 		}
 	}
 	return true
+}
+
+// What a device has learnt, sealed for itself alone: rosters may be lost, or garbled by an admin gone bad.
+// Temporary memory.
+@(require_results)
+keyring_save :: proc(k: ^Keyring) -> []byte {
+	w := make([dynamic]byte, context.temp_allocator)
+	for &s in k.scopes {
+		write_varint(&w, u64(s.scope))
+		append(&w, ..s.list_key[:])
+		write_varint(&w, u64(len(s.epochs)))
+		for &e in s.epochs {
+			append(&w, ..e[:])
+		}
+	}
+	iv: [24]byte
+	crypto.rand_bytes(iv[:])
+	out := make([dynamic]byte, context.temp_allocator)
+	append(&out, ..iv[:])
+	aead_append(&out, derive(k.secret, "zsp-keep"), &iv, nil, w[:])
+	crypto.zero_explicit(raw_data(w), len(w))
+	return out[:]
+}
+
+// Before any roster is adopted.
+keyring_load :: proc(k: ^Keyring, bytes: []byte) -> bool {
+	if len(bytes) < 24 {
+		return false
+	}
+	iv: [24]byte
+	copy(iv[:], bytes)
+	plain := make([dynamic]byte, context.temp_allocator)
+	aead_open(&plain, derive(k.secret, "zsp-keep"), &iv, nil, bytes[24:]) or_return
+	defer crypto.zero_explicit(raw_data(plain), len(plain))
+	r := Reader{buf = plain[:]}
+	for r.pos < len(r.buf) && !r.bad {
+		s: Scope_Keys
+		s.scope = Scope(read_varint(&r))
+		s.list_key = read_key32(&r)
+		epochs := read_count(&r) // once: a range's end is found anew at each turn
+		for _ in 0 ..< epochs {
+			append(&s.epochs, read_key32(&r))
+		}
+		scope_keys_index(&s)
+		append(&k.scopes, s)
+	}
+	return !r.bad
+}
+
+key_commit :: proc(key: Key32) -> Key32 {
+	return derive(key, "zsp-commit")
 }
 
 @(private)

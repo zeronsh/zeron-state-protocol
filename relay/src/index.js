@@ -134,18 +134,24 @@ export class Space extends DurableObject {
         this.#make();
         sql.exec("INSERT OR REPLACE INTO page VALUES (?, ?)", no, view(ptr, len).slice());
       },
-      save_roster: (ptr, len) => this.#keep("roster", view(ptr, len).slice()),
+      save_roster: (ptr, len) => {
+        const old = this.#kept("roster");
+        if (old) this.#keep("roster.old", old);
+        this.#keep("roster", view(ptr, len).slice());
+      },
       authenticate: (id, device, ptr, len) => this.#judge(id, hex(view(device, 32)), view(ptr, len).slice()),
       now: () => Date.now(),
     }));
     this.#wasm = exports;
     this.#view = view;
+    const old = this.#kept("roster.old") ?? new Uint8Array();
     const roster = this.#kept("roster") ?? new Uint8Array();
-    const ptr = exports.buffer(64 + roster.length);
+    const ptr = exports.buffer(64 + old.length + roster.length);
     view(ptr, 32).set(space);
     view(ptr + 32, 32).set(unhex(this.env.RELAY_SECRET));
-    view(ptr + 64, roster.length).set(roster);
-    if (!exports.init(ptr, ptr + 32, ptr + 64, roster.length)) throw new Error("storage is damaged");
+    view(ptr + 64, old.length).set(old);
+    view(ptr + 64 + old.length, roster.length).set(roster);
+    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length)) throw new Error("storage is damaged");
     let lost = false;
     for (const ws of this.ctx.getWebSockets()) {
       const { id, state } = ws.deserializeAttachment() ?? {};

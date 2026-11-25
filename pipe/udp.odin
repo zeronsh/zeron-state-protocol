@@ -274,6 +274,12 @@ link_datagram :: proc(l: ^Link, bytes: []byte) -> bool {
 	return true
 }
 
+// Whether all that was written has arrived.
+@(require_results)
+link_quiet :: proc(l: ^Link) -> bool {
+	return link_held(l) == 0
+}
+
 link_close :: proc(l: ^Link) {
 	l.closing = true
 }

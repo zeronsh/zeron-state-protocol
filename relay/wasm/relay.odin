@@ -45,7 +45,7 @@ pages: map[u32]^zsp.Page
 message: [dynamic]byte // handed in and out
 
 @(export)
-init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, roster: [^]byte, roster_len: int) -> bool {
+init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len: int, roster: [^]byte, roster_len: int) -> bool {
 	context = runtime.default_context()
 	secret = secret_ptr^
 	disk := zsp.Disk {
@@ -89,7 +89,7 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, roster: [^]byte, roster_len
 	node.now = u64(now())
 	zsp.node_init(&node, disk, space_ptr^, nil, true) or_return
 	if roster_len > 0 {
-		zsp.node_adopt(&node, roster[:roster_len])
+		zsp.node_resume(&node, before[:before_len], roster[:roster_len])
 	}
 	node.host.roster = proc(_: rawptr, bytes: []byte) {
 		save_roster(raw_data(bytes), len(bytes))

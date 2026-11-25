@@ -36,7 +36,7 @@ subscribed to is a set of ranges, and bringing two replicas level is comparing r
 | identifier | layout |
 |---|---|
 | scope | 32 bits, 1 … 2³²−2 |
-| row | scope (4) ‖ creation time in seconds (4) ‖ random (8) |
+| row | scope (4) ‖ its maker's clock at creation, in seconds (4) ‖ random (8) |
 | list | scope (4) ‖ tag (12), where tag = SHA-256(list key ‖ name)[0..12]. Tag zero is the scope's graveyard |
 | stamp | time (8) ‖ salt (8). time = milliseconds since 1970 × 2¹⁶ + counter; salt is random |
 
@@ -50,7 +50,7 @@ be reused; because the salt is drawn anew from the operating system, even a fork
 above 2⁶³ are invalid. A stamp more than fifteen minutes ahead of the receiver's clock ends the session with *clock*: one of the two is wrong by
 more than can be allowed for, and dialling again will do once they agree. **Nothing is older than its row**: a cell whose time is before the first
 moment of its row's creation second is invalid, whatever its kind. So whoever may no longer write, and can only pretend to have written earlier,
-cannot touch any row made since. A row with a well-known id has creation time zero.
+cannot touch any row made since by one who had heard. A row with a well-known id has creation time zero.
 
 **Slots.** 0 grave, 1–15 places, 16–255 data. Slots are the application's columns.
 
@@ -105,7 +105,8 @@ The **roster** says who may do what. It is a document signed by the space or by 
 ```
 "zsp-r1" ‖ space (32) ‖ charter bytes ‖ serial varint
 n varint, n × scope   { id varint, flags (1), epoch varint ≥ 1,
-                        (epoch − 1) × closed varint }                        ascending ids, ascending times
+                        (epoch − 1) × closed varint,                         ascending ids, ascending times
+                        epoch × commitment (32) }                            commitment = derive(key, "zsp-commit")
 n varint, n × member  { device (32), signer (32), subject bytes,
                         n varint, n × grant { scope varint, rights (1), until varint } }
 n varint, n × relay   { key (32), url bytes }
@@ -117,8 +118,14 @@ signature (64, Ed25519 over everything before it)
 
 A serial is term × 2⁴⁴ + count × 2²⁰ + 20 random bits, its term being the charter's. Of two valid rosters the higher serial wins: a new charter
 outranks whatever was signed under an old one, however high it counts; and of two rosters drawn up at once, all agree which it is, and the other's
-change is to be made again. An admin carries the charter over untouched, and must hold every scope's keys. An owner recovers the seed from the charter,
-member or not, so that no admin can shut owners out. With all but that an admin is trusted, the times at which grants are said to have ended included.
+change is to be made again. An admin carries the charter over untouched, and must hold every scope's keys. With all but the charter an admin is
+trusted: who is who, who may do what, and when that ended.
+
+But no admin can shut an owner out. A roster is invalid unless every owner in its charter is a member, with the charter's signer, and Read and Write in force
+in every scope. No two members share a device or a signer. A key that does not match its commitment is as good as none; a device keeps, sealed for itself, the keys it
+has learnt, so that nothing garbled later takes them away; and an owner signs although a key was kept from it, declaring that epoch **void** by
+closing it no later than the one before (the first, at 0), with 32 zero bytes for its key in `history`. Nothing sealed under a void epoch is acceptable; what honest
+members sealed under it they seal again.
 
 Rights are bits: 1 Read, 2 Write, 4 Call. Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
 invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
@@ -146,27 +153,29 @@ Ending a grant must raise the scope's epoch, but for one in a signed scope that 
 A cell at rest and in transit between devices is **sealed**. Its body is
 
 ```
-clear prefix ‖ [author varint] ‖ epoch varint ‖ ciphertext ‖ tag (16) ‖ [signature (64)]
+clear prefix ‖ [author varint] ‖ key id (4) ‖ ciphertext ‖ tag (16) ‖ [signature (64)]
 ```
 
-XChaCha20-Poly1305 under the scope's key for that epoch, with nonce = stamp (16) ‖ slot ‖ kind ‖ 0 (6), and associated data =
+XChaCha20-Poly1305 under one of the scope's keys, the id being the first 4 bytes of its commitment, with nonce = stamp (16) ‖ slot ‖ kind ‖ 0 (6), and associated data =
 row ‖ slot ‖ kind ‖ clear prefix. The bracketed parts exist in signed scopes: author is an index into the roster's members, and
 the signature, by that member's signer, covers row ‖ slot ‖ kind ‖ stamp ‖ body short of the signature.
 
 A replica accepts a cell from a peer only if
 
-- its scope is in the roster; and
+- its scope is in the roster, and its key is one of the scope's and not void; and
 - in a signed scope, some grant of the author's there includes Write, with `until` zero or no less than the stamp time, and the
-  signature verifies; in an unsigned one, the *sending session* has Write there (a relay one dialled counts as having it), and the epoch is the
-  current one, or the stamp time no greater than that epoch's `closed`; and
+  signature verifies; in an unsigned one, the *sending session* has Write there (a relay one dialled counts as having it), and the key is the
+  current one, or the stamp time no greater than its epoch's `closed`; and
 - where the replica holds the scope's key, the seal opens. Otherwise garbage could win by claiming a late stamp.
 
 In a signed scope authority travels with the cell, so anyone may carry it. In an unsigned scope, to hold the key is to be a writer.
 
 On adopting a roster, and on starting with one it has not yet held its cells against, a replica looks again at cells later than any epoch or grant
 it ends. In an unsigned scope, one that is no longer acceptable is sealed again, with the same stamp, under the key in force at that stamp's
-time, by a replica that can open it, since someone may merely not have heard; otherwise it is dropped. A partial replica offers again
-all it holds in that scope, for who took it may be gone. Then, whatever the roster changed, each side watches afresh. Where a cell is
+time, by a replica that can open it, since someone may merely not have heard; in a signed scope, by its author alone, for a void key; otherwise it is dropped.
+A roster that does not extend the one held (a prefix of whose members, grants, keys and times it keeps) won over it: then everything held is looked at. A partial replica that may have written there offers again
+all it holds in that scope, for who took it may be gone. Then, whatever the roster changed, each device watches afresh, partial ones under new ids. A device's clock moves past
+the end of everything that has ended, but for what is too far ahead. Where a cell is
 held already, another body for the same identity is ignored.
 
 So: a revoked device can open nothing sealed afterwards; nobody who has heard accepts what it writes later; and no row made later can be touched by it,
@@ -242,7 +251,7 @@ Each side first sends
 ```
 
 The accepting host decides from the credential and the proven key whether to serve the connection (§15); until it has, later frames
-wait. Then, between peers, whichever has the newer roster sends it, and each verifies that the other is a member with a grant in
+wait. Then, between peers, whichever has the newer roster sends it (one no older than it said, or the session ends), and each verifies that the other is a member with a grant in
 force, or is a relay it chose to dial:
 
 ```
@@ -329,8 +338,8 @@ wants the row in turn, with *final* set, which is not answered so. Wants are sen
 
 Operations of a piece still being written, from a byte offset in its operation stream, always whole. They are hints: never
 stored, never acknowledged, droppable at any point. A gap is ignored; the piece itself will follow. Between peers the body is
-[author varint] ‖ epoch varint ‖ ciphertext ‖ tag ‖ [signature], the brackets in signed scopes, sealed as in §4 under a fresh stamp with kind 0x40 and associated
-data *a* = row ‖ slot ‖ piece ‖ offset (8); the signature covers *a* ‖ 0x40 ‖ stamp ‖ the body short of it. Only the current epoch's key is accepted, only an author whose right to write is in force, and no stamp more than a minute
+[author varint] ‖ key id ‖ ciphertext ‖ tag ‖ [signature], the brackets in signed scopes, sealed as in §4 under a fresh stamp with kind 0x40 and associated
+data *a* = row ‖ slot ‖ piece ‖ offset (8); the signature covers *a* ‖ 0x40 ‖ stamp ‖ the body short of it. Only the current key is accepted, only an author whose right to write is in force, and no stamp more than a minute
 behind the latest the receiver has seen, nor sixteen behind its clock. From a local client the stamp is zero, and the body at most 2¹⁶ − 128 bytes; between peers it is at most 2¹⁶.
 
 Live frames go only to watches with **live** that cover the row. A node forwards its clients' live watches to its peers, and a relay

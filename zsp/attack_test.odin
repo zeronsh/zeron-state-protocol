@@ -1,7 +1,9 @@
 #+build !js
 package zsp
 
+import "core:crypto/ed25519"
 import "core:math/rand"
+import "core:slice"
 import "core:testing"
 
 // Each of these was once an attack, or a failure, that worked. Most were found by an independent review.
@@ -323,6 +325,7 @@ revoked_devices_stay_asleep :: proc(t: ^testing.T) {
 	saved := make([dynamic]byte, context.temp_allocator)
 	testing.expect(t, session_save(at_relay, &saved))
 	for &m in relay.node.roster.members {
+		m.admin = false
 		for &g in m.grants {
 			g.until = 1
 		}
@@ -663,13 +666,12 @@ a_failing_disk_does_not_admit_the_revoked :: proc(t: ^testing.T) {
 	sim_link(&s, 1, 0)
 	sim_settle(&s)
 	sim_put(&s, a, 1)
-	before := a.roster
 	a.disk.fail = true
 	testing.expect(t, !test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
 		draft_revoke(d, s.nodes[1].keys.device)
 	}))
 	testing.expect(t, !s.links[0].b.ready && a.node.failed)
-	testing.expect_value(t, raw_data(a.roster), raw_data(before)) // not kept, and so heard again
+	testing.expect_value(t, string(a.roster), string(a.node.roster.bytes)) // and will have heard when it starts again
 	a.disk.fail = false
 }
 
@@ -751,7 +753,7 @@ live_text_needs_a_standing_right :: proc(t: ^testing.T) {
 // Damage is found in every form: rotted, zeroed, or cut short; and whatever was in it is forgotten unread.
 @(test)
 evacuation_finds_all_damage :: proc(t: ^testing.T) {
-	for damage in 0 ..< 4 {
+	for damage in 0 ..< 5 {
 		m: Memory_Disk
 		defer memory_disk_destroy(&m)
 		s: Store
@@ -787,6 +789,10 @@ evacuation_finds_all_damage :: proc(t: ^testing.T) {
 			resize(log, first) // at the end of a record
 		case 3:
 			resize(log, first + 20) // in the middle of a placement
+		case 4:
+			for &x in log[:8] {
+				x = 0xff
+			}
 		}
 		for _ in 0 ..< 4 {
 			testing.expectf(t, store_checkpoint(&s), "damage %d", damage)
@@ -985,9 +991,8 @@ admins_come_and_go :: proc(t: ^testing.T) {
 	d.owners = nil
 	bytes, ok = roster_sign(&b, nil, &d, context.temp_allocator)
 	testing.expect(t, ok)
-	coup, parsed := roster_parse(bytes, space)
-	defer roster_destroy(&coup)
-	testing.expect(t, parsed && !roster_unwrap(&a, &coup) && a.root == root)
+	_, parsed := roster_parse(bytes, space)
+	testing.expect(t, !parsed)
 
 	// The owner unmakes the admin, and no serial the admin can reach outranks that.
 	testing.expect(t, roster_unwrap(&a, &r2))
@@ -1006,11 +1011,10 @@ admins_come_and_go :: proc(t: ^testing.T) {
 		roster_destroy(&late)
 	}
 
-	// One who lacks a scope's keys cannot sign for it, rather than losing them for everyone.
-	d = draft_from(&r3, 600)
-	stranger := test_keyring()
-	defer keyring_destroy(&stranger)
-	_, ok = roster_sign(&stranger, root, &d, context.temp_allocator)
+	// An admin who lacks a scope's keys cannot sign for it, rather than losing them for everyone.
+	keyring_clear(&b)
+	d = draft_from(&r2, 600)
+	_, ok = roster_sign(&b, nil, &d, context.temp_allocator)
 	testing.expect(t, !ok)
 }
 
@@ -1022,6 +1026,7 @@ the_stale_are_told :: proc(t: ^testing.T) {
 	s: Sim
 	sim_init(t, &s, 2, 0, 0, 64)
 	defer sim_destroy(&s)
+	sim_level(&s)
 	a, b := s.nodes[0], s.nodes[1]
 	sim_link(&s, 1, 0)
 	sim_settle(&s)
@@ -1041,8 +1046,8 @@ the_stale_are_told :: proc(t: ^testing.T) {
 	at_a := s.links[0].b
 	testing.expect(t, session_input(at_a, raw_cells(old)))
 	testing.expect_value(t, len(at_a.tasks) - at_a.task_head, len(rows))
-	for task, i in at_a.tasks[at_a.task_head:] {
-		testing.expect_value(t, task.row, rows[i])
+	for task in at_a.tasks[at_a.task_head:] {
+		testing.expect(t, slice.contains(rows[:], task.row))
 	}
 }
 
@@ -1134,5 +1139,454 @@ the_revoked_take_nothing_with_them :: proc(t: ^testing.T) {
 	sim_link(&s, 2, 3)
 	sim_settle(&s)
 	testing.expect_value(t, store_range(&a.node.store, KEY_MIN, KEY_MAX).count, 1)
+	testing.expect_value(t, phone.node.outbox.root, 0)
+}
+
+// ---------------------------------------------------------------- the third review
+
+// An admin gone bad garbles the keys it wraps for the owner, and the history, under a key of its own choosing.
+// The owner still holds what it had, still owns the space, and takes it back with everyone's writing.
+@(test)
+an_owner_outlasts_a_rogue_admin :: proc(t: ^testing.T) {
+	state := seeded(70)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 3, 0, 1, 64) // the first owns, the second is an admin
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, b, c := s.nodes[0], s.nodes[1], s.nodes[2]
+	for i in 0 ..< 3 {
+		sim_link(&s, i, 3)
+	}
+	sim_put(&s, a, 1)
+	sim_settle(&s)
+
+	// Nobody can be rid of an owner the plain way.
+	d := draft_from(&b.node.roster, max(b.node.clock, b.node.now << 16))
+	draft_revoke(&d, a.keys.device)
+	d.scopes[0].rotate = true
+	bytes, ok := roster_sign(&b.keys, nil, &d, context.temp_allocator)
+	testing.expect(t, ok)
+	fair, sound := roster_parse(bytes, s.space)
+	testing.expect(t, sound)
+	for g in roster_member(&fair, a.keys.device).grants {
+		testing.expect(t, g.until == 0)
+	}
+	// Nor by hand: the first of the owner's grants is made to have ended, and its key is not wrapped.
+	shorn := make([dynamic]byte, context.temp_allocator)
+	append(&shorn, ..fair.bytes)
+	entry := 0
+	for i in 0 ..< len(shorn) - 64 {
+		if string(shorn[i:][:32]) == string(a.keys.device[:]) && string(shorn[i + 32:][:32]) == string(a.keys.signer[:]) {
+			entry = i // the last: the charter's comes before
+		}
+	}
+	testing.expect(t, shorn[entry + 64] == 0 && shorn[entry + 66] == 1 && shorn[entry + 68] == 0) // no subject; scope 1; in force
+	shorn[entry + 68] = 1
+	lost := int(uintptr(raw_data(fair.wraps)) - uintptr(raw_data(fair.bytes)))
+	remove_range(&shorn, lost, lost + 48)
+	resign: ed25519.Private_Key
+	testing.expect(t, ed25519.private_key_set_bytes(&resign, b.keys.seed[:]))
+	ed25519.sign(&resign, shorn[:len(shorn) - 64], shorn[len(shorn) - 64:])
+	_, usurped := roster_parse(shorn[:], s.space)
+	testing.expect(t, !usurped)
+
+	// So it is left its rights, and lied to about the keys.
+	at := int(uintptr(raw_data(fair.wraps)) - uintptr(raw_data(fair.bytes)))
+	bad := slice.clone(fair.bytes, context.temp_allocator)
+	for &x in bad[at:][:48] {
+		x ~= 0x55 // the owner's, for the first scope
+	}
+	history := int(uintptr(raw_data(fair.history)) - uintptr(raw_data(fair.bytes)))
+	for &x in bad[history:][:len(fair.history)] {
+		x ~= 0x55 // everyone's, of what came before
+	}
+	roster_destroy(&fair)
+	sk: ed25519.Private_Key
+	testing.expect(t, ed25519.private_key_set_bytes(&sk, b.keys.seed[:]))
+	ed25519.sign(&sk, bad[:len(bad) - 64], bad[len(bad) - 64:])
+	testing.expect(t, node_adopt(&b.node, bad))
+	sim_settle(&s)
+	testing.expect_value(t, a.node.roster.serial, b.node.roster.serial)
+	testing.expect(t, a.keys.root != nil && keyring_scope(&a.keys, 1).epochs[1] == {} && keyring_scope(&a.keys, 1).epochs[0] != {})
+	// Others write on, under a key the owner was never given.
+	sim_put(&s, c, 2)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&a.node.store, scope_lo(1), scope_hi(1)).count, 1)
+
+	// What was sealed under the key it was denied is named by that key, whatever time it claims.
+	denied := Cell{row = {1 << 32, 1}, slot = DATA, kind = .Value, stamp = {1, 1}}
+	denied.body = make([]byte, 24, context.temp_allocator)
+	put_u32(denied.body, key_id(roster_scope(&c.node.roster, 1).commits[1]))
+	testing.expect(t, cell_lawful(&c.node.roster, &denied))
+	denied_id := get_u32(denied.body)
+
+	// The owner's device dies, and comes back with what it had kept.
+	#reverse for l, i in s.links {
+		if l.an == 0 {
+			sim_cut(&s, i)
+		}
+	}
+	store_sync(&a.node.store)
+	node_destroy(&a.node)
+	keyring_destroy(&a.keys)
+	keyring_init(&a.keys, a.secret)
+	testing.expect(t, keyring_load(&a.keys, a.kept))
+	sim_boot(&s, a)
+	testing.expect(t, keyring_scope(&a.keys, 1).epochs[0] != {})
+
+	// And takes it back.
+	s.now += 1000
+	a.node.now = s.now
+	testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+		draft_revoke(d, s.nodes[1].keys.device)
+	}))
+	testing.expect(t, epoch_void(roster_scope(&a.node.roster, 1), 2))
+	denied.body = make([]byte, 24, context.temp_allocator)
+	put_u32(denied.body, denied_id)
+	testing.expect(t, !cell_lawful(&a.node.roster, &denied))
+	sim_link(&s, 0, 3)
+	for _ in 0 ..< 40 {
+		pass_all(&s, 1)
+	}
+	testing.expect(t, !node_member(&b.node))
+	testing.expect_value(t, store_range(&a.node.store, scope_lo(1), scope_hi(1)).count, 2)
+	for x in ([]^Sim_Node{a, c, s.nodes[3]}) {
+		testing.expect_value(t, census(&x.node.store), census(&a.node.store))
+		scan := tree_scan(&x.node, x.node.cells, KEY_MIN, KEY_MAX)
+		for leaf in tree_next(&scan) {
+			cell, where_ := cell_unkey(leaf)
+			cell.body = log_bytes(&x.node.store, where_.off, where_.len)
+			testing.expect(t, cell_authentic(&a.node.roster, &cell) && cell_open(&a.keys, &a.node.roster, &cell))
+		}
+	}
+	// No serial the admin can reach outranks that, and nobody may share a signer, or an owner's.
+	testing.expect(t, a.node.roster.term > 1)
+}
+
+// Nobody in a roster is two, and no owner is another.
+@(test)
+members_are_who_they_are :: proc(t: ^testing.T) {
+	root, space := test_root()
+	a, b, c := test_keyring(), test_keyring(), test_keyring()
+	defer keyring_destroy(&a)
+	defer keyring_destroy(&b)
+	defer keyring_destroy(&c)
+	for way in 0 ..< 4 {
+		none: Roster
+		d := draft_from(&none, 100)
+		home := draft_scope(&d)
+		draft_grant(&d, a.device, a.signer, home, {.Write}).owner = true
+		draft_grant(&d, b.device, b.signer, home, {.Write}).admin = true
+		r1 := test_publish(t, &a, root, space, &d)
+		defer roster_destroy(&r1)
+		testing.expect(t, roster_unwrap(&b, &r1))
+		d = draft_from(&r1, 200)
+		switch way {
+		case 1:
+			draft_grant(&d, c.device, b.signer, home, {.Write}) // a stranger who signs as an admin
+		case 2:
+			d.members[0].signer = c.signer // an owner who signs as a stranger
+		case 3:
+			d.members[0].device = c.device // a stranger who signs as an owner
+		}
+		bytes, ok := roster_sign(&b, nil, &d, context.temp_allocator)
+		r2, sound := roster_parse(bytes, space)
+		testing.expectf(t, (ok && sound) == (way == 0), "way %d", way)
+		if sound {
+			roster_destroy(&r2)
+		}
+	}
+}
+
+// A store that was held against a later roster than the one found at the start loses nothing by it.
+@(test)
+an_older_roster_undoes_nothing :: proc(t: ^testing.T) {
+	state := seeded(72)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a := s.nodes[0]
+	sim_put(&s, a, 1)
+	older: []byte
+	defer delete(older)
+	for i in 0 ..< 2 {
+		s.now += 1000
+		a.node.now = s.now
+		testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+			d.scopes[0].rotate = true
+		}))
+		if i == 0 {
+			older = slice.clone(a.node.roster.bytes)
+		}
+	}
+	newer := slice.clone(a.node.roster.bytes)
+	defer delete(newer)
+	s.now += 1000
+	sim_put(&s, a, 2)
+	testing.expect(t, store_checkpoint(&a.node.store))
+	want := census(&a.node.store)
+	node_destroy(&a.node)
+	delete(a.roster)
+	delete(a.roster_old)
+	a.roster_old = nil
+	a.roster = slice.clone(older)
+	sim_boot(&s, a)
+	testing.expect_value(t, census(&a.node.store), want)
+	testing.expect(t, node_adopt(&a.node, newer))
+	testing.expect_value(t, census(&a.node.store), want)
+}
+
+// A forgery costs whoever sends it an answer to nothing.
+@(test)
+forgeries_are_not_answered :: proc(t: ^testing.T) {
+	state := seeded(73)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 3, 0, 0, 64) // the third only reads scope 2
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a := s.nodes[0]
+	sim_link(&s, 2, 0)
+	sim_settle(&s)
+	rows: [2]Id
+	body: [24]byte
+	put_u64(body[:], 2 << 32 | 5)
+	put_u64(body[8:], 5)
+	for &row in rows {
+		row = node_id(&a.node, 2)
+		testing.expect(t, node_write(&a.node, {{row, PLACE, .Place, node_stamp(&a.node), body[:]}, {row, DATA, .Value, node_stamp(&a.node), nil}}))
+	}
+	sim_settle(&s)
+	at_a := s.links[0].b
+	forged := make([]Cell, 200, context.temp_allocator)
+	zeroes := make([]byte, 80, context.temp_allocator) // the first member's, under the right key, so far
+	put_u32(zeroes[1:], key_id(roster_scope(&a.node.roster, 2).commits[0]))
+	for &c, i in forged {
+		c = {rows[i % 2], DATA, .Value, {row_born(rows[i % 2]) + u64(i), 1}, zeroes}
+	}
+	testing.expect(t, session_input(at_a, raw_cells(forged)))
+	testing.expect_value(t, len(at_a.tasks) - at_a.task_head, 0)
+	testing.expect(t, len(at_a.refused) > 0)
+}
+
+// A row is as young as all its maker has heard, so that no right the maker knows to have ended can reach it.
+@(test)
+rows_are_younger_than_what_ended :: proc(t: ^testing.T) {
+	state := seeded(74)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	b.node.now -= 5 * 60 * 1000
+	testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+		draft_grant(d, s.nodes[1].keys.device, s.nodes[1].keys.signer, 2, {.Read})
+	}))
+	ended: u64
+	for g in roster_member(&a.node.roster, b.keys.device).grants {
+		ended = max(ended, g.until)
+	}
+	testing.expect(t, node_adopt(&b.node, a.node.roster.bytes))
+	row := node_id(&b.node, 1)
+	testing.expect(t, row_born(row) > ended && stamp_timely(node_stamp(&b.node), s.now))
+}
+
+// Who says they hold a later roster must show it.
+@(test)
+promised_rosters_are_shown :: proc(t: ^testing.T) {
+	state := seeded(75)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	a := s.nodes[0]
+	p := session_open(&a.node, .Peer, false, s.nodes[1].keys.device)
+	defer session_close(p)
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Hello)
+	append(&w, VERSION, 1)
+	append(&w, ..a.node.space[:])
+	write_varint(&w, max(u64))
+	write_varint(&w, 0)
+	frame_end(&w, at)
+	at = frame_begin(&w, .Roster)
+	append(&w, "zsp-r1")
+	append(&w, ..a.node.space[:])
+	append(&w, 0, 0)
+	frame_end(&w, at)
+	session_input(p, w[:])
+	testing.expect(t, !p.ready && p.fault == .Malformed)
+}
+
+// However fast rosters come, a window is settled by answers to the last asking; and what changed nothing for a
+// peer asks nothing of it.
+@(test)
+asking_afresh_is_counted :: proc(t: ^testing.T) {
+	state := seeded(76)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 1, 2, 1, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, phone, relay := s.nodes[0], s.nodes[1], s.nodes[3]
+	for i in 0 ..< 3 {
+		sim_link(&s, i, 3)
+	}
+	sim_settle(&s)
+	ui := sim_client(&s, phone)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo({1 << 32 | 5, 5}), list_hi({1 << 32 | 5, 5}), 50, {data = true, live = true})
+	empty :: proc(s: ^Sim, d: ^Draft) {
+		draft_scope(d)
+	}
+	for _ in 0 ..< 2 {
+		testing.expect(t, test_amend(&s, a, empty))
+		testing.expect(t, node_adopt(&phone.node, a.node.roster.bytes))
+	}
+	waiting := 0
+	for it in phone.node.interests {
+		waiting += it.waiting
+	}
+	owed := 0
+	for x in phone.node.sessions {
+		owed += len(x.owed)
+	}
+	testing.expect(t, waiting == 1 && owed == 1)
+	sim_settle(&s)
+	for it in phone.node.interests {
+		testing.expect_value(t, it.waiting, 0)
+	}
+	// Nothing of the relay's interests is said again for a scope that has nothing to do with them.
+	for x in relay.node.sessions {
+		session_sent(x, len(session_output(x)))
+	}
+	before := relay.node.next_watch
+	testing.expect(t, test_amend(&s, a, empty))
+	testing.expect(t, node_adopt(&relay.node, a.node.roster.bytes))
+	for x in relay.node.sessions {
+		out := session_output(x)
+		r := Reader{buf = out}
+		for r.pos < len(out) {
+			testing.expect(t, Message(read_bytes(&r)[0]) != .Watch)
+		}
+	}
+	testing.expect_value(t, relay.node.next_watch, before)
+}
+
+// Who never could write somewhere offers nothing of it again.
+@(test)
+readers_offer_nothing :: proc(t: ^testing.T) {
+	state := seeded(77)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 1, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, phone := s.nodes[0], s.nodes[2]
+	body: [24]byte
+	put_u64(body[:], 2 << 32 | 5)
+	put_u64(body[8:], 5)
+	testing.expect(t, node_write(&a.node, {{node_id(&a.node, 2), PLACE, .Place, node_stamp(&a.node), body[:]}}))
+	sim_link(&s, 2, 0)
+	sim_settle(&s)
+	ui := sim_client(&s, phone)
+	defer session_close(ui)
+	sim_watch(ui, 1, scope_lo(2), scope_hi(2), 0, {data = true})
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&phone.node.store, KEY_MIN, KEY_MAX).count, 1)
+	testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+		draft_grant(d, s.nodes[1].keys.device, s.nodes[1].keys.signer, 2, {.Read})
+	}))
+	testing.expect(t, node_adopt(&phone.node, a.node.roster.bytes))
+	testing.expect_value(t, phone.node.outbox.root, 0)
+}
+
+// Two admins draw up rosters at once, each with a key for the same epoch and a scope of the same number. All
+// agree which it is, whatever was in flight, and nothing is left that cannot be read.
+@(test)
+forks_heal :: proc(t: ^testing.T) {
+	state := seeded(78)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 3, 0, 1, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, b, c, relay := s.nodes[0], s.nodes[1], s.nodes[2], s.nodes[3]
+	both :: proc(s: ^Sim, d: ^Draft) {
+		d.scopes[0].rotate = true
+		id := draft_scope(d)
+		for x in s.nodes {
+			if !x.relay {
+				draft_grant(d, x.keys.device, x.keys.signer, id, {.Write})
+			}
+		}
+	}
+	s.now += 1000
+	a.node.now, b.node.now = s.now, s.now
+	testing.expect(t, test_amend(&s, a, both))
+	d := draft_from(&b.node.roster, max(b.node.clock, b.node.now << 16))
+	both(&s, &d)
+	bytes, ok := roster_sign(&b.keys, nil, &d, context.temp_allocator)
+	testing.expect(t, ok && node_adopt(&b.node, bytes))
+	testing.expect(t, node_adopt(&c.node, bytes) && a.node.roster.serial != b.node.roster.serial)
+	s.now += 1000
+	for x in ([]^Sim_Node{a, b, c}) {
+		sim_put(&s, x, 1)
+		body: [24]byte
+		put_u64(body[:], 3 << 32 | 5)
+		put_u64(body[8:], 5)
+		testing.expect(t, node_write(&x.node, {{node_id(&x.node, 3), PLACE, .Place, node_stamp(&x.node), body[:]}}))
+	}
+	// The relay has the one, and the other's writing is on its way to it already.
+	winner := a if a.node.roster.serial > b.node.roster.serial else b
+	testing.expect(t, node_adopt(&relay.node, winner.node.roster.bytes))
+	for i in 0 ..< 3 {
+		sim_link(&s, i, 3)
+	}
+	sim_settle(&s)
+	sim_check(&s)
+	testing.expect_value(t, store_range(&a.node.store, scope_lo(1), scope_hi(1)).count, 3)
+	testing.expect_value(t, store_range(&a.node.store, scope_lo(3), scope_hi(3)).count, 3)
+}
+
+// What came from a peer does not keep the phone in debt to it.
+@(test)
+echoes_are_not_owed :: proc(t: ^testing.T) {
+	state := seeded(79)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 1, 1, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, phone := s.nodes[0], s.nodes[1]
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	sim_put(&s, phone, 1)
+	at_phone, at_a := s.links[0].a, s.links[0].b
+	carry :: proc(from, to: ^Session) {
+		out := session_output(from)
+		copied := make([]byte, len(out), context.temp_allocator)
+		copy(copied, out)
+		session_sent(from, len(out))
+		session_input(to, copied)
+	}
+	carry(at_phone, at_a)
+	node_sync(&a.node)
+	out := session_output(at_a) // the acknowledgement
+	ack := make([]byte, len(out), context.temp_allocator)
+	copy(ack, out)
+	session_sent(at_a, len(out))
+	// Something of that very row comes from there first.
+	scan := tree_scan(&phone.node, phone.node.cells, KEY_MIN, KEY_MAX)
+	leaf, _ := tree_next(&scan)
+	c := Cell{{leaf.key[0], leaf.key[1]}, DATA, .Value, node_stamp(&a.node), nil}
+	testing.expect(t, cell_seal(&a.keys, &a.node.roster, &c))
+	testing.expect(t, session_input(at_phone, raw_cells({c})))
+	testing.expect(t, session_input(at_phone, ack))
+	sim_settle(&s)
 	testing.expect_value(t, phone.node.outbox.root, 0)
 }

@@ -36,6 +36,7 @@ Stream :: struct {
 	in_buf:    [dynamic]byte,
 	pieces:    [dynamic]byte, // of a message that comes in several frames
 	fragmented: bool, // more of pieces is to come
+	dead:      bool, // and is not waited for
 	out:       [dynamic]byte,
 	sent:      int,
 	recv_op:   ^nbio.Operation,
@@ -335,8 +336,12 @@ stream_put :: proc(s: ^Stream, op: pipe.Opcode, payload: []byte) {
 // Draws what the session has to say into the socket, for as long as the socket takes it.
 @(private)
 stream_flush :: proc(s: ^Stream) {
-	for s.send_op == nil && !s.closing {
-		if s.session != nil {
+	if s.dead {
+		stream_close(s)
+		return
+	}
+	for s.send_op == nil {
+		if s.session != nil && !s.closing {
 			for len(s.out) - s.sent < OUT_HIGH {
 				out := zsp.session_output(s.session)
 				if len(out) == 0 {
@@ -357,8 +362,8 @@ stream_flush :: proc(s: ^Stream) {
 				}
 				zsp.session_sent(s.session, n)
 			}
-			if s.session.closing {
-				s.closing = true
+			if s.session.closing && len(zsp.session_output(s.session)) == 0 {
+				s.closing = true // all has been said, the reason last
 			}
 		}
 		if len(s.out) == s.sent {
@@ -369,7 +374,7 @@ stream_flush :: proc(s: ^Stream) {
 			return
 		}
 	}
-	if s.closing && s.send_op == nil {
+	if s.closing && s.send_op == nil && len(s.out) == s.sent {
 		stream_close(s)
 	}
 }
@@ -524,12 +529,12 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 				d.failures = 0 // admitted, not merely answered
 			}
 			if d.dropped {
-				d.stream.closing = true
+				d.stream.dead = true
 				continue
 			}
 			quiet := time.tick_diff(d.stream.quiet_at, now)
 			if d.stream.pinged && quiet >= PONG_WAIT {
-				d.stream.closing = true
+				d.stream.dead = true
 			} else if !d.stream.pinged && quiet >= PING_IDLE {
 				d.stream.pinged = true
 				d.stream.quiet_at = now

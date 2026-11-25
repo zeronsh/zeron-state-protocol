@@ -18,7 +18,7 @@ Sim_Node :: struct {
 	secret: Key32,
 	relay:  bool,
 	full:   bool,
-	roster: []byte, // as persisted
+	roster, roster_old, kept: []byte, // as persisted
 	skew:   i64, // of its clock, in milliseconds
 }
 
@@ -54,18 +54,23 @@ sim_init :: proc(t: ^testing.T, s: ^Sim, full, partial, relays, ring: int) {
 	defer keyring_destroy(&admin)
 	none: Roster
 	d := draft_from(&none, 100)
+	d.random = sim_random
 	home := draft_scope(&d)
 	shown := draft_scope(&d, {.Signed})
 	for i in 0 ..< full + partial + relays {
 		x := new(Sim_Node)
-		x.keys = test_keyring()
-		x.secret = x.keys.secret
+		for &b in x.secret {
+			b = byte(rand.uint32())
+		}
+		keyring_init(&x.keys, x.secret)
 		x.relay = i >= full + partial
 		x.full = i < full || x.relay
 		x.skew = rand.int63_max(600_000) - 300_000
 		append(&s.nodes, x)
 		if !x.relay {
-			draft_grant(&d, x.keys.device, x.keys.signer, home, {.Write, .Call})
+			m := draft_grant(&d, x.keys.device, x.keys.signer, home, {.Write, .Call})
+			// The first owns the space, and the second helps run it.
+			m.owner, m.admin = i == 0, i == 1
 			// The first two devices publish; the others only read.
 			draft_grant(&d, x.keys.device, x.keys.signer, shown, {.Write} if i < 2 else {.Read})
 		}
@@ -82,9 +87,7 @@ sim_init :: proc(t: ^testing.T, s: ^Sim, full, partial, relays, ring: int) {
 sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 	assert(node_init(&x.node, memory_disk(&x.disk), s.space, nil if x.relay else &x.keys, x.full, s.ring))
 	x.node.host.random = proc(_: rawptr, into: []byte) {
-		for &b in into {
-			b = byte(rand.uint32())
-		}
+		sim_random(into)
 	}
 	x.node.host.authenticate = proc(_: rawptr, s: ^Session, credential: []byte) {
 		if s.role == .Peer {
@@ -97,15 +100,28 @@ sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 	}
 	x.node.now = sim_now(s, x)
 	if x.roster != nil {
-		assert(node_adopt(&x.node, x.roster) && !x.node.failed)
+		assert(node_resume(&x.node, x.roster_old, x.roster) && !x.node.failed)
 	} else if !x.relay {
 		assert(node_adopt(&x.node, s.roster))
 	}
 	x.node.host.data = x
 	x.node.host.roster = proc(data: rawptr, bytes: []byte) {
 		x := (^Sim_Node)(data)
-		delete(x.roster)
+		delete(x.roster_old)
+		x.roster_old = x.roster
 		x.roster = slice.clone(bytes)
+	}
+	x.node.host.keep = proc(data: rawptr, bytes: []byte) {
+		x := (^Sim_Node)(data)
+		delete(x.kept)
+		x.kept = slice.clone(bytes)
+	}
+}
+
+@(private)
+sim_random :: proc(into: []byte) {
+	for &b in into {
+		b = byte(rand.uint32())
 	}
 }
 
@@ -114,12 +130,13 @@ sim_now :: proc(s: ^Sim, x: ^Sim_Node) -> u64 {
 	return u64(i64(s.now) + x.skew)
 }
 
-// The first device changes who may do what, or draws new keys; the others hear of it when they hear of it.
+// One of those who may changes who may do what, or draws new keys, perhaps both at once; the others hear of it when they hear of it.
 @(private)
 sim_rotate :: proc(s: ^Sim, restore := false) {
-	x := s.nodes[0]
+	x := s.nodes[0] if restore || len(s.nodes) < 2 || s.nodes[1].relay else s.nodes[rand.int_max(2)]
 	x.node.now = sim_now(s, x)
 	d := draft_from(&x.node.roster, max(x.node.clock, x.node.now << 16))
+	d.random = sim_random
 	who := s.nodes[1 + rand.int_max(len(s.nodes) - 1)]
 	switch r := rand.int_max(6); {
 	case restore:
@@ -151,9 +168,17 @@ sim_rotate :: proc(s: ^Sim, restore := false) {
 	case !who.relay:
 		draft_grant(&d, who.keys.device, who.keys.signer, 1, {.Write, .Call})
 	}
-	bytes, ok := roster_sign(&x.keys, s.root, &d)
+	root: Maybe(Key32)
+	if x == s.nodes[0] {
+		root = s.root
+	}
+	bytes, ok := roster_sign(&x.keys, root, &d)
 	defer delete(bytes)
-	testing.expect(s.t, ok && node_adopt(&x.node, bytes))
+	// The second cannot while it is shut out of something.
+	testing.expect(s.t, ok || x != s.nodes[0])
+	if ok {
+		testing.expect(s.t, node_adopt(&x.node, bytes))
+	}
 }
 
 @(private)
@@ -166,6 +191,8 @@ sim_destroy :: proc(s: ^Sim) {
 		keyring_destroy(&x.keys)
 		memory_disk_destroy(&x.disk)
 		delete(x.roster)
+		delete(x.roster_old)
+		delete(x.kept)
 		free(x)
 	}
 	delete(s.nodes)
@@ -352,7 +379,7 @@ sim_check :: proc(s: ^Sim, looked := false) {
 			continue
 		}
 		check_shelf(s.t, &x.node.store)
-		got := census(&x.node.store, shelved = true)
+		got := census(&x.node.store, shelved = true, reader = s.nodes[0])
 		w, have := want.?
 		if !have {
 			want = got
@@ -381,6 +408,10 @@ sim_look :: proc(s: ^Sim) {
 	sim_check(s, looked = true)
 	for ui in lookers {
 		session_close(ui)
+	}
+	for x in s.nodes {
+		testing.expect(s.t, x.full || x.node.outbox.root == 0)
+		testing.expect(s.t, x.relay || len(x.keys.before) == 0)
 	}
 	sim_settle(s)
 }
@@ -427,10 +458,20 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 				d := memory_disk(&x.disk)
 				d.log_truncate(&x.disk, x.disk.kept + u64(rand.int_max(int(end - x.disk.kept) + 1)))
 			}
-			if x != s.nodes[0] && rand.int_max(3) == 0 {
-				// And someone gave it the latest roster meanwhile.
-				delete(x.roster)
-				x.roster = slice.clone(s.nodes[0].node.roster.bytes)
+			newest := &s.nodes[0].node.roster
+			if x != s.nodes[0] && newest.serial > 0 && rand.int_max(3) == 0 {
+				if serial, _ := roster_claims(x.roster, s.space); serial < newest.serial {
+					// And someone gave it a later roster meanwhile.
+					delete(x.roster_old)
+					x.roster_old = x.roster
+					x.roster = slice.clone(newest.bytes)
+				}
+			}
+			// What it had learnt, it has kept.
+			keyring_destroy(&x.keys)
+			keyring_init(&x.keys, x.secret)
+			if x.kept != nil {
+				testing.expect(s.t, keyring_load(&x.keys, x.kept))
 			}
 			sim_boot(s, x)
 		case:
@@ -460,7 +501,6 @@ network_converges :: proc(t: ^testing.T) {
 		sim_chaos(&s, 800)
 		// Heal, through the relays alone, or with them hushed.
 		direct := seed % 4 == 3
-		sim_rotate(&s, restore = true)
 		for i in 0 ..< len(s.nodes) {
 			for j in 0 ..< len(s.nodes) {
 				if !s.nodes[i].relay && (s.nodes[j].relay || (direct && s.nodes[j].full && i != j)) {
@@ -468,6 +508,9 @@ network_converges :: proc(t: ^testing.T) {
 				}
 			}
 		}
+		// Whichever roster won is known to all, and then the owner's is the only one drawn up.
+		sim_settle(&s)
+		sim_rotate(&s, restore = true)
 		sim_settle(&s)
 		sim_look(&s)
 		// And go on, whole, through changes of everything.
@@ -484,6 +527,7 @@ network_converges :: proc(t: ^testing.T) {
 			}
 			free_all(context.temp_allocator)
 		}
+		sim_settle(&s)
 		sim_rotate(&s, restore = true)
 		sim_settle(&s)
 		sim_look(&s)

@@ -54,11 +54,13 @@ cells :: proc() {
 	zsp.keyring_init(&k, key_of(1))
 	sk := zsp.Scope_Keys{scope = 3, list_key = zsp.derive(key_of(50), "zsp-list")}
 	append(&sk.epochs, key_of(50))
+	zsp.scope_keys_index(&sk)
 	append(&k.scopes, sk)
 	r: zsp.Roster
-	r.scopes = {{3, {}, 1, nil}, {4, {.Signed}, 1, nil}}
+	r.scopes = {{id = 3, epoch = 1}, {id = 4, flags = {.Signed}, epoch = 1}}
 	signed := zsp.Scope_Keys{scope = 4, list_key = zsp.derive(key_of(90), "zsp-list")}
 	append(&signed.epochs, key_of(90))
+	zsp.scope_keys_index(&signed)
 	append(&k.scopes, signed)
 	r.members = {{device = k.device, signer = k.signer, grants = {{4, {.Read, .Write}, 0}}}}
 

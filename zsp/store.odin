@@ -16,7 +16,7 @@ import "core:slice"
 
 SEGMENT :: #config(ZSP_SEGMENT, 16 << 20)
 RECORD_HEAD :: 8
-ROLLED :: max(u32) // where a record's size would be, says that the segment ends here
+ROLLED :: 0xffff_ffff_7a73_7021 // where a record would begin, says that the segment ends with this
 MAX_RECORD :: SEGMENT / 2
 CHECKPOINT_TAIL :: SEGMENT / 4 // log bytes replayed at worst on open
 CHECKPOINT_DIRTY :: 1024 // pages held in memory at worst
@@ -612,7 +612,7 @@ log_roll :: proc(s: ^Store) -> bool {
 	tail := store_tail(s)
 	if SEGMENT - tail % SEGMENT >= RECORD_HEAD {
 		mark: [RECORD_HEAD]byte
-		put_u32(mark[:], ROLLED)
+		put_u64(mark[:], ROLLED)
 		append(&s.buf, ..mark[:])
 	}
 	store_flush(s) or_return
@@ -746,7 +746,7 @@ evacuate :: proc(s: ^Store) -> []u64 {
 	for pos < len(part) {
 		n := record_at(part[pos:])
 		if n == 0 {
-			whole = len(part) - pos >= 4 && get_u32(part[pos:]) == ROLLED
+			whole = len(part) - pos == RECORD_HEAD && get_u64(part[pos:]) == ROLLED
 			break
 		}
 		if !relocate(s, base + u64(pos + RECORD_HEAD), part[pos + RECORD_HEAD:][:n]) {

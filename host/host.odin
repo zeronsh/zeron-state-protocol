@@ -126,6 +126,9 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 	if !h.relay {
 		zsp.keyring_init(&s.keys, h.secret)
 		keys = &s.keys
+		if kept, err := os.read_entire_file(file_in(s.dir, "keys"), context.temp_allocator); err == nil {
+			zsp.keyring_load(keys, kept)
+		}
 	}
 	s.node.now = now_ms()
 	if !zsp.node_init(&s.node, file_disk(&s.disk), id, keys, h.full || h.relay) {
@@ -133,7 +136,8 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		return nil
 	}
 	if bytes, err := os.read_entire_file(file_in(s.dir, "roster"), context.temp_allocator); err == nil {
-		if !zsp.node_adopt(&s.node, bytes) {
+		before, _ := os.read_entire_file(file_in(s.dir, "roster.old"), context.temp_allocator)
+		if !zsp.node_resume(&s.node, before, bytes) {
 			report(.Warning, "the saved roster is not sound")
 		} else if !h.relay && !zsp.node_member(&s.node) {
 			report(.Warning, "this device does not belong to the space")
@@ -142,9 +146,17 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 	s.node.host = {
 		data         = s,
 		authenticate = space_authenticate,
+		keep         = proc(data: rawptr, bytes: []byte) {
+			s := (^Space)(data)
+			file_disk_make(&s.disk)
+			save(file_in(s.dir, "keys"), bytes)
+		},
 		roster       = proc(data: rawptr, bytes: []byte) {
 			s := (^Space)(data)
 			file_disk_make(&s.disk)
+			if old, err := os.read_entire_file(file_in(s.dir, "roster"), context.temp_allocator); err == nil {
+				save(file_in(s.dir, "roster.old"), old)
+			}
 			save(file_in(s.dir, "roster"), bytes)
 			dialers_refresh(s.host)
 		},

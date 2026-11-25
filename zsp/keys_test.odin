@@ -120,7 +120,7 @@ roster_grants_and_revokes :: proc(t: ^testing.T) {
 	testing.expect(t, !cell_open(&b, &r2, &later))
 	// What a wrote before losing the right still stands, and nothing after does.
 	testing.expect(t, cell_authentic(&r2, &post))
-	testing.expect(t, keyring_scope(&a, shown) == nil)
+	testing.expect(t, keyring_scope(&a, shown) != nil) // an owner's rights do not end
 	testing.expect(t, roster_unwrap(&c, &r2))
 	got = post
 	testing.expect(t, cell_open(&c, &r2, &got))

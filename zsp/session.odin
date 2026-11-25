@@ -40,7 +40,8 @@ Session :: struct {
 	relay:     bool, // dialled as a relay, at a key known to be one's
 	peer_full: bool,
 	peer_relay: bool, // and says it is
-	peer_serial: u64,
+	peer_serial: u64, // known to be held by them, or on its way to them
+	promised:  u64, // what their hello said they held
 	credential: []byte, // owned; presented in our hello
 	grants:    [dynamic]Grant, // what the peer may do; scope zero stands for every scope
 	greeted:   bool, // their hello arrived
@@ -184,7 +185,12 @@ session_refuse :: proc(s: ^Session) {
 // What the peer may do in a scope.
 @(require_results)
 session_rights :: proc(s: ^Session, scope: Scope) -> Rights {
-	for g in s.grants {
+	return grants_rights(s.grants[:], scope)
+}
+
+@(private)
+grants_rights :: proc(grants: []Grant, scope: Scope) -> Rights {
+	for g in grants {
 		if (g.scope == scope || g.scope == 0) && g.until == 0 {
 			return g.rights
 		}
@@ -270,6 +276,9 @@ session_fail :: proc(s: ^Session, f: Fault) {
 
 // Feeds bytes from the pipe, in any fragmentation. False means close the pipe.
 session_input :: proc(s: ^Session, bytes: []byte) -> bool {
+	if s.closing {
+		return false
+	}
 	s.busy = true
 	defer s.busy = false
 	bytes := bytes
@@ -321,7 +330,7 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 @(require_results)
 session_output :: proc(s: ^Session) -> []byte {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	if s.ready {
+	if s.ready && !s.closing {
 		pump(s)
 	}
 	return s.out[s.sent:]
@@ -422,7 +431,8 @@ on_hello :: proc(s: ^Session, r: ^Reader) -> Fault {
 	}
 	flags := Hello_Flags(read_u8(r))
 	space := read_key32(r)
-	s.peer_serial = read_varint(r)
+	s.promised = read_varint(r)
+	s.peer_serial = min(s.promised, n.roster.serial)
 	credential := read_bytes(r)
 	if r.bad {
 		return .Malformed
@@ -462,7 +472,7 @@ session_settle_membership :: proc(s: ^Session) {
 		return
 	}
 	send_roster(s)
-	if s.peer_serial <= n.roster.serial {
+	if s.promised <= n.roster.serial {
 		session_authorize(s)
 	} // else a newer roster is on its way, and decides
 }
@@ -515,12 +525,15 @@ on_roster :: proc(s: ^Session, r: ^Reader) -> Fault {
 	if !ok {
 		return .Malformed
 	}
-	s.peer_serial = max(s.peer_serial, serial)
+	if !s.ready && serial < s.promised {
+		return .Malformed // it said it had a later one
+	}
 	if serial > n.roster.serial {
 		roster, sound := roster_parse(bytes, n.space, &n.roster)
 		if !sound {
 			return .Malformed
 		}
+		s.peer_serial = max(s.peer_serial, serial)
 		node_take(n, roster)
 	}
 	if n.keys != nil && !node_member(n) {
@@ -537,6 +550,7 @@ on_roster :: proc(s: ^Session, r: ^Reader) -> Fault {
 @(private)
 session_authorize :: proc(s: ^Session) {
 	n := s.node
+	before := slice.clone(s.grants[:], context.temp_allocator)
 	if s.role == .Peer {
 		clear(&s.grants)
 		m := roster_member(&n.roster, s.peer)
@@ -568,8 +582,12 @@ session_authorize :: proc(s: ^Session) {
 		// that the other never heard. Asking again costs a fingerprint.
 		if !s.paused {
 			roots_send(s, afresh = true)
+		}
+		if n.keys == nil {
+			// A relay's are never dropped; but there may be more it can ask now.
 			for &it in n.interests {
-				if interest_concerns(n, it.session, s) {
+				scope := key_scope(it.watch.lo)
+				if interest_concerns(n, it.session, s) && .Read in session_rights(s, scope) && .Read not_in grants_rights(before, scope) {
 					interest_send(s, &it)
 				}
 			}
@@ -1374,6 +1392,8 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 				session_fail(s, .Denied)
 				return
 			}
+		} else if _, held := tree_get(&n.store, n.cells, cell_key(c.row, c.slot, c.kind, c.stamp)); held {
+			continue // whatever it says, it goes no further: most often, it came by two roads
 		} else if !cell_welcome(s, c) {
 			if len(s.refused) == 0 || s.refused[len(s.refused) - 1] != c.row {
 				append(&s.refused, c.row)
@@ -1398,10 +1418,9 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 	s.seq_in = seq
 	s.ack_at = store_tail(&n.store)
 	// The sender holds something older than this side does, and would not otherwise hear of it.
-	for id, i in stale {
-		if i == 0 || id != stale[i - 1] {
-			append(&s.tasks, Task{kind = .Row, row = id})
-		}
+	slice.sort_by(stale[:], proc(a, b: Id) -> bool {return a[0] < b[0] || (a[0] == b[0] && a[1] < b[1])})
+	for id in slice.unique(stale[:]) {
+		append(&s.tasks, Task{kind = .Row, row = id})
 	}
 }
 
@@ -1421,9 +1440,6 @@ cell_welcome :: proc(s: ^Session, c: Cell) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	c := c
 	cell_lawful(&n.roster, &c) or_return
-	if !store_news(&n.store, c.row, c.slot, c.kind, c.stamp) {
-		return true // it goes no further whatever it says: most often, it came by two roads
-	}
 	cell_authentic(&n.roster, &c) or_return
 	// Where this node holds the key, garbage cannot win by claiming a late stamp.
 	return n.keys == nil || cell_open(n.keys, &n.roster, &c)
@@ -1444,19 +1460,30 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 	for done < len(s.unacked) && s.unacked[done].seq <= seq {
 		done += 1
 	}
+	if done == 0 || s.cursor < n.events.first {
+		remove_range(&s.unacked, 0, done)
+		return // what was written since is not known
+	}
+	// A row refused, or written again since, stays until its latest version is acknowledged too.
+	owed := make(map[Id]bool, context.temp_allocator)
+	for row in refused {
+		owed[row] = true
+	}
+	for v in s.unacked[done:] {
+		owed[v.row] = true
+	}
+	for t in s.tasks[s.task_head:] {
+		if t.kind == .Row || t.kind == .Cell {
+			owed[t.row] = true
+		}
+	}
+	for i := s.cursor; i < n.events.next; i += 1 {
+		if c := ring_at(&n.events, i); c.origin != s.id { // what came from there does not go back
+			owed[c.row] = true
+		}
+	}
 	for u in s.unacked[:done] {
-		// A row written again since stays until its latest version is acknowledged too.
-		later := s.cursor < n.events.first || slice.contains(refused[:], u.row)
-		for v in s.unacked[done:] {
-			later ||= v.row == u.row
-		}
-		for t in s.tasks[s.task_head:] {
-			later ||= (t.kind == .Row || t.kind == .Cell) && t.row == u.row
-		}
-		for i := max(s.cursor, n.events.first); i < n.events.next && !later; i += 1 {
-			later = ring_at(&n.events, i).row == u.row
-		}
-		if !later {
+		if u.row not_in owed {
 			tree_delete(n, &n.outbox, {u.row[0], u.row[1], 0, 0, 0})
 		}
 	}
@@ -1583,7 +1610,7 @@ on_live :: proc(s: ^Session, r: ^Reader) {
 // Seals a live frame under its stamp and, in a signed scope, signs it, as a cell is.
 @(private)
 live_seal :: proc(n: ^Node, keys: ^Scope_Keys, signed: bool, l: ^Live) -> bool {
-	if keys == nil {
+	if keys == nil || keys.epochs[len(keys.epochs) - 1] == {} {
 		return false
 	}
 	bind := live_bind(l)
@@ -1624,7 +1651,7 @@ live_open :: proc(n: ^Node, keys: ^Scope_Keys, signed: bool, l: ^Live) -> bool {
 	}
 	// Only the key of the moment will do: what is live is now.
 	r := Reader{buf = body}
-	if read_varint(&r) != u64(len(keys.epochs)) {
+	if last := len(keys.epochs) - 1; keys.epochs[last] == {} || read_u32(&r) != keys.ids[last] {
 		return false
 	}
 	iv := aead_nonce(l.stamp, l.slot, LIVE_KIND)
