@@ -3,6 +3,13 @@
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
+for d in /opt/homebrew/opt/lld*/bin /usr/local/opt/lld*/bin; do # Homebrew keeps wasm-ld to itself
+	[ -d "$d" ] && PATH="$PATH:$d"
+done
+PYTHON=python3
+command -v python3 >/dev/null || PYTHON=python
+EXE=
+[ "${OS:-}" = Windows_NT ] && EXE=.exe
 STRICT="-vet -strict-style"
 SMALL="-define:ZSP_SEGMENT=262144" # so that tests roll and reclaim segments
 
@@ -12,10 +19,10 @@ wasm() {
 }
 
 end_to_end() {
-	odin build zspd -out:build/zspd -debug $STRICT
+	odin build zspd -out:build/zspd$EXE -debug $STRICT
 	[ -f relay/src/relay.wasm ] || wasm
 	[ -d relay/node_modules ] || (cd relay && npm install --silent)
-	python3 tests/end_to_end.py "$@"
+	$PYTHON tests/end_to_end.py "$@"
 }
 
 case "${1:-test}" in
@@ -27,10 +34,10 @@ check) # every platform, no code generated
 	luau-analyze luau/zsp/init.luau && echo "ok   luau"
 	;;
 test)
-	odin test zsp -out:build/zsp-test $STRICT $SMALL
-	odin test pipe -out:build/pipe-test $STRICT
-	odin build vectors -out:build/vectors $STRICT
-	build/vectors | cmp - vectors/vectors.json
+	odin test zsp -out:build/zsp-test$EXE $STRICT $SMALL
+	odin test pipe -out:build/pipe-test$EXE $STRICT
+	odin build vectors -out:build/vectors$EXE $STRICT
+	build/vectors$EXE | cmp - vectors/vectors.json
 	node tests/vectors.mjs vectors/vectors.json
 	lune run luau/tests/vectors.luau vectors/vectors.json
 	end_to_end
@@ -42,16 +49,16 @@ build)
 	*"clang version $want."*"LLD $want."*) lto=-lto:thin ;;
 	*) lto= ;;
 	esac
-	odin build zspd -out:build/zspd -o:speed $lto $STRICT
+	odin build zspd -out:build/zspd$EXE -o:speed $lto $STRICT
 	;;
 wasm) wasm ;;
 sim) # as many worlds as you have patience for: ./x sim 10000 [first]
-	odin test zsp -o:speed -out:build/sim $SMALL -define:ZSP_SEEDS=${2:-5000} -define:ZSP_FIRST_SEED=${3:-1000} \
+	odin test zsp -o:speed -out:build/sim$EXE $SMALL -define:ZSP_SEEDS=${2:-5000} -define:ZSP_FIRST_SEED=${3:-1000} \
 		-define:ZSP_TEXT_SEEDS=${2:-5000} -define:ZSP_FUZZ=$((${2:-5000} / 10))
 	;;
 bench)
-	odin build bench -out:build/bench -o:speed $STRICT
-	build/bench build/bench-data
+	odin build bench -out:build/bench$EXE -o:speed $STRICT
+	build/bench$EXE build/bench-data
 	;;
 nat) odin build zspd -out:build/zspd -debug $STRICT && sudo tests/nat.sh && sudo env NAT_B=--random-fully EXPECT_RELAY=1 tests/nat.sh ;;
 slow) end_to_end slow_hibernation ;;
