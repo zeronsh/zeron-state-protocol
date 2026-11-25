@@ -35,7 +35,7 @@ test)
 	# Side by side, since none needs another; each says what it has to say at its end.
 	rm -f build/failed
 	for p in zsp pipe find host; do
-		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL -define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &
+		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL -define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &
 	done
 	(odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 || echo zspd >>build/failed) &
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
@@ -62,7 +62,7 @@ sim) # as many worlds as you have patience for: ./x sim 10000 [first]
 	odin test zsp -o:speed -out:build/sim$EXE $SMALL -define:ZSP_SEEDS=${2:-5000} -define:ZSP_FIRST_SEED=${3:-1000} \
 		-define:ZSP_TEXT_SEEDS=${2:-5000} -define:ZSP_FUZZ=$((${2:-5000} / 10))
 	odin test find -o:speed -out:build/find-sim$EXE $SMALL -define:ZSP_FIND_SEEDS=${2:-5000} -define:ZSP_FIND_FIRST=${3:-1000} \
-		-define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8
+		-define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3
 	;;
 bench)
 	odin build bench -out:build/bench$EXE -o:speed $STRICT

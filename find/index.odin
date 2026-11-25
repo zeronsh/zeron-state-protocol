@@ -46,7 +46,7 @@ EVERY_SLOT :: Slots{max(u64), max(u64), max(u64), max(u64)}
 Watcher :: struct {
 	data:   rawptr,
 	before: proc(data: rawptr, s: ^Scope, row: u32),
-	after:  proc(data: rawptr, s: ^Scope, row: u32, slots: ^Slots, gone: bool),
+	after:  proc(data: rawptr, s: ^Scope, row: u32, id: zsp.Id, slots: ^Slots, gone: bool),
 	done:   proc(data: rawptr),
 }
 
@@ -819,7 +819,7 @@ row_reread :: proc(s: ^Scope, id: zsp.Id, slots: ^Slots) {
 	}
 	x.unsaved += 1
 	for w in x.watchers {
-		w.after(w.data, s, row, slots, !there)
+		w.after(w.data, s, row, id, slots, !there)
 	}
 }
 

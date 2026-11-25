@@ -154,7 +154,7 @@ world_write :: proc(t: ^testing.T, w: ^World) {
 			b[0] = byte(rand.int_max(2))
 			put(&cells, 18, .Value, b)
 		case 3:
-			other := rand.choice(w.rows[:])
+			other := rand.choice(w.rows[:]) if rand.int_max(2) == 0 else w.rows[rand.int_max(min(2, len(w.rows)))] // some far more than others
 			b := make([]byte, 16, context.temp_allocator)
 			zsp.put_u64(b, other[0])
 			zsp.put_u64(b[8:], other[1])

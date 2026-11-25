@@ -1,5 +1,6 @@
 package find
 
+import "base:runtime"
 import "core:mem/virtual"
 import "core:slice"
 import "../zsp"
@@ -28,6 +29,7 @@ Finder :: struct {
 	by_value: map[Anchor][dynamic]^Live, // questions that can only hold where a column has a value
 	others:  [dynamic]^Live,
 	anchors: [dynamic]^Held, // columns such questions turn on, each once
+	backs:   [dynamic]^Held, // columns by which questions ask what refers to a row, each once
 	before:  map[u32][dynamic]Anchor, // what rows being gone over had there
 	changed: [dynamic]Changed,
 	settled: bool, // this node is a full replica
@@ -68,6 +70,7 @@ Anchor :: struct {
 Changed :: struct {
 	s:     ^Scope,
 	row:   u32,
+	id:    zsp.Id,
 	slots: Slots,
 	gone:  bool,
 }
@@ -112,6 +115,7 @@ finder_close :: proc(f: ^Finder) {
 	delete(f.by_value)
 	delete(f.others)
 	delete(f.anchors)
+	delete(f.backs)
 	for _, a in f.before {
 		delete(a)
 	}
@@ -339,6 +343,7 @@ live_place :: proc(l: ^Live) {
 	} else {
 		l.anchor = nil
 		append(&f.others, l)
+		finder_backs(f)
 	}
 }
 
@@ -355,6 +360,9 @@ live_free :: proc(l: ^Live) {
 	}
 	take(&f.live, l)
 	take(&f.others, l)
+	if l.joined {
+		finder_backs(f)
+	}
 	if a, ok := l.anchor.?; ok {
 		if at := &f.by_value[a]; at != nil {
 			take(at, l)
@@ -402,23 +410,25 @@ live_free :: proc(l: ^Live) {
 @(private)
 finder_before :: proc(data: rawptr, s: ^Scope, row: u32) {
 	f := (^Finder)(data)
-	for h in f.anchors {
-		if h.scope != s || !h.built {
-			continue
-		}
-		for v in held_values(h, row) {
-			if row not_in f.before {
-				f.before[row] = {}
+	for list, i in ([]^[dynamic]^Held{&f.anchors, &f.backs}) {
+		for h in list {
+			if h.scope != s || !h.built || (i == 1 && slice.contains(f.anchors[:], h)) {
+				continue
 			}
-			append(&f.before[row], Anchor{h, v.key})
+			for v in held_values(h, row) {
+				if row not_in f.before {
+					f.before[row] = {}
+				}
+				append(&f.before[row], Anchor{h, v.key})
+			}
 		}
 	}
 }
 
 @(private)
-finder_after :: proc(data: rawptr, s: ^Scope, row: u32, slots: ^Slots, gone: bool) {
+finder_after :: proc(data: rawptr, s: ^Scope, row: u32, id: zsp.Id, slots: ^Slots, gone: bool) {
 	f := (^Finder)(data)
-	append(&f.changed, Changed{s, row, slots^, gone})
+	append(&f.changed, Changed{s, row, id, slots^, gone})
 }
 
 // A batch has been gone over: questions are asked of the rows in it.
@@ -427,6 +437,9 @@ finder_done :: proc(data: rawptr) {
 	f := (^Finder)(data)
 	if len(f.changed) > 0 {
 		for l in f.others {
+			if l.joined {
+				live_touched(l)
+			}
 			for &c in f.changed {
 				live_changed(l, &c)
 			}
@@ -460,12 +473,6 @@ finder_done :: proc(data: rawptr) {
 @(private)
 live_changed :: proc(l: ^Live, c: ^Changed) {
 	if !l.ready || l.renew || l.far.have {
-		return
-	}
-	if l.joined {
-		if live_reads(l, c) {
-			l.renew = true
-		}
 		return
 	}
 	if c.s.id != l.q.scope {
@@ -509,21 +516,114 @@ live_ordered :: proc(l: ^Live, c: ^Changed) -> bool {
 	return false
 }
 
-// Whether a change is to a scope that some part of a question is about.
+// Asks a question again of the rows it may hold for, or not, because of others that have changed.
 @(private)
-live_reads :: proc(l: ^Live, c: ^Changed) -> bool {
-	about :: proc(p: ^Pred, id: zsp.Scope) -> bool {
-		if (p.op == .Ref || p.op == .Back) && p.scope == id {
-			return true
+live_touched :: proc(l: ^Live) {
+	if !l.ready || l.renew || l.far.have || !query_ready(&l.f.x, &l.q) {
+		return
+	}
+	s := index_scope(&l.f.x, l.q.scope)
+	touched: Set
+	defer set_destroy(&touched)
+	if !pred_touched(l.f, s, &l.q.where_, &touched) {
+		l.renew = true
+		return
+	}
+	it := set_iterator(&touched)
+	for row in set_next(&it) {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		was := set_has(&l.rows, row)
+		now := set_has(&s.all, row) && pred_holds(s, &l.q.where_, row)
+		if now && !was {
+			set_add(&l.rows, row)
+		} else if was && !now {
+			set_remove(&l.rows, row)
 		}
+		l.stale ||= now != was
+	}
+}
+
+// The rows a predicate reaches what has changed from, by what they refer to or what refers to them. False if they are so
+// many that it is as well asked of all.
+@(private)
+pred_touched :: proc(f: ^Finder, s: ^Scope, p: ^Pred, out: ^Set) -> bool {
+	if p.op != .Ref && p.op != .Back {
 		for &k in p.kids {
-			if about(&k, id) {
-				return true
+			pred_touched(f, s, &k, out) or_return
+		}
+		return true
+	}
+	x := &f.x
+	other := index_scope(x, p.scope)
+	inner: Set
+	defer set_destroy(&inner)
+	pred_touched(f, other, &p.kids[0], &inner) or_return
+	cost := 0
+	refers :: proc(x: ^Index, p: ^Pred, id: zsp.Id, out: ^Set, cost: ^int) -> bool {
+		key := Key{id[0], id[1]}
+		cost^ += tree_between(x, p.held.by_key, key, key_next(key)).count
+		if cost^ > TOUCHED + p.held.scope.all.count / 64 {
+			return false
+		}
+		tree_subs(x, p.held.by_key, key, key_next(key), out)
+		return true
+	}
+	referred :: proc(s: ^Scope, key: Key, out: ^Set) {
+		if row, ok := row_number(s, {key.hi, key.lo}); ok {
+			set_add(out, row)
+		}
+	}
+	for &c in f.changed {
+		if c.s != other {
+			continue
+		}
+		if p.op == .Ref {
+			refers(x, p, c.id, out, &cost) or_return
+			continue
+		}
+		for v in held_values(p.held, c.row) {
+			referred(s, v.key, out)
+		}
+		for a in f.before[c.row] {
+			if a.held == p.held {
+				referred(s, a.key, out)
 			}
 		}
-		return false
 	}
-	return c.s.id == l.q.scope || about(&l.q.where_, c.s.id)
+	it := set_iterator(&inner)
+	for row in set_next(&it) {
+		if p.op == .Ref {
+			id := row_id(other, row) or_continue
+			refers(x, p, id, out, &cost) or_return
+			continue
+		}
+		for v in held_values(p.held, row) {
+			referred(s, v.key, out)
+		}
+	}
+	return true
+}
+
+@(private)
+TOUCHED :: #config(ZSP_FIND_TOUCHED, 64)
+
+// The columns by which some live question asks what refers to a row.
+@(private)
+finder_backs :: proc(f: ^Finder) {
+	look :: proc(f: ^Finder, p: ^Pred) {
+		if p.op == .Back && p.held != nil && !slice.contains(f.backs[:], p.held) {
+			append(&f.backs, p.held)
+		}
+		for &k in p.kids {
+			look(f, &k)
+		}
+	}
+	clear(&f.backs)
+	for l in f.others {
+		if l.joined {
+			look(f, &l.q.where_)
+		}
+	}
 }
 
 // Does some of what there is to do, and says whatever follows from it. True when there is nothing left.
@@ -837,11 +937,12 @@ far_wants :: proc(l: ^Live, r: ^zsp.Reader) -> bool {
 	return true
 }
 
-// Whether all the rows of an answer are here, or will not come.
+// Whether all the rows of an answer are here. One that moves or goes before it comes is answered for anew, and one
+// that is nowhere never comes.
 @(private)
 far_whole :: proc(l: ^Live) -> bool {
 	for k in l.far.keys {
-		if zsp.row_places(&l.f.n.store, zsp.key_row(k)).count == 0 && zsp.session_awaits(l.session, k) {
+		if zsp.row_places(&l.f.n.store, zsp.key_row(k)).count == 0 && !zsp.is_graveyard(zsp.key_list(k)) {
 			return false
 		}
 	}
