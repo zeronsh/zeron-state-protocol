@@ -19,7 +19,13 @@ def say(text):
     print("  " + text)
 
 
+def admitted(client, scope):
+    """Waits until a device has heard that it is, which the roster has to reach it for."""
+    client.until(lambda: scope in client.scopes, 15)
+
+
 def put(client, scope, name, text):
+    admitted(client, scope)
     row = client.put(scope, name, 1, [text.encode()])
     client.until(lambda: client.acked == client.seq)
     return row
@@ -27,6 +33,7 @@ def put(client, scope, name, text):
 
 def sees(client, scope, name, text):
     """Whether a row with that text reaches a client."""
+    admitted(client, scope)
     which = client.watches = getattr(client, "watches", 0) + 1
     client.watch(which, scope, name)
     try:
@@ -42,6 +49,21 @@ def denied(client, scope):
     client.ask(which, scope)
     client.until(lambda: which in client.answers)
     return bool(client.answers[which].get("denied"))
+
+
+def scopes_of(device):
+    client = device.client()
+    try:
+        return set(client.scopes)
+    finally:
+        client.sock.close()
+
+
+def eventually(condition, seconds=15):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
 
 
 def main(work):
@@ -121,7 +143,6 @@ def main(work):
     people["scopes"][str(NEWS)] = {"read": ["ann", "bob"], "write": ["hr"]}
     directory.sync(server.dir, people)
     guest = devices["guest"].client()
-    guest.until(lambda: ENGINEERING in guest.scopes, 10)
     assert sees(guest, ENGINEERING, "plans", "ship it") and denied(guest, EVERYONE)
     say("a guest reads what engineering has written, and nothing else is there for them")
 
@@ -134,6 +155,7 @@ def main(work):
     people["teams"]["engineering"] = []
     did = directory.sync(server.dir, people)
     assert {step[0] for step in did} == {"revoke"}
+    eventually(lambda: ENGINEERING not in scopes_of(devices["ann-laptop"]))
     put(guest, ENGINEERING, "plans", "after Ann")
     assert sees(boss, ENGINEERING, "plans", "after Ann")
     fresh = devices["ann-laptop"].client()
