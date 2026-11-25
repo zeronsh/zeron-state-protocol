@@ -501,18 +501,15 @@ do
 		return best.status == "ready" and #best.rows == 20 and best.rows[1].words == "The quick brown foxes"
 	end)
 	local typed = best.rows[1].id
-	assert(not pcall(a.text, a, typed, Track.words), "what is not held cannot be added to")
-	local held: any
-	local holds = a:ask({ scope = 1, table = Track, where = w.ids({ typed }) }, function(s)
-		held = s
-	end)
-	eventually("it is held", function()
-		return #held.rows == 1
+	assert(not a.rows[typed])
+	local editor = a:text(typed, Track.words)
+	editor.append(" ju") -- before it is here
+	eventually("what is being edited is had", function()
+		return editor.read() == "The quick brown foxes ju"
 	end)
 	task.wait(0.1)
 	local began = os.clock()
-	local editor = a:text(typed, Track.words)
-	editor.append(" jump")
+	editor.append("mp")
 	eventually("live text shows in an answer", function()
 		for _, row in best.rows do
 			if row.id == typed then
@@ -522,9 +519,28 @@ do
 		return false
 	end)
 	assert(os.clock() - began < 0.5, "as it is typed, not once it is sealed")
+	local other = b:text(typed, Track.words)
+	other.append("!")
+	eventually("and what others write there is heard", function()
+		return editor.read() == "The quick brown foxes jump!"
+	end)
+	other.close()
 	editor.close()
-	holds.stop()
+	local brief = a:text(tracks[1], Track.words)
+	brief.append("typed and gone")
+	brief.close()
+	local shown: any
+	local shows = b:ask({ scope = 1, table = Track, where = w.matches("words", "typed and gone", { phrase = true }) }, function(s)
+		shown = s
+	end)
+	eventually("even if closed at once", function()
+		return #shown.rows == 1 and shown.rows[1].id == tracks[1]
+	end)
+	shows.stop()
 	searched.stop()
+	eventually("nothing is held for those who edit no more", function()
+		return next(a.asked) == nil
+	end)
 	eventually("nothing is asked", function()
 		return next(b.asked) == nil
 	end)

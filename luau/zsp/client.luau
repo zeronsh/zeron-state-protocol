@@ -86,6 +86,8 @@ type Stored = {
 	pages: number, -- that hold it
 	texts: { [number]: text.Text },
 	held: { [number]: number }, -- open editors, by slot
+	asking: (() -> ())?, -- for the sake of those, while nothing else shows it: ends that
+	awaited: { () -> () }, -- by those, until it is here
 	lives: { [number]: number }, -- when live text was last heard, by slot
 	views: { [any]: Row }, -- by table, until the row changes
 	dirty: { [number]: boolean }, -- slots with live text to send
@@ -848,8 +850,48 @@ end
 
 function Client._release(self: Client, row: Stored)
 	row.pages -= 1
+	if row.pages == 0 and not row.asking and not row.dead then
+		self:_keep(row)
+	end
 	if row.pages == 0 and next(row.held) == nil and not self:_pending(row.id) then
 		self.rows[row.id] = nil
+	end
+end
+
+-- Has a row that is being edited shown, if nothing else shows it, so that what others write in it is heard of too.
+-- Calls back once it is here, or known not to be anywhere.
+function Client._keep(self: Client, row: Stored, here: (() -> ())?)
+	if row.pages > 0 or next(row.held) == nil then
+		if here then
+			here()
+		end
+		return
+	end
+	if here then
+		table.insert(row.awaited, here)
+	end
+	if row.asking then
+		return
+	end
+	local function hear(answer: Answer)
+		if #answer.rows > 0 or answer.status == "ready" or answer.status == "denied" then
+			local awaited = row.awaited
+			row.awaited = {}
+			for _, f in awaited do
+				f()
+			end
+		end
+	end
+	local asked = self:ask({
+		scope = string.unpack(">I4", row.id) :: any,
+		table = {},
+		where = asking.where.ids({ row.id }),
+		limit = 1,
+	}, hear)
+	if next(row.held) then
+		row.asking = asked.stop
+	else
+		asked.stop()
 	end
 end
 
@@ -935,8 +977,9 @@ end
 function Client._row(self: Client, id: string): Stored
 	local row = self.rows[id]
 	if not row then
-		row = { id = id, slots = {}, dead = false, pages = 0, texts = {}, held = {}, lives = {}, views = {}, dirty = {} }
-		self.rows[id] = row
+		local made: Stored = { id = id, slots = {}, dead = false, pages = 0, texts = {}, held = {}, lives = {}, views = {}, dirty = {}, asking = nil, awaited = {} }
+		row = made
+		self.rows[id] = made
 	end
 	return row
 end
@@ -1107,6 +1150,9 @@ function Client._place(self: Client, row: Stored)
 			if have and (not want or entries[have].key ~= want) then
 				table.remove(entries, have)
 				row.pages -= 1
+				if row.pages == 0 and not row.asking and not row.dead then
+					self:_keep(row)
+				end
 				self:_touch(window)
 				have = nil
 			end
@@ -1420,11 +1466,11 @@ end
 -- become durable a piece at a time.
 function Client.text(self: Client, id: string, col: Column)
 	assert(col.text, "not a text column")
-	assert(self.rows[id], "no window and no answer holds the row") -- so there is no telling what is written there
 	local slot = col.slot
+	local early: { () -> () }? = if self.rows[id] then nil else {} -- what is done before there is a row to do it to
 	local row = self:_row(id)
 	row.held[slot] = (row.held[slot] or 0) + 1
-	local closed = false
+	local closed, ended = false, false
 	local function fresh(): string
 		return self.host.random(8)
 	end
@@ -1445,10 +1491,50 @@ function Client.text(self: Client, id: string, col: Column)
 	end
 	local function edit(f: (text.Text) -> ())
 		assert(not closed and not row.dead, "the text is closed")
+		if early then
+			table.insert(early, function()
+				f(self:_text(row, slot))
+			end)
+			return
+		end
 		f(self:_text(row, slot))
 		edited()
 		schedule()
 	end
+	local function finish()
+		if ended or early then
+			return
+		end
+		ended = true
+		if timer then
+			timer()
+		end
+		self:_seal(row, slot)
+		row.held[slot] -= 1
+		if row.held[slot] == 0 then
+			row.held[slot] = nil
+		end
+		local asking = row.asking
+		if asking and next(row.held) == nil then
+			row.asking = nil
+			asking()
+		end
+		self:_place(row)
+	end
+	self:_keep(row, function()
+		local todo = early
+		early = nil
+		if todo and #todo > 0 and not row.dead then
+			for _, f in todo do
+				f()
+			end
+			edited()
+			schedule()
+		end
+		if closed then
+			finish()
+		end
+	end)
 	return table.freeze({
 		read = function(): string
 			return text.read(self:_text(row, slot))
@@ -1478,15 +1564,7 @@ function Client.text(self: Client, id: string, col: Column)
 				return
 			end
 			closed = true
-			if timer then
-				timer()
-			end
-			self:_seal(row, slot)
-			row.held[slot] -= 1
-			if row.held[slot] == 0 then
-				row.held[slot] = nil
-			end
-			self:_place(row)
+			finish()
 		end,
 	})
 end
