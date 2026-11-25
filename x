@@ -37,7 +37,7 @@ test)
 	for p in zsp pipe find host; do
 		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL -define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &
 	done
-	(odin build zspd -out:build/zspd$EXE -debug $STRICT || echo zspd >>build/failed) &
+	(odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 || echo zspd >>build/failed) &
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
 	[ -f relay/src/relay.wasm ] && [ -z "$(find zsp relay/wasm -name "*.odin" -newer relay/src/relay.wasm)" ] || wasm || echo wasm >>build/failed
 	wait
@@ -69,6 +69,6 @@ bench)
 	build/bench$EXE build/bench-data
 	;;
 nat) odin build zspd -out:build/zspd -debug $STRICT && sudo tests/nat.sh && sudo env NAT_B=--random-fully EXPECT_RELAY=1 tests/nat.sh ;;
-slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT && end_to_end slow_hibernation ;;
+slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 && end_to_end slow_hibernation ;;
 *) sed -n 2p "$0" && exit 2 ;;
 esac

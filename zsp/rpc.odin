@@ -272,6 +272,18 @@ node_flow :: proc(n: ^Node, call: u64, kind: Flow, payload: []byte = nil) {
 	}
 }
 
+// Whether any call is under way on a session.
+node_calling :: proc(n: ^Node, s: ^Session) -> bool {
+	for &c in n.calls {
+		for e in c.ends {
+			if e.session == s.id && e.tunnel == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // How much this node may say in a call yet. 0 when there is no such call.
 node_granted :: proc(n: ^Node, call: u64) -> int {
 	for &c in n.calls {

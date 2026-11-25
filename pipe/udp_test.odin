@@ -330,3 +330,36 @@ link_holds_what_it_accepts :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, len(n.links[1].early) <= MAX_EARLY && refused > 0)
 }
+
+// Nobody is there any more, and it is found out, however often there is more to say to them.
+@(test)
+link_to_nobody_is_closed :: proc(t: ^testing.T) {
+	for every in ([]Time{50 * MS, 300 * MS, 1000 * MS, 1700 * MS, 5000 * MS}) {
+		state := rand.create(u64(every))
+		context.random_generator = rand.default_random_generator(&state)
+		n: Net
+		net_init(t, &n)
+		defer net_destroy(&n)
+		n.delay = 5 * MS
+		for i in 0 ..< 50 {
+			link_write(&n.links[i % 2], {1, 2, 3})
+			for net_step(&n) {
+			}
+		}
+		testing.expect(t, n.links[0].state == .Open)
+		l := &n.links[0]
+		start := n.now
+		for n.now - start < 60_000 * MS && l.state == .Open {
+			link_write(l, {1, 2, 3})
+			until := n.now + every
+			for l.state == .Open && n.now < until {
+				buf: [PACKET_MAX]byte
+				for link_output(l, buf[:], n.now) != nil {
+				}
+				d := link_deadline(l)
+				n.now = min(max(d, n.now + 1), until) if d != 0 else until
+			}
+		}
+		testing.expectf(t, l.state == .Closed && n.now - start < 15_000 * MS + every, "after %v ms, saying something every %v", (n.now - start) / MS, every / MS)
+	}
+}

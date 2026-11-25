@@ -84,7 +84,7 @@ Link :: struct {
 	in_flight:   int,
 	largest_acked: u64,
 	acked_any:   bool,
-	last_sent:   Time,
+	waiting:     Time, // since when, for word of what is in flight: more being sent is none
 	probes:      int,
 	want_probe:  bool,
 	closing:     bool,
@@ -278,6 +278,11 @@ link_datagram :: proc(l: ^Link, bytes: []byte) -> bool {
 @(require_results)
 link_quiet :: proc(l: ^Link) -> bool {
 	return link_held(l) == 0
+}
+
+// Says something that must be answered, so that a link to nobody is found out.
+link_poke :: proc(l: ^Link) {
+	l.want_probe = true
 }
 
 link_close :: proc(l: ^Link) {
@@ -484,7 +489,7 @@ link_acked :: proc(l: ^Link, r: ^zsp.Reader, now: Time) {
 	if !any {
 		return
 	}
-	l.probes = 0
+	l.probes, l.waiting = 0, now
 	if newest != 0 {
 		rtt := max(f64(now - newest), 1)
 		if !l.acked_any {
@@ -695,9 +700,11 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 	p.idle = !link_sendable(l)
 	append(&l.sent, p)
 	if eliciting {
+		if l.in_flight == 0 {
+			l.waiting = now
+		}
 		l.in_flight += len(out)
 		l.round_sent += len(out)
-		l.last_sent = now
 	}
 	return out
 }
@@ -757,7 +764,7 @@ link_expire :: proc(l: ^Link, now: Time) {
 		l.state = .Closed
 		return
 	}
-	l.last_sent = now
+	l.waiting = now
 	l.want_probe = true
 	// Send the oldest unacknowledged bytes again.
 	for &p in link_sent(l) {
@@ -778,7 +785,7 @@ link_expire :: proc(l: ^Link, now: Time) {
 @(private)
 link_timeout :: proc(l: ^Link) -> Time {
 	pto := Time(l.srtt + max(4 * l.rttvar, 1000)) + ACK_DELAY
-	return l.last_sent + pto << uint(l.probes) + 1
+	return l.waiting + pto << uint(l.probes) + 1
 }
 
 // When link_output must next be called, absent other reasons; zero for never.

@@ -184,6 +184,8 @@ def test_direct_links():
 
 
 def test_lan_without_relay():
+    import threading
+
     a, b = Node("g"), Node("h")
     sid = zspd("create", a.dir)
     zspd("admit", a.dir, zspd("key", b.dir), "1")
@@ -196,6 +198,11 @@ def test_lan_without_relay():
     cb.until(lambda: 1 in cb.windows)
     ca.put(1, "x", 1, [b"no servers"])
     cb.until(lambda: len(cb.list(1, "x")) == 1)
+    # Whoever was called dies without a word, and the link has nothing to say: the call is known to be lost.
+    cb.serve(1, "wait", lambda device, body: None)
+    ca.until(lambda: len(ca.devices) == 2)
+    threading.Timer(0.7, b.stop).start()
+    assert ca.call(ca.devices[1][0], 1, "wait", timeout=15)["fault"] == 4
 
 
 def refused(*args):
@@ -585,7 +592,7 @@ def one(name):
         print(f"FAIL {name}: {type(e).__name__} {e} at {where}\nlogs in {TMP}")
         for log in sorted(f for f in os.listdir(TMP) if f.endswith(".log")):
             with open(os.path.join(TMP, log), errors="replace") as f:
-                print("".join(f"     {log}: {line}" for line in f.readlines()[-20:]), end="")
+                print("".join(f"     {log}: {line}" for line in f.readlines()[-40:]), end="")
         return 1
     finally:
         for p in procs:

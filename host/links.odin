@@ -18,6 +18,7 @@ KNOCK_EVERY :: 200 * time.Millisecond
 KNOCKS :: 25
 RETRY_AFTER :: 15 * time.Second
 NAT_IDLE :: 25 * time.Second
+CALL_ALIVE :: #config(ZSP_CALL_ALIVE, 15_000) * time.Millisecond // a call is not left waiting on a link that has been quiet for longer
 STUN_WAIT :: 400 * time.Millisecond
 BEACON_PORT :: 9083
 ANNOUNCES :: 4 // at once, then 0.3, 1.2 and 4.8 seconds apart
@@ -394,6 +395,11 @@ links_greet :: proc(s: ^Space, online: []zsp.Key32) {
 	if !s.host.udp.open {
 		return
 	}
+	for p in s.host.udp.links {
+		if p.space == s && p.session != nil && !slice.contains(online, p.device) {
+			pipe.link_poke(p.link) // gone from there, and perhaps from here
+		}
+	}
 	for device in online {
 		if p := peer_for(s, device); p != nil && p.session == nil {
 			peer_offer(p)
@@ -609,7 +615,9 @@ links_run :: proc(h: ^Host) {
 			if p.session.closing && len(zsp.session_output(p.session)) == 0 && pipe.link_quiet(p.link) {
 				pipe.link_close(p.link)
 			}
-			if p.far && time.tick_diff(p.used, now) > NAT_IDLE {
+			if time.tick_diff(p.used, now) >= CALL_ALIVE && zsp.node_calling(&p.space.node, p.session) {
+				pipe.link_poke(p.link)
+			} else if p.far && time.tick_diff(p.used, now) > NAT_IDLE {
 				pipe.link_close(p.link)
 			}
 		} else if p.knocks > 0 && time.tick_diff(p.next_knock, now) >= 0 {
@@ -686,6 +694,9 @@ links_deadline :: proc(h: ^Host) -> (due: pipe.Time) {
 	for p in u.links {
 		if p.session != nil {
 			nearer(&due, pipe.link_deadline(p.link))
+			if zsp.node_calling(&p.space.node, p.session) {
+				nearer(&due, at(p.used, CALL_ALIVE))
+			}
 			if p.far {
 				nearer(&due, at(p.used, NAT_IDLE + time.Millisecond))
 			}
