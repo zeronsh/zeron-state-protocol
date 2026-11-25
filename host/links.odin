@@ -504,9 +504,7 @@ beacon_send :: proc(s: ^Space, to: Maybe(pipe.Address) = nil) {
 	}
 	say :: proc(u: ^Udp, packet: []byte, at: net.IP4_Address) {
 		_, err := net.send_udp(u.socket, packet, {at, BEACON_PORT})
-		if err != nil {
-			report(.Debug, "cannot announce to ", net.address_to_string(at, context.temp_allocator), ": ", fmt.tprint(err))
-		}
+		report(.Debug, "announcing to ", net.address_to_string(at, context.temp_allocator), ": ", fmt.tprint(err))
 	}
 	say(u, packet, {255, 255, 255, 255})
 	// And on interfaces that are not the default one.

@@ -190,6 +190,7 @@ def test_lan_without_relay():
     zspd("peer", b.dir, os.path.join(a.dir, sid, "roster"))
     a.start(), b.start()
     eventually("beacons meet", lambda: "linked directly" in a.log() and "linked directly" in b.log())
+    print(a.log(), end="")
     ca, cb = a.client(), b.client()
     cb.watch(1, 1, "x")
     cb.until(lambda: 1 in cb.windows)
