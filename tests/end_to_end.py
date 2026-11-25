@@ -526,6 +526,9 @@ def one(name):
 
         where = [f.lineno for f in traceback.extract_tb(e.__traceback__) if f.filename == __file__]
         print(f"FAIL {name}: {type(e).__name__} {e} at {where}\nlogs in {TMP}")
+        for log in sorted(f for f in os.listdir(TMP) if f.endswith(".log")):
+            with open(os.path.join(TMP, log), errors="replace") as f:
+                print("".join(f"     {log}: {line}" for line in f.readlines()[-20:]), end="")
         return 1
     finally:
         for p in procs:
