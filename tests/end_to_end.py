@@ -231,7 +231,7 @@ def test_permissions():
     zspd("admit", a.dir, zspd("key", b.dir), str(two), "read")
     cb.until(lambda: two in cb.scopes)
     ca.until(lambda: two in ca.scopes)
-    assert cb.scopes[two][0] == zsp.READ and ca.scopes[two][0] & zsp.WRITE
+    assert cb.scopes[two][0] == zsp.READ | zsp.SAYS_WHOSE and ca.scopes[two][0] & zsp.WRITE
     cb.watch(2, two, "news")
     ca.put(two, "news", 1, [b"signed"])
     cb.until(lambda: len(cb.list(two, "news")) == 1)
@@ -322,6 +322,11 @@ def test_calls():
 
 def test_luau():
     _, (a, b) = space("v", "w")
+    signed = zspd("scope", a.dir, "signed")
+    assert signed == "2"
+    zspd("admit", a.dir, zspd("key", b.dir), signed, "vouch")
+    zspd("subject", a.dir, zspd("key", a.dir), "ann")
+    zspd("subject", a.dir, zspd("key", b.dir), "bob")
     args = []
     for d in (a, b):
         with open(os.path.join(d.dir, "token")) as f:
@@ -482,7 +487,7 @@ def test_limits():
     ca.put(1, "x", 1, [b"first"])
     cb.until(lambda: len(cb.list(1, "x")) == 1)
     # The largest legal value arrives; a larger one is refused before it can do harm.
-    ca.put(1, "x", 2, [os.urandom((1 << 20) - 128)])
+    ca.put(1, "x", 2, [os.urandom((1 << 20) - 192)])
     cb.until(lambda: len(cb.list(1, "x")) == 2)
     try:
         ca.put(1, "x", 3, [bytes(1 << 20)])
@@ -535,7 +540,7 @@ def test_durable_object():
     cb.serve(1, "add", lambda device, body: body + b"!")
     cb.drain(0.1)
     ca.until(lambda: len(ca.devices) == 2)
-    ca.send(zsp.CALL, zsp.varint(9) + ca.devices[1][0] + zsp.varint(1) + zsp.varint(3) + b"addhi")
+    ca.send(zsp.CALL, zsp.varint(9) + ca.devices[1][0] + zsp.varint(1) + zsp.varint(3) + b"add\0hi")
     ca.calls[9] = {"data": [], "ended": False, "fault": None}
     cb.drain(1)
     ca.until(lambda: ca.calls[9]["data"] == [b"hi!"])

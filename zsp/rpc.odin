@@ -130,7 +130,7 @@ on_serve :: proc(s: ^Session, r: ^Reader) {
 	}
 }
 
-// id, device, scope, method, first message
+// id, device, scope, method, for whom, first message
 @(private)
 on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 	n := s.node
@@ -138,8 +138,9 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 	device := read_key32(r)
 	scope := Scope(read_varint(r))
 	method := string(read_bytes(r))
+	who := read_bytes(r)
 	body := read_take(r, len(r.buf) - r.pos)
-	if r.bad || n.keys == nil {
+	if r.bad || n.keys == nil || len(who) > MAX_AS {
 		r.bad = true
 		return
 	}
@@ -161,6 +162,10 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 	allowed := need in (session_rights(s, scope) if local else device_rights(n, caller, scope))
 	if local {
 		allowed &&= !own && .Call in device_rights(n, n.keys.device, scope) && .Call in device_rights(n, device, scope)
+		// A client is for whom the host says it is, and not for whom it says.
+		may: bool
+		who, may = session_as(s, scope, call = true)
+		allowed &&= may
 	} else {
 		allowed &&= need in device_rights(n, n.keys.device, scope)
 	}
@@ -207,23 +212,27 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 		}
 		to.session = server.id
 		append(&n.calls, c)
-		call_put(&server.out, server, to.id, caller if !local else n.keys.device, scope, method, body)
+		if caller = caller if !local else n.keys.device; len(who) == 0 || !device_vouches(n, caller, scope) {
+			m := roster_member(&n.roster, caller)
+			who = m.subject if m != nil else nil
+		}
+		call_put(&server.out, server, to.id, caller, scope, method, who, body)
 		return
 	}
-	if f, ok := call_out(n, &c, device, method, body).?; ok {
+	if f, ok := call_out(n, &c, device, method, who, body).?; ok {
 		refuse(n, from, f)
 	}
 }
 
 // Sends a call on its way to another device.
 @(private)
-call_out :: proc(n: ^Node, c: ^Call, device: Key32, method: string, body: []byte) -> Maybe(Call_Fault) {
+call_out :: proc(n: ^Node, c: ^Call, device: Key32, method: string, who, body: []byte) -> Maybe(Call_Fault) {
 	to := &c.ends[CALLEE]
 	for p in n.sessions {
 		if p.ready && p.role == .Peer && p.peer == device && !p.peer_relay {
 			to.session = p.id
 			append(&n.calls, c^)
-			call_put(&p.out, p, to.id, device, c.scope, method, body)
+			call_put(&p.out, p, to.id, device, c.scope, method, who, body)
 			return nil
 		}
 	}
@@ -237,7 +246,7 @@ call_out :: proc(n: ^Node, c: ^Call, device: Key32, method: string, body: []byte
 	to.session, to.tunnel = t.relay, t.id
 	append(&n.calls, c^)
 	frame: [dynamic]byte
-	call_put(&frame, nil, to.id, device, c.scope, method, body)
+	call_put(&frame, nil, to.id, device, c.scope, method, who, body)
 	tunnel_send(n, t, frame)
 	return nil
 }
@@ -256,7 +265,7 @@ node_call :: proc(n: ^Node, device: Key32, scope: Scope, body: []byte) -> u64 {
 	c := Call{scope = scope, own = true}
 	c.ends[CALLER] = {session = SELF, id = n.next_call - 1, granted = CALL_WINDOW - len(body)}
 	c.ends[CALLEE] = {id = n.next_call, granted = CALL_WINDOW}
-	if _, failed := call_out(n, &c, device, "", body).?; failed {
+	if _, failed := call_out(n, &c, device, "", nil, body).?; failed {
 		return 0
 	}
 	return n.next_call - 1
@@ -321,7 +330,7 @@ node_reach :: proc(n: ^Node) -> []Key32 {
 }
 
 @(private)
-call_put :: proc(w: ^[dynamic]byte, s: ^Session, id: u64, device: Key32, scope: Scope, method: string, body: []byte) {
+call_put :: proc(w: ^[dynamic]byte, s: ^Session, id: u64, device: Key32, scope: Scope, method: string, who, body: []byte) {
 	device := device
 	if s != nil {
 		flush_changes(s) // it may be about them
@@ -332,8 +341,15 @@ call_put :: proc(w: ^[dynamic]byte, s: ^Session, id: u64, device: Key32, scope: 
 	append(w, ..device[:])
 	write_varint(w, u64(scope))
 	write_bytes(w, transmute([]byte)method)
+	write_bytes(w, who)
 	append(w, ..body)
 	frame_end(w, at)
+}
+
+// Whether a device is believed about whom it calls for.
+@(private)
+device_vouches :: proc(n: ^Node, device: Key32, scope: Scope) -> bool {
+	return .Vouch in device_rights(n, device, scope)
 }
 
 // What a device may do in a scope.

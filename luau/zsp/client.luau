@@ -12,12 +12,12 @@ local text = require("./text")
 
 local HELLO, ROSTER, WATCH, UNWATCH, CELLS, ACK = 1, 2, 3, 4, 7, 8
 local ASK, UNASK, ANSWER, FETCH = 32, 33, 34, 35
-local LIVE, SYNCED, PRESENCE, ERROR, SERVE, CALL, FLOW = 9, 10, 12, 13, 14, 15, 16
+local LIVE, SYNCED, PRESENCE, ERROR, SERVE, CALL, FLOW, AUTHOR = 9, 10, 12, 13, 14, 15, 16, 17
 local GRAVE, PLACE, VALUE, PIECE, BUNDLE = 1, 2, 3, 4, 5
 local W_DATA, W_LIVE, W_BACK, W_ADOPT, W_COUNTS = 1, 2, 4, 8, 32
 local F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = 0, 1, 2, 3, 4
 local CALL_WINDOW = 262144
-local MAX_OPEN = 1048576 - 128
+local MAX_OPEN = 1048576 - 192
 local ZERO32 = string.rep("\0", 32)
 
 local PIECE_BYTES = 4096 -- a piece is sealed at this size,
@@ -42,6 +42,7 @@ export type Column = {
 	read is: string, -- what it can be asked about as
 	read encode: (any) -> string,
 	read decode: (string) -> any,
+	read who: ("last" | "all")?, -- not what is in the slot, but who wrote it
 }
 export type Table = { [string]: Column }
 export type Row = { id: string, order: number, [string]: any }
@@ -79,7 +80,7 @@ type Asked = {
 }
 export type Device = { read id: string, read subject: string }
 
-type Cell = { kind: number, stamp: string, body: string }
+type Cell = { kind: number, stamp: string, body: string, author: Device? }
 type Stored = {
 	id: string,
 	slots: { [number]: { [string]: Cell } }, -- by stamp
@@ -130,6 +131,7 @@ export type Call = {
 	on_fault: ((fault: string) -> ())?,
 	device: string,
 	method: string,
+	subject: string?, -- of one that is answered: whom whoever calls goes by
 }
 type Live_Call = {
 	call: Call,
@@ -145,9 +147,9 @@ local Faults = { "denied", "unreachable", "unserved", "lost", "overrun", "busy" 
 
 -- ---------------------------------------------------------------- columns
 
-local function column(slot: number, is: string, encode: (any) -> string, decode: (string) -> any): Column
+local function column(slot: number, is: string, encode: (any) -> string, decode: (string) -> any, who: ("last" | "all")?): Column
 	assert(slot >= 16 and slot <= 255, "data slots are 16 to 255")
-	return table.freeze({ slot = slot, text = is == "text", is = is, encode = encode, decode = decode })
+	return table.freeze({ slot = slot, text = is == "text", is = is, encode = encode, decode = decode, who = who })
 end
 
 local function same(v: any): any
@@ -186,6 +188,20 @@ function columns.custom(slot: number, encode: (any) -> string, decode: (string) 
 	return column(slot, "string", encode, decode)
 end
 
+-- Whose what is in a slot is: whom the last to write there goes by, where the scope says; and everyone who has
+-- written there, in order of their names, for texts.
+local function unwritable(): string
+	error("whose a row is cannot be written")
+end
+
+function columns.author(slot: number): Column
+	return column(slot, "author", unwritable, same, "last")
+end
+
+function columns.authors(slot: number): Column
+	return column(slot, "author", unwritable, same, "all")
+end
+
 -- Collaborative, streamable text.
 function columns.text(slot: number): Column
 	return column(slot, "text", same, same)
@@ -209,6 +225,7 @@ local function new_client(host: Host)
 		clock_ms = 0,
 		clock_n = 0,
 		scopes = {} :: { [number]: { rights: number, key: string } },
+		authors = {} :: { [number]: Device }, -- by what this pipe calls them: 0 is this client
 		devices = {} :: { Device },
 		watchers = {} :: { [string]: { [(any) -> ()]: boolean } },
 		rows = {} :: { [string]: Stored },
@@ -264,7 +281,7 @@ function Client._dial(self: Client)
 	end
 	self.wire = wire
 	local w = codec.writer()
-	codec.put(w, "\1\0")
+	codec.put(w, "\1\4") -- telling who wrote what
 	codec.put(w, ZERO32)
 	codec.put_varint(w, 0)
 	codec.put_bytes(w, self.host.credential)
@@ -274,6 +291,7 @@ end
 function Client._lost(self: Client)
 	self.wire = nil
 	self.ready = false
+	table.clear(self.authors)
 	for _, set in { self.calls, self.answers } do
 		for id, c in set do
 			set[id] = nil
@@ -421,6 +439,15 @@ function Client._handle(self: Client, kind: number, r: codec.Reader)
 		self:_on_flow(r)
 	elseif kind == CALL then
 		self:_on_call(r)
+	elseif kind == AUTHOR then
+		local number = codec.varint(r)
+		local id = codec.take(r, 32)
+		local who = table.freeze({ id = id, subject = codec.bytes(r) })
+		local was = self.authors[number]
+		self.authors[number] = who
+		if number == 0 and not (was and was.id == id and was.subject == who.subject) then
+			self:_tell("self", who)
+		end
 	elseif kind == ROSTER then
 		self:_on_scopes(r)
 	elseif kind == PRESENCE then
@@ -506,8 +533,9 @@ function Client._tell(self: Client, what: string, value: any)
 	end
 end
 
--- "status" (connected or not), "devices" (those reachable, this one first) or "error". Returns a way to stop.
-function Client.on(self: Client, what: "status" | "devices" | "error", f: (any) -> ()): () -> ()
+-- "status" (connected or not), "devices" (those reachable, this one first), "self" (this device, and whom this client
+-- goes by) or "error". Returns a way to stop.
+function Client.on(self: Client, what: "status" | "devices" | "self" | "error", f: (any) -> ()): () -> ()
 	local set = self.watchers[what] or {}
 	self.watchers[what] = set
 	set[f] = true
@@ -515,6 +543,8 @@ function Client.on(self: Client, what: "status" | "devices" | "error", f: (any) 
 		f(self.ready)
 	elseif what == "devices" then
 		f(self.devices)
+	elseif what == "self" and self.authors[0] then
+		f(self.authors[0])
 	end
 	return function()
 		set[f] = nil
@@ -963,7 +993,28 @@ function Client._view(self: Client, row: Stored, schema: Table, key: string): Ro
 	end
 	local made: { [string]: any } = { id = row.id, order = order }
 	for name, c in schema do
-		if c.text then
+		if c.who then
+			local latest: Cell? = nil
+			local names: { [string]: boolean } = {}
+			for _, cell in row.slots[c.slot] or {} :: any do
+				if not latest or cell.stamp > latest.stamp then
+					latest = cell
+				end
+				if cell.author and cell.author.subject ~= "" then
+					names[cell.author.subject] = true
+				end
+			end
+			local list: { string } = {}
+			for name in names do
+				table.insert(list, name)
+			end
+			table.sort(list)
+			if c.who == "all" then
+				made[name] = table.freeze(list)
+			elseif latest and latest.author and latest.author.subject ~= "" then
+				made[name] = latest.author.subject
+			end
+		elseif c.text then
 			local t = self:_text(row, c.slot)
 			made[name] = text.read(t)
 		else
@@ -1012,7 +1063,7 @@ local function bundle_has(body: string, stamp: string): boolean
 end
 
 -- The merge rule. Returns whether the cell was news.
-local function merge(row: Stored, slot: number, kind: number, stamp: string, body: string): boolean
+local function merge(row: Stored, slot: number, kind: number, stamp: string, body: string, author: Device?): boolean
 	if row.dead then
 		return false
 	end
@@ -1049,7 +1100,7 @@ local function merge(row: Stored, slot: number, kind: number, stamp: string, bod
 			end
 		end
 	end
-	cells[stamp] = { kind = kind, stamp = stamp, body = body }
+	cells[stamp] = { kind = kind, stamp = stamp, body = body, author = author }
 	return true
 end
 
@@ -1073,15 +1124,27 @@ function Client._on_cells(self: Client, r: codec.Reader)
 				page.stale[id] = nil
 			end
 		end
-		self:_accept(row, slot, tag % 128, stamp, body)
+		local author: Device? = nil
+		if bit32.btest(tag, 64) then
+			author = self.authors[codec.varint(r)]
+		end
+		self:_accept(row, slot, tag % 64, stamp, body, author)
 	end
 	for row in touched do
 		self:_place(row)
 	end
 end
 
-function Client._accept(self: Client, row: Stored, slot: number, kind: number, stamp: string, body: string): boolean
-	if not merge(row, slot, kind, stamp, body) then
+function Client._accept(self: Client, row: Stored, slot: number, kind: number, stamp: string, body: string, author: Device?): boolean
+	if not merge(row, slot, kind, stamp, body, author) then
+		-- Known already; but perhaps not whose it is, or by what name they go now.
+		local cell = row.slots[slot] and row.slots[slot][stamp]
+		if cell and author then
+			if not cell.author or cell.author.subject ~= author.subject then
+				row.views = {}
+			end
+			cell.author = author
+		end
 		return false
 	end
 	local t = row.texts[slot]
@@ -1529,6 +1592,17 @@ function Client._send_live(self: Client, row: Stored)
 	end
 end
 
+-- This device, and whom this client goes by, once that is known: "self" is told when it changes.
+function Client.me(self: Client): Device?
+	return self.authors[0]
+end
+
+-- Whose what is written here is, in a scope that says.
+function Client._mine(self: Client, scope: number): Device?
+	local s = self.scopes[scope]
+	return if s and bit32.btest(s.rights, 128) then self.authors[0] else nil
+end
+
 function Client._seal(self: Client, row: Stored, slot: number)
 	local t = row.texts[slot]
 	if not t or t.open == "" then
@@ -1537,7 +1611,8 @@ function Client._seal(self: Client, row: Stored, slot: number)
 	local stamp = self:_stamp()
 	local body = text.close(t, stamp)
 	if body then
-		merge(row, slot, PIECE, stamp, body)
+		merge(row, slot, PIECE, stamp, body, self:_mine(string.unpack(">I4", row.id) :: any))
+		row.views = {}
 		self:_send_cells({ { row = row.id, slot = slot, kind = PIECE, stamp = stamp, body = body } })
 	end
 end
@@ -1734,16 +1809,16 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	local fresh: { [string]: boolean } = {} -- rows made here
 	local rows: { [string]: boolean } = {}
 	local function put(row: string, slot: number, kind: number, body: string)
-		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 128 bytes")
+		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 192 bytes")
 		local stamp = self:_stamp()
 		rows[row] = true
 		table.insert(cells, { row = row, slot = slot, kind = kind, stamp = stamp, body = body })
-		self:_accept(self:_row(row), slot, kind, stamp, body)
+		self:_accept(self:_row(row), slot, kind, stamp, body, self:_mine(scope))
 	end
 	local function set(id: string, schema: Table, values: { [string]: any })
 		for name, value in values do
 			local c = schema[name]
-			assert(c, `no column {name}`)
+			assert(c and not c.who, `no column {name} to write`)
 			-- Empty text is what a text is before anything is written: it need only be said to clear one.
 			local row = self.rows[id]
 			if value ~= "" or not c.text or (row and row.slots[c.slot]) or not fresh[id] then
@@ -1807,6 +1882,7 @@ function Client._call(self: Client, id: number, side: number, device: string, me
 	local call: Call = {
 		device = device,
 		method = method,
+		subject = nil,
 		on_data = nil,
 		on_end = nil,
 		on_fault = nil,
@@ -1879,6 +1955,7 @@ function Client.call(self: Client, device: string, scope: number, method: string
 	codec.put(w, device)
 	codec.put_varint(w, scope)
 	codec.put_bytes(w, method)
+	codec.put_bytes(w, "") -- for whom is for the node to say
 	codec.put(w, data)
 	self:_frame(CALL, w)
 	return live.call
@@ -1949,6 +2026,7 @@ function Client._on_call(self: Client, r: codec.Reader)
 	local device = codec.take(r, 32)
 	local scope = codec.varint(r)
 	local method = codec.bytes(r)
+	local subject = codec.bytes(r)
 	local handler = self.handlers[`{scope}/{method}`]
 	if not handler then
 		self:_flow(id, 1, F_FAULT, "\3")
@@ -1956,6 +2034,7 @@ function Client._on_call(self: Client, r: codec.Reader)
 	end
 	local data = codec.rest(r)
 	local live = self:_call(id, 1, device, method)
+	live.call.subject = subject
 	local w = codec.writer()
 	codec.put_varint(w, #data)
 	self:_flow(id, 1, F_CREDIT, codec.string(w))

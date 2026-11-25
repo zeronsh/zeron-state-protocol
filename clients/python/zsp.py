@@ -6,14 +6,14 @@ client speaks to its own device's node; no storage, because the node is that.
 
 import base64, hashlib, os, socket, struct, time
 
-HELLO, ROSTER, WATCH, UNWATCH, RECON, WANT, CELLS, ACK, LIVE, SYNCED, SIGNAL, PRESENCE, ERROR, SERVE, CALL, FLOW = range(1, 17)
+HELLO, ROSTER, WATCH, UNWATCH, RECON, WANT, CELLS, ACK, LIVE, SYNCED, SIGNAL, PRESENCE, ERROR, SERVE, CALL, FLOW, AUTHOR = range(1, 18)
 GRAVE, PLACE, VALUE, PIECE, BUNDLE = range(1, 6)
-READ, WRITE, MAY_CALL = 1, 2, 4
+READ, WRITE, MAY_CALL, VOUCH, SAYS_WHOSE = 1, 2, 4, 8, 128
 F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = range(5)
 DATA_WATCH, LIVE_WATCH, BACK, ADOPT, KNOWN = 1, 2, 4, 8, 16
 KEY_MAX = b"\xff" * 40
 ASK, UNASK, ANSWER, FETCH = 32, 33, 34, 35
-BYTES, FOLD, NUMBER, BOOL, ID, WORDS, CREATED, MODIFIED, ORDER = range(1, 10)
+BYTES, FOLD, NUMBER, BOOL, ID, WORDS, CREATED, MODIFIED, ORDER, OF = range(1, 11)
 SUM, MIN, MAX, COUNT, FACET = range(1, 6)
 
 
@@ -85,6 +85,8 @@ def key_after(prefix):
 def column(kind, slot=0, path="", tag=b""):
     if kind in (CREATED, MODIFIED):
         return bytes([kind])
+    if kind == OF:
+        return bytes([kind, slot])
     return bytes([kind]) + (tag if kind == ORDER else bytes([slot]) + put_bytes(path.encode()))
 
 
@@ -175,7 +177,7 @@ def question(scope, where=ALL, order=(NEWEST,), offset=0, limit=50, from_end=Fal
 
 
 class Client:
-    def __init__(self, address, credential, timeout=10):
+    def __init__(self, address, credential, timeout=10, authors=False):
         host, port = address.rsplit(":", 1)
         self.sock = socket.create_connection((host, int(port)), timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -200,10 +202,13 @@ class Client:
         self.lives = []  # (row, slot, piece, offset, bytes)
         self.answers = {}  # question id -> dict(rows, total, first, settled, totals), or what is said instead
         self.devices = []  # reachable: (key, subject), this one first
+        self.authors = {}  # number -> (device, subject): 0 is this client
+        self.by = {}  # (row, slot, stamp) -> author's number
+        self.caller = None  # the subject of whoever's call is being answered
         self.handlers = {}  # (scope, method) -> function(device, bytes) -> bytes
         self.calls = {}  # id -> {"data": [], "ended": bool, "fault": int or None}
         self.next_call = 0
-        self.send(HELLO, bytes([1, 0]) + bytes(32) + varint(0) + varint(len(credential)) + credential)
+        self.send(HELLO, bytes([1, 4 if authors else 0]) + bytes(32) + varint(0) + varint(len(credential)) + credential)
         while self.step() != ROSTER:
             pass
 
@@ -268,7 +273,13 @@ class Client:
                 tag = r.u8()
                 if not tag & 0x80:
                     row = r.take(16)
-                self.merge(row, r.u8(), tag & 0x7F, r.take(16), r.bytes())
+                slot, stamp, value = r.u8(), r.take(16), r.bytes()
+                if tag & 0x40:
+                    self.by[(row, slot, stamp)] = r.varint()
+                self.merge(row, slot, tag & 0x3F, stamp, value)
+        elif kind == AUTHOR:
+            number = r.varint()
+            self.authors[number] = (r.take(32), r.bytes())
         elif kind == ACK:
             self.acked = r.varint()
         elif kind == SYNCED:
@@ -286,6 +297,7 @@ class Client:
                 self.devices.append((r.take(32), r.bytes()))
         elif kind == CALL:
             call, device, scope, method = r.varint(), r.take(32), r.varint(), r.bytes().decode()
+            self.caller = r.bytes()
             answer = self.handlers[(scope, method)](device, r.take(len(body) - r.pos))
             self.flow(call, 1, F_DATA, answer)
             self.flow(call, 1, F_END)
@@ -429,11 +441,16 @@ class Client:
     def call(self, device, scope, method, body=b"", timeout=10):
         self.next_call += 1
         call = self.calls[self.next_call] = {"data": [], "ended": False, "fault": None}
-        self.send(CALL, varint(self.next_call) + device + varint(scope) + varint(len(method)) + method.encode() + body)
+        self.send(CALL, varint(self.next_call) + device + varint(scope) + varint(len(method)) + method.encode() + b"\0" + body)
         self.flow(self.next_call, 0, F_END)
         self.until(lambda: call["ended"], timeout)
         del self.calls[self.next_call]
         return call
+
+    def author(self, row, slot):
+        """Whom the last to write there goes by, and on which device, if that is known: (device, subject)."""
+        stamps = [t for (s, _, t) in self.rows.get(row, ()) if s == slot]
+        return self.authors.get(self.by.get((row, slot, max(stamps)))) if stamps else None
 
     def list(self, scope, name):
         """Rows of a list in order: (order, id, {slot: value})."""

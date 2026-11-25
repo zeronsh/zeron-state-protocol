@@ -10,7 +10,7 @@ import tempfile
 import time
 
 import directory
-from zspd import ROOT, Device, zspd
+from zspd import ROOT, Device, zsp, zspd
 
 EVERYONE, ENGINEERING, NEWS, ANN = 1, 2, 3, 4  # scopes
 
@@ -136,6 +136,13 @@ def main(work):
         pass
     assert not sees(ann, NEWS, "news", "free lunch")
     say("all may read the news, and only HR write it: every replica checks who signed")
+    reader = devices["ann-phone"].client(authors=True)
+    item = sees(reader, NEWS, "news", "new coffee") and reader.list(NEWS, "news")[0][1]
+    assert reader.author(item, 16)[1] == b"hana"
+    assert reader.fetch(NEWS, zsp.equals(zsp.column(zsp.OF, 16), "hana"))["rows"] == [item]
+    people["scopes"][str(NEWS)]["vouch"] = ["bob"]
+    assert directory.sync(server.dir, people) == [("admit", devices["bob"].key, str(NEWS), "vouch")] and directory.sync(server.dir, people) == []
+    say("and everyone is told whose it is. Bob's device has the company's website on it now, which says whose is what it writes")
 
     # A guest has one scope, and the rest of the company is not there.
     people["people"]["guest"] = [devices["guest"].key]

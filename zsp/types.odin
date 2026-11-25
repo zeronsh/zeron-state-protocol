@@ -60,7 +60,8 @@ KEY_MIN :: Key{}
 KEY_MAX :: Key{max(u64), max(u64), max(u64), max(u64), max(u64)} // reserved: exclusive upper bound
 
 MAX_CELL :: 1 << 20 // a body at rest and between devices
-MAX_OPEN :: MAX_CELL - 128 // and before it is sealed, and perhaps signed
+MAX_OPEN :: MAX_CELL - 192 // and before it is sealed, and perhaps signed
+MAX_AS :: 64 // bytes of a name that a device vouches for
 
 // A stamp further ahead of the clock than this is refused. Clocks follow stamps, so what one device's clock
 // may be off by, every device's may; and it is how long a right may outlive its revocation.

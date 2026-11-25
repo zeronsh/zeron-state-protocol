@@ -4,7 +4,7 @@
 
 local codec = require("./codec")
 
-local BYTES, FOLD, NUMBER, BOOL, ID, WORDS, CREATED, MODIFIED, ORDER = 1, 2, 3, 4, 5, 6, 7, 8, 9
+local BYTES, FOLD, NUMBER, BOOL, ID, WORDS, CREATED, MODIFIED, ORDER, AUTHOR = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
 local SUM, MIN, MAX, COUNT, FACET = 1, 2, 3, 4, 5
 
 export type Columns = { [string]: { read slot: number, read is: string } }
@@ -136,6 +136,10 @@ local function column(x: Writing, name: string, value: any, want: number?): numb
 		local kind = if is == "created" then CREATED else MODIFIED
 		codec.put_u8(x.w, kind)
 		return kind
+	elseif is == "author" then
+		codec.put_u8(x.w, AUTHOR)
+		codec.put_u8(x.w, slot)
+		return AUTHOR
 	end
 	local kind = want or kind_of(is, value)
 	put_column(x, kind, slot, path)

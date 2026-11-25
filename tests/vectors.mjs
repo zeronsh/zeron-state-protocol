@@ -85,7 +85,11 @@ for (const c of v.cells) {
   assert.deepEqual(sealed.subarray(0, 4), hkdf(null, bytes(c.key), "zsp-commit").subarray(0, 4)); // which key
   const nonce = Buffer.concat([s.stamp, Buffer.from([s.slot, s.kind, 0, 0, 0, 0, 0, 0])]);
   const plain = xopen(bytes(c.key), nonce, Buffer.concat([id, s.body.subarray(0, clear)]), sealed.subarray(4));
-  assert.deepEqual(Buffer.concat([s.body.subarray(0, clear), plain]), o.body);
+  // and in a signed scope, for whom, first
+  const as = bytes(c.as);
+  const before = s.row.readUInt32BE(0) === 4 ? Buffer.concat([Buffer.from([as.length]), as]) : Buffer.alloc(0);
+  assert.deepEqual(plain.subarray(0, before.length), before);
+  assert.deepEqual(Buffer.concat([s.body.subarray(0, clear), plain.subarray(before.length)]), o.body);
 }
 
 // §7 the handshake, from both ends

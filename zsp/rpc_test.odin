@@ -18,6 +18,8 @@ Caller :: struct {
 	faults: [dynamic]Call_Fault,
 	cancels: int,
 	reach:  int, // devices, itself included
+	who:    string, // owned; for whom the last call was
+	claim:  []byte, // what is said of that in calling, for what it is worth
 }
 
 @(private)
@@ -27,6 +29,7 @@ caller_destroy :: proc(c: ^Caller) {
 	delete(c.data)
 	delete(c.faults)
 	delete(c.method)
+	delete(c.who)
 }
 
 @(private)
@@ -43,6 +46,8 @@ caller_read :: proc(c: ^Caller) {
 			_ = read_varint(&f)
 			delete(c.method)
 			c.method = strings.clone(string(read_bytes(&f)))
+			delete(c.who)
+			c.who = strings.clone(string(read_bytes(&f)))
 			clear(&c.first)
 			append(&c.first, ..f.buf[f.pos:])
 		case .Flow:
@@ -86,7 +91,7 @@ caller_serve :: proc(c: ^Caller, scope: Scope, method: string) -> bool {
 @(private)
 caller_call :: proc(c: ^Caller, id: u64, device: Key32, scope: Scope, method, body: string) {
 	w := make([dynamic]byte, context.temp_allocator)
-	call_put(&w, nil, id, device, scope, method, transmute([]byte)body)
+	call_put(&w, nil, id, device, scope, method, c.claim, transmute([]byte)body)
 	session_input(c.s, w[:])
 }
 

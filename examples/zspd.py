@@ -38,9 +38,9 @@ class Device:
         self.name, self.address = re.match(r"(\w{64}) listening on ws://(\S+)", self.process.stdout.readline()).groups()
         return self
 
-    def client(self, credential=None):
+    def client(self, credential=None, **more):
         with open(os.path.join(self.dir, "token"), "rb") as f:
-            return zsp.Client(self.address, credential or f.read())
+            return zsp.Client(self.address, credential or f.read(), **more)
 
     def stop(self):
         if self.process:

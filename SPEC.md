@@ -64,7 +64,7 @@ cannot touch any row made since by one who had heard. A row with a well-known id
 | 5 | Bundle | 16–255 | n (4, ≥ 1) ‖ n stamps (16 each), strictly ascending |
 
 Every stamp a bundle names is less than its own. A bundle that names a bundle must also name everything that one names. It kills, and
-refuses, pieces and bundles only. A sealed body is at most 2²⁰ bytes; before sealing, clear prefix included, at most 2²⁰ − 128.
+refuses, pieces and bundles only. A sealed body is at most 2²⁰ bytes; before sealing, clear prefix included, at most 2²⁰ − 192.
 
 ## 2 Encoding
 
@@ -128,9 +128,9 @@ has learnt, so that nothing garbled later takes them away; and an owner signs al
 closing it no later than the one before (the first, at 0), with 32 zero bytes for its key in `history`. Nothing sealed under a void epoch is acceptable; what honest
 members sealed under it they seal again.
 
-Rights are bits: 1 Read, 2 Write, 4 Call. Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
+Rights are bits: 1 Read, 2 Write, 4 Call, 8 Vouch: to be believed about for whom one writes and calls (§4, §12). Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
 invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
-a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed. `closed`
+a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed; and so does taking Vouch away in a signed scope. `closed`
 says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
 `subject` is the consumer's name for whomever the device belongs to, opaque here. A roster is at most 2²² − 64 bytes. Members are never removed, only their grants
 ended, so that a member's index is for ever.
@@ -147,7 +147,7 @@ of the scope's current sealing key. For each scope in order, `history` holds its
 ChaCha20-Poly1305 under derive(current key, "zsp-history") with nonce 0 (4) ‖ epoch − 1 (8). A scope's **list key** is
 derive(first epoch's key, "zsp-list").
 
-Ending a grant must raise the scope's epoch, but for one in a signed scope that only loses Write. Admitting a device need not.
+Ending a grant must raise the scope's epoch, but for one in a signed scope that only loses Write or Vouch. Admitting a device need not.
 
 ## 4 Cells
 
@@ -159,7 +159,12 @@ clear prefix ‖ [author varint] ‖ key id (4) ‖ ciphertext ‖ tag (16) ‖ 
 
 XChaCha20-Poly1305 under one of the scope's keys, the id being the first 4 bytes of its commitment, with nonce = stamp (16) ‖ slot ‖ kind ‖ 0 (6), and associated data =
 row ‖ slot ‖ kind ‖ clear prefix. The bracketed parts exist in signed scopes: author is an index into the roster's members, and
-the signature, by that member's signer, covers row ‖ slot ‖ kind ‖ stamp ‖ body short of the signature.
+the signature, by that member's signer, covers row ‖ slot ‖ kind ‖ stamp ‖ body short of the signature. In a signed scope the plaintext is
+`as` (bytes, at most 64) ‖ what was written: for whom its author wrote it, if for another than its device belongs to, and otherwise nothing.
+
+**Whose a cell is**, in a signed scope: that of whom `as` names, if a grant of the author's there includes Vouch, with `until` zero or no less than the stamp time, and `as` is not
+empty; otherwise its author's `subject`. Nothing is refused over it, and a relay sees none of it. In an unsigned scope a cell is nobody's. A host says for whom a local client is as it accepts it, and a node writes nothing there for
+anybody else without Vouch: that is *denied*. What is sealed again keeps its `as`.
 
 A replica accepts a cell from a peer only if
 
@@ -248,7 +253,7 @@ clear prefix and then plaintext; the node seals and opens on its client's behalf
 Each side first sends
 
 ```
-1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, 2 relay: which only confirms what the dialler knows) ‖ space (32) ‖ roster serial varint ‖ credential bytes
+1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, 2 relay: which only confirms what the dialler knows; 4, of a local client, that it is told whose cells are) ‖ space (32) ‖ roster serial varint ‖ credential bytes
 ```
 
 The accepting host decides from the credential and the proven key whether to serve the connection (§15); until it has, later frames
@@ -257,8 +262,13 @@ force, or is a relay it chose to dial:
 
 ```
 2 Roster   the document                                                       between peers
-           clock (8) ‖ n × { scope varint, rights (1), list key (32) }        to a local client: what it may do, and what it needs to
+           clock (8) ‖ n × { scope varint, rights (1, and 128 in a signed scope), list key (32) }
+                                                                              to a local client: what it may do, and what it needs to
+17 Author  number varint ‖ device (32) ‖ subject bytes                        to a local client that asked: whom a number is for from now on
 ```
+
+Whose a cell is follows it, to a local client that asked: 0x40 in its tag, and after its body the number (varint) of an Author said before. Number 0 is the client itself, said ahead of all else and again
+whenever the roster changes. When the roster changes whose anything is, all that is watched is sent again, under new numbers.
 
 A roster that arrives later is adopted likewise, at any time, from anyone; its signature is its authority. Sessions it no longer allows end, and a
 device it no longer allows gives up its keys.
@@ -352,13 +362,14 @@ writer seals a piece within about a second of beginning it; a reader drops live 
 
 ```
 14 Serve   scope varint ‖ 1 or 0 ‖ method bytes                             a local client offers a method, or ceases to
-15 Call    id varint ‖ device (32) ‖ scope varint ‖ method bytes ‖ first message
+15 Call    id varint ‖ device (32) ‖ scope varint ‖ method bytes ‖ for whom bytes ‖ first message
 16 Flow    id varint × 2 + (1 if sent by the callee) ‖ kind (1) ‖ payload
            0 Data (message) · 1 End · 2 Fault (code (1)) · 3 Cancel · 4 Credit (varint bytes)
 12 Presence   to a local client: n × { device (32), subject bytes }, this device first, then all it can reach
 ```
 
-A call is a stream of messages each way. `device` is the callee's on the way out and the caller's on arrival. Ids belong to whoever sent
+A call is a stream of messages each way. `device` is the callee's on the way out and the caller's on arrival. For whom is at most 64 bytes: what a client says of that is disregarded, and its node says whom its host accepted it for, or nothing; the
+last node tells its own client the same if the calling device has Vouch in that scope, and otherwise the device's `subject`. Who may not vouch may not call for another: *denied*. Ids belong to whoever sent
 Call on that session. A call ends when both sides have sent End, or on Fault or Cancel. Each side may have 256 KiB of messages outstanding beyond what the
 other has credited; the first message counts. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
 
@@ -444,6 +455,7 @@ total       function (1: 1 sum, 2 min, 3 max, 4 count, 5 facet) ‖ column ‖ t
 column      kind (1) ‖ slot (1) ‖ path bytes   kinds 1 to 6
             7 created, or 8 modified           in seconds
             9 ‖ list (16)                      the row's order there
+            10 ‖ slot (1)                      whose what is in the slot is
 ```
 
 | kind | a value is | and is written |
@@ -456,6 +468,7 @@ column      kind (1) ‖ slot (1) ‖ path bytes   kinds 1 to 6
 | 6 words | the words of the slot's text or Value | – |
 | 7, 8 | when the row was made, by its id; its latest stamp | f64 |
 | 9 order | its order in a list | u64, big-endian |
+| 10 author | whose each cell in the slot is (§4), compared bytewise; none for those that are nobody's | as it is |
 
 With a path, the slot holds JSON and the path, names with dots between, says where in it; an array on the way stands for all it holds. A row may thus have many
 values, and a condition holds for it if it does for one of them. Ties in the order are settled by row id, the least first. An order by column kind 7 is order 2. A row that is nowhere (§1) is not there to be asked about. With *from end* the offset and limit count back
@@ -469,7 +482,7 @@ commonest of which follow with how many rows have each; for min and max, the val
 | 3 | where | not |
 | 4 | column ‖ flags (1: 1 lo, 2 hi, 4 lo itself, 8 hi itself) ‖ [lo bytes] ‖ [hi bytes] | from lo to hi; not kind 6 |
 | 5 | column ‖ n varint ‖ n × bytes | one of these; not kind 6 |
-| 6, 7 | column ‖ bytes | begins with, contains; kinds 1 and 2 |
+| 6, 7 | column ‖ bytes | begins with, contains; kinds 1, 2 and 10 |
 | 8 | column | has a value; not kind 6 |
 | 9 | list (16) | is in a list |
 | 10 | column ‖ mode (1: 0 every word, 1 any, 2 a phrase) ‖ flags (1) ‖ text bytes | matches; kind 6 |
@@ -494,10 +507,10 @@ does, and when none can be reached, the answer is of what is held. A Fetch waits
 
 | | protocol | consumer |
 |---|---|---|
-| **Identity** | proves possession of a device key; carries `subject` in the signed roster | decides which person a key is, and puts their name in `subject` |
+| **Identity** | proves possession of a device key; carries `subject` in the signed roster; carries whom a host vouches for with what is written and called | decides which person a key is, and puts their name in `subject`; and, where one device serves several people, says for whom each connection is |
 | **Scope** | what one key opens; bounds every watch, cell and call | decides what to share |
-| **Permission** | Read, Write, Call per scope, in the roster; enforced by every replica, relays included | decides whom to grant |
+| **Permission** | Read, Write, Call, Vouch per scope, in the roster; enforced by every replica, relays included | decides whom to grant |
 | **Keys** | wraps, rotates, seals, signs | keeps the device's secret |
 | **Authentication** | carries an opaque credential, inside the channel, to the accepting host, and waits for its verdict | is the verdict: accounts, tokens, quotas, billing |
 
-For a peer, the verdict says whether to serve the connection; what it may then do is the roster's. For a local client, the verdict *is* the grants.
+For a peer, the verdict says whether to serve the connection; what it may then do is the roster's. For a local client, the verdict *is* the grants, and for whom it is.

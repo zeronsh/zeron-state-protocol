@@ -1424,7 +1424,7 @@ facet_bytes :: proc(s: ^Scope, a: ^Aggregate, facet: Facet) -> []byte {
 	zsp.put_u64(b, facet.key.hi)
 	zsp.put_u64(b[8:], facet.key.lo)
 	switch a.col.kind {
-	case .Bytes, .Fold:
+	case .Bytes, .Fold, .Author:
 		if facet.rest != 0 {
 			id, _ := row_id(s, facet.row)
 			r := Row{n = s.x.n, x = s.x, id = id}

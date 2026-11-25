@@ -2,6 +2,7 @@ package zsp
 
 import "core:crypto"
 import "core:crypto/ed25519"
+import "core:hash"
 import "core:slice"
 
 // Who may do what, as a document.
@@ -22,6 +23,7 @@ Right :: enum u8 {
 	Read,
 	Write, // implies Read
 	Call, // make and answer calls; needs neither, yet comes with Read, as every grant does
+	Vouch, // be believed about whom it writes and calls for: its host knows its users, and is trusted to
 }
 Rights :: distinct bit_set[Right;u8]
 
@@ -395,6 +397,18 @@ roster_scope :: proc(r: ^Roster, scope: Scope) -> ^Scope_Info {
 	return nil
 }
 
+// Of whom a member goes by and whom it is believed about: another, if that is another.
+@(require_results)
+member_name :: proc(m: ^Member) -> u64 {
+	h := hash.fnv64a(m.subject, hash.fnv64a(m.device[:]))
+	for g in m.grants {
+		if .Vouch in g.rights {
+			h = (h * 31 + u64(g.scope)) * 31 + g.until
+		}
+	}
+	return h
+}
+
 @(require_results)
 roster_member :: proc(r: ^Roster, device: Key32) -> ^Member {
 	for &m in r.members {
@@ -551,7 +565,7 @@ draft_grant :: proc(d: ^Draft, device, signer: Key32, scope: Scope, rights: Righ
 		if g.scope != scope || g.until != 0 {
 			continue
 		}
-		if .Write in g.rights && .Write not_in rights {
+		if card((g.rights & {.Write, .Vouch}) - rights) > 0 && (.Write not_in rights || draft_signed(d, scope)) {
 			g.until = d.now // ended, not unmade: what it allowed stays allowed
 			break
 		}
@@ -563,6 +577,16 @@ draft_grant :: proc(d: ^Draft, device, signer: Key32, scope: Scope, rights: Righ
 	append(&grants, Grant{scope, rights + {.Read}, 0})
 	m.grants = grants[:]
 	return m
+}
+
+@(private)
+draft_signed :: proc(d: ^Draft, scope: Scope) -> bool {
+	for s in d.scopes {
+		if s.id == scope {
+			return .Signed in s.flags
+		}
+	}
+	return false
 }
 
 // Ends a device's rights in a scope, or everywhere, and rotates what it could read. An owner's do not end.

@@ -24,7 +24,8 @@ USAGE :: `zspd - Zeron State Protocol node
   zspd create <dir>                          make a space, owned by this device
   zspd key <dir>                             print what an admin needs to admit this device
   zspd scope <dir> [signed]                  add a scope to the space
-  zspd admit <dir> <key> <scope> [read]      grant a device a scope: to read, write and call, or only read
+  zspd admit <dir> <key> <scope> [read|vouch] grant a device a scope: to read, write and call; only to read; or to say
+                                             for whom, too, and be believed
   zspd revoke <dir> <key> [scope]            end a device's grants
   zspd subject <dir> <key> <text>            say whose a device is: an account, a name, as you know them
   zspd members <dir>                         list devices: key, rights in each scope, whose it is
@@ -94,7 +95,17 @@ run :: proc() -> int {
 			device, signer: zsp.Key32
 			copy(device[:], key)
 			copy(signer[:], key[32:])
-			rights := zsp.Rights{.Read} if len(args) > 2 && args[2] == "read" else {.Read, .Write, .Call}
+			rights := zsp.Rights{.Read, .Write, .Call}
+			if len(args) > 2 {
+				switch args[2] {
+				case "read":
+					rights = {.Read}
+				case "vouch":
+					rights += {.Vouch}
+				case:
+					return false
+				}
+			}
 			zsp.draft_grant(&a.draft, device, signer, zsp.Scope(scope), rights)
 			return true
 		})
@@ -260,7 +271,7 @@ members :: proc(dir: string) -> bool {
 			if g.until != 0 {
 				continue
 			}
-			say(os.stdout, " ", strconv.write_uint(buf[:], u64(g.scope), 10), ":", "r" if .Read in g.rights else "", "w" if .Write in g.rights else "", "c" if .Call in g.rights else "")
+			say(os.stdout, " ", strconv.write_uint(buf[:], u64(g.scope), 10), ":", "r" if .Read in g.rights else "", "w" if .Write in g.rights else "", "c" if .Call in g.rights else "", "v" if .Vouch in g.rights else "")
 		}
 		say(os.stdout, " owner" if m.owner else " admin" if m.admin else "", "\t", string(m.subject), "\n")
 	}

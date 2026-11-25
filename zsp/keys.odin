@@ -2,6 +2,7 @@ package zsp
 
 import "core:crypto/chacha20poly1305"
 import "core:crypto/ed25519"
+import "core:slice"
 
 // Key derivation, and the sealing of cells and frames.
 
@@ -153,7 +154,7 @@ cell_signed :: proc(c: ^Cell, body: []byte) -> []byte {
 // Replaces an open body with a sealed one, in temporary memory. In a signed scope the author's
 // index in the roster precedes the seal and a signature follows it. The epoch is the latest unless given.
 @(require_results)
-cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, epoch := 0) -> bool {
+cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, epoch := 0, as: []byte = nil) -> bool {
 	scope := row_scope(c.row)
 	keys, info := keyring_scope(k, scope), roster_scope(r, scope)
 	if keys == nil || info == nil || keys.epochs[(epoch if epoch != 0 else len(keys.epochs)) - 1] == {} {
@@ -166,7 +167,15 @@ cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, epoch := 0) -> bool {
 	if .Signed in info.flags {
 		write_varint(&w, author_index(k, r) or_return)
 	}
-	seal_append(&w, keys, &iv, cell_bind(c), c.body[n:], epoch)
+	if .Signed in info.flags {
+		// For whom, first: under the seal, where a relay does not see it, and under the signature.
+		plain := make([dynamic]byte, 0, len(c.body) - n + len(as) + 1, context.temp_allocator)
+		write_bytes(&plain, as)
+		append(&plain, ..c.body[n:])
+		seal_append(&w, keys, &iv, cell_bind(c), plain[:], epoch)
+	} else {
+		seal_append(&w, keys, &iv, cell_bind(c), c.body[n:], epoch)
+	}
 	if .Signed in info.flags {
 		sign_append(&w, k, cell_signed(c, w[:])) or_return
 	}
@@ -174,9 +183,15 @@ cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, epoch := 0) -> bool {
 	return true
 }
 
+// Who a cell of a signed scope is by: a member's number, from one; and for whom, if for another.
+By :: struct {
+	member: u32,
+	as:     []byte,
+}
+
 // Replaces a sealed body with an open one, in temporary memory.
 @(require_results)
-cell_open :: proc(k: ^Keyring, r: ^Roster, c: ^Cell) -> bool {
+cell_open :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, by: ^By = nil) -> bool {
 	scope := row_scope(c.row)
 	keys, info := keyring_scope(k, scope), roster_scope(r, scope)
 	if keys == nil || info == nil {
@@ -184,20 +199,62 @@ cell_open :: proc(k: ^Keyring, r: ^Roster, c: ^Cell) -> bool {
 	}
 	n := clear_size(c.kind, c.body)
 	sealed := c.body[n:]
-	if .Signed in info.flags {
+	signed := .Signed in info.flags
+	from: By
+	if signed {
 		rd := Reader{buf = sealed}
-		_ = read_varint(&rd)
-		if rd.bad || len(sealed) - rd.pos < SIGNATURE {
+		author := read_varint(&rd)
+		if rd.bad || len(sealed) - rd.pos < SIGNATURE || author >= u64(len(r.members)) {
 			return false
 		}
 		sealed = sealed[rd.pos:len(sealed) - SIGNATURE]
+		from.member = u32(author) + 1
 	}
 	iv := aead_nonce(c.stamp, c.slot, u8(c.kind))
 	w := make([dynamic]byte, 0, len(c.body), context.temp_allocator)
 	append(&w, ..c.body[:n])
 	open_append(&w, keys, &iv, cell_bind(c), sealed) or_return
+	if signed {
+		rd := Reader{buf = w[n:]}
+		from.as = read_bytes(&rd)
+		if rd.bad || len(from.as) > MAX_AS {
+			return false
+		}
+		from.as = slice.clone(from.as, context.temp_allocator) if by != nil else nil
+		copy(w[n:], w[n + rd.pos:])
+		resize(&w, len(w) - rd.pos)
+	}
 	c.body = w[:]
+	if by != nil {
+		by^ = from
+	}
 	return true
+}
+
+// Who wrote an open cell: a device, and whose name it goes by. Only a signed scope says; and for another than the
+// roster has it belong to, only a device that may vouch for them.
+@(require_results)
+cell_author :: proc(r: ^Roster, c: ^Cell, by: By) -> (device: Key32, subject: []byte, vouched, ok: bool) {
+	if by.member == 0 || int(by.member) > len(r.members) {
+		return
+	}
+	m := &r.members[by.member - 1]
+	subject = m.subject
+	if len(by.as) > 0 && member_vouches(m, row_scope(c.row), c.stamp.time) {
+		subject, vouched = by.as, true
+	}
+	return m.device, subject, vouched, true
+}
+
+// Whether a member is believed about whom it speaks for, or was at some time.
+@(require_results)
+member_vouches :: proc(m: ^Member, scope: Scope, time: u64) -> bool {
+	for g in m.grants {
+		if g.scope == scope && .Vouch in g.rights && (g.until == 0 || time <= g.until) {
+			return true
+		}
+	}
+	return false
 }
 
 // Whether a sealed cell may exist. In a signed scope authority travels with the cell, and anyone, keys or

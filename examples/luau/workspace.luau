@@ -23,9 +23,9 @@ export type Place = {
 
 local workspace = {}
 
--- Whose device this is, as the space has it: what `zspd subject`, or your own admin, said.
+-- Who the user is: whom this client was accepted for, or whose device this is: what `zspd subject`, or your own admin, said.
 function workspace.user(client: any): string
-	local mine = client.devices[1]
+	local mine = client:me()
 	return if mine then mine.subject else ""
 end
 

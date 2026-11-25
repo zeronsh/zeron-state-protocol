@@ -47,9 +47,10 @@ world_make :: proc(t: ^testing.T, w: ^World, partial: ^World = nil, flags := zsp
 	}
 	none: zsp.Roster
 	d := zsp.draft_from(&none, 1)
-	for _ in 0 ..< 2 {
-		scope := zsp.draft_scope(&d, flags)
-		zsp.draft_grant(&d, w.keys.device, w.keys.signer, scope, {.Write}).owner = true
+	for i in 0 ..< 2 {
+		scope := zsp.draft_scope(&d, flags + (zsp.Scope_Flags{.Signed} if i == 0 else {})) // whose what is, the first says
+		m := zsp.draft_grant(&d, w.keys.device, w.keys.signer, scope, {.Write, .Vouch})
+		m.owner, m.subject = true, transmute([]byte)string("whoever")
 		if partial != nil {
 			zsp.draft_grant(&d, partial.keys.device, partial.keys.signer, scope, {.Read, .Write})
 		}
@@ -192,7 +193,27 @@ world_write :: proc(t: ^testing.T, w: ^World) {
 		c.row = id
 		c.stamp = zsp.node_stamp(n)
 	}
-	testing.expect(t, zsp.node_write(n, cells[:n_cells]))
+	as := rand.choice(NAMES[2:]) if rand.int_max(2) == 0 else ""
+	testing.expect(t, zsp.node_write(n, cells[:n_cells], transmute([]byte)as))
+}
+
+// The roster has the one who writes go by another name, or be believed about others, or not.
+@(private)
+world_rename :: proc(t: ^testing.T, w: ^World) {
+	d := zsp.draft_from(&w.node.roster, max(w.node.clock, w.node.now << 16))
+	if rand.int_max(2) == 0 {
+		for &m in d.members {
+			if m.device == w.keys.device {
+				m.subject = transmute([]byte)rand.choice(NAMES)
+			}
+		}
+	} else {
+		zsp.draft_grant(&d, w.keys.device, w.keys.signer, 1, {.Write, .Vouch} if rand.int_max(2) == 0 else {.Write})
+	}
+	bytes, ok := zsp.roster_sign(&w.keys, w.root, &d)
+	testing.expect(t, ok && zsp.node_adopt(&w.node, bytes))
+	delete(w.roster)
+	w.roster = bytes
 }
 
 // ---------------------------------------------------------------- questions
@@ -206,7 +227,7 @@ Ask :: struct {
 @(private)
 ask_column :: proc(out: ^[dynamic]byte, kinds: bit_set[Kind]) -> Kind {
 	for {
-		k := Kind(1 + rand.int_max(9))
+		k := Kind(1 + rand.int_max(len(Kind)))
 		if k not_in kinds {
 			continue
 		}
@@ -246,6 +267,8 @@ ask_column :: proc(out: ^[dynamic]byte, kinds: bit_set[Kind]) -> Kind {
 			zsp.write_u64(out, l[0])
 			zsp.write_u64(out, l[1])
 		case .Created, .Modified:
+		case .Author:
+			append(out, u8(16 + rand.int_max(5)))
 		case:
 			append(out, slot)
 			zsp.write_bytes(out, transmute([]byte)path)
@@ -262,7 +285,7 @@ ask_value :: proc(a: ^Ask, k: Kind) {
 		zsp.write_u64(out, v)
 	}
 	switch k {
-	case .Bytes, .Fold:
+	case .Bytes, .Fold, .Author:
 		zsp.write_bytes(out, transmute([]byte)(rand.choice(NAMES) if rand.int_max(2) == 0 else rand.choice(WORDS) if rand.int_max(2) == 0 else rand.choice(TAGS)))
 	case .Number:
 		eight(out, transmute(u64)(f64(rand.int_max(21) - 10) / 2))
@@ -285,7 +308,7 @@ ask_value :: proc(a: ^Ask, k: Kind) {
 @(private)
 ask_pred :: proc(a: ^Ask, depth: int) {
 	out := a.out
-	SORTED :: bit_set[Kind]{.Bytes, .Fold, .Number, .Bool, .Id, .Created, .Modified, .Order}
+	SORTED :: bit_set[Kind]{.Bytes, .Fold, .Number, .Bool, .Id, .Created, .Modified, .Order, .Author}
 	op := Op(rand.int_max(14))
 	if depth > 3 && (op == .And || op == .Or || op == .Not || op == .Ref || op == .Back) {
 		op = .Range
@@ -327,7 +350,7 @@ ask_pred :: proc(a: ^Ask, depth: int) {
 			ask_value(a, k)
 		}
 	case .Prefix, .Has:
-		ask_column(out, {.Bytes, .Fold})
+		ask_column(out, {.Bytes, .Fold, .Author})
 		s := rand.choice(NAMES) if rand.int_max(2) == 0 else rand.choice(WORDS)
 		zsp.write_bytes(out, transmute([]byte)s[:rand.int_max(len(s) + 1)])
 	case .Exists:
@@ -382,7 +405,7 @@ ask :: proc(w: ^World) -> []byte {
 		by := rand.int_max(3)
 		append(&out, byte(by), byte(rand.int_max(2)))
 		if by == 0 {
-			ask_column(&out, {.Bytes, .Fold, .Number, .Bool, .Id, .Created, .Modified, .Order})
+			ask_column(&out, {.Bytes, .Fold, .Number, .Bool, .Id, .Created, .Modified, .Order, .Author})
 		}
 	}
 	append(&out, byte(rand.int_max(2)))
@@ -393,7 +416,7 @@ ask :: proc(w: ^World) -> []byte {
 	for _ in 0 ..< totals {
 		fn := Fn(1 + rand.int_max(5))
 		append(&out, u8(fn))
-		ask_column(&out, {.Number} if fn == .Sum else {.Bytes, .Fold, .Number, .Bool, .Id, .Created, .Modified, .Order})
+		ask_column(&out, {.Number} if fn == .Sum else {.Bytes, .Fold, .Number, .Bool, .Id, .Created, .Modified, .Order, .Author})
 		zsp.write_varint(&out, u64(rand.int_max(5)))
 	}
 	return out[:]
@@ -429,6 +452,25 @@ plain_values :: proc(w: ^World, id: zsp.Id, c: ^Column) -> []Plain {
 			cell := cell
 			if zsp.cell_list(&cell) == c.list {
 				append(&out, Plain{number = f64(zsp.cell_order(&cell)), is_number = true})
+			}
+		}
+	case .Author:
+		scan := zsp.row_scan(&n.store, id, c.slot, c.slot)
+		for cell in zsp.row_next(&n.store, &scan) {
+			cell := cell
+			by: zsp.By
+			if !zsp.cell_open(&w.keys, &n.roster, &cell, &by) || by.member == 0 {
+				continue
+			}
+			m := n.roster.members[by.member - 1]
+			name := string(m.subject)
+			for g in m.grants {
+				if len(by.as) > 0 && .Vouch in g.rights && g.scope == zsp.row_scope(id) && (g.until == 0 || cell.stamp.time <= g.until) {
+					name = string(by.as)
+				}
+			}
+			if name != "" {
+				append(&out, Plain{bytes = name})
 			}
 		}
 	case .Bytes, .Fold, .Number, .Bool, .Id, .Words:
@@ -535,7 +577,7 @@ plain_slot :: proc(w: ^World, id: zsp.Id, slot: zsp.Slot) -> (s: string, have: b
 @(private)
 plain_key :: proc(k: Kind, b: ^Bound) -> Plain {
 	#partial switch k {
-	case .Bytes, .Fold:
+	case .Bytes, .Fold, .Author:
 		return {bytes = string(b.bytes)}
 	case .Id:
 		return {bytes = string(b.bytes)}
@@ -1028,6 +1070,8 @@ answers_match_the_cells :: proc(t: ^testing.T) {
 				testing.expect_value(t, w.x.generation, kept) // what was saved is found
 			case 3:
 				testing.expect(t, zsp.store_checkpoint(&w.node.store))
+			case 5, 6:
+				world_rename(t, &w)
 			case 4:
 				// A column nobody asks of any longer.
 				for s in w.x.scopes {

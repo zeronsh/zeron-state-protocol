@@ -31,6 +31,9 @@ sums and facets: each answer stays true while it is open, and costs nothing once
 index that a device makes of its own rows, of the columns asked about, when they are first asked about; it may be deleted at any time. A device that
 holds little asks one that holds everything, and says whose answer it has.
 
+**Whose it is, is yours to say.** Where a scope is signed, every cell is known to be of the device that wrote it, and that of the user your own sign-in says: by the roster for a
+device somebody has, or by the host of one that serves many, if you let it vouch. No application can say otherwise, no relay sees it, and it can be shown, searched, ordered and counted like any other column.
+
 **The log is the database.** A sealed cell is appended once. The bytes on disk are the bytes on the wire are the bytes on the relay.
 
 **Nothing happens unless something happened.** An idle node makes no system calls. An idle link sends no packets and sets no timer.

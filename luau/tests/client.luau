@@ -362,4 +362,90 @@ do
 	assert(a.status == "denied")
 end
 
+-- Whose a row is, is shown and can be asked about; and when it is another's after all, or by another name, so shown.
+do
+	local AUTHOR, CALL, SERVE, ASK = 17, 15, 14, 32
+	local Signed = { title = zsp.string(16), by = zsp.author(16), body = zsp.text(17), writers = zsp.authors(17) }
+	local h = harness()
+	h.run()
+	assert(string.sub(h.self.said[1].body, 1, 2) == "\1\4", "it wants to be told")
+	h.tell(ROSTER, string.rep("\0", 8) .. "\1\7" .. string.rep("k", 32) .. "\2\135" .. string.rep("k", 32))
+	local me: any
+	h.client:on("self", function(who)
+		me = who
+	end)
+	h.tell(AUTHOR, "\0" .. string.rep("d", 32) .. "\2me")
+	assert(me.subject == "me" and me.id == string.rep("d", 32))
+	local shown: any, plain: any
+	h.client:window({ scope = 2, list = "a", table = Signed }, function(s)
+		shown = s
+	end)
+	h.client:window({ scope = 1, list = "a", table = Signed }, function(s)
+		plain = s
+	end)
+	h.run()
+	local mine, theirs = "", ""
+	h.client:write(2, function(change)
+		mine = change.insert(Signed, "a", 1, { title = "t" })
+	end)
+	h.client:write(1, function(change)
+		theirs = change.insert(Signed, "a", 1, { title = "t" })
+	end)
+	h.run()
+	assert(shown.rows[1].by == "me" and #shown.rows[1].writers == 0)
+	assert(plain.rows[1].by == nil, "where nobody is told, neither is this")
+	local editor = h.client:text(mine, Signed.body)
+	editor.append("typed")
+	editor.close()
+	h.run()
+	assert(shown.rows[1].writers[1] == "me")
+	assert(not pcall(function()
+		h.client:write(2, function(change)
+			change.set(mine, Signed, { by = "you" })
+		end)
+	end))
+
+	local row = "\0\0\0\2" .. string.rep("r", 12)
+	local function cell(kind: number, slot: number, n: number, body: string, author: string): string
+		local w = codec.writer()
+		codec.put(w, string.char(kind + 64) .. row .. string.char(slot) .. string.rep("\0", 15) .. string.char(n))
+		codec.put_bytes(w, body)
+		codec.put(w, author)
+		return codec.string(w)
+	end
+	local function send(a: string, b: string)
+		h.tell(CELLS, "\0" .. cell(2, 1, 1, h.client:_tag(2, "a") .. codec.u64(2), a) .. cell(3, 16, 2, "theirs", b) .. cell(3, 17, 3, "x", a) .. cell(4, 17, 4, codec.u64(1) .. "\1\0\0\1y", b))
+	end
+	h.tell(AUTHOR, "\1" .. string.rep("e", 32) .. "\3zoe")
+	h.tell(AUTHOR, "\2" .. string.rep("e", 32) .. "\3ann")
+	send("\1", "\2")
+	assert(shown.rows[2].by == "ann" and table.concat(shown.rows[2].writers, " ") == "ann zoe")
+	local before = shown.rows[2]
+	send("\1", "\2")
+	assert(shown.rows[2] == before, "nothing has changed")
+	h.tell(AUTHOR, "\3" .. string.rep("e", 32) .. "\9ann smith")
+	send("\1", "\3")
+	assert(shown.rows[2].by == "ann smith" and table.concat(shown.rows[2].writers, " ") == "ann smith zoe")
+	h.tell(AUTHOR, "\4" .. string.rep("f", 32) .. "\0")
+	send("\4", "\4")
+	assert(shown.rows[2].by == nil and #shown.rows[2].writers == 0, "a device that is nobody's")
+
+	h.client:ask({ scope = 2, table = Signed, where = zsp.where.begins("by", "an"), order = { "-by" }, totals = { whose = { "facet", "by" } } }, function() end)
+	h.run()
+	local asked = (h.last(ASK) :: any).body
+	assert(string.find(asked, "\6\10\16\2an", 1, true) and string.find(asked, "\0\1\10\16\0", 1, true) and string.find(asked, "\5\10\16\100", 1, true))
+
+	local caller: any
+	h.client:serve(2, "m", function(call)
+		caller = call.subject
+	end)
+	h.run()
+	h.tell(CALL, "\1" .. string.rep("e", 32) .. "\2\1m\3zoehello")
+	assert(caller == "zoe")
+	h.client:call(string.rep("e", 32), 2, "m", "hello")
+	h.run()
+	assert(string.sub((h.last(CALL) :: any).body, -8) == "\1m\0hello", "and for whom is not for it to say")
+	assert(h.last(SERVE))
+end
+
 print("ok")

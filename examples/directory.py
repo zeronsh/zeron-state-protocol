@@ -5,12 +5,13 @@ run as often as you like. What it is given is yours: here, people with devices, 
 which teams may read or write them.
 
     {
-      "scopes": {"1": {"write": ["everyone"]}, "3": {"read": ["everyone"], "write": ["hr"]}},
+      "scopes": {"1": {"write": ["everyone"]}, "3": {"read": ["everyone"], "write": ["hr"], "vouch": ["website"]}},
       "teams":  {"hr": ["hana"]},
-      "people": {"hana": ["<key>"], "ann": ["<key>", "<key>"]}
+      "people": {"hana": ["<key>"], "ann": ["<key>", "<key>"], "website": ["<key>"]}
     }
 
-A scope that some may only read has to be a signed one: `zspd scope <dir> signed`.
+A scope that some may only read has to be a signed one: `zspd scope <dir> signed`. Who may vouch writes for people who sign in
+to it, and is believed about who they are.
 """
 
 import json
@@ -22,7 +23,7 @@ EVERYONE = "everyone"
 
 
 def members(dir):
-    """What the space says now: key -> (subject, {scope: "r" or "w"}, whether it rules)."""
+    """What the space says now: key -> (subject, {scope: "r", "w" or "v"}, whether it rules)."""
     found = {}
     for line in zspd("members", dir).splitlines():
         rest, _, subject = line.partition("\t")
@@ -31,19 +32,19 @@ def members(dir):
         for word in words:
             scope, colon, what = word.partition(":")
             if colon:
-                rights[scope] = "w" if "w" in what else "r"
+                rights[scope] = "v" if "v" in what else "w" if "w" in what else "r"
         found[key] = (subject, rights, words[-1:] in (["owner"], ["admin"]))
     return found
 
 
 def wanted(directory):
-    """What it should say: key -> (subject, {scope: "r" or "w"})."""
+    """What it should say: key -> (subject, {scope: "r", "w" or "v"})."""
     teams = {EVERYONE: list(directory["people"]), **directory.get("teams", {})}
     want = {}
     for person, devices in directory["people"].items():
         rights = {}
         for scope, rule in directory["scopes"].items():
-            for right, who in (("r", rule.get("read", [])), ("w", rule.get("write", []))):
+            for right, who in (("r", rule.get("read", [])), ("w", rule.get("write", [])), ("v", rule.get("vouch", []))):
                 if any(person == name or person in teams.get(name, []) for name in who):
                     rights[scope] = right
         for key in devices:
@@ -66,7 +67,7 @@ def sync(dir, directory):
             continue
         for scope, right in rights.items():
             if held.get(scope) != right:
-                did.append(("admit", key, scope, *(["read"] if right == "r" else [])))
+                did.append(("admit", key, scope, *{"r": ["read"], "w": [], "v": ["vouch"]}[right]))
         if subject != person and rights:
             did.append(("subject", key, person))
     for command, *args in did:

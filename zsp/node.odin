@@ -138,6 +138,10 @@ node_take :: proc(n: ^Node, r: Roster) -> bool {
 	}
 	old := n.roster
 	n.roster = r
+	renamed := false
+	for i in 0 ..< min(len(old.members), len(r.members)) {
+		renamed ||= member_name(&old.members[i]) != member_name(&r.members[i])
+	}
 	swept := roster_sweep(n, &old)
 	if n.keys != nil {
 		keyring_forget(n.keys)
@@ -175,6 +179,9 @@ node_take :: proc(n: ^Node, r: Roster) -> bool {
 			continue
 		}
 		session_authorize(s)
+		if renamed {
+			authors_renew(s)
+		}
 		if swept {
 			session_recompare(s)
 		}
@@ -269,7 +276,8 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 				epoch += 1
 			}
 			mine := .Signed not_in info.flags || cell_mine(n, old, &c)
-			if mine && cell_reopen(n, &c) && cell_seal(n.keys, &n.roster, &c, epoch) {
+			by: By
+			if mine && cell_reopen(n, &c, &by) && cell_seal(n.keys, &n.roster, &c, epoch, by.as) {
 				if !store_replace(&n.store, &c) {
 					return // the checkpoint to come fails too
 				}
@@ -314,15 +322,15 @@ cell_mine :: proc(n: ^Node, old: ^Roster, c: ^Cell) -> bool {
 
 // Opens a cell sealed under an earlier roster, perhaps with a key that is no longer what it was.
 @(private)
-cell_reopen :: proc(n: ^Node, c: ^Cell) -> bool {
+cell_reopen :: proc(n: ^Node, c: ^Cell, by: ^By) -> bool {
 	if n.keys == nil {
 		return false
 	}
-	if cell_open(n.keys, &n.roster, c) {
+	if cell_open(n.keys, &n.roster, c, by) {
 		return true
 	}
 	then := Keyring{scopes = n.keys.before}
-	return cell_open(&then, &n.roster, c)
+	return cell_open(&then, &n.roster, c, by)
 }
 
 // Whether some of what this holds in a scope may be its own writing.
@@ -366,13 +374,16 @@ node_id :: proc(n: ^Node, scope: Scope) -> Id {
 	return {u64(scope) << 32 | u64(u32((n.clock >> 16) / 1000)), get_u64(b[:])}
 }
 
-// Writes open cells on behalf of this node itself. False, and nothing written, if it may not.
-node_write :: proc(n: ^Node, cells: []Cell) -> bool {
+// Writes open cells on behalf of this node itself, or of someone it may vouch for. False, and nothing written, if it may not.
+node_write :: proc(n: ^Node, cells: []Cell, as: []byte = nil) -> bool {
+	if len(as) > MAX_AS {
+		return false
+	}
 	for &c in cells {
 		if c.stamp.time > n.clock && !stamp_timely(c.stamp, n.now) {
 			return false // not from node_stamp
 		}
-		if len(c.body) > MAX_OPEN || !cell_valid(&c) || !node_may_write(n, row_scope(c.row)) || !cell_seal(n.keys, &n.roster, &c) {
+		if len(c.body) > MAX_OPEN || !cell_valid(&c) || !node_may_write(n, row_scope(c.row)) || !cell_seal(n.keys, &n.roster, &c, 0, as) {
 			return false
 		}
 	}

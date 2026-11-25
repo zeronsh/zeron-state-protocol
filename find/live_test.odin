@@ -385,6 +385,9 @@ answers_stay_true :: proc(t: ^testing.T) {
 			if rand.int_max(3) == 0 {
 				client_hear(t, &c) // in the middle
 			}
+			if rand.int_max(8) == 0 {
+				world_rename(t, &w)
+			}
 			for !finder_run(&f, 1 + rand.int_max(200)) {
 				if rand.int_max(10) == 0 {
 					world_write(t, &w)

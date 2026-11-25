@@ -4,10 +4,14 @@ place of `zspd run`:
 
 	apps <dir>
 
-<dir>/apps says who there is, a line for each: a secret, and what it may do in which scopes.
+<dir>/apps says who there is, a line for each: a secret, what it may do in which scopes, and, if it is for someone else
+than this device belongs to, for whom.
 
 	6f1c…  1:rwc 2:r
-	09ab…  2:rw
+	09ab…  2:rw as=zoe
+
+Who that is, is for whoever checks the secret to say, and never for the application: here the file does, and elsewhere
+it would be an account's session. Others believe it if this device may vouch there: `zspd admit <dir> <key> 2 vouch`.
 
 What an application may do is that and no more, and no more than this device may. See docs/scoping.md.
 */
@@ -25,6 +29,7 @@ import "../../zsp"
 App :: struct {
 	secret: string,
 	grants: []zsp.Grant,
+	as:     string,
 }
 
 Apps :: struct {
@@ -40,7 +45,7 @@ authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
 	}
 	for app in (^Apps)(data).all {
 		if crypto.compare_constant_time(credential, transmute([]byte)app.secret) == 1 {
-			zsp.session_accept(s, app.grants)
+			zsp.session_accept(s, app.grants, app.as)
 			return
 		}
 	}
@@ -58,8 +63,13 @@ apps_read :: proc(path: string) -> (apps: Apps, ok: bool) {
 		if len(words) == 0 {
 			continue
 		}
+		app := App{secret = words[0]}
 		grants: [dynamic]zsp.Grant
 		for word in words[1:] {
+			if strings.has_prefix(word, "as=") {
+				app.as = word[3:]
+				continue
+			}
 			colon := strings.index_byte(word, ':')
 			scope := strconv.parse_uint(word[:max(colon, 0)], 10) or_return
 			g := zsp.Grant{scope = zsp.Scope(scope)}
@@ -77,7 +87,8 @@ apps_read :: proc(path: string) -> (apps: Apps, ok: bool) {
 			}
 			append(&grants, g)
 		}
-		append(&apps.all, App{words[0], grants[:]})
+		app.grants = grants[:]
+		append(&apps.all, app)
 	}
 	return apps, true
 }

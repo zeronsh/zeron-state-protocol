@@ -1518,10 +1518,11 @@ forks_heal :: proc(t: ^testing.T) {
 	a, b, c, relay := s.nodes[0], s.nodes[1], s.nodes[2], s.nodes[3]
 	both :: proc(s: ^Sim, d: ^Draft) {
 		d.scopes[0].rotate = true
-		id := draft_scope(d)
+		id, shown := draft_scope(d), draft_scope(d, {.Signed})
 		for x in s.nodes {
 			if !x.relay {
 				draft_grant(d, x.keys.device, x.keys.signer, id, {.Write})
+				draft_grant(d, x.keys.device, x.keys.signer, shown, {.Write, .Vouch})
 			}
 		}
 	}
@@ -1540,6 +1541,8 @@ forks_heal :: proc(t: ^testing.T) {
 		put_u64(body[:], 3 << 32 | 5)
 		put_u64(body[8:], 5)
 		testing.expect(t, node_write(&x.node, {{node_id(&x.node, 3), PLACE, .Place, node_stamp(&x.node), body[:]}}))
+		put_u64(body[:], 4 << 32 | 5)
+		testing.expect(t, node_write(&x.node, {{node_id(&x.node, 4), PLACE, .Place, node_stamp(&x.node), body[:]}}, transmute([]byte)string("zoe")))
 	}
 	// The relay has the one, and the other's writing is on its way to it already.
 	winner := a if a.node.roster.serial > b.node.roster.serial else b
@@ -1551,6 +1554,23 @@ forks_heal :: proc(t: ^testing.T) {
 	sim_check(&s)
 	testing.expect_value(t, store_range(&a.node.store, scope_lo(1), scope_hi(1)).count, 3)
 	testing.expect_value(t, store_range(&a.node.store, scope_lo(3), scope_hi(3)).count, 3)
+	// Whose name it was written in, it is in still.
+	for x in ([]^Sim_Node{a, b, c}) {
+		said: [3]bool
+		scan := tree_scan(&x.node, x.node.cells, scope_lo(4), scope_hi(4))
+		for leaf in tree_next(&scan) {
+			cell, at := cell_unkey(leaf)
+			cell.body = log_bytes(&x.node.store, at.off, at.len)
+			by: By
+			testing.expect(t, cell_open(&x.keys, &x.node.roster, &cell, &by))
+			device, subject, vouched, known := cell_author(&x.node.roster, &cell, by)
+			testing.expect(t, known && vouched && string(subject) == "zoe")
+			for y, i in ([]^Sim_Node{a, b, c}) {
+				said[i] ||= y.keys.device == device
+			}
+		}
+		testing.expect(t, said[0] && said[1] && said[2])
+	}
 }
 
 // What came from a peer does not keep the phone in debt to it.

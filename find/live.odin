@@ -1049,7 +1049,7 @@ far_sound :: proc(l: ^Live, r: zsp.Reader) -> bool {
 			// As long as a value of its kind is.
 			v := zsp.read_bytes(&r)
 			switch a.col.kind {
-			case .Bytes, .Fold, .Words:
+			case .Bytes, .Fold, .Words, .Author:
 			case .Number, .Created, .Modified, .Order:
 				r.bad ||= len(v) != 8
 			case .Bool:

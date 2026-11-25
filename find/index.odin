@@ -25,6 +25,8 @@ Index :: struct {
 	checking:   bool, // for rows that were forgotten: in this scope, from this row on
 	check_scope: int,
 	check_row:  u32,
+	check_slots: Slots, // of every row, those that may read otherwise
+	said:       [dynamic]u64, // of each member: whom it goes by, and may vouch for
 	cursor:     u64, // into the node's recent changes
 	tailing:    bool, // which are all that has happened since
 	unsaved:    int, // rows gone over since it was last written
@@ -159,6 +161,7 @@ index_open :: proc(x: ^Index, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
 	if !whole || x.failed {
 		index_reset(x)
 	}
+	authors_check(x)
 }
 
 // Forgets everything. It is made again as it is asked for.
@@ -181,11 +184,12 @@ index_reset :: proc(x: ^Index) {
 	set_destroy(&x.fresh)
 	clear(&x.blob)
 	clear(&x.kept)
-	x.checking, x.unsaved = false, 0
+	x.checking, x.check_slots, x.unsaved = false, {}, 0
 	x.forgot = x.n.forgot
 	pager_salt(x)
 	x.next = HEADERS
 	x.upto, x.serial, x.tailing, x.failed, x.unwritten = 0, x.n.roster.serial, false, false, false
+	authors_check(x)
 }
 
 index_close :: proc(x: ^Index) {
@@ -197,6 +201,7 @@ index_close :: proc(x: ^Index) {
 	delete(x.scopes)
 	delete(x.blob)
 	delete(x.kept)
+	delete(x.said)
 	delete(x.watchers)
 	pager_close(x)
 	x^ = {}
@@ -1315,6 +1320,9 @@ Dirty :: struct {
 // Brings the index level with the store, or so far towards it. True when it is.
 index_follow :: proc(x: ^Index, budget := max(int) / 1024) -> bool {
 	n := x.n
+	if x.serial != n.roster.serial {
+		authors_check(x)
+	}
 	if len(x.scopes) == 0 {
 		// Nothing is kept, so there is nothing to bring up.
 		x.upto, x.serial = zsp.store_tail(&n.store), n.roster.serial
@@ -1323,8 +1331,8 @@ index_follow :: proc(x: ^Index, budget := max(int) / 1024) -> bool {
 	}
 	if x.forgot != n.forgot || x.serial == max(u64) {
 		// Rows may be gone that nothing said were.
-		x.forgot, x.checking, x.check_scope, x.check_row = n.forgot, true, 0, 0
-		hot_clear(x)
+		x.forgot = n.forgot
+		check_begin(x, EVERY_SLOT)
 	}
 	x.serial = n.roster.serial
 	if x.checking {
@@ -1411,6 +1419,40 @@ dirty_flush :: proc(d: ^Dirty) {
 	}
 }
 
+@(private)
+check_begin :: proc(x: ^Index, slots: Slots) {
+	x.checking, x.check_scope, x.check_row = true, 0, 0
+	x.check_slots |= slots
+	hot_clear(x)
+}
+
+// What was written is another's, by the roster as it is, if who wrote it goes by another name, or is believed about
+// others, or no more.
+@(private)
+authors_check :: proc(x: ^Index) {
+	changed := false
+	for &m, i in x.n.roster.members {
+		h := zsp.member_name(&m)
+		if i >= len(x.said) {
+			append(&x.said, h)
+		} else if x.said[i] != h {
+			x.said[i] = h
+			changed = true
+		}
+	}
+	slots: Slots
+	for s in x.scopes {
+		for h in s.columns {
+			if h.kind == .Author {
+				slots_add(&slots, h.slot)
+			}
+		}
+	}
+	if changed && slots != {} {
+		check_begin(x, slots)
+	}
+}
+
 // Looks for rows the store no longer has, or has otherwise, without its having been said: a roster may make cells
 // unlawful, and damage take them.
 @(private)
@@ -1441,7 +1483,7 @@ index_check :: proc(x: ^Index, budget: int) {
 			d := Dirty{x = x}
 			defer delete(d.rows)
 			for id in some {
-				d.rows[id] = EVERY_SLOT
+				d.rows[id] = x.check_slots
 			}
 			dirty_flush(&d)
 			if left <= 0 {
@@ -1450,5 +1492,5 @@ index_check :: proc(x: ^Index, budget: int) {
 		}
 		x.check_scope, x.check_row = x.check_scope + 1, 0
 	}
-	x.checking = false
+	x.checking, x.check_slots = false, {}
 }

@@ -559,6 +559,50 @@ do
 	end)
 end
 
+-- Whose a row is, on the other device, and as a question.
+do
+	local News = { title = zsp.string(16), by = zsp.author(16), body = zsp.text(17), writers = zsp.authors(17) }
+	eventually("both may write there", function()
+		return a:may(2, "write") and b:may(2, "write")
+	end)
+	local id = ""
+	a:write(2, function(change)
+		id = change.insert(News, "news", 1, { title = "from ann" })
+	end)
+	local there: any
+	local w = b:window({ scope = 2, list = "news", table = News }, function(s)
+		there = s
+	end)
+	eventually("it says whose it is", function()
+		return #there.rows == 1 and there.rows[1].by == "ann"
+	end)
+	local editor = b:text(id, News.body)
+	editor.append("and bob")
+	editor.close()
+	local more = a:text(id, News.body)
+	more.append("and ann")
+	more.close()
+	eventually("and who wrote in a text", function()
+		return table.concat(there.rows[1].writers, " ") == "ann bob"
+	end)
+	local of: any
+	local asked = b:ask({ scope = 2, table = News, where = zsp.where.is("by", "ann"), totals = { whose = { "facet", "writers" } } }, function(s)
+		of = s
+	end)
+	eventually("it can be asked for", function()
+		return of.status == "ready" and #of.rows == 1 and #of.totals.whose == 2
+	end)
+	asked.stop()
+	local other = b:ask({ scope = 2, table = News, where = zsp.where.is("by", "bob") }, function(s)
+		of = s
+	end)
+	eventually("and is nobody else's", function()
+		return of.status == "ready" and #of.rows == 0
+	end)
+	other.stop()
+	w.stop()
+end
+
 -- A window nobody observes is let go.
 theirs.stop()
 window.stop()

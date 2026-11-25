@@ -90,9 +90,9 @@ You have a list of people and teams already: an identity provider, a table of me
 
 ```json
 {
-  "scopes": {"1": {"write": ["everyone"]}, "2": {"write": ["engineering"]}, "3": {"read": ["everyone"], "write": ["hr"]}},
+  "scopes": {"1": {"write": ["everyone"]}, "2": {"write": ["engineering"]}, "3": {"read": ["everyone"], "write": ["hr"], "vouch": ["website"]}},
   "teams":  {"engineering": ["ann"], "hr": ["hana"]},
-  "people": {"ann": ["<laptop>", "<phone>"], "bob": ["<key>"], "hana": ["<key>"]}
+  "people": {"ann": ["<laptop>", "<phone>"], "bob": ["<key>"], "hana": ["<key>"], "website": ["<key>"]}
 }
 ```
 
@@ -135,7 +135,7 @@ authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
 ```
 
 [examples/apps](../examples/apps/main.odin) is the whole program. The grants are what that session may do, and never more than its device may. The same is how one node serves several people: let
-the credential be a session of your own, and the grants what that person may do.
+the credential be a session of your own, the grants what that person may do, and a third argument [who they are](#whose-a-row-is).
 
 ## Asking within it
 
@@ -164,15 +164,50 @@ if not team.writable then hide(composer) end -- or client:may(scope, "write")
 
 A column says so because an application wrote it there, and an application could write another name. In an unsigned scope that is all there is, for anyone who can write can write anything:
 fine among people who trust one another, which is who shares a scope. In a **signed** scope every cell is signed by its device and refused if that device may not write there, so no one *without* the right can write
-in anyone's name. Which member wrote a cell is not told to local clients, so a column is still what an application goes by for *which* of those who may.
+in anyone's name. 
+There, too, it is known whose each cell is, and that is a column like any other, only that nobody writes it:
 
-For what must be decided by someone, such as an approval, a payment or a limit, make it a call. The device that serves it knows for certain which device is calling, and so whose it is:
+```luau
+local News = { title = zsp.string(16), by = zsp.author(16), body = zsp.text(17), writers = zsp.authors(17) }
+
+row.by                                                                -- whom the last to write the title goes by
+row.writers                                                           -- everyone who has written in the text
+client:ask({ scope = news, table = News, where = w.is("by", "hana") }, render)
+client:ask({ scope = news, table = News, totals = { whose = { "facet", "by" } } }, render)
+```
+
+Whom they go by is yours to say, in one of two ways.
+
+**A device of their own.** It is its `subject`, in the roster. Rename it, and all it wrote goes by the new name.
+
+**A device that serves several**: a web server, a shared kiosk, a bot that acts for whoever asked it. Its host checks who each connection is, as your sign-in does, and says so as it accepts it:
+
+```odin
+user, ok := session_of(credential) // a cookie, a JWT, an API key: yours entirely
+if !ok {
+	zsp.session_refuse(s)
+	return
+}
+zsp.session_accept(s, grants_of(user), as = user.id)
+```
+
+What that connection writes and calls is then that user's, to every device that reads it, if the device has the **Vouch** right there:
+
+```sh
+zspd admit /srv/acme <your server's key> 3 vouch
+```
+
+The application cannot say otherwise: it never says at all. A device without Vouch cannot either, however it has been tampered with: what it writes goes by its own subject. And one that has Vouch can write as anybody, in the scopes it has it in and no others,
+so give it to what runs your sign-in, and to nothing else. If you take it away, what was vouched for before still is. A name is at most 64 bytes: use an id that does not change, and keep what people are
+called in rows. Relays see none of it.
+
+`zspd run` says nothing of who its applications are, so what they write is the device's own. [examples/apps](../examples/apps/main.odin) says it of each.
+
+For what must be decided by someone, such as an approval, a payment or a limit, make it a call. The device that serves it knows for certain which device is calling, and is told whose call it is in the same way:
 
 ```luau
 client:serve(scope, "approve", function(call, data)
-	for _, device in client.devices do
-		if device.id == call.device and device.subject == "hana" then … end
-	end
+	if call.subject == "hana" then … end
 end)
 ```
 

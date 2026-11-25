@@ -5,6 +5,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:math/rand"
 import "core:slice"
+import "core:strings"
 import "core:testing"
 
 // Whole networks in one thread, under a seeded scheduler that fragments, delays, partitions and
@@ -94,6 +95,8 @@ sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 			session_accept(s)
 		} else if string(credential) == "let me in" {
 			session_accept(s, {{0, {.Read, .Write, .Call}, 0}})
+		} else if strings.has_prefix(string(credential), "as ") {
+			session_accept(s, {{0, {.Read, .Write, .Call}, 0}}, string(credential[3:]))
 		} else {
 			session_refuse(s)
 		}

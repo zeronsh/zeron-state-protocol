@@ -14,5 +14,7 @@ return table.freeze({
 	custom = client.columns.custom,
 	where = ask.where,
 	text = client.columns.text,
+	author = client.columns.author,
+	authors = client.columns.authors,
 	Text = text,
 })

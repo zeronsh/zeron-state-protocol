@@ -178,6 +178,9 @@ column_parse :: proc(r: ^zsp.Reader) -> (c: Column) {
 		if c.slot < zsp.DATA || strings.contains(c.path, "\x00") {
 			r.bad = true
 		}
+	case .Author:
+		c.slot = zsp.Slot(zsp.read_u8(r))
+		r.bad ||= c.slot < zsp.DATA
 	case .Order:
 		c.list = {zsp.read_u64(r), zsp.read_u64(r)}
 	case .Created, .Modified:
@@ -263,7 +266,7 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 	case .Prefix, .Has:
 		p.col = column_parse(r)
 		p.bytes = compared(p.col.kind, zsp.read_bytes(r))
-		if p.col.kind != .Bytes && p.col.kind != .Fold {
+		if !kind_long(p.col.kind) {
 			r.bad = true
 		}
 	case .Exists:
@@ -379,6 +382,9 @@ row_bytes :: proc(r: ^Row, c: ^Column) -> [][]byte {
 	Both :: struct {
 		out:  [dynamic][]byte,
 		kind: Kind,
+	}
+	if c.kind == .Author {
+		return row_authors(r, c.slot)
 	}
 	b := Both{make([dynamic][]byte, context.temp_allocator), c.kind}
 	raw, have := row_slot(r, c.slot)

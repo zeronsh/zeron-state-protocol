@@ -85,20 +85,22 @@ cells :: proc() {
 		{row, zsp.DATA + 1, .Bundle, {1700000000000 << 16 | 3, 4}, bundle[:]},
 		{row, zsp.GRAVE, .Grave, {1700000000000 << 16 | 4, 5}, nil},
 		{{4 << 32 | 1700000000, 1}, zsp.DATA, .Value, {1700000000000 << 16 | 5, 6}, transmute([]byte)string("signed")},
+		{{4 << 32 | 1700000000, 1}, zsp.DATA, .Value, {1700000000000 << 16 | 6, 7}, transmute([]byte)string("signed for another")},
 	}
 	for &c, i in all {
 		sealing := key_of(50) if i < 5 else key_of(90)
 		open := c
 		w: [dynamic]byte
 		zsp.write_cell(&w, &open, false)
-		_ = zsp.cell_seal(&k, &r, &c)
+		as := "zoe" if i == 6 else ""
+		_ = zsp.cell_seal(&k, &r, &c, 0, transmute([]byte)as)
 		s: [dynamic]byte
 		zsp.write_cell(&s, &c, false)
 		print := zsp.cell_print(&c)
 		pb: [16]byte
 		zsp.put_u64(pb[:], print[0])
 		zsp.put_u64(pb[8:], print[1])
-		fmt.printfln(`    {{"key": "%s", "open": "%s", "sealed": "%s", "print": "%s"}}%s`, h(sealing[:]), h(w[:]), h(s[:]), h(pb[:]), "," if i + 1 < len(all) else "")
+		fmt.printfln(`    {{"key": "%s", "open": "%s", "sealed": "%s", "print": "%s", "as": "%s"}}%s`, h(sealing[:]), h(w[:]), h(s[:]), h(pb[:]), h(transmute([]byte)as), "," if i + 1 < len(all) else "")
 	}
 	fmt.println("  ],")
 }

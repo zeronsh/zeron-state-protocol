@@ -2,6 +2,7 @@ package zsp
 
 import "base:runtime"
 import "core:slice"
+import "core:strings"
 
 VERSION :: 1
 OUT_HIGH :: 64 << 10 // stop producing bulk when this much is waiting
@@ -76,6 +77,10 @@ Session :: struct {
 	unacked:   [dynamic]Unacked,
 	owed:      [dynamic]u64, // interests this peer has yet to say are level
 	online:    [dynamic]Key32, // latest presence
+	as:        string, // owned; whom the host says a local client is for
+	authors:   map[Author]u32, // that it has been told of, by the numbers it knows them by
+	next_author: u32,
+	wants_authors: bool,
 	// Where live frames go when the pipe has a faster, lossier way to carry them.
 	datagram_data: rawptr,
 	datagram:  proc(data: rawptr, frame: []byte) -> bool,
@@ -114,7 +119,8 @@ Synced_Flags :: bit_field u8 {
 Hello_Flags :: bit_field u8 {
 	full:  bool | 1,
 	relay: bool | 1,
-	_:     u8   | 6,
+	authors: bool | 1, // a local client's, which wants to be told who wrote what
+	_:     u8   | 5,
 }
 
 Task :: struct {
@@ -164,13 +170,18 @@ session_open :: proc(n: ^Node, role: Role, initiator: bool, peer: Key32 = {}, cr
 
 // The host vouches for a connection. Open sessions get exactly these grants; a peer's come from the
 // roster, and these are not consulted.
-session_accept :: proc(s: ^Session, grants: []Grant = nil) {
+session_accept :: proc(s: ^Session, grants: []Grant = nil, as: string = "") {
 	if s.accepted || s.closing {
+		return
+	}
+	if len(as) > MAX_AS {
+		session_refuse(s)
 		return
 	}
 	s.accepted = true
 	if s.role == .Open {
 		append(&s.grants, ..grants)
+		s.as = strings.clone(as)
 	}
 	session_settle_membership(s)
 	if !s.busy {
@@ -253,6 +264,9 @@ session_close :: proc(s: ^Session) {
 	}
 	delete(s.owed)
 	delete(s.online)
+	delete(s.as)
+	authors_clear(s)
+	delete(s.authors)
 	ready := s.ready
 	free(s)
 	if ready && n.keys == nil {
@@ -437,6 +451,7 @@ on_hello :: proc(s: ^Session, r: ^Reader) -> Fault {
 		return .Version
 	}
 	flags := Hello_Flags(read_u8(r))
+	s.wants_authors = flags.authors && s.role == .Open
 	space := read_key32(r)
 	s.promised = read_varint(r)
 	s.peer_serial = min(s.promised, n.roster.serial)
@@ -501,6 +516,8 @@ send_roster :: proc(s: ^Session) {
 	frame_end(&s.out, at)
 }
 
+SAYS_WHOSE :: 0x80 // with the rights in a scope: what is written there says who wrote it
+
 @(private)
 send_scopes :: proc(s: ^Session) {
 	n := s.node
@@ -513,7 +530,8 @@ send_scopes :: proc(s: ^Session) {
 			continue
 		}
 		write_varint(&s.out, u64(k.scope))
-		write_u8(&s.out, transmute(u8)rights)
+		signed := .Signed in roster_scope(&n.roster, k.scope).flags
+		write_u8(&s.out, transmute(u8)rights | (SAYS_WHOSE if signed else 0))
 		append(&s.out, ..k.list_key[:])
 	}
 	frame_end(&s.out, at)
@@ -581,6 +599,7 @@ session_authorize :: proc(s: ^Session) {
 	if s.role == .Open {
 		s.ready = true
 		send_scopes(s)
+		authors_tell(s)
 		reach_tell(n, s)
 		if n.host.questions.again != nil {
 			n.host.questions.again(n.host.questions.data, s)
@@ -1338,6 +1357,88 @@ cells_close :: proc(s: ^Session) {
 	}
 }
 
+// Who wrote something, as a local client is told it.
+@(private)
+Author :: struct {
+	device: Key32,
+	as:     string, // owned; whom the device vouched for, or nothing if it was for its own
+}
+
+@(private)
+author_tell :: proc(s: ^Session, number: u32, device: Key32, subject: []byte) {
+	device := device
+	cells_close(s)
+	at := frame_begin(&s.out, .Author)
+	write_varint(&s.out, u64(number))
+	append(&s.out, ..device[:])
+	write_bytes(&s.out, subject)
+	frame_end(&s.out, at)
+}
+
+// The number a local client knows a cell's author by, told it first if need be.
+@(private)
+session_author :: proc(s: ^Session, c: ^Cell, by: By) -> (number: u32, ok: bool) {
+	device, subject, vouched := cell_author(&s.node.roster, c, by) or_return
+	a := Author{device, string(subject) if vouched else ""}
+	known: bool
+	if number, known = s.authors[a]; known {
+		return number, true
+	}
+	a.as = strings.clone(a.as)
+	s.next_author += 1 // none is this client's own
+	number = s.next_author
+	s.authors[a] = number
+	author_tell(s, number, device, subject)
+	return number, true
+}
+
+// Says who the client is, as others will see it.
+@(private)
+authors_tell :: proc(s: ^Session) {
+	n := s.node
+	if !s.wants_authors {
+		return
+	}
+	mine := transmute([]byte)s.as
+	if m := roster_member(&n.roster, n.keys.device); m != nil && len(mine) == 0 {
+		mine = m.subject
+	}
+	author_tell(s, 0, n.keys.device, mine)
+}
+
+// Someone goes by another name: who wrote what is told afresh, with what they wrote.
+@(private)
+authors_renew :: proc(s: ^Session) {
+	if s.wants_authors && s.ready {
+		authors_clear(s)
+		resync(s)
+	}
+}
+
+@(private)
+authors_clear :: proc(s: ^Session) {
+	for a in s.authors {
+		delete(a.as)
+	}
+	clear(&s.authors)
+}
+
+// For whom a local client writes or calls in a scope, if for another than this device belongs to; and whether it may.
+@(private)
+session_as :: proc(s: ^Session, scope: Scope, call := false) -> (as: []byte, ok: bool) {
+	n := s.node
+	info := roster_scope(&n.roster, scope)
+	m := roster_member(&n.roster, n.keys.device) if n.keys != nil else nil
+	if s.as == "" || info == nil || m == nil || s.as == string(m.subject) {
+		return nil, true
+	}
+	// Where nobody could tell, nothing is said. Where they are told, it must be so.
+	if !call && .Signed not_in info.flags {
+		return nil, true
+	}
+	return transmute([]byte)s.as, .Vouch in member_rights(m, scope)
+}
+
 @(private)
 emit_cell :: proc(s: ^Session, c: ^Cell) {
 	n := s.node
@@ -1350,11 +1451,18 @@ emit_cell :: proc(s: ^Session, c: ^Cell) {
 		}
 		return
 	}
-	if s.role == .Open && !cell_open(n.keys, &n.roster, c) {
+	by: By
+	if s.role == .Open && !cell_open(n.keys, &n.roster, c, &by if s.wants_authors else nil) {
 		return
 	}
+	author, known := session_author(s, c, by)
 	cells_open(s)
+	at := len(s.out)
 	write_cell(&s.out, c, c.row == s.cells.row)
+	if known {
+		s.out[at] |= 0x40
+		write_varint(&s.out, u64(author))
+	}
 	s.cells.row = c.row
 	if !n.full && s.peer_full {
 		if _, ok := tree_get(n, n.outbox, {c.row[0], c.row[1], 0, 0, 0}); ok {
@@ -1398,7 +1506,9 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 		}
 		row = c.row
 		if s.role == .Open {
-			if .Write not_in session_rights(s, row_scope(c.row)) || !node_may_write(n, row_scope(c.row)) || !cell_seal(n.keys, &n.roster, &c) {
+			scope := row_scope(c.row)
+			as, may := session_as(s, scope)
+			if !may || .Write not_in session_rights(s, scope) || !node_may_write(n, scope) || !cell_seal(n.keys, &n.roster, &c, 0, as) {
 				session_fail(s, .Denied)
 				return
 			}

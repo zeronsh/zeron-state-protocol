@@ -17,6 +17,7 @@ Kind :: enum u8 {
 	Created  = 7, // seconds, from the row's id
 	Modified = 8, // seconds, from its latest stamp
 	Order    = 9, // its place in a list
+	Author   = 10, // whose what is in a slot is: whom those who wrote it go by
 }
 
 // A path reaches into JSON: names with dots between. An array along the way stands for all it holds.
@@ -47,14 +48,14 @@ SEVERAL :: 1
 // Whether a column's keys may be only how its values begin.
 @(private)
 kind_long :: proc(k: Kind) -> bool {
-	return k == .Bytes || k == .Fold
+	return k == .Bytes || k == .Fold || k == .Author
 }
 
 // Whether what changed in a slot may change a column.
 @(private)
 column_reads :: proc(c: ^Column, slot: zsp.Slot) -> bool {
 	switch c.kind {
-	case .Bytes, .Fold, .Number, .Bool, .Id, .Words:
+	case .Bytes, .Fold, .Number, .Bool, .Id, .Words, .Author:
 		return c.slot == slot
 	case .Modified:
 		return true
@@ -133,6 +134,24 @@ row_slot :: proc(r: ^Row, slot: zsp.Slot) -> (bytes: []byte, have: bool) {
 	return
 }
 
+// Whom those who wrote what is in a slot go by, perhaps more than once. Temporary memory.
+row_authors :: proc(r: ^Row, slot: zsp.Slot) -> [][]byte {
+	out := make([dynamic][]byte, context.temp_allocator)
+	scan := zsp.row_scan(&r.n.store, r.id, slot, slot)
+	for c in zsp.row_next(&r.n.store, &scan) {
+		c := c
+		by: zsp.By
+		if !zsp.cell_open(r.n.keys, &r.n.roster, &c, &by) {
+			continue
+		}
+		_, subject, _ := zsp.cell_author(&r.n.roster, &c, by) or_continue
+		if len(subject) > 0 {
+			append(&out, slice.clone(subject, context.temp_allocator))
+		}
+	}
+	return out[:]
+}
+
 // The values a row has in a column: none, one, or for what reaches into arrays any number. Ascending, each
 // once. Temporary memory.
 row_values :: proc(r: ^Row, c: ^Column) -> []Value {
@@ -155,6 +174,10 @@ row_values :: proc(r: ^Row, c: ^Column) -> []Value {
 			}
 		}
 	case .Words:
+	case .Author:
+		for subject in row_authors(r, c.slot) {
+			append(&out, bytes_value(subject))
+		}
 	case .Bytes, .Fold, .Number, .Bool, .Id:
 		bytes, have := row_slot(r, c.slot)
 		if !have {
@@ -188,7 +211,7 @@ row_values :: proc(r: ^Row, c: ^Column) -> []Value {
 @(require_results)
 value_key :: proc(kind: Kind, bytes: []byte) -> (v: Value, ok: bool) {
 	switch kind {
-	case .Bytes:
+	case .Bytes, .Author:
 		v = bytes_value(bytes)
 		return v, true
 	case .Fold:
