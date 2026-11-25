@@ -390,7 +390,7 @@ A packet there is no room for goes unacknowledged. Data frames: 0 padding to the
 the sender's affair. A link with nothing in flight sends nothing.
 
 The device with the lesser key dials. Devices that share a relay swap candidate addresses, 18 bytes each (IPv6 or mapped IPv4, then port, big-endian), in signals of kind 0, and
-both send to all of the other's at once. On a local network a device broadcasts from its link socket, at start, to UDP port 9083, and a device that hears it and should be dialled answers that socket with the same: 0x44 ‖ salt (8) ‖
+both send to all of the other's at once. On a local network a device broadcasts from its link socket, at start and a few times soon after, to UDP port 9083, and a device that hears it and should be dialled answers that socket with the same: 0x44 ‖ salt (8) ‖
 XChaCha20-Poly1305 under derive(space, "zsp-beacon"), nonce 0 (8) ‖ salt ‖ 0 ‖ 0x42 ‖ 0 (6), of device (32) ‖ link port (2, big-endian), no associated data.
 
 A link through a NAT is closed after 25 idle seconds, before the NAT forgets it, and dialled again when there is something to say.

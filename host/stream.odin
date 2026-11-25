@@ -69,10 +69,20 @@ stream_accepted :: proc(op: ^nbio.Operation) {
 	stream_new(h, op.accept.client)
 }
 
+// Where two polls wait on one socket, Windows completes whichever was made first, whichever of them it was
+// that had something to wait for, and leaves the other waiting. So there either is taken to speak for both.
+POLLS_MEET :: ODIN_OS == .Windows
+
 @(private)
 stream_listen :: proc(s: ^Stream) {
 	s.recv_op = nbio.poll_poly(s.socket, .Receive, s, proc(op: ^nbio.Operation, s: ^Stream) {
 		s.recv_op = nil
+		when POLLS_MEET {
+			if s.send_op != nil {
+				nbio.remove(s.send_op)
+				s.send_op = nil // what is yet to be sent is tried again
+			}
+		}
 		stream_readable(s)
 	})
 }
@@ -373,6 +383,13 @@ stream_flush_bytes :: proc(s: ^Stream) -> bool {
 			if s.send_op == nil {
 				s.send_op = nbio.poll_poly(s.socket, .Send, s, proc(op: ^nbio.Operation, s: ^Stream) {
 					s.send_op = nil
+					when POLLS_MEET {
+						if s.recv_op != nil {
+							nbio.remove(s.recv_op)
+							s.recv_op = nil
+							stream_readable(s)
+						}
+					}
 				})
 			}
 			return true

@@ -3,6 +3,7 @@ package host
 import "core:encoding/endian"
 import "core:nbio"
 import "core:net"
+import "core:slice"
 import "core:time"
 import "../pipe"
 import "../zsp"
@@ -18,6 +19,8 @@ RETRY_AFTER :: 15 * time.Second
 NAT_IDLE :: 25 * time.Second
 STUN_WAIT :: 400 * time.Millisecond
 BEACON_PORT :: 9083
+ANNOUNCES :: 4 // at once, then 0.3, 1.2 and 4.8 seconds apart
+ANNOUNCE_AFTER :: 300 * time.Millisecond
 MAX_CANDIDATES :: 16
 
 @(private)
@@ -26,6 +29,8 @@ Udp :: struct {
 	socket:   net.UDP_Socket, // IPv4
 	socket6:  net.UDP_Socket,
 	have6:    bool,
+	announces: int, // yet to make
+	announce: time.Tick, // when the next is due
 	beacon:   net.UDP_Socket,
 	have_beacon: bool,
 	port:     int,
@@ -513,12 +518,26 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 			continue
 		}
 		p := peer_for(s, device)
-		if p == nil || p.session != nil || p.knocks > 0 || (p.heard != {} && time.tick_since(p.heard) < RETRY_AFTER) {
+		if p == nil || p.session != nil {
+			return
+		}
+		at := from
+		at.port = u16(port)
+		if p.knocks > 0 {
+			// Heard by another road, which may be the one that works.
+			if slice.contains(p.candidates[:], at) || len(p.candidates) >= MAX_CANDIDATES {
+				return
+			}
+			append(&p.candidates, at)
+			if !peer_dials(p) {
+				beacon_send(s, from)
+			}
+			return
+		}
+		if p.heard != {} && time.tick_since(p.heard) < RETRY_AFTER {
 			return
 		}
 		p.heard = time.tick_now()
-		at := from
-		at.port = u16(port)
 		clear(&p.candidates)
 		append(&p.candidates, at)
 		if !peer_dials(p) {
@@ -529,13 +548,26 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 	}
 }
 
-// Announces this device to the local network. Call at start, and when the network changes.
+// Announces this device to the local network. Call at start, and when the network changes. A broadcast may be
+// lost and nobody the wiser, so it is said a few times, ever less often, and then no more.
 links_announce :: proc(h: ^Host) {
 	if h.udp.open && !h.relay {
-		for s in h.spaces {
-			beacon_send(s)
-		}
+		h.udp.announces = ANNOUNCES
+		h.udp.announce = time.tick_now()
 	}
+}
+
+@(private)
+announce_run :: proc(h: ^Host, now: time.Tick) {
+	u := &h.udp
+	if u.announces == 0 || time.tick_diff(u.announce, now) < 0 {
+		return
+	}
+	for s in h.spaces {
+		beacon_send(s)
+	}
+	u.announces -= 1
+	u.announce = time.tick_add(now, ANNOUNCE_AFTER << uint(2 * (ANNOUNCES - 1 - u.announces)))
 }
 
 // ---------------------------------------------------------------- running
@@ -547,6 +579,7 @@ links_run :: proc(h: ^Host) {
 		return
 	}
 	now := time.tick_now()
+	announce_run(h, now)
 	if u.asking && time.tick_diff(u.asked, now) > STUN_WAIT {
 		u.asking = false
 	}
@@ -642,6 +675,9 @@ links_deadline :: proc(h: ^Host) -> (due: pipe.Time) {
 	}
 	if u.asking {
 		nearer(&due, at(u.asked, STUN_WAIT + time.Millisecond))
+	}
+	if u.announces > 0 {
+		nearer(&due, at(u.announce, 0))
 	}
 	for p in u.links {
 		if p.session != nil {

@@ -130,7 +130,10 @@ export class Space extends DurableObject {
         view(ptr, row.data.byteLength).set(new Uint8Array(row.data));
         return 1;
       },
-      page_write: (no, ptr, len) => void this.#make() ?? sql.exec("INSERT OR REPLACE INTO page VALUES (?, ?)", no, view(ptr, len).slice()),
+      page_write: (no, ptr, len) => {
+        this.#make();
+        sql.exec("INSERT OR REPLACE INTO page VALUES (?, ?)", no, view(ptr, len).slice());
+      },
       save_roster: (ptr, len) => this.#keep("roster", view(ptr, len).slice()),
       authenticate: (id, device, ptr, len) => this.#judge(id, hex(view(device, 32)), view(ptr, len).slice()),
       now: () => Date.now(),
