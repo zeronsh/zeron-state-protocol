@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|sim|bench [find|edits]|nat|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|sim|bench [find|edits|mirror]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -47,6 +47,7 @@ test)
 	node tests/vectors.mjs vectors/vectors.json
 	lune run luau/tests/vectors.luau vectors/vectors.json
 	lune run luau/tests/client.luau
+	lune run luau/tests/mirror_model.luau
 	node examples/relay/test.mjs
 	$PYTHON examples/apps/test.py
 	$PYTHON examples/organization.py
@@ -69,7 +70,9 @@ sim) # as many worlds as you have patience for: ./x sim 10000 [first]
 		-define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 -define:ZSP_FIND_RUN=64 -define:ZSP_FIND_HOT=0
 	;;
 bench)
-	if [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]
+	if [ "${2:-}" = mirror ]; then # what structured state costs a client: ./x bench mirror [rows]
+		lune run luau/tests/mirror_bench.luau ${3:-2000}
+	elif [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]
 		odin build bench/find -out:build/bench-find$EXE -o:speed $STRICT
 		build/bench-find$EXE ${3:-1000000}
 	elif [ "${2:-}" = edits ]; then # what it costs to keep up with one edit of a text: ./x bench edits

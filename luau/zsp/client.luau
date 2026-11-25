@@ -117,6 +117,8 @@ export type Window = {
 	size: number,
 	pages: { Page },
 	entries: { { key: string, row: Stored } }, -- in order
+	at: { [Stored]: string }, -- where each of them is among them
+	bare: boolean, -- its observers want to know when it changes, not how it is
 	observers: { [(State) -> ()]: boolean },
 	watching: number,
 	state: State?,
@@ -248,6 +250,10 @@ local function new_client(host: Host)
 		answers = {} :: { [number]: Live_Call }, -- of others
 		next_call = 0,
 		handlers = {} :: { [string]: (Call, string) -> () },
+		followers = {} :: { [(string) -> ()]: boolean },
+		typing = {} :: { [Stored]: boolean }, -- rows with live text to send
+		tags = {} :: { [string]: string }, -- of lists, by their scope, its key and their name
+		bulk = nil :: { [Window]: { { key: string, row: Stored } } }?, -- rows to add to windows, all at once
 	}, Client)
 	self:_dial()
 	return self
@@ -360,7 +366,10 @@ end
 
 function Client._flush(self: Client)
 	self.flushing = false
-	for _, row in self.rows do
+	-- Rows with live text to send: only those, however many rows are held.
+	local typing = self.typing
+	self.typing = {}
+	for row in typing do
 		if next(row.dirty) ~= nil then
 			self:_send_live(row)
 		end
@@ -571,15 +580,22 @@ end
 function Client._tag(self: Client, scope: number, list: string): string
 	local s = self.scopes[scope]
 	assert(s, "no such scope")
-	return string.pack(">I4", scope) .. string.sub(sha256(s.key .. list), 1, 12)
+	local k = string.pack(">I4", scope) .. s.key .. list
+	local tag = self.tags[k]
+	if not tag then
+		tag = string.sub(k, 1, 4) .. string.sub(sha256(s.key .. list), 1, 12)
+		self.tags[k] = tag
+	end
+	return tag
 end
 
 export type Query = {
 	scope: number,
 	list: string,
 	table: Table,
-	size: number?, -- rows to a page: 50
+	size: number?, -- rows to a page: 50; 0 for all of them
 	from: ("start" | "end")?, -- where to begin: the end
+	bare: boolean?, -- observers are only told that it changed, as what is built on the client wants
 }
 
 -- Observes a list. The observer hears the current state at once, and every change after, at most once a
@@ -592,7 +608,7 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 		shape = self.next_shape
 		self.shapes[query.table] = shape
 	end
-	local key = `{query.scope}/{from}/{query.size or 50}/{shape}/{query.list}`
+	local key = `{query.scope}/{from}/{query.size or 50}/{shape}/{query.list}/{query.bare == true}`
 	local window = self.windows[key]
 	if not window then
 		local made: Window = {
@@ -603,6 +619,8 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 			size = query.size or 50,
 			pages = {},
 			entries = {},
+			at = {},
+			bare = query.bare == true,
 			observers = {},
 			watching = 0,
 			state = nil,
@@ -623,7 +641,7 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 	end
 	window.observers[observer] = true
 	window.watching += 1
-	observer(self:_state(window))
+	observer(if window.bare then nil :: any else self:_state(window))
 	local stopped = false
 
 	return table.freeze({
@@ -908,9 +926,11 @@ end
 function Client._trim(self: Client, window: Window)
 	local lo, hi = window.pages[1].lo, window.pages[#window.pages].hi
 	local kept = {}
+	table.clear(window.at)
 	for _, e in window.entries do
 		if e.key >= lo and e.key < hi then
 			table.insert(kept, e)
+			window.at[e.row] = e.key
 		else
 			self:_release(e.row)
 		end
@@ -1019,7 +1039,7 @@ end
 
 function Client._publish(self: Client, window: Window)
 	window.changed = false
-	local state = self:_state(window)
+	local state = if window.bare then nil :: any else self:_state(window)
 	for f in table.clone(window.observers) do
 		f(state)
 	end
@@ -1244,6 +1264,9 @@ end
 
 -- Puts a row where its placements say, in every window, and takes it from where they do not.
 function Client._place(self: Client, row: Stored)
+	for f in self.followers do
+		f(row.id)
+	end
 	local keys = {}
 	if not row.dead then
 		for slot = 1, 15 do
@@ -1265,15 +1288,12 @@ function Client._place(self: Client, row: Stored)
 				end
 			end
 			local entries = window.entries
-			local have: number? = nil
-			for i, e in entries do
-				if e.row == row then
-					have = i
-					break
-				end
-			end
+			-- Where it is now, found by where it was: keys are in order, and each is a row's own.
+			local was = window.at[row]
+			local have: number? = if was then self:_find(window, was) else nil
 			if have and (not want or entries[have].key ~= want) then
 				table.remove(entries, have)
+				window.at[row] = nil
 				row.pages -= 1
 				if row.pages == 0 and not row.asking and not row.dead then
 					self:_keep(row)
@@ -1282,7 +1302,15 @@ function Client._place(self: Client, row: Stored)
 				have = nil
 			end
 			if want and not have then
-				table.insert(entries, self:_find(window, want), { key = want, row = row })
+				local e = { key = want, row = row }
+				local bulk = self.bulk
+				if bulk then
+					bulk[window] = bulk[window] or {}
+					table.insert(bulk[window], e)
+				else
+					table.insert(entries, self:_find(window, want), e)
+				end
+				window.at[row] = want
 				row.pages += 1
 				self:_touch(window)
 			elseif want then
@@ -1693,6 +1721,7 @@ function Client.text(self: Client, id: string, col: Column)
 	end
 	local function edited()
 		row.dirty[slot] = true
+		self.typing[row] = true
 		row.views = {}
 		self:_place(row)
 		self:_later()
@@ -1786,6 +1815,27 @@ function Client.text(self: Client, id: string, col: Column)
 	})
 end
 
+-- ---------------------------------------------------------------- for what is built on the client
+
+-- Hears of every row that changes, here or anywhere, by its id. Returns a way to stop.
+function Client.follow(self: Client, f: (string) -> ()): () -> ()
+	self.followers[f] = true
+	return function()
+		self.followers[f] = nil
+	end
+end
+
+-- A row as it is held: its cells by slot and stamp, or nil. Not to be changed.
+function Client.held(self: Client, id: string): Stored?
+	return self.rows[id]
+end
+
+-- A text column of a held row, as it is; nil if the row is not held.
+function Client.held_text(self: Client, id: string, slot: number): text.Text?
+	local row = self.rows[id]
+	return if row then self:_text(row, slot) else nil
+end
+
 -- ---------------------------------------------------------------- writing
 
 function Client._heard(self: Client, stamp: string)
@@ -1860,6 +1910,8 @@ export type Change = {
 	set: (id: string, schema: Table, values: { [string]: any }) -> (),
 	place: (id: string, list: string, order: number, slot: number?) -> (),
 	delete: (id: string) -> (),
+	-- Edits a text column as one piece of this change: f is given the text, and a way to name pieces.
+	edit: (id: string, slot: number, f: (t: text.Text, fresh: () -> string) -> ()) -> (),
 }
 
 -- Applies several changes as one: all visible in the same turn, all durable together or not at all.
@@ -1909,17 +1961,55 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		delete = function(id)
 			put(id, 0, GRAVE, "")
 		end,
+		edit = function(id, slot, f)
+			assert(slot >= 16 and slot <= 255, "data slots are 16 to 255")
+			local row = self:_row(id)
+			if row.texts[slot] and row.texts[slot].open ~= "" then
+				self:_seal(row, slot) -- what an editor has open goes first
+			end
+			local t = self:_text(row, slot)
+			f(t, function(): string
+				return self.host.random(8)
+			end)
+			local stamp = self:_stamp()
+			local body = text.close(t, stamp)
+			if body then
+				assert(#body <= MAX_OPEN, "an edit may be 1 MiB at most, less 192 bytes")
+				rows[id] = true
+				table.insert(cells, { row = id, slot = slot, kind = PIECE, stamp = stamp, body = body })
+				merge(row, slot, PIECE, stamp, body)
+				row.views = {}
+			end
+		end,
 	})
 	if #cells > 0 then
 		self:_send_cells(cells, done)
 	elseif done then
 		self.host.defer(done)
 	end
+	-- Many rows at once go into windows at once: sorted together, rather than each moving all after it.
+	local many = 0
+	for _ in rows do
+		many += 1
+	end
+	if many > 64 then
+		self.bulk = {}
+	end
 	for id in rows do
 		local row = self.rows[id]
 		if row then
 			self:_place(row)
 		end
+	end
+	local bulk = self.bulk
+	self.bulk = nil
+	for window, add in bulk or {} :: any do
+		for _, e in add do
+			table.insert(window.entries, e)
+		end
+		table.sort(window.entries, function(x: { key: string, row: Stored }, y: { key: string, row: Stored }): boolean
+			return x.key < y.key
+		end)
 	end
 end
 

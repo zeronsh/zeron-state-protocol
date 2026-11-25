@@ -35,8 +35,9 @@ holds little asks one that holds everything, and says whose answer it has.
 device somebody has, or by the host of one that serves many, if you let it vouch. No application can say otherwise, no relay sees it, and it can be shown, searched, ordered and counted like any other column.
 
 **Documents are tables.** Maps, lists, records and trees, nested as deep as you like, are plain Luau tables: set a new one and what
-differs is written; what others write comes back with whatever did not change the very same table. It is rows underneath, so it costs
-the protocol nothing ([docs/mirror.md](docs/mirror.md)).
+differs is written; what others write comes back with whatever did not change the very same table. Lists keep their order as text does,
+so nothing interleaves and nothing runs out of room. It is rows and texts underneath, so it costs the protocol nothing
+([docs/mirror.md](docs/mirror.md)).
 
 **The log is the database.** A sealed cell is appended once. The bytes on disk are the bytes on the wire are the bytes on the relay.
 

@@ -108,16 +108,16 @@ local function show(v: any, depth: number?): string
 	return "{" .. table.concat(parts, ", ") .. "}"
 end
 
-local Task = m.map({ title = zsp.string(16), done = zsp.boolean(17), notes = zsp.text(18), tags = m.list(zsp.string(19)) })
+local Task = m.map({ title = zsp.string(16), done = zsp.boolean(17), notes = zsp.text(18), tags = m.list(19, zsp.string(16)) })
 local Node = m.map({ name = zsp.string(16) })
 local Board = m.map({
 	title = zsp.string(16),
 	count = zsp.number(17),
 	meta = m.map({ owner = zsp.string(16), created = zsp.number(17) }),
-	tasks = m.list(Task),
+	tasks = m.list(18, Task),
 	scores = m.record(zsp.number(16)),
 	people = m.record(m.map({ role = zsp.string(16), bio = zsp.text(17) })),
-	outline = m.tree(Node),
+	outline = m.tree(19, Node),
 })
 
 local args = process.args
@@ -133,10 +133,36 @@ eventually("both connect", function()
 	return ca.ready and cb.ready and ca:may(1, "write") and cb:may(1, "write")
 end)
 local a = m.open(ca, { scope = 1, name = "board", schema = Board })
+local function differ(x: any, y: any, path: string): string?
+	if equal(x, y) then
+		return nil
+	end
+	if type(x) ~= "table" or type(y) ~= "table" then
+		return `{path}: {tostring(x)} / {tostring(y)}`
+	end
+	for k, v in x do
+		local d = differ(v, y[k], `{path}.{tostring(k)}`)
+		if d then
+			return d
+		end
+	end
+	for k, v in y do
+		local d = differ(x[k], v, `{path}.{tostring(k)}`)
+		if d then
+			return d
+		end
+	end
+	return path
+end
 local function level(what: string)
-	eventually(what, function()
-		return equal(a.state(), b.state())
-	end)
+	for _ = 1, 500 do
+		if equal(a.state(), b.state()) then
+			return
+		end
+		task.wait(0.01)
+	end
+	print("never: " .. what, differ(a.state(), b.state(), ""))
+	process.exit(1)
 end
 
 -- What one sets, the other has, as it was set.
@@ -242,7 +268,7 @@ local notes = titles["ship it"].notes
 assert(string.find(notes, "a: ", 1, true) and string.find(notes, " :b", 1, true), `text kept from both: {notes}`)
 
 -- One place, written into again and again: room is made, and the order is as it was written.
-local Squeeze = m.map({ items = m.list(zsp.number(16)) })
+local Squeeze = m.map({ items = m.list(17, zsp.number(16)) })
 local sa = m.open(ca, { scope = 1, name = "squeeze", schema = Squeeze })
 local sb = m.open(cb, { scope = 1, name = "squeeze", schema = Squeeze })
 sa.set({ items = { 0, 1000 } })
@@ -350,7 +376,7 @@ for round = 1, 40 do
 end
 
 -- A document of thousands: what one change costs, writing and reading.
-local Big = m.map({ items = m.list(m.map({ n = zsp.number(16), label = zsp.string(17) })) })
+local Big = m.map({ items = m.list(18, m.map({ n = zsp.number(16), label = zsp.string(17) })) })
 local big = m.open(ca, { scope = 1, name = "big", schema = Big })
 local items = {}
 for i = 1, 2000 do

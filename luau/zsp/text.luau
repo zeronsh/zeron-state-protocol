@@ -13,6 +13,7 @@ type Span = {
 	len: number,
 	parts: { string },
 	dead: boolean,
+	label: number, -- greater than that of any span before it: so where two elements are is found in a few steps
 }
 
 -- Elements made at once: the first hangs beneath what its operation says, and each of the rest beneath the one before.
@@ -36,6 +37,7 @@ type Piece = {
 	stamp: string, -- "" while only live
 	shown: string, -- what was consumed while only live, to hold the sealed piece to
 	runs: { Run },
+	spans: { Span }, -- its spans, by offset
 }
 
 export type Text = {
@@ -49,6 +51,7 @@ export type Text = {
 	size: number, -- bytes of ops
 	flushed: number,
 	cache: string?,
+	version: number, -- counts changes, that whoever reads it may know whether to again
 }
 
 export type Result = "same" | "changed" | "waiting" | "rebuild"
@@ -70,13 +73,14 @@ function text.new(): Text
 		size = 0,
 		flushed = 0,
 		cache = nil,
+		version = 0,
 	}
 end
 
 local function piece_of(t: Text, id: string): Piece
 	local p = t.pieces[id]
 	if not p then
-		p = { count = 0, rpiece = "", roffset = 0, fed = 0, stamp = "", shown = "", runs = {} }
+		p = { count = 0, rpiece = "", roffset = 0, fed = 0, stamp = "", shown = "", runs = {}, spans = {} }
 		t.pieces[id] = p
 	end
 	return p
@@ -114,21 +118,61 @@ local function find(t: Text, piece: string, offset: number): number
 	error("a reference that was checked is missing")
 end
 
+-- Labels go up along the document, with room between them; when there is none, they are made again.
+local GAP = 2 ^ 20
+local function label(t: Text, i: number)
+	local spans = t.spans
+	local lo = if i > 1 then spans[i - 1].label else 0
+	local hi = if i < #spans then spans[i + 1].label else nil
+	local l = if hi then (lo + hi) / 2 else lo + GAP
+	if hi and not (l > lo and l < hi) then
+		for k, s in spans do
+			s.label = k * GAP
+		end
+		return
+	end
+	spans[i].label = l
+end
+
+-- A piece's span holding an element, and where it is among them.
+local function span_of(p: Piece, offset: number): (Span?, number)
+	local list = p.spans
+	local lo, hi = 1, #list
+	while lo <= hi do
+		local mid = (lo + hi) // 2
+		local s = list[mid]
+		if offset < s.offset then
+			hi = mid - 1
+		elseif offset >= s.offset + s.len then
+			lo = mid + 1
+		else
+			return s, mid
+		end
+	end
+	return nil, lo
+end
+
 local function split(t: Text, i: number, n: number)
 	local s = t.spans[i]
 	if n == 0 or n >= s.len then
 		return
 	end
 	local body = joined(s)
-	table.insert(t.spans, i + 1, {
+	local tail: Span = {
 		piece = s.piece,
 		offset = s.offset + n,
 		len = s.len - n,
 		parts = { string.sub(body, n + 1) },
 		dead = s.dead,
-	})
+		label = 0,
+	}
+	table.insert(t.spans, i + 1, tail)
 	s.parts = { string.sub(body, 1, n) }
 	s.len = n
+	label(t, i + 1)
+	local p = piece_of(t, s.piece)
+	local _, at = span_of(p, s.offset)
+	table.insert(p.spans, at + 1, tail)
 end
 
 -- Index of the span ending with the element; 0 for the document's start.
@@ -279,6 +323,7 @@ end
 
 local function insert_run(t: Text, id: string, bytes: string, lpiece: string, loffset: number, rpiece: string, roffset: number)
 	t.cache = nil
+	t.version += 1
 	local p = piece_of(t, id)
 	local offset = p.count
 	p.count += #bytes
@@ -325,12 +370,16 @@ local function insert_run(t: Text, id: string, bytes: string, lpiece: string, lo
 			return
 		end
 	end
-	table.insert(spans, at, { piece = id, offset = offset, len = #bytes, parts = { bytes }, dead = false })
+	local made: Span = { piece = id, offset = offset, len = #bytes, parts = { bytes }, dead = false, label = 0 }
+	table.insert(spans, at, made)
+	label(t, at)
+	table.insert(p.spans, made) -- the newest of its piece, so the last
 	t.hint = at
 end
 
 local function kill(t: Text, piece: string, offset: number, count: number)
 	t.cache = nil
+	t.version += 1
 	while count > 0 do
 		local i = right_of(t, piece, offset)
 		split(t, i, count)
@@ -624,6 +673,7 @@ function text.delete(t: Text, pos: number, count: number, fresh: () -> string)
 	end
 	begin(t, fresh)
 	t.cache = nil
+	t.version += 1
 	local i = 1
 	while i <= #t.spans and count > 0 do
 		local s = t.spans[i]
@@ -649,6 +699,124 @@ function text.delete(t: Text, pos: number, count: number, fresh: () -> string)
 			i += 1
 		end
 	end
+end
+
+-- ---------------------------------------------------------------- elements by name
+
+-- An element's name: its piece, and its offset in it.
+local function eid(piece: string, offset: number): string
+	return piece .. string.pack(">I4", offset)
+end
+
+local function uneid(id: string): (string, number)
+	return string.sub(id, 1, 8), (string.unpack(">I4", id, 9) :: any) :: number
+end
+
+-- The elements that are there, in order: one name for each visible byte.
+function text.ids(t: Text): { string }
+	local out = {}
+	for _, s in t.spans do
+		if not s.dead then
+			for k = 0, s.len - 1 do
+				table.insert(out, eid(s.piece, s.offset + k))
+			end
+		end
+	end
+	return out
+end
+
+-- Where every element is, deleted or not, by name: what was inserted next to one stays next to it.
+function text.order(t: Text): { [string]: number }
+	local out = {}
+	local n = 0
+	for _, s in t.spans do
+		for k = 0, s.len - 1 do
+			n += 1
+			out[eid(s.piece, s.offset + k)] = n
+		end
+	end
+	return out
+end
+
+-- Types bytes just after an element, deleted or not ("" for the start), and says what the first is called.
+function text.after(t: Text, after: string, bytes: string, fresh: () -> string): string
+	begin(t, fresh)
+	local lp, lo = "", 0
+	local i = 1
+	if after ~= "" then
+		lp, lo = uneid(after)
+		i = left_of(t, lp, lo) + 1
+	end
+	local rp, ro = "", 0
+	if i <= #t.spans then
+		rp, ro = t.spans[i].piece, t.spans[i].offset
+	end
+	local id = t.open
+	local p = piece_of(t, id)
+	local first = p.count
+	local w = codec.writer()
+	if p.count > 0 and lp == id and lo == p.count - 1 and rp == p.rpiece and ro == p.roffset then
+		codec.put_u8(w, EXTEND)
+	else
+		codec.put_u8(w, INSERT)
+		put_ref(w, id, lp, lo)
+		put_ref(w, id, rp, ro)
+	end
+	codec.put_bytes(w, bytes)
+	record(t, w)
+	insert_run(t, id, bytes, lp, lo, rp, ro)
+	return eid(id, first)
+end
+
+-- Deletes elements by name: so many from one on, of one piece, those still there.
+function text.remove(t: Text, id: string, count: number, fresh: () -> string)
+	begin(t, fresh)
+	t.cache = nil
+	t.version += 1
+	local piece, offset = uneid(id)
+	while count > 0 do
+		local i = right_of(t, piece, offset)
+		split(t, i, count)
+		local s = t.spans[i]
+		if not s.dead then
+			s.dead = true
+			local w = codec.writer()
+			codec.put_u8(w, DELETE)
+			put_ref(w, t.open, s.piece, s.offset)
+			codec.put_varint(w, s.len)
+			record(t, w)
+		end
+		offset += s.len
+		count -= s.len
+	end
+end
+
+-- Where an element is, deleted or not, as two numbers to compare in order; nil if it is not here.
+function text.position(t: Text, id: string): (number?, number)
+	local piece, offset = uneid(id)
+	local p = t.pieces[piece]
+	if not p then
+		return nil, 0
+	end
+	local s = span_of(p, offset)
+	if not s then
+		return nil, 0
+	end
+	return s.label, offset
+end
+
+-- Whether an element is here, and not deleted.
+function text.standing(t: Text, id: string): boolean
+	local piece, offset = uneid(id)
+	local p = t.pieces[piece]
+	local s = if p then span_of(p, offset) else nil
+	return s ~= nil and not s.dead
+end
+
+-- Whether an element is here, deleted or not.
+function text.has(t: Text, id: string): boolean
+	local piece, offset = uneid(id)
+	return has(t, piece, offset, 1)
 end
 
 -- What has been written since the last call: piece, offset, bytes.
