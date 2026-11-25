@@ -157,6 +157,25 @@ store_header :: proc(disk: Disk) -> (best: Header) {
 	return
 }
 
+// Every cell written to the log from an offset on, living or dead, some perhaps twice. Flush first.
+store_since :: proc(s: ^Store, from: u64, data: rawptr, each: proc(data: rawptr, c: ^Cell)) {
+	Both :: struct {
+		data: rawptr,
+		each: proc(data: rawptr, c: ^Cell),
+	}
+	b := Both{data, each}
+	log_scan(s.disk, from, &b, proc(data: rawptr, _: u64, body: []byte) {
+		b := (^Both)(data)
+		r := Reader{buf = body}
+		row: Id
+		for r.pos < len(r.buf) {
+			c := read_cell(&r, row) or_break
+			row = c.row
+			b.each(b.data, &c)
+		}
+	})
+}
+
 // The latest stamp time a store has seen, without opening it.
 @(require_results)
 store_clock :: proc(disk: Disk) -> u64 {

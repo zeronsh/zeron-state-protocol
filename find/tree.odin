@@ -1,0 +1,768 @@
+package find
+
+import "../zsp"
+
+// One structure for everything: an ordered set of (key, sub), each with a value, in leaves that write each entry
+// as its difference from the last. A posting is two bytes; a number in its place, five or so. Branches carry how
+// many entries lie below, and what their keys come to when they are numbers, so any range is counted, summed
+// and indexed into in logarithmic time.
+
+Key :: struct {
+	hi, lo: u64,
+}
+
+Entry :: struct {
+	key: Key,
+	sub: u32,
+	val: u64,
+}
+
+// What an entry's value takes.
+Width :: enum u8 {
+	None,
+	Byte,
+	Varint,
+}
+
+Tree :: struct {
+	root:  u32, // zero when empty
+	width: Width,
+	sums:  bool, // the keys are numbers
+}
+
+Edit :: struct {
+	using entry: Entry,
+	gone: bool,
+}
+
+Total :: struct {
+	count: int,
+	sum:   f64,
+}
+
+KEY_MIN :: Key{}
+KEY_MAX :: Key{max(u64), max(u64)}
+
+@(private)
+LEAF_ROOM :: size_of(Page{}.data)
+@(private)
+RESTART :: 512 // bytes of a leaf between places reading can start
+@(private)
+ENTRY_MAX :: 2 + 16 + 5 + 10
+@(private)
+SAME_LONG :: 0xe0 // the key is the same, and a varint says how far on the sub is
+@(private)
+FRESH :: 0xe1 // plus how many leading bytes of the key are
+
+@(private)
+Child :: struct #packed {
+	key:   Key,
+	sub:   u32,
+	child: u32,
+	count: u32,
+	sum:   f64,
+}
+@(private)
+BRANCH_CAP :: LEAF_ROOM / size_of(Child)
+
+@(require_results)
+key_less :: #force_inline proc "contextless" (a, b: Key) -> bool {
+	return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo)
+}
+
+@(require_results)
+entry_less :: #force_inline proc "contextless" (ak: Key, as: u32, bk: Key, bs: u32) -> bool {
+	return ak.hi < bk.hi || (ak.hi == bk.hi && (ak.lo < bk.lo || (ak.lo == bk.lo && as < bs)))
+}
+
+// The next key there can be. Zero after the last.
+@(require_results)
+key_next :: proc "contextless" (k: Key) -> Key {
+	return {k.hi + (1 if k.lo == max(u64) else 0), k.lo + 1}
+}
+
+@(private)
+children :: proc(pg: ^Page) -> []Child {
+	return ([^]Child)(&pg.data)[:pg.count]
+}
+
+// ---------------------------------------------------------------- leaves
+
+// A leaf is entries, then, from the end backwards, where each restart begins.
+@(private)
+Reader :: struct {
+	pg:    ^Page,
+	width: Width,
+	pos:   int,
+	stop:  int,
+	using at: Entry,
+}
+
+@(private)
+restart_at :: #force_inline proc(pg: ^Page, i: int) -> int {
+	return int((^u16)(&pg.data[LEAF_ROOM - 2 * (i + 1)])^)
+}
+
+@(private)
+reader :: proc(pg: ^Page, width: Width, block := 0) -> Reader {
+	return {pg = pg, width = width, pos = restart_at(pg, block) if pg.count > 0 else 0, stop = int(pg.used)}
+}
+
+@(private)
+reader_next :: #force_inline proc(r: ^Reader) -> bool #no_bounds_check {
+	if r.pos >= r.stop {
+		return false
+	}
+	d := &r.pg.data
+	h := d[r.pos]
+	r.pos += 1
+	switch {
+	case h < SAME_LONG:
+		r.sub += u32(h) + 1
+	case h == SAME_LONG:
+		r.sub += u32(read_varint(d[:], &r.pos))
+	case:
+		shared, n := int(h - FRESH), int(d[r.pos])
+		r.pos += 1
+		r.key = key_join(r.key, shared, d[r.pos:][:n])
+		r.pos += n
+		r.sub = u32(read_varint(d[:], &r.pos))
+	}
+	switch r.width {
+	case .None:
+	case .Byte:
+		r.val = u64(d[r.pos])
+		r.pos += 1
+	case .Varint:
+		r.val = read_varint(d[:], &r.pos)
+	}
+	return true
+}
+
+@(private)
+read_varint :: #force_inline proc(d: []byte, pos: ^int) -> (v: u64) #no_bounds_check {
+	shift: uint
+	for {
+		b := d[pos^]
+		pos^ += 1
+		v |= u64(b & 0x7f) << shift
+		if b < 0x80 {
+			return
+		}
+		shift += 7
+	}
+}
+
+// The first `shared` bytes of a key, then others, then zeroes.
+@(private)
+key_join :: proc(k: Key, shared: int, rest: []byte) -> Key #no_bounds_check {
+	b: [16]byte = ---
+	zsp.put_u64(b[:], k.hi)
+	zsp.put_u64(b[8:], k.lo)
+	copy(b[shared:], rest)
+	for i in shared + len(rest) ..< 16 {
+		b[i] = 0
+	}
+	return {zsp.get_u64(b[:]), zsp.get_u64(b[8:])}
+}
+
+@(private)
+Writer :: struct {
+	p:     ^Pager,
+	t:     ^Tree,
+	out:   ^[dynamic]Child, // where finished leaves go
+	pg:    ^Page,
+	no:    u32,
+	next_restart: int,
+	last:  Entry,
+	total: Total,
+}
+
+@(private)
+write_varint :: #force_inline proc(d: []byte, pos: int, v: u64) -> int #no_bounds_check {
+	v, pos := v, pos
+	for v >= 0x80 {
+		d[pos] = byte(v) | 0x80
+		pos += 1
+		v >>= 7
+	}
+	d[pos] = byte(v)
+	return pos + 1
+}
+
+@(private)
+writer_put :: proc(w: ^Writer, e: Entry) #no_bounds_check {
+	if w.pg != nil && int(w.pg.used) + ENTRY_MAX + 2 * (int(w.pg.count) + 1) > LEAF_ROOM {
+		writer_end(w)
+	}
+	if w.pg == nil {
+		w.no, w.pg = page_new(w.p)
+		append(w.out, Child{key = e.key, sub = e.sub, child = w.no})
+		w.next_restart = 0
+		w.total = {}
+	}
+	pg := w.pg
+	d := pg.data[:]
+	pos := int(pg.used)
+	fresh := pos >= w.next_restart
+	if fresh {
+		(^u16)(&pg.data[LEAF_ROOM - 2 * (int(pg.count) + 1)])^ = u16(pos)
+		pg.count += 1
+		w.next_restart = pos + RESTART
+	}
+	if !fresh && e.key == w.last.key {
+		step := e.sub - w.last.sub
+		if step <= SAME_LONG {
+			d[pos] = byte(step - 1)
+			pos += 1
+		} else {
+			d[pos] = SAME_LONG
+			pos = write_varint(d, pos + 1, u64(step))
+		}
+	} else {
+		b, was: [16]byte = ---, ---
+		zsp.put_u64(b[:], e.key.hi)
+		zsp.put_u64(b[8:], e.key.lo)
+		shared := 0
+		if !fresh {
+			zsp.put_u64(was[:], w.last.key.hi)
+			zsp.put_u64(was[8:], w.last.key.lo)
+			for shared < 15 && b[shared] == was[shared] {
+				shared += 1
+			}
+		}
+		end := 16
+		for end > shared && b[end - 1] == 0 {
+			end -= 1
+		}
+		d[pos], d[pos + 1] = byte(FRESH + shared), byte(end - shared)
+		copy(d[pos + 2:], b[shared:end])
+		pos = write_varint(d, pos + 2 + end - shared, u64(e.sub))
+	}
+	switch w.t.width {
+	case .None:
+	case .Byte:
+		d[pos] = byte(e.val)
+		pos += 1
+	case .Varint:
+		pos = write_varint(d, pos, e.val)
+	}
+	pg.used = u16(pos)
+	w.last = e
+	w.total.count += 1
+	if w.t.sums {
+		w.total.sum += key_number(e.key)
+	}
+}
+
+@(private)
+writer_end :: proc(w: ^Writer) {
+	if w.pg == nil {
+		return
+	}
+	c := &w.out[len(w.out) - 1]
+	c.count, c.sum = u32(w.total.count), w.total.sum
+	w.pg = nil
+}
+
+// ---------------------------------------------------------------- changing
+
+// Applies edits, which are in order and name each entry once.
+tree_apply :: proc(p: ^Pager, t: ^Tree, edits: []Edit) {
+	if len(edits) == 0 {
+		return
+	}
+	top := make([dynamic]Child, context.temp_allocator)
+	if t.root == 0 {
+		w := Writer{p = p, t = t, out = &top}
+		for e in edits {
+			if !e.gone {
+				writer_put(&w, e.entry)
+			}
+		}
+		writer_end(&w)
+		tree_grow(p, t, &top, 1)
+		return
+	}
+	level := int(page_get(p, t.root).level)
+	node_apply(p, t, t.root, edits, &top)
+	tree_grow(p, t, &top, level + 1)
+}
+
+// Puts branches over nodes until there is one.
+@(private)
+tree_grow :: proc(p: ^Pager, t: ^Tree, nodes: ^[dynamic]Child, level: int) {
+	nodes, level := nodes^, level
+	for len(nodes) > 1 {
+		up := make([dynamic]Child, context.temp_allocator)
+		branch_write(p, nodes[:], level, &up)
+		nodes = up
+		level += 1
+	}
+	t.root = 0
+	if len(nodes) == 0 {
+		return
+	}
+	t.root = nodes[0].child
+	// A branch over a single child says nothing.
+	for {
+		pg := page_get(p, t.root)
+		if pg.level == 0 || pg.count != 1 {
+			return
+		}
+		only := children(pg)[0].child
+		page_drop(p, t.root)
+		t.root = only
+	}
+}
+
+@(private)
+branch_write :: proc(p: ^Pager, nodes: []Child, level: int, out: ^[dynamic]Child) {
+	pages := (len(nodes) + BRANCH_CAP - 1) / BRANCH_CAP
+	at := 0
+	for i in 0 ..< pages {
+		n := (len(nodes) - at + pages - i - 1) / (pages - i)
+		no, pg := page_new(p)
+		pg.level, pg.count = u16(level), u16(n)
+		copy(children(pg), nodes[at:][:n])
+		c := Child{key = nodes[at].key, sub = nodes[at].sub, child = no}
+		for x in nodes[at:][:n] {
+			c.count += x.count
+			c.sum += x.sum
+		}
+		append(out, c)
+		at += n
+	}
+}
+
+@(private)
+node_apply :: proc(p: ^Pager, t: ^Tree, no: u32, edits: []Edit, out: ^[dynamic]Child) {
+	pg := page_get(p, no)
+	if pg.level == 0 {
+		leaf_apply(p, t, no, edits, out)
+		return
+	}
+	level := int(pg.level)
+	old := make([]Child, int(pg.count), context.temp_allocator)
+	copy(old, children(pg))
+	page_drop(p, no)
+	nodes := make([dynamic]Child, 0, len(old) + 4, context.temp_allocator)
+	at := 0
+	for c, i in old {
+		end := len(edits)
+		if i + 1 < len(old) {
+			// Up to where the next child begins.
+			lo, hi := at, len(edits)
+			for lo < hi {
+				mid := (lo + hi) / 2
+				if entry_less(edits[mid].key, edits[mid].sub, old[i + 1].key, old[i + 1].sub) {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			end = lo
+		}
+		if end == at {
+			append(&nodes, c)
+			continue
+		}
+		before := len(nodes)
+		node_apply(p, t, c.child, edits[at:end], &nodes)
+		at = end
+		if before > 0 && before < len(nodes) {
+			node_join(p, t, &nodes, before)
+		}
+	}
+	if len(nodes) > 0 {
+		branch_write(p, nodes[:], level, out)
+	}
+}
+
+// Two small neighbours become one.
+@(private)
+node_join :: proc(p: ^Pager, t: ^Tree, nodes: ^[dynamic]Child, i: int) {
+	a, b := nodes[i - 1], nodes[i]
+	pa, pb := page_get(p, a.child), page_get(p, b.child)
+	if pa.level != pb.level {
+		return
+	}
+	joined := make([dynamic]Child, context.temp_allocator)
+	if pa.level > 0 {
+		if int(pa.count) + int(pb.count) > BRANCH_CAP / 2 {
+			return
+		}
+		all := make([dynamic]Child, context.temp_allocator)
+		append(&all, ..children(pa))
+		append(&all, ..children(pb))
+		level := int(pa.level)
+		branch_write(p, all[:], level, &joined)
+	} else {
+		if int(pa.used) + int(pb.used) > LEAF_ROOM / 2 {
+			return
+		}
+		w := Writer{p = p, t = t, out = &joined}
+		for c in ([2]u32{a.child, b.child}) {
+			copied := new_clone(page_get(p, c)^, context.temp_allocator)
+			r := reader(copied, t.width)
+			for reader_next(&r) {
+				writer_put(&w, r.at)
+			}
+		}
+		writer_end(&w)
+	}
+	page_drop(p, a.child)
+	page_drop(p, b.child)
+	nodes[i - 1] = joined[0]
+	if len(joined) > 1 {
+		nodes[i] = joined[1]
+	} else {
+		ordered_remove(nodes, i)
+	}
+}
+
+@(private)
+leaf_apply :: proc(p: ^Pager, t: ^Tree, no: u32, edits: []Edit, out: ^[dynamic]Child) {
+	old := new_clone(page_get(p, no)^, context.temp_allocator)
+	page_drop(p, no)
+	w := Writer{p = p, t = t, out = out}
+	r := reader(old, t.width)
+	have := reader_next(&r)
+	for e in edits {
+		for have && entry_less(r.key, r.sub, e.key, e.sub) {
+			writer_put(&w, r.at)
+			have = reader_next(&r)
+		}
+		if have && r.key == e.key && r.sub == e.sub {
+			have = reader_next(&r)
+		}
+		if !e.gone {
+			writer_put(&w, e.entry)
+		}
+	}
+	for have {
+		writer_put(&w, r.at)
+		have = reader_next(&r)
+	}
+	writer_end(&w)
+}
+
+// Gives up every page.
+tree_clear :: proc(p: ^Pager, t: ^Tree) {
+	drop :: proc(p: ^Pager, no: u32) {
+		pg := page_get(p, no)
+		if pg.level > 0 {
+			below := make([]u32, int(pg.count), context.temp_allocator)
+			for c, i in children(pg) {
+				below[i] = c.child
+			}
+			for c in below {
+				drop(p, c)
+			}
+		}
+		page_drop(p, no)
+	}
+	if t.root != 0 {
+		drop(p, t.root)
+	}
+	t.root = 0
+}
+
+// ---------------------------------------------------------------- asking
+
+// The child that would hold an entry.
+@(private)
+child_find :: proc(cs: []Child, key: Key, sub: u32) -> int #no_bounds_check {
+	lo, hi := 1, len(cs)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if entry_less(key, sub, cs[mid].key, cs[mid].sub) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo - 1
+}
+
+// A reader of a leaf, at the last restart not past an entry.
+@(private)
+leaf_seek :: proc(pg: ^Page, width: Width, key: Key, sub: u32) -> Reader {
+	lo, hi := 1, int(pg.count)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		r := reader(pg, width, mid)
+		reader_next(&r)
+		if entry_less(key, sub, r.key, r.sub) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return reader(pg, width, max(lo - 1, 0))
+}
+
+@(require_results)
+tree_get :: proc(p: ^Pager, t: Tree, key: Key, sub: u32) -> (val: u64, ok: bool) {
+	if t.root == 0 {
+		return
+	}
+	pg := page_get(p, t.root)
+	for pg.level > 0 {
+		cs := children(pg)
+		pg = page_get(p, cs[child_find(cs, key, sub)].child)
+	}
+	r := leaf_seek(pg, t.width, key, sub)
+	for reader_next(&r) {
+		if !entry_less(r.key, r.sub, key, sub) {
+			return r.val, r.key == key && r.sub == sub
+		}
+	}
+	return
+}
+
+// What lies before an entry.
+@(require_results)
+tree_before :: proc(p: ^Pager, t: Tree, key: Key, sub: u32) -> (s: Total) {
+	if t.root == 0 {
+		return
+	}
+	pg := page_get(p, t.root)
+	for pg.level > 0 {
+		cs := children(pg)
+		at := child_find(cs, key, sub)
+		for c in cs[:at] {
+			s.count += int(c.count)
+			s.sum += c.sum
+		}
+		pg = page_get(p, cs[at].child)
+	}
+	r := reader(pg, t.width)
+	for reader_next(&r) && entry_less(r.key, r.sub, key, sub) {
+		s.count += 1
+		if t.sums {
+			s.sum += key_number(r.key)
+		}
+	}
+	return
+}
+
+@(require_results)
+tree_total :: proc(p: ^Pager, t: Tree) -> (s: Total) {
+	if t.root == 0 {
+		return
+	}
+	pg := page_get(p, t.root)
+	if pg.level > 0 {
+		for c in children(pg) {
+			s.count += int(c.count)
+			s.sum += c.sum
+		}
+		return
+	}
+	r := reader(pg, t.width)
+	for reader_next(&r) {
+		s.count += 1
+		if t.sums {
+			s.sum += key_number(r.key)
+		}
+	}
+	return
+}
+
+// Entries of keys from `lo` up to, and not including, `hi`; where `hi` is KEY_MAX, including it.
+@(require_results)
+tree_between :: proc(p: ^Pager, t: Tree, lo, hi: Key) -> (s: Total) {
+	a := tree_before(p, t, lo, 0)
+	s = tree_total(p, t) if hi == KEY_MAX else tree_before(p, t, hi, 0)
+	return {max(s.count - a.count, 0), s.sum - a.sum}
+}
+
+// Walks entries in either direction.
+Cursor :: struct {
+	p:     ^Pager,
+	t:     Tree,
+	path:  [8]struct {
+		no: u32,
+		at: int,
+	},
+	depth: int, // of the leaf in the path
+	block: int,
+	items: [dynamic]Entry, // the block's
+	at:    int, // the next going forward
+	done:  bool,
+}
+
+cursor_make :: proc(p: ^Pager, t: Tree, allocator := context.temp_allocator) -> (c: Cursor) {
+	c.p, c.t = p, t
+	c.items = make([dynamic]Entry, allocator)
+	return
+}
+
+cursor_destroy :: proc(c: ^Cursor) {
+	delete(c.items)
+	c^ = {}
+}
+
+// Stands before the first entry not less than this one.
+cursor_seek :: proc(c: ^Cursor, key: Key, sub: u32 = 0) {
+	clear(&c.items)
+	c.at, c.depth = 0, 0
+	c.done = c.t.root == 0
+	if c.done {
+		return
+	}
+	no := c.t.root
+	for {
+		pg := page_get(c.p, no)
+		if pg.level == 0 {
+			c.path[c.depth] = {no, 0}
+			lo, hi := 1, int(pg.count)
+			for lo < hi {
+				mid := (lo + hi) / 2
+				r := reader(pg, c.t.width, mid)
+				reader_next(&r)
+				if entry_less(r.key, r.sub, key, sub) {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			cursor_block(c, max(lo - 1, 0))
+			break
+		}
+		cs := children(pg)
+		at := child_find(cs, key, sub)
+		c.path[c.depth] = {no, at}
+		c.depth += 1
+		no = cs[at].child
+	}
+	lo, hi := 0, len(c.items)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if entry_less(c.items[mid].key, c.items[mid].sub, key, sub) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	c.at = lo
+}
+
+@(private)
+cursor_block :: proc(c: ^Cursor, block: int) {
+	pg := page_get(c.p, c.path[c.depth].no)
+	c.block = block
+	clear(&c.items)
+	if pg.count == 0 {
+		return
+	}
+	r := reader(pg, c.t.width, block)
+	if block + 1 < int(pg.count) {
+		r.stop = restart_at(pg, block + 1)
+	}
+	for reader_next(&r) {
+		append(&c.items, r.at)
+	}
+}
+
+@(require_results)
+cursor_next :: proc(c: ^Cursor) -> (e: Entry, ok: bool) {
+	for !c.done {
+		if c.at < len(c.items) {
+			c.at += 1
+			return c.items[c.at - 1], true
+		}
+		if !cursor_step(c, 1) {
+			c.at = len(c.items)
+			return
+		}
+		c.at = 0
+	}
+	return
+}
+
+@(require_results)
+cursor_prev :: proc(c: ^Cursor) -> (e: Entry, ok: bool) {
+	for !c.done {
+		if c.at > 0 {
+			c.at -= 1
+			return c.items[c.at], true
+		}
+		if !cursor_step(c, -1) {
+			c.at = 0
+			return
+		}
+		c.at = len(c.items)
+	}
+	return
+}
+
+// The block after this one, or before it. False, and nothing moved, when there is none.
+@(private)
+cursor_step :: proc(c: ^Cursor, way: int) -> bool {
+	pg := page_get(c.p, c.path[c.depth].no)
+	if b := c.block + way; b >= 0 && b < int(pg.count) {
+		cursor_block(c, b)
+		return true
+	}
+	d := c.depth - 1
+	for d >= 0 {
+		up := page_get(c.p, c.path[d].no)
+		if at := c.path[d].at + way; at >= 0 && at < int(up.count) {
+			c.path[d].at = at
+			break
+		}
+		d -= 1
+	}
+	if d < 0 {
+		return false
+	}
+	for d < c.depth {
+		up := page_get(c.p, c.path[d].no)
+		below := children(up)[c.path[d].at].child
+		d += 1
+		c.path[d] = {below, 0}
+		if d < c.depth && way < 0 {
+			c.path[d].at = int(page_get(c.p, below).count) - 1
+		}
+	}
+	leaf := page_get(c.p, c.path[c.depth].no)
+	cursor_block(c, 0 if way > 0 else max(int(leaf.count) - 1, 0))
+	return true
+}
+
+// Every entry of keys from `lo` up to, and not including, `hi`, as fast as they can be read.
+tree_each :: proc(p: ^Pager, t: Tree, lo, hi: Key, data: rawptr, each: proc(data: rawptr, e: ^Entry)) {
+	walk :: proc(p: ^Pager, t: ^Tree, no: u32, lo, hi: Key, data: rawptr, each: proc(data: rawptr, e: ^Entry)) {
+		pg := page_get(p, no)
+		if pg.level > 0 {
+			cs := make([]Child, int(pg.count), context.temp_allocator)
+			copy(cs, children(pg))
+			for c, i in cs {
+				if !key_less(c.key, hi) && hi != KEY_MAX {
+					return
+				}
+				if i + 1 < len(cs) && key_less(cs[i + 1].key, lo) {
+					continue
+				}
+				walk(p, t, c.child, lo, hi, data, each)
+			}
+			return
+		}
+		r := leaf_seek(pg, t.width, lo, 0)
+		for reader_next(&r) {
+			if key_less(r.key, lo) {
+				continue
+			}
+			if !key_less(r.key, hi) && hi != KEY_MAX {
+				return
+			}
+			each(data, &r.at)
+		}
+	}
+	t := t
+	if t.root != 0 {
+		walk(p, &t, t.root, lo, hi, data, each)
+	}
+}
