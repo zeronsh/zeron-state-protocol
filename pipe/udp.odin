@@ -24,6 +24,7 @@ RECV_WINDOW :: 1 << 20
 SEND_BUFFER :: 1 << 20
 ACK_DELAY :: 5 * MS
 MAX_PROBES :: 6
+PROBE_MOST :: 2_000 * MS // between them, unless the path is slower than that
 MAX_PATH_PROBES :: 3
 
 // First bytes. STUN's are below 0x40.
@@ -282,7 +283,9 @@ link_quiet :: proc(l: ^Link) -> bool {
 
 // Says something that must be answered, so that a link to nobody is found out.
 link_poke :: proc(l: ^Link) {
-	l.want_probe = true
+	if l.in_flight == 0 {
+		l.want_probe = true
+	}
 }
 
 link_close :: proc(l: ^Link) {
@@ -785,7 +788,7 @@ link_expire :: proc(l: ^Link, now: Time) {
 @(private)
 link_timeout :: proc(l: ^Link) -> Time {
 	pto := Time(l.srtt + max(4 * l.rttvar, 1000)) + ACK_DELAY
-	return l.waiting + pto << uint(l.probes) + 1
+	return l.waiting + max(min(pto << uint(l.probes), PROBE_MOST), pto) + 1
 }
 
 // When link_output must next be called, absent other reasons; zero for never.

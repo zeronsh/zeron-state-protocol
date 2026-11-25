@@ -331,16 +331,16 @@ link_holds_what_it_accepts :: proc(t: ^testing.T) {
 	testing.expect(t, len(n.links[1].early) <= MAX_EARLY && refused > 0)
 }
 
-// Nobody is there any more, and it is found out, however often there is more to say to them.
+// Nobody is there any more, and it is found out, however often there is more to say to them, and however slow the path was.
 @(test)
 link_to_nobody_is_closed :: proc(t: ^testing.T) {
-	for every in ([]Time{50 * MS, 300 * MS, 1000 * MS, 1700 * MS, 5000 * MS}) {
+	for every, n_th in ([]Time{50 * MS, 300 * MS, 1000 * MS, 1700 * MS, 5000 * MS, 1000 * MS}) {
 		state := rand.create(u64(every))
 		context.random_generator = rand.default_random_generator(&state)
 		n: Net
 		net_init(t, &n)
 		defer net_destroy(&n)
-		n.delay = 5 * MS
+		n.delay = 5 * MS if n_th < 5 else 150 * MS
 		for i in 0 ..< 50 {
 			link_write(&n.links[i % 2], {1, 2, 3})
 			for net_step(&n) {
