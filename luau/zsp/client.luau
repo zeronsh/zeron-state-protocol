@@ -637,6 +637,10 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 		load_after = function()
 			self:_load_after(window)
 		end,
+		-- The rows as they are held, in order: for what is built on the client, such as a mirror.
+		entries = function(): { { key: string, row: Stored } }
+			return window.entries
+		end,
 		stop = function()
 			if stopped then
 				return

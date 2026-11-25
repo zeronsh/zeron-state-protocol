@@ -339,6 +339,20 @@ def test_luau():
     assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stderr
 
 
+def test_mirror():
+    _, (a, b) = space("ma", "mb")
+    args = []
+    for d in (a, b):
+        with open(os.path.join(d.dir, "token")) as f:
+            args += [d.address, f.read()]
+    try:
+        p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "mirror.luau"), *args], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as e:
+        raise AssertionError((e.stderr or b"").decode()) from None
+    sys.stdout.write(p.stdout.replace("ok\n", ""))
+    assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stdout[-2000:] + p.stderr
+
+
 def knock(address, path):
     """An upgrade, and nothing after it."""
     host, port = address.split(":")

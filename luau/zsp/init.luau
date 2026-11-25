@@ -3,6 +3,7 @@
 
 local ask = require("@self/ask")
 local client = require("@self/client")
+local mirror = require("@self/mirror")
 local text = require("@self/text")
 
 return table.freeze({
@@ -17,4 +18,5 @@ return table.freeze({
 	author = client.columns.author,
 	authors = client.columns.authors,
 	Text = text,
+	mirror = mirror,
 })

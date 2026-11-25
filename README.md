@@ -14,7 +14,7 @@ relay/     the same relay as a Cloudflare Durable Object: zsp/ compiled to wasm,
 luau/zsp/  the query client
 clients/   a whole client in the Python standard library, to show how little one needs
 vectors/   what two implementations must agree on
-docs/      how to lay out who sees what; examples/ has it running
+docs/      how to lay out who sees what, and structured state; examples/ has it running
 ```
 
 ## The idea
@@ -33,6 +33,10 @@ holds little asks one that holds everything, and says whose answer it has.
 
 **Whose it is, is yours to say.** Where a scope is signed, every cell is known to be of the device that wrote it, and that of the user your own sign-in says: by the roster for a
 device somebody has, or by the host of one that serves many, if you let it vouch. No application can say otherwise, no relay sees it, and it can be shown, searched, ordered and counted like any other column.
+
+**Documents are tables.** Maps, lists, records and trees, nested as deep as you like, are plain Luau tables: set a new one and what
+differs is written; what others write comes back with whatever did not change the very same table. It is rows underneath, so it costs
+the protocol nothing ([docs/mirror.md](docs/mirror.md)).
 
 **The log is the database.** A sealed cell is appended once. The bytes on disk are the bytes on the wire are the bytes on the relay.
 
