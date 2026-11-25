@@ -777,7 +777,7 @@ on_unwatch :: proc(s: ^Session, id: u64) {
 			break
 		}
 	}
-	if (s.role == .Open && id != LIVES) || s.node.keys == nil {
+	if (s.role == .Open && id != SHOWN) || s.node.keys == nil {
 		for it, i in s.node.interests {
 			if it.session == s.id && it.watch.id == id {
 				interest_remove(s.node, i)
@@ -1703,20 +1703,32 @@ session_show :: proc(s: ^Session, row: Id) {
 }
 
 @(private)
-LIVES :: max(u64) // the window of an interest in what an answer shows
+SHOWN :: max(u64) // the window of an interest in what an answer shows
 
-// Wants what is typed in a range of places streamed here, for what a client is shown in answers.
-session_lives :: proc(s: ^Session, lo, hi: Key) {
-	interest_add(s, {id = LIVES, lo = lo, hi = hi, live = true}, 0, false)
+// Wants what is typed in a range of places streamed here, for what a client is shown in answers; and if this is a
+// partial replica, perhaps what is there too.
+session_wants :: proc(s: ^Session, lo, hi: Key, data := false) {
+	interest_add(s, {id = SHOWN, lo = lo, hi = hi, live = true, data = data}, 0, false)
 }
 
-session_unlives :: proc(s: ^Session, lo, hi: Key) {
+session_unwants :: proc(s: ^Session, lo, hi: Key, data := false) {
 	for it, i in s.node.interests {
-		if it.session == s.id && it.watch.id == LIVES && it.watch.lo == lo && it.watch.hi == hi {
+		w := it.watch
+		if it.session == s.id && w.id == SHOWN && w.lo == lo && w.hi == hi && w.data == (data && !s.node.full) {
 			interest_remove(s.node, i)
 			return
 		}
 	}
+}
+
+// Whether some of what is wanted at a place has yet to be heard of from a full replica.
+session_awaits :: proc(s: ^Session, at: Key) -> bool {
+	for it in s.node.interests {
+		if it.session == s.id && it.watch.id == SHOWN && it.watch.data && it.waiting > 0 && it.watch.lo == at {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)

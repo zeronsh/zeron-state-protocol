@@ -397,6 +397,40 @@ def test_questions():
         assert cb.answers[1]["rows"][0] == bob
 
 
+def test_questions_passed_on():
+    """A device that holds little has one that holds everything answer, whichever way it is reached."""
+    for names, udp in ((("bc", "bd"), ()), (("be", "bf"), ("be", "bf"))):
+        relay, (a, b) = space(*names, udp=udp)
+        b.stop()
+        b.options.append("--partial")
+        b.start()
+        ca, cb = a.client(), b.client()
+        rows = [ca.put(1, "people", i, [b"person %d" % i]) for i in range(300)]
+        ca.until(lambda: ca.acked == ca.seq)
+        name = zsp.column(zsp.FOLD, 16)
+        cb.ask(1, 1, zsp.begins(name, "person 2"), [zsp.by(name)], limit=20, totals=[(zsp.FACET, name, 3)])
+        cb.until(lambda: cb.answers.get(1, {}).get("settled") and cb.answers[1]["total"] == 111)
+        assert cb.answers[1]["rows"][0] == rows[2] and len(cb.answers[1]["rows"]) == 20 and len(cb.answers[1]["totals"][0][1]) == 3
+        assert all(b"person 2" in b"".join(cb.rows[r].values()) for r in cb.answers[1]["rows"])
+        assert rows[100] not in cb.rows
+        # It stays true, whoever writes.
+        start = time.monotonic()
+        ca.write((rows[0], 16, zsp.VALUE, b"person 2"))
+        cb.until(lambda: cb.answers[1]["total"] == 112 and set(cb.answers[1]["rows"][:2]) == {rows[0], rows[2]})
+        print(f"     a change over there shows in an answer here in {1000 * (time.monotonic() - start):.1f} ms")
+        cb.write((rows[2], 16, zsp.VALUE, b"nobody"))
+        cb.until(lambda: cb.answers[1]["total"] == 111 and cb.answers[1]["rows"][0] == rows[0])
+        # With nobody to ask, what is here is the answer, and says so; and then not.
+        a.stop()
+        cb.until(lambda: not cb.answers[1].get("settled", True) and cb.answers[1]["total"] >= 20)
+        cb.ask(2, 1, zsp.equals(name, "person 2"))
+        assert cb.answer(2)["rows"] == [rows[0]] and not cb.answers[2]["settled"]
+        a.start()
+        cb.until(lambda: cb.answers[1].get("settled") and cb.answers[1]["total"] == 111, 20)
+        cb.until(lambda: cb.answers[2].get("settled"))
+        cb.unask(1), cb.unask(2)
+
+
 def test_knocking_leaves_no_trace():
     relay = Node("y-relay", "serve", "--no-udp").start()
     ks = [knock(relay.address, "/" + os.urandom(32).hex()) for _ in range(5)]

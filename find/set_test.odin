@@ -16,7 +16,8 @@ sets_match_maps :: proc(t: ^testing.T) {
 		}
 		for i in 0 ..< 2 {
 			span := u32(200_000) >> uint(rand.int_max(8))
-			for _ in 0 ..< rand.int_max(40_000 if round % 2 == 0 else 3000) {
+			many := rand.int_max(40_000 if round % 2 == 0 else 3000)
+			for _ in 0 ..< many {
 				v := rand.uint32() % span
 				if rand.int_max(5) == 0 {
 					testing.expect(t, set_remove(&s[i], v) == (v in m[i]))

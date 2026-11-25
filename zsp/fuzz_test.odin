@@ -11,7 +11,8 @@ FUZZ :: #config(ZSP_FUZZ, 12)
 
 @(private)
 mangle :: proc(b: []byte) {
-	for _ in 0 ..< 1 + rand.int_max(4) {
+	many := 1 + rand.int_max(4)
+	for _ in 0 ..< many {
 		if len(b) > 0 {
 			b[rand.int_max(len(b))] = byte(rand.uint32())
 		}

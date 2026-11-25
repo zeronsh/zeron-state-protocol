@@ -24,7 +24,8 @@ tree_matches_model :: proc(t: ^testing.T) {
 			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 			edits := make([dynamic]Edit, context.temp_allocator)
 			seen := make(map[Entry]bool, context.temp_allocator)
-			for _ in 0 ..< 1 + rand.int_max(1 if batch % 3 == 0 else 1500) {
+			many := 1 + rand.int_max(1 if batch % 3 == 0 else 1500)
+			for _ in 0 ..< many {
 				e: Entry
 				switch round {
 				case 0: // postings: few keys, many subs

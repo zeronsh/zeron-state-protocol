@@ -54,6 +54,9 @@ Questions :: struct {
 	shows: proc(data: rawptr, s: ^Session, row: Id) -> bool, // whether an answer is showing a row
 	again: proc(data: rawptr, s: ^Session), // a session fell behind, or its rights have changed
 	ended: proc(data: rawptr, s: ^Session),
+	// A call from another node, and what is said in those this node is an end of. Nothing may be said in return until later.
+	called: proc(data: rawptr, call: u64, device: Key32, scope: Scope, body: []byte),
+	flow:   proc(data: rawptr, call: u64, kind: Flow, payload: []byte),
 }
 
 // The least message type that is a question.

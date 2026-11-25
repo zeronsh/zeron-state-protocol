@@ -30,12 +30,22 @@ questions :: proc(s: ^Space) -> zsp.Questions {
 		},
 		again = proc(data: rawptr, session: ^zsp.Session) {
 			if s := (^Space)(data); s.found != nil {
+				s.found.more = true
 				find.finder_again(&s.found.finder, session)
 			}
 		},
 		ended = proc(data: rawptr, session: ^zsp.Session) {
 			if s := (^Space)(data); s.found != nil {
 				find.finder_ended(&s.found.finder, session)
+			}
+		},
+		called = proc(data: rawptr, call: u64, device: zsp.Key32, scope: zsp.Scope, body: []byte) {
+			find.finder_called(space_finder((^Space)(data)), call, device, body)
+		},
+		flow = proc(data: rawptr, call: u64, kind: zsp.Flow, payload: []byte) {
+			if s := (^Space)(data); s.found != nil {
+				s.found.more = true
+				find.finder_flow(&s.found.finder, call, kind, payload)
 			}
 		},
 	}
@@ -61,7 +71,7 @@ found_run :: proc(s: ^Space, now: time.Tick) {
 		return
 	}
 	f.more = !find.finder_run(&f.finder)
-	if len(f.finder.live) > 0 {
+	if len(f.finder.live) > 0 || len(f.finder.calls) > 0 {
 		f.resting = false
 		if !f.more && f.finder.x.unsaved > 1 << 16 {
 			found_save(s)

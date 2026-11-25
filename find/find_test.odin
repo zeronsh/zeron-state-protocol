@@ -18,6 +18,7 @@ World :: struct {
 	keys:   zsp.Keyring,
 	secret: zsp.Key32,
 	space:  zsp.Key32,
+	root:   zsp.Key32,
 	roster: []byte,
 	pages:  Memory_Disk,
 	x:      Index,
@@ -28,7 +29,7 @@ WORDS := []string{"apple", "apples", "apply", "banana", "band", "cherry", "Crèm
 NAMES := []string{"", "a", "A", "ab", "Ab", "abc", "Zoë", "zoe", "exactly sixteen!", "exactly sixteen!!", "exactly sixteen?", "EXACTLY SIXTEEN!", "a long name that goes on", "a long name that goes off", "n\x00", "n"}
 
 @(private)
-world_make :: proc(t: ^testing.T, w: ^World) {
+world_make :: proc(t: ^testing.T, w: ^World, partial: ^World = nil) {
 	root: zsp.Key32
 	for &b in root {
 		b = byte(rand.uint32())
@@ -37,21 +38,35 @@ world_make :: proc(t: ^testing.T, w: ^World) {
 		b = byte(rand.uint32())
 	}
 	zsp.keyring_init(&w.keys, w.secret)
+	if partial != nil {
+		for &b in partial.secret {
+			b = byte(rand.uint32())
+		}
+		zsp.keyring_init(&partial.keys, partial.secret)
+	}
 	none: zsp.Roster
 	d := zsp.draft_from(&none, 1)
 	for _ in 0 ..< 2 {
-		zsp.draft_grant(&d, w.keys.device, w.keys.signer, zsp.draft_scope(&d), {.Write}).owner = true
+		scope := zsp.draft_scope(&d)
+		zsp.draft_grant(&d, w.keys.device, w.keys.signer, scope, {.Write}).owner = true
+		if partial != nil {
+			zsp.draft_grant(&d, partial.keys.device, partial.keys.signer, scope, {.Read, .Write})
+		}
 	}
 	ok: bool
 	w.roster, ok = zsp.roster_sign(&w.keys, root, &d)
 	testing.expect(t, ok)
-	w.space = zsp.ed25519_public(root)
+	w.space, w.root = zsp.ed25519_public(root), root
 	world_start(t, w)
+	if partial != nil {
+		partial.roster, partial.space = slice.clone(w.roster), w.space
+		world_start(t, partial, false)
+	}
 }
 
 @(private)
-world_start :: proc(t: ^testing.T, w: ^World) {
-	testing.expect(t, zsp.node_init(&w.node, zsp.memory_disk(&w.disk), w.space, &w.keys, true, 64))
+world_start :: proc(t: ^testing.T, w: ^World, full := true) {
+	testing.expect(t, zsp.node_init(&w.node, zsp.memory_disk(&w.disk), w.space, &w.keys, full, 64))
 	testing.expect(t, zsp.node_adopt(&w.node, w.roster))
 	w.node.now = 1_700_000_000_000
 	index_open(&w.x, &w.node, memory_disk(&w.pages), w.secret)
@@ -77,7 +92,8 @@ world_destroy :: proc(w: ^World) {
 @(private)
 some_text :: proc() -> string {
 	b := make([dynamic]byte, context.temp_allocator)
-	for i in 0 ..< rand.int_max(12) {
+	many := rand.int_max(12)
+	for i in 0 ..< many {
 		if i > 0 {
 			append(&b, " ")
 		}
@@ -121,7 +137,8 @@ world_write :: proc(t: ^testing.T, w: ^World) {
 			place(&cells, zsp.row_scope(id))
 		}
 	}
-	for _ in 0 ..< rand.int_max(4) {
+	many_2 := rand.int_max(4)
+	for _ in 0 ..< many_2 {
 		if len(cells) > 0 && cells[0].kind == .Grave {
 			break
 		}
@@ -314,7 +331,8 @@ ask_pred :: proc(a: ^Ask, depth: int) {
 		ask_column(out, {.Words})
 		append(out, byte(rand.int_max(3)), byte(rand.int_max(16)))
 		text := make([dynamic]byte, context.temp_allocator)
-		for _ in 0 ..< rand.int_max(3) {
+		many_3 := rand.int_max(3)
+		for _ in 0 ..< many_3 {
 			word := rand.choice(WORDS)
 			if rand.int_max(3) == 0 {
 				word = word[:rand.int_max(len(word)) + 1]
@@ -938,7 +956,8 @@ answers_match_the_cells :: proc(t: ^testing.T) {
 		big := seed % 3 == 2
 		for step in 0 ..< 120 {
 			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-			for _ in 0 ..< (1 + rand.int_max(400 if big && step % 20 == 0 else 12)) {
+			many_4 := (1 + rand.int_max(400 if big && step % 20 == 0 else 12))
+			for _ in 0 ..< many_4 {
 				world_write(t, &w)
 			}
 			source := ask(&w)

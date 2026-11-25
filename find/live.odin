@@ -32,6 +32,30 @@ Finder :: struct {
 	changed: [dynamic]Changed,
 	settled: bool, // this node is a full replica
 	again:   [dynamic]^zsp.Session, // to be told everything afresh
+	calls:   [dynamic]Called, // questions from partial replicas, not yet looked at
+}
+
+@(private)
+Called :: struct {
+	call:   u64,
+	device: zsp.Key32,
+	body:   []byte,
+}
+
+// A partial replica has a full one answer, and answers from what it holds itself while none does.
+@(private)
+Far :: struct {
+	call:   u64, // under way, if not 0
+	device: zsp.Key32,
+	source: []byte, // the question
+	tried:  [dynamic]zsp.Key32, // and would not
+	over:   Maybe(u8), // the call is, with this fault if not 0
+	next:   []byte, // the last said, not yet looked at, if any
+	spent:  int, // bytes heard since credit was last given
+	answer: []byte, // the last answer
+	due:    bool, // which has yet to be passed on, there being rows in it still to come
+	have:   bool, // what is shown is an answer of theirs
+	keys:   [dynamic]zsp.Key, // the places of its rows, which are wanted here
 }
 
 @(private)
@@ -51,7 +75,10 @@ Changed :: struct {
 Live :: struct {
 	f:       ^Finder,
 	id:      u64,
-	session: ^zsp.Session,
+	session: ^zsp.Session, // whose client asks; or
+	call:    u64, // the call a partial replica does by,
+	device:  zsp.Key32, // and which
+	far:     Far,
 	arena:   virtual.Arena, // the question
 	q:       Query,
 	anchor:  Maybe(Anchor),
@@ -91,8 +118,21 @@ finder_close :: proc(f: ^Finder) {
 	delete(f.before)
 	delete(f.changed)
 	delete(f.again)
+	for c in f.calls {
+		delete(c.body)
+	}
+	delete(f.calls)
 	index_close(&f.x)
 	f^ = {}
+}
+
+// How many questions a session, or a device, has asked.
+@(private)
+finder_many :: proc(f: ^Finder, s: ^zsp.Session, device: zsp.Key32) -> (many: int) {
+	for l in f.live {
+		many += 1 if l.session == s && l.device == device else 0
+	}
+	return
 }
 
 // A message from a client. False if it makes no sense.
@@ -107,33 +147,12 @@ finder_asked :: proc(f: ^Finder, s: ^zsp.Session, type: u8, payload: []byte) -> 
 		if l := live_find(f, s, id); l != nil {
 			live_free(l)
 		}
-		many := 0
-		for l in f.live {
-			many += 1 if l.session == s else 0
-		}
-		if many >= 1024 {
+		if finder_many(f, s, {}) >= 1024 {
 			return false
 		}
 		l := new(Live)
 		l.f, l.id, l.session = f, id, s
-		append(&f.live, l)
-		ok: bool
-		l.q, ok = query_parse(r.buf[r.pos:], virtual.arena_allocator(&l.arena))
-		if !ok {
-			answer_flag(l, {faulty = true})
-			live_free(l)
-			return true
-		}
-		if !live_allowed(l) {
-			answer_flag(l, {denied = true})
-			live_free(l)
-			return true
-		}
-		index_follow(&f.x)
-		query_prepare(&f.x, &l.q)
-		query_uses(&l.q, 1)
-		live_place(l)
-		l.renew = true
+		live_start(l, r.buf[r.pos:])
 	case UNASK:
 		// Said back, since until then its rows are held, and an answer may count on that.
 		if l := live_find(f, s, id); l != nil {
@@ -145,6 +164,73 @@ finder_asked :: proc(f: ^Finder, s: ^zsp.Session, type: u8, payload: []byte) -> 
 		zsp.session_post(s, ANSWER, w[:])
 	}
 	return true
+}
+
+@(private)
+live_start :: proc(l: ^Live, source: []byte) {
+	f := l.f
+	append(&f.live, l)
+	ok: bool
+	l.q, ok = query_parse(source, virtual.arena_allocator(&l.arena))
+	if !ok {
+		answer_flag(l, {faulty = true})
+		live_free(l)
+		return
+	}
+	if !live_allowed(l) {
+		answer_flag(l, {denied = true})
+		live_free(l)
+		return
+	}
+	if l.session != nil && !f.settled {
+		l.far.source = slice.clone(source)
+	}
+	index_follow(&f.x)
+	query_prepare(&f.x, &l.q)
+	query_uses(&l.q, 1)
+	live_place(l)
+	l.renew = true
+}
+
+// A partial replica asks. It is answered, later, by a full one.
+finder_called :: proc(f: ^Finder, call: u64, device: zsp.Key32, body: []byte) {
+	append(&f.calls, Called{call, device, slice.clone(body)})
+}
+
+// Something is said in a call, by whoever is at its other end.
+finder_flow :: proc(f: ^Finder, call: u64, kind: zsp.Flow, payload: []byte) {
+	for l in f.live {
+		if l.call == call {
+			#partial switch kind {
+			case .End, .Fault, .Cancel:
+				l.call = 0 // it is let go of when next gone over
+			case .Credit:
+				l.stale = true // what there was no room for can be said
+			}
+			return
+		}
+		if l.far.call != call {
+			continue
+		}
+		#partial switch kind {
+		case .Data:
+			delete(l.far.next)
+			l.far.next = slice.clone(payload)
+			l.far.spent += len(payload)
+		case .End, .Cancel:
+			l.far.over = 0
+		case .Fault:
+			l.far.over = payload[0] if len(payload) > 0 else 0
+		}
+		return
+	}
+	for c, i in f.calls {
+		if c.call == call && (kind == .End || kind == .Fault || kind == .Cancel) {
+			delete(c.body)
+			ordered_remove(&f.calls, i)
+			return
+		}
+	}
 }
 
 @(private)
@@ -190,7 +276,9 @@ finder_shows :: proc(f: ^Finder, s: ^zsp.Session, row: zsp.Id) -> bool {
 @(private)
 live_allowed :: proc(l: ^Live) -> bool {
 	may :: proc(l: ^Live, scope: zsp.Scope) -> bool {
-		return .Read in zsp.session_rights(l.session, scope) && zsp.keyring_scope(l.f.n.keys, scope) != nil
+		n := l.f.n
+		rights := zsp.session_rights(l.session, scope) if l.session != nil else zsp.device_rights(n, l.device, scope)
+		return .Read in rights && zsp.keyring_scope(n.keys, scope) != nil
 	}
 	parts :: proc(l: ^Live, p: ^Pred) -> bool {
 		if p.op == .Ref || p.op == .Back {
@@ -288,12 +376,21 @@ live_free :: proc(l: ^Live) {
 			}
 		}
 	}
+	if l.call != 0 {
+		zsp.node_flow(f.n, l.call, .Fault, {u8(zsp.Call_Fault.Unserved)})
+	}
 	query_uses(&l.q, -1)
 	set_destroy(&l.rows)
 	for at in l.lives {
-		zsp.session_unlives(l.session, at[0], at[1])
+		zsp.session_unwants(l.session, at[0], at[1])
 	}
 	delete(l.lives)
+	far_drop(l)
+	delete(l.far.source)
+	delete(l.far.tried)
+	delete(l.far.next)
+	delete(l.far.answer)
+	delete(l.far.keys)
 	delete(l.shown)
 	delete(l.said)
 	virtual.arena_destroy(&l.arena)
@@ -362,7 +459,7 @@ finder_done :: proc(data: rawptr) {
 
 @(private)
 live_changed :: proc(l: ^Live, c: ^Changed) {
-	if !l.ready || l.renew {
+	if !l.ready || l.renew || l.far.have {
 		return
 	}
 	if l.joined {
@@ -431,14 +528,19 @@ live_reads :: proc(l: ^Live, c: ^Changed) -> bool {
 
 // Does some of what there is to do, and says whatever follows from it. True when there is nothing left.
 finder_run :: proc(f: ^Finder, budget := 500) -> bool {
-	if len(f.live) == 0 {
-		return true
+	for c in f.calls {
+		if !f.settled {
+			zsp.node_flow(f.n, c.call, .Fault, {u8(zsp.Call_Fault.Unserved)})
+		} else if finder_many(f, nil, c.device) >= 1024 {
+			zsp.node_flow(f.n, c.call, .Fault, {u8(zsp.Call_Fault.Busy)})
+		} else {
+			l := new(Live)
+			l.f, l.call, l.device = f, c.call, c.device
+			live_start(l, c.body)
+		}
+		delete(c.body)
 	}
-	level := index_step(&f.x, budget)
-	for l in f.live {
-		// A column may be being made again, and what was asked of it meanwhile means nothing.
-		l.renew ||= l.ready && !query_ready(&f.x, &l.q)
-	}
+	clear(&f.calls)
 	for s in f.again {
 		#reverse for l in f.live {
 			if l.session != s {
@@ -451,11 +553,33 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 			}
 			clear(&l.shown)
 			delete(l.said)
-			l.said, l.stale = nil, true
+			l.said, l.stale, l.far.due = nil, true, l.far.due || l.far.have
 		}
 	}
 	clear(&f.again)
+	local := false
+	#reverse for l in f.live {
+		if l.session == nil && (l.call == 0 || !live_allowed(l)) {
+			if l.call != 0 {
+				zsp.node_flow(f.n, l.call, .Fault, {u8(zsp.Call_Fault.Denied)})
+			}
+			live_free(l)
+			continue
+		}
+		if l.far.source != nil {
+			far_run(l)
+		}
+		local ||= !l.far.have
+	}
+	level := !local || index_step(&f.x, budget)
 	for l in f.live {
+		// A column may be being made again, and what was asked of it meanwhile means nothing.
+		l.renew ||= l.ready && !query_ready(&f.x, &l.q)
+	}
+	for l in f.live {
+		if l.far.have {
+			continue
+		}
 		if !l.ready || l.renew {
 			if !f.x.tailing || f.x.checking || !query_ready(&f.x, &l.q) {
 				if !l.ready {
@@ -485,9 +609,35 @@ flag_byte :: proc(f: Answer_Flags) -> u8 {
 @(private)
 answer_flag :: proc(l: ^Live, flags: Answer_Flags) {
 	w := make([dynamic]byte, context.temp_allocator)
-	zsp.write_varint(&w, l.id)
-	append(&w, flag_byte(flags))
-	zsp.session_post(l.session, ANSWER, w[:])
+	answer_begin(l, &w, flags)
+	answer_post(l, w[:])
+}
+
+@(private)
+answer_begin :: proc(l: ^Live, w: ^[dynamic]byte, flags: Answer_Flags) {
+	if l.session != nil {
+		zsp.write_varint(w, l.id)
+	}
+	append(w, flag_byte(flags))
+}
+
+// False if there is not yet room to.
+@(private)
+answer_post :: proc(l: ^Live, w: []byte) -> bool {
+	if l.session != nil {
+		zsp.session_post(l.session, ANSWER, w)
+		return true
+	}
+	if len(w) > zsp.CALL_WINDOW {
+		zsp.node_flow(l.f.n, l.call, .Fault, {u8(zsp.Call_Fault.Overrun)})
+		l.call = 0
+		return true
+	}
+	if len(w) > zsp.node_granted(l.f.n, l.call) {
+		return false
+	}
+	zsp.node_flow(l.f.n, l.call, .Data, w)
+	return true
 }
 
 // How much of what it needs is made, in hundredths.
@@ -512,9 +662,9 @@ answer_wait :: proc(l: ^Live) {
 	}
 	l.waited = done
 	w := make([dynamic]byte, context.temp_allocator)
-	zsp.write_varint(&w, l.id)
-	append(&w, flag_byte({waiting = true}), u8(min(done, 99)))
-	zsp.session_post(l.session, ANSWER, w[:])
+	answer_begin(l, &w, {waiting = true})
+	append(&w, u8(min(done, 99)))
+	answer_post(l, w[:])
 }
 
 // id varint, flags, how many rows there are in all, where the first shown comes, and the rows shown in order; then
@@ -525,15 +675,17 @@ answer_send :: proc(l: ^Live) {
 	s := index_scope(&f.x, l.q.scope)
 	page := query_page(s, &l.q, &l.rows)
 	totals := query_totals(s, &l.q, &l.rows)
-	live_lives(l, page)
 	w := make([dynamic]byte, context.temp_allocator)
-	zsp.write_varint(&w, l.id)
-	append(&w, flag_byte({settled = f.settled}))
+	answer_begin(l, &w, {settled = f.settled})
 	zsp.write_varint(&w, u64(l.rows.count))
 	first := max(l.rows.count - l.q.offset - len(page), 0) if l.q.from_end else min(l.q.offset, l.rows.count)
 	zsp.write_varint(&w, u64(first))
 	zsp.write_varint(&w, u64(len(page)))
 	for hit in page {
+		if l.session == nil {
+			zsp.write_key(&w, live_key(l, hit.id)) // so that it can be watched there
+			continue
+		}
 		zsp.write_u64(&w, hit.id[0])
 		zsp.write_u64(&w, hit.id[1])
 	}
@@ -547,32 +699,206 @@ answer_send :: proc(l: ^Live) {
 			zsp.write_bytes(&w, facet_bytes(s, &l.q.totals[i], facet))
 		}
 	}
-	if string(l.said) == string(w[:]) {
+	ids := make([]zsp.Id, len(page), context.temp_allocator)
+	for hit, i in page {
+		ids[i] = hit.id
+	}
+	if l.session != nil {
+		live_wants(l, ids)
+	}
+	l.moved = false
+	answer_say(l, ids, w[:])
+}
+
+@(private)
+answer_say :: proc(l: ^Live, ids: []zsp.Id, w: []byte) {
+	if string(l.said) == string(w) {
 		return
 	}
-	for hit in page {
-		if !slice.contains(l.shown[:], hit.id) && !finder_shows(f, l.session, hit.id) {
-			zsp.session_show(l.session, hit.id)
+	if l.session != nil {
+		for id in ids {
+			if !slice.contains(l.shown[:], id) && !finder_shows(l.f, l.session, id) {
+				zsp.session_show(l.session, id)
+			}
 		}
 	}
-	clear(&l.shown)
-	for hit in page {
-		append(&l.shown, hit.id)
+	if !answer_post(l, w) {
+		return // credit will come, and whatever is so by then is said
 	}
+	clear(&l.shown)
+	append(&l.shown, ..ids)
 	delete(l.said)
-	l.said = slice.clone(w[:])
-	zsp.session_post(l.session, ANSWER, w[:])
+	l.said = slice.clone(w)
 }
+
+// Where a row is, or if nowhere, somewhere it never will be.
+@(private)
+live_key :: proc(l: ^Live, id: zsp.Id) -> zsp.Key {
+	places := zsp.row_places(&l.f.n.store, id)
+	if places.count > 0 {
+		return places.keys[0]
+	}
+	return {id[0] & 0xffff_ffff_0000_0000, 0, 0, id[0], id[1]}
+}
+
+// ---------------------------------------------------------------- answers from afar
+
+@(private)
+far_run :: proc(l: ^Live) {
+	f, far := l.f, &l.far
+	if fault, over := far.over.?; over {
+		far.over, far.call = nil, 0
+		if zsp.Call_Fault(fault) != .Lost {
+			append(&far.tried, far.device)
+		}
+		far_drop(l)
+	}
+	reach := zsp.node_reach(f.n)
+	#reverse for device, i in far.tried {
+		if !slice.contains(reach, device) {
+			unordered_remove(&far.tried, i) // it may come back otherwise minded
+		}
+	}
+	if far.call == 0 {
+		for device in reach {
+			if slice.contains(far.tried[:], device) {
+				continue
+			}
+			if far.call = zsp.node_call(f.n, device, l.q.scope, far.source); far.call != 0 {
+				far.device = device
+				break
+			}
+		}
+	}
+	if far.call != 0 && far.spent > zsp.CALL_WINDOW / 2 {
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, u64(far.spent))
+		zsp.node_flow(f.n, far.call, .Credit, w[:])
+		far.spent = 0
+	}
+	if far.next != nil {
+		next := far.next
+		far.next = nil
+		defer delete(next)
+		r := zsp.Reader{buf = next}
+		flags := Answer_Flags(zsp.read_u8(&r))
+		switch {
+		case flags.waiting: // what is here will do until it is done
+		case flags.denied || flags.faulty || !far_wants(l, &r):
+			zsp.node_flow(f.n, far.call, .Cancel)
+			far.call = 0
+			append(&far.tried, far.device)
+			far_drop(l)
+		case:
+			delete(far.answer)
+			far.answer, next = next, nil
+			far.due = true
+		}
+	}
+	if far.due && far_whole(l) {
+		far.due, far.have = false, true
+		far_say(l)
+	}
+}
+
+// Reads where the rows of an answer are, and wants what is there.
+@(private)
+far_wants :: proc(l: ^Live, r: ^zsp.Reader) -> bool {
+	_, _ = zsp.read_varint(r), zsp.read_varint(r) // how many in all, and where these come among them
+	n := int(zsp.read_varint(r) & 0xffff)
+	if r.bad || n > 1000 || (len(r.buf) - r.pos) < n * 40 {
+		return false
+	}
+	keys := make([dynamic]zsp.Key, 0, n)
+	new := make(map[zsp.Key]bool, context.temp_allocator)
+	for _ in 0 ..< n {
+		k := zsp.read_key(r)
+		if zsp.key_scope(k) != l.q.scope || zsp.row_scope(zsp.key_row(k)) != l.q.scope || k in new {
+			delete(keys)
+			return false
+		}
+		append(&keys, k)
+		new[k] = true
+	}
+	for k in l.far.keys {
+		if k in new {
+			delete_key(&new, k)
+		} else {
+			zsp.session_unwants(l.session, k, zsp.key_next(k), true)
+		}
+	}
+	for k in keys {
+		if k in new {
+			zsp.session_wants(l.session, k, zsp.key_next(k), true)
+		}
+	}
+	delete(l.far.keys)
+	l.far.keys = keys
+	return true
+}
+
+// Whether all the rows of an answer are here, or will not come.
+@(private)
+far_whole :: proc(l: ^Live) -> bool {
+	for k in l.far.keys {
+		if zsp.row_places(&l.f.n.store, zsp.key_row(k)).count == 0 && zsp.session_awaits(l.session, k) {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+far_say :: proc(l: ^Live) {
+	r := zsp.Reader{buf = l.far.answer}
+	w := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&w, l.id)
+	append(&w, zsp.read_u8(&r))
+	zsp.write_varint(&w, zsp.read_varint(&r))
+	zsp.write_varint(&w, zsp.read_varint(&r))
+	n := int(zsp.read_varint(&r))
+	zsp.write_varint(&w, u64(n))
+	ids := make([]zsp.Id, n, context.temp_allocator)
+	for &id in ids {
+		id = zsp.key_row(zsp.read_key(&r))
+		zsp.write_u64(&w, id[0])
+		zsp.write_u64(&w, id[1])
+	}
+	append(&w, ..r.buf[r.pos:])
+	live_wants(l, nil) // the places themselves are
+	answer_say(l, ids, w[:])
+}
+
+// What was answered from afar is no longer known to be so.
+@(private)
+far_drop :: proc(l: ^Live) {
+	far := &l.far
+	if far.call != 0 {
+		zsp.node_flow(l.f.n, far.call, .Cancel)
+		far.call = 0
+	}
+	for k in far.keys {
+		zsp.session_unwants(l.session, k, zsp.key_next(k), true)
+	}
+	clear(&far.keys)
+	if far.have {
+		l.renew, l.moved = true, true
+	}
+	delete(far.next)
+	far.next = nil
+	far.have, far.due, far.spent = false, false, 0
+}
+
 
 LIVE_LISTS :: 16
 
 // Asks for live text where the rows about to be shown are: a stretch of each list they are in, or where those are
 // many, one of everything between.
 @(private)
-live_lives :: proc(l: ^Live, page: []Hit) {
+live_wants :: proc(l: ^Live, page: []zsp.Id) {
 	same := len(page) == len(l.shown) && !l.moved
 	for hit, i in page {
-		same = same && hit.id == l.shown[i]
+		same = same && hit == l.shown[i]
 	}
 	if same {
 		return
@@ -583,7 +909,7 @@ live_lives :: proc(l: ^Live, page: []Hit) {
 	count := 0
 	all := [2]zsp.Key{zsp.KEY_MAX, zsp.KEY_MIN}
 	for hit in page {
-		places := zsp.row_places(&n.store, hit.id)
+		places := zsp.row_places(&n.store, hit)
 		if places.count == 0 || zsp.is_graveyard(zsp.key_list(places.keys[0])) {
 			continue
 		}
@@ -617,12 +943,12 @@ live_lives :: proc(l: ^Live, page: []Hit) {
 			}
 		}
 		if !keep {
-			zsp.session_unlives(l.session, old[0], old[1])
+			zsp.session_unwants(l.session, old[0], old[1])
 			unordered_remove(&l.lives, i)
 		}
 	}
 	for w in want[:count] {
-		zsp.session_lives(l.session, w[0], w[1])
+		zsp.session_wants(l.session, w[0], w[1])
 		append(&l.lives, w)
 	}
 }

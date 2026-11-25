@@ -43,6 +43,9 @@ CALLER :: 0
 CALLEE :: 1
 
 @(private)
+SELF :: max(u32) // the session of an end that is this node itself
+
+@(private)
 End :: struct {
 	session: u32,
 	tunnel:  u32, // within that session, if not zero
@@ -55,6 +58,7 @@ End :: struct {
 Call :: struct {
 	ends:  [2]End,
 	scope: Scope,
+	own:   bool, // between the nodes themselves
 }
 
 @(private)
@@ -150,11 +154,13 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 	}
 	local := s.role == .Open
 	caller := s.peer if tunnel == nil else tunnel.peer
-	allowed := .Call in (session_rights(s, scope) if local else device_rights(n, caller, scope))
+	own := method == ""
+	need := Right.Read if own else Right.Call
+	allowed := need in (session_rights(s, scope) if local else device_rights(n, caller, scope))
 	if local {
-		allowed &&= .Call in device_rights(n, n.keys.device, scope) && .Call in device_rights(n, device, scope)
+		allowed &&= !own && .Call in device_rights(n, n.keys.device, scope) && .Call in device_rights(n, device, scope)
 	} else {
-		allowed &&= .Call in device_rights(n, n.keys.device, scope)
+		allowed &&= need in device_rights(n, n.keys.device, scope)
 	}
 	switch {
 	case !allowed:
@@ -169,12 +175,23 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 	}
 	from.granted -= len(body)
 	n.next_call += 1
-	c := Call{scope = scope}
+	c := Call{scope = scope, own = own}
 	c.ends[CALLER] = from
 	to := &c.ends[CALLEE]
 	to.id = n.next_call
 	to.granted = CALL_WINDOW
 
+	if own {
+		q := &n.host.questions
+		if q.called == nil {
+			refuse(n, from, .Unserved)
+			return
+		}
+		to.session = SELF
+		append(&n.calls, c)
+		q.called(q.data, to.id, caller, scope, body)
+		return
+	}
 	if !local || device == n.keys.device {
 		server: ^Session
 		for x in n.serving {
@@ -191,28 +208,102 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 		call_put(&server.out, server, to.id, caller if !local else n.keys.device, scope, method, body)
 		return
 	}
+	if f, ok := call_out(n, &c, device, method, body).?; ok {
+		refuse(n, from, f)
+	}
+}
+
+// Sends a call on its way to another device.
+@(private)
+call_out :: proc(n: ^Node, c: ^Call, device: Key32, method: string, body: []byte) -> Maybe(Call_Fault) {
+	to := &c.ends[CALLEE]
 	for p in n.sessions {
 		if p.ready && p.role == .Peer && p.peer == device && !p.peer_relay {
 			to.session = p.id
-			append(&n.calls, c)
-			call_put(&p.out, p, to.id, device, scope, method, body)
-			return
+			append(&n.calls, c^)
+			call_put(&p.out, p, to.id, device, c.scope, method, body)
+			return nil
 		}
 	}
 	t := tunnel_to(n, device)
 	if t == nil {
-		refuse(n, from, .Unreachable)
-		return
+		return .Unreachable
 	}
 	if len(t.pending) >= MAX_PENDING {
-		refuse(n, from, .Busy)
-		return
+		return .Busy
 	}
 	to.session, to.tunnel = t.relay, t.id
-	append(&n.calls, c)
+	append(&n.calls, c^)
 	frame: [dynamic]byte
-	call_put(&frame, nil, to.id, device, scope, method, body)
+	call_put(&frame, nil, to.id, device, c.scope, method, body)
 	tunnel_send(n, t, frame)
+	return nil
+}
+
+// ---------------------------------------------------------------- between nodes themselves
+
+// Calls the node at another device, by the method with no name. 0 if it cannot be.
+node_call :: proc(n: ^Node, device: Key32, scope: Scope, body: []byte) -> u64 {
+	if n.keys == nil || len(n.calls) >= MAX_CALLS || len(body) > CALL_WINDOW || device == n.keys.device {
+		return 0
+	}
+	if .Read not_in device_rights(n, n.keys.device, scope) || .Read not_in device_rights(n, device, scope) {
+		return 0
+	}
+	n.next_call += 2
+	c := Call{scope = scope, own = true}
+	c.ends[CALLER] = {session = SELF, id = n.next_call - 1, granted = CALL_WINDOW - len(body)}
+	c.ends[CALLEE] = {id = n.next_call, granted = CALL_WINDOW}
+	if _, failed := call_out(n, &c, device, "", body).?; failed {
+		return 0
+	}
+	return n.next_call - 1
+}
+
+// Says something in a call this node is an end of.
+node_flow :: proc(n: ^Node, call: u64, kind: Flow, payload: []byte = nil) {
+	for &c, i in n.calls {
+		for e, side in c.ends {
+			if e.session == SELF && e.id == call {
+				flow_pass(n, i, side, kind, payload)
+				return
+			}
+		}
+	}
+}
+
+// How much this node may say in a call yet. 0 when there is no such call.
+node_granted :: proc(n: ^Node, call: u64) -> int {
+	for &c in n.calls {
+		for e in c.ends {
+			if e.session == SELF && e.id == call {
+				return min(e.granted, CALL_WINDOW)
+			}
+		}
+	}
+	return 0
+}
+
+// Devices within reach, those linked directly first. Not those linked to and known not to be full replicas.
+node_reach :: proc(n: ^Node) -> []Key32 {
+	out := make([dynamic]Key32, context.temp_allocator)
+	less := make([dynamic]Key32, context.temp_allocator)
+	for s in n.sessions {
+		if s.ready && s.role == .Peer && !s.peer_relay {
+			append(&out if s.peer_full else &less, s.peer)
+		}
+	}
+	for s in n.sessions {
+		if !s.ready || s.role != .Peer || !s.peer_relay {
+			continue
+		}
+		for device in s.online {
+			if device != n.keys.device && !slice.contains(out[:], device) && !slice.contains(less[:], device) {
+				append(&out, device)
+			}
+		}
+	}
+	return out[:]
 }
 
 @(private)
@@ -230,7 +321,7 @@ call_put :: proc(w: ^[dynamic]byte, s: ^Session, id: u64, device: Key32, scope: 
 	frame_end(w, at)
 }
 
-@(private)
+// What a device may do in a scope.
 device_rights :: proc(n: ^Node, device: Key32, scope: Scope) -> Rights {
 	m := roster_member(&n.roster, device)
 	return member_rights(m, scope) if m != nil else {}
@@ -253,46 +344,58 @@ on_flow :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 	tid := tunnel.id if tunnel != nil else 0
 	for &c, i in n.calls {
 		from := &c.ends[side]
-		if from.session != s.id || from.tunnel != tid || from.id != tag >> 1 {
-			continue
-		}
-		to := &c.ends[1 - side]
-		over := false
-		switch kind {
-		case .Data:
-			if from.ended {
-				return
-			}
-			from.granted -= len(payload)
-			if from.granted < 0 || len(payload) > CALL_WINDOW {
-				call_flow(n, from, 1 - side, .Fault, {u8(Call_Fault.Overrun)})
-				call_flow(n, to, side, .Fault, {u8(Call_Fault.Overrun)})
-				unordered_remove(&n.calls, i)
-				return
-			}
-		case .End:
-			from.ended = true
-			over = to.ended
-		case .Fault, .Cancel:
-			over = true
-		case .Credit:
-			credit := Reader{buf = payload}
-			to.granted = min(to.granted + int(read_varint(&credit) & 0xff_ffff), 16 * CALL_WINDOW)
-		case:
+		if from.session == s.id && from.tunnel == tid && from.id == tag >> 1 {
+			flow_pass(n, i, side, kind, payload)
 			return
 		}
-		call_flow(n, to, side, kind, payload)
-		if over {
-			unordered_remove(&n.calls, i)
-		}
-		return
 	}
 	// Not a call of ours, or no longer: both sides speak until they hear it is over.
+}
+
+@(private)
+flow_pass :: proc(n: ^Node, i: int, side: int, kind: Flow, payload: []byte) {
+	c := &n.calls[i]
+	from, to := &c.ends[side], &c.ends[1 - side]
+	over := false
+	switch kind {
+	case .Data:
+		if from.ended {
+			return
+		}
+		from.granted -= len(payload)
+		if from.granted < 0 || len(payload) > CALL_WINDOW {
+			call_flow(n, from, 1 - side, .Fault, {u8(Call_Fault.Overrun)})
+			call_flow(n, to, side, .Fault, {u8(Call_Fault.Overrun)})
+			unordered_remove(&n.calls, i)
+			return
+		}
+	case .End:
+		from.ended = true
+		over = to.ended
+	case .Fault, .Cancel:
+		over = true
+	case .Credit:
+		credit := Reader{buf = payload}
+		to.granted = min(to.granted + int(read_varint(&credit) & 0xff_ffff), 16 * CALL_WINDOW)
+	case:
+		return
+	}
+	call_flow(n, to, side, kind, payload)
+	if over {
+		unordered_remove(&n.calls, i)
+	}
 }
 
 // Sends to an end what the other side said.
 @(private)
 call_flow :: proc(n: ^Node, to: ^End, speaker: int, kind: Flow, payload: []byte) {
+	if to.session == SELF {
+		q := &n.host.questions
+		if q.flow != nil {
+			q.flow(q.data, to.id, kind, payload)
+		}
+		return
+	}
 	s := node_session(n, to.session)
 	if s == nil {
 		return
@@ -358,7 +461,8 @@ rpc_roster_changed :: proc(n: ^Node) {
 		return
 	}
 	#reverse for &c, i in n.calls {
-		allowed := .Call in device_rights(n, n.keys.device, c.scope)
+		need := Right.Read if c.own else Right.Call
+		allowed := need in device_rights(n, n.keys.device, c.scope)
 		for e in c.ends {
 			s := node_session(n, e.session)
 			if s == nil || s.role == .Open {
@@ -370,7 +474,7 @@ rpc_roster_changed :: proc(n: ^Node) {
 					device = t.peer
 				}
 			}
-			allowed &&= .Call in device_rights(n, device, c.scope)
+			allowed &&= need in device_rights(n, device, c.scope)
 		}
 		if !allowed {
 			for &e, side in c.ends {

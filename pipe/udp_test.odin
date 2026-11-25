@@ -92,7 +92,8 @@ net_push :: proc(n: ^Net, from: int) {
 			}
 			at = n.free_at[from]
 		}
-		for _ in 0 ..< (2 if rand.float32() < n.loss else 1) {
+		many := (2 if rand.float32() < n.loss else 1)
+		for _ in 0 ..< many {
 			f := new(Flight)
 			n.order += 1
 			f.at, f.order, f.to, f.size = Time(at) + n.delay + Time(rand.int_max(n.jitter + 1)), n.order, 1 - from, len(out)
@@ -152,7 +153,8 @@ link_delivers :: proc(t: ^testing.T) {
 			size := min(rand.int_max(len(chunk)), max(link_room(&n.links[from]), 0))
 			link_write(&n.links[from], chunk[:size])
 			append(&sent[from], ..chunk[:size])
-			for _ in 0 ..< rand.int_max(6) {
+			many_2 := rand.int_max(6)
+			for _ in 0 ..< many_2 {
 				net_step(&n)
 			}
 			if i % 50 == 0 {

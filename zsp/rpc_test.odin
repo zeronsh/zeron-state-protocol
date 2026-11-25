@@ -155,6 +155,11 @@ calls_between_devices :: proc(t: ^testing.T) {
 		caller_call(&ca, 4, s.nodes[2].keys.device, 1, "echo", "")
 		settle(&s, &ca, &cb)
 		testing.expect_value(t, len(ca.faults), 3)
+		// The method with no name is for nodes themselves, not for whoever uses one.
+		caller_call(&ca, 9, b.keys.device, 1, "", "")
+		caller_call(&ca, 10, a.keys.device, 1, "", "")
+		settle(&s, &ca, &cb)
+		testing.expect(t, len(ca.faults) == 5 && ca.faults[3] == .Denied && ca.faults[4] == .Denied)
 		for want in ([]Call_Fault{.Unserved, .Denied, .Unreachable}) {
 			found := false
 			for f in ca.faults {
