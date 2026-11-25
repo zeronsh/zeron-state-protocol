@@ -113,7 +113,7 @@ BATCH :: 1 << 17 // edits gathered before they are made
 @(private)
 HEADERS :: 2
 @(private)
-MAGIC :: 0x7a73_7066_696e_6433
+MAGIC :: 0x7a73_7066_696e_6434
 
 @(private)
 Header :: struct {
@@ -600,7 +600,7 @@ tree_first :: proc(p: ^Pager, t: Tree, key: Key, sub: u32 = 0) -> (e: Entry, ok:
 @(private)
 held_shape :: proc(h: ^Held) {
 	if h.kind == .Words {
-		h.by_key.width = .Byte
+		h.by_key.width = .Varint
 		h.texts.blocks.width = .Varint
 		return
 	}
@@ -828,7 +828,7 @@ row_admit :: proc(s: ^Scope, id: zsp.Id) -> u32 {
 
 // Goes over a row again, in so far as these slots can have changed it.
 @(private)
-row_reread :: proc(s: ^Scope, id: zsp.Id, slots: ^Slots) {
+row_reread :: proc(s: ^Scope, id: zsp.Id, slots: ^Slots, new: ^Arrived = nil) {
 	if s.filling != nil {
 		again := s.filling.again[id]
 		again |= slots^
@@ -848,7 +848,7 @@ row_reread :: proc(s: ^Scope, id: zsp.Id, slots: ^Slots) {
 	} else {
 		row = row_admit(s, id)
 	}
-	r := Row{n = x.n, id = id}
+	r := Row{n = x.n, id = id, new = new}
 	for h in s.columns {
 		if f := h.filling; f != nil {
 			if !there && f.row > row {
@@ -1008,6 +1008,11 @@ text_bury :: proc(h: ^Held, row: u32) {
 
 @(private)
 words_read :: proc(h: ^Held, row: u32, r: ^Row, fresh: bool) {
+	if !fresh && h.path == "" {
+		if was, now, ok := row_before(r, h.slot); ok && words_reread(h, row, was, now) {
+			return
+		}
+	}
 	bytes: []byte
 	have: bool
 	if h.path == "" {
@@ -1058,7 +1063,7 @@ words_read :: proc(h: ^Held, row: u32, r: ^Row, fresh: bool) {
 		for j < len(all) && all[j].key == all[i].key {
 			j += 1
 		}
-		append(&h.edits[1], Edit{entry = {all[i].key, text, u64(min(j - i, 255))}})
+		append(&h.edits[1], Edit{entry = {all[i].key, text, u64(j - i)}})
 		if !fresh {
 			if _, known := tree_get(h.scope.x, h.lexicon, all[i].key, 0); !known {
 				append(&h.edits[3], Edit{entry = {key = all[i].key}})
@@ -1072,6 +1077,82 @@ words_read :: proc(h: ^Held, row: u32, r: ^Row, fresh: bool) {
 	append(&h.edits[0], Edit{entry = {{u64(row) << 32, hash}, text, 0}})
 	append(&h.edits[2], Edit{entry = {{u64(text), u64(len(all)) << 32 | u64(row + 1)}, 0, 0}})
 	h.alive += 1
+}
+
+// Reads of a text only where it has changed, if what it is said to have been is what was read of it.
+@(private)
+words_reread :: proc(h: ^Held, row: u32, was, now: []byte) -> bool {
+	text, old := held_text_hash(h, row) or_return
+	if bytes_hash(was) != old {
+		return false
+	}
+	hash := bytes_hash(now)
+	if hash == old {
+		return true
+	}
+	// No word reaches over white space.
+	white :: proc(b: byte) -> bool {
+		return b == ' ' || b == '\n' || b == '\t' || b == '\r'
+	}
+	least := min(len(was), len(now))
+	lo, hi := 0, 0
+	for lo < least && was[lo] == now[lo] {
+		lo += 1
+	}
+	for lo > 0 && !white(was[lo - 1]) {
+		lo -= 1
+	}
+	for hi < least - lo && was[len(was) - 1 - hi] == now[len(now) - 1 - hi] {
+		hi += 1
+	}
+	for hi > 0 && !white(was[len(was) - hi]) {
+		hi -= 1
+	}
+	Change :: struct {
+		key: Key,
+		by:  int,
+	}
+	all := make([dynamic]Change, context.temp_allocator)
+	for part, i in ([][]byte{was[lo:len(was) - hi], now[lo:len(now) - hi]}) {
+		it := words(part)
+		for w in words_next(&it) {
+			w := w
+			k, _ := bytes_key(w.bytes[:w.len])
+			append(&all, Change{k, i * 2 - 1})
+		}
+	}
+	slice.sort_by(all[:], proc(a, b: Change) -> bool {return key_less(a.key, b.key)})
+	entry, _ := text_entry(h, text)
+	length := int(entry.length)
+	for c in all {
+		length += c.by
+	}
+	if length <= 0 {
+		return false // it has no words, and so is nothing
+	}
+	x := h.scope.x
+	for i := 0; i < len(all); {
+		key, by := all[i].key, 0
+		for i < len(all) && all[i].key == key {
+			by += all[i].by
+			i += 1
+		}
+		if by == 0 {
+			continue
+		}
+		had, has := tree_get(x, h.by_key, key, text)
+		have := (int(had) if has else 0) + by
+		append(&h.edits[1], Edit{entry = {key, text, u64(max(have, 0))}, gone = have <= 0})
+		if by > 0 {
+			if _, known := tree_get(x, h.lexicon, key, 0); !known {
+				append(&h.edits[3], Edit{entry = {key = key}})
+			}
+		}
+	}
+	h.length = h.length - u64(entry.length) + u64(length)
+	append(&h.edits[0], Edit{entry = {{u64(row) << 32, old}, text, 0}, gone = true}, Edit{entry = {{u64(row) << 32, hash}, text, 0}})
+	append(&h.edits[2], Edit{entry = {{u64(text), u64(length) << 32 | u64(row + 1)}, 0, 0}})
+	return true
 }
 
 @(private)
@@ -1260,6 +1341,7 @@ index_finish :: proc(x: ^Index) {
 Dirty :: struct {
 	x:    ^Index,
 	rows: map[zsp.Id]Slots,
+	new:  map[zsp.Id]Arrived, // pieces
 }
 
 // Brings the index level with the store, or so far towards it. True when it is.
@@ -1285,6 +1367,7 @@ index_follow :: proc(x: ^Index, budget := max(int) / 1024) -> bool {
 	}
 	d := Dirty{x = x}
 	defer delete(d.rows)
+	defer delete(d.new)
 	level := true
 	if x.tailing && x.cursor >= n.events.first {
 		for i in x.cursor ..< n.events.next {
@@ -1292,6 +1375,26 @@ index_follow :: proc(x: ^Index, budget := max(int) / 1024) -> bool {
 			slots := d.rows[c.row]
 			slots_add(&slots, c.slot)
 			d.rows[c.row] = slots
+			if c.slot < 16 {
+				continue
+			}
+			new, had := d.new[c.row]
+			switch {
+			case c.kind != .Piece:
+				if had && new.slot != c.slot {
+					continue
+				}
+				new = {slot = c.slot, count = max(int) / 2}
+			case !had:
+				new = {slot = c.slot}
+				fallthrough
+			case new.slot == c.slot:
+				if new.count < len(new.stamps) {
+					new.stamps[new.count] = c.stamp
+				}
+				new.count += 1
+			}
+			d.new[c.row] = new
 		}
 		x.upto = zsp.store_tail(&n.store)
 	} else {
@@ -1322,10 +1425,12 @@ dirty_flush :: proc(d: ^Dirty) {
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		slots := slots
 		if s := index_scope(d.x, zsp.row_scope(id)); s != nil {
-			row_reread(s, id, &slots)
+			new := d.new[id]
+			row_reread(s, id, &slots, &new if new.count > 0 else nil)
 		}
 	}
 	clear(&d.rows)
+	clear(&d.new)
 	for s in d.x.scopes {
 		if s.filling == nil {
 			scope_flush(s)

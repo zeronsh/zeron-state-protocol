@@ -1540,3 +1540,169 @@ index_is_patient :: proc(t: ^testing.T) {
 	testing.expect(t, len(x.scopes) == 0 && !x.failed && len(x.free) == 0)
 	index_close(&x)
 }
+
+// Texts are edited anywhere in them, a piece at a time, and what is kept of their words is what they come to.
+@(test)
+texts_are_read_again_only_where_they_change :: proc(t: ^testing.T) {
+	SEEDS :: #config(ZSP_FIND_SEEDS, 6)
+	PARTS := []string{"apple", "apples ", " band", " ", "don", "'", "t", "\n", "京都", "大学 ", "é", "Crème ", "x", "counterrevolutionary ", "counterrevolutionaries", "́", "  ", "fig fig fig "}
+	for seed in 0 ..< SEEDS {
+		state := rand.create(u64(seed) + 12000)
+		context.random_generator = rand.default_random_generator(&state)
+		w: World
+		world_make(t, &w)
+		defer world_destroy(&w)
+		Doc :: struct {
+			id:   zsp.Id,
+			text: zsp.Text,
+			held: [dynamic]zsp.Cell, // written elsewhere, and not here yet
+		}
+		docs: [4]Doc
+		defer for &d in docs {
+			zsp.text_destroy(&d.text)
+			for c in d.held {
+				delete(c.body)
+			}
+			delete(d.held)
+		}
+		write :: proc(t: ^testing.T, w: ^World, cells: []zsp.Cell) {
+			testing.expect(t, zsp.node_write(&w.node, cells))
+		}
+		for &d in docs {
+			d.id = zsp.node_id(&w.node, 1)
+			append(&w.rows, d.id)
+			b := make([]byte, 24, context.temp_allocator)
+			l := list_of(1, 0)
+			zsp.put_u64(b, l[0])
+			zsp.put_u64(b[8:], l[1])
+			write(t, &w, {{d.id, 1, .Place, zsp.node_stamp(&w.node), b}})
+		}
+		q, ok := query_parse([]byte{1, u8(Op.And), 2, u8(Op.Match), u8(Kind.Words), 20, 0, 0, 0, 3, 'f', 'i', 'g', u8(Op.Match), u8(Kind.Words), 22, 0, 0, 0, 3, 'f', 'i', 'g', 0, 0, 0, 50, 0})
+		testing.expect(t, ok)
+		index_follow(&w.x)
+		query_prepare(&w.x, &q)
+		index_finish(&w.x)
+		h := q.where_.kids[0].held
+		again, edits := 0, 0
+		for step in 0 ..< 150 {
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			many := 1 + rand.int_max(3)
+			for _ in 0 ..< many {
+				w.node.now += u64(rand.int_max(3000))
+				d := &docs[rand.int_max(len(docs))]
+				edits_made := 1 + rand.int_max(3)
+				for _ in 0 ..< edits_made {
+					n := zsp.text_len(&d.text)
+					if n > 0 && rand.int_max(3) == 0 {
+						at := rand.int_max(n)
+						zsp.text_delete(&d.text, at, min(1 + rand.int_max(12), n - at), rand.uint64() | 1)
+					} else {
+						// Where a character begins, or anywhere: what is not text is read all the same.
+						zsp.text_insert(&d.text, rand.int_max(n + 1), transmute([]byte)rand.choice(PARTS), rand.uint64() | 1)
+					}
+				}
+				stamp := zsp.node_stamp(&w.node)
+				body, made := zsp.text_close(&d.text, stamp)
+				if !made {
+					continue
+				}
+				edits += 1
+				// Some come late, after those that were written after them.
+				if rand.int_max(6) == 0 {
+					append(&d.held, zsp.Cell{d.id, 20, .Piece, stamp, slice.clone(body)})
+					continue
+				}
+				write(t, &w, {{d.id, 20, .Piece, stamp, body}})
+				if rand.int_max(4) == 0 { // in another text of it
+					b := make([dynamic]byte, context.temp_allocator)
+					zsp.write_u64(&b, rand.uint64() | 1)
+					append(&b, 1, 0, 0)
+					zsp.write_bytes(&b, transmute([]byte)rand.choice(PARTS))
+					write(t, &w, {{d.id, 22, .Piece, zsp.node_stamp(&w.node), b[:]}})
+				}
+				if rand.int_max(4) == 0 {
+					for c in d.held {
+						write(t, &w, {c})
+						delete(c.body)
+					}
+					clear(&d.held)
+				}
+			}
+			switch rand.int_max(25) {
+			case 2, 3: // what was written is gathered up
+				d := &docs[rand.int_max(len(docs))]
+				cells := make([dynamic]zsp.Cell, context.temp_allocator)
+				scan := zsp.row_scan(&w.node.store, d.id, 20, 20)
+				for c in zsp.row_next(&w.node.store, &scan) {
+					c := c
+					if c.kind == .Piece && zsp.cell_open(&w.keys, &w.node.roster, &c) {
+						c.body = slice.clone(c.body, context.temp_allocator)
+						append(&cells, c)
+					}
+				}
+				if len(cells) > 1 {
+					b := zsp.text_bundle(cells[:1 + rand.int_max(len(cells) - 1)], context.temp_allocator)
+					b.row, b.slot, b.stamp = d.id, 20, zsp.node_stamp(&w.node)
+					write(t, &w, {b})
+				}
+			case 0: // a text beneath it all
+				d := &docs[rand.int_max(len(docs))]
+				if zsp.text_len(&d.text) == 0 && len(d.held) == 0 {
+					write(t, &w, {{d.id, 20, .Value, zsp.node_stamp(&w.node), transmute([]byte)string("grape fig")}})
+				}
+			case 1: // more than is remembered
+				id := docs[0].id
+				for i in 0 ..< 80 {
+					write(t, &w, {{id, 16, .Value, zsp.node_stamp(&w.node), {byte(i)}}})
+				}
+			}
+			before := h.next_text
+			index_finish(&w.x)
+			again += max(int(h.next_text) - int(before), 0) // unless the words were all read again
+			// What is kept is what there is, and nothing else is.
+			s := index_scope(&w.x, 1)
+			for &k in q.where_.kids {
+				held := k.held
+				whole, length := 0, u64(0)
+				for &d in docs {
+					r := Row{n = &w.node, id = d.id}
+					bytes, _ := row_slot(&r, held.slot)
+					tally := make(map[Key]int, context.temp_allocator)
+					n := 0
+					it := words(bytes)
+					for word in words_next(&it) {
+						word := word
+						k, _ := bytes_key(word.bytes[:word.len])
+						tally[k] += 1
+						n += 1
+					}
+					row, _ := row_number(s, d.id)
+					text, has := held_text(held, row)
+					testing.expect_value(t, has, n > 0)
+					if !has {
+						continue
+					}
+					entry, _ := text_entry(held, text)
+					testing.expect(t, int(entry.length) == n && entry.row == row)
+					for k, count in tally {
+						had, _ := tree_get(&w.x, held.by_key, k, text)
+						testing.expect_value(t, int(had), count)
+						_, known := tree_get(&w.x, held.lexicon, k, 0)
+						testing.expect(t, known)
+					}
+					whole += len(tally)
+					length += u64(n)
+				}
+				testing.expect_value(t, held.length, length)
+				if held.dead == 0 {
+					testing.expect_value(t, tree_total(&w.x, held.by_key).count, whole)
+				}
+			}
+			if testing.failed(t) {
+				fmt.println("seed", seed, "step", step)
+				return
+			}
+		}
+		testing.expectf(t, again * 3 < edits, "read in whole %d times, of %d", again, edits)
+	}
+}

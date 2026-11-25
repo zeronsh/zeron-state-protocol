@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|sim|bench [find]|nat|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|sim|bench [find|edits]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -68,6 +68,9 @@ bench)
 	if [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]
 		odin build bench/find -out:build/bench-find$EXE -o:speed $STRICT
 		build/bench-find$EXE ${3:-1000000}
+	elif [ "${2:-}" = edits ]; then # what it costs to keep up with one edit of a text: ./x bench edits
+		odin build bench/edits -out:build/bench-edits$EXE -o:speed $STRICT
+		build/bench-edits$EXE
 	else
 		odin build bench -out:build/bench$EXE -o:speed $STRICT
 		build/bench$EXE build/bench-data
