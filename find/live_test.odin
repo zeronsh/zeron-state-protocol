@@ -311,6 +311,23 @@ answers_stay_true :: proc(t: ^testing.T) {
 				continue
 			}
 			client_hear(t, &c)
+			// Live text is asked for wherever a row is shown, and nowhere once none is.
+			wanted := 0
+			for l in f.live {
+				wanted += len(l.lives)
+				for id in l.shown {
+					places := zsp.row_places(&w.node.store, id)
+					if places.count == 0 || zsp.is_graveyard(zsp.key_list(places.keys[0])) {
+						continue
+					}
+					covered := false
+					for it in w.node.interests {
+						covered ||= it.watch.live && !zsp.key_less(places.keys[0], it.watch.lo) && zsp.key_less(places.keys[0], it.watch.hi)
+					}
+					testing.expectf(t, covered, "seed %d: nothing typed in %v comes", seed, id)
+				}
+			}
+			testing.expect_value(t, len(w.node.interests), wanted)
 			for id, question in asked {
 				q, _ := query_parse(question)
 				query_prepare(&f.x, &q)

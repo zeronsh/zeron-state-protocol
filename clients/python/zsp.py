@@ -303,7 +303,9 @@ class Client:
                     call["ended"], call["fault"] = True, payload[0] if payload else None
         elif kind == ANSWER:
             which, flags = r.varint(), r.u8()
-            if flags & ~1:
+            if flags & 16:
+                self.answers.pop(which, None)
+            elif flags & ~1:
                 self.answers[which] = dict(denied=flags & 2, faulty=flags & 4, waiting=r.u8() if flags & 8 else None)
             else:
                 a = self.answers[which] = dict(settled=flags & 1, total=r.varint(), first=r.varint())

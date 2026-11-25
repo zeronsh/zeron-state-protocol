@@ -5,11 +5,13 @@
 -- in either direction, shared between whoever observes them and let go when nobody does. Writes show at
 -- once and survive reconnection. It owns no thread, clock or socket; the host lends it those.
 
+local asking = require("./ask")
 local codec = require("./codec")
 local sha256 = require("./sha256")
 local text = require("./text")
 
 local HELLO, ROSTER, WATCH, UNWATCH, CELLS, ACK = 1, 2, 3, 4, 7, 8
+local ASK, UNASK, ANSWER = 32, 33, 34
 local LIVE, SYNCED, PRESENCE, ERROR, SERVE, CALL, FLOW = 9, 10, 12, 13, 14, 15, 16
 local GRAVE, PLACE, VALUE, PIECE, BUNDLE = 1, 2, 3, 4, 5
 local W_DATA, W_LIVE, W_BACK, W_ADOPT, W_COUNTS = 1, 2, 4, 8, 32
@@ -37,6 +39,7 @@ export type Host = {
 export type Column = {
 	read slot: number,
 	read text: boolean,
+	read is: string, -- what it can be asked about as
 	read encode: (any) -> string,
 	read decode: (string) -> any,
 }
@@ -47,6 +50,31 @@ export type State = {
 	read status: "loading" | "stale" | "ready" | "denied",
 	read before: number, -- rows of the list that lie before these,
 	read after: number, -- and after
+}
+export type Answer = {
+	read rows: { Row },
+	read status: "loading" | "indexing" | "ready" | "stale" | "denied" | "faulty",
+	read progress: number, -- of indexing, from 0 to 1
+	read total: number, -- rows there are in all,
+	read first: number, -- and how many come before these
+	read totals: { [string]: any }, -- as named: numbers, or lists of { value, count }
+}
+type Asked = {
+	id: number,
+	question: asking.Question,
+	schema: Table,
+	totals_of: { asking.Told },
+	observer: (Answer) -> (),
+	ids: { string },
+	shown: { [string]: boolean },
+	stopped: boolean, -- though the node may not know yet, and count on its rows being held
+	answer: Answer?,
+	status: any,
+	progress: number,
+	total: number,
+	first: number,
+	totals: { [string]: any },
+	changed: boolean,
 }
 export type Device = { read id: string, read subject: string }
 
@@ -114,9 +142,9 @@ local Faults = { "denied", "unreachable", "unserved", "lost", "overrun", "busy" 
 
 -- ---------------------------------------------------------------- columns
 
-local function column(slot: number, is_text: boolean, encode: (any) -> string, decode: (string) -> any): Column
+local function column(slot: number, is: string, encode: (any) -> string, decode: (string) -> any): Column
 	assert(slot >= 16 and slot <= 255, "data slots are 16 to 255")
-	return table.freeze({ slot = slot, text = is_text, encode = encode, decode = decode })
+	return table.freeze({ slot = slot, text = is == "text", is = is, encode = encode, decode = decode })
 end
 
 local function same(v: any): any
@@ -126,11 +154,11 @@ end
 local columns = {}
 
 function columns.string(slot: number): Column
-	return column(slot, false, same, same)
+	return column(slot, "string", same, same)
 end
 
 function columns.number(slot: number): Column
-	return column(slot, false, function(v)
+	return column(slot, "number", function(v)
 		return string.pack(">d", v)
 	end, function(s)
 		return (string.unpack(">d", s))
@@ -138,21 +166,26 @@ function columns.number(slot: number): Column
 end
 
 function columns.boolean(slot: number): Column
-	return column(slot, false, function(v)
+	return column(slot, "boolean", function(v)
 		return if v then "\1" else "\0"
 	end, function(s)
 		return s == "\1"
 	end)
 end
 
--- Anything, given a way to write it down.
+-- Another row, by its id.
+function columns.row(slot: number): Column
+	return column(slot, "id", same, same)
+end
+
+-- Anything, given a way to write it down. What is written as JSON can be asked about by path.
 function columns.custom(slot: number, encode: (any) -> string, decode: (string) -> any): Column
-	return column(slot, false, encode, decode)
+	return column(slot, "string", encode, decode)
 end
 
 -- Collaborative, streamable text.
 function columns.text(slot: number): Column
-	return column(slot, true, same, same)
+	return column(slot, "text", same, same)
 end
 
 table.freeze(columns)
@@ -179,6 +212,9 @@ local function new_client(host: Host)
 		windows = {} :: { [string]: Window },
 		pages = {} :: { [number]: Page },
 		next_page = 0,
+		asked = {} :: { [number]: Asked },
+		next_ask = 0,
+		loose = {} :: { [string]: boolean }, -- rows sent for an answer still to come
 		shapes = (setmetatable({}, { __mode = "k" }) :: any) :: { [Table]: number },
 		next_shape = 0,
 		seq = 0,
@@ -249,6 +285,15 @@ function Client._lost(self: Client)
 		end
 		self:_touch(window)
 	end
+	for _, a in table.clone(self.asked) do
+		if a.stopped then
+			self:_unasked(a)
+		elseif a.status == "ready" then
+			a.status = "stale"
+			self:_touch_answer(a)
+		end
+	end
+	self:_sweep()
 	self:_tell("status", false)
 	if not self.closed then
 		local wait = math.min(0.1 * 2 ^ self.failures, 10)
@@ -306,6 +351,12 @@ function Client._flush(self: Client)
 			self:_publish(window)
 		end
 	end
+	for _, a in table.clone(self.asked) do
+		if a.changed and not a.stopped then
+			a.changed = false
+			a.observer(self:_answer(a))
+		end
+	end
 end
 
 function Client._receive(self: Client, data: buffer | string)
@@ -356,6 +407,8 @@ function Client._handle(self: Client, kind: number, r: codec.Reader)
 		self:_on_live(r)
 	elseif kind == SYNCED then
 		self:_on_synced(r)
+	elseif kind == ANSWER then
+		self:_on_answer(r)
 	elseif kind == ACK then
 		self:_on_ack(codec.varint(r))
 	elseif kind == FLOW then
@@ -401,6 +454,11 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 				self:_touch(window)
 			end
 		end
+		for _, a in self.asked do
+			if a.status == "denied" then
+				self:_ask(a)
+			end
+		end
 		self:_tell("status", true)
 		return
 	end
@@ -424,6 +482,9 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 				self:_watch(page)
 			end
 		end
+	end
+	for _, a in self.asked do
+		self:_ask(a)
 	end
 	self:_tell("status", true)
 end
@@ -1058,9 +1119,223 @@ function Client._place(self: Client, row: Stored)
 			end
 		end
 	end
+	self:_touch_asked(row)
 	if row.pages <= 0 and next(row.held) == nil and (row.dead or not self:_pending(row.id)) then
-		self.rows[row.id] = nil
+		if next(self.asked) ~= nil and not row.dead then
+			self.loose[row.id] = true
+		else
+			self.rows[row.id] = nil
+		end
 	end
+end
+
+-- ---------------------------------------------------------------- questions
+
+-- Asks a question, which stays asked: the observer hears the answer, and again whenever it changes, at most once
+-- a turn. Returns ways to look at another stretch of it, and to stop.
+function Client.ask(self: Client, question: asking.Question, observer: (Answer) -> ())
+	asking.write(question, function()
+		return string.rep("\0", 16)
+	end) -- or an error, here rather than later
+	self.next_ask += 1
+	local a: Asked = {
+		id = self.next_ask,
+		question = question,
+		schema = question.table :: any,
+		totals_of = {},
+		observer = observer,
+		ids = {},
+		shown = {},
+		stopped = false,
+		answer = nil,
+		status = "loading",
+		progress = 0,
+		total = 0,
+		first = 0,
+		totals = {},
+		changed = false,
+	}
+	self.asked[a.id] = a
+	if self.ready then
+		self:_ask(a)
+	end
+	observer(self:_answer(a))
+	return table.freeze({
+		move = function(offset: number, limit: number?)
+			local q: any = table.clone(a.question)
+			q.offset, q.limit = offset, limit or q.limit
+			a.question = q
+			if self.ready and not a.stopped then
+				self:_ask(a)
+			end
+		end,
+		stop = function()
+			if a.stopped then
+				return
+			end
+			a.stopped = true
+			if not self.ready then
+				self:_unasked(a)
+			else
+				local w = codec.writer()
+				codec.put_varint(w, a.id)
+				self:_frame(UNASK, w)
+			end
+		end,
+	})
+end
+
+function Client._ask(self: Client, a: Asked)
+	if not self.scopes[a.question.scope] then
+		a.status = "denied"
+		self:_touch_answer(a)
+		return
+	end
+	local body, totals = asking.write(a.question, function(scope, name)
+		return self:_tag(scope, name)
+	end)
+	a.totals_of = totals
+	local w = codec.writer()
+	codec.put_varint(w, a.id)
+	codec.put(w, body)
+	self:_frame(ASK, w)
+end
+
+function Client._on_answer(self: Client, r: codec.Reader)
+	local a = self.asked[codec.varint(r)]
+	if not a then
+		return
+	end
+	local flags = codec.u8(r)
+	if flags == 16 then
+		self:_unasked(a)
+		return
+	elseif flags >= 2 then
+		if bit32.btest(flags, 8) then
+			a.status, a.progress = "indexing", codec.u8(r) / 100
+		else
+			a.status = if bit32.btest(flags, 2) then "denied" else "faulty"
+			self:_show(a, {})
+		end
+		self:_touch_answer(a)
+		return
+	end
+	a.status, a.progress = if flags == 1 then "ready" else "stale", 1
+	a.total, a.first = codec.varint(r), codec.varint(r)
+	local ids = {}
+	for _ = 1, codec.varint(r) do
+		table.insert(ids, codec.take(r, 16))
+	end
+	self:_show(a, ids)
+	self:_sweep()
+	local totals: { [string]: any } = {}
+	for i = 1, codec.varint(r) do
+		local some = codec.u8(r) ~= 0
+		local number = string.unpack(">d", codec.take(r, 8))
+		local of = a.totals_of[i]
+		local facets: { { read value: any, read count: number } } = {}
+		for _ = 1, codec.varint(r) do
+			local count = codec.varint(r)
+			local value: any = codec.bytes(r)
+			if of then
+				value = of.read(value)
+			end
+			table.insert(facets, table.freeze({ value = value, count = count }))
+		end
+		local out: any = if some then number else nil
+		if of and of.facet then
+			out = table.freeze(facets)
+		elseif #facets > 0 then
+			out = facets[1].value -- the least or the most, as it is
+		end
+		if of then
+			totals[of.name] = out
+		end
+	end
+	a.totals = table.freeze(totals)
+	self:_touch_answer(a)
+end
+
+-- Holds the rows of an answer, and lets go of those of the last.
+function Client._show(self: Client, a: Asked, ids: { string })
+	local old = a.ids
+	a.ids = ids
+	a.shown = {}
+	for _, id in ids do
+		a.shown[id] = true
+		self:_row(id).pages += 1
+	end
+	for _, id in old do
+		local row = self.rows[id]
+		if row then
+			self:_release(row)
+		end
+	end
+end
+
+-- A question is no more, here or at the node.
+function Client._unasked(self: Client, a: Asked)
+	self.asked[a.id] = nil
+	self:_show(a, {})
+	self:_sweep()
+end
+
+-- Lets go of what was sent for an answer and is not in it.
+function Client._sweep(self: Client)
+	for id in self.loose do
+		local row = self.rows[id]
+		if row and row.pages <= 0 and next(row.held) == nil and not self:_pending(id) then
+			self.rows[id] = nil
+		end
+	end
+	table.clear(self.loose)
+end
+
+function Client._touch_answer(self: Client, a: Asked)
+	a.changed, a.answer = true, nil
+	self:_later()
+end
+
+function Client._touch_asked(self: Client, row: Stored)
+	for _, a in self.asked do
+		if not a.changed and a.shown[row.id] then
+			self:_touch_answer(a)
+		end
+	end
+end
+
+function Client._answer(self: Client, a: Asked): Answer
+	local answer = a.answer
+	if answer then
+		return answer
+	end
+	local rows: { Row } = table.create(#a.ids) :: any
+	for _, id in a.ids do
+		local row = self.rows[id]
+		if row and not row.dead then
+			-- A row's order is that of its first place.
+			local key = string.rep("\0", 40)
+			for slot = 1, 15 do
+				local cells = row.slots[slot]
+				local _, c = next(cells or {} :: { [string]: Cell })
+				if c then
+					key = string.sub(c.body, 1, 24) .. id
+					break
+				end
+			end
+			table.insert(rows, self:_view(row, a.schema, key))
+		end
+	end
+	local made: Answer = table.freeze({
+		rows = table.freeze(rows :: any),
+		status = a.status,
+		progress = a.progress,
+		total = a.total,
+		first = a.first,
+		totals = a.totals,
+	})
+	a.answer = made
+	return made
 end
 
 -- ---------------------------------------------------------------- live text
@@ -1145,6 +1420,7 @@ end
 -- become durable a piece at a time.
 function Client.text(self: Client, id: string, col: Column)
 	assert(col.text, "not a text column")
+	assert(self.rows[id], "no window and no answer holds the row") -- so there is no telling what is written there
 	local slot = col.slot
 	local row = self:_row(id)
 	row.held[slot] = (row.held[slot] or 0) + 1

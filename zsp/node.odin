@@ -445,7 +445,7 @@ interest_add :: proc(s: ^Session, w: Watch, limit: u64, back: bool) -> ^Interest
 	n := s.node
 	w := w
 	w.data = w.data && !n.full
-	if !w.data && !w.live {
+	if (!w.data && !w.live) || len(n.interests) >= MAX_INTERESTS {
 		return nil
 	}
 	n.next_watch += 1

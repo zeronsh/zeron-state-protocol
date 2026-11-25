@@ -711,7 +711,7 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 		theirs.print = read_pair(r, Print)
 	}
 	scope := key_scope(lo)
-	if r.bad || !key_less(lo, hi) || key_less(scope_hi(scope), hi) || len(s.watches) >= 1024 {
+	if r.bad || !key_less(lo, hi) || key_less(scope_hi(scope), hi) || len(s.watches) >= (1024 if s.role == .Open else MAX_INTERESTS) {
 		r.bad = true
 		return
 	}
@@ -777,7 +777,7 @@ on_unwatch :: proc(s: ^Session, id: u64) {
 			break
 		}
 	}
-	if s.role == .Open || s.node.keys == nil {
+	if (s.role == .Open && id != LIVES) || s.node.keys == nil {
 		for it, i in s.node.interests {
 			if it.session == s.id && it.watch.id == id {
 				interest_remove(s.node, i)
@@ -1700,6 +1700,23 @@ session_show :: proc(s: ^Session, row: Id) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	emit_row(s, row)
 	cells_close(s)
+}
+
+@(private)
+LIVES :: max(u64) // the window of an interest in what an answer shows
+
+// Wants what is typed in a range of places streamed here, for what a client is shown in answers.
+session_lives :: proc(s: ^Session, lo, hi: Key) {
+	interest_add(s, {id = LIVES, lo = lo, hi = hi, live = true}, 0, false)
+}
+
+session_unlives :: proc(s: ^Session, lo, hi: Key) {
+	for it, i in s.node.interests {
+		if it.session == s.id && it.watch.id == LIVES && it.watch.lo == lo && it.watch.hi == hi {
+			interest_remove(s.node, i)
+			return
+		}
+	}
 }
 
 @(private)

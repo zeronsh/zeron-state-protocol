@@ -193,4 +193,97 @@ do
 	assert(not pcall(call.send, string.rep("x", 262145)), "a message too big for any window is refused at once")
 end
 
+-- What is sent for an answer waits for it, and what another answer shows outlives the one that stops.
+do
+	local ASK, UNASK, ANSWER = 32, 33, 34
+	local h = harness()
+	h.run()
+	h.greet()
+	local function row(id: string, n: number): string
+		local w = codec.writer()
+		codec.put_u8(w, 3) -- a value, and a row first named
+		codec.put(w, id)
+		codec.put_u8(w, 16)
+		codec.put(w, string.rep("\0", 15) .. string.char(n))
+		codec.put_bytes(w, "title " .. n)
+		return codec.string(w)
+	end
+	local function answer(id: number, ids: { string })
+		local w = codec.writer()
+		codec.put_varint(w, id)
+		codec.put_u8(w, 1)
+		codec.put_varint(w, #ids)
+		codec.put_varint(w, 0)
+		codec.put_varint(w, #ids)
+		codec.put(w, table.concat(ids))
+		codec.put_varint(w, 0)
+		h.tell(ANSWER, codec.string(w))
+	end
+	local function flags(id: number, f: number)
+		h.tell(ANSWER, string.char(id, f) .. if f == 8 then "\42" else "")
+	end
+	local one, two = string.rep("1", 16), string.rep("2", 16)
+	local a, b
+	local first = h.client:ask({ scope = 1, table = Note }, function(s)
+		a = s
+	end)
+	local second = h.client:ask({ scope = 1, table = Note, where = zsp.where.is("title", "x"), limit = 7 }, function(s)
+		b = s
+	end)
+	h.run()
+	assert(a.status == "loading" and h.last(ASK))
+	flags(1, 8)
+	assert(a.status == "indexing" and a.progress == 0.42)
+	h.tell(CELLS, "\0" .. row(one, 1) .. row(two, 2))
+	assert(#a.rows == 0)
+	answer(1, { one })
+	assert(a.status == "ready" and #a.rows == 1 and a.rows[1].title == "title 1" and a.total == 1)
+	assert(h.client.rows[two] == nil, "what no answer shows is not held")
+	local was = a
+	h.tell(CELLS, "\0" .. row(one, 9))
+	assert(a ~= was and a.rows[1].title == "title 9", "and what one does is kept up")
+	first.stop()
+	h.run()
+	assert(h.last(UNASK))
+	answer(2, { one }) -- the node says this before it knows, so it does not send the row
+	assert(b.rows[1].title == "title 9")
+	flags(1, 16)
+	assert(b.rows[1].title == "title 9" and h.client.rows[one])
+	-- Asked again down a new pipe, and over what was.
+	h.self.closed()
+	h.run()
+	assert(b.status == "stale" and #b.rows == 1)
+	local before = #h.self.said
+	for _, f in h.self.later do
+		f()
+	end
+	h.run()
+	h.greet()
+	local again = 0
+	for i = before + 1, #h.self.said do
+		again += if h.self.said[i].kind == ASK then 1 else 0
+	end
+	assert(again == 1)
+	second.move(7)
+	h.run()
+	local r = codec.reader((h.last(ASK) :: any).body)
+	assert(codec.varint(r) == 2 and string.sub((h.last(ASK) :: any).body, -3) == "\7\7\0")
+	flags(2, 2)
+	assert(b.status == "denied" and #b.rows == 0 and next(h.client.rows) == nil)
+	second.stop()
+	second.stop()
+	flags(2, 16)
+	assert(next(h.client.asked) == nil)
+	-- A question that makes no sense here is an error here.
+	assert(not pcall(function()
+		h.client:ask({ scope = 1, table = Note, where = zsp.where.is("nothing", 1) }, function() end)
+	end))
+	assert(next(h.client.asked) == nil)
+	-- A scope that cannot be read is known to be.
+	h.client:ask({ scope = 5, table = Note }, function(s)
+		a = s
+	end)
+	assert(a.status == "denied")
+end
+
 print("ok")

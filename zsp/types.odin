@@ -98,6 +98,8 @@ row_scope :: #force_inline proc "contextless" (row: Id) -> Scope {
 	return Scope(row[0] >> 32)
 }
 
+MAX_INTERESTS :: 16384 // watches a peer may be asked to keep
+
 // The least stamp time a cell of this row may have.
 @(require_results)
 row_born :: #force_inline proc "contextless" (row: Id) -> u64 {

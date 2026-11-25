@@ -319,7 +319,10 @@ def test_luau():
     for d in (a, b):
         with open(os.path.join(d.dir, "token")) as f:
             args += [d.address, f.read()]
-    p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "live.luau"), *args], capture_output=True, text=True, timeout=60)
+    try:
+        p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "live.luau"), *args], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as e: # it waits on its sockets once something has gone wrong
+        raise AssertionError((e.stderr or b"").decode()) from None
     sys.stdout.write(p.stdout.replace("ok\n", ""))
     assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stderr
 

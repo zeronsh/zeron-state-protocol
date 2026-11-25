@@ -275,6 +275,261 @@ eventually("what was written while away arrives", function()
 end)
 assert(b:request(b.devices[1].id, 1, "shout", "again") == "AGAIN")
 
+-- Questions, asked of one device about what another writes.
+do
+	local w = zsp.where
+	local serde = require("@lune/serde")
+	local Track = {
+		name = zsp.string(16),
+		words = zsp.text(17),
+		length = zsp.number(18),
+		liked = zsp.boolean(19),
+		album = zsp.row(20),
+		meta = zsp.custom(21, function(v)
+			return serde.encode("json", v)
+		end, function(s)
+			return serde.decode("json", s)
+		end),
+	}
+	local Album = { title = zsp.string(24), year = zsp.number(25) }
+	local albums, tracks, records = {}, {}, {}
+	local titles = { "Blue", "Red", "Green" }
+	local names = { "alpha", "Beta", "gamma", "Delta", "ALPHA" }
+	a:write(1, function(change)
+		for i, title in titles do
+			albums[i] = change.insert(Album, "albums", i, { title = title, year = 1990 + i })
+		end
+		for i = 1, 60 do
+			local at = i % 4
+			local t = {
+				name = names[i % 5 + 1],
+				words = if i % 7 == 0 then "The quick brown foxes" elseif i % 3 == 0 then "a lazy dog, quick to sleep" else nil,
+				length = i * 10,
+				liked = if i % 2 == 0 then true elseif i % 5 == 0 then nil else false,
+				album = albums[at],
+				meta = { tags = { `t{i % 6}`, "all" }, size = { mb = i / 4 } },
+			}
+			tracks[i] = change.insert(Track, "tracks", i, t)
+			records[tracks[i]] = t
+		end
+	end)
+	local function text_of(t: any): string
+		return string.lower(t.words or "")
+	end
+	-- Each condition against what it means.
+	local checks: { { any } } = {
+		{ w.is("name", "Alpha"), function(t)
+			return string.lower(t.name) == "alpha"
+		end },
+		{ w.exactly("name", "ALPHA"), function(t)
+			return t.name == "ALPHA"
+		end },
+		{ w.among("length", { 10, 20, 30, 5 }), function(t)
+			return t.length <= 30
+		end },
+		{ w.among("name", { "beta", "DELTA" }), function(t)
+			return t.name == "Beta" or t.name == "Delta"
+		end },
+		{ w.between("length", 100, 200), function(t)
+			return t.length >= 100 and t.length <= 200
+		end },
+		{ w.over("length", 500), function(t)
+			return t.length > 500
+		end },
+		{ w.under("length", 50), function(t)
+			return t.length < 50
+		end },
+		{ w.between("length", nil, 50), function(t)
+			return t.length <= 50
+		end },
+		{ w.is("liked", true), function(t)
+			return t.liked == true
+		end },
+		{ w.is("liked", false), function(t)
+			return t.liked == false
+		end },
+		{ w.has("liked"), function(t)
+			return t.liked ~= nil
+		end },
+		{ w.none(w.has("album")), function(t)
+			return t.album == nil
+		end },
+		{ w.is("album", albums[2]), function(t)
+			return t.album == albums[2]
+		end },
+		{ w.begins("name", "AL"), function(t)
+			return string.lower(t.name) == "alpha"
+		end },
+		{ w.contains("name", "ELT"), function(t)
+			return t.name == "Delta"
+		end },
+		{ w.is("meta.tags", "t3"), function(t)
+			return t.meta.tags[1] == "t3"
+		end },
+		{ w.over("meta.size.mb", 10), function(t)
+			return t.meta.size.mb > 10
+		end },
+		{ w.matches("words", "quick"), function(t)
+			return string.find(text_of(t), "quick") ~= nil
+		end },
+		{ w.matches("words", "lazy fox", { any = true, prefix = true }), function(t)
+			return t.words ~= nil
+		end },
+		{ w.matches("words", "brown quick"), function(t)
+			return string.find(text_of(t), "brown") ~= nil
+		end },
+		{ w.matches("words", "brown quick", { phrase = true }), function(_)
+			return false
+		end },
+		{ w.matches("words", "quick brown", { phrase = true }), function(t)
+			return string.find(text_of(t), "brown") ~= nil
+		end },
+		{ w.matches("words", "qiuck", { typos = 2 }), function(t)
+			return t.words ~= nil
+		end },
+		{ w.matches("words", "oxe", { inside = true }), function(t)
+			return string.find(text_of(t), "foxes") ~= nil
+		end },
+		{ w.in_list("tracks"), function(_)
+			return true
+		end },
+		{ w.ids({ tracks[3], tracks[9], albums[1] }), function(t)
+			return t == records[tracks[3]] or t == records[tracks[9]]
+		end },
+		{ w.refers("album", 1, w.over("year", 1991), Album), function(t)
+			return t.album == albums[2] or t.album == albums[3]
+		end },
+		{ w.any(w.under("length", 20), w.all(w.is("liked", true), w.over("length", 580))), function(t)
+			return t.length < 20 or (t.liked == true and t.length > 580)
+		end },
+		{ w.all(), function(_)
+			return true
+		end },
+	}
+	for i, check in checks do
+		local want = {}
+		for j = 60, 1, -1 do
+			if check[2](records[tracks[j]]) then
+				table.insert(want, tracks[j])
+			end
+		end
+		local got: any
+		local asked = b:ask(
+			{ scope = 1, table = Track, where = w.all(w.in_list("tracks"), check[1]), order = { "-length" }, limit = 100 },
+			function(s)
+				got = s
+			end
+		)
+		eventually(`question {i}`, function()
+			if got.status ~= "ready" or got.total ~= #want or #got.rows ~= #want then
+				return false
+			end
+			for j, row in got.rows do
+				if row.id ~= want[j] or row.length ~= records[want[j]].length then
+					return false
+				end
+			end
+			return true
+		end)
+		asked.stop()
+	end
+
+	local got: any
+	local asked = b:ask({
+		scope = 1,
+		table = Track,
+		where = w.in_list("tracks"),
+		order = { "name", "-meta.size.mb:number" },
+		limit = 3,
+		offset = 2,
+		totals = {
+			whole = { "sum", "length" },
+			least = { "min", "length" },
+			most = { "max", "name" },
+			liked = { "facet", "liked" },
+			size = { "max", "meta.size.mb:number" },
+			by_name = { "facet", "name", 2 },
+			known = { "count", "album" },
+		},
+	}, function(s)
+		got = s
+	end)
+	eventually("totals", function()
+		return got.status == "ready" and got.total == 60
+	end)
+	assert(got.first == 2 and #got.rows == 3 and got.rows[1].id == tracks[55] and got.rows[2].id == tracks[54])
+	local t = got.totals
+	assert(t.whole == 18300 and t.least == 10 and string.lower(t.most) == "gamma" and t.size == 15 and t.known == 45)
+	assert(#t.by_name == 2 and t.by_name[1].count == 24 and string.lower(t.by_name[1].value) == "alpha" and t.by_name[2].count == 12)
+	assert(#t.liked == 2 and t.liked[1].value == true and t.liked[1].count == 30 and t.liked[2].count == 24)
+	asked.move(0, 1)
+	eventually("another stretch", function()
+		return got.status == "ready" and got.first == 0 and #got.rows == 1 and got.rows[1].id == tracks[60]
+	end)
+	-- And it stays true.
+	a:write(1, function(change)
+		change.set(tracks[60], Track, { name = "zeta" })
+	end)
+	eventually("what is written is answered", function()
+		return got.rows[1].id == tracks[59] and got.totals.most == "zeta"
+	end)
+	a:write(1, function(change)
+		change.set(tracks[59], Track, { liked = true })
+	end)
+	eventually("what is shown is kept up", function()
+		return got.rows[1].liked == true and got.totals.liked[1].count == 31
+	end)
+	local of: any
+	local counted = b:ask({
+		scope = 1,
+		table = Album,
+		where = w.referred(1, "album", w.is("liked", true), 10, nil, Track),
+		order = { "title" },
+	}, function(s)
+		of = s
+	end)
+	eventually("albums with ten liked", function()
+		return of.status == "ready" and of.total == 2 and of.rows[1].title == "Blue" or of.total == 1
+	end)
+	counted.stop()
+	asked.stop()
+	local best: any
+	local searched = b:ask({ scope = 1, table = Track, where = w.matches("words", "quick foxes", { any = true }), order = { "best" }, limit = 20 }, function(s)
+		best = s
+	end)
+	eventually("the best come first", function()
+		return best.status == "ready" and #best.rows == 20 and best.rows[1].words == "The quick brown foxes"
+	end)
+	local typed = best.rows[1].id
+	assert(not pcall(a.text, a, typed, Track.words), "what is not held cannot be added to")
+	local held: any
+	local holds = a:ask({ scope = 1, table = Track, where = w.ids({ typed }) }, function(s)
+		held = s
+	end)
+	eventually("it is held", function()
+		return #held.rows == 1
+	end)
+	task.wait(0.1)
+	local began = os.clock()
+	local editor = a:text(typed, Track.words)
+	editor.append(" jump")
+	eventually("live text shows in an answer", function()
+		for _, row in best.rows do
+			if row.id == typed then
+				return row.words == "The quick brown foxes jump"
+			end
+		end
+		return false
+	end)
+	assert(os.clock() - began < 0.5, "as it is typed, not once it is sealed")
+	editor.close()
+	holds.stop()
+	searched.stop()
+	eventually("nothing is asked", function()
+		return next(b.asked) == nil
+	end)
+end
+
 -- A window nobody observes is let go.
 theirs.stop()
 window.stop()

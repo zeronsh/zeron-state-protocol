@@ -17,7 +17,8 @@ Answer_Flags :: bit_field u8 {
 	denied:  bool | 1, // may not be asked, and is no longer
 	faulty:  bool | 1, // makes no sense
 	waiting: bool | 1, // an index is being made, and nothing else is said but how much of it is
-	_:       u8   | 4,
+	ended:   bool | 1, // is asked no longer, as was wished
+	_:       u8   | 3,
 }
 
 Finder :: struct {
@@ -58,6 +59,8 @@ Live :: struct {
 	joined:  bool, // what it holds for turns on other rows too
 	rows:    Set,
 	shown:   [dynamic]zsp.Id, // in order
+	lives:   [dynamic][2]zsp.Key, // where those are, so that what is typed there comes here
+	moved:   bool, // one of those may be elsewhere
 	first:   int,
 	said:    []byte, // the last answer
 	stale:   bool, // the page may have changed
@@ -132,9 +135,14 @@ finder_asked :: proc(f: ^Finder, s: ^zsp.Session, type: u8, payload: []byte) -> 
 		live_place(l)
 		l.renew = true
 	case UNASK:
+		// Said back, since until then its rows are held, and an answer may count on that.
 		if l := live_find(f, s, id); l != nil {
 			live_free(l)
 		}
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, id)
+		append(&w, flag_byte({ended = true}))
+		zsp.session_post(s, ANSWER, w[:])
 	}
 	return true
 }
@@ -282,6 +290,10 @@ live_free :: proc(l: ^Live) {
 	}
 	query_uses(&l.q, -1)
 	set_destroy(&l.rows)
+	for at in l.lives {
+		zsp.session_unlives(l.session, at[0], at[1])
+	}
+	delete(l.lives)
 	delete(l.shown)
 	delete(l.said)
 	virtual.arena_destroy(&l.arena)
@@ -369,8 +381,9 @@ live_changed :: proc(l: ^Live, c: ^Changed) {
 	} else if was && !now {
 		set_remove(&l.rows, c.row)
 	}
+	l.moved ||= now && c.slots[0] & 0xffff != 0
 	// Where it stands among the others, or what they come to, may have changed all the same.
-	l.stale ||= now != was || (now && live_ordered(l, c))
+	l.stale ||= l.moved || now != was || (now && live_ordered(l, c))
 }
 
 @(private)
@@ -452,7 +465,7 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 			}
 			set_destroy(&l.rows)
 			l.rows = pred_rows(index_scope(&f.x, l.q.scope), &l.q.where_)
-			l.ready, l.renew, l.stale = true, false, true
+			l.ready, l.renew, l.stale, l.moved = true, false, true, true
 		}
 		if l.stale {
 			l.stale = false
@@ -512,6 +525,7 @@ answer_send :: proc(l: ^Live) {
 	s := index_scope(&f.x, l.q.scope)
 	page := query_page(s, &l.q, &l.rows)
 	totals := query_totals(s, &l.q, &l.rows)
+	live_lives(l, page)
 	w := make([dynamic]byte, context.temp_allocator)
 	zsp.write_varint(&w, l.id)
 	append(&w, flag_byte({settled = f.settled}))
@@ -548,6 +562,69 @@ answer_send :: proc(l: ^Live) {
 	delete(l.said)
 	l.said = slice.clone(w[:])
 	zsp.session_post(l.session, ANSWER, w[:])
+}
+
+LIVE_LISTS :: 16
+
+// Asks for live text where the rows about to be shown are: a stretch of each list they are in, or where those are
+// many, one of everything between.
+@(private)
+live_lives :: proc(l: ^Live, page: []Hit) {
+	same := len(page) == len(l.shown) && !l.moved
+	for hit, i in page {
+		same = same && hit.id == l.shown[i]
+	}
+	if same {
+		return
+	}
+	l.moved = false
+	n := l.f.n
+	want: [LIVE_LISTS + 1][2]zsp.Key
+	count := 0
+	all := [2]zsp.Key{zsp.KEY_MAX, zsp.KEY_MIN}
+	for hit in page {
+		places := zsp.row_places(&n.store, hit.id)
+		if places.count == 0 || zsp.is_graveyard(zsp.key_list(places.keys[0])) {
+			continue
+		}
+		lo := places.keys[0]
+		hi := zsp.key_next(lo)
+		at := 0
+		for at < count && zsp.key_list(want[at][0]) != zsp.key_list(lo) {
+			at += 1
+		}
+		if at == count && count <= LIVE_LISTS {
+			want[at] = {lo, hi}
+			count += 1
+		}
+		for r in ([]^[2]zsp.Key{&all, &want[min(at, LIVE_LISTS)]}) {
+			r[0] = lo if zsp.key_less(lo, r[0]) else r[0]
+			r[1] = hi if zsp.key_less(r[1], hi) else r[1]
+		}
+	}
+	if count > LIVE_LISTS {
+		want[0], count = all, 1
+	}
+	// What was asked for already will do, unless it is of much else.
+	#reverse for old, i in l.lives {
+		keep := false
+		for w, j in want[:count] {
+			if !zsp.key_less(w[0], old[0]) && !zsp.key_less(old[1], w[1]) && zsp.store_range(&n.store, old[0], old[1]).count <= 64 + 4 * len(page) {
+				keep = true
+				count -= 1
+				want[j] = want[count]
+				break
+			}
+		}
+		if !keep {
+			zsp.session_unlives(l.session, old[0], old[1])
+			unordered_remove(&l.lives, i)
+		}
+	}
+	for w in want[:count] {
+		zsp.session_lives(l.session, w[0], w[1])
+		append(&l.lives, w)
+	}
 }
 
 // A value as its kind is written.
