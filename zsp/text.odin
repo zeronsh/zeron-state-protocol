@@ -9,8 +9,9 @@ import "core:slice"
 // is sealed into a cell, whatever was already integrated is skipped. A text is a pure function of the
 // set of pieces in its slot, plus at most one Value beneath them.
 //
-// Placement is YjsMod/FugueMax: each run remembers its neighbours at birth, so concurrent runs never
-// interleave.
+// Placement is Fugue's: every element hangs in a tree, by nothing but what its own operation says, and the text is
+// the tree read in order. So concurrent runs never interleave, and whatever anyone says of neighbours, the text is
+// the same for everyone who has the same pieces.
 
 Ref :: struct {
 	piece:  u64, // zero for the edge of the document
@@ -47,10 +48,22 @@ Span :: struct {
 	using id: Spot, // of its first byte; the rest follow
 	len:   u32,
 	at:    u32, // in Text.data
-	left:  Spot, // neighbours of its first byte, when it was typed
-	right: Spot,
+	run:   u32, // that it is of
 	block: ^Block, // where it is in the document
 	marks: bit_set[Mark;u32],
+}
+
+// Elements made at once: the first hangs beneath what its operation says, and each of the rest beneath the one before,
+// on its right. The start of the document is the root, at depth 0.
+@(private)
+Run :: struct {
+	using id: Spot, // of its first element
+	parent: Spot, // of the first
+	right:  bool, // the side of it the first hangs on
+	depth:  u32, // of the first
+	hops:   u32, // runs between it and the root, and one
+	up:     u32, // the run that holds its parent; NONE for the root
+	jump:   u32, // a run further up, so that any ancestor is a few steps away; NONE for the root
 }
 
 // Some of the spans, in document order, dead ones included.
@@ -70,7 +83,8 @@ NONE :: max(u32)
 
 Text :: struct {
 	data:    [dynamic]byte,
-	spans:   [dynamic]Span, // by number, as they came to be
+	spans:   [dynamic]Span, // by number, as they came to be; each a run, or part of one
+	runs:    [dynamic]Run, // by number, as they came to be
 	blocks:  [dynamic]^Block,
 	visible: int, // bytes
 	pieces:  [dynamic]Piece, // by number; the first is no piece
@@ -114,6 +128,7 @@ Waiting :: struct {
 text_destroy :: proc(t: ^Text) {
 	delete(t.data)
 	delete(t.spans)
+	delete(t.runs)
 	for b in t.blocks {
 		free(b)
 	}
@@ -136,7 +151,7 @@ text_destroy :: proc(t: ^Text) {
 // Bytes it takes to hold a text, more or less.
 @(require_results)
 text_size :: proc(t: ^Text) -> int {
-	return cap(t.data) + cap(t.spans) * size_of(Span) + len(t.blocks) * size_of(Block) + cap(t.pieces) * size_of(Piece) + cap(t.numbers) * 16
+	return cap(t.data) + cap(t.spans) * size_of(Span) + cap(t.runs) * size_of(Run) + len(t.blocks) * size_of(Block) + cap(t.pieces) * size_of(Piece) + cap(t.numbers) * 16
 }
 
 // How many runs it is in.
@@ -553,7 +568,6 @@ text_split :: proc(t: ^Text, no: u32, n: u32) -> u32 {
 	tail.offset += n
 	tail.len -= n
 	tail.at += n
-	tail.left = {s.piece, s.offset + n - 1}
 	if .Dead not_in s.marks {
 		s.block.visible -= int(tail.len)
 	}
@@ -594,67 +608,231 @@ text_right :: proc(t: ^Text, s: Spot) -> u32 {
 	return no
 }
 
+// ---------------------------------------------------------------- the tree
+
+@(private)
+run_find :: proc(t: ^Text, s: Spot) -> u32 {
+	no, _ := text_find(t, s)
+	return t.spans[no].run
+}
+
+@(private)
+text_depth :: proc(t: ^Text, s: Spot) -> u32 {
+	if s.piece == 0 {
+		return 0
+	}
+	r := &t.runs[run_find(t, s)]
+	return r.depth + s.offset - r.offset
+}
+
+// Steps taken in finding places, which tests count.
+@(private, thread_local)
+text_steps: int
+
+// What an element hangs beneath at a depth no greater than its own. A few steps, however deep it is.
+@(private)
+text_ancestor :: proc(t: ^Text, s: Spot, depth: u32) -> Spot {
+	if depth == 0 {
+		return {}
+	}
+	r := run_find(t, s)
+	for t.runs[r].depth > depth {
+		when ODIN_TEST {
+			text_steps += 1
+		}
+		j := t.runs[r].jump
+		r = j if j != NONE && t.runs[j].depth > depth else t.runs[r].up
+	}
+	x := &t.runs[r]
+	return {x.piece, x.offset + depth - x.depth}
+}
+
+// Whether one element hangs beneath another, however far down; everything hangs beneath the start, and nothing
+// beneath the end.
+@(private)
+text_below :: proc(t: ^Text, x, a: Spot) -> bool {
+	if x.piece == 0 {
+		return false
+	}
+	if a.piece == 0 {
+		return true
+	}
+	dx, da := text_depth(t, x), text_depth(t, a)
+	return dx > da && text_ancestor(t, x, da) == a
+}
+
+@(private)
+first_span :: proc(t: ^Text) -> u32 {
+	return t.blocks[0].items[0] if len(t.blocks) > 0 else NONE
+}
+
+// Which way a span stands to an insertion among the siblings it will have.
+@(private)
+Probe :: struct {
+	parent: Spot,
+	depth:  u32, // of the parent
+	key:    Spot, // the first element of what is inserted
+	right:  bool, // the side it goes on
+}
+
+// Whether a span is beneath the parent, beneath a sibling that comes before what is inserted on the right, or after it
+// on the left. A span is of one run, and hangs where its first element does. Going away from the parent such spans come
+// first, and then none: the siblings come in order, and what is beneath each is all in one stretch.
+@(private)
+probe :: proc(t: ^Text, no: u32, q: ^Probe) -> bool {
+	when ODIN_TEST {
+		text_steps += 1
+	}
+	e := t.spans[no].id
+	if !text_below(t, e, q.parent) {
+		return false
+	}
+	c := text_ancestor(t, e, q.depth + 1)
+	return text_key_less(t, c, q.key) if q.right else text_key_less(t, q.key, c)
+}
+
+// The first span from one on of which the probe is false, or NONE: by doubling and halving, in a few steps however far.
+@(private)
+seek_forward :: proc(t: ^Text, i: u32, q: ^Probe) -> u32 {
+	if i == NONE || !probe(t, i, q) {
+		return i
+	}
+	b := t.spans[i].block
+	x := b
+	lo, hi := span_index(b, i), b.count - 1
+	if probe(t, b.items[hi], q) {
+		at, step := b.at, 1
+		for at + step < len(t.blocks) && probe(t, t.blocks[at + step].items[t.blocks[at + step].count - 1], q) {
+			at += step
+			step *= 2
+		}
+		top := min(at + step, len(t.blocks))
+		for top - at > 1 {
+			mid := (at + top) / 2
+			if probe(t, t.blocks[mid].items[t.blocks[mid].count - 1], q) {
+				at = mid
+			} else {
+				top = mid
+			}
+		}
+		if top == len(t.blocks) {
+			return NONE
+		}
+		x = t.blocks[top]
+		lo, hi = -1, x.count - 1
+	}
+	for hi - lo > 1 {
+		mid := (lo + hi) / 2
+		if probe(t, x.items[mid], q) {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return x.items[hi]
+}
+
+// The last span from one back of which the probe is false, or NONE.
+@(private)
+seek_back :: proc(t: ^Text, i: u32, q: ^Probe) -> u32 {
+	if i == NONE || !probe(t, i, q) {
+		return i
+	}
+	b := t.spans[i].block
+	x := b
+	lo, hi := 0, span_index(b, i)
+	if probe(t, b.items[0], q) {
+		at, step := b.at, 1
+		for at - step >= 0 && probe(t, t.blocks[at - step].items[0], q) {
+			at -= step
+			step *= 2
+		}
+		bottom := max(at - step, -1)
+		for at - bottom > 1 {
+			mid := (at + bottom) / 2
+			if probe(t, t.blocks[mid].items[0], q) {
+				at = mid
+			} else {
+				bottom = mid
+			}
+		}
+		if bottom == -1 {
+			return NONE
+		}
+		x = t.blocks[bottom]
+		lo, hi = 0, x.count
+	}
+	for hi - lo > 1 {
+		mid := (lo + hi) / 2
+		if probe(t, x.items[mid], q) {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return x.items[lo]
+}
+
+// Siblings go by piece and then by number.
+@(private)
+text_key_less :: proc(t: ^Text, a, b: Spot) -> bool {
+	ia, ib := t.pieces[a.piece].id, t.pieces[b.piece].id
+	return ia < ib || (ia == ib && a.offset < b.offset)
+}
+
 @(private)
 text_insert_run :: proc(t: ^Text, piece: u32, bytes: []byte, left, right: Spot) {
 	p := &t.pieces[piece]
+	first := Spot{piece, p.count}
 	run := Span {
-		id    = {piece, p.count},
+		id    = first,
 		len   = u32(len(bytes)),
 		at    = u32(len(t.data)),
-		left  = left,
-		right = right,
 		marks = {.New} if t.follow else {},
 	}
 	append(&t.data, ..bytes)
 	p.count += run.len
 	p.last = right
-	id := p.id
 
-	r := text_right(t, right)
-	l := text_left(t, left) // after, for a writer who minds nothing may say that the one is before the other
-	START, END :: -1, max(int)
-	lp := START if l == NONE else span_place(t, l)
-	rp := END if r == NONE else span_place(t, r)
-	i: u32
-	if l == NONE {
-		i = t.blocks[0].items[0] if len(t.blocks) > 0 else NONE
-	} else {
-		i = span_next(t, l)
-	}
-	before := i
-	scanning := false
-	for ;; i = span_next(t, i) {
-		if !scanning {
-			before = i
-		}
-		if i == NONE || i == r {
-			break
-		}
-		o := t.spans[i]
-		ol, or := START, END
-		if o.left.piece != 0 {
-			at, _ := text_find(t, o.left)
-			ol = span_place(t, at)
-		}
-		if o.right.piece != 0 {
-			at, _ := text_find(t, o.right)
-			or = span_place(t, at)
-		}
-		same_left := o.left == left
-		if ol < lp || (ol == lp && !same_left) {
-			break
-		}
-		if same_left {
-			if o.right == right && id < t.pieces[o.piece].id {
-				break
+	// Beneath the right neighbour if that is beneath the left, and otherwise beneath the left.
+	under := text_below(t, right, left) && right != left
+	parent := right if under else left
+	side := !under
+	if !(side && parent == {piece, first.offset - 1}) {
+		up := run_find(t, parent) if parent.piece != 0 else NONE
+		x := Run{id = first, parent = parent, right = side, depth = text_depth(t, parent) + 1, up = up, jump = up}
+		// Myers' jump pointers: the jumps of a path double and merge.
+		if up != NONE {
+			x.hops = t.runs[up].hops + 1
+			if j := t.runs[up].jump; j != NONE {
+				jj := t.runs[j].jump
+				if t.runs[up].hops - t.runs[j].hops == t.runs[j].hops - (t.runs[jj].hops if jj != NONE else 0) {
+					x.jump = jj
+				}
 			}
-			scanning = or < rp
+		} else {
+			x.hops = 1
 		}
+		append(&t.runs, x)
+		run.run = u32(len(t.runs) - 1)
+	} else {
+		run.run = run_find(t, parent)
 	}
-	// A run that continues the one before it, in the document and in memory, joins it.
+
+	// Among its siblings, each with all that hangs beneath it: on the right, after the parent; on the left, before it.
+	q := Probe{parent, text_depth(t, parent), first, side}
+	before: u32
+	if side {
+		l := text_left(t, parent)
+		before = seek_forward(t, span_next(t, l) if l != NONE else first_span(t), &q)
+	} else {
+		i := seek_back(t, span_prev(t, text_right(t, parent)), &q)
+		before = span_next(t, i) if i != NONE else first_span(t)
+	}
+	// A run that continues the one before it, in the tree, the document and memory, joins it.
 	if at := span_prev(t, before); at != NONE {
 		b := &t.spans[at]
-		if b.piece == piece && b.offset + b.len == run.offset && left == {piece, run.offset - 1} && b.right == right && b.at + b.len == run.at && b.marks == run.marks {
+		if side && parent == {piece, first.offset - 1} && b.piece == piece && b.offset + b.len == first.offset && b.at + b.len == run.at && b.marks == run.marks {
 			b.len += run.len
 			b.block.visible += int(run.len)
 			t.visible += int(run.len)

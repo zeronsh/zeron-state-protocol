@@ -184,8 +184,8 @@ texts :: proc() {
 			}
 		}
 		if doc % 3 == 0 {
-			// Pieces by someone who minds nothing: neighbours in any order, and of any piece. What they come to
-			// may turn on the order they come in, and is the same for the same.
+			// Pieces by someone who minds nothing: neighbours in any order, and of any piece. They come to the
+			// same in any order.
 			ids: [dynamic]u64
 			for c in all {
 				append(&ids, zsp.get_u64(c.body))
@@ -220,6 +220,39 @@ texts :: proc() {
 				append(&ids, id)
 			}
 		}
+		if doc == DOCS - 1 {
+			// And a tree as deep and as wide as someone cares to make it: each before the last, or after the first.
+			clear(&all)
+			first, last: u64
+			for i in 0 ..< 400 {
+				clock += 1
+				id := rand.uint64() | 1
+				w: [dynamic]byte
+				zsp.write_u64(&w, id)
+				append(&w, 1)
+				ref :: proc(w: ^[dynamic]byte, id: u64) {
+					append(w, 2)
+					zsp.write_u64(w, id)
+					zsp.write_varint(w, 0)
+				}
+				switch {
+				case i == 0:
+					append(&w, 0, 0)
+					first = id
+				case i % 2 == 0:
+					append(&w, 0)
+					ref(&w, last)
+				case:
+					ref(&w, first)
+					append(&w, 0)
+				}
+				zsp.write_bytes(&w, {'a' + byte(rand.int_max(26))})
+				append(&all, zsp.Cell{{1, 1}, zsp.DATA, .Piece, {clock, rand.uint64()}, w[:]})
+				if i % 2 == 0 {
+					last = id
+				}
+			}
+		}
 		if doc % 2 == 0 && len(all) > 4 {
 			n := len(all) / 2
 			bundle := zsp.text_bundle(all[:n])
@@ -241,7 +274,7 @@ texts :: proc() {
 			zsp.put_u64(s[8:], c.stamp.salt)
 			fmt.printf(`%s{{"kind": %d, "stamp": "%s", "body": "%s"}}`, ", " if i > 0 else "", int(c.kind), h(s[:]), h(c.body))
 		}
-		fmt.printfln(`], "ordered": %v, "text": "%s"}}%s`, doc % 3 == 0, string(w[:]), "," if doc + 1 < DOCS else "")
+		fmt.printfln(`], "text": "%s"}}%s`, string(w[:]), "," if doc + 1 < DOCS else "")
 	}
 	fmt.println("  ],")
 }

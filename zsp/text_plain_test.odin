@@ -11,8 +11,8 @@ package zsp
 // is sealed into a cell, whatever was already integrated is skipped. A text is a pure function of the
 // set of pieces in its slot, plus at most one Value beneath them.
 //
-// Placement is YjsMod/FugueMax: each run remembers its neighbours at birth, so concurrent runs never
-// interleave.
+// Placement is Fugue's: each element hangs in a tree by what its operation says, and the text is the tree read in
+// order. Here an element at a time, and every ancestor by walking up to it.
 
 Plain_Ref :: struct {
 	piece:  u64, // zero for the edge of the document
@@ -33,8 +33,6 @@ Plain_Span :: struct {
 	id:   Plain_Ref, // of its first byte; the rest follow
 	len:  u32,
 	at:   u32, // in Plain_Text.data
-	left: Plain_Ref, // neighbours of its first byte, when it was typed
-	right: Plain_Ref,
 	dead: bool,
 }
 
@@ -45,10 +43,16 @@ Plain_Text :: struct {
 	waiting: [dynamic]Plain_Waiting, // pieces whose references have not arrived
 	base:    Stamp, // of the Value beneath
 	hint:    int, // a span near the last one touched
+	under:   map[Plain_Ref]Plain_Under, // what each element hangs beneath
 	// The piece being written here.
 	open:    u64,
 	ops:     [dynamic]byte,
 	flushed: int,
+}
+
+Plain_Under :: struct {
+	parent: Plain_Ref,
+	right:  bool,
 }
 
 Plain_Piece :: struct {
@@ -78,6 +82,7 @@ plain_text_destroy :: proc(t: ^Plain_Text) {
 	}
 	delete(t.waiting)
 	delete(t.ops)
+	delete(t.under)
 	t^ = {}
 }
 
@@ -324,7 +329,6 @@ plain_text_split :: proc(t: ^Plain_Text, i: int, n: u32) {
 	tail.id.offset += n
 	tail.len -= n
 	tail.at += n
-	tail.left = {s.id.piece, s.id.offset + n - 1}
 	t.spans[i].len = n
 	inject_at(&t.spans, i + 1, tail)
 }
@@ -354,58 +358,106 @@ plain_text_right :: proc(t: ^Plain_Text, ref: Plain_Ref) -> int {
 	return i
 }
 
+// Whether one element hangs beneath another, however far down.
+@(private)
+plain_below :: proc(t: ^Plain_Text, x, a: Plain_Ref) -> bool {
+	if x.piece == 0 {
+		return false
+	}
+	if a.piece == 0 {
+		return true
+	}
+	for at := x; at.piece != 0; {
+		at = t.under[at].parent
+		if at == a {
+			return true
+		}
+	}
+	return false
+}
+
+// What hangs beneath an element and has another beneath it, or is it.
+@(private)
+plain_child :: proc(t: ^Plain_Text, x, a: Plain_Ref) -> Plain_Ref {
+	at := x
+	for t.under[at].parent != a {
+		at = t.under[at].parent
+	}
+	return at
+}
+
 @(private)
 plain_text_insert_run :: proc(t: ^Plain_Text, id: u64, bytes: []byte, left, right: Plain_Ref) {
 	p := t.pieces[id]
 	run := Plain_Span {
-		id    = {id, p.count},
-		len   = u32(len(bytes)),
-		at    = u32(len(t.data)),
-		left  = left,
-		right = right,
+		id  = {id, p.count},
+		len = u32(len(bytes)),
+		at  = u32(len(t.data)),
 	}
 	append(&t.data, ..bytes)
 	p.count += run.len
 	p.last = right
 	t.pieces[id] = p
-
-	l := plain_text_left(t, left)
-	r := plain_text_right(t, right)
-	l = plain_text_left(t, left) // what was split may have been before it
-	at := l + 1
-	scanning := false
-	for i := at;; i += 1 {
-		if !scanning {
-			at = i
-		}
-		if i >= len(t.spans) || i == r {
-			break
-		}
-		o := t.spans[i]
-		ol := -1 if o.left.piece == 0 else plain_text_find(t, o.left)
-		or := len(t.spans) if o.right.piece == 0 else plain_text_find(t, o.right)
-		same_left := o.left == left
-		if ol < l || (ol == l && !same_left) {
-			break
-		}
-		if same_left {
-			if o.right == right && id < o.id.piece {
+	under := plain_below(t, right, left) && right != left
+	parent := right if under else left
+	for i in 0 ..< run.len {
+		t.under[{id, run.id.offset + i}] = {parent, !under} if i == 0 else {{id, run.id.offset + i - 1}, true}
+	}
+	less :: proc(a, b: Plain_Ref) -> bool {
+		return a.piece < b.piece || (a.piece == b.piece && a.offset < b.offset)
+	}
+	element :: proc(t: ^Plain_Text, span, at: int) -> Plain_Ref {
+		return {t.spans[span].id.piece, t.spans[span].id.offset + u32(at)}
+	}
+	// Where it goes: before an element, as a span and an offset into it.
+	span, at := len(t.spans), 0
+	if under {
+		// Going back from the parent: past its left children that come after it, each with all beneath it.
+		span = plain_text_right(t, parent)
+		for {
+			ps, pa := span, at - 1
+			if pa < 0 {
+				ps -= 1
+				if ps < 0 {
+					break
+				}
+				pa = int(t.spans[ps].len) - 1
+			}
+			e := element(t, ps, pa)
+			if !plain_below(t, e, parent) || less(plain_child(t, e, parent), run.id) {
 				break
 			}
-			scanning = or < r
+			span, at = ps, pa
+		}
+	} else {
+		// Going on from the parent: past its right children that come before it.
+		span = plain_text_left(t, parent) + 1
+		for span < len(t.spans) {
+			e := element(t, span, at)
+			if !plain_below(t, e, parent) || less(run.id, plain_child(t, e, parent)) {
+				break
+			}
+			at += 1
+			if at == int(t.spans[span].len) {
+				span, at = span + 1, 0
+			}
 		}
 	}
-	// A run that continues the one before it, in the document and in memory, joins it.
 	if at > 0 {
-		b := &t.spans[at - 1]
-		if b.id.piece == id && b.id.offset + b.len == run.id.offset && left == {id, run.id.offset - 1} && b.right == right && b.at + b.len == run.at && !b.dead {
+		plain_text_split(t, span, u32(at))
+		span += 1
+	}
+	// A run that continues the one before it, in the tree, the document and in memory, joins it.
+	if span > 0 {
+		b := &t.spans[span - 1]
+		if !under && parent == {id, run.id.offset - 1} && b.id.piece == id && b.id.offset + b.len == run.id.offset && b.at + b.len == run.at && !b.dead {
 			b.len += run.len
-			t.hint = at - 1
+			t.hint = span - 1
 			return
 		}
 	}
-	inject_at(&t.spans, at, run)
-	t.hint = at
+	inject_at(&t.spans, span, run)
+	t.hint = span
 }
 
 @(private)

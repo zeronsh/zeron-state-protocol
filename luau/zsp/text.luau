@@ -12,11 +12,20 @@ type Span = {
 	offset: number,
 	len: number,
 	parts: { string },
-	lpiece: string,
-	loffset: number,
-	rpiece: string,
-	roffset: number,
 	dead: boolean,
+}
+
+-- Elements made at once: the first hangs beneath what its operation says, and each of the rest beneath the one before.
+type Run = {
+	piece: string,
+	offset: number, -- of its first element; it lasts until the piece's next run
+	ppiece: string, -- what the first hangs beneath: "" for the start of the document
+	poffset: number,
+	right: boolean,
+	depth: number,
+	hops: number,
+	up: Run?,
+	jump: Run?,
 }
 
 type Piece = {
@@ -26,6 +35,7 @@ type Piece = {
 	fed: number,
 	stamp: string, -- "" while only live
 	shown: string, -- what was consumed while only live, to hold the sealed piece to
+	runs: { Run },
 }
 
 export type Text = {
@@ -66,7 +76,7 @@ end
 local function piece_of(t: Text, id: string): Piece
 	local p = t.pieces[id]
 	if not p then
-		p = { count = 0, rpiece = "", roffset = 0, fed = 0, stamp = "", shown = "" }
+		p = { count = 0, rpiece = "", roffset = 0, fed = 0, stamp = "", shown = "", runs = {} }
 		t.pieces[id] = p
 	end
 	return p
@@ -115,10 +125,6 @@ local function split(t: Text, i: number, n: number)
 		offset = s.offset + n,
 		len = s.len - n,
 		parts = { string.sub(body, n + 1) },
-		lpiece = s.piece,
-		loffset = s.offset + n - 1,
-		rpiece = s.rpiece,
-		roffset = s.roffset,
 		dead = s.dead,
 	})
 	s.parts = { string.sub(body, 1, n) }
@@ -149,6 +155,128 @@ local function right_of(t: Text, piece: string, offset: number): number
 	return i
 end
 
+-- ---------------------------------------------------------------- the tree
+
+local function run_of(t: Text, piece: string, offset: number): Run
+	local runs = (t.pieces[piece] :: Piece).runs
+	local lo, hi = 1, #runs
+	while lo < hi do
+		local mid = (lo + hi + 1) // 2
+		if runs[mid].offset <= offset then
+			lo = mid
+		else
+			hi = mid - 1
+		end
+	end
+	return runs[lo]
+end
+
+local function depth_of(t: Text, piece: string, offset: number): number
+	if piece == "" then
+		return 0
+	end
+	local r = run_of(t, piece, offset)
+	return r.depth + offset - r.offset
+end
+
+local steps = 0 -- taken in finding places, which tests count
+
+-- What an element hangs beneath at a depth no greater than its own, in a few steps however deep.
+local function ancestor(t: Text, piece: string, offset: number, depth: number): (string, number)
+	if depth == 0 then
+		return "", 0
+	end
+	local r = run_of(t, piece, offset)
+	while r.depth > depth do
+		steps += 1
+		local j = r.jump
+		r = if j and j.depth > depth then j else r.up :: Run
+	end
+	return r.piece, r.offset + depth - r.depth
+end
+
+-- Whether one element hangs beneath another; everything beneath the start, and nothing beneath the end.
+local function below(t: Text, xp: string, xo: number, ap: string, ao: number): boolean
+	if xp == "" then
+		return false
+	elseif ap == "" then
+		return true
+	end
+	local dx, da = depth_of(t, xp, xo), depth_of(t, ap, ao)
+	if dx <= da then
+		return false
+	end
+	local p, o = ancestor(t, xp, xo, da)
+	return p == ap and o == ao
+end
+
+-- Siblings go by piece and then by number.
+local function key_less(ap: string, ao: number, bp: string, bo: number): boolean
+	return ap < bp or (ap == bp and ao < bo)
+end
+
+type Probe = { piece: string, offset: number, depth: number, kpiece: string, koffset: number, right: boolean }
+
+-- Whether a span hangs beneath the parent, beneath a sibling before what is inserted on the right, or after it on the
+-- left. Going away from the parent such spans come first, and then none.
+local function probe(t: Text, i: number, q: Probe): boolean
+	steps += 1
+	local s = t.spans[i]
+	if not below(t, s.piece, s.offset, q.piece, q.offset) then
+		return false
+	end
+	local cp, co = ancestor(t, s.piece, s.offset, q.depth + 1)
+	if q.right then
+		return key_less(cp, co, q.kpiece, q.koffset)
+	end
+	return key_less(q.kpiece, q.koffset, cp, co)
+end
+
+-- The first index from i on of which the probe is false (or one past the last), by doubling and halving.
+local function seek_forward(t: Text, i: number, q: Probe): number
+	local n = #t.spans
+	if i > n or not probe(t, i, q) then
+		return i
+	end
+	local lo, step = i, 1
+	while lo + step <= n and probe(t, lo + step, q) do
+		lo += step
+		step *= 2
+	end
+	local hi = math.min(lo + step, n + 1)
+	while hi - lo > 1 do
+		local mid = (lo + hi) // 2
+		if probe(t, mid, q) then
+			lo = mid
+		else
+			hi = mid
+		end
+	end
+	return hi
+end
+
+-- The last index from i back of which the probe is false, or 0.
+local function seek_back(t: Text, i: number, q: Probe): number
+	if i < 1 or not probe(t, i, q) then
+		return i
+	end
+	local hi, step = i, 1
+	while hi - step >= 1 and probe(t, hi - step, q) do
+		hi -= step
+		step *= 2
+	end
+	local lo = math.max(hi - step, 0)
+	while hi - lo > 1 do
+		local mid = (lo + hi) // 2
+		if probe(t, mid, q) then
+			hi = mid
+		else
+			lo = mid
+		end
+	end
+	return lo
+end
+
 local function insert_run(t: Text, id: string, bytes: string, lpiece: string, loffset: number, rpiece: string, roffset: number)
 	t.cache = nil
 	local p = piece_of(t, id)
@@ -156,64 +284,48 @@ local function insert_run(t: Text, id: string, bytes: string, lpiece: string, lo
 	p.count += #bytes
 	p.rpiece, p.roffset = rpiece, roffset
 
-	left_of(t, lpiece, loffset)
-	local r = right_of(t, rpiece, roffset)
-	local l = left_of(t, lpiece, loffset) -- again, for what was split may have been before it
-	local spans = t.spans
-	local at = l + 1
-	local scanning = false
-	local i = at
-	while true do
-		if not scanning then
-			at = i
-		end
-		if i > #spans or i == r then
-			break
-		end
-		local o = spans[i]
-		local ol = if o.lpiece == "" then 0 else find(t, o.lpiece, o.loffset)
-		local same_left = o.lpiece == lpiece and (lpiece == "" or o.loffset == loffset)
-		if ol < l or (ol == l and not same_left) then
-			break
-		end
-		if same_left then
-			local same_right = o.rpiece == rpiece and (rpiece == "" or o.roffset == roffset)
-			if same_right and id < o.piece then
-				break
-			end
-			local rr = if o.rpiece == "" then #spans + 1 else find(t, o.rpiece, o.roffset)
-			scanning = rr < r
-		end
-		i += 1
+	-- Beneath the right neighbour if that is beneath the left, and otherwise beneath the left.
+	local under = below(t, rpiece, roffset, lpiece, loffset)
+	local ppiece, poffset = lpiece, loffset
+	if under then
+		ppiece, poffset = rpiece, roffset
 	end
-	if at > 1 then
+	local chain = not under and ppiece == id and poffset == offset - 1
+	if not chain then
+		local up = if ppiece ~= "" then run_of(t, ppiece, poffset) else nil
+		local run: Run = { piece = id, offset = offset, ppiece = ppiece, poffset = poffset, right = not under, depth = depth_of(t, ppiece, poffset) + 1, hops = 1, up = up, jump = up }
+		if up then
+			run.hops = up.hops + 1
+			local j = up.jump
+			if j then
+				local jj = j.jump
+				if up.hops - j.hops == j.hops - (if jj then jj.hops else 0) then
+					run.jump = jj
+				end
+			end
+		end
+		table.insert(p.runs, run)
+	end
+
+	-- Among its siblings, each with all beneath it: on the right, after the parent; on the left, before it.
+	local q: Probe = { piece = ppiece, offset = poffset, depth = depth_of(t, ppiece, poffset), kpiece = id, koffset = offset, right = not under }
+	local at
+	if under then
+		at = seek_back(t, right_of(t, ppiece, poffset) - 1, q) + 1
+	else
+		at = seek_forward(t, left_of(t, ppiece, poffset) + 1, q)
+	end
+	local spans = t.spans
+	if at > 1 and chain then
 		local b = spans[at - 1]
-		if
-			b.piece == id
-			and b.offset + b.len == offset
-			and lpiece == id
-			and loffset == offset - 1
-			and b.rpiece == rpiece
-			and b.roffset == roffset
-			and not b.dead
-		then
+		if b.piece == id and b.offset + b.len == offset and not b.dead then
 			table.insert(b.parts, bytes)
 			b.len += #bytes
 			t.hint = at - 1
 			return
 		end
 	end
-	table.insert(spans, at, {
-		piece = id,
-		offset = offset,
-		len = #bytes,
-		parts = { bytes },
-		lpiece = lpiece,
-		loffset = loffset,
-		rpiece = rpiece,
-		roffset = roffset,
-		dead = false,
-	})
+	table.insert(spans, at, { piece = id, offset = offset, len = #bytes, parts = { bytes }, dead = false })
 	t.hint = at
 end
 
@@ -563,6 +675,11 @@ function text.close(t: Text, stamp: string): string?
 	t.size = 0
 	t.flushed = 0
 	return out
+end
+
+-- Steps taken so far in finding places: for tests.
+function text.steps(): number
+	return steps
 end
 
 return table.freeze(text)

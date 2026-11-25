@@ -213,12 +213,17 @@ inserts its body into an empty text.
 ref = 0 (the edge) | 1 offset varint (this piece) | 2 piece (8) offset varint
 ```
 
-`left` and `right` are the neighbours, deleted ones included, at the moment of typing. An insertion is placed by YjsMod / FugueMax:
-walk from just after `left`; stop at `right`; on meeting an element *o* whose own left is before `left`, stop; on meeting one with
-the same left, stop if its right is also the same and this piece's id is less than *o*'s, and otherwise remember to skip on if *o*'s
-right is before `right`; place at the last position not skipped. Operations apply in order within a piece; one that refers to what is
-not yet present waits, with the rest of its piece, until it is. (Two open pieces may refer to each other, so pieces are never
-applied all-or-nothing.)
+`left` and `right` are the neighbours, deleted ones included, at the moment of typing. Every element hangs in a tree whose root is the start
+of the document, by what its own operation says and nothing else (Fugue). The first element of an insertion hangs on the left of `right` if `right` is an
+element, other than `left`, that hangs beneath `left`, however far down (everything hangs beneath the start); and otherwise on the right of `left`.
+Each further element hangs on the right of the one before it. The text is the tree read in order: for each element, what hangs on its left, then itself,
+then what hangs on its right; what hangs on one side, each with all beneath it, in order of piece id and then of number. Whatever anyone says of
+neighbours, then, the text is a function of the set of pieces alone, and where they were honest the insertion is where it was typed. Operations apply in
+order within a piece; one that refers to what is not yet present waits, with the rest of its piece, until it is. (Two open pieces may refer to each
+other, so pieces are never applied all-or-nothing.)
+
+Nobody need walk the tree: siblings, each with all beneath it, lie one stretch after another, so a place is found by halving; and an ancestor at any
+depth is a few steps away by jump pointers (Myers). So here an insertion costs a few logarithms of the text's length, however its writers shaped it.
 
 A long text need not be a great many cells: whoever may write a piece may bundle it, at any time and however often, and nothing about the text is changed by it. (Here a node that has just written a piece bundles those
 that are loose once there are 128, and bundles of about a size once there are 16; in a signed scope its own, and those of one `as`, so that whose they are stands; with a stamp just after the last of them.)

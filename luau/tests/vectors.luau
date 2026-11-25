@@ -39,7 +39,7 @@ for _, v in vectors.lists do
 end
 
 for i, v in vectors.texts do
-	for round = 1, if v.ordered then 1 else 6 do
+	for round = 1, 6 do -- in any order: the text is of the cells alone
 		local cells = table.clone(v.cells)
 		if round > 1 then
 			for j = #cells, 2, -1 do
@@ -110,4 +110,37 @@ for seed = 1, 60 do
 		assert(#t.waiting == 0 and text.read(t) == text.read(writers[1]), `seed {seed}`)
 	end
 end
+-- However deep or wide someone makes a text, a place in it is found in a few steps.
+do
+	local t = text.new()
+	local ids: { string } = {}
+	local took = { 0, 0 }
+	local N = 12000
+	for i = 1, N do
+		local id = random()
+		local function ref(of: string): string
+			return "\2" .. of .. "\0"
+		end
+		local where
+		if i == 1 then
+			where = "\0\0"
+		elseif i % 3 == 0 then
+			where = "\0" .. ref(ids[#ids - 2] or ids[1])
+		elseif i % 3 == 1 then
+			where = ref(ids[1]) .. "\0"
+		else
+			where = ref(ids[math.random(#ids)]) .. ref(ids[math.random(#ids)])
+		end
+		local before = text.steps()
+		assert(text.apply(t, 4, codec.u64(i) .. random(), id .. "\1" .. where .. "\1x") == "changed")
+		if i <= 1000 then
+			took[1] += text.steps() - before
+		elseif i > N - 1000 then
+			took[2] += text.steps() - before
+		end
+		table.insert(ids, id)
+	end
+	assert(took[2] < 3 * took[1], `the last took {took[2]} steps, the first {took[1]}`)
+end
+
 print("ok")
