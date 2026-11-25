@@ -101,12 +101,12 @@ udp_open :: proc(h: ^Host, port: int) -> bool {
 			when ODIN_OS != .Windows {
 				net.set_option(u.beacon, .Reuse_Port, true)
 			}
-			if net.bind(u.beacon, {net.IP4_Any, BEACON_PORT}) == nil {
+			if berr := net.bind(u.beacon, {net.IP4_Any, BEACON_PORT}); berr == nil {
 				net.set_blocking(u.beacon, false)
 				u.have_beacon = true
 				udp_listen(h, u.beacon)
 			} else {
-				report(.Debug, "cannot listen for those nearby")
+				report(.Debug, "cannot listen for those nearby: ", fmt.tprint(berr))
 				net.close(u.beacon)
 			}
 		}

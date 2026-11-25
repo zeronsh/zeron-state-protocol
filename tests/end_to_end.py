@@ -207,7 +207,7 @@ def probe_broadcast():
     for i, s in enumerate(listeners):
         while select.select([s], [], [], 0)[0]:
             print("probe listener", i, s.recvfrom(100))
-    print(subprocess.run("ifconfig; netstat -rn -f inet; sw_vers", shell=True, capture_output=True, text=True).stdout)
+    print(subprocess.run("ps ax | grep -c zspd; lsof -nP -iUDP:9083; sudo lsof -nP -iUDP:9083; netstat -an -p udp | grep 908", shell=True, capture_output=True, text=True).stdout)
 
 
 def test_lan_without_relay():
