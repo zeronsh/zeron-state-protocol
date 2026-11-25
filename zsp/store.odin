@@ -842,18 +842,16 @@ evacuate :: proc(s: ^Store) -> []u64 {
 	return victims[:]
 }
 
-when ODIN_TEST {
-	// Loses rows, as when where their cells lay cannot be read. For tests.
-	store_lose :: proc(s: ^Store, rows: []Id) {
-		lost := make([dynamic]Leaf, context.temp_allocator)
-		for row in rows {
-			scan := tree_scan(s, s.cells, {row[0], row[1], 0, 0, 0}, {row[0], row[1], max(u64), max(u64), max(u64)})
-			for leaf in tree_next(&scan) {
-				append(&lost, leaf)
-			}
+// Loses rows, as when where their cells lay cannot be read: to see what is made of that.
+store_lose :: proc(s: ^Store, rows: []Id) {
+	lost := make([dynamic]Leaf, context.temp_allocator)
+	for row in rows {
+		scan := tree_scan(s, s.cells, {row[0], row[1], 0, 0, 0}, {row[0], row[1], max(u64), max(u64), max(u64)})
+		for leaf in tree_next(&scan) {
+			append(&lost, leaf)
 		}
-		forget(s, lost[:])
 	}
+	forget(s, lost[:])
 }
 
 // Unholds cells, as though they had never come. Where they lay is not read: it may be unreadable.
