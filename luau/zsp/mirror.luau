@@ -1,4 +1,6 @@
 --!strict
+--!native
+--!optimize 2
 -- Structured state as plain tables: maps, lists, records and trees, nested as deep as wanted, and texts in them. What
 -- an application sets is compared with what there was, and only what differs is written; what others write comes back
 -- as new tables where something changed and the very same ones where nothing did. See docs/mirror.md.
@@ -168,7 +170,8 @@ local function frame(c: Column, v: any): string
 	return codec.string(w)
 end
 
-type Frame = { value: any, first: string, count: number }
+-- A value's elements: as one run, which is how anyone who minds writes it; or, as a forger may, scattered, each named.
+type Frame = { value: any, first: string, count: number, last: string, scattered: { string }? }
 
 -- The values of a list from its text, with where each is. What does not read as one is not.
 local function frames_of(c: Column, t: text.Text?): ({ any }, { Frame }, { string })
@@ -193,8 +196,16 @@ local function frames_of(c: Column, t: text.Text?): ({ any }, { Frame }, { strin
 		end
 		local fine, v = pcall(c.decode, string.sub(bytes, at + used, at + used + n - 1))
 		if fine and v ~= nil then
+			local count = used + n
+			local scattered: { string }? = nil
+			for k = 1, count - 1 do
+				if ids[at + k] ~= next_marker(ids[at], k) then
+					scattered = table.move(ids, at, at + count - 1, 1, {})
+					break
+				end
+			end
 			table.insert(values, v)
-			table.insert(frames, { value = v, first = ids[at], count = used + n })
+			table.insert(frames, { value = v, first = ids[at], count = count, last = ids[at + count - 1], scattered = scattered })
 		else
 			for k = at, at + used + n - 1 do
 				table.insert(junk, ids[k])
@@ -267,6 +278,8 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 	local hangs: { [string]: { [string]: boolean } } = {} -- of each tree node: what says it hangs from it
 	local schema_of: { [string]: Schema } = {} -- of each map row, as last read
 	local tree_up: { [string]: string } = {} -- of each tree node, as last read: the node it hangs from
+	local losing: { [string]: boolean } = {} -- trees with nodes beneath what is not there
+	local standing_in: { [string]: string } = {} -- of each map within a map: where it is, which its id says, row or no row
 	local versions: { [string]: any } = {} -- of each text that keeps an order, as last read
 	local dirty_rows: { [string]: boolean } = {}
 	local moved_in: { [string]: { [string]: any } } = {} -- of each list: what came, went or moved, and from which marker
@@ -335,8 +348,14 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			mark_node(up)
 		end
 		local w = wheres[id]
-		if w then
-			mark_box(key_of(w.owner, w.field), false, id)
+		local box = if w then key_of(w.owner, w.field) else nil
+		if box then
+			mark_box(box, false, id)
+		end
+		-- A map within a map is there whether its own row has come or not, and is where its id says.
+		local within = standing_in[id]
+		if within and within ~= box then
+			mark_box(within, false, id)
 		end
 	end
 
@@ -389,8 +408,11 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 				if members[k] then
 					members[k][id] = nil
 				end
+				-- Where it was when the list was last read, to find it there: true if it was not in it then.
 				moved_in[k] = moved_in[k] or {}
-				moved_in[k][id] = if old.kind == ITEM then old.marker else true -- where it was, to find it there
+				if moved_in[k][id] == nil then
+					moved_in[k][id] = if old.kind == ITEM then old.marker else true
+				end
 				if old.kind == ITEM and (not w or w.marker ~= old.marker) then
 					-- A marker no longer anyone's, if it is still there: let go of when the list is next written.
 					local box = boxes[k]
@@ -411,7 +433,9 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 				owned[w.owner] = owned[w.owner] or {}
 				owned[w.owner][k] = true
 				moved_in[k] = moved_in[k] or {}
-				moved_in[k][id] = true
+				if moved_in[k][id] == nil then
+					moved_in[k][id] = true
+				end
 				mark_box(k, true)
 			end
 			mark_node(id)
@@ -586,6 +610,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		if b.kind == "map" then
 			local id = derive(owner, field)
 			standing[id] = true
+			standing_in[id] = key
 			local out = build_map(b, id)
 			boxes[key] = { out = out }
 			return out
@@ -630,6 +655,8 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					local function at_of(id: string, was: any): number?
 						if index then
 							return index[id]
+						elseif was == true then
+							return nil -- it was not in the list as last read
 						end
 						if type(was) == "string" and t then
 							local lw, ow = text.position(t :: any, was)
@@ -680,6 +707,8 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 						table.remove(parts, at)
 					end
 					hidden = {}
+					-- Where each put back is, so long as they are few enough to keep count of as more go in.
+					local put: { number }? = {}
 					for id in redo do
 						if mine[id] and alive(id) then
 							if pos(id) then
@@ -694,6 +723,18 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 								end
 								table.insert(new_ids, lo, id)
 								table.insert(parts, lo, build_map(b.of, id))
+								if put then
+									if #put >= 64 then
+										put = nil
+									else
+										for i, at in put do
+											if at >= lo then
+												put[i] = at + 1
+											end
+										end
+										table.insert(put, lo)
+									end
+								end
 							else
 								hidden[id] = true
 							end
@@ -718,13 +759,22 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					for id in redo do
 						dups[id] = nil
 					end
-					for i, id in new_ids do
-						if redo[id] then
-							for _, j in { i, i + 1 } do
-								local x, y = new_ids[j - 1], new_ids[j]
-								if x and y and wheres[x] and wheres[y] and wheres[x].marker == wheres[y].marker then
-									dups[y] = true
-								end
+					local function beside(i: number)
+						for j = i, i + 1 do
+							local x, y = new_ids[j - 1], new_ids[j]
+							if x and y and wheres[x] and wheres[y] and wheres[x].marker == wheres[y].marker then
+								dups[y] = true
+							end
+						end
+					end
+					if put then
+						for _, i in put do
+							beside(i)
+						end
+					else
+						for i, id in new_ids do
+							if redo[id] then
+								beside(i)
 							end
 						end
 					end
@@ -847,6 +897,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			local kids = if st then st.kids else {}
 			local up = if st then st.up else {}
 			local sits = if st then st.sits else {}
+			local lost: { [string]: string } = if st then st.lost else {} -- of each node not shown: the node, not there, it is beneath
 			if structural then
 				local here: { [string]: Where } = {}
 				if holds(owner) then
@@ -863,7 +914,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					parent[id] = w.parent
 					marker[id] = w.marker
 				end
-				local ids = {}
+				local ids: { string } = {}
 				for id in here do
 					table.insert(ids, id)
 				end
@@ -872,14 +923,17 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 				while true do
 					local state: { [string]: number } = {} -- 1 on the way up, 2 reaches the top, 3 hangs from nothing
 					local loop: { string }? = nil
+					lost = {}
 					for _, start in ids do
 						local path = {}
 						local at = start
 						local final = 2
+						local missing: string? = nil
 						while at ~= ZERO do
 							local st2 = state[at]
 							if st2 == 2 or st2 == 3 then
 								final = st2
+								missing = lost[at]
 								break
 							elseif st2 == 1 then
 								local cycle, inside = {}, false
@@ -893,6 +947,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 								break
 							elseif not here[at] then
 								final = 3
+								missing = at
 								break
 							end
 							state[at] = 1
@@ -904,6 +959,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 						end
 						for _, p in path do
 							state[p] = final
+							lost[p] = missing
 						end
 					end
 					if not loop then
@@ -1005,7 +1061,8 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 				end
 			end
 			local out = level(ZERO)
-			boxes[key] = { out = out, kids = kids, up = up, sits = sits, levels = fresh_levels, slot = b.slot, tree = true }
+			boxes[key] = { out = out, kids = kids, up = up, sits = sits, lost = lost, levels = fresh_levels, slot = b.slot, tree = true }
+			losing[key] = if next(lost) ~= nil then true else nil
 			return out
 		end
 	end
@@ -1376,14 +1433,21 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 							text.remove(t, id, 1, fresh)
 						end
 						for k = a + 1, #old - z do
-							text.remove(t, frames[k].first, frames[k].count, fresh)
+							local f = frames[k]
+							if f.scattered then
+								for _, id in f.scattered do
+									text.remove(t, id, 1, fresh)
+								end
+							else
+								text.remove(t, f.first, f.count, fresh)
+							end
 						end
 						if #new - a - z > 0 then
 							local parts = {}
 							for k = a + 1, #new - z do
 								table.insert(parts, frame(b.of, new[k]))
 							end
-							local prev = if a > 0 then next_marker(frames[a].first, frames[a].count - 1) else ""
+							local prev = if a > 0 then frames[a].last else ""
 							text.after(t, prev, table.concat(parts), fresh)
 						end
 					end)
@@ -1573,7 +1637,8 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 				change.set(root, writing_of(schema), { [W] = where_encode(ZERO, "", MAP) })
 				change.place(root, list, 0)
 			end
-			write_map(schema, if exists then current else nil, state, root, not exists)
+			-- What is in the document is there whether its own row is or not, so what is written is what differs from that.
+			write_map(schema, current, state, root, not exists)
 			-- What others put in keys that were being let go of meanwhile goes too; but not a map within it, which
 			-- is that key's for ever, and only emptied.
 			local function empty(id: string)
@@ -1602,7 +1667,16 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					delete_row(m)
 				end
 			end
-
+			-- And what is beneath a deleted node only where loops are undone, which shows nowhere and never will. What is
+			-- beneath a node that has not come yet waits for it.
+			for key in losing do
+				local st = boxes[key]
+				for id, missing in if st and st.lost then st.lost else {} do
+					if dead_rows[missing] then
+						delete_row(id)
+					end
+				end
+			end
 		end)
 		refresh()
 	end
@@ -1611,8 +1685,9 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 
 	-- A draft is the state as it is, until something in it is changed: then that, and what leads to it, is copied.
 	-- So what was not changed is the very same table, and costs nothing to write.
-	local origin: { [any]: any } = setmetatable({}, { __mode = "k" }) :: any -- of each draft: what it is a draft of
-	local written: { [any]: any } = setmetatable({}, { __mode = "k" }) :: any -- and what has been done to it
+	-- Each draft keeps, under keys no one else has, what it is a draft of and what has been done to it: in itself, not in tables
+	-- on the side, which would cost a lookup each time and the collector a weak table of every draft.
+	local ORIGIN, WRITTEN = {}, {}
 	local thawed: { [any]: any } = setmetatable({}, { __mode = "k" }) :: any
 	local metas: { [Schema]: { [any]: any } } = {}
 	local drafted: { [any]: boolean } = {}
@@ -1631,19 +1706,19 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		end
 		mt = {}
 		mt.__index = function(p: any, key: any): any
-			local w = written[p]
+			local w: any = rawget(p, WRITTEN)
 			local x = if w then w[key] else nil
 			if x ~= nil then
 				return if x == NIL then nil else x
 			end
-			local o = origin[p]
+			local o: any = rawget(p, ORIGIN)
 			local v = if o then o[key] else nil
 			local b = s.boxes[key] or (if key == "children" then tree else nil)
 			if b then
 				local t = thaw(b, v)
 				if not w then
 					w = {}
-					written[p] = w
+					rawset(p, WRITTEN, w)
 				end
 				w[key] = if t == nil then NIL else t
 				return t
@@ -1651,19 +1726,19 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			return v
 		end
 		mt.__newindex = function(p: any, key: any, v: any)
-			local w = written[p]
+			local w: any = rawget(p, WRITTEN)
 			if not w then
 				w = {}
-				written[p] = w
+				rawset(p, WRITTEN, w)
 			end
 			w[key] = if v == nil then NIL else v
 		end
 		mt.__iter = function(p: any)
 			local all = {}
-			for key in origin[p] or {} do
+			for key in rawget(p, ORIGIN) or {} do
 				all[key] = p[key]
 			end
-			for key, x in written[p] or {} do
+			for key, x in rawget(p, WRITTEN) or {} do
 				all[key] = if x == NIL then nil else x
 			end
 			return next, all
@@ -1673,9 +1748,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		return mt
 	end
 	local function draft_map(s: Schema, orig: any, tree: Schema?): any
-		local p = setmetatable({}, meta(s, tree))
-		origin[p] = orig
-		return p
+		return setmetatable({ [ORIGIN] = orig }, meta(s, tree))
 	end
 	thaw = function(b: Schema, v: any): any
 		if v == nil then
@@ -1688,20 +1761,29 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			if not b.of.kind then
 				out = table.clone(v)
 			else
+				local mt = meta(b.of)
 				out = table.create(#v)
 				for i, x in v do
-					out[i] = draft_map(b.of, x)
+					out[i] = setmetatable({ [ORIGIN] = x }, mt)
 				end
 			end
 		elseif b.kind == "record" then
 			out = {}
-			for k, x in v do
-				out[k] = if b.of.kind then draft_map(b.of, x) else x
+			if b.of.kind then
+				local mt = meta(b.of)
+				for k, x in v do
+					out[k] = setmetatable({ [ORIGIN] = x }, mt)
+				end
+			else
+				for k, x in v do
+					out[k] = x
+				end
 			end
 		else
+			local mt = meta(b.of, b)
 			out = table.create(#v)
 			for i, x in v do
-				out[i] = draft_map(b.of, x, b)
+				out[i] = setmetatable({ [ORIGIN] = x }, mt)
 			end
 		end
 		thawed[out] = v
@@ -1726,8 +1808,8 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			end
 			return out
 		end
-		local orig = origin[v]
-		local writes = written[v]
+		local orig: any = rawget(v, ORIGIN)
+		local writes: any = rawget(v, WRITTEN)
 		if writes == nil then
 			return orig
 		end
@@ -1760,13 +1842,25 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		local out = {}
 		local whole = true
 		local orig = thawed[v]
-		for k, x in v do
-			local y = if b.kind == "list" and not b.of.kind then x
-				elseif b.kind == "record" and not b.of.kind then x
-				elseif b.kind == "tree" then finish_map(x, b.of, b)
-				else finish_map(x, b.of)
-			out[k] = y
-			whole = whole and orig ~= nil and rawequal(orig[k], y)
+		if not b.of.kind then
+			for k, x in v do
+				out[k] = x
+				whole = whole and orig ~= nil and rawequal(orig[k], x)
+			end
+		else
+			-- A draft of a map no one changed is what it is a draft of: seen to here, without a call.
+			local mt = meta(b.of, if b.kind == "tree" then b else nil)
+			local tree = if b.kind == "tree" then b else nil
+			for k, x in v do
+				local y
+				if getmetatable(x) == mt and rawget(x, WRITTEN) == nil then
+					y = rawget(x, ORIGIN)
+				else
+					y = finish_map(x, b.of, tree)
+				end
+				out[k] = y
+				whole = whole and orig ~= nil and rawequal(orig[k], y)
+			end
 		end
 		if whole and orig then
 			for k in orig do

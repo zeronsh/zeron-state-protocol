@@ -87,18 +87,21 @@ is one list, so one window, however deep it goes. On the client, `./x bench mirr
 
 | rows in the list | 2,000 | 20,000 |
 |---|---|---|
-| made, all at once | 90 ms | 1.1 s |
-| one changed, by `set` | 0.3 ms | 1.8 ms |
-| one changed, by `update` | 1.2 ms | 20 ms |
-| one moved, by `set` | 0.9 ms | 8.6 ms |
-| one moved, by `update` | 2.3 ms | 31 ms |
+| made, all at once | 73 ms | 1.3 s |
+| opened by another, from what a node sends | 68 ms | 0.81 s |
+| one changed, by `set` | 0.3 ms | 1.6 ms |
+| one changed, by `update` | 0.6 ms | 7.9 ms |
+| one moved, by `set` | 0.5 ms | 2.0 ms |
+| one moved, by `update` | 1.1 ms | 10 ms |
 
 What is read of a row is kept until that row changes; a list in which items changed is patched where they are, and one in which items
 moved has them taken out and put back where their markers say, the rest keeping their order, for the order of what is there never
 changes. What is left that grows with a list is copying its array, which a new state must have, and, by `set`, looking along it for
 what is not the very same table. `update` must also give `f` a list it can change with `table.insert` and `table.remove`, which do
-not call metamethods, so a list it touches is copied whole, at a little under a microsecond an item. For lists of many thousands,
-use `set`.
+not call metamethods, so a list it touches is a real array of a draft for each item, at about a third of a microsecond an item. For
+lists of many thousands, `set` costs the least.
+
+These were measured on Lune 0.11, which interprets Luau; every module asks for native code (`--!native`) where a host gives it.
 
 A tree's order is read anew when anything in its shape changes, at some microseconds a node; what changes in its nodes is patched.
 

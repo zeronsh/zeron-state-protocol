@@ -21,6 +21,10 @@ local function peer(): Peer
 			return clock
 		end,
 		random = function(n: number): string
+			-- As cheap as a host's own would be, so that what is measured is the client.
+			if n == 8 then
+				return string.pack("<I4I4", math.random(0, 0x7FFFFFFF) * 2 + math.random(0, 1), math.random(0, 0x7FFFFFFF) * 2 + math.random(0, 1))
+			end
 			local b = {}
 			for i = 1, n do
 				b[i] = string.char(math.random(0, 255))
@@ -68,6 +72,7 @@ local function run(p: Peer)
 end
 
 -- As a node would send it: whole rows, of what it holds; and nothing of a row it holds deleted, but a later deletion.
+local received = 0 -- of the time hearing takes, what is the client's own
 type Held = { rows: { [string]: { [string]: string } }, dead: { [string]: string } }
 local nodes: { [Peer]: Held } = setmetatable({}, { __mode = "k" }) :: any
 local function hear(p: Peer, cells: string)
@@ -123,8 +128,10 @@ local function hear(p: Peer, cells: string)
 	codec.put(w, cells)
 	local framed = codec.writer()
 	codec.put_bytes(framed, codec.string(w))
+	local t = os.clock()
 	p.receive(codec.string(framed))
 	run(p)
+	received += os.clock() - t
 end
 
 -- ---------------------------------------------------------------- measured
@@ -149,6 +156,17 @@ print(`{N} rows, each a map in one list`)
 each("made, all at once", 1, function()
 	doc.set({ items = items })
 end)
+do
+	local q = peer()
+	local other = m.open(q.client, { scope = 1, name = "big", schema = Big })
+	run(q)
+	local sent = table.concat(p.out)
+	received = 0
+	hear(q, sent)
+	print(string.format("  %-58s %8.2f ms", "opened by another, from what a node sends", received * 1000))
+	assert(#other.state().items == N, "the other has it all")
+	other.stop()
+end
 each("one changed, by set, sharing what did not change", 50, function()
 	local now = doc.state()
 	local list = table.clone(now.items)

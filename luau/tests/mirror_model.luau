@@ -680,172 +680,184 @@ local SEEDS = tonumber(require("@lune/process").args[1] or "") or 60
 if require("@lune/process").args[2] == "plain" then
 	m._plain(true)
 end
-for seed = 1, SEEDS do
-	math.randomseed(seed)
-	local n = 2 + seed % 2
-	local peers, docs, others = {}, {}, {}
-	for i = 1, n do
-		peers[i] = peer()
-		docs[i] = m.open(peers[i].client, { scope = 1, name = "board", schema = Board })
-		others[i] = m.open(peers[i].client, { scope = 1, name = "another", schema = Board })
-	end
-	local log: { string } = {} -- every write, in the order written
-	local heard: { [number]: { [number]: boolean } } = {}
-	for i = 1, n do
-		heard[i] = {}
-	end
-	local function check(i: number, what: string)
-		local want = model(peers[i].client, Board)
-		if not equal(docs[i].state(), want) then
-			failures += 1
-			local function ids(list: any): string
-				local out = {}
-				for _, t in list do
-					table.insert(out, string.format("%02x%02x:", string.byte(t.id, 15, 16)) .. tostring(t.title))
-				end
-				return table.concat(out, " ")
-			end
-			error(`seed {seed}, client {i}, {what}: {where_differ(docs[i].state(), want, "")}\n  mirror {ids(docs[i].state().tasks)}\n  model  {ids(want.tasks)}`)
-		end
-	end
-	for step = 1, 30 do
-		clock += math.random() * 3
-		-- Some write; each change reads back as what was set.
+local FIRST = tonumber(require("@lune/process").args[3] or "") or 1 -- to go back to one seed
+local now = 0 -- the seed being gone over, to say if anything fails in it
+local ok, why = xpcall(function()
+	for seed = FIRST, FIRST + SEEDS - 1 do
+		now = seed
+		math.randomseed(seed)
+		-- Each seed from the same start, so that any one of them can be gone back to alone.
+		clock, hostile_clock = 1800000000, 0
+		local n = 2 + seed % 2
+		local peers, docs, others = {}, {}, {}
 		for i = 1, n do
-			if math.random(3) > 1 then
-				local before = #peers[i].out
-				if math.random(3) == 1 then
-					-- Another document, of the same shape, in the same scope: nothing of it is in this one.
-					others[i].update(mutate)
+			peers[i] = peer()
+			docs[i] = m.open(peers[i].client, { scope = 1, name = "board", schema = Board })
+			others[i] = m.open(peers[i].client, { scope = 1, name = "another", schema = Board })
+		end
+		local log: { string } = {} -- every write, in the order written
+		local heard: { [number]: { [number]: boolean } } = {}
+		for i = 1, n do
+			heard[i] = {}
+		end
+		local function check(i: number, what: string)
+			local want = model(peers[i].client, Board)
+			if not equal(docs[i].state(), want) then
+				failures += 1
+				local function ids(list: any): string
+					local out = {}
+					for _, t in list do
+						table.insert(out, string.format("%02x%02x:", string.byte(t.id, 15, 16)) .. tostring(t.title))
+					end
+					return table.concat(out, " ")
+				end
+				error(`seed {seed}, client {i}, {what}: {where_differ(docs[i].state(), want, "")}\n  mirror {ids(docs[i].state().tasks)}\n  model  {ids(want.tasks)}`)
+			end
+		end
+		for step = 1, 30 do
+			clock += math.random() * 3
+			-- Some write; each change reads back as what was set.
+			for i = 1, n do
+				if math.random(3) > 1 then
+					local before = #peers[i].out
+					if math.random(3) == 1 then
+						-- Another document, of the same shape, in the same scope: nothing of it is in this one.
+						others[i].update(mutate)
+						run(peers[i])
+					end
+					local draft: any = nil
+					docs[i].update(function(d)
+						mutate(d)
+						draft = plain(d)
+					end)
 					run(peers[i])
-				end
-				local draft: any = nil
-				docs[i].update(function(d)
-					mutate(d)
-					draft = plain(d)
-				end)
-				run(peers[i])
-				if not equal(docs[i].state(), draft, false) then
-					failures += 1
-					local function strip(v: any): any
-						if type(v) ~= "table" then
-							return v
-						end
-						local out = {}
-						for k, x in v do
-							if k ~= "id" then
-								out[k] = strip(x)
+					if not equal(docs[i].state(), draft, false) then
+						failures += 1
+						local function strip(v: any): any
+							if type(v) ~= "table" then
+								return v
 							end
+							local out = {}
+							for k, x in v do
+								if k ~= "id" then
+									out[k] = strip(x)
+								end
+							end
+							return out
 						end
-						return out
+						print("differ", where_differ(strip(draft), strip(docs[i].state()), ""))
+											error(`seed {seed} step {step}, client {i}: what was set is not what is read\n  set  {show(draft)}\n  read {show(docs[i].state())}`)
 					end
-					print("differ", where_differ(strip(draft), strip(docs[i].state()), ""))
-										error(`seed {seed} step {step}, client {i}: what was set is not what is read\n  set  {show(draft)}\n  read {show(docs[i].state())}`)
-				end
-				check(i, `step {step}, after writing`)
-				for k = before + 1, #peers[i].out do
-					table.insert(log, peers[i].out[k])
-				end
-			end
-		end
-		if seed % 3 == 0 and math.random(3) == 1 then
-			table.insert(log, hostile(peers[1].client))
-		end
-		-- Some of what was written reaches some, in any order, some of it twice.
-		for i = 1, n do
-			for _ = 1, math.random(0, 4) do
-				if #log > 0 then
-					local k = math.random(#log)
-					hear(peers[i], log[k])
-					heard[i][k] = true
-					check(i, `step {step}, after hearing`)
-				end
-			end
-		end
-	end
-	-- Then all of it, everywhere: one document.
-	for i = 1, n do
-		local order = {}
-		for k = 1, #log do
-			table.insert(order, k)
-		end
-		for j = #order, 2, -1 do
-			local k = math.random(j)
-			order[j], order[k] = order[k], order[j]
-		end
-		for _, k in order do
-			hear(peers[i], log[k])
-		end
-		check(i, "at the end")
-	end
-	-- Each writes once more, which lets go of what nothing shows; and once that is everywhere, nothing is kept that is not
-	-- shown, but keys that were let go of, which hold nothing.
-	if seed % 3 ~= 0 then
-		local before = {}
-		for i = 1, n do
-			before[i] = #peers[i].out
-			docs[i].update(function() end)
-			run(peers[i])
-		end
-		for i = 1, n do
-			for k = before[i] + 1, #peers[i].out do
-				for j = 1, n do
-					hear(peers[j], peers[i].out[k])
-				end
-			end
-		end
-		for i = 1, n do
-			check(i, "after letting go")
-			local shown = {}
-			local function walk(v: any)
-				if type(v) == "table" then
-					if type(v.id) == "string" then
-						shown[v.id] = v
-					end
-					for _, x in v do
-						walk(x)
+					check(i, `step {step}, after writing`)
+					for k = before + 1, #peers[i].out do
+						table.insert(log, peers[i].out[k])
 					end
 				end
 			end
-			walk(docs[i].state())
-			local tag = peers[i].client:_tag(1, "mirror/" .. document)
-			for id, w in wheres(peers[i].client) do
-				local row = peers[i].client.rows[id]
-				local here = false
-				for _, c in row.slots[1] or {} do
-					here = here or string.sub(c.body, 1, 16) == tag
-				end
-				local empty = true -- a key that holds nothing, however it came to: as a deleted one is
-				for slot, cells in row.slots do
-					if slot >= 16 and slot < 255 then
-						local c = latest(row, slot)
-						empty = empty and (c == nil or c.body == "")
+			if seed % 3 == 0 and math.random(3) == 1 then
+				table.insert(log, hostile(peers[1].client))
+			end
+			-- Some of what was written reaches some, in any order, some of it twice.
+			for i = 1, n do
+				for _ = 1, math.random(0, 4) do
+					if #log > 0 then
+						local k = math.random(#log)
+						hear(peers[i], log[k])
+						heard[i][k] = true
+						check(i, `step {step}, after hearing`)
 					end
-				end
-				local held = w.kind == 2 and shown[w.owner] and type(shown[w.owner][w.field]) == "table" and shown[w.owner][w.field][w.key] ~= nil
-				local fine = not here or shown[id] or held or (w.kind == 2 and (not w.present or empty)) or w.kind == 0
-				if not fine then
-					failures += 1
-																				error(`seed {seed}, client {i}: a row is kept that nothing shows (kind {w.kind})`)
 				end
 			end
 		end
-	end
-	for i = 2, n do
-		if not equal(docs[i].state(), docs[1].state()) then
-			failures += 1
-			error(`seed {seed}: clients 1 and {i} differ: {where_differ(docs[1].state(), docs[i].state(), "")}`)
+		-- Then all of it, everywhere: one document.
+		for i = 1, n do
+			local order = {}
+			for k = 1, #log do
+				table.insert(order, k)
+			end
+			for j = #order, 2, -1 do
+				local k = math.random(j)
+				order[j], order[k] = order[k], order[j]
+			end
+			for _, k in order do
+				hear(peers[i], log[k])
+			end
+			check(i, "at the end")
 		end
-	end
-	-- No loops, no node twice.
-	local seen = {}
-	local function walk(level: any)
-		for _, node in level do
-			assert(not seen[node.id], "a node twice")
-			seen[node.id] = true
-			walk(node.children)
+		-- Each writes once more, which lets go of what nothing shows; and once that is everywhere, nothing is kept that is not
+		-- shown, but keys that were let go of, which hold nothing.
+		if seed % 3 ~= 0 then
+			local before = {}
+			for i = 1, n do
+				before[i] = #peers[i].out
+				docs[i].update(function() end)
+				run(peers[i])
+			end
+			for i = 1, n do
+				for k = before[i] + 1, #peers[i].out do
+					for j = 1, n do
+						hear(peers[j], peers[i].out[k])
+					end
+				end
+			end
+			for i = 1, n do
+				check(i, "after letting go")
+				local shown = {}
+				local function walk(v: any)
+					if type(v) == "table" then
+						if type(v.id) == "string" then
+							shown[v.id] = v
+						end
+						for _, x in v do
+							walk(x)
+						end
+					end
+				end
+				walk(docs[i].state())
+				local tag = peers[i].client:_tag(1, "mirror/" .. document)
+				for id, w in wheres(peers[i].client) do
+					local row = peers[i].client.rows[id]
+					local here = false
+					for _, c in row.slots[1] or {} do
+						here = here or string.sub(c.body, 1, 16) == tag
+					end
+					local empty = true -- a key that holds nothing, however it came to: as a deleted one is
+					for slot, cells in row.slots do
+						if slot >= 16 and slot < 255 then
+							local c = latest(row, slot)
+							empty = empty and (c == nil or c.body == "")
+						end
+					end
+					local held = w.kind == 2 and shown[w.owner] and type(shown[w.owner][w.field]) == "table" and shown[w.owner][w.field][w.key] ~= nil
+					local fine = not here or shown[id] or held or (w.kind == 2 and (not w.present or empty)) or w.kind == 0
+					if not fine then
+						failures += 1
+																					error(`seed {seed}, client {i}: a row is kept that nothing shows (kind {w.kind})`)
+					end
+				end
+			end
 		end
+		for i = 2, n do
+			if not equal(docs[i].state(), docs[1].state()) then
+				failures += 1
+				error(`seed {seed}: clients 1 and {i} differ: {where_differ(docs[1].state(), docs[i].state(), "")}`)
+			end
+		end
+		-- No loops, no node twice.
+		local seen = {}
+		local function walk(level: any)
+			for _, node in level do
+				assert(not seen[node.id], "a node twice")
+				seen[node.id] = true
+				walk(node.children)
+			end
+		end
+		walk(docs[1].state().outline)
 	end
-	walk(docs[1].state().outline)
+end, function(e: any): string
+	return `seed {now}: {e}\n{debug.traceback()}`
+end)
+if not ok then
+	error(why, 0)
 end
 print(if failures == 0 then "ok" else `{failures} failed`)

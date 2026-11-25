@@ -47,8 +47,10 @@ test)
 	node tests/vectors.mjs vectors/vectors.json
 	lune run luau/tests/vectors.luau vectors/vectors.json
 	lune run luau/tests/client.luau
-	lune run luau/tests/mirror_model.luau
-	lune run luau/tests/mirror_model.luau 30 plain
+	# Structured state held to a model, with its shortcuts and without: side by side, as each is a minute or so.
+	lune run luau/tests/mirror_model.luau 300 & quick=$!
+	lune run luau/tests/mirror_model.luau 300 plain & long=$!
+	mfail=; wait $quick || mfail=1; wait $long || mfail=1; [ -z "$mfail" ]
 	node examples/relay/test.mjs
 	$PYTHON examples/apps/test.py
 	$PYTHON examples/organization.py

@@ -779,6 +779,14 @@ function Client._on_synced(self: Client, r: codec.Reader)
 	self:_trim(window)
 end
 
+-- What was read of a row is read again when next it is wanted. Nothing keeps the table of views but the row, so one
+-- that is empty already need not be made again: a cell comes for each column of each row, and this is all of them.
+local function unview(row: Stored)
+	if next(row.views) ~= nil then
+		row.views = {}
+	end
+end
+
 -- A range was said over again and this row was not in it: it was moved away, or deleted, while this client
 -- was not listening. Only its place there is known to be wrong. Where else it is, and what is being typed in
 -- it, stand.
@@ -818,7 +826,7 @@ function Client._prune(self: Client, row: Stored, said: { [string]: boolean })
 		end
 	end
 	if some then
-		row.views = {}
+		unview(row)
 		self:_place(row)
 	end
 end
@@ -1198,9 +1206,7 @@ function Client._on_cells(self: Client, r: codec.Reader)
 		end
 		self:_accept(row, slot, tag % 64, stamp, body, author)
 	end
-	for row in touched do
-		self:_place(row)
-	end
+	self:_place_all(touched)
 end
 
 function Client._accept(self: Client, row: Stored, slot: number, kind: number, stamp: string, body: string, author: Device?): boolean
@@ -1209,7 +1215,7 @@ function Client._accept(self: Client, row: Stored, slot: number, kind: number, s
 		local cell = row.slots[slot] and row.slots[slot][stamp]
 		if cell and author then
 			if not cell.author or cell.author.subject ~= author.subject then
-				row.views = {}
+				unview(row)
 			end
 			cell.author = author
 		end
@@ -1225,7 +1231,7 @@ function Client._accept(self: Client, row: Stored, slot: number, kind: number, s
 			self:_rebuild(row, slot)
 		end
 	end
-	row.views = {}
+	unview(row)
 	return true
 end
 
@@ -1259,7 +1265,7 @@ function Client._rebuild(self: Client, row: Stored, slot: number)
 	end
 	row.texts[slot] = nil
 	row.lives[slot] = nil
-	row.views = {}
+	unview(row)
 end
 
 -- Puts a row where its placements say, in every window, and takes it from where they do not.
@@ -1325,6 +1331,31 @@ function Client._place(self: Client, row: Stored)
 		else
 			self.rows[row.id] = nil
 		end
+	end
+end
+
+-- Places rows, each once. Many at once go into windows at once: sorted together, rather than each moving all after it.
+function Client._place_all(self: Client, rows: { [Stored]: boolean })
+	local many = 0
+	for _ in rows do
+		many += 1
+		if many > 64 then
+			self.bulk = {}
+			break
+		end
+	end
+	for row in rows do
+		self:_place(row)
+	end
+	local bulk = self.bulk
+	self.bulk = nil
+	for window, add in bulk or {} :: any do
+		for _, e in add do
+			table.insert(window.entries, e)
+		end
+		table.sort(window.entries, function(x: { key: string, row: Stored }, y: { key: string, row: Stored }): boolean
+			return x.key < y.key
+		end)
 	end
 end
 
@@ -1631,7 +1662,7 @@ function Client._on_live(self: Client, r: codec.Reader)
 	end
 	local t = self:_text(row, slot)
 	if text.live(t, piece, offset, codec.rest(r)) == "changed" then
-		row.views = {}
+		unview(row)
 		self:_place(row)
 		if not row.lives[slot] then
 			self:_expire(row, slot)
@@ -1702,7 +1733,7 @@ function Client._seal(self: Client, row: Stored, slot: number)
 	local body = text.close(t, stamp)
 	if body then
 		merge(row, slot, PIECE, stamp, body, self:_mine(string.unpack(">I4", row.id) :: any))
-		row.views = {}
+		unview(row)
 		self:_send_cells({ { row = row.id, slot = slot, kind = PIECE, stamp = stamp, body = body } })
 	end
 end
@@ -1722,7 +1753,7 @@ function Client.text(self: Client, id: string, col: Column)
 	local function edited()
 		row.dirty[slot] = true
 		self.typing[row] = true
-		row.views = {}
+		unview(row)
 		self:_place(row)
 		self:_later()
 	end
@@ -1978,7 +2009,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 				rows[id] = true
 				table.insert(cells, { row = id, slot = slot, kind = PIECE, stamp = stamp, body = body })
 				merge(row, slot, PIECE, stamp, body)
-				row.views = {}
+				unview(row)
 			end
 		end,
 	})
@@ -1987,30 +2018,14 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	elseif done then
 		self.host.defer(done)
 	end
-	-- Many rows at once go into windows at once: sorted together, rather than each moving all after it.
-	local many = 0
-	for _ in rows do
-		many += 1
-	end
-	if many > 64 then
-		self.bulk = {}
-	end
+	local placing: { [Stored]: boolean } = {}
 	for id in rows do
 		local row = self.rows[id]
 		if row then
-			self:_place(row)
+			placing[row] = true
 		end
 	end
-	local bulk = self.bulk
-	self.bulk = nil
-	for window, add in bulk or {} :: any do
-		for _, e in add do
-			table.insert(window.entries, e)
-		end
-		table.sort(window.entries, function(x: { key: string, row: Stored }, y: { key: string, row: Stored }): boolean
-			return x.key < y.key
-		end)
-	end
+	self:_place_all(placing)
 end
 
 -- ---------------------------------------------------------------- calls
