@@ -417,7 +417,7 @@ leaf_rows :: proc(s: ^Scope, p: ^Pred) -> Set {
 	defer delete(g.perhaps)
 	each :: proc(data: rawptr, e: ^Entry) {
 		g := (^Gather)(data)
-		switch leaf_answer(g.p, {e.key, e.val != 0}) {
+		switch leaf_answer(g.p, {e.key, e.val}) {
 		case .Yes:
 			set_add(&g.out, e.sub)
 		case .Perhaps:
@@ -837,8 +837,7 @@ Hit :: struct {
 // What a row is ordered by: its first value that way, or that it has none, which is last either way.
 @(private)
 Sort_Key :: struct {
-	key:  Key,
-	long: bool,
+	using value: Value,
 	none: bool,
 }
 
@@ -861,7 +860,7 @@ sort_keys :: proc(s: ^Scope, q: ^Query, hit: ^Hit) -> []Sort_Key {
 			continue
 		}
 		v := values[len(values) - 1] if o.desc else values[0]
-		keys[i] = {v.key, v.long, false}
+		keys[i].value = v
 	}
 	return keys
 }
@@ -895,7 +894,7 @@ sorted_compare :: proc(s: ^Scope, q: ^Query, a, b: ^Sorted) -> int {
 			switch {
 			case ka.key != kb.key:
 				c = -1 if key_less(ka.key, kb.key) else 1
-			case ka.long || kb.long:
+			case ka.rest != kb.rest || ka.rest == SEVERAL:
 				c = long_compare(s, &o, a.hit.id, b.hit.id)
 			}
 		}
@@ -1128,7 +1127,7 @@ query_all :: proc(s: ^Scope, q: ^Query, rows: ^Set, first, count: int) -> []Hit 
 // ---------------------------------------------------------------- what they come to
 
 Facet :: struct {
-	key:   Key,
+	using value: Value,
 	count: int,
 	row:   u32, // one that has it, should the key not be all of it
 }
@@ -1215,8 +1214,11 @@ aggregate :: proc(s: ^Scope, a: ^Aggregate, rows: ^Set) -> (out: Sum_Of) {
 			e := cursor_prev(&c) or_break if most else cursor_next(&c) or_break
 			if set_has(rows, e.sub) {
 				out.facets = make([]Facet, 1, context.temp_allocator)
-				out.facets[0] = {e.key, 1, e.sub}
+				out.facets[0] = {{e.key, e.val}, 1, e.sub}
 				out.number, out.some = key_number(e.key), true
+				if kind_long(a.col.kind) {
+					out.facets[0] = long_extreme(s, a, rows, e.key)
+				}
 				return
 			}
 		}
@@ -1236,44 +1238,183 @@ aggregate :: proc(s: ^Scope, a: ^Aggregate, rows: ^Set) -> (out: Sum_Of) {
 		return {f64(have.count), have.count > 0, nil}
 	case .Facet:
 		Tally :: struct {
-			rows: ^Set,
-			top:  int,
-			best: [dynamic]Facet,
-			now:  Facet,
+			using group: Group,
+			top:   int,
+			best:  [dynamic]Facet,
 			kinds: int,
 		}
-		t := Tally{rows = rows, top = a.top, best = make([dynamic]Facet, context.temp_allocator)}
-		settle :: proc(t: ^Tally) {
-			if t.now.count == 0 {
+		t := Tally{group = {s = s, a = a, rows = rows}, top = a.top, best = make([dynamic]Facet, context.temp_allocator)}
+		defer delete(t.longs)
+		count :: proc(t: ^Tally, f: Facet) {
+			if f.count == 0 {
 				return
 			}
 			t.kinds += 1
 			at := len(t.best)
-			for at > 0 && t.best[at - 1].count < t.now.count {
+			for at > 0 && t.best[at - 1].count < f.count {
 				at -= 1
 			}
 			if at < t.top {
-				inject_at(&t.best, at, t.now)
+				inject_at(&t.best, at, f)
 				if len(t.best) > t.top {
 					pop(&t.best)
 				}
 			}
-			t.now = {}
+		}
+		settle :: proc(t: ^Tally) {
+			count(t, t.short)
+			t.short = {}
+			for f in group_next(&t.group) {
+				count(t, f)
+			}
 		}
 		tree_each(x, h.by_key, KEY_MIN, KEY_MAX, &t, proc(data: rawptr, e: ^Entry) {
 			t := (^Tally)(data)
-			if t.now.count > 0 && t.now.key != e.key {
+			if t.key != e.key {
 				settle(t)
+				t.key = e.key
 			}
-			if set_has(t.rows, e.sub) {
-				if t.now.count == 0 {
-					t.now.key, t.now.row = e.key, e.sub
-				}
-				t.now.count += 1
-			}
+			group_add(&t.group, e)
 		})
 		settle(&t)
 		return {f64(t.kinds), t.kinds > 0, t.best[:]}
 	}
 	return
+}
+
+// Those that share a key, told apart by what comes after.
+@(private)
+Group :: struct {
+	s:     ^Scope,
+	a:     ^Aggregate,
+	rows:  ^Set,
+	key:   Key,
+	short: Facet, // whose key is all of it
+	longs: [dynamic]Long,
+	at:    int,
+}
+
+@(private)
+Long :: struct {
+	rest: u64,
+	row:  u32,
+}
+
+@(private)
+group_add :: proc(g: ^Group, e: ^Entry) {
+	if !set_has(g.rows, e.sub) {
+		return
+	}
+	switch e.val {
+	case 0:
+		group_put(g, 0, e.sub)
+	case SEVERAL:
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		id, _ := row_id(g.s, e.sub)
+		r := Row{n = g.s.x.n, id = id}
+		seen := make([dynamic]u64, context.temp_allocator)
+		for b in row_bytes(&r, &g.a.col) {
+			if v := bytes_value(b); v.key == e.key && !slice.contains(seen[:], v.rest) {
+				append(&seen, v.rest)
+				group_put(g, v.rest, e.sub)
+			}
+		}
+	case:
+		group_put(g, e.val, e.sub)
+	}
+}
+
+@(private)
+group_put :: proc(g: ^Group, rest: u64, row: u32) {
+	if rest != 0 {
+		append(&g.longs, Long{rest, row})
+		return
+	}
+	if g.short.count == 0 {
+		g.short = {{g.key, 0}, 0, row}
+	}
+	g.short.count += 1
+}
+
+// Those that go on beyond the key, by how they do; and then the group is empty.
+@(private)
+group_next :: proc(g: ^Group) -> (f: Facet, ok: bool) {
+	if g.at == len(g.longs) {
+		clear(&g.longs)
+		g.at = 0
+		return
+	}
+	if g.at == 0 {
+		slice.sort_by(g.longs[:], proc(a, b: Long) -> bool {return a.rest < b.rest})
+	}
+	first := g.longs[g.at]
+	f = {{g.key, first.rest}, 0, first.row}
+	for g.at < len(g.longs) && g.longs[g.at].rest == first.rest {
+		g.at += 1
+		f.count += 1
+	}
+	return f, true
+}
+
+// The least or the greatest of those that share a key.
+@(private)
+long_extreme :: proc(s: ^Scope, a: ^Aggregate, rows: ^Set, key: Key) -> (best: Facet) {
+	g := Group{s = s, a = a, rows = rows, key = key}
+	defer delete(g.longs)
+	tree_each(s.x, a.held.by_key, key, key_next(key) if key != KEY_MAX else KEY_MAX, &g, proc(data: rawptr, e: ^Entry) {
+		group_add((^Group)(data), e)
+	})
+	best = g.short
+	if best.count > 0 && (a.fn == .Min || len(g.longs) == 0) {
+		return // it ends where the others go on
+	}
+	most: [dynamic]byte
+	defer delete(most)
+	found := false
+	for f in group_next(&g) {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		f := f
+		v := facet_bytes(s, a, f)
+		if c := bytes.compare(v, most[:]); !found || (c > 0 if a.fn == .Max else c < 0) {
+			found, best = true, f
+			clear(&most)
+			append(&most, ..v)
+		}
+	}
+	best.count = 1
+	return
+}
+
+// A value as its kind is written. Temporary memory.
+@(private)
+facet_bytes :: proc(s: ^Scope, a: ^Aggregate, facet: Facet) -> []byte {
+	b := make([]byte, 16, context.temp_allocator)
+	zsp.put_u64(b, facet.key.hi)
+	zsp.put_u64(b[8:], facet.key.lo)
+	switch a.col.kind {
+	case .Bytes, .Fold:
+		if facet.rest != 0 {
+			id, _ := row_id(s, facet.row)
+			r := Row{n = s.x.n, id = id}
+			for v in row_bytes(&r, &a.col) {
+				if bytes_value(v) == facet.value {
+					return v
+				}
+			}
+		}
+		n := 16
+		for n > 0 && b[n - 1] == 0 {
+			n -= 1
+		}
+		return b[:n]
+	case .Number, .Created, .Modified:
+		zsp.put_u64(b, transmute(u64)key_number(facet.key))
+		return b[:8]
+	case .Bool:
+		return b[7:8]
+	case .Order:
+		return b[:8]
+	case .Id, .Words:
+	}
+	return b
 }

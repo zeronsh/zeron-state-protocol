@@ -26,6 +26,7 @@ World :: struct {
 }
 
 WORDS := []string{"apple", "apples", "apply", "banana", "band", "cherry", "Crème", "déjà", "elephant", "elegant", "fig", "grape", "grapefruit", "house", "mouse", "东京", "京都大学", "x", "don't", "counterrevolutionaries", "counterrevolutionary", "a"}
+TAGS := []string{"apple", "a long name that", "exactly sixteen!", "exactly sixteen!!", "exactly sixteen?", "a long name that goes on", "a long name that goes off"}
 NAMES := []string{"", "a", "A", "ab", "Ab", "abc", "Zoë", "zoe", "exactly sixteen!", "exactly sixteen!!", "exactly sixteen?", "EXACTLY SIXTEEN!", "a long name that goes on", "a long name that goes off", "n\x00", "n"}
 
 @(private)
@@ -171,7 +172,7 @@ world_write :: proc(t: ^testing.T, w: ^World) {
 				put(&cells, 20, .Piece, b[:])
 			}
 		case 5:
-			json := fmt.tprintf(`{{"n":%v,"tags":["%s","%s"],"deep":{{"on":%v,"name":"%s"}},"skip":[{{"n":9}}]}}`, rand.int_max(5), rand.choice(WORDS[:6]), rand.choice(WORDS[:6]), rand.int_max(2) == 0, rand.choice(WORDS[:4]))
+			json := fmt.tprintf(`{{"n":%v,"tags":["%s","%s","%s"],"deep":{{"on":%v,"name":"%s"}},"skip":[{{"n":9}}]}}`, rand.int_max(5), rand.choice(TAGS), rand.choice(TAGS), rand.choice(TAGS), rand.int_max(2) == 0, rand.choice(WORDS[:4]))
 			put(&cells, 21, .Value, transmute([]byte)(json if rand.int_max(10) > 0 else "not json"))
 		}
 	}
@@ -262,7 +263,7 @@ ask_value :: proc(a: ^Ask, k: Kind) {
 	}
 	switch k {
 	case .Bytes, .Fold:
-		zsp.write_bytes(out, transmute([]byte)(rand.choice(NAMES) if rand.int_max(2) == 0 else rand.choice(WORDS)))
+		zsp.write_bytes(out, transmute([]byte)(rand.choice(NAMES) if rand.int_max(2) == 0 else rand.choice(WORDS) if rand.int_max(2) == 0 else rand.choice(TAGS)))
 	case .Number:
 		eight(out, transmute(u64)(f64(rand.int_max(21) - 10) / 2))
 	case .Bool:
@@ -304,6 +305,14 @@ ask_pred :: proc(a: ^Ask, depth: int) {
 		k := ask_column(out, SORTED)
 		flags := byte(rand.int_max(16))
 		append(out, flags)
+		if flags == 15 && rand.int_max(2) == 0 {
+			v := make([dynamic]byte, context.temp_allocator)
+			b := Ask{a.w, &v}
+			ask_value(&b, k)
+			append(out, ..v[:])
+			append(out, ..v[:])
+			break
+		}
 		if flags & 1 != 0 {
 			ask_value(a, k)
 		}
@@ -902,10 +911,25 @@ check_query :: proc(t: ^testing.T, w: ^World, source: []byte) -> bool {
 		least, most: Key
 		n, have := 0, 0
 		tally := make(map[Key]int, context.temp_allocator)
+		strings := make(map[string]int, context.temp_allocator)
+		least_of, most_of: string
 		for id in want {
 			r := Row{n = &w.node, id = id}
 			values := row_values(&r, &a.col)
 			have += 1 if len(values) > 0 else 0
+			if kind_long(a.col.kind) {
+				seen := make(map[string]bool, context.temp_allocator)
+				for b in row_bytes(&r, &a.col) {
+					if string(b) in seen {
+						continue
+					}
+					seen[string(b)] = true
+					first := len(strings) == 0
+					strings[string(b)] += 1
+					least_of = string(b) if first || string(b) < least_of else least_of
+					most_of = string(b) if first || string(b) > most_of else most_of
+				}
+			}
 			for v in values {
 				sum += key_number(v.key)
 				least = v.key if n == 0 || key_less(v.key, least) else least
@@ -916,6 +940,29 @@ check_query :: proc(t: ^testing.T, w: ^World, source: []byte) -> bool {
 		}
 		out := totals[i]
 		good := false
+		if a.held != nil && kind_long(a.col.kind) && (a.fn == .Min || a.fn == .Max || a.fn == .Facet) {
+			good = out.some == (n > 0)
+			least_count := max(int)
+			for f in out.facets {
+				v := string(facet_bytes(s, &a, f))
+				if a.fn == .Facet {
+					good &&= strings[v] == f.count && f.count <= least_count
+					least_count = f.count
+					continue
+				}
+				good &&= v == (least_of if a.fn == .Min else most_of)
+			}
+			if a.fn == .Facet {
+				good &&= int(out.number) == len(strings) && len(out.facets) == min(a.top, len(strings))
+			} else {
+				good &&= len(out.facets) == (1 if n > 0 else 0)
+			}
+			if !good {
+				testing.expectf(t, false, "%v: %v is not right (%v)", a.fn, out, strings)
+				return false
+			}
+			continue
+		}
 		switch a.fn {
 		case .Sum:
 			good = abs(out.number - sum) < 1e-6 && out.some == (n > 0)

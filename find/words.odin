@@ -156,6 +156,17 @@ fold :: proc(s: []byte, into: ^[dynamic]byte) {
 	}
 }
 
+// Bytes as a value of a column.
+@(require_results)
+bytes_value :: proc(s: []byte) -> (v: Value) {
+	long: bool
+	if v.key, long = bytes_key(s); long {
+		h := zsp.sha256(s)
+		v.rest = zsp.get_u64(h[:]) >> 8 + SEVERAL + 1
+	}
+	return
+}
+
 // The first sixteen bytes, as a key; and whether that is not all there is to it.
 @(require_results)
 bytes_key :: proc(s: []byte) -> (k: Key, long: bool) {

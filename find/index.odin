@@ -105,7 +105,7 @@ BATCH :: 1 << 17 // edits gathered before they are made
 @(private)
 HEADERS :: 2
 @(private)
-MAGIC :: 0x7a73_7066_696e_6431
+MAGIC :: 0x7a73_7066_696e_6432
 
 @(private)
 Header :: struct {
@@ -544,8 +544,8 @@ held_shape :: proc(h: ^Held) {
 		h.texts.blocks.width = .Varint
 		return
 	}
-	h.by_row.width = .Byte
-	h.by_key.width = .Byte if h.kind == .Bytes || h.kind == .Fold else .None
+	h.by_row.width = .Varint if kind_long(h.kind) else .None
+	h.by_key.width = h.by_row.width
 	h.by_key.sums = h.kind == .Number
 }
 
@@ -841,7 +841,7 @@ held_values :: proc(h: ^Held, row: u32) -> []Value {
 	r := leaf_seek(pg, h.by_row.width, lo.key, lo.sub)
 	for reader_next(&r) {
 		if at := u32(r.key.hi >> 32); at == row {
-			append(&out, Value{by_row_key(r.key, r.sub), r.val != 0})
+			append(&out, Value{by_row_key(r.key, r.sub), r.val})
 		} else if at > row {
 			return out[:]
 		}
@@ -854,7 +854,7 @@ held_values :: proc(h: ^Held, row: u32) -> []Value {
 		if u32(e.key.hi >> 32) != row {
 			break
 		}
-		append(&out, Value{by_row_key(e.key, e.sub), e.val != 0})
+		append(&out, Value{by_row_key(e.key, e.sub), e.val})
 	}
 	return out[:]
 }
@@ -892,9 +892,9 @@ held_read :: proc(h: ^Held, row: u32, r: ^Row, fresh: bool) {
 @(private)
 held_edit :: proc(h: ^Held, row: u32, v: Value, gone: bool) {
 	e := by_row_split(row, v.key)
-	e.val = 1 if v.long else 0
+	e.val = v.rest
 	append(&h.edits[0], Edit{entry = e, gone = gone})
-	append(&h.edits[1], Edit{entry = {v.key, row, e.val if h.by_key.width == .Byte else 0}, gone = gone})
+	append(&h.edits[1], Edit{entry = {v.key, row, v.rest}, gone = gone})
 }
 
 @(private)

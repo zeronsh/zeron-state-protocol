@@ -112,7 +112,7 @@ on_serve :: proc(s: ^Session, r: ^Reader) {
 	on := read_u8(r) == 1
 	method := string(read_bytes(r))
 	// Whether it may is asked when a call comes: rights come and go.
-	if r.bad || s.role != .Open || len(method) > MAX_METHOD || len(n.serving) >= MAX_CALLS {
+	if r.bad || s.role != .Open || len(method) == 0 || len(method) > MAX_METHOD || len(n.serving) >= MAX_CALLS {
 		r.bad = true
 		return
 	}

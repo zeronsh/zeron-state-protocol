@@ -40,8 +40,7 @@ Pred :: struct {
 }
 
 Bound :: struct {
-	key:   Key,
-	long:  bool,
+	using value: Value,
 	bytes: []byte, // in full, as compared
 }
 
@@ -192,7 +191,7 @@ bound_parse :: proc(r: ^zsp.Reader, kind: Kind) -> (b: Bound) {
 		r.bad = true
 		return
 	}
-	b.key, b.long = v.key, v.long
+	b.value = v
 	b.bytes = compared(kind, raw)
 	return
 }
@@ -320,12 +319,24 @@ bound_side :: proc(v: Value, b: ^Bound) -> (side: int, sure: bool) {
 	if v.key != b.key {
 		return -1 if key_less(v.key, b.key) else 1, true
 	}
-	return 0, !v.long && !b.long
+	switch {
+	case v.rest == SEVERAL:
+	case v.rest == 0 && b.rest == 0:
+		return 0, true
+	case v.rest == 0:
+		return -1, true // it ends where the other goes on
+	case b.rest == 0:
+		return 1, true
+	}
+	return 0, false
 }
 
 @(private)
 range_answer :: proc(b: ^Bounds, v: Value) -> Answer {
 	perhaps := false
+	if b.has_lo && b.has_hi && v.rest > SEVERAL && b.lo.value == b.hi.value && v.key == b.lo.key && v.rest != b.lo.rest {
+		return .No
+	}
 	if b.has_lo {
 		side, sure := bound_side(v, &b.lo)
 		switch {
@@ -421,10 +432,12 @@ leaf_answer :: proc(p: ^Pred, v: Value) -> Answer {
 		}
 		answer := Answer.No
 		for ; lo < len(p.set) && p.set[lo].key == v.key; lo += 1 {
-			if !v.long && !p.set[lo].long {
+			switch {
+			case v.rest == 0 && p.set[lo].rest == 0:
 				return .Yes
+			case v.rest == p.set[lo].rest || v.rest == SEVERAL:
+				answer = .Perhaps
 			}
-			answer = .Perhaps
 		}
 		return answer
 	case .Prefix:
@@ -437,14 +450,14 @@ leaf_answer :: proc(p: ^Pred, v: Value) -> Answer {
 		}
 		// Zeroes may be the value's, or only fill out the key.
 		if len(p.bytes) > 16 || (n > 0 && p.bytes[n - 1] == 0) {
-			return .Perhaps if v.long else .No
+			return .Perhaps if v.rest != 0 else .No
 		}
 		return .Yes
 	case .Has:
 		if len(p.bytes) == 0 {
 			return .Yes
 		}
-		if v.long {
+		if v.rest != 0 {
 			return .Perhaps
 		}
 		k: [16]byte

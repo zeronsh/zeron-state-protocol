@@ -1053,35 +1053,3 @@ live_wants :: proc(l: ^Live, page: []zsp.Id) {
 		append(&l.lives, w)
 	}
 }
-
-// A value as its kind is written.
-@(private)
-facet_bytes :: proc(s: ^Scope, a: ^Aggregate, facet: Facet) -> []byte {
-	b := make([]byte, 16, context.temp_allocator)
-	zsp.put_u64(b, facet.key.hi)
-	zsp.put_u64(b[8:], facet.key.lo)
-	switch a.col.kind {
-	case .Bytes, .Fold:
-		id, _ := row_id(s, facet.row)
-		r := Row{n = s.x.n, id = id}
-		for v in row_bytes(&r, &a.col) {
-			if k, _ := bytes_key(v); k == facet.key {
-				return v
-			}
-		}
-		n := 16
-		for n > 0 && b[n - 1] == 0 {
-			n -= 1
-		}
-		return b[:n]
-	case .Number, .Created, .Modified:
-		zsp.put_u64(b, transmute(u64)key_number(facet.key))
-		return b[:8]
-	case .Bool:
-		return b[7:8]
-	case .Order:
-		return b[:8]
-	case .Id, .Words:
-	}
-	return b
-}

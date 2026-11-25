@@ -39,7 +39,15 @@ column_sorted :: proc(k: Kind) -> bool {
 
 Value :: struct {
 	key:  Key,
-	long: bool, // and more: the key is only how it begins
+	rest: u64, // 0 if that is all there is of it; or else, a hash of the whole; or SEVERAL, of which one or more are longer
+}
+
+SEVERAL :: 1
+
+// Whether a column's keys may be only how its values begin.
+@(private)
+kind_long :: proc(k: Kind) -> bool {
+	return k == .Bytes || k == .Fold
 }
 
 // Whether what changed in a slot may change a column.
@@ -150,14 +158,14 @@ row_values :: proc(r: ^Row, c: ^Column) -> []Value {
 		}
 	}
 	if len(out) > 1 {
-		slice.sort_by(out[:], proc(a, b: Value) -> bool {return key_less(a.key, b.key) || (a.key == b.key && !a.long && b.long)})
+		slice.sort_by(out[:], proc(a, b: Value) -> bool {return key_less(a.key, b.key)})
 		n := 0
 		for v in out {
 			if n == 0 || out[n - 1].key != v.key {
 				out[n] = v
 				n += 1
 			} else {
-				out[n - 1].long ||= v.long
+				out[n - 1].rest = v.rest if out[n - 1].rest == v.rest else SEVERAL
 			}
 		}
 		resize(&out, n)
@@ -170,12 +178,12 @@ row_values :: proc(r: ^Row, c: ^Column) -> []Value {
 value_key :: proc(kind: Kind, bytes: []byte) -> (v: Value, ok: bool) {
 	switch kind {
 	case .Bytes:
-		v.key, v.long = bytes_key(bytes)
+		v = bytes_value(bytes)
 		return v, true
 	case .Fold:
 		folded := make([dynamic]byte, 0, len(bytes), context.temp_allocator)
 		fold(bytes, &folded)
-		v.key, v.long = bytes_key(folded[:])
+		v = bytes_value(folded[:])
 		return v, true
 	case .Number, .Created, .Modified:
 		if len(bytes) == 8 {

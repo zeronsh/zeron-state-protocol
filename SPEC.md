@@ -7,7 +7,8 @@ trusted with nothing. This document is enough to write a client, a relay or a fu
 **Contents.** [1 Model](#1-model) · [2 Encoding](#2-encoding) · [3 Keys and the roster](#3-keys-and-the-roster) ·
 [4 Cells](#4-cells) · [5 Text](#5-text) · [6 Fingerprints](#6-fingerprints) · [7 Channels](#7-channels) ·
 [8 Sessions](#8-sessions) · [9 Watching](#9-watching) · [10 Reconciling](#10-reconciling) · [11 Live](#11-live) ·
-[12 Calls](#12-calls) · [13 Relays](#13-relays) · [14 Links](#14-links) · [15 Who handles what](#15-who-handles-what)
+[12 Calls](#12-calls) · [13 Relays](#13-relays) · [14 Links](#14-links) · [15 Questions](#15-questions) ·
+[16 Who handles what](#16-who-handles-what)
 
 ## 1 Model
 
@@ -285,7 +286,8 @@ old and would not otherwise hear.
 
 A watch subscribes to `lo ≤ key < hi`, within one scope; another with the same id replaces it. With a nonzero limit the owner moves `lo` up
 (if *back*) or `hi` down so that at most that many entries lie within. The watcher learns the result, and how many entries of the list lay
-before and after it at that moment, from Synced, which follows everything the watch was owed. A page before this one is a watch whose `hi` is this one's `lo`.
+before and after it at that moment, from Synced, which follows everything the watch was owed. A page before this one is a watch whose `hi` is this one's `lo`. A local client may have 1024
+watches standing, and a peer 16384.
 
 With **data**, the owner brings the watcher level and then sends changes as they commit. *known* gives the watcher's own count and
 fingerprint of the range: equal, and there is nothing to send; a count of zero, and the owner sends everything; otherwise they reconcile. A
@@ -358,7 +360,7 @@ writer seals a piece within about a second of beginning it; a reader drops live 
 
 A call is a stream of messages each way. `device` is the callee's on the way out and the caller's on arrival. Ids belong to whoever sent
 Call on that session. A call ends when both sides have sent End, or on Fault or Cancel. Each side may have 256 KiB of messages outstanding beyond what the
-other has credited; the first message counts. One message is at most 256 KiB, and a method's name 255 bytes.
+other has credited; the first message counts. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
 
 Both devices need the Call right in the scope, and both check. A call takes a direct session with the device if there is one, else a tunnel (§13). It
 stays on the path it began on: if that fails the call faults *lost*, and may or may not have happened. Faults: 1 denied, 2 unreachable, 3 unserved,
@@ -402,9 +404,86 @@ The device with the lesser key dials. Devices that share a relay swap candidate 
 both send to all of the other's at once. On a local network a device broadcasts from its link socket, at start and a few times soon after, to UDP port 9083, and a device that hears it and should be dialled answers that socket with the same: 0x44 ‖ salt (8) ‖
 XChaCha20-Poly1305 under derive(space, "zsp-beacon"), nonce 0 (8) ‖ salt ‖ 0 ‖ 0x42 ‖ 0 (6), of device (32) ‖ link port (2, big-endian), no associated data.
 
-A link through a NAT is closed after 25 idle seconds, before the NAT forgets it, and dialled again when there is something to say.
+A link through a NAT is closed after 25 idle seconds, before the NAT forgets it, and dialled again when there is something to say. While a call is under
+way on a link, an end that has said nothing on it for 15 seconds pings; and so does one whose relay says that the device has gone.
 
-## 15 Who handles what
+## 15 Questions
+
+A local client asks its node for rows by what is in them. Nothing is written or replicated for it and no relay takes part: what answers is an index a
+node makes for itself of what it holds, and may throw away. A node need not answer questions; one that does not ignores them.
+
+```
+32 Ask      id varint ‖ question             stays asked; another with the same id replaces it
+33 Unask    id varint
+34 Answer   id varint ‖ flags (1)
+            flags 1 settled, or 0:   total varint ‖ first varint ‖ n varint ‖ n × row (16) ‖
+                                     m varint ‖ m × { some (1) ‖ number (8) ‖ k varint ‖ k × { count varint ‖ value bytes } }
+            flags 2 denied, 4 faulty:   nothing follows, and it is asked no longer
+            flags 8 waiting:            hundredths (1), of an index being made
+            flags 16 ended:             to Unask
+```
+
+An Answer follows whenever it differs from the last. `total` is how many rows there are, `first` how many of them come before those shown. Rows not shown
+before in any answer are sent whole, in Cells, ahead of it; what changes in a row shown, and live text in it, is sent as for a watch. A client therefore
+keeps a row while any answer shows it, and those of a question it ends until that is said to be *ended*, for an answer on its way may count on them.
+*settled* says that a full replica gave the answer; otherwise it is true of what is held here. A client may ask about scopes it may read, in every part of a
+question; one that asks about others is *denied*, as is one whose right ends.
+
+```
+question    scope varint ‖ where ‖ n varint ‖ n × order ‖ from end (1) ‖ offset varint ‖ limit varint ‖ m varint ‖ m × total
+order       0 ‖ descending (1) ‖ column        by a value. Rows with none come last either way
+            1 ‖ descending (1)                 by how well they answer, best first
+            2 ‖ descending (1)                 by when they were made
+total       function (1: 1 sum, 2 min, 3 max, 4 count, 5 facet) ‖ column ‖ top varint
+column      kind (1) ‖ slot (1) ‖ path bytes   kinds 1 to 6
+            7 created, or 8 modified           in seconds
+            9 ‖ list (16)                      the row's order there
+```
+
+| kind | a value is | and is written |
+|---|---|---|
+| 1 bytes | what the slot's Value holds, compared bytewise | as it is |
+| 2 fold | the same as text, without case or the marks over letters | as it is |
+| 3 number | eight bytes of it, as a float, or a number in JSON | f64, big-endian |
+| 4 bool | one byte, or a boolean in JSON | 0 or 1 |
+| 5 id | sixteen bytes of it: another row | 16 bytes |
+| 6 words | the words of the slot's text or Value | – |
+| 7, 8 | when the row was made, by its id; its latest stamp | f64 |
+| 9 order | its order in a list | u64, big-endian |
+
+With a path, the slot holds JSON and the path, names with dots between, says where in it; an array on the way stands for all it holds. A row may thus have many
+values, and a condition holds for it if it does for one of them. Ties in the order are settled by row id. With *from end* the offset and limit count back
+from the last row. A number is meaningful where `some` is 1: for count, how many rows have a value; for facet, how many different values there are, the `top`
+commonest of which follow with how many rows have each; for min and max, the value itself follows too.
+
+| where | | |
+|---|---|---|
+| 0 | | every row |
+| 1, 2 | n varint ‖ n × where | all of them, one of them |
+| 3 | where | not |
+| 4 | column ‖ flags (1: 1 lo, 2 hi, 4 lo itself, 8 hi itself) ‖ [lo bytes] ‖ [hi bytes] | from lo to hi |
+| 5 | column ‖ n varint ‖ n × bytes | one of these |
+| 6, 7 | column ‖ bytes | begins with, contains; kinds 1 and 2 |
+| 8 | column | has a value |
+| 9 | list (16) | is in a list |
+| 10 | column ‖ mode (1: 0 every word, 1 any, 2 a phrase) ‖ flags (1) ‖ text bytes | matches; kind 6 |
+| 11 | n varint ‖ n × row (16) | is one of these rows |
+| 12 | column ‖ scope varint ‖ where | refers, by a column of kind 5, to a row of a scope that … |
+| 13 | column ‖ scope varint ‖ min varint ‖ max varint ‖ where | is referred to, by a column of kind 5 of a scope, by so many rows that … |
+
+The flags of a match: 1, the last word may be only begun; 2, words may be parts of words; bits 2 and 3, how many letters of a word may be wrong, of one of three to
+five letters at most one. A word is a run of letters and digits, without case or marks, the first 64 bytes of which count; an apostrophe between letters is
+passed over; scripts that write no spaces are taken in overlapping pairs. How well a row answers is Okapi BM25 (k₁ 1.2, b 0.75), its sole use being an order.
+
+A question has at most 8 orders, 64 totals, a limit of 1000, 4096 conditions 32 deep, and 4096 bytes of text to match; a session has at most 1024.
+
+**Passing on.** A partial replica has a full one answer. It calls (§12) the device by the method with no name, which is for nodes themselves: no client may call or
+serve it, and it needs Read where others need Call, in every scope the question is about. The first message is the question. Each message back is an Answer without its id, and with
+each row's key (40) in place of its id, any key of it, or one in the graveyard at order zero for a row that is nowhere. The partial replica watches those
+places, data and live, and answers its client once it holds the rows. A device that will not answer faults *unserved*, and another is asked; until one
+does, and when none can be reached, the answer is of what is held.
+
+## 16 Who handles what
 
 | | protocol | consumer |
 |---|---|---|
