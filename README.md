@@ -6,6 +6,7 @@ The protocol is [SPEC.md](SPEC.md). This is the reference implementation, in Odi
 
 ```
 zsp/       the protocol: store, merge, windows, reconciliation, text, keys, calls. No I/O, threads or clocks
+find/      answering questions about it: an index made when first asked, kept encrypted, and never replicated
 pipe/      carrying it: UDP links, WebSocket, TLS, STUN. No I/O either
 host/      files, sockets, one thread, one event loop
 zspd/      a device's node, or a self-hosted relay: one consumer of the above
@@ -23,6 +24,11 @@ what it supersedes. The rule needs no key, so a relay that cannot read still mer
 **Everything is a range.** Rows sit in one ordered index of `(list, order, row)`. A list is a range, a page is a range, a scope is a range; a subscription is a
 set of ranges. The index is a B+tree that also sums fingerprints, so any two replicas compare any range in logarithmic time. That one
 operation is sync, resume, paging, scrollbars and recovery. There are no version vectors, no per-peer state and no queues.
+
+**Questions are asked of what is there.** Filters of any shape, words, phrases, misspellings, substrings, references either way between rows, JSON, any order,
+sums and facets: each answer stays true while it is open, and costs nothing once it is not. None of it is stored, replicated or seen by a relay. What answers is an
+index that a device makes of its own rows, of the columns asked about, when they are first asked about; it may be deleted at any time. A device that
+holds little asks one that holds everything, and says whose answer it has.
 
 **The log is the database.** A sealed cell is appended once. The bytes on disk are the bytes on the wire are the bytes on the relay.
 
@@ -52,6 +58,25 @@ operation is sync, resume, paging, scrollbars and recovery. There are no version
 | building the daemon | 1 s, or 10 s optimised; on an M5 Max, 0.3 s and 4.9 s |
 | building and running the core's tests | 5 s; everything, 9 s |
 
+`./x bench find`, the same machine, a million rows with a name, a number, a flag and twenty words of text, encrypted on disk. Every answer is the first 50 in order, and the exact count:
+
+| | |
+|---|---|
+| memory, holding the rows and an index of all of it | 5.3 MB private, of which the rows take 3.9 |
+| on disk | 255 bytes a row, for five columns, one of them every word |
+| making it, when first asked | 1 s, and 2 s for each column; 11 s for the words; never more than a few tens of ms at a time |
+| everything, newest first | 3 µs |
+| everything, by a number | 32 to 40 µs |
+| a name | 55 µs |
+| a name, a range and a flag, by number | 0.3 ms |
+| a wide range: 600,000 rows | 8 ms |
+| a rare word; a word in 400,000 rows; a phrase | 20 µs; 5 ms; 8 to 11 ms |
+| a word begun; misspelt; part of one | 2 ms; 5 ms; 3 ms |
+| the sum of every number | 2 µs |
+| the ten commonest names among 333,000 rows | 14 ms |
+| one more row, known to all of it | 0.12 to 0.17 ms |
+| opening it again | 11 to 17 ms |
+
 ## Using it
 
 ```sh
@@ -70,7 +95,7 @@ zspd admin ~/.zsp <that>                    # let it admit others; `off` to take
 ```luau
 local zsp = require("zsp")
 
-local Message = { author = zsp.string(16), body = zsp.text(17) }
+local Message = { author = zsp.string(16), body = zsp.text(17), stars = zsp.number(18) }
 local client = zsp.connect(host) -- a socket, a clock, a scheduler: see Host
 
 local window = client:window({ scope = 1, list = "chat/42", table = Message }, function(state)
@@ -81,6 +106,16 @@ window.visible(first, last) -- as the user scrolls, either way, for ever
 client:write(1, function(change)
     id = change.insert(Message, "chat/42", os.time(), { author = "model" })
 end)
+local w = zsp.where
+local found = client:ask({
+    scope = 1, table = Message,
+    where = w.all(w.matches("body", "quick fox", { prefix = true }), w.any(w.is("author", "ann"), w.over("stars", 3))),
+    order = { "best" }, limit = 50, totals = { authors = { "facet", "author", 10 } },
+}, function(answer)
+    render(answer.rows, answer.total, answer.totals.authors) -- again whenever it is no longer so
+end)
+found.move(50) -- another stretch of it
+
 local text = client:text(id, Message.body)
 text.append(token) -- seen everywhere at once; durable a piece at a time
 

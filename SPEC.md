@@ -426,7 +426,8 @@ node makes for itself of what it holds, and may throw away. A node need not answ
 
 An Answer follows whenever it differs from the last. `total` is how many rows there are, `first` how many of them come before those shown. Rows not shown
 before in any answer are sent whole, in Cells, ahead of it; what changes in a row shown, and live text in it, is sent as for a watch. A client therefore
-keeps a row while any answer shows it, and those of a question it ends until that is said to be *ended*, for an answer on its way may count on them.
+keeps a row while any answer shows it, those of a question it replaces until that is answered, and those of one it ends until that is said to be *ended*, for
+an answer on its way may count on them.
 *settled* says that a full replica gave the answer; otherwise it is true of what is held here. A client may ask about scopes it may read, in every part of a
 question; one that asks about others is *denied*, as is one whose right ends.
 

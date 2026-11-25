@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|sim|bench|nat|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|sim|bench [find]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -65,8 +65,13 @@ sim) # as many worlds as you have patience for: ./x sim 10000 [first]
 		-define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3
 	;;
 bench)
-	odin build bench -out:build/bench$EXE -o:speed $STRICT
-	build/bench$EXE build/bench-data
+	if [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]
+		odin build bench/find -out:build/bench-find$EXE -o:speed $STRICT
+		build/bench-find$EXE ${3:-1000000}
+	else
+		odin build bench -out:build/bench$EXE -o:speed $STRICT
+		build/bench$EXE build/bench-data
+	fi
 	;;
 nat) odin build zspd -out:build/zspd -debug $STRICT && sudo tests/nat.sh && sudo env NAT_B=--random-fully EXPECT_RELAY=1 tests/nat.sh ;;
 slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 && end_to_end slow_hibernation ;;
