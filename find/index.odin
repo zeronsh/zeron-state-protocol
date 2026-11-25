@@ -93,6 +93,8 @@ Held :: struct {
 }
 
 @(private)
+DEAD :: #config(ZSP_FIND_DEAD, 4096) // texts that are gone, and whose words are put up with
+@(private)
 BATCH :: 1 << 17 // edits gathered before they are made
 
 @(private)
@@ -1114,7 +1116,7 @@ held_flush :: proc(h: ^Held) {
 		}
 	}
 	texts_make(h)
-	if h.dead > 4096 && h.dead > h.alive {
+	if h.dead > DEAD && h.dead > h.alive {
 		words_renew(h)
 	}
 	index_relieve(h.scope.x)

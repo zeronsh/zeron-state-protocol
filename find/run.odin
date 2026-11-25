@@ -255,7 +255,7 @@ pred_rows :: proc(s: ^Scope, p: ^Pred) -> (out: Set) {
 			}
 			most := part.most if !part.not else pred_most(s, part.p)
 			// To ask it of each row that is left, or to find all that it holds for?
-			if most / ASK > out.count {
+			if most / ASK_COST > out.count {
 				gone: [dynamic]u32
 				defer delete(gone)
 				it := set_iterator(&out)
@@ -300,7 +300,7 @@ pred_rows :: proc(s: ^Scope, p: ^Pred) -> (out: Set) {
 		some := pred_rows(other, &p.kids[0])
 		defer set_destroy(&some)
 		it := set_iterator(&some)
-		if some.count * ASK < tree_total(x, p.held.by_key).count {
+		if some.count * ASK_COST < tree_total(x, p.held.by_key).count {
 			for row in set_next(&it) {
 				id, _ := row_id(other, row)
 				key := Key{id[0], id[1]}
@@ -365,7 +365,7 @@ pred_rows :: proc(s: ^Scope, p: ^Pred) -> (out: Set) {
 
 // Asking a row a question from the index costs about as much as reading so many entries in a row.
 @(private)
-ASK :: #config(ZSP_FIND_ASK, 64)
+ASK_COST :: #config(ZSP_FIND_ASK, 64)
 
 @(private)
 Gather :: struct {
@@ -641,7 +641,7 @@ match_texts :: proc(s: ^Scope, p: ^Pred) -> (out: Set, sure: bool) {
 		if out.count == 0 {
 			return
 		}
-		if counts[i] / ASK > out.count && len(keys[i]) == 1 {
+		if counts[i] / ASK_COST > out.count && len(keys[i]) == 1 {
 			gone: [dynamic]u32
 			defer delete(gone)
 			it := set_iterator(&out)
@@ -952,7 +952,7 @@ query_page :: proc(s: ^Scope, q: ^Query, rows: ^Set) -> []Hit {
 	lead := q.order[0] if len(q.order) > 0 else Sort{by = .Created}
 	// Looking for them in order reads all that lies between; having them all reads each.
 	between := (skip + count) * s.all.count / max(rows.count, 1)
-	walk := !relevance && rows.count > WALK && between / ASK < rows.count
+	walk := !relevance && rows.count > WALK && between / ASK_COST < rows.count
 	if !walk {
 		// All of them, put in order.
 		all := make([]Sorted, rows.count, context.temp_allocator)
@@ -1164,7 +1164,7 @@ aggregate :: proc(s: ^Scope, a: ^Aggregate, rows: ^Set) -> (out: Sum_Of) {
 			some: bool,
 		}
 		add := Add{rows = rows}
-		if rows.count * ASK < tree_total(x, h.by_row).count {
+		if rows.count * ASK_COST < tree_total(x, h.by_row).count {
 			it := set_iterator(rows)
 			for row in set_next(&it) {
 				runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()

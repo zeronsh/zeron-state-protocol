@@ -219,6 +219,9 @@ session_close :: proc(s: ^Session) {
 		}
 	}
 	rpc_session_closed(n, s)
+	if q := &n.host.questions; s.role == .Open && q.ended != nil {
+		q.ended(q.data, s)
+	}
 	delete(s.credential)
 	delete(s.grants)
 	delete(s.roots)
@@ -352,6 +355,7 @@ session_sent :: proc(s: ^Session, n: int) {
 
 @(private)
 session_frame :: proc(s: ^Session, frame: []byte) -> Fault {
+	n := s.node
 	r := Reader{buf = frame[1:]}
 	type := Message(frame[0])
 	if !s.greeted && type != .Hello {
@@ -401,6 +405,9 @@ session_frame :: proc(s: ^Session, frame: []byte) -> Fault {
 	case .Flow:
 		on_flow(s, &r)
 	case:
+		if q := &n.host.questions; frame[0] >= QUESTION && s.role == .Open && q.asked != nil {
+			return .None if q.asked(q.data, s, frame[0], frame[1:]) else .Malformed
+		}
 		return .None // unknown messages are for a later version
 	}
 	return .Malformed if r.bad else .None
@@ -575,6 +582,9 @@ session_authorize :: proc(s: ^Session) {
 		s.ready = true
 		send_scopes(s)
 		reach_tell(n, s)
+		if n.host.questions.again != nil {
+			n.host.questions.again(n.host.questions.data, s)
+		}
 		return
 	}
 	if s.ready {
@@ -1596,7 +1606,7 @@ on_live :: proc(s: ^Session, r: ^Reader) {
 	}
 	places := row_places(&n.store, l.row)
 	for to in n.sessions {
-		if to == s || !to.ready || !live_watched(to, &places) {
+		if to == s || !to.ready || !(live_watched(to, &places) || session_shows(to, l.row)) {
 			continue
 		}
 		if to.role == .Open {
@@ -1669,6 +1679,27 @@ live_signed :: proc(l: ^Live, bind, body: []byte) -> []byte {
 	write_stamp(&m, l.stamp)
 	append(&m, ..body)
 	return m[:]
+}
+
+@(private)
+session_shows :: proc(s: ^Session, row: Id) -> bool {
+	q := &s.node.host.questions
+	return s.role == .Open && q.shows != nil && q.shows(q.data, s, row)
+}
+
+// Says something in answer to a question.
+session_post :: proc(s: ^Session, type: u8, payload: []byte) {
+	cells_close(s)
+	at := frame_begin(&s.out, Message(type))
+	append(&s.out, ..payload)
+	frame_end(&s.out, at)
+}
+
+// Has the whole of a row sent, before whatever is said after.
+session_show :: proc(s: ^Session, row: Id) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	emit_row(s, row)
+	cells_close(s)
 }
 
 @(private)
@@ -1922,6 +1953,9 @@ emit_change :: proc(s: ^Session, c: ^Change) {
 			now ||= range_has(&w, k)
 		}
 	}
+	if !now && s.role == .Open && session_shows(s, c.row) {
+		was, now, level = true, true, true // it was sent whole when it was found
+	}
 	if !was && !now {
 		return
 	}
@@ -2025,6 +2059,9 @@ session_recompare :: proc(s: ^Session) {
 resync :: proc(s: ^Session) {
 	n := s.node
 	s.cursor = n.events.next
+	if n.host.questions.again != nil && s.role == .Open {
+		n.host.questions.again(n.host.questions.data, s)
+	}
 	for &w in s.watches {
 		if !w.data {
 			continue

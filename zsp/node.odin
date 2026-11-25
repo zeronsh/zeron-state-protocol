@@ -44,7 +44,20 @@ Host :: struct {
 	roster:       proc(data: rawptr, bytes: []byte), // a newer roster was adopted: persist it
 	signal:       proc(data: rawptr, from: Key32, blob: []byte), // from another member, via a relay
 	presence:     proc(data: rawptr, online: []Key32),
+	questions:    Questions,
 }
+
+// Whoever answers questions about what is here, if anyone does: see package find. Open sessions ask them.
+Questions :: struct {
+	data:  rawptr,
+	asked: proc(data: rawptr, s: ^Session, type: u8, payload: []byte) -> bool, // false if it makes no sense
+	shows: proc(data: rawptr, s: ^Session, row: Id) -> bool, // whether an answer is showing a row
+	again: proc(data: rawptr, s: ^Session), // a session fell behind, or its rights have changed
+	ended: proc(data: rawptr, s: ^Session),
+}
+
+// The least message type that is a question.
+QUESTION :: 32
 
 // Interest ids never meet the ids of root watches.
 @(private)

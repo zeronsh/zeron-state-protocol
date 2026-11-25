@@ -781,6 +781,16 @@ check_index :: proc(t: ^testing.T, w: ^World) {
 			if h.kind != .Words {
 				testing.expect_value(t, tree_total(&w.x, h.by_row).count, tree_total(&w.x, h.by_key).count)
 			}
+			Ghosts :: struct {
+				s: ^Scope,
+				n: int,
+			}
+			g := Ghosts{s = s}
+			tree_each(&w.x, h.by_row, KEY_MIN, KEY_MAX, &g, proc(data: rawptr, e: ^Entry) {
+				g := (^Ghosts)(data)
+				g.n += 0 if set_has(&g.s.all, u32(e.key.hi >> 32)) else 1
+			})
+			testing.expect_value(t, g.n, 0)
 		}
 	}
 	testing.expect(t, !w.x.failed)
