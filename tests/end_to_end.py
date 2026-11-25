@@ -1,6 +1,6 @@
 """Real processes on real sockets: a relay, devices and clients. Run by `./x test`."""
 
-import os, re, shutil, socket, subprocess, sys, tempfile, time
+import os, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "clients", "python"))
@@ -50,15 +50,24 @@ class Node:
 
 
 class Cloud:
-    """The same relay as a Durable Object, under workerd."""
+    """The same relay as a Durable Object: under workerd here or, given ZSP_CLOUD=https://... and
+    ZSP_CLOUD_TOKEN, wherever it is deployed."""
 
     def start(self, **env):
+        self.token = env.get("ACCESS_TOKEN", "")
+        live = os.environ.get("ZSP_CLOUD")
+        if live:
+            request = urllib.request.Request(live, headers={"User-Agent": "zsp-test"})
+            self.key = urllib.request.urlopen(request).read().decode().strip()
+            self.url, self.token, self.p = live.replace("http", "ws", 1), os.environ["ZSP_CLOUD_TOKEN"], None
+            return self
         self.p = subprocess.Popen(
             ["node", os.path.join(ROOT, "relay", "dev.mjs")], stdout=subprocess.PIPE, text=True, env={**os.environ, **env},
             stderr=open(os.path.join(TMP, "cloud.log"), "a"),
         )
         procs.append(self.p)
         self.key, self.address = re.match(r"(\w{64}) listening on ws://(\S+)", self.p.stdout.readline()).groups()
+        self.url = "ws://" + self.address
         return self
 
 
@@ -76,10 +85,11 @@ def space(*names, udp=(), relay=None, options=()):
     relay = relay or Node(names[0] + "-relay", "serve", "--no-udp").start()
     devices = [Node(n, "run", *options, *([] if n in udp else ["--no-udp"])) for n in names]
     sid = zspd("create", devices[0].dir)
-    zspd("relay", devices[0].dir, relay.key, "ws://" + relay.address)
+    url = getattr(relay, "url", None) or "ws://localhost:" + relay.address.split(":")[1]
+    zspd("relay", devices[0].dir, relay.key, url)
     for d in devices[1:]:
         zspd("admit", devices[0].dir, zspd("key", d.dir), "1")
-        zspd("join", d.dir, sid, relay.key, "ws://" + relay.address)
+        zspd("join", d.dir, sid, relay.key, url)
     for d in devices:
         d.start()
     for d in devices:
@@ -119,6 +129,18 @@ def test_sync_through_relay():
     ca.live(rows[119], 17, b"pieceone", 6, b"world")
     cb.until(lambda: len(cb.lives) == 2)
     assert cb.lives[1] == (rows[119], 17, b"pieceone", 6, b"world")
+
+
+def test_dial_by_name():
+    # Resolving a name is a thread's work, and the loop must hear of it with nobody there to poke it.
+    relay = Node("x-relay", "serve", "--no-udp").start()
+    for i in range(12):
+        n = Node("x%d" % i, "run", "--no-udp")
+        sid = zspd("create", n.dir)
+        zspd("relay", n.dir, relay.key, "ws://localhost:" + relay.address.split(":")[1])
+        n.start()
+        eventually("the relay hears from it", lambda: os.path.exists(os.path.join(relay.dir, sid, "roster")), 3)
+        n.stop()
 
 
 def test_offline_and_crash():
@@ -286,7 +308,7 @@ def test_luau():
 
 def test_durable_object():
     cloud = Cloud().start(ACCESS_TOKEN="sesame")
-    _, (a, b) = space("p", "q", relay=cloud, options=["--credential=sesame"])
+    _, (a, b) = space("p", "q", relay=cloud, options=["--credential=" + cloud.token])
     ca, cb = a.client(), b.client()
     cb.watch(1, 1, "chat", limit=50)
     cb.until(lambda: 1 in cb.windows)
@@ -301,16 +323,16 @@ def test_durable_object():
     ca.until(lambda: len(ca.devices) == 2)
     ca.send(zsp.CALL, zsp.varint(9) + ca.devices[1][0] + zsp.varint(1) + zsp.varint(3) + b"addhi")
     ca.calls[9] = {"data": [], "ended": False, "fault": None}
-    cb.drain(0.3)
+    cb.drain(1)
     ca.until(lambda: ca.calls[9]["data"] == [b"hi!"])
 
     # A device that was away while everything happened, with nobody else online.
     a.stop(), b.stop()
-    c = Node("r", "run", "--no-udp", "--credential=sesame")
+    c = Node("r", "run", "--no-udp", "--credential=" + cloud.token)
     zspd("admit", a.dir, zspd("key", c.dir), "1")
-    zspd("join", c.dir, zspd_space(a), cloud.key, "ws://" + cloud.address)
+    zspd("join", c.dir, zspd_space(a), cloud.key, cloud.url)
     a.start()
-    time.sleep(0.5)
+    time.sleep(2)
     a.stop()
     c.start()
     cc = c.client()
@@ -320,24 +342,26 @@ def test_durable_object():
 
     # Without the credential, nothing.
     d = Node("s", "run", "--no-udp")
-    zspd("join", d.dir, zspd_space(a), cloud.key, "ws://" + cloud.address)
+    zspd("join", d.dir, zspd_space(a), cloud.key, cloud.url)
     d.start()
-    time.sleep(0.5)
+    time.sleep(2)
     assert not os.path.exists(os.path.join(d.dir, zspd_space(a), "roster"))
 
 
 def slow_hibernation():
     cloud = Cloud().start()
-    _, (a, b) = space("t", "u", relay=cloud)
+    _, (a, b) = space("t", "u", relay=cloud, options=["--credential=" + cloud.token])
     ca, cb = a.client(), b.client()
     cb.watch(1, 1, "chat", limit=50)
     ca.put(1, "chat", 1, [b"before"])
     cb.until(lambda: len(cb.list(1, "chat")) == 1)
-    time.sleep(15)  # the object is evicted; its sockets are not
+    time.sleep(40 if cloud.p is None else 15)  # the object is evicted; its sockets are not
     ca.put(1, "chat", 2, [b"after"])
     cb.until(lambda: len(cb.list(1, "chat")) == 2)
     ca.live(cb.list(1, "chat")[0][1], 17, b"pieceone", 0, b"still live")
     cb.until(lambda: cb.lives)
+    if cloud.p is None:
+        return  # its console is elsewhere
     cloud.p.terminate()
     assert "woke with 2 sockets" in cloud.p.stdout.read() + open(os.path.join(TMP, "cloud.log")).read()
 

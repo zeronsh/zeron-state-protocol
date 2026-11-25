@@ -4,6 +4,7 @@ import "core:encoding/hex"
 import "core:nbio"
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:thread"
 import "core:time"
 import "../pipe"
@@ -252,9 +253,6 @@ stream_session :: proc(s: ^Stream, initiator: bool) {
 	credential := transmute([]byte)s.host.credential if initiator else nil
 	s.session = zsp.session_open(&s.space.node, s.role, initiator, s.channel.peer, credential)
 	s.phase = .Open
-	if s.dialer != nil {
-		s.dialer.failures = 0
-	}
 }
 
 @(private)
@@ -397,6 +395,7 @@ Dialer :: struct {
 	thread:   ^thread.Thread,
 	endpoint: net.Endpoint,
 	found:    bool,
+	answered: bool, // atomic
 	loop:     ^nbio.Event_Loop,
 }
 
@@ -475,12 +474,16 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 				dialer_resolve(d)
 			}
 		case .Resolving:
-			if thread.is_done(d.thread) {
+			if sync.atomic_load(&d.answered) {
+				thread.join(d.thread)
 				thread.destroy(d.thread)
 				d.thread = nil
 				dialer_resolved(d)
 			}
 		case .Up:
+			if d.stream.session != nil && d.stream.session.ready {
+				d.failures = 0 // admitted, not merely answered
+			}
 			if d.dropped {
 				d.stream.closing = true
 				continue
@@ -506,6 +509,7 @@ dialer_resolve :: proc(d: ^Dialer) {
 		return
 	}
 	d.state = .Resolving
+	d.answered = false
 	d.loop = nbio.current_thread_event_loop()
 	d.thread = thread.create_and_start_with_poly_data(d, proc(d: ^Dialer) {
 		ep, err := net.resolve_ip4(d.url.name)
@@ -514,6 +518,9 @@ dialer_resolve :: proc(d: ^Dialer) {
 		}
 		d.endpoint = {ep.address, d.url.port}
 		d.found = err == nil
+		// Said before waking the loop: a thread is not done until after its last word, and a loop that
+		// looked too soon would sleep on it for ever.
+		sync.atomic_store(&d.answered, true)
 		nbio.wake_up(d.loop)
 	})
 }

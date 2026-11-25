@@ -429,10 +429,10 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	}
 	bound, _ := net.bound_endpoint(h.listener)
 	address := net.endpoint_to_string(bound, context.temp_allocator)
-	say(os.stdout, to_hex(h.device[:]), " listening on ws://", address, "\n")
 	if !relay {
 		host.save(in_dir(dir, "address"), transmute([]byte)address)
 	}
+	say(os.stdout, to_hex(h.device[:]), " listening on ws://", address, "\n")
 	host.links_announce(&h)
 	return 0 if host.host_run(&h) else 1
 }
