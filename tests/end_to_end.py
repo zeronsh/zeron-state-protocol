@@ -235,6 +235,7 @@ def test_permissions():
     except PermissionError:
         pass
 
+    roster = lambda d: open(os.path.join(d.dir, zspd_space(a), "roster"), "rb").read()
     # An admin governs without owning; may not appoint; and, unmade, governs no more.
     zspd("admin", a.dir, zspd("key", b.dir))
     cb = b.client()
@@ -242,9 +243,10 @@ def test_permissions():
     three = int(zspd("scope", b.dir))
     zspd("admit", b.dir, zspd("key", a.dir), str(three))
     ca.until(lambda: three in ca.scopes)
+    eventually("a hears of it", lambda: roster(b) == roster(a))
     assert refused("admin", b.dir, zspd("key", c.dir)) and refused("revoke", b.dir, zspd("key", a.dir))
     zspd("admin", a.dir, zspd("key", b.dir), "off")
-    time.sleep(0.5)
+    eventually("b hears of it", lambda: roster(b) == roster(a))
     assert refused("scope", b.dir)
 
     # The wrong token, and a web page, are refused.
