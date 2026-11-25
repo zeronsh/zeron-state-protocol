@@ -30,7 +30,7 @@ TAGS := []string{"apple", "a long name that", "exactly sixteen!", "exactly sixte
 NAMES := []string{"", "a", "A", "ab", "Ab", "abc", "Zoë", "zoe", "exactly sixteen!", "exactly sixteen!!", "exactly sixteen?", "EXACTLY SIXTEEN!", "a long name that goes on", "a long name that goes off", "n\x00", "n"}
 
 @(private)
-world_make :: proc(t: ^testing.T, w: ^World, partial: ^World = nil) {
+world_make :: proc(t: ^testing.T, w: ^World, partial: ^World = nil, flags := zsp.Scope_Flags{}) {
 	root: zsp.Key32
 	for &b in root {
 		b = byte(rand.uint32())
@@ -48,7 +48,7 @@ world_make :: proc(t: ^testing.T, w: ^World, partial: ^World = nil) {
 	none: zsp.Roster
 	d := zsp.draft_from(&none, 1)
 	for _ in 0 ..< 2 {
-		scope := zsp.draft_scope(&d)
+		scope := zsp.draft_scope(&d, flags)
 		zsp.draft_grant(&d, w.keys.device, w.keys.signer, scope, {.Write}).owner = true
 		if partial != nil {
 			zsp.draft_grant(&d, partial.keys.device, partial.keys.signer, scope, {.Read, .Write})

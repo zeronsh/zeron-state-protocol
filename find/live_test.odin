@@ -923,3 +923,85 @@ what_is_known_is_not_found_again :: proc(t: ^testing.T) {
 		testing.expect(t, len(c.cells[id]) > 0)
 	}
 }
+
+// A roster that says someone had no right to what they wrote takes it out of every replica, and out of the answers.
+@(test)
+what_a_roster_takes_is_not_answered :: proc(t: ^testing.T) {
+	state := rand.create(99)
+	context.random_generator = rand.default_random_generator(&state)
+	for round in 0 ..< 6 {
+		w, p: World
+		world_make(t, &w, &p, {.Signed})
+		defer world_destroy(&w)
+		defer world_destroy(&p)
+		f: Finder
+		pages: Memory_Disk
+		finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+		f.settled = true
+		c := client_open(&w, &f)
+		w.node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+			zsp.session_accept(s, {{0, {.Read, .Write}, 0}} if s.role == .Open else nil)
+		}
+		p.node.host.authenticate = w.node.host.authenticate
+		g: Finder
+		link := link_make(&p, &w)
+		defer {
+			zsp.session_close(link[0])
+			zsp.session_close(link[1])
+			zsp.session_close(c.session)
+			finder_close(&f)
+			client_free(&c)
+			memory_disk_destroy(&pages)
+		}
+		for _ in 0 ..< 30 {
+			world_write(t, &w)
+		}
+		w.node.now += 60_000
+		before := w.node.now
+		p.node.now = before + 60_000
+		mine := make([dynamic]zsp.Id, context.temp_allocator)
+		for i in 0 ..< 20 {
+			id := zsp.node_id(&p.node, 1)
+			b := make([]byte, 24, context.temp_allocator)
+			l := list_of(1, 0)
+			zsp.put_u64(b, l[0])
+			zsp.put_u64(b[8:], l[1])
+			zsp.put_u64(b[16:], u64(i))
+			testing.expect(t, zsp.node_write(&p.node, {{id, 1, .Place, zsp.node_stamp(&p.node), b}, {id, 16, .Value, zsp.node_stamp(&p.node), transmute([]byte)rand.choice(NAMES)}}))
+			append(&mine, id)
+			append(&w.rows, id)
+		}
+		w.node.now = p.node.now
+		q := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&q, 1)
+		append(&q, u8(Op.Exists), u8(Kind.Bytes), 16, 0, 1, 2, 1, 0, 0, 50, 0)
+		g.n = &p.node
+		client_ask(t, &c, 1, q[:])
+		for _ in 0 ..< 6 {
+			link_pass(t, link, max(int))
+			finder_run(&f, 1 << 16)
+		}
+		client_hear_out(t, &c, &f)
+		testing.expect(t, answer_check(t, &w, &f, &c, 1, q[:]) && c.answers[1].total >= 20)
+		if round % 2 == 1 {
+			index_save(&f.x)
+		}
+		d := zsp.draft_from(&w.node.roster, before << 16)
+		zsp.draft_revoke(&d, p.keys.device, 1)
+		bytes, ok := zsp.roster_sign(&w.keys, w.root, &d)
+		defer delete(bytes)
+		testing.expect(t, ok && zsp.node_adopt(&w.node, bytes))
+		for id in mine {
+			testing.expect(t, zsp.row_places(&w.node.store, id).count == 0)
+		}
+		for _ in 0 ..< 4 {
+			for !finder_run(&f, 1 + rand.int_max(4)) {
+			}
+			client_hear_out(t, &c, &f)
+		}
+		for id in c.answers[1].ids {
+			testing.expect(t, !slice.contains(mine[:], id))
+		}
+		testing.expect(t, answer_check(t, &w, &f, &c, 1, q[:]))
+	}
+}
