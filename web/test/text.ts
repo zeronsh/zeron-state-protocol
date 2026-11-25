@@ -1,13 +1,9 @@
 // Holds text.ts to text.luau: seeded writers type, delete, name elements, stream, seal, bundle and receive, here, and
 // text.luau does exactly the same; every step's outcome, the bodies sealed, and where every element ends up must be the
 // same byte for byte. node web/test/text.ts [seeds] [first]
-//
-// The Luau is that of luau/zsp/text.luau if it names elements, and otherwise that of the mirror branch, which does.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -249,17 +245,6 @@ function generate(r: Random): { ops: Op[]; world: World } {
 
 // ---------------------------------------------------------------- side by side
 
-// The Luau text that names elements, and the codec beside it, in a place of their own.
-function luauText(): { path: string; done: () => void } {
-  const main = readFileSync(join(root, "luau/zsp/text.luau"), "utf8");
-  if (main.includes("function text.after(")) return { path: relative(here, join(root, "luau/zsp/text")), done: () => {} };
-  const dir = mkdtempSync(join(tmpdir(), "zsp-text-"));
-  for (const name of ["text", "codec"]) {
-    writeFileSync(join(dir, `${name}.luau`), execFileSync("git", ["-C", root, "show", `origin/mirror:luau/zsp/${name}.luau`]));
-  }
-  return { path: relative(here, join(dir, "text")), done: () => rmSync(dir, { recursive: true }) };
-}
-
 const began = performance.now();
 const seeds: { seed: number; ops: Op[]; out: string[] }[] = [];
 for (let seed = FIRST; seed < FIRST + SEEDS; seed++) {
@@ -268,14 +253,9 @@ for (let seed = FIRST; seed < FIRST + SEEDS; seed++) {
 }
 const ran = performance.now();
 
-const luau = luauText();
-let theirs: string[];
-try {
-  const input = JSON.stringify({ seeds: seeds.map((s) => ({ ops: s.ops.map((op) => ({ ...op, w: op.w + 1, ...(op.o === "apply" || op.o === "live" ? lua(op) : {}) })) })) });
-  theirs = execFileSync("lune", ["run", join(here, "text.luau"), luau.path], { input, maxBuffer: 1 << 30 }).toString().replace(/\n$/, "").split("\n");
-} finally {
-  luau.done();
-}
+const input = JSON.stringify({ seeds: seeds.map((s) => ({ ops: s.ops.map((op) => ({ ...op, w: op.w + 1, ...(op.o === "apply" || op.o === "live" ? lua(op) : {}) })) })) });
+const luau = relative(here, join(root, "luau/zsp/text"));
+const theirs = execFileSync("lune", ["run", join(here, "text.luau"), luau], { input, maxBuffer: 1 << 30 }).toString().replace(/\n$/, "").split("\n");
 const replayed = performance.now();
 
 // Luau counts from one.

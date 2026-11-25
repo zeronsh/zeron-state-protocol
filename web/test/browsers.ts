@@ -9,10 +9,17 @@ import { createServer as http } from "node:http";
 import { createServer as tcp, connect as dial } from "node:net";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
-import { Chrome, type Page } from "./chrome.ts";
+import { Chrome, findChrome, type Page } from "./chrome.ts";
 import { cloud, eventually, exists, expectEqual, node, procs, ROOT, TMP, token, zspd, zspdConnect } from "./procs.ts";
 import { Client, columns } from "../src/client.ts";
 import type { Side } from "./browser.ts";
+
+// A machine without a browser cannot run these, and says so; but CI is never such a machine.
+if (!findChrome()) {
+  if (process.env.CI) throw new Error("no Chrome here: set CHROME to where it is");
+  console.log("skip browsers: no Chrome here; set CHROME to where it is");
+  process.exit(0);
+}
 
 const WEB = join(ROOT, "web");
 execFileSync(process.execPath, [join(WEB, "build.ts"), "--test"], { stdio: "inherit" });

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|sim|bench [find|edits|mirror]|nat|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -20,9 +20,41 @@ wasm() {
 		-extra-linker-flags:"--strip-all -z stack-size=262144 --stack-first"
 }
 
+# A device's node for browsers and Node, and one with small segments, so that test/store.ts rolls and drops them often.
+web_wasm() {
+	odin build web/wasm -target:js_wasm32 -o:size -out:web/src/node.wasm -no-entry-point $STRICT \
+		-extra-linker-flags:"--strip-all -z stack-size=262144 --stack-first"
+}
+web_small() {
+	odin build web/wasm -target:js_wasm32 -o:minimal -out:build/node-small.wasm -no-entry-point $STRICT $SMALL \
+		-extra-linker-flags:"--strip-all -z stack-size=262144 --stack-first"
+}
+web_deps() {
+	[ -d web/node_modules ] || (cd web && npm ci --silent)
+}
+stale() { # whether a file is older than any Odin it is built from
+	[ ! -f "$1" ] || [ -n "$(find zsp find web/wasm -name "*.odin" -newer "$1")" ]
+}
+
 end_to_end() {
 	[ -d relay/node_modules ] || (cd relay && npm install --silent)
 	$PYTHON tests/end_to_end.py "$@"
+}
+
+# The web client and node: on their own, against the other clients, beside zspd devices, and in a browser. Side by side,
+# each saying what it has to say at its end.
+web_test() {
+	cd web
+	node test/client.ts
+	node test/vectors.ts ../vectors/vectors.json
+	node test/ask.ts
+	for t in text store end_to_end browsers; do
+		args=
+		[ $t = store ] && args=../build/node-small.wasm
+		(node test/$t.ts $args >../build/web-$t.log 2>&1 || echo web-$t >>../build/failed) &
+	done
+	wait
+	cat ../build/web-text.log ../build/web-store.log ../build/web-end_to_end.log ../build/web-browsers.log
 }
 
 case "${1:-test}" in
@@ -31,7 +63,9 @@ check) # every platform, no code generated
 		odin check zspd -target:$t $STRICT && echo "ok   $t"
 	done
 	odin check relay/wasm -target:js_wasm32 -no-entry-point $STRICT && echo "ok   js_wasm32"
+	odin check web/wasm -target:js_wasm32 -no-entry-point $STRICT && echo "ok   js_wasm32 web"
 	luau-analyze luau/zsp/init.luau examples/luau/workspace.luau && echo "ok   luau"
+	web_deps && (cd web && npx tsc -p .) && echo "ok   typescript"
 	;;
 test)
 	# Side by side, since none needs another; each says what it has to say at its end.
@@ -42,9 +76,14 @@ test)
 	(odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 || echo zspd >>build/failed) &
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
 	(odin build examples/apps -out:build/apps$EXE -debug $STRICT || echo examples >>build/failed) &
+	(! stale web/src/node.wasm || web_wasm || echo web >>build/failed) &
+	(! stale build/node-small.wasm || web_small || echo web >>build/failed) &
+	web_deps
 	[ -f relay/src/relay.wasm ] && [ -z "$(find zsp relay/wasm -name "*.odin" -newer relay/src/relay.wasm)" ] || wasm || echo wasm >>build/failed
 	wait
 	[ ! -f build/failed ]
+	(web_test >build/web.log 2>&1 || echo web >>build/failed) &
+	web=$!
 	build/vectors$EXE | cmp - vectors/vectors.json
 	node tests/vectors.mjs vectors/vectors.json
 	lune run luau/tests/vectors.luau vectors/vectors.json
@@ -57,6 +96,9 @@ test)
 	$PYTHON examples/apps/test.py
 	$PYTHON examples/organization.py
 	end_to_end
+	wait $web || true
+	cat build/web.log
+	[ ! -f build/failed ]
 	;;
 build)
 	# Whole-program optimisation, in parallel where the linker speaks the compiler's own LLVM.
@@ -67,7 +109,10 @@ build)
 	esac
 	odin build zspd -out:build/zspd$EXE -o:speed $lto $STRICT
 	;;
-wasm) wasm ;;
+wasm) wasm && web_wasm ;;
+web) # what a browser loads, built into web/dist: ./x web
+	web_wasm && web_deps && node web/build.ts
+	;;
 sim) # as many worlds as you have patience for: ./x sim 10000 [first]
 	odin test zsp -o:speed -out:build/sim$EXE $SMALL -define:ZSP_SEEDS=${2:-5000} -define:ZSP_FIRST_SEED=${3:-1000} \
 		-define:ZSP_TEXT_SEEDS=${2:-5000} -define:ZSP_FUZZ=$((${2:-5000} / 10))

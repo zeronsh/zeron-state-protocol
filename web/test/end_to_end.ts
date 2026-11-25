@@ -2,6 +2,7 @@
 // can meet runs test/live.ts: the TypeScript client against zspd as the Luau client is, and web devices against zspd
 // devices through a relay of zspd's and through the Durable Object. `node test/end_to_end.ts [names...]`
 
+import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "../src/client.ts";
@@ -145,18 +146,34 @@ const tests: Record<string, () => Promise<void>> = {
 
 async function main(): Promise<void> {
   const names = process.argv.slice(2).length > 0 ? process.argv.slice(2) : Object.keys(tests);
-  let failed = 0;
-  for (const name of names) {
-    const start = performance.now();
-    try {
-      await tests[name]();
-      console.log(`ok   ${name} ${((performance.now() - start) / 1000).toFixed(2)}s`);
-    } catch (e) {
-      failed++;
-      console.log(`FAIL ${name}: ${e instanceof Error ? e.stack : e}\n     in ${TMP}`);
-    } finally {
-      for (const p of procs.splice(0)) p.kill();
+  if (names.length > 1) {
+    // Side by side, each in a process of its own, as tests/end_to_end.py runs.
+    const runs = names.map((name) => {
+      const p = spawn(process.execPath, [process.argv[1], name], { stdio: ["ignore", "pipe", "pipe"] });
+      let out = "";
+      p.stdout.on("data", (d) => (out += d));
+      p.stderr.on("data", (d) => (out += d));
+      return new Promise<[string, number]>((done) => p.on("exit", (code) => done([out, code ?? 1])));
+    });
+    let failed = false;
+    for (const [out, code] of await Promise.all(runs)) {
+      process.stdout.write(out);
+      failed ||= code !== 0;
     }
+    rmSync(TMP, { recursive: true, force: true });
+    process.exit(failed ? 1 : 0);
+  }
+  const name = names[0];
+  const start = performance.now();
+  let failed = false;
+  try {
+    await tests[name]();
+    console.log(`ok   ${name} ${((performance.now() - start) / 1000).toFixed(2)}s`);
+  } catch (e) {
+    failed = true;
+    console.log(`FAIL ${name}: ${e instanceof Error ? e.stack : e}\n     in ${TMP}`);
+  } finally {
+    for (const p of procs.splice(0)) p.kill();
   }
   if (!failed) rmSync(TMP, { recursive: true, force: true });
   process.exit(failed ? 1 : 0);
