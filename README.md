@@ -103,3 +103,7 @@ Embedding in Odin is the same question asked of `host.Config.authenticate`, or o
 
 `./x check` type-checks every platform, `./x test` runs everything, `./x sim 10000` runs ten thousand seeded networks that fragment, partition, crash and
 conflict, `./x nat` punches through real NATs in network namespaces, `./x slow` watches a Durable Object sleep. Needs `odin` (dev-2026-11), `wasm-ld`, `lune`, `luau-analyze`, `node`, `python3`.
+
+## License
+
+[MIT](LICENSE)

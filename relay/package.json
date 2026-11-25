@@ -1,6 +1,7 @@
 {
   "name": "zsp-relay",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "devDependencies": {
     "miniflare": "^4.20260730.0"
