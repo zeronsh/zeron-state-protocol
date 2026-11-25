@@ -183,8 +183,38 @@ def test_direct_links():
     cb.until(lambda: cb.lives and cb.lives[0][4] == b"direct")
 
 
+def probe_broadcast():
+    import select
+
+    listeners = []
+    for _ in range(2):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        s.bind(("", 9084))
+        listeners.append(s)
+    t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    t.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.connect(("8.8.8.8", 53))
+    mine = u.getsockname()[0]
+    for to in (mine.rsplit(".", 1)[0] + ".255", "127.255.255.255", "255.255.255.255", mine, "127.0.0.1"):
+        try:
+            t.sendto(to.encode(), (to, 9084))
+        except OSError as e:
+            print("probe", to, e)
+    time.sleep(0.5)
+    for i, s in enumerate(listeners):
+        while select.select([s], [], [], 0)[0]:
+            print("probe listener", i, s.recvfrom(100))
+    print(subprocess.run("ifconfig; netstat -rn -f inet; sw_vers", shell=True, capture_output=True, text=True).stdout)
+
+
 def test_lan_without_relay():
     import threading
+
+    if sys.platform == "darwin":
+        probe_broadcast()
 
     a, b = Node("g"), Node("h")
     sid = zspd("create", a.dir)
@@ -430,7 +460,7 @@ def test_questions_passed_on():
         cb.until(lambda: cb.answers[1]["total"] == 111 and cb.answers[1]["rows"][0] == rows[0])
         # With nobody to ask, what is here is the answer, and says so; and then not.
         a.stop()
-        cb.until(lambda: not cb.answers[1].get("settled", True) and cb.answers[1]["total"] >= 20)
+        cb.until(lambda: not cb.answers[1].get("settled", True) and cb.answers[1]["total"] >= 20, 40) # not before it has been asked seven times
         cb.ask(2, 1, zsp.equals(name, "person 2"))
         assert cb.answer(2)["rows"] == [rows[0]] and not cb.answers[2]["settled"]
         a.start()

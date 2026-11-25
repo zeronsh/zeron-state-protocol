@@ -106,6 +106,7 @@ udp_open :: proc(h: ^Host, port: int) -> bool {
 				u.have_beacon = true
 				udp_listen(h, u.beacon)
 			} else {
+				report(.Debug, "cannot listen for those nearby")
 				net.close(u.beacon)
 			}
 		}
