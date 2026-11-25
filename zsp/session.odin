@@ -7,6 +7,11 @@ VERSION :: 1
 OUT_HIGH :: 64 << 10 // stop producing bulk when this much is waiting
 OUT_LIVE :: 16 << 10 // drop live frames when this much is waiting
 CELLS_FRAME :: 16 << 10 // close a cells frame past this
+RECON_FRAME :: 128 << 10 // say no more than this at once; the rest is said next time
+WANT_FRAME :: 64 << 10
+WANT_HELD :: 2048 // do not list more of a row than this: have it sent whole
+MAX_LIVE :: 64 << 10
+LIVE_LATE :: 60 << 26 // a minute of stamp time: 60 * 1024 ms * 2^16
 LIST_MAX :: 32 // reconcile ranges this small by listing them
 FANOUT :: 16
 
@@ -29,8 +34,9 @@ Session :: struct {
 	role:      Role,
 	initiator: bool,
 	peer:      Key32,
+	relay:     bool, // dialled as a relay, at a key known to be one's
 	peer_full: bool,
-	peer_relay: bool,
+	peer_relay: bool, // and says it is
 	peer_serial: u64,
 	credential: []byte, // owned; presented in our hello
 	grants:    [dynamic]Grant, // what the peer may do; scope zero stands for every scope
@@ -43,6 +49,8 @@ Session :: struct {
 	roots_gen: u64,
 	roots_due: int, // how many of them are yet to be brought level
 	settled:   bool, // none
+	told:      bool, // and the responder has been told that all of it was sent
+	hushed:    u64, // roster serial under which it was paused
 	paused:    bool, // everyone who could write is reachable without this session
 
 	input:     [dynamic]byte, // an incomplete frame, or frames awaiting the host's verdict
@@ -132,8 +140,8 @@ Cells_Frame :: struct {
 }
 
 // `peer` is the key the channel proved, and nothing for open sessions. `credential` is for the other
-// end's host to judge.
-session_open :: proc(n: ^Node, role: Role, initiator: bool, peer: Key32 = {}, credential: []byte = nil) -> ^Session {
+// end's host to judge. `relay` says the key dialled is known to be a relay's: no peer can say so itself.
+session_open :: proc(n: ^Node, role: Role, initiator: bool, peer: Key32 = {}, credential: []byte = nil, relay := false) -> ^Session {
 	s := new(Session)
 	s.node = n
 	s.id = n.next_id
@@ -141,6 +149,7 @@ session_open :: proc(n: ^Node, role: Role, initiator: bool, peer: Key32 = {}, cr
 	s.role = role
 	s.initiator = initiator
 	s.peer = peer
+	s.relay = relay
 	s.credential = slice.clone(credential)
 	s.cursor = n.events.next
 	append(&n.sessions, s)
@@ -208,6 +217,13 @@ session_close :: proc(s: ^Session) {
 	delete(s.tasks)
 	delete(s.watches)
 	delete(s.unacked)
+	for &it in n.interests {
+		#reverse for r, i in it.reports {
+			if r.session == s.id {
+				unordered_remove(&it.reports, i)
+			}
+		}
+	}
 	for id in s.owed {
 		interest_settled(n, id) // it never will: what is here is all that can be had
 	}
@@ -398,7 +414,10 @@ on_hello :: proc(s: ^Session, r: ^Reader) -> Fault {
 		return .Denied
 	}
 	s.peer_full = flags.full
-	s.peer_relay = flags.relay
+	s.peer_relay = s.relay && flags.relay
+	if s.relay != s.peer_relay {
+		return .Denied
+	}
 	switch {
 	case s.initiator && s.role == .Peer:
 		session_accept(s) // the dialler chose whom to dial
@@ -484,6 +503,7 @@ on_roster :: proc(s: ^Session, r: ^Reader) -> Fault {
 	if n.keys != nil && !node_member(n) {
 		return .Denied // a device that does not belong has no peers
 	}
+	send_roster(s)
 	if !s.ready {
 		session_authorize(s)
 	}
@@ -500,7 +520,7 @@ session_authorize :: proc(s: ^Session) {
 		switch {
 		case m != nil && member_active(m):
 			append(&s.grants, ..m.grants)
-		case s.initiator && s.peer_relay:
+		case m == nil && s.peer_relay:
 			// Not a member: trusted only to be the relay whose key was dialled, and to carry.
 			append(&s.grants, Grant{0, {.Read, .Write}, 0})
 		case:
@@ -549,7 +569,10 @@ ROOT :: u64(1) << 32
 @(private)
 roots_send :: proc(s: ^Session, afresh := false) {
 	n := s.node
-	if n.keys == nil || !n.full || !s.peer_full || !s.initiator || (s.paused && !afresh) {
+	if n.keys == nil || !n.full || !s.peer_full || !s.initiator {
+		return
+	}
+	if s.paused && !afresh {
 		return
 	}
 	if afresh {
@@ -561,6 +584,7 @@ roots_send :: proc(s: ^Session, afresh := false) {
 		}
 		append(&s.roots, k.scope)
 		s.roots_due += 1
+		s.told = false
 		send_watch(s, s.roots_gen * ROOT + u64(k.scope), scope_lo(k.scope), scope_hi(k.scope), {data = true})
 	}
 	s.settled = s.roots_due == 0
@@ -575,6 +599,7 @@ roots_drop :: proc(s: ^Session) {
 	s.roots_gen += 1 // answers to the old watches no longer count
 	s.roots_due = 0
 	s.settled = false
+	s.told = false
 }
 
 // ---------------------------------------------------------------- watching
@@ -643,6 +668,9 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 		}
 	}
 	on_unwatch(s, id)
+	if !s.initiator && id < INTEREST {
+		s.settled = false
+	}
 	w := Watch{id = id, lo = lo, hi = hi, data = flags.data, live = flags.live, counts = flags.counts}
 	append(&s.watches, w)
 
@@ -701,6 +729,12 @@ on_synced :: proc(s: ^Session, r: ^Reader) {
 	n := s.node
 	id := read_varint(r)
 	if id < INTEREST {
+		if !s.initiator {
+			// The dialler has compared everything and sent what this end lacked: this end is level too.
+			s.settled = true
+			node_balance(n)
+			return
+		}
 		if id / ROOT == s.roots_gen && s.roots_due > 0 && slice.contains(s.roots[:], Scope(id % ROOT)) {
 			s.roots_due -= 1
 			s.settled = s.roots_due == 0
@@ -715,7 +749,7 @@ on_synced :: proc(s: ^Session, r: ^Reader) {
 		return
 	}
 	if !flags.denied {
-		interest_bound(n, id, lo, hi, before, after)
+		interest_bound(s, id, lo, hi, before, after)
 	}
 	for x, i in s.owed {
 		if x == id {
@@ -727,9 +761,11 @@ on_synced :: proc(s: ^Session, r: ^Reader) {
 }
 
 // A full replica has said what a client's window really spans and what lies beyond it. What this one
-// happens to hold outside that span has gaps in it, so the window closes to it.
+// happens to hold outside that span has gaps in it, so the window closes to it. Replicas may lag one
+// another: the window is what all have vouched for, and what lies beyond is the most any of them knows of.
 @(private)
-interest_bound :: proc(n: ^Node, id: u64, lo, hi: Key, before, after: int) {
+interest_bound :: proc(s: ^Session, id: u64, lo, hi: Key, before, after: int) {
+	n := s.node
 	for &it in n.interests {
 		if it.id != id || !it.watch.data {
 			continue
@@ -738,14 +774,29 @@ interest_bound :: proc(n: ^Node, id: u64, lo, hi: Key, before, after: int) {
 		if to == nil {
 			return
 		}
+		mine: ^Report
+		for &r in it.reports {
+			if r.session == s.id {
+				mine = &r
+			}
+		}
+		if mine == nil {
+			append(&it.reports, Report{session = s.id})
+			mine = &it.reports[len(it.reports) - 1]
+		}
+		mine^ = {s.id, lo, hi, before, after}
 		for &w in to.watches {
 			if w.id != it.watch.id || !w.data {
 				continue
 			}
 			w.lo = lo if key_less(w.lo, lo) else w.lo
 			w.hi = hi if key_less(hi, w.hi) else w.hi
-			w.far, w.far_before, w.far_after = true, before, after
 			it.watch.lo, it.watch.hi, it.limit = w.lo, w.hi, 0
+			w.far, w.far_before, w.far_after = true, 0, 0
+			for r in it.reports {
+				w.far_before = max(w.far_before, r.before + store_range(&n.store, r.lo, w.lo).count)
+				w.far_after = max(w.far_after, r.after + store_range(&n.store, w.hi, r.hi).count)
+			}
 			if it.waiting == 0 && w.settled {
 				append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = true})
 			}
@@ -924,12 +975,25 @@ on_recon :: proc(s: ^Session, r: ^Reader) {
 		return
 	}
 	out := recon_begin(s, id, !owner_sent, lo)
-	wants := want_begin()
+	wants := want_begin(s)
+	rest, rests: Key // parts put off until next time
+	put_off := false
 	for r.pos < len(r.buf) && !r.bad {
 		hi := read_key(r)
 		if !key_less(lo, hi) || key_less(scope_hi(scope), hi) {
 			r.bad = true
 			break
+		}
+		if len(out.buf) > RECON_FRAME {
+			if !put_off {
+				put_off = true
+				rest = lo
+			}
+			if recon_pass(r) {
+				rests = hi
+			}
+			lo = hi
+			continue
 		}
 		switch Part(read_u8(r)) {
 		case .Skip:
@@ -952,21 +1016,27 @@ on_recon :: proc(s: ^Session, r: ^Reader) {
 				recon_describe(&out, lo, hi, mine)
 			}
 		case .List:
-			recon_compare(s, r, &wants, lo, hi)
+			recon_compare(s, r, &wants, scope, lo, hi)
 			recon_part(&out, hi, .Skip)
 		case:
 			r.bad = true
 		}
 		lo = hi
 	}
+	if r.bad {
+		return
+	}
+	if put_off && key_less(rest, rests) {
+		recon_print(&out, rests, store_range(&n.store, rest, rests))
+	}
 	// Wants precede the reply, so that the reply's acceptance implies their answers.
-	want_send(s, &wants, false)
+	want_send(&wants)
 	recon_end(&out)
 }
 
 // Walks their list beside this side's range, sending what they lack and asking for what differs.
 @(private)
-recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, lo, hi: Key) {
+recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, scope: Scope, lo, hi: Key) {
 	n := s.node
 	count := read_count(r)
 	scan := tree_scan(n, n.shelf, lo, hi)
@@ -975,7 +1045,8 @@ recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, lo, hi: Key) {
 	for _ in 0 ..< count {
 		key := read_key_delta(r, prev)
 		print := read_u64(r)
-		if r.bad {
+		if r.bad || key_less(key, lo) || !key_less(key, hi) || !key_less(prev, key) || row_scope(key_row(key)) != scope {
+			r.bad = true
 			return
 		}
 		prev = key
@@ -985,11 +1056,11 @@ recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, lo, hi: Key) {
 		}
 		if have && mine.key == key {
 			if mine.val[0] != print {
-				want_row(n, wants, key_row(key))
+				want_row(wants, key_row(key))
 			}
 			mine, have = tree_next(&scan)
 		} else if node_wants(n, key) {
-			want_row(n, wants, key_row(key))
+			want_row(wants, key_row(key))
 		}
 	}
 	for have {
@@ -1028,27 +1099,64 @@ watched :: proc(s: ^Session, key: Key) -> bool {
 	return false
 }
 
+// Steps over a part without acting on it. Whether there was anything in it to act on.
 @(private)
-Wants :: struct {
-	buf:   [dynamic]byte,
-	count: int,
+recon_pass :: proc(r: ^Reader) -> bool {
+	switch Part(read_u8(r)) {
+	case .Skip:
+		return false
+	case .Print:
+		_ = read_varint(r)
+		_ = read_pair(r, Print)
+	case .List:
+		count := read_count(r)
+		for _ in 0 ..< count {
+			_ = read_key_delta(r, KEY_MIN)
+			_ = read_u64(r)
+			if r.bad {
+				break
+			}
+		}
+	case:
+		r.bad = true
+	}
+	return true
 }
 
 @(private)
-want_begin :: proc() -> Wants {
-	return {buf = make([dynamic]byte, context.temp_allocator)}
+Wants :: struct {
+	s:     ^Session,
+	buf:   [dynamic]byte,
+	count: int,
+	final: bool,
+}
+
+@(private)
+want_begin :: proc(s: ^Session, final := false) -> Wants {
+	return {s = s, buf = make([dynamic]byte, context.temp_allocator), final = final}
 }
 
 // "Here is what I hold of this row: send the rest, and ask for what you lack."
 @(private)
-want_row :: proc(n: ^Node, w: ^Wants, row: Id) {
+want_row :: proc(w: ^Wants, row: Id) {
+	n := w.s.node
+	if len(w.buf) > WANT_FRAME {
+		want_send(w)
+	}
 	write_pair(&w.buf, row)
 	scan := row_scan(&n.store, row)
 	count := 0
 	for _ in tree_next(&scan) {
 		count += 1
 	}
+	if count > WANT_HELD {
+		count = 0
+	}
 	write_varint(&w.buf, u64(count))
+	w.count += 1
+	if count == 0 {
+		return
+	}
 	scan = row_scan(&n.store, row)
 	for leaf in tree_next(&scan) {
 		c, _ := cell_unkey(leaf)
@@ -1056,20 +1164,22 @@ want_row :: proc(n: ^Node, w: ^Wants, row: Id) {
 		write_u8(&w.buf, u8(c.slot))
 		write_stamp(&w.buf, c.stamp)
 	}
-	w.count += 1
 }
 
 @(private)
-want_send :: proc(s: ^Session, w: ^Wants, final: bool) {
+want_send :: proc(w: ^Wants) {
 	if w.count == 0 {
 		return
 	}
+	s := w.s
 	cells_close(s)
 	at := frame_begin(&s.out, .Want)
-	write_u8(&s.out, 1 if final else 0)
+	write_u8(&s.out, 1 if w.final else 0)
 	write_varint(&s.out, u64(w.count))
 	append(&s.out, ..w.buf[:])
 	frame_end(&s.out, at)
+	clear(&w.buf)
+	w.count = 0
 }
 
 @(private)
@@ -1083,7 +1193,7 @@ Held :: struct {
 on_want :: proc(s: ^Session, r: ^Reader) {
 	n := s.node
 	final := read_u8(r) == 1
-	counter := want_begin()
+	counter := want_begin(s, true)
 	rows := read_count(r)
 	for _ in 0 ..< rows {
 		row := read_pair(r, Id)
@@ -1103,10 +1213,18 @@ on_want :: proc(s: ^Session, r: ^Reader) {
 			append(&s.tasks, Task{kind = .Row, row = row})
 			continue
 		}
+		keys := make([]Key, len(held), context.temp_allocator)
+		for h, i in held {
+			keys[i] = cell_key(row, h.slot, h.kind, h.stamp)
+		}
+		slice.sort_by(keys, proc(a, b: Key) -> bool {return key_less(a, b)})
 		scan := row_scan(&n.store, row)
+		i := 0
 		for leaf in tree_next(&scan) {
-			c, _ := cell_unkey(leaf)
-			if !slice.contains(held, Held{c.kind, c.slot, c.stamp}) {
+			for i < len(keys) && key_less(keys[i], leaf.key) {
+				i += 1
+			}
+			if i == len(keys) || keys[i] != leaf.key {
 				append(&s.tasks, Task{kind = .Cell, row = row, lo = leaf.key})
 			}
 		}
@@ -1115,12 +1233,12 @@ on_want :: proc(s: ^Session, r: ^Reader) {
 		}
 		for h in held {
 			if store_news(&n.store, row, h.slot, h.kind, h.stamp) {
-				want_row(n, &counter, row)
+				want_row(&counter, row)
 				break
 			}
 		}
 	}
-	want_send(s, &counter, true)
+	want_send(&counter)
 }
 
 // ---------------------------------------------------------------- cells
@@ -1185,6 +1303,10 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 		if !ok {
 			return
 		}
+		if !stamp_timely(c.stamp, n.now) || (s.role == .Open && len(c.body) > MAX_OPEN) {
+			r.bad = true
+			return
+		}
 		row = c.row
 		if s.role == .Open {
 			if .Write not_in session_rights(s, row_scope(c.row)) || !node_may_write(n, row_scope(c.row)) || !cell_seal(n.keys, &n.roster, &c) {
@@ -1195,6 +1317,10 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 			continue
 		}
 		append(&cells, c)
+	}
+	if record_size(cells[:]) > MAX_RECORD {
+		r.bad = true
+		return
 	}
 	stale := make([dynamic]Id, context.temp_allocator)
 	n.stale = &stale
@@ -1242,6 +1368,9 @@ on_ack :: proc(s: ^Session, seq: u64) {
 		later := s.cursor < n.events.first
 		for v in s.unacked[done:] {
 			later ||= v.row == u.row
+		}
+		for t in s.tasks[s.task_head:] {
+			later ||= (t.kind == .Row || t.kind == .Cell) && t.row == u.row
 		}
 		for i := max(s.cursor, n.events.first); i < n.events.next && !later; i += 1 {
 			later = ring_at(&n.events, i).row == u.row
@@ -1322,53 +1451,112 @@ on_live :: proc(s: ^Session, r: ^Reader) {
 		return
 	}
 	scope := row_scope(l.row)
-	if .Write not_in session_rights(s, scope) {
+	info := roster_scope(&n.roster, scope)
+	if info == nil || len(l.body) > MAX_LIVE {
 		return
 	}
+	signed := .Signed in info.flags
 	keys := keyring_scope(n.keys, scope) if n.keys != nil else nil
-	places := row_places(&n.store, l.row)
 	sealed, open := l, l
-	have_sealed, have_open := s.role == .Peer, s.role == .Open
-	if s.role == .Peer {
+	if s.role == .Open {
+		if .Write not_in session_rights(s, scope) || !node_may_write(n, scope) {
+			return
+		}
+		sealed.stamp = node_stamp(n)
+		if !live_seal(n, keys, signed, &sealed) {
+			return
+		}
+	} else {
+		// Late is as good as never, and may be a replay.
+		if !stamp_timely(l.stamp, n.now) || l.stamp.time + LIVE_LATE < n.clock {
+			return
+		}
+		if !signed && .Write not_in session_rights(s, scope) {
+			return
+		}
 		// The same frame may arrive by two roads.
 		for salt in n.recent {
 			if salt == l.stamp.salt {
 				return
 			}
 		}
+		if !live_open(n, keys, signed, &open) {
+			return
+		}
 		n.recent[n.recent_at] = l.stamp.salt
 		n.recent_at = (n.recent_at + 1) % len(n.recent)
 	}
+	places := row_places(&n.store, l.row)
 	for to in n.sessions {
 		if to == s || !to.ready || !live_watched(to, &places) {
 			continue
 		}
 		if to.role == .Open {
-			if !have_open {
-				bind := live_bind(&l)
-				iv := aead_nonce(l.stamp, l.slot, LIVE_KIND)
-				w := make([dynamic]byte, context.temp_allocator)
-				if keys == nil || !open_append(&w, keys, &iv, bind[:], l.body) {
-					return
-				}
-				open.body, have_open = w[:], true
-			}
 			send_live(to, &open)
 		} else if s.role == .Open || n.keys == nil {
-			if !have_sealed {
-				sealed.stamp = node_stamp(n)
-				bind := live_bind(&sealed)
-				iv := aead_nonce(sealed.stamp, l.slot, LIVE_KIND)
-				w := make([dynamic]byte, context.temp_allocator)
-				if keys == nil {
-					return
-				}
-				seal_append(&w, keys, &iv, bind[:], l.body)
-				sealed.body, have_sealed = w[:], true
-			}
 			send_live(to, &sealed)
 		}
 	}
+}
+
+// Seals a live frame under its stamp and, in a signed scope, signs it, as a cell is.
+@(private)
+live_seal :: proc(n: ^Node, keys: ^Scope_Keys, signed: bool, l: ^Live) -> bool {
+	if keys == nil {
+		return false
+	}
+	bind := live_bind(l)
+	iv := aead_nonce(l.stamp, l.slot, LIVE_KIND)
+	w := make([dynamic]byte, context.temp_allocator)
+	if signed {
+		write_varint(&w, author_index(n.keys, &n.roster) or_return)
+	}
+	seal_append(&w, keys, &iv, bind[:], l.body)
+	if signed {
+		sign_append(&w, n.keys, live_signed(l, bind[:], w[:])) or_return
+	}
+	l.body = w[:]
+	return true
+}
+
+// Checks a live frame as far as this node can, and opens it if it holds the key.
+@(private)
+live_open :: proc(n: ^Node, keys: ^Scope_Keys, signed: bool, l: ^Live) -> bool {
+	bind := live_bind(l)
+	body := l.body
+	if signed {
+		r := Reader{buf = body}
+		author := read_varint(&r)
+		if r.bad || len(body) - r.pos < SIGNATURE || !author_allowed(&n.roster, author, row_scope(l.row), l.stamp) {
+			return false
+		}
+		rest := body[:len(body) - SIGNATURE]
+		ed25519_verify(n.roster.members[author].signer, live_signed(l, bind[:], rest), body[len(rest):]) or_return
+		body = rest[r.pos:]
+	}
+	if keys == nil {
+		return n.keys == nil
+	}
+	// Only the key of the moment will do: what is live is now.
+	r := Reader{buf = body}
+	if read_varint(&r) != u64(len(keys.epochs)) {
+		return false
+	}
+	iv := aead_nonce(l.stamp, l.slot, LIVE_KIND)
+	w := make([dynamic]byte, context.temp_allocator)
+	open_append(&w, keys, &iv, bind[:], body) or_return
+	l.body = w[:]
+	return true
+}
+
+@(private)
+live_signed :: proc(l: ^Live, bind, body: []byte) -> []byte {
+	m := make([dynamic]byte, context.temp_allocator)
+	append(&m, ..bind)
+	write_u8(&m, LIVE_KIND)
+	write_stamp(&m, l.stamp)
+	append(&m, ..body)
+	return m[:]
 }
 
 @(private)
@@ -1518,11 +1706,15 @@ node_balance :: proc(n: ^Node) {
 			}
 			hush &&= direct
 		}
+		if hush && s.paused && s.hushed != n.roster.serial {
+			hush = false // the roster has changed: there may be scopes here never yet compared
+		}
 		if hush == s.paused {
 			continue
 		}
 		s.paused = hush
 		if hush {
+			s.hushed = n.roster.serial
 			roots_drop(s)
 			s.settled = true
 		} else {
@@ -1551,6 +1743,13 @@ pump :: proc(s: ^Session) {
 	}
 	for len(s.out) - s.sent < OUT_HIGH && s.task_head < len(s.tasks) {
 		run_task(s, &s.tasks[s.task_head])
+	}
+	if s.initiator && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && s.task_head == len(s.tasks) {
+		s.told = true
+		cells_close(s)
+		at := frame_begin(&s.out, .Synced)
+		append(&s.out, 0, 1, 0, 0, 0, 0)
+		frame_end(&s.out, at)
 	}
 	if s.task_head == len(s.tasks) && len(s.tasks) > 0 {
 		clear(&s.tasks)
@@ -1682,6 +1881,29 @@ send_synced :: proc(s: ^Session, t: ^Task) {
 	write_varint(&s.out, u64(t.before))
 	write_varint(&s.out, u64(t.after))
 	frame_end(&s.out, at)
+}
+
+// What this end holds has changed otherwise than by being told: all that either watches is compared again.
+@(private)
+session_recompare :: proc(s: ^Session) {
+	n := s.node
+	if !s.ready || s.role == .Open {
+		return
+	}
+	flush_changes(s)
+	for &w in s.watches {
+		if w.data && key_less(w.lo, w.hi) {
+			w.level = false
+			recon_start(s, w.id, w.lo, w.hi, {count = 1}, store_range(&n.store, w.lo, w.hi))
+		}
+	}
+	if s.initiator && s.peer_full && !s.paused {
+		if n.full {
+			roots_send(s, afresh = true)
+		} else {
+			outbox_send(s)
+		}
+	}
 }
 
 // The session fell off the ring: bring its windows level by comparison instead.

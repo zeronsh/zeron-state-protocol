@@ -84,7 +84,17 @@ save :: proc(path: string, bytes: []byte) -> bool {
 	_, werr := os.write(f, bytes)
 	serr := os.sync(f)
 	os.close(f)
-	return werr == nil && serr == nil && os.rename(partial, path) == nil
+	if werr != nil || serr != nil || os.rename(partial, path) != nil {
+		return false
+	}
+	when ODIN_OS != .Windows {
+		// The name is the directory's to remember.
+		if dir, derr := os.open(filepath.dir(path), {.Read}); derr == nil {
+			os.sync(dir)
+			os.close(dir)
+		}
+	}
+	return true
 }
 
 @(private)
@@ -133,6 +143,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		authenticate = space_authenticate,
 		roster       = proc(data: rawptr, bytes: []byte) {
 			s := (^Space)(data)
+			file_disk_make(&s.disk)
 			save(file_in(s.dir, "roster"), bytes)
 			dialers_refresh(s.host)
 		},
@@ -280,6 +291,19 @@ host_settle :: proc(h: ^Host) {
 		stream_flush(s)
 	}
 	links_flush(h)
+	if h.relay {
+		// A space nobody is in costs nothing.
+		#reverse for s, i in h.spaces {
+			busy := len(s.node.sessions) > 0
+			for x in h.streams {
+				busy ||= x.space == s
+			}
+			if !busy {
+				unordered_remove(&h.spaces, i)
+				space_close(s)
+			}
+		}
+	}
 	for s in h.spaces {
 		zsp.store_flush(&s.node.store)
 		if zsp.store_unsynced(&s.node.store) && !h.syncing {

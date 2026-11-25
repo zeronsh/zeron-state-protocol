@@ -17,6 +17,7 @@ Sim_Node :: struct {
 	secret: Key32,
 	relay:  bool,
 	full:   bool,
+	roster: []byte, // as persisted
 }
 
 @(private)
@@ -32,6 +33,7 @@ Sim :: struct {
 	links:  [dynamic]Sim_Link,
 	space:  Key32,
 	roster: []byte,
+	root:   Key32,
 	now:    u64,
 	rows:   [dynamic]Id,
 	ring:   int,
@@ -45,10 +47,11 @@ sim_init :: proc(t: ^testing.T, s: ^Sim, full, partial, relays, ring: int) {
 	s.ring = ring
 	root, space := test_root()
 	s.space = space
+	s.root = root
 	admin: Keyring
 	defer keyring_destroy(&admin)
 	none: Roster
-	d := draft_from(&none)
+	d := draft_from(&none, 100)
 	home := draft_scope(&d)
 	shown := draft_scope(&d, {.Signed})
 	for i in 0 ..< full + partial + relays {
@@ -90,9 +93,29 @@ sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 		}
 	}
 	x.node.now = s.now
-	if !x.relay {
+	if x.roster != nil {
+		assert(node_adopt(&x.node, x.roster))
+	} else if !x.relay {
 		assert(node_adopt(&x.node, s.roster))
 	}
+	x.node.host.data = x
+	x.node.host.roster = proc(data: rawptr, bytes: []byte) {
+		x := (^Sim_Node)(data)
+		delete(x.roster)
+		x.roster = slice.clone(bytes)
+	}
+}
+
+// The first device draws new keys, as after a revocation; the others hear of it when they hear of it.
+@(private)
+sim_rotate :: proc(s: ^Sim) {
+	x := s.nodes[0]
+	x.node.now = s.now
+	d := draft_from(&x.node.roster, max(x.node.clock, s.now << 16))
+	d.scopes[rand.int_max(2)].rotate = true
+	bytes, ok := roster_sign(&x.keys, s.root, &d)
+	defer delete(bytes)
+	testing.expect(s.t, ok && node_adopt(&x.node, bytes))
 }
 
 @(private)
@@ -104,6 +127,7 @@ sim_destroy :: proc(s: ^Sim) {
 		node_destroy(&x.node)
 		keyring_destroy(&x.keys)
 		memory_disk_destroy(&x.disk)
+		delete(x.roster)
 		free(x)
 	}
 	delete(s.nodes)
@@ -123,7 +147,7 @@ sim_link :: proc(s: ^Sim, a, b: int) {
 	append(
 		&s.links,
 		Sim_Link {
-			session_open(&x.node, .Peer, true, x25519_public(y.secret)),
+			session_open(&x.node, .Peer, true, x25519_public(y.secret), relay = y.relay),
 			session_open(&y.node, .Peer, false, x25519_public(x.secret)),
 			a,
 			b,
@@ -305,6 +329,8 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 			if len(s.links) > 0 {
 				sim_cut(s, rand.int_max(len(s.links)))
 			}
+		case r < 50 && rand.int_max(4) == 0:
+			sim_rotate(s)
 		case r < 50:
 			// Power loss: the last synced state comes back, and nothing after it was acknowledged.
 			i := rand.int_max(n)

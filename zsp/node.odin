@@ -1,5 +1,6 @@
 package zsp
 
+import "base:runtime"
 import "core:crypto"
 import "core:slice"
 
@@ -56,6 +57,14 @@ Interest :: struct {
 	limit:   u64,
 	back:    bool,
 	waiting: int, // upstreams yet to settle
+	reports: [dynamic]Report, // what full replicas last said of it
+}
+
+@(private)
+Report :: struct {
+	session: u32,
+	lo, hi:  Key,
+	before, after: int,
 }
 
 node_init :: proc(n: ^Node, disk: Disk, space: Key32, keys: ^Keyring, full: bool, ring := 256) -> bool {
@@ -72,6 +81,9 @@ node_destroy :: proc(n: ^Node) {
 		session_close(n.sessions[0])
 	}
 	rpc_destroy(n)
+	for it in n.interests {
+		delete(it.reports)
+	}
 	delete(n.sessions)
 	delete(n.interests)
 	roster_destroy(&n.roster)
@@ -88,21 +100,37 @@ node_adopt :: proc(n: ^Node, bytes: []byte) -> bool {
 		roster_destroy(&r)
 		return false
 	}
-	if n.keys != nil && !roster_unwrap(n.keys, &r) {
-		keyring_clear(n.keys)
-		n.keys.root = nil
+	old_keys: Keyring
+	if n.keys != nil {
+		old_keys.scopes = n.keys.scopes
+		n.keys.scopes = {}
+		if !roster_unwrap(n.keys, &r) {
+			keyring_clear(n.keys)
+			n.keys.root = nil
+		}
 	}
-	roster_destroy(&n.roster)
+	old := n.roster
 	n.roster = r
+	swept := roster_sweep(n, &old, &old_keys)
+	roster_destroy(&old)
+	keyring_destroy(&old_keys)
+	if swept && !store_checkpoint(&n.store) {
+		return false // or a crash could bring back, under this roster, what it made unlawful
+	}
 	if n.host.roster != nil {
 		n.host.roster(n.host.data, n.roster.bytes)
 	}
 	for s in n.sessions {
+		if s.greeted && s.accepted {
+			send_roster(s) // and to one whose own, older, is still on its way
+		}
 		if !s.ready {
 			continue
 		}
-		send_roster(s)
 		session_authorize(s)
+		if swept {
+			session_recompare(s)
+		}
 	}
 	rpc_roster_changed(n)
 	reach_tell(n)
@@ -114,6 +142,67 @@ node_adopt :: proc(n: ^Node, bytes: []byte) -> bool {
 node_member :: proc(n: ^Node) -> bool {
 	m := roster_member(&n.roster, n.keys.device) if n.keys != nil else nil
 	return m != nil && member_active(m)
+}
+
+// A roster can make unlawful what was accepted before it was heard: cells later than the end of the key
+// or the right they were written by. One sealed under an old key by someone who merely had not heard is
+// sealed again, under the new key, its identity unchanged, by every device that can; what cannot be is
+// dropped. Either way all replicas come to hold the same.
+@(private)
+roster_sweep :: proc(n: ^Node, old: ^Roster, old_keys: ^Keyring) -> (swept: bool) {
+	for info in n.roster.scopes {
+		was := roster_scope(old, info.id)
+		if was == nil {
+			continue
+		}
+		from := max(u64)
+		if .Signed not_in info.flags && info.epoch > was.epoch {
+			from = info.closed[was.epoch - 1]
+		}
+		if .Signed in info.flags {
+			for m in n.roster.members {
+				before := roster_member(old, m.device)
+				for g, i in m.grants {
+					if g.scope == info.id && .Write in g.rights && g.until != 0 && (before == nil || i >= len(before.grants) || before.grants[i].until == 0) {
+						from = min(from, g.until)
+					}
+				}
+			}
+		}
+		if from == max(u64) {
+			continue
+		}
+		swept = true
+		late := make([dynamic]Leaf, context.temp_allocator)
+		scan := tree_scan(n, n.cells, scope_lo(info.id), scope_hi(info.id))
+		for leaf in tree_next(&scan) {
+			if leaf.key[3] > from {
+				append(&late, leaf)
+			}
+		}
+		for leaf in late {
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			c, at := cell_unkey(leaf)
+			c.body = log_bytes(&n.store, at.off, at.len)
+			if c.body == nil || cell_authentic(&n.roster, &c) {
+				continue
+			}
+			c.body = slice.clone(c.body, context.temp_allocator)
+			again := c
+			if n.keys != nil && .Signed not_in info.flags && cell_open(old_keys, &n.roster, &again) && cell_seal(n.keys, &n.roster, &again) {
+				store_replace(&n.store, &again)
+				// Someone who had heard already may have refused it, and will take it now.
+				places := row_places(&n.store, c.row)
+				ring_push(&n.events, {c.row, c.slot, c.kind, c.stamp, 0}, &places, &places)
+				if n.partial {
+					tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
+				}
+			} else {
+				forget(&n.store, leaf)
+			}
+		}
+	}
+	return
 }
 
 @(private)
@@ -144,9 +233,12 @@ node_id :: proc(n: ^Node, scope: Scope) -> Id {
 // Writes open cells on behalf of this node itself. False, and nothing written, if it may not.
 node_write :: proc(n: ^Node, cells: []Cell) -> bool {
 	for &c in cells {
-		if !node_may_write(n, row_scope(c.row)) || !cell_seal(n.keys, &n.roster, &c) {
+		if len(c.body) > MAX_OPEN || !cell_valid(&c) || !node_may_write(n, row_scope(c.row)) || !cell_seal(n.keys, &n.roster, &c) {
 			return false
 		}
+	}
+	if record_size(cells) > MAX_RECORD {
+		return false
 	}
 	node_commit(n, cells, nil)
 	return true
@@ -234,6 +326,7 @@ interest_add :: proc(s: ^Session, w: Watch, limit: u64, back: bool) -> ^Interest
 @(private)
 interest_remove :: proc(n: ^Node, i: int) {
 	it := n.interests[i]
+	delete(it.reports)
 	unordered_remove(&n.interests, i)
 	for to in n.sessions {
 		if interest_concerns(n, it.session, to) {

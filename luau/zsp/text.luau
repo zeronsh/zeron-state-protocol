@@ -24,8 +24,8 @@ type Piece = {
 	rpiece: string, -- the last insertion's right neighbour
 	roffset: number,
 	fed: number,
-	sum: number,
 	stamp: string, -- "" while only live
+	shown: string, -- what was consumed while only live, to hold the sealed piece to
 }
 
 export type Text = {
@@ -46,6 +46,7 @@ export type Result = "same" | "changed" | "waiting" | "rebuild"
 local text = {}
 
 local INSERT, EXTEND, DELETE = 1, 2, 3
+local NOBODY = string.rep("\0", 8)
 
 function text.new(): Text
 	return {
@@ -65,19 +66,10 @@ end
 local function piece_of(t: Text, id: string): Piece
 	local p = t.pieces[id]
 	if not p then
-		p = { count = 0, rpiece = "", roffset = 0, fed = 0, sum = 1, stamp = "" }
+		p = { count = 0, rpiece = "", roffset = 0, fed = 0, stamp = "", shown = "" }
 		t.pieces[id] = p
 	end
 	return p
-end
-
-local function adler(sum: number, s: string): number
-	local a, b = sum % 65536, sum // 65536
-	for i = 1, #s do
-		a = (a + string.byte(s, i)) % 65521
-		b = (b + a) % 65521
-	end
-	return b * 65536 + a
 end
 
 local function has(t: Text, piece: string, offset: number, n: number): boolean
@@ -293,7 +285,9 @@ local function apply_ops(t: Text, id: string, ops: string): number
 			break
 		end
 		local p = piece_of(t, id)
-		p.sum = adler(p.sum, string.sub(ops, done + 1, r.pos))
+		if p.stamp == "" and id ~= t.open then
+			p.shown ..= string.sub(ops, done + 1, r.pos)
+		end
 		p.fed += r.pos - done
 		done = r.pos
 	end
@@ -315,6 +309,9 @@ end
 
 local function apply_piece(t: Text, name: string, stamp: string, ops: string): Result
 	local id = name
+	if id == NOBODY then
+		return "same" -- the edge of the document is nobody's piece
+	end
 	local p = t.pieces[id]
 	if p and p.stamp == stamp then
 		return "same"
@@ -324,14 +321,15 @@ local function apply_piece(t: Text, name: string, stamp: string, ops: string): R
 			return "rebuild"
 		end
 		id = string.sub(stamp, 9)
-		if t.pieces[id] then
+		if id == NOBODY or t.pieces[id] then
 			return "same"
 		end
 	end
 	local piece = piece_of(t, id)
-	if piece.fed > #ops or (piece.fed > 0 and piece.sum ~= adler(1, string.sub(ops, 1, piece.fed))) then
+	if piece.fed > #ops or piece.shown ~= string.sub(ops, 1, piece.fed) then
 		return "rebuild"
 	end
+	piece.shown = ""
 	piece.stamp = stamp
 	local at = piece.fed + apply_ops(t, id, string.sub(ops, piece.fed + 1))
 	if at < #ops then
@@ -357,6 +355,9 @@ function text.apply(t: Text, kind: number, stamp: string, body: string): Result
 		end
 		t.base = stamp
 		local id = string.sub(stamp, 9)
+		if id == NOBODY then
+			id = string.rep("\0", 7) .. "\1"
+		end
 		piece_of(t, id).stamp = stamp
 		if #body > 0 then
 			insert_run(t, id, body, "", 0, "", 0)
@@ -393,7 +394,7 @@ end
 function text.live(t: Text, piece: string, offset: number, bytes: string): Result
 	local p = t.pieces[piece]
 	local fed = if p then p.fed else 0
-	if (p and p.stamp ~= "") or piece == t.open or offset > fed or offset + #bytes <= fed then
+	if (p and p.stamp ~= "") or piece == t.open or piece == NOBODY or offset > fed or offset + #bytes <= fed then
 		return "same"
 	end
 	if apply_ops(t, piece, string.sub(bytes, fed - offset + 1)) == 0 then

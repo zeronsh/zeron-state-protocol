@@ -55,7 +55,7 @@ roster_grants_and_revokes :: proc(t: ^testing.T) {
 	defer keyring_destroy(&c)
 
 	none: Roster
-	d := draft_from(&none)
+	d := draft_from(&none, 100)
 	home := draft_scope(&d)
 	shown := draft_scope(&d, {.Signed})
 	draft_grant(&d, a.device, a.signer, home, {.Write}).admin = true
@@ -72,7 +72,7 @@ roster_grants_and_revokes :: proc(t: ^testing.T) {
 	testing.expect_value(t, list_scope(list_tag(keyring_scope(&a, home), "x")), home)
 
 	// A read-only member of an unsigned scope would be a lie, and no roster may tell it.
-	bad := draft_from(&r1)
+	bad := draft_from(&r1, 100)
 	draft_grant(&bad, c.device, c.signer, home, {.Read})
 	bytes, signed := roster_sign(&a, root, &bad, context.temp_allocator)
 	_, parsed := roster_parse(bytes, space)
@@ -103,9 +103,9 @@ roster_grants_and_revokes :: proc(t: ^testing.T) {
 	post.stamp.time -= 1
 
 	// Revocation: b learns nothing sealed afterwards; a still reads the past.
-	d = draft_from(&r1)
-	draft_revoke(&d, b.device, 100)
-	draft_revoke(&d, a.device, 100, shown)
+	d = draft_from(&r1, 100)
+	draft_revoke(&d, b.device)
+	draft_revoke(&d, a.device, shown)
 	r2 := test_publish(t, &a, root, space, &d)
 	defer roster_destroy(&r2)
 	testing.expect(t, roster_unwrap(&a, &r2) && !roster_unwrap(&b, &r2))

@@ -115,7 +115,7 @@ frame_begin :: proc(w: ^[dynamic]byte, type: Message) -> int {
 
 frame_end :: proc(w: ^[dynamic]byte, start: int) {
 	n := len(w) - start
-	assert(n < MAX_FRAME)
+	assert(n <= MAX_FRAME)
 	if n < 0x80 { // the common case, tightened to one byte
 		copy(w[start - 3:], w[start:])
 		resize(w, len(w) - 3)

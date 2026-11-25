@@ -67,7 +67,7 @@ make_space :: proc(b: ^Bench) {
 	_ = ed25519.private_key_set_bytes(&sk, root[:])
 	ed25519.private_key_public_bytes(&sk, b.space[:])
 	none: zsp.Roster
-	d := zsp.draft_from(&none)
+	d := zsp.draft_from(&none, 100)
 	zsp.draft_grant(&d, b.keys.device, b.keys.signer, zsp.draft_scope(&d), {.Read, .Write, .Call})
 	b.roster, _ = zsp.roster_sign(&b.keys, root, &d)
 }
@@ -194,7 +194,7 @@ link :: proc() {
 	fmt.printfln("handshake       %8.0f µs           both ends", per(t, 1))
 	got := 0
 	b.data = &got
-	b.on_stream = proc(data: rawptr, bytes: []byte) {(^int)(data)^ += len(bytes)}
+	b.on_stream = proc(l: ^pipe.Link, bytes: []byte) {(^int)(l.data)^ += len(bytes)}
 	chunk: [64 << 10]byte
 	SIZE :: 256 << 20
 	now := pipe.Time(1000)

@@ -116,6 +116,9 @@ tls_input :: proc(t: ^Tls, bytes: []byte, plain, w: ^[dynamic]byte) -> bool {
 		type, body := rest[0], rest[5:][:n]
 		used += 5 + n
 		if type == 20 {
+			if t.state == .Open {
+				return false
+			}
 			continue // change_cipher_spec, for appearances
 		}
 		if t.state != .Hello {
@@ -229,7 +232,7 @@ tls_server_hello :: proc(t: ^Tls, m: []byte) -> bool {
 		switch {
 		case type == 43 && len(body) == 2:
 			modern = body[0] == 3 && body[1] == 4
-		case type == 51 && len(body) == 36 && body[1] == 29:
+		case type == 51 && len(body) == 36 && body[0] == 0 && body[1] == 29:
 			copy(share[:], body[4:])
 			have = true
 		}

@@ -16,6 +16,7 @@ import "core:slice"
 
 SEGMENT :: #config(ZSP_SEGMENT, 16 << 20)
 RECORD_HEAD :: 8
+MAX_RECORD :: SEGMENT / 2
 CHECKPOINT_TAIL :: SEGMENT / 4 // log bytes replayed at worst on open
 CHECKPOINT_DIRTY :: 1024 // pages held in memory at worst
 BUFFER_KEEP :: 64 << 10
@@ -111,17 +112,7 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 	s.disk = disk
 	ring_init(&s.events, ring)
 
-	best: Header
-	for i in u32(0) ..< HEADER_PAGES {
-		pg := disk.page(disk.data, i)
-		if pg == nil {
-			continue
-		}
-		h := (^Header)(pg)^
-		if h.magic == MAGIC && h.sum == header_sum(&h) && h.generation >= best.generation {
-			best = h
-		}
-	}
+	best := store_header(disk)
 	s.generation = best.generation
 	s.clock = best.clock
 	s.checkpoint = best.log
@@ -144,6 +135,27 @@ store_close :: proc(s: ^Store) {
 	ring_destroy(&s.events)
 	s.disk.close(s.disk.data)
 	s^ = {}
+}
+
+@(private)
+store_header :: proc(disk: Disk) -> (best: Header) {
+	for i in u32(0) ..< HEADER_PAGES {
+		pg := disk.page(disk.data, i)
+		if pg == nil {
+			continue
+		}
+		h := (^Header)(pg)^
+		if h.magic == MAGIC && h.sum == header_sum(&h) && h.generation >= best.generation {
+			best = h
+		}
+	}
+	return
+}
+
+// The latest stamp time a store had seen when it was last checkpointed, without opening it.
+@(require_results)
+store_clock :: proc(disk: Disk) -> u64 {
+	return store_header(disk).clock
 }
 
 @(private)
@@ -278,17 +290,26 @@ store_tail :: proc(s: ^Store) -> u64 {
 	return s.buf_base + u64(len(s.buf))
 }
 
-// Merges cells into the store and returns how many were news. The accepted ones become one atomic
-// log record; stale ones cost nothing.
-store_commit :: proc(s: ^Store, cells: []Cell, origin: u32 = 0) -> (accepted: int) {
+// What a commit of these cells may come to. A caller passing on what it was sent must check.
+@(require_results)
+record_size :: proc(cells: []Cell) -> int {
 	size := RECORD_HEAD
 	for &c in cells {
 		size += 48 + len(c.body)
 	}
-	assert(size <= SEGMENT / 2)
+	return size
+}
+
+// Merges cells into the store and returns how many were news. The accepted ones become one atomic
+// log record; stale ones cost nothing.
+store_commit :: proc(s: ^Store, cells: []Cell, origin: u32 = 0) -> (accepted: int) {
+	size := record_size(cells)
+	assert(size <= MAX_RECORD)
 	tail := store_tail(s)
 	if tail % SEGMENT + u64(size) > SEGMENT {
-		store_flush(s)
+		if !store_flush(s) {
+			return 0
+		}
 		s.buf_base = (tail / SEGMENT + 1) * SEGMENT
 		clear(&s.buf)
 		s.flushed = 0
@@ -326,7 +347,6 @@ store_commit :: proc(s: ^Store, cells: []Cell, origin: u32 = 0) -> (accepted: in
 @(private)
 apply :: proc(s: ^Store, c: ^Cell, off: u64, origin: u32, replaying: bool) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	s.clock = max(s.clock, c.stamp.time)
 	key := cell_key(c.row, c.slot, c.kind, c.stamp)
 	if old, ok := tree_get(s, s.cells, key); ok {
 		// Replay meets a cell again when a crash followed its evacuation from an old segment.
@@ -345,7 +365,7 @@ apply :: proc(s: ^Store, c: ^Cell, off: u64, origin: u32, replaying: bool) -> bo
 		return false
 	}
 
-	if slot_refuses(s, c.row, c.slot, c.stamp) {
+	if slot_refuses(s, c.row, c.slot, c.kind, c.stamp) {
 		stale_add(s, c.row)
 		return false
 	}
@@ -390,6 +410,7 @@ apply :: proc(s: ^Store, c: ^Cell, off: u64, origin: u32, replaying: bool) -> bo
 		tree_delete(s, &s.cells, leaf.key)
 		waste_add(s, at.off, at.len)
 	}
+	s.clock = max(s.clock, c.stamp.time)
 	print += cell_print(c)
 	tree_put(s, &s.cells, key, place_pack({off, len(c.body), c.kind}))
 
@@ -438,16 +459,19 @@ store_news :: proc(s: ^Store, row: Id, slot: Slot, kind: Kind, stamp: Stamp) -> 
 	if grave, ok := row_grave(s, row); ok && (kind != .Grave || !stamp_less(grave, stamp)) {
 		return false
 	}
-	return !slot_refuses(s, row, slot, stamp)
+	return !slot_refuses(s, row, slot, kind, stamp)
 }
 
 // Whether what a slot holds has already killed a stamp.
 @(private)
-slot_refuses :: proc(s: ^Store, row: Id, slot: Slot, stamp: Stamp) -> bool {
+slot_refuses :: proc(s: ^Store, row: Id, slot: Slot, kind: Kind, stamp: Stamp) -> bool {
 	scan := tree_scan(s, s.cells, {row[0], row[1], u64(slot) << 8, 0, 0}, {row[0], row[1], u64(slot) << 8 | 1, 0, 0})
 	for leaf in tree_next(&scan) {
 		c, at := cell_unkey(leaf)
 		if c.kind == .Bundle {
+			if kind != .Piece && kind != .Bundle {
+				continue // a bundle absorbs nothing else, whenever it comes
+			}
 			head := log_bytes(s, at.off, 4)
 			if head == nil {
 				continue
@@ -602,6 +626,9 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 	}
 	victims := evacuate(s)
 	store_sync(s) or_return
+	if s.failed {
+		return false
+	}
 
 	nos := slice.map_keys(s.dirty, context.temp_allocator) or_else nil
 	slice.sort(nos)
@@ -668,33 +695,106 @@ evacuate :: proc(s: ^Store) -> []u64 {
 		return nil
 	}
 	seg := victims[0]
-	pos := seg * SEGMENT
-	end := pos + SEGMENT
-	for pos + RECORD_HEAD < end {
-		head: [RECORD_HEAD]byte
-		if !s.disk.log_read(s.disk.data, pos, head[:]) {
-			break
+	base := seg * SEGMENT
+	size := log_size(s, base, SEGMENT)
+	part := make([]byte, size)
+	defer delete(part)
+	if size > 0 && !s.disk.log_read(s.disk.data, base, part) {
+		s.failed = true
+		return nil
+	}
+	damaged := false
+	for pos := 0; pos < len(part); {
+		n := record_at(part[pos:])
+		if n == 0 {
+			damaged ||= part[pos] != 0
+			pos += 1
+			continue
 		}
-		n := u64(get_u32(head[:]))
-		if n == 0 || pos + RECORD_HEAD + n > end {
-			break
+		if !relocate(s, base + u64(pos + RECORD_HEAD), part[pos + RECORD_HEAD:][:n]) {
+			return nil
 		}
-		body := make([]byte, n)
-		defer delete(body)
-		if !s.disk.log_read(s.disk.data, pos + RECORD_HEAD, body) || record_sum(body) != get_u32(head[4:]) {
-			break
-		}
-		relocate(s, pos + RECORD_HEAD, body)
 		pos += RECORD_HEAD + n
+	}
+	if damaged {
+		// What lay in the damage is gone from here. Not holding it is better than holding it unread:
+		// a replica that does not have a cell is sent it again.
+		lost := make([dynamic]Leaf, context.temp_allocator)
+		all := tree_scan(s, s.cells, KEY_MIN, KEY_MAX)
+		for leaf in tree_next(&all) {
+			if place_unpack(leaf.val).off / SEGMENT == seg {
+				append(&lost, leaf)
+			}
+		}
+		for leaf in lost {
+			forget(s, leaf)
+		}
 	}
 	return victims[:]
 }
 
+// Unholds a cell, as though it had never come.
 @(private)
-relocate :: proc(s: ^Store, base: u64, body: []byte) {
+forget :: proc(s: ^Store, leaf: Leaf) {
+	c, at := cell_unkey(leaf)
+	before := row_places(s, c.row)
+	// The row's print is summed anew: its places may be among what is unreadable.
+	tree_delete(s, &s.cells, leaf.key)
+	waste_add(s, at.off, at.len)
+	after := row_places(s, c.row)
+	print := row_print(s, c.row)
+	if c.kind == .Place || c.kind == .Grave {
+		// Its own place may no longer be readable: find the row's entries by looking.
+		lost := make([dynamic]Key, context.temp_allocator)
+		scan := tree_scan(s, s.shelf, scope_lo(row_scope(c.row)), scope_hi(row_scope(c.row)))
+		for entry in tree_next(&scan) {
+			if key_row(entry.key) == c.row && !slice.contains(after.keys[:after.count], entry.key) {
+				append(&lost, entry.key)
+			}
+		}
+		for k in lost {
+			tree_delete(s, &s.shelf, k)
+		}
+	}
+	for k in before.keys[:before.count] {
+		if !slice.contains(after.keys[:after.count], k) {
+			tree_delete(s, &s.shelf, k)
+		}
+	}
+	for k in after.keys[:after.count] {
+		tree_put(s, &s.shelf, k, print)
+	}
+}
+
+// Puts another body in place of a held cell's, its identity unchanged. False when the log cannot take it.
+@(private)
+store_replace :: proc(s: ^Store, c: ^Cell) -> bool {
+	key := cell_key(c.row, c.slot, c.kind, c.stamp)
+	old := tree_get(s, s.cells, key) or_return
+	tail := store_tail(s)
+	if tail % SEGMENT + u64(record_size({c^})) > SEGMENT {
+		store_flush(s) or_return
+		s.buf_base = (tail / SEGMENT + 1) * SEGMENT
+		clear(&s.buf)
+		s.flushed = 0
+	}
+	start := len(s.buf)
+	append(&s.buf, 0, 0, 0, 0, 0, 0, 0, 0)
+	write_cell(&s.buf, c, false)
+	out := s.buf[start + RECORD_HEAD:]
+	put_u32(s.buf[start:], u32(len(out)))
+	put_u32(s.buf[start + 4:], record_sum(out))
+	at := place_unpack(old)
+	waste_add(s, at.off, at.len)
+	tree_put(s, &s.cells, key, place_pack({s.buf_base + u64(len(s.buf) - len(c.body)), len(c.body), c.kind}))
+	return true
+}
+
+@(private)
+relocate :: proc(s: ^Store, base: u64, body: []byte) -> bool {
 	tail := store_tail(s)
 	if tail % SEGMENT + u64(len(body) * 2 + RECORD_HEAD) > SEGMENT {
-		store_flush(s)
+		store_flush(s) or_return
 		s.buf_base = (tail / SEGMENT + 1) * SEGMENT
 		clear(&s.buf)
 		s.flushed = 0
@@ -718,11 +818,12 @@ relocate :: proc(s: ^Store, base: u64, body: []byte) {
 	}
 	if len(s.buf) == start + RECORD_HEAD {
 		resize(&s.buf, start)
-		return
+		return true
 	}
 	out := s.buf[start + RECORD_HEAD:]
 	put_u32(s.buf[start:], u32(len(out)))
 	put_u32(s.buf[start + 4:], record_sum(out))
+	return true
 }
 
 // Rows currently shelved in lo <= key < hi.

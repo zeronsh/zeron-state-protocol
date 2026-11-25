@@ -13,10 +13,10 @@ websocket_round_trip :: proc(t: ^testing.T) {
 		for client in ([]bool{false, true}) {
 			w := make([dynamic]byte, context.temp_allocator)
 			ws_put(&w, .Binary, payload, client)
-			_, _, _, partial := ws_take(w[:len(w) - 1])
+			_, _, _, _, partial := ws_take(w[:len(w) - 1])
 			testing.expect_value(t, partial, Ws_Result.More)
-			op, got, used, result := ws_take(w[:])
-			testing.expect(t, op == .Binary && result == .Message && used == len(w) && string(got) == string(payload))
+			op, got, used, fin, result := ws_take(w[:])
+			testing.expect(t, fin && op == .Binary && result == .Message && used == len(w) && string(got) == string(payload))
 		}
 	}
 	// The example in RFC 6455.
@@ -65,7 +65,7 @@ parsers_survive_noise :: proc(t: ^testing.T) {
 		for &x in b {
 			x = byte(rand.uint32()) & (0xff if rand.int_max(3) == 0 else 0x13)
 		}
-		_, _, _, _ = ws_take(b)
+		_, _, _, _, _ = ws_take(b)
 		_, _ = http_head(b)
 		_, _ = url_parse(string(b))
 		ask := stun_request()

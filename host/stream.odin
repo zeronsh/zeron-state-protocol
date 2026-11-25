@@ -34,6 +34,7 @@ Stream :: struct {
 	session:   ^zsp.Session,
 	role:      zsp.Role,
 	in_buf:    [dynamic]byte,
+	pieces:    [dynamic]byte, // of a message that comes in several frames
 	out:       [dynamic]byte,
 	sent:      int,
 	recv_op:   ^nbio.Operation,
@@ -102,6 +103,7 @@ stream_close :: proc(s: ^Stream) {
 	free(s.handshake)
 	net.close(s.socket)
 	delete(s.in_buf)
+	delete(s.pieces)
 	delete(s.out)
 	free(s)
 }
@@ -165,7 +167,7 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 		used += head.size
 	}
 	for {
-		op, payload, n, result := pipe.ws_take(s.in_buf[used:])
+		op, payload, n, fin, result := pipe.ws_take(s.in_buf[used:])
 		switch result {
 		case .More:
 			return true
@@ -175,8 +177,20 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 		}
 		used += n
 		#partial switch op {
-		case .Binary:
-			stream_message(s, payload) or_return
+		case .Binary, .Continue:
+			if (op == .Continue) != (len(s.pieces) > 0) || len(s.pieces) + len(payload) > pipe.MAX_MESSAGE {
+				return false
+			}
+			if fin && op == .Binary {
+				stream_message(s, payload) or_return
+				continue
+			}
+			append(&s.pieces, ..payload)
+			if fin {
+				stream_message(s, s.pieces[:]) or_return
+				clear(&s.pieces)
+				shrink(&s.pieces)
+			}
 		case .Ping:
 			stream_put(s, .Pong, payload)
 		case .Close:
@@ -251,7 +265,7 @@ stream_greeted :: proc(s: ^Stream, head: ^pipe.Http) -> bool {
 @(private)
 stream_session :: proc(s: ^Stream, initiator: bool) {
 	credential := transmute([]byte)s.host.credential if initiator else nil
-	s.session = zsp.session_open(&s.space.node, s.role, initiator, s.channel.peer, credential)
+	s.session = zsp.session_open(&s.space.node, s.role, initiator, s.channel.peer, credential, relay = initiator)
 	s.phase = .Open
 }
 
@@ -397,6 +411,7 @@ Dialer :: struct {
 	found:    bool,
 	answered: bool, // atomic
 	loop:     ^nbio.Event_Loop,
+	dialling: ^nbio.Operation,
 }
 
 // Brings the dialers level with what the rosters name.
@@ -444,6 +459,9 @@ dial :: proc(h: ^Host, s: ^Space, key: zsp.Key32, url: string, pinned := true) {
 
 @(private)
 dialer_free :: proc(d: ^Dialer) {
+	if d.dialling != nil {
+		nbio.remove(d.dialling)
+	}
 	if d.thread != nil {
 		thread.join(d.thread)
 		thread.destroy(d.thread)
@@ -532,7 +550,8 @@ dialer_resolved :: proc(d: ^Dialer) {
 		return
 	}
 	d.state = .Dialling
-	nbio.dial_poly(d.endpoint, d, proc(op: ^nbio.Operation, d: ^Dialer) {
+	d.dialling = nbio.dial_poly(d.endpoint, d, proc(op: ^nbio.Operation, d: ^Dialer) {
+		d.dialling = nil
 		if op.dial.err != nil {
 			dialer_failed(d)
 			return

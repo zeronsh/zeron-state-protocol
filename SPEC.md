@@ -47,7 +47,7 @@ it has one.
 **Stamps.** A writer's clock is `max(clock + 1, now)`, where `clock` also advances past the time of every stamp seen. Every
 cell gets its own time and fresh salt. A stamp is at once a cell's version, its tie-break and its AEAD nonce, so it must never
 be reused; because the salt is drawn anew from the operating system, even a forked virtual machine does not. Times at or
-above 2⁶³ are invalid.
+above 2⁶³ are invalid, and a stamp more than ten years (3650 days) ahead of the receiver's clock, or of 2025 if its clock says earlier, is refused.
 
 **Slots.** 0 grave, 1–15 places, 16–255 data. Slots are the application's columns.
 
@@ -59,7 +59,8 @@ above 2⁶³ are invalid.
 | 4 | Piece | 16–255 | none |
 | 5 | Bundle | 16–255 | n (4, ≥ 1) ‖ n stamps (16 each), strictly ascending |
 
-A bundle that names a bundle must also name everything that one names. A body is at most 2²⁰ bytes.
+Every stamp a bundle names is less than its own. A bundle that names a bundle must also name everything that one names. It kills, and
+refuses, pieces and bundles only. A sealed body is at most 2²⁰ bytes; before sealing, clear prefix included, at most 2²⁰ − 128.
 
 ## 2 Encoding
 
@@ -76,7 +77,8 @@ cell  = tag (1) ‖ [row (16)] ‖ slot (1) ‖ stamp (16) ‖ body (bytes)
 frame = length (varint) ‖ type (1) ‖ payload          length counts type and payload, ≤ 2²²
 ```
 
-A pipe carries frames as a byte stream in any fragmentation. Unknown frame types are ignored.
+A pipe carries frames as a byte stream in any fragmentation. Unknown frame types are ignored. The cells of one frame, each counted as 48
+bytes and its sealed body, come to at most 2²³.
 
 ## 3 Keys and the roster
 
@@ -89,7 +91,8 @@ The **roster** says who may do what. It is a document signed by the space:
 
 ```
 "zsp-r1" ‖ space (32) ‖ serial varint
-n varint, n × scope   { id varint, flags (1), epoch varint ≥ 1 }            ascending ids
+n varint, n × scope   { id varint, flags (1), epoch varint ≥ 1,
+                        (epoch − 1) × closed varint }                        ascending ids, ascending times
 n varint, n × member  { device (32), signer (32), admin (1), subject bytes,
                         n varint, n × grant { scope varint, rights (1), until varint } }
 n varint, n × relay   { key (32), url bytes }
@@ -98,7 +101,9 @@ wraps (48 each)   history (48 each)   signature (64, Ed25519 over everything bef
 ```
 
 Rights are bits: 1 Read, 2 Write, 4 Call. Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
-invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended.
+invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
+a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed. `closed`
+says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
 `subject` is the consumer's name for whomever the device belongs to, opaque here. Members are never removed, only their grants
 ended, so that a member's index is for ever. Of two valid rosters the higher serial wins.
 
@@ -131,11 +136,20 @@ the signature, by that member's signer, covers row ‖ slot ‖ kind ‖ stamp �
 A replica accepts a cell from a peer only if
 
 - its scope is in the roster; and
-- in a signed scope, the author's grant there includes Write, the stamp time does not exceed `until` unless that is zero, and the
-  signature verifies; in an unsigned one, the *sending session* has Write there (a relay one dialled counts as having it); and
+- in a signed scope, some grant of the author's there includes Write, with `until` zero or no less than the stamp time, and the
+  signature verifies; in an unsigned one, the *sending session* has Write there (a relay one dialled counts as having it), and the epoch is the
+  current one, or the stamp time no greater than that epoch's `closed`; and
 - where the replica holds the scope's key, the seal opens. Otherwise garbage could win by claiming a late stamp.
 
 In a signed scope authority travels with the cell, so anyone may carry it. In an unsigned scope, to hold the key is to be a writer.
+
+On adopting a roster a replica looks again at cells later than any epoch or grant it ends. In an unsigned scope, one that is no longer acceptable is
+sealed again under the current key, with the same stamp, by a replica that can open it, since someone may merely not have heard; otherwise
+it is dropped. Replicas then reconcile afresh. Where a cell is held already, another body for the same identity is ignored.
+
+So: a revoked device can open nothing sealed afterwards, and nobody who has heard accepts what it writes later. What it gave to someone who had *not* heard stands,
+and it can still put an earlier time on new writing, for no clock here is trusted; a colluding relay could deliver that. Revocation ends
+access and bounds damage; it does not undo the past. List tags do not change on rotation, so a revoked device can still recognise them.
 
 A relay sees: scopes, list tags, orders, stamps, sizes. It can order and page; it cannot read, name, move, alter or forge.
 Orders are public to it, so derive them from time or rank rather than content.
@@ -185,7 +199,7 @@ Between devices, and between devices and relays, a pipe is wrapped in `Noise_IK_
 "zsp-1" ‖ space and empty payloads. The dialler knows the other's key: from the roster, or from whoever told it of the relay.
 
 Over WebSocket, each binary message is one Noise message: 96 bytes, 48 bytes, then transport messages of at most 65535 bytes, whose
-plaintexts concatenate into the pipe. The path is `/` and the space in hex. TLS, where used, is for traversal; certificates need not
+plaintexts concatenate into the pipe. The path is `/` and the space in hex. A message may come in several frames. TLS, where used, is for traversal; certificates need not
 be judged, for nothing rests on them, and no credential may be put where TLS alone protects it.
 
 A **local client** speaks to its own device's node in the open, over a pipe the host trusts (loopback, a socket pair, shared memory):
@@ -199,7 +213,7 @@ clear prefix and then plaintext; the node seals and opens on its client's behalf
 Each side first sends
 
 ```
-1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, 2 relay) ‖ space (32) ‖ roster serial varint ‖ credential bytes
+1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, 2 relay: which only confirms what the dialler knows) ‖ space (32) ‖ roster serial varint ‖ credential bytes
 ```
 
 The accepting host decides from the credential and the proven key whether to serve the connection (§15); until it has, later frames
@@ -252,7 +266,8 @@ be reached. Before honouring Unwatch, an owner sends what it committed while the
 ends, its watches end with Synced *denied*; to a local client, a new Roster comes first.
 
 A **full replica** watches, on each session it dials, every scope it can read, whole. A **partial replica** watches what its local clients watch, and
-keeps what it wrote on record until a full replica acknowledges it.
+keeps what it wrote on record until a full replica acknowledges it. When all a dialler's whole-scope watches are level, and it has sent all the other
+lacked, it says so: Synced with id 0, settled, empty keys and zero counts.
 
 With *counts* the owner says Synced again whenever, after a burst of changes, how much lies before or after differs from what it last said. A
 partial replica relays to its client the bounds and counts a full replica gives it, closing the window to those bounds, for what it holds
@@ -268,14 +283,15 @@ beyond them may have gaps.
 6 Want     final (1) ‖ n varint ‖ n × { row (16), n varint, n × { kind (1), slot (1), stamp (16) } }
 ```
 
-Parts are consecutive ranges from `lo`; the unmentioned remainder is level. The owner begins; the sides alternate; the watcher
+Parts are consecutive ranges from `lo`, within one scope; keys in a list ascend strictly within their part; the unmentioned remainder is level. A
+reply is kept short, about 128 KiB: what it has no room for it returns as one part of type 1, to be gone into next time. The owner begins; the sides alternate; the watcher
 always replies; the owner, on a reply with no parts, says Synced. A receiver answers each part of type
 
 - **1** that equals its own with 0; that counts zero with 0, after sending all it has there; otherwise with a list if it has no more
   than 32 entries, the same type 1 if the other has that few, or type 1 for each sixteenth of its own entries;
 - **2** with 0, after sending each row the other lacks (if the other would keep it), and wanting each row it lacks or that differs.
 
-Want means: here is what I hold of these rows; send the rest. If the sender of Want holds what the receiver would accept, the receiver
+Want means: here is what I hold of these rows; send the rest. (A row of very many cells may be given as holding none.) If the sender of Want holds what the receiver would accept, the receiver
 wants the row in turn, with *final* set, which is not answered so. Wants are sent before the Recon they arise from.
 
 ## 11 Live
@@ -285,8 +301,10 @@ wants the row in turn, with *final* set, which is not answered so. Wants are sen
 ```
 
 Operations of a piece still being written, from a byte offset in its operation stream, always whole. They are hints: never
-stored, never acknowledged, droppable at any point. A gap is ignored; the piece itself will follow. Between peers the body is sealed as
-in §4 with kind 0x40 and associated data row ‖ slot ‖ piece ‖ offset (8), under a fresh stamp; from a local client the stamp is zero.
+stored, never acknowledged, droppable at any point. A gap is ignored; the piece itself will follow. Between peers the body is
+[author varint] ‖ epoch varint ‖ ciphertext ‖ tag ‖ [signature], the brackets in signed scopes, sealed as in §4 under a fresh stamp with kind 0x40 and associated
+data *a* = row ‖ slot ‖ piece ‖ offset (8); the signature covers *a* ‖ 0x40 ‖ stamp ‖ the body short of it. Only the current epoch's key is accepted, and no stamp more than a minute
+behind the receiver's clock. From a local client the stamp is zero. The body is at most 64 KiB.
 
 Live frames go only to watches with **live** that cover the row. A node forwards its clients' live watches to its peers, and a relay
 forwards each device's to the others, so a frame nobody will see is never sent. A node does not forward between peers unless it is a relay. A
@@ -298,13 +316,13 @@ writer seals a piece within about a second of beginning it; a reader drops live 
 14 Serve   scope varint ‖ 1 or 0 ‖ method bytes                             a local client offers a method, or ceases to
 15 Call    id varint ‖ device (32) ‖ scope varint ‖ method bytes ‖ first message
 16 Flow    id varint × 2 + (1 if sent by the callee) ‖ kind (1) ‖ payload
-           0 Data (message) · 1 End · 2 Fault (code, text) · 3 Cancel · 4 Credit (varint bytes)
+           0 Data (message) · 1 End · 2 Fault (code (1)) · 3 Cancel · 4 Credit (varint bytes)
 12 Presence   to a local client: n × { device (32), subject bytes }, this device first, then all it can reach
 ```
 
 A call is a stream of messages each way. `device` is the callee's on the way out and the caller's on arrival. Ids belong to whoever sent
 Call on that session. A call ends when both sides have sent End, or on Fault or Cancel. Each side may have 256 KiB of messages outstanding beyond what the
-other has credited; the first message counts.
+other has credited; the first message counts. One message is at most 256 KiB, and a method's name 255 bytes.
 
 Both devices need the Call right in the scope, and both check. A call takes a direct session with the device if there is one, else a tunnel (§13). It
 stays on the path it began on: if that fails the call faults *lost*, and may or may not have happened. Faults: 1 denied, 2 unreachable, 3 unserved,
@@ -312,7 +330,8 @@ stays on the path it began on: if that fails the call faults *lost*, and may or 
 
 ## 13 Relays
 
-A relay is a full replica without keys. It verifies rosters, enforces rights, merges, pages, reconciles and forwards; it serves each space separately.
+A relay is a full replica without keys. It verifies rosters, enforces rights, merges, pages, reconciles and forwards; it serves each space separately. Which peer
+is a relay is never the peer's to say: it is one whose key was dialled as a relay's. A relay should store nothing for a space until someone its host accepts has something to store.
 
 ```
 12 Presence   n × device (32)                    from a relay: who else is here
@@ -335,15 +354,16 @@ watch afresh when that ceases to be so.
 
 A link is an ordered byte stream and datagrams (live frames) over UDP. First byte: 0x40 punch (ignored), 0x41 first (sender's id (4, little-endian) ‖ Noise 1),
 0x42 second (sender's id ‖ receiver's id ‖ Noise 2), 0x43 data (receiver's id ‖ counter (8, little-endian) ‖ ciphertext, the 13 bytes before it being
-associated data), 0x44 beacon. Anything lower is STUN. A genuine data packet's source is thenceforth the peer's address.
+associated data), 0x44 beacon. Anything lower is STUN. The source of a genuine data packet newer than any before it is thenceforth the
+peer's address; a packet seen before, or too old to tell, is dropped. A live link gives way to a new knock only when that proves itself with data.
 
 Data frames: 0 padding to the end · 1 ping · 2 ack (largest varint, run varint, then (gap, run) pairs, a zero gap, then the highest stream offset permitted) ·
 3 stream (offset varint, bytes) · 4 datagram (bytes) · 5 close. Runs count downward from the largest. Loss recovery is RFC 9002's; congestion control is
 the sender's affair. A link with nothing in flight sends nothing.
 
-The device with the lesser key dials. Devices that share a relay swap candidate addresses, 18 bytes each (IPv6 or mapped IPv4, port), in signals of kind 0, and
+The device with the lesser key dials. Devices that share a relay swap candidate addresses, 18 bytes each (IPv6 or mapped IPv4, then port, big-endian), in signals of kind 0, and
 both send to all of the other's at once. On a local network a device broadcasts from its link socket, at start, to UDP port 9083, and a device that hears it and should be dialled answers that socket with the same: 0x44 ‖ salt (8) ‖
-XChaCha20-Poly1305 under derive(space, "zsp-beacon"), nonce 0 (8) ‖ salt ‖ 0 ‖ 0x42 ‖ 0 (6), of device (32) ‖ link port (2).
+XChaCha20-Poly1305 under derive(space, "zsp-beacon"), nonce 0 (8) ‖ salt ‖ 0 ‖ 0x42 ‖ 0 (6), of device (32) ‖ link port (2, big-endian), no associated data.
 
 A link through a NAT is closed after 25 idle seconds, before the NAT forgets it, and dialled again when there is something to say.
 

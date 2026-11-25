@@ -59,7 +59,13 @@ Cell :: struct {
 KEY_MIN :: Key{}
 KEY_MAX :: Key{max(u64), max(u64), max(u64), max(u64), max(u64)} // reserved: exclusive upper bound
 
-MAX_CELL :: 1 << 20
+MAX_CELL :: 1 << 20 // a body at rest and between devices
+MAX_OPEN :: MAX_CELL - 128 // and before it is sealed, and perhaps signed
+
+// A stamp this far ahead of the clock is refused, lest one drag every clock to the end of time. It is far,
+// because a clock may be wrong in earnest, and merely ahead does no harm.
+LEAP_MS :: 10 * 365 * 24 * 3600 * 1000
+DAWN_MS :: 1_735_689_600_000 // 2025: a clock that says earlier has not been set
 MAX_PLACES :: int(PLACE_LAST)
 
 @(require_results)
@@ -200,9 +206,15 @@ cell_valid :: proc(c: ^Cell) -> bool {
 				return false
 			}
 		}
-		return true
+		// It absorbs what came before it, and so nothing absorbs it in turn.
+		return stamp_less(bundle_at(c.body, int(get_u32(c.body)) - 1), c.stamp)
 	}
 	return false
+}
+
+@(require_results)
+stamp_timely :: proc "contextless" (s: Stamp, now_ms: u64) -> bool {
+	return s.time >> 16 <= max(now_ms, DAWN_MS) + LEAP_MS
 }
 
 @(require_results)

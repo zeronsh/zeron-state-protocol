@@ -95,7 +95,7 @@ export { Space };
 export default relay({ authenticate: async ({ space, device, credential, env }) => isCustomer(credential, env) });
 ```
 
-`cd relay && wrangler secret put RELAY_SECRET && wrangler deploy`; `GET /` then answers with the key devices pin.
+`cd relay && wrangler secret put RELAY_SECRET && wrangler deploy`; `GET /` then answers with the key devices pin: fetch it once, with something that checks certificates, as a browser or curl does.
 
 Embedding in Odin is the same question asked of `host.Config.authenticate`, or of `zsp.Host.authenticate` if you bring your own I/O.
 

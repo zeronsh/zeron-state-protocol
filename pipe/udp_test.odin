@@ -51,8 +51,8 @@ net_init :: proc(t: ^testing.T, n: ^Net) {
 	testing.expect(t, link_input(&n.links[0], link_hello(&n.links[1], buf[:]), n.now))
 	for &l, i in n.links {
 		l.data = &n.got[i]
-		l.on_stream = proc(data: rawptr, bytes: []byte) {
-			append((^[dynamic]byte)(data), ..bytes)
+		l.on_stream = proc(l: ^Link, bytes: []byte) {
+			append((^[dynamic]byte)(l.data), ..bytes)
 		}
 	}
 }
@@ -218,4 +218,69 @@ link_notices_death :: proc(t: ^testing.T) {
 	for net_step(&n) {}
 	testing.expect_value(t, n.links[0].state, Link_State.Closed)
 	testing.expectf(t, n.now - start < 20_000 * MS, "took %v ms", (n.now - start) / MS)
+}
+
+// A packet counts once, from wherever and whenever it comes again.
+@(test)
+link_ignores_replays :: proc(t: ^testing.T) {
+	state := rand.create(9)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	for net_step(&n) {}
+	got := 0
+	n.links[1].data = &got
+	n.links[1].on_datagram = proc(l: ^Link, bytes: []byte) {(^int)(l.data)^ += 1}
+	kept: [dynamic][]byte
+	defer delete(kept)
+	for _ in 0 ..< 200 {
+		testing.expect(t, link_datagram(&n.links[0], {1, 2, 3}))
+		buf: [PACKET_MAX]byte
+		out := link_output(&n.links[0], buf[:], n.now)
+		copied := make([]byte, len(out), context.temp_allocator)
+		copy(copied, out)
+		append(&kept, copied)
+		n.links[0].in_flight = 0
+	}
+	feed :: proc(n: ^Net, p: []byte) -> bool {
+		b := make([]byte, len(p), context.temp_allocator)
+		copy(b, p)
+		return link_input(&n.links[1], b, n.now)
+	}
+	// Every other one, then the gaps, so that ranges are evicted and then merge.
+	for i := 0; i < 200; i += 2 {
+		feed(&n, kept[i])
+	}
+	for i := 151; i < 200; i += 2 {
+		feed(&n, kept[i])
+	}
+	before := got
+	for p in kept[:150] {
+		testing.expect(t, !feed(&n, p))
+	}
+	for i := 0; i < 150; i += 2 {
+		testing.expect(t, !feed(&n, kept[i]))
+	}
+	testing.expectf(t, got - before <= 64, "%d", got - before) // the odd ones still within the window
+	again := got
+	for p in kept {
+		testing.expect(t, !feed(&n, p))
+	}
+	testing.expect_value(t, got, again)
+}
+
+// A full datagram leaves no room, and that is fine.
+@(test)
+link_packs_to_the_brim :: proc(t: ^testing.T) {
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	for net_step(&n) {}
+	for size in n.links[0].mtu - HEAD - zsp.TAG - 24 ..= n.links[0].mtu - HEAD - zsp.TAG - 4 {
+		d := make([]byte, size, context.temp_allocator)
+		link_datagram(&n.links[0], d)
+		link_write(&n.links[0], d)
+		for net_step(&n) {}
+	}
 }

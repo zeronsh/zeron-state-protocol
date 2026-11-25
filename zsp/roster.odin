@@ -32,6 +32,8 @@ Member :: struct {
 	signer:  Key32, // Ed25519: signs cells in signed scopes
 	admin:   bool, // holds the space's signing key
 	subject: []byte, // whom the host says this is; opaque here
+	// In the order given. At most one per scope is in force; the rest say what was once allowed, and so
+	// what was rightly written.
 	grants:  []Grant,
 }
 
@@ -46,6 +48,8 @@ Scope_Info :: struct {
 	id:    Scope,
 	flags: Scope_Flags,
 	epoch: u32,
+	// When each earlier epoch ended, as stamp times. A key that was given up cannot seal what is later.
+	closed: []u64, // owned
 }
 
 Relay :: struct {
@@ -158,20 +162,32 @@ roster_parse :: proc(bytes: []byte, space: Key32) -> (r: Roster, ok: bool) {
 		s.id = Scope(read_varint(&rd))
 		s.flags = transmute(Scope_Flags)read_u8(&rd)
 		s.epoch = u32(read_varint(&rd))
-		if rd.bad || s.id <= last || s.id == max(Scope) || s.epoch == 0 {
+		if rd.bad || s.id <= last || s.id == max(Scope) || s.epoch == 0 || int(s.epoch) > len(rd.buf) - rd.pos {
 			return
+		}
+		s.closed = make([]u64, s.epoch - 1)
+		for &c, i in s.closed {
+			c = read_varint(&rd)
+			if i > 0 && c < s.closed[i - 1] {
+				return
+			}
 		}
 		last = s.id
 		history += int(s.epoch - 1)
 	}
 	r.members = make([]Member, read_count(&rd))
-	for &m in r.members {
+	for &m, i in r.members {
 		m.device = read_key32(&rd)
 		m.signer = read_key32(&rd)
+		for other in r.members[:i] {
+			if other.device == m.device {
+				return
+			}
+		}
 		m.admin = read_u8(&rd) != 0
 		m.subject = read_bytes(&rd)
 		m.grants = make([]Grant, read_count(&rd))
-		for &g in m.grants {
+		for &g, j in m.grants {
 			g.scope = Scope(read_varint(&rd))
 			g.rights = transmute(Rights)read_u8(&rd)
 			g.until = read_varint(&rd)
@@ -184,6 +200,11 @@ roster_parse :: proc(bytes: []byte, space: Key32) -> (r: Roster, ok: bool) {
 			}
 			if g.until == 0 {
 				wraps += 1
+				for other in m.grants[:j] {
+					if other.scope == g.scope && other.until == 0 {
+						return
+					}
+				}
 			}
 		}
 		if m.admin {
@@ -205,6 +226,9 @@ roster_parse :: proc(bytes: []byte, space: Key32) -> (r: Roster, ok: bool) {
 roster_destroy :: proc(r: ^Roster) {
 	for m in r.members {
 		delete(m.grants)
+	}
+	for s in r.scopes {
+		delete(s.closed)
 	}
 	delete(r.bytes)
 	delete(r.scopes)
@@ -259,6 +283,7 @@ member_active :: proc(m: ^Member) -> bool {
 // What an admin intends the next roster to say.
 Draft :: struct {
 	serial:  u64,
+	now:     u64, // stamp time at which this takes effect
 	scopes:  [dynamic]Draft_Scope,
 	members: [dynamic]Member,
 	relays:  [dynamic]Relay,
@@ -268,17 +293,20 @@ Draft_Scope :: struct {
 	id:     Scope,
 	flags:  Scope_Flags,
 	rotate: bool, // draw a new sealing key
+	closed: []u64,
 }
 
-// The current roster as a draft, in temporary memory.
+// The current roster as a draft, in temporary memory. `now` should be no less than any stamp the admin
+// has seen: what others wrote before then stands.
 @(require_results)
-draft_from :: proc(r: ^Roster, allocator := context.temp_allocator) -> (d: Draft) {
+draft_from :: proc(r: ^Roster, now: u64, allocator := context.temp_allocator) -> (d: Draft) {
 	d.serial = r.serial + 1
+	d.now = max(now, 1)
 	d.scopes = make([dynamic]Draft_Scope, allocator)
 	d.members = make([dynamic]Member, allocator)
 	d.relays = make([dynamic]Relay, allocator)
 	for s in r.scopes {
-		append(&d.scopes, Draft_Scope{s.id, s.flags, false})
+		append(&d.scopes, Draft_Scope{s.id, s.flags, false, s.closed})
 	}
 	for m in r.members {
 		m := m
@@ -294,7 +322,7 @@ draft_scope :: proc(d: ^Draft, flags: Scope_Flags = {}) -> (id: Scope) {
 		id = max(id, s.id)
 	}
 	id += 1
-	append(&d.scopes, Draft_Scope{id, flags, false})
+	append(&d.scopes, Draft_Scope{id = id, flags = flags})
 	return
 }
 
@@ -311,10 +339,15 @@ draft_grant :: proc(d: ^Draft, device, signer: Key32, scope: Scope, rights: Righ
 		m = &d.members[len(d.members) - 1]
 	}
 	for &g in m.grants {
-		if g.scope == scope {
-			g.rights, g.until = rights + {.Read}, 0
-			return m
+		if g.scope != scope || g.until != 0 {
+			continue
 		}
+		if .Write in g.rights && .Write not_in rights {
+			g.until = d.now // ended, not unmade: what it allowed stays allowed
+			break
+		}
+		g.rights = rights + {.Read}
+		return m
 	}
 	grants := make([dynamic]Grant, 0, len(m.grants) + 1, allocator)
 	append(&grants, ..m.grants)
@@ -323,8 +356,8 @@ draft_grant :: proc(d: ^Draft, device, signer: Key32, scope: Scope, rights: Righ
 	return m
 }
 
-// Ends a device's rights in a scope, or everywhere, as of a stamp time, and rotates what it could read.
-draft_revoke :: proc(d: ^Draft, device: Key32, now: u64, scope: Scope = 0) {
+// Ends a device's rights in a scope, or everywhere, and rotates what it could read.
+draft_revoke :: proc(d: ^Draft, device: Key32, scope: Scope = 0) {
 	for &m in d.members {
 		if m.device != device {
 			continue
@@ -336,7 +369,7 @@ draft_revoke :: proc(d: ^Draft, device: Key32, now: u64, scope: Scope = 0) {
 			if g.until != 0 || (scope != 0 && g.scope != scope) {
 				continue
 			}
-			g.until = max(now, 1)
+			g.until = d.now
 			for &s in d.scopes {
 				if s.id == g.scope {
 					s.rotate = true
@@ -382,6 +415,14 @@ roster_sign :: proc(k: ^Keyring, root: Key32, d: ^Draft, allocator := context.al
 		write_varint(&w, u64(s.id))
 		write_u8(&w, transmute(u8)s.flags)
 		write_varint(&w, u64(epochs))
+		last: u64
+		for c in s.closed {
+			write_varint(&w, c)
+			last = c
+		}
+		if len(s.closed) < epochs - 1 {
+			write_varint(&w, max(d.now, last))
+		}
 	}
 	write_varint(&w, u64(len(d.members)))
 	for m in d.members {

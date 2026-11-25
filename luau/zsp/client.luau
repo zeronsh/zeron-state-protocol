@@ -15,6 +15,7 @@ local GRAVE, PLACE, VALUE, PIECE, BUNDLE = 1, 2, 3, 4, 5
 local W_DATA, W_LIVE, W_BACK, W_ADOPT, W_COUNTS = 1, 2, 4, 8, 32
 local F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = 0, 1, 2, 3, 4
 local CALL_WINDOW = 262144
+local MAX_OPEN = 1048576 - 128
 local ZERO32 = string.rep("\0", 32)
 
 local PIECE_BYTES = 4096 -- a piece is sealed at this size,
@@ -70,6 +71,8 @@ type Page = {
 	settled: boolean,
 	before: number,
 	after: number,
+	limit: number, -- as first asked for, until the node says what the page spans
+	back: boolean,
 	stale: { [string]: boolean }?, -- while being sent afresh: rows not yet mentioned
 }
 export type Window = {
@@ -176,6 +179,8 @@ local function new_client(host: Host)
 		windows = {} :: { [string]: Window },
 		pages = {} :: { [number]: Page },
 		next_page = 0,
+		shapes = (setmetatable({}, { __mode = "k" }) :: any) :: { [Table]: number },
+		next_shape = 0,
 		seq = 0,
 		pending = {} :: { { seq: number, body: string, rows: { string }, done: () -> () } },
 		unacked = {} :: { [string]: number }, -- rows in pending, and how often
@@ -319,6 +324,13 @@ function Client._receive(self: Client, data: buffer | string)
 				return
 			end
 			p += 1
+			if p - at > 5 then -- no frame is so long
+				self.input = ""
+				if self.wire then
+					self.wire.close()
+				end
+				return
+			end
 			n += b % 128 * scale
 			if b < 128 then
 				break
@@ -380,7 +392,7 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 		for _, window in self.windows do
 			if window.denied and self.scopes[window.scope] then
 				for _, page in window.pages do
-					self:_watch(page, 0, false)
+					self:_watch(page)
 				end
 				if #window.pages == 0 then
 					self:_open(window)
@@ -409,7 +421,7 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 			self:_open(window)
 		else
 			for _, page in window.pages do
-				self:_watch(page, 0, false)
+				self:_watch(page)
 			end
 		end
 	end
@@ -462,7 +474,13 @@ export type Query = {
 -- turn. Returns the window's controls.
 function Client.window(self: Client, query: Query, observer: (State) -> ())
 	local from = query.from or "end"
-	local key = `{query.scope}/{from}/{query.size or 50}/{query.list}`
+	local shape = self.shapes[query.table]
+	if not shape then
+		self.next_shape += 1
+		shape = self.next_shape
+		self.shapes[query.table] = shape
+	end
+	local key = `{query.scope}/{from}/{query.size or 50}/{shape}/{query.list}`
 	local window = self.windows[key]
 	if not window then
 		local made: Window = {
@@ -548,19 +566,24 @@ function Client._page(self: Client, window: Window, lo: string, hi: string): Pag
 		settled = false,
 		before = 0,
 		after = 0,
+		limit = 0,
+		back = false,
 		stale = nil,
 	}
 	self.pages[page.id] = page
 	return page
 end
 
-function Client._watch(self: Client, page: Page, limit: number, back: boolean, adopt: boolean?)
+function Client._watch(self: Client, page: Page, limit: number?, back: boolean?, adopt: boolean?)
+	if limit then
+		page.limit, page.back = limit, back == true
+	end
 	local w = codec.writer()
 	codec.put_varint(w, page.id)
-	codec.put_u8(w, W_DATA + W_LIVE + W_COUNTS + (if back then W_BACK else 0) + (if adopt then W_ADOPT else 0))
+	codec.put_u8(w, W_DATA + W_LIVE + W_COUNTS + (if page.back then W_BACK else 0) + (if adopt then W_ADOPT else 0))
 	codec.put_key(w, page.lo)
 	codec.put_key(w, page.hi)
-	codec.put_varint(w, limit)
+	codec.put_varint(w, page.limit)
 	if not adopt then
 		self:_mark(page)
 	end
@@ -602,6 +625,7 @@ function Client._on_synced(self: Client, r: codec.Reader)
 		return
 	end
 	page.lo, page.hi = codec.key(r), codec.key(r)
+	page.limit = 0 -- from here on it is a range, however many are in it
 	page.before, page.after = codec.varint(r), codec.varint(r)
 	page.settled = bit32.btest(flags, 1)
 	page.open = false
@@ -611,7 +635,7 @@ function Client._on_synced(self: Client, r: codec.Reader)
 		for id in stale do
 			local row = self.rows[id]
 			if row and not self:_pending(id) then
-				self:_discard(row)
+				self:_unplace(row, page.lo, page.hi)
 			end
 		end
 	end
@@ -619,10 +643,21 @@ function Client._on_synced(self: Client, r: codec.Reader)
 	self:_trim(window)
 end
 
--- Walks down from the node's account of a row to what is on screen.
-function Client._discard(self: Client, row: Stored)
-	row.slots = {}
-	row.texts = {}
+-- A range was said over again and this row was not in it: it was moved away, or deleted, while this client
+-- was not listening. Only its place there is known to be wrong. Where else it is, and what is being typed in
+-- it, stand.
+function Client._unplace(self: Client, row: Stored, lo: string, hi: string)
+	for slot = 1, 15 do
+		local cells = row.slots[slot]
+		if cells then
+			for stamp, c in cells do
+				local key = string.sub(c.body, 1, 24) .. row.id
+				if key >= lo and key < hi then
+					cells[stamp] = nil
+				end
+			end
+		end
+	end
 	self:_place(row)
 end
 
@@ -883,7 +918,7 @@ local function merge(row: Stored, slot: number, kind: number, stamp: string, bod
 	for s, c in cells do
 		if (c.kind == PLACE or c.kind == VALUE) and stamp <= s then
 			return false
-		elseif c.kind == BUNDLE and bundle_has(c.body, stamp) then
+		elseif c.kind == BUNDLE and (kind == PIECE or kind == BUNDLE) and bundle_has(c.body, stamp) then
 			return false
 		end
 	end
@@ -894,8 +929,8 @@ local function merge(row: Stored, slot: number, kind: number, stamp: string, bod
 			end
 		end
 	elseif kind == BUNDLE then
-		for s in cells do
-			if bundle_has(body, s) then
+		for s, c in cells do
+			if (c.kind == PIECE or c.kind == BUNDLE) and bundle_has(body, s) then
 				cells[s] = nil
 			end
 		end
@@ -1262,8 +1297,10 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	local s = self.scopes[scope]
 	assert(s and bit32.btest(s.rights, 2), "this client may not write there")
 	local cells: { Written } = {}
+	local fresh: { [string]: boolean } = {} -- rows made here
 	local rows: { [string]: boolean } = {}
 	local function put(row: string, slot: number, kind: number, body: string)
+		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 128 bytes")
 		local stamp = self:_stamp()
 		rows[row] = true
 		table.insert(cells, { row = row, slot = slot, kind = kind, stamp = stamp, body = body })
@@ -1273,7 +1310,9 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		for name, value in values do
 			local c = schema[name]
 			assert(c, `no column {name}`)
-			if value ~= "" or not c.text then
+			-- Empty text is what a text is before anything is written: it need only be said to clear one.
+			local row = self.rows[id]
+			if value ~= "" or not c.text or (row and row.slots[c.slot]) or not fresh[id] then
 				put(id, c.slot, VALUE, c.encode(value))
 			end
 		end
@@ -1284,6 +1323,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	f({
 		insert = function(schema, list, order, values)
 			local id = string.pack(">I4I4", scope, math.floor(self.host.now())) .. self.host.random(8)
+			fresh[id] = true
 			place(id, list, order)
 			set(id, schema, values)
 			return id
@@ -1296,6 +1336,8 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	})
 	if #cells > 0 then
 		self:_send_cells(cells, done)
+	elseif done then
+		self.host.defer(done)
 	end
 	for id in rows do
 		local row = self.rows[id]
@@ -1330,6 +1372,7 @@ function Client._call(self: Client, id: number, side: number, device: string, me
 		on_end = nil,
 		on_fault = nil,
 		send = function(data: string)
+			assert(#data <= CALL_WINDOW, "a message may be 256 KiB at most")
 			if not over() and not live.finishing then
 				table.insert(live.queue, data)
 				self:_drain(id, live)

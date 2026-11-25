@@ -159,22 +159,11 @@ cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell) -> bool {
 	w := make([dynamic]byte, 0, len(c.body) + TAG + SIGNATURE + 10, context.temp_allocator)
 	append(&w, ..c.body[:n])
 	if .Signed in info.flags {
-		author := -1
-		for m, i in r.members {
-			if m.device == k.device {
-				author = i
-			}
-		}
-		write_varint(&w, u64(author))
+		write_varint(&w, author_index(k, r) or_return)
 	}
 	seal_append(&w, keys, &iv, cell_bind(c), c.body[n:])
 	if .Signed in info.flags {
-		sk: ed25519.Private_Key
-		ed25519.private_key_set_bytes(&sk, k.seed[:]) or_return
-		sig: [SIGNATURE]byte
-		ed25519.sign(&sk, cell_signed(c, w[:]), sig[:])
-		ed25519.private_key_clear(&sk)
-		append(&w, ..sig[:])
+		sign_append(&w, k, cell_signed(c, w[:])) or_return
 	}
 	c.body = w[:]
 	return true
@@ -206,8 +195,8 @@ cell_open :: proc(k: ^Keyring, r: ^Roster, c: ^Cell) -> bool {
 	return true
 }
 
-// Whether a sealed cell may exist: in a signed scope, authority travels with the cell, and anyone,
-// keys or no keys, can check it.
+// Whether a sealed cell may exist. In a signed scope authority travels with the cell, and anyone, keys or
+// no keys, can check it. In an unsigned one the key is the authority, and ends when its epoch did.
 @(require_results)
 cell_authentic :: proc(r: ^Roster, c: ^Cell) -> bool {
 	scope := row_scope(c.row)
@@ -215,21 +204,53 @@ cell_authentic :: proc(r: ^Roster, c: ^Cell) -> bool {
 	if info == nil {
 		return false
 	}
-	if .Signed not_in info.flags {
-		return true
-	}
 	rd := Reader{buf = c.body, pos = clear_size(c.kind, c.body)}
+	if .Signed not_in info.flags {
+		epoch := read_varint(&rd)
+		if rd.bad || epoch == 0 || epoch > u64(info.epoch) {
+			return false
+		}
+		return epoch == u64(info.epoch) || c.stamp.time <= info.closed[epoch - 1]
+	}
 	author := read_varint(&rd)
-	if rd.bad || author >= u64(len(r.members)) || len(c.body) - rd.pos < SIGNATURE {
+	if rd.bad || len(c.body) - rd.pos < SIGNATURE {
 		return false
 	}
-	m := &r.members[author]
-	allowed := false
-	for g in m.grants {
-		if g.scope == scope && .Write in g.rights {
-			allowed = g.until == 0 || c.stamp.time <= g.until
+	body := c.body[:len(c.body) - SIGNATURE]
+	return author_allowed(r, author, scope, c.stamp) && ed25519_verify(r.members[author].signer, cell_signed(c, body), c.body[len(body):])
+}
+
+@(private)
+author_allowed :: proc(r: ^Roster, author: u64, scope: Scope, stamp: Stamp) -> bool {
+	if author >= u64(len(r.members)) {
+		return false
+	}
+	for g in r.members[author].grants {
+		if g.scope == scope && .Write in g.rights && (g.until == 0 || stamp.time <= g.until) {
+			return true
 		}
 	}
-	body := c.body[:len(c.body) - SIGNATURE]
-	return allowed && ed25519_verify(m.signer, cell_signed(c, body), c.body[len(body):])
+	return false
+}
+
+// A signature by this device, with the index others will know it by.
+@(private)
+author_index :: proc(k: ^Keyring, r: ^Roster) -> (index: u64, ok: bool) {
+	for m, i in r.members {
+		if m.device == k.device {
+			return u64(i), true
+		}
+	}
+	return
+}
+
+@(private)
+sign_append :: proc(w: ^[dynamic]byte, k: ^Keyring, message: []byte) -> bool {
+	sk: ed25519.Private_Key
+	ed25519.private_key_set_bytes(&sk, k.seed[:]) or_return
+	defer ed25519.private_key_clear(&sk)
+	sig: [SIGNATURE]byte
+	ed25519.sign(&sk, message, sig[:])
+	append(w, ..sig[:])
+	return true
 }

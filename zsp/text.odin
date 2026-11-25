@@ -53,8 +53,8 @@ Piece :: struct {
 	count: u32, // bytes inserted so far
 	last:  Ref, // the last insertion's right neighbour
 	fed:   int, // bytes of the operation stream consumed
-	sum:   u32, // Adler-32 of them
 	stamp: Stamp, // zero while only live
+	shown: [dynamic]byte, // what was consumed while only live, to hold the sealed piece to
 }
 
 @(private)
@@ -67,6 +67,9 @@ Waiting :: struct {
 text_destroy :: proc(t: ^Text) {
 	delete(t.data)
 	delete(t.spans)
+	for _, p in t.pieces {
+		delete(p.shown)
+	}
 	delete(t.pieces)
 	for w in t.waiting {
 		delete(w.rest)
@@ -94,7 +97,7 @@ text_apply :: proc(t: ^Text, c: ^Cell) -> Text_Result {
 			return .Rebuild
 		}
 		t.base = c.stamp
-		id := c.stamp.salt
+		id := max(c.stamp.salt, 1)
 		t.pieces[id] = {stamp = c.stamp}
 		if len(c.body) > 0 {
 			text_insert_run(t, id, c.body, NO_REF, NO_REF)
@@ -149,6 +152,9 @@ text_live :: proc(t: ^Text, piece: u64, offset: int, bytes: []byte) -> Text_Resu
 @(private)
 text_piece :: proc(t: ^Text, id: u64, stamp: Stamp, ops: []byte) -> Text_Result {
 	id := id
+	if id == 0 {
+		return .Same // the edge of the document is nobody's piece
+	}
 	p, known := t.pieces[id]
 	if known && p.stamp == stamp {
 		return .Same
@@ -159,14 +165,16 @@ text_piece :: proc(t: ^Text, id: u64, stamp: Stamp, ops: []byte) -> Text_Result 
 			return .Rebuild
 		}
 		id = stamp.salt
-		if id in t.pieces {
+		if id == 0 || id in t.pieces {
 			return .Same
 		}
 		p = {}
 	}
-	if p.fed > len(ops) || (p.fed > 0 && p.sum != adler(1, ops[:p.fed])) {
+	if p.fed > len(ops) || string(p.shown[:]) != string(ops[:p.fed]) {
 		return .Rebuild // what was seen live is not what was sealed
 	}
+	delete(p.shown)
+	p.shown = {}
 	p.stamp = stamp
 	t.pieces[id] = p
 	at := p.fed + text_ops(t, id, ops[p.fed:])
@@ -237,22 +245,14 @@ text_ops :: proc(t: ^Text, id: u64, ops: []byte) -> int {
 			text_insert_run(t, id, bytes, first, right)
 		}
 		p := t.pieces[id]
-		p.sum = adler(p.sum if p.fed > 0 else 1, ops[done:r.pos])
+		if p.stamp == {} && id != t.open {
+			append(&p.shown, ..ops[done:r.pos])
+		}
 		p.fed += r.pos - done
 		t.pieces[id] = p
 		done = r.pos
 	}
 	return done
-}
-
-@(private)
-adler :: proc(sum: u32, bytes: []byte) -> u32 {
-	a, b := sum & 0xffff, sum >> 16
-	for x in bytes {
-		a = (a + u32(x)) % 65521
-		b = (b + a) % 65521
-	}
-	return b << 16 | a
 }
 
 @(private)

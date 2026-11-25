@@ -99,7 +99,7 @@ run :: proc() -> int {
 			if len(args) > 1 {
 				scope = strconv.parse_u64(args[1]) or_return
 			}
-			zsp.draft_revoke(&a.draft, device, host.now_ms() << 16, zsp.Scope(scope))
+			zsp.draft_revoke(&a.draft, device, zsp.Scope(scope))
 			return true
 		})
 	case "relay":
@@ -166,7 +166,7 @@ create :: proc(dir: string) -> bool {
 	k: zsp.Keyring
 	zsp.keyring_init(&k, secret)
 	none: zsp.Roster
-	d := zsp.draft_from(&none)
+	d := zsp.draft_from(&none, host.now_ms() << 16)
 	home := zsp.draft_scope(&d)
 	zsp.draft_grant(&d, k.device, k.signer, home, {.Read, .Write, .Call}).admin = true
 	bytes := zsp.roster_sign(&k, root, &d, context.temp_allocator) or_return
@@ -218,7 +218,7 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 		say(os.stderr, "this device is not an admin of the space\n")
 		return false
 	}
-	a.draft = zsp.draft_from(&a.roster)
+	a.draft = zsp.draft_from(&a.roster, max(host.now_ms() << 16, host.clock_of(in_dir(dir, name)), running_clock(dir)))
 	change(&a, args) or_return
 	bytes := zsp.roster_sign(&a.keys, root, &a.draft, context.temp_allocator) or_return
 	if _, sound := zsp.roster_parse(bytes, space); !sound {
@@ -232,10 +232,21 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 
 // Hands a roster to the node running here, if one is, so that the change takes effect at once.
 announce :: proc(dir: string, roster: []byte) {
+	_, _ = speak(dir, roster)
+}
+
+// What the node running here, if one is, thinks the time is: no earlier than anything it has seen.
+running_clock :: proc(dir: string) -> u64 {
+	clock, _ := speak(dir, nil)
+	return clock
+}
+
+// Greets the node running here, with a roster if there is one to hand over, and hears what it says back.
+speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool) {
 	address, aerr := os.read_entire_file(in_dir(dir, "address"), context.temp_allocator)
 	token, terr := os.read_entire_file(in_dir(dir, "token"), context.temp_allocator)
-	endpoint, ok := net.parse_endpoint(string(address))
-	if aerr != nil || terr != nil || !ok {
+	endpoint, parsed := net.parse_endpoint(string(address))
+	if aerr != nil || terr != nil || !parsed {
 		return
 	}
 	socket, err := net.dial_tcp(endpoint)
@@ -252,25 +263,49 @@ announce :: proc(dir: string, roster: []byte) {
 	zsp.write_varint(&frames, 0)
 	zsp.write_bytes(&frames, token)
 	zsp.frame_end(&frames, at)
-	at = zsp.frame_begin(&frames, .Roster)
-	append(&frames, ..roster)
-	zsp.frame_end(&frames, at)
+	if roster != nil {
+		at = zsp.frame_begin(&frames, .Roster)
+		append(&frames, ..roster)
+		zsp.frame_end(&frames, at)
+	}
 	message := make([dynamic]byte, context.temp_allocator)
 	pipe.ws_put(&message, .Binary, frames[:], true)
 	net.send_tcp(socket, message[:])
-	// Its answer says it has read this far.
+	// Its answer, which begins with its clock, says it has read this far.
 	buf: [4096]byte
-	net.set_option(socket, .Receive_Timeout, time.Second)
+	net.set_option(socket, .Receive_Timeout, 2 * time.Second)
 	got := make([dynamic]byte, context.temp_allocator)
+	stream := make([dynamic]byte, context.temp_allocator)
+	used := 0
 	for {
 		n, rerr := net.recv_tcp(socket, buf[:])
 		if n <= 0 || rerr != nil {
 			return
 		}
 		append(&got, ..buf[:n])
-		head, whole := pipe.http_head(got[:])
-		if whole && len(got) > head.size {
-			return
+		if used == 0 {
+			head := pipe.http_head(got[:]) or_continue
+			used = head.size
+		}
+		for {
+			op, payload, size, _, result := pipe.ws_take(got[used:])
+			if result != .Message {
+				break
+			}
+			used += size
+			if op == .Binary {
+				append(&stream, ..payload)
+			}
+		}
+		r := zsp.Reader{buf = stream[:]}
+		for {
+			frame := zsp.read_bytes(&r)
+			if r.bad || len(frame) == 0 {
+				break
+			}
+			if zsp.Message(frame[0]) == .Roster && len(frame) >= 9 {
+				return zsp.get_u64(frame[1:]), true
+			}
 		}
 	}
 }
@@ -420,7 +455,11 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		if line, err := os.read_entire_file(in_dir(dir, "relay"), context.allocator); err == nil {
 			parts := strings.fields(string(line), context.temp_allocator)
 			key: zsp.Key32
-			if bytes, hexed := parse_hex(parts[0], 32); hexed && len(parts) == 2 {
+			if len(parts) != 2 {
+				say(os.stderr, "the relay file makes no sense\n")
+				return 1
+			}
+			if bytes, hexed := parse_hex(parts[0], 32); hexed {
 				copy(key[:], bytes)
 				host.dial(&h, h.spaces[0], key, parts[1])
 			}

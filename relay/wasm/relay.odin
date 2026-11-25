@@ -16,6 +16,7 @@ foreign host {
 	log_read :: proc(off: f64, ptr: [^]byte, len: int) -> bool ---
 	log_end :: proc() -> f64 ---
 	log_drop :: proc(lo, hi: f64) ---
+	log_truncate :: proc(off: f64) ---
 	page_read :: proc(no: u32, ptr: rawptr) -> bool ---
 	page_write :: proc(no: u32, ptr: [^]byte, len: int) ---
 	save_roster :: proc(ptr: [^]byte, len: int) ---
@@ -59,7 +60,7 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, roster: [^]byte, roster_len
 		log_drop = proc(_: rawptr, segment: u64) {
 			log_drop(f64(segment * zsp.SEGMENT), f64((segment + 1) * zsp.SEGMENT))
 		},
-		log_truncate = proc(_: rawptr, off: u64) {log_drop(f64(off), 1e300)},
+		log_truncate = proc(_: rawptr, off: u64) {log_truncate(f64(off))},
 		// Storage here is synchronous, and what leaves is held back until it is durable.
 		log_sync = proc(_: rawptr) -> bool {return true},
 		page = proc(_: rawptr, no: u32) -> ^zsp.Page {

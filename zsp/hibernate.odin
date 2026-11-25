@@ -75,7 +75,7 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 		append(&s.watches, x)
 	}
 	m := roster_member(&n.roster, s.peer)
-	if r.bad || (s.ready && m == nil) {
+	if r.bad || (s.ready && (m == nil || !member_active(m))) {
 		delete(s.watches)
 		free(s)
 		return nil, false

@@ -40,6 +40,7 @@ test)
 	build/vectors$EXE | cmp - vectors/vectors.json
 	node tests/vectors.mjs vectors/vectors.json
 	lune run luau/tests/vectors.luau vectors/vectors.json
+	lune run luau/tests/client.luau
 	end_to_end
 	;;
 build)

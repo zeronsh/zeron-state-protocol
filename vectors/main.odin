@@ -56,7 +56,7 @@ cells :: proc() {
 	append(&sk.epochs, key_of(50))
 	append(&k.scopes, sk)
 	r: zsp.Roster
-	r.scopes = {{3, {}, 1}, {4, {.Signed}, 1}}
+	r.scopes = {{3, {}, 1, nil}, {4, {.Signed}, 1, nil}}
 	signed := zsp.Scope_Keys{scope = 4, list_key = zsp.derive(key_of(90), "zsp-list")}
 	append(&signed.epochs, key_of(90))
 	append(&k.scopes, signed)

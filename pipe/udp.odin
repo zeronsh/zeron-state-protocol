@@ -107,6 +107,7 @@ Link :: struct {
 
 	// Receiving.
 	seen:        [dynamic]Range, // packet numbers, newest last
+	seen_floor:  u64, // below this, every packet is as good as seen
 	ack_due:     Time,
 	ack_count:   int,
 	in_next:     u64,
@@ -115,8 +116,8 @@ Link :: struct {
 
 	// Where bytes go.
 	data:        rawptr,
-	on_stream:   proc(data: rawptr, bytes: []byte),
-	on_datagram: proc(data: rawptr, bytes: []byte),
+	on_stream:   proc(l: ^Link, bytes: []byte),
+	on_datagram: proc(l: ^Link, bytes: []byte),
 }
 
 Range :: struct {
@@ -276,8 +277,8 @@ link_close :: proc(l: ^Link) {
 	l.closing = true
 }
 
-// Processes one packet, decrypting it in place. True when it was genuine: the sender's address is
-// then the one to answer.
+// Processes one packet, decrypting it in place. True when it was genuine and the newest yet: only then is
+// its sender's address the one to answer, for anyone can send an old packet again from anywhere.
 link_input :: proc(l: ^Link, packet: []byte, now: Time) -> bool {
 	if l.state == .Closed || len(packet) < 1 {
 		return false
@@ -302,13 +303,15 @@ link_input :: proc(l: ^Link, packet: []byte, now: Time) -> bool {
 		if l.state == .Waiting {
 			l.state = .Open
 		}
-		if range_contains(l.seen[:], number) {
-			return true
+		if number < l.seen_floor || range_contains(l.seen[:], number) {
+			return false
 		}
+		newest := len(l.seen) == 0 || number >= l.seen[len(l.seen) - 1].hi
 		gap := len(l.seen) > 0 && number != l.seen[len(l.seen) - 1].hi
 		range_add(&l.seen, number)
 		if len(l.seen) > 32 {
 			ordered_remove(&l.seen, 0)
+			l.seen_floor = l.seen[0].lo
 		}
 		if link_frames(l, plain, now) {
 			l.ack_count += 1
@@ -318,7 +321,7 @@ link_input :: proc(l: ^Link, packet: []byte, now: Time) -> bool {
 				l.ack_due = now + ACK_DELAY
 			}
 		}
-		return true
+		return newest
 	}
 	return false
 }
@@ -345,7 +348,7 @@ link_frames :: proc(l: ^Link, plain: []byte, now: Time) -> (eliciting: bool) {
 		case .Datagram:
 			bytes := zsp.read_bytes(&r)
 			if !r.bad && l.on_datagram != nil {
-				l.on_datagram(l.data, bytes)
+				l.on_datagram(l, bytes)
 			}
 			eliciting = true
 		case .Close:
@@ -376,11 +379,23 @@ link_stream :: proc(l: ^Link, offset: u64, bytes: []byte) {
 		}
 		return
 	}
+	// Kept without overlap, so that what is held never exceeds what was permitted.
 	at := len(l.early)
-	for at > 0 && l.early[at - 1].offset >= offset {
+	for at > 0 && l.early[at - 1].offset > offset {
 		at -= 1
 	}
-	if at < len(l.early) && l.early[at].offset == offset && len(l.early[at].bytes) >= len(bytes) {
+	if at > 0 {
+		end := l.early[at - 1].offset + u64(len(l.early[at - 1].bytes))
+		if end > offset {
+			skip := min(end - offset, u64(len(bytes)))
+			offset += skip
+			bytes = bytes[skip:]
+		}
+	}
+	if at < len(l.early) && offset + u64(len(bytes)) > l.early[at].offset {
+		bytes = bytes[:l.early[at].offset - offset] // what lies past it will come again if it must
+	}
+	if len(bytes) == 0 {
 		return
 	}
 	copied := make([]byte, len(bytes))
@@ -396,13 +411,17 @@ link_deliver :: proc(l: ^Link, bytes: []byte) {
 	l.in_next += u64(len(bytes))
 	l.in_limit = l.in_next + RECV_WINDOW
 	if l.on_stream != nil {
-		l.on_stream(l.data, bytes)
+		l.on_stream(l, bytes)
 	}
 }
 
 @(private)
 link_acked :: proc(l: ^Link, r: ^zsp.Reader, now: Time) {
 	largest := zsp.read_varint(r)
+	if largest >= link_next(l) {
+		r.bad = true // nothing so numbered was ever sent
+		return
+	}
 	hi := largest + 1
 	newest: Time
 	any := false
@@ -615,7 +634,9 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 		}
 	}
 	if room {
-		p.stream = link_take(l, limit - w.pos - 14)
+		if space := limit - w.pos - 14; space > 0 {
+			p.stream = link_take(l, space)
+		}
 		if p.stream.lo < p.stream.hi {
 			put(&w, byte(Frame.Stream))
 			put_varint(&w, p.stream.lo)
@@ -830,9 +851,6 @@ put_bytes :: proc(w: ^Writer, b: []byte) {
 
 @(private)
 range_contains :: proc(rs: []Range, v: u64) -> bool {
-	if len(rs) == 32 && v < rs[0].lo {
-		return true // too old to tell: a replay, or as good as one
-	}
 	#reverse for r in rs {
 		if v >= r.lo {
 			return v < r.hi

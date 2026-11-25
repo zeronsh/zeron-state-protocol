@@ -112,9 +112,9 @@ http_path :: proc(h: ^Http) -> (path: string, ok: bool) {
 	return parts[1], true
 }
 
-// Takes one message off the front of a buffer, unmasking it in place.
+// Takes one frame off the front of a buffer, unmasking it in place.
 @(require_results)
-ws_take :: proc(buf: []byte) -> (op: Opcode, payload: []byte, used: int, result: Ws_Result) {
+ws_take :: proc(buf: []byte) -> (op: Opcode, payload: []byte, used: int, fin: bool, result: Ws_Result) {
 	if len(buf) < 2 {
 		return
 	}
@@ -140,8 +140,9 @@ ws_take :: proc(buf: []byte) -> (op: Opcode, payload: []byte, used: int, result:
 		n = int(long)
 		at = 10
 	}
-	// Fragmentation is never needed here, and reserved bits never negotiated.
-	if n > MAX_MESSAGE || buf[0] & 0xf0 != 0x80 {
+	fin = buf[0] & 0x80 != 0
+	// Reserved bits are never negotiated, and control frames never in pieces.
+	if n > MAX_MESSAGE || buf[0] & 0x70 != 0 || (!fin && op >= .Close) {
 		result = .Broken
 		return
 	}
@@ -160,7 +161,7 @@ ws_take :: proc(buf: []byte) -> (op: Opcode, payload: []byte, used: int, result:
 	if masked {
 		ws_mask(payload, mask)
 	}
-	return op, payload, at + n, .Message
+	return op, payload, at + n, fin, .Message
 }
 
 ws_put :: proc(w: ^[dynamic]byte, op: Opcode, payload: []byte, client: bool) {

@@ -23,32 +23,44 @@ File_Disk :: struct {
 	dirty:   bool,
 }
 
+// Nothing is created until there is something to keep: merely asking about a space leaves no trace.
 file_disk_open :: proc(d: ^File_Disk, dir: string) -> bool {
 	d.dir = strings.clone(dir)
-	if err := os.make_directory_all(dir); err != nil && !os.is_dir(dir) {
+	d.number = max(u64)
+	d.read_no = max(u64)
+	return !os.exists(dir) || file_disk_make(d)
+}
+
+file_disk_make :: proc(d: ^File_Disk) -> bool {
+	if d.tree != nil {
+		return true
+	}
+	if err := os.make_directory_all(d.dir); err != nil && !os.is_dir(d.dir) {
 		return false
 	}
-	path, _ := filepath.join({dir, "tree"}, context.temp_allocator)
+	path, _ := filepath.join({d.dir, "tree"}, context.temp_allocator)
 	err: os.Error
 	d.tree, err = os.open(path, {.Read, .Write, .Create}, os.Permissions{.Read_User, .Write_User})
 	if err != nil {
+		d.tree = nil
 		return false
 	}
-	d.number = max(u64)
-	d.read_no = max(u64)
-	file_remap(d)
-	return true
+	return file_remap(d)
 }
 
 @(private)
-file_remap :: proc(d: ^File_Disk) {
+file_remap :: proc(d: ^File_Disk) -> bool {
 	if d.mapped != nil {
 		virtual.unmap_file(d.mapped)
 		d.mapped = nil
 	}
-	if size, err := os.file_size(d.tree); err == nil && size > 0 {
-		d.mapped, _ = virtual.map_file_from_file(d.tree, {.Read})
+	size, err := os.file_size(d.tree)
+	if err != nil || size == 0 {
+		return err == nil
 	}
+	merr: virtual.Map_File_Error
+	d.mapped, merr = virtual.map_file_from_file(d.tree, {.Read})
+	return merr == .None
 }
 
 @(private)
@@ -105,6 +117,9 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 		data = d,
 		log_write = proc(data: rawptr, off: u64, bytes: []byte) -> bool {
 			d := (^File_Disk)(data)
+			if !file_disk_make(d) {
+				return false
+			}
 			number := off / zsp.SEGMENT
 			if number != d.number {
 				if d.active != nil {
@@ -168,8 +183,11 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			if d.active == nil || !d.dirty {
 				return true
 			}
+			if !disk_sync(d.active) {
+				return false
+			}
 			d.dirty = false
-			return disk_sync(d.active)
+			return true
 		},
 		page = proc(data: rawptr, no: u32) -> ^zsp.Page {
 			d := (^File_Disk)(data)
@@ -181,6 +199,9 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 		},
 		page_write = proc(data: rawptr, no: u32, bytes: []byte) -> bool {
 			d := (^File_Disk)(data)
+			if !file_disk_make(d) {
+				return false
+			}
 			block: [zsp.PAGE_SIZE]byte
 			copy(block[:], bytes)
 			n, err := os.write_at(d.tree, block[:], i64(no) * zsp.PAGE_SIZE)
@@ -188,11 +209,14 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 		},
 		page_sync = proc(data: rawptr) -> bool {
 			d := (^File_Disk)(data)
-			ok := disk_sync(d.tree)
-			if size, err := os.file_size(d.tree); err != nil || int(size) != len(d.mapped) {
-				file_remap(d)
+			if d.tree == nil {
+				return true
 			}
-			return ok
+			if !disk_sync(d.tree) {
+				return false
+			}
+			size, err := os.file_size(d.tree)
+			return err == nil && (int(size) == len(d.mapped) || file_remap(d))
 		},
 		close = proc(data: rawptr) {
 			d := (^File_Disk)(data)
@@ -208,4 +232,15 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			d^ = {}
 		},
 	}
+}
+
+// The latest stamp time a closed store has seen, as of its last checkpoint.
+clock_of :: proc(dir: string) -> u64 {
+	d: File_Disk
+	if !os.exists(dir) || !file_disk_open(&d, dir) {
+		return 0
+	}
+	disk := file_disk(&d)
+	defer disk.close(disk.data)
+	return zsp.store_clock(disk)
 }

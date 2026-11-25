@@ -17,6 +17,8 @@ import "core:strings"
 CALL_WINDOW :: 256 << 10 // bytes a side may send before the other grants more
 MAX_CALLS :: 4096
 MAX_METHOD :: 255
+MAX_FLOW :: 1024 // of anything but data
+MAX_PENDING :: 64 // frames awaiting a tunnel, past which no more calls join them
 
 Flow :: enum u8 {
 	Data   = 0, // one message
@@ -161,7 +163,7 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 	case len(n.calls) >= MAX_CALLS:
 		refuse(n, from, .Busy)
 		return
-	case len(body) > CALL_WINDOW:
+	case len(body) > CALL_WINDOW || len(method) > MAX_METHOD:
 		refuse(n, from, .Overrun)
 		return
 	}
@@ -202,6 +204,10 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 		refuse(n, from, .Unreachable)
 		return
 	}
+	if len(t.pending) >= MAX_PENDING {
+		refuse(n, from, .Busy)
+		return
+	}
 	to.session, to.tunnel = t.relay, t.id
 	append(&n.calls, c)
 	frame: [dynamic]byte
@@ -239,7 +245,8 @@ on_flow :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 	tag := read_varint(r)
 	kind := Flow(read_u8(r))
 	payload := read_take(r, len(r.buf) - r.pos)
-	if r.bad {
+	if r.bad || (kind != .Data && len(payload) > MAX_FLOW) {
+		r.bad = true
 		return
 	}
 	side := int(tag & 1)
@@ -257,7 +264,7 @@ on_flow :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 				return
 			}
 			from.granted -= len(payload)
-			if from.granted < 0 {
+			if from.granted < 0 || len(payload) > CALL_WINDOW {
 				call_flow(n, from, 1 - side, .Fault, {u8(Call_Fault.Overrun)})
 				call_flow(n, to, side, .Fault, {u8(Call_Fault.Overrun)})
 				unordered_remove(&n.calls, i)

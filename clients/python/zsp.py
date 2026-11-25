@@ -236,9 +236,9 @@ class Client:
             elif s == slot:
                 if k in (PLACE, VALUE) and stamp <= t:
                     return
-                if k == BUNDLE and stamp in stamps_of(b):
+                if k == BUNDLE and kind in (PIECE, BUNDLE) and stamp in stamps_of(b):
                     return
-                if (kind in (PLACE, VALUE) and t < stamp) or (kind == BUNDLE and t in stamps_of(body)):
+                if (kind in (PLACE, VALUE) and t < stamp) or (kind == BUNDLE and k in (PIECE, BUNDLE) and t in stamps_of(body)):
                     del cells[(s, k, t)]
         cells[(slot, kind, stamp)] = body
 

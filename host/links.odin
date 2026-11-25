@@ -47,6 +47,7 @@ Peer :: struct {
 	link:       ^pipe.Link, // open, or being dialled
 	answer:     ^pipe.Link, // answered, not yet confirmed
 	session:    ^zsp.Session,
+	answered:   time.Tick, // when `answer` was made
 	address:    pipe.Address, // where it was last heard from
 	far:        bool, // beyond a NAT
 	used:       time.Tick,
@@ -54,6 +55,7 @@ Peer :: struct {
 	next_knock: time.Tick,
 	tried:      time.Tick, // when candidates were last sent
 	ever_tried: bool,
+	heard:      time.Tick, // a beacon, and knocked for it
 	owed:       bool, // candidates are to be sent once the outside address is known
 }
 
@@ -268,22 +270,19 @@ peer_answer :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 			continue
 		}
 		p := peer_for(s, l.channel.peer)
-		if p == nil || p.session != nil {
-			// A stranger; or a peer that thinks a live link dead, which will lapse here too when unused.
-			if p != nil && p.session != nil && time.tick_since(p.used) > 2 * time.Second {
-				peer_drop(p)
-			} else {
-				pipe.link_destroy(&l)
-				return
-			}
+		// A stranger; or someone's old knock, over and over. A live link is not disturbed by either: it
+		// gives way only when the new one proves itself.
+		if p == nil || (p.answer != nil && time.tick_since(p.answered) < time.Second) {
+			pipe.link_destroy(&l)
+			return
 		}
+		p.answered = time.tick_now()
 		if p.answer == nil {
 			p.answer = new(pipe.Link)
 		} else {
 			pipe.link_destroy(p.answer)
 		}
 		p.answer^ = l
-		p.address = from
 		peer_wire(p, p.answer)
 		buf: [pipe.PACKET]byte
 		udp_send(h, pipe.link_hello(p.answer, buf[:]), from)
@@ -302,13 +301,19 @@ peer_heard :: proc(p: ^Peer, l: ^pipe.Link, from: pipe.Address) {
 	peer_opened(p, l)
 }
 
-// The link is proven: make it the peer's, and begin a session on it.
+// The link is proven: make it the peer's, and begin a session on it. One that was there before gives way,
+// for a device answers only the knock of one that has no link, or thinks so; and only a proven one.
 @(private)
 peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
-	if l.state != .Open || p.session != nil {
+	if l.state != .Open || (p.session != nil && l != p.answer) {
 		return
 	}
 	if l == p.answer {
+		if p.session != nil {
+			session := p.session
+			p.session = nil
+			zsp.session_close(session)
+		}
 		if p.link != nil {
 			pipe.link_destroy(p.link)
 			free(p.link)
@@ -328,16 +333,16 @@ peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
 peer_wire :: proc(p: ^Peer, l: ^pipe.Link) {
 	l.data = p
 	// The packet that proves a link may already carry its first bytes.
-	l.on_stream = proc(data: rawptr, bytes: []byte) {
-		p := (^Peer)(data)
-		peer_opened(p, p.answer if p.answer != nil else p.link)
-		if p.session != nil && !zsp.session_input(p.session, bytes) {
-			pipe.link_close(p.link)
+	l.on_stream = proc(l: ^pipe.Link, bytes: []byte) {
+		p := (^Peer)(l.data)
+		peer_opened(p, l)
+		if l == p.link && p.session != nil && !zsp.session_input(p.session, bytes) {
+			pipe.link_close(l)
 		}
 	}
-	l.on_datagram = proc(data: rawptr, bytes: []byte) {
-		p := (^Peer)(data)
-		if p.session != nil {
+	l.on_datagram = proc(l: ^pipe.Link, bytes: []byte) {
+		p := (^Peer)(l.data)
+		if l == p.link && p.session != nil {
 			zsp.session_datagram(p.session, bytes)
 		}
 	}
@@ -502,9 +507,10 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 			continue
 		}
 		p := peer_for(s, device)
-		if p == nil || p.session != nil || p.knocks > 0 {
+		if p == nil || p.session != nil || p.knocks > 0 || (p.heard != {} && time.tick_since(p.heard) < RETRY_AFTER) {
 			return
 		}
+		p.heard = time.tick_now()
 		at := from
 		at.port = u16(port)
 		clear(&p.candidates)

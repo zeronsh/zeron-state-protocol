@@ -306,6 +306,63 @@ def test_luau():
     assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stderr
 
 
+def knock(address, path):
+    """An upgrade, and nothing after it."""
+    host, port = address.split(":")
+    k = socket.create_connection((host, int(port)))
+    k.sendall(
+        f"GET {path} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".encode()
+    )
+    assert b" 101 " in k.recv(500)
+    return k
+
+
+def test_knocking_leaves_no_trace():
+    relay = Node("y-relay", "serve", "--no-udp").start()
+    ks = [knock(relay.address, "/" + os.urandom(32).hex()) for _ in range(5)]
+    time.sleep(0.2)
+    left = [d for d in os.listdir(relay.dir) if len(d) == 64]
+    assert not left, left
+    for k in ks:
+        k.close()
+
+
+def test_limits():
+    relay, (a, b) = space("aa", "ab")
+    ca, cb = a.client(), b.client()
+    cb.watch(1, 1, "x")
+    ca.put(1, "x", 1, [b"first"])
+    cb.until(lambda: len(cb.list(1, "x")) == 1)
+    # The largest legal value arrives; a larger one is refused before it can do harm.
+    ca.put(1, "x", 2, [os.urandom((1 << 20) - 128)])
+    cb.until(lambda: len(cb.list(1, "x")) == 2)
+    try:
+        ca.put(1, "x", 3, [bytes(1 << 20)])
+        ca.drain(1)
+        raise SystemExit("accepted")
+    except (PermissionError, ConnectionError):
+        pass
+    ca = a.client()
+    ca.put(1, "x", 4, [b"after"])
+    cb.until(lambda: len(cb.list(1, "x")) == 3)
+    # Frames that would outgrow a record end the session that sent them, and not the node.
+    for target in (a,):
+        c = target.client()
+        c.seq += 1
+        graves = b"".join(bytes([zsp.GRAVE]) + c.new_id(1) + b"\0" + c.stamp() + b"\0" for _ in range(100000))
+        c.send(zsp.CELLS, zsp.varint(c.seq) + graves[: (1 << 22) - 100])
+        time.sleep(0.5)
+    assert a.p.poll() is None
+    # A message in several frames is a message.
+    c = a.client()
+    body = zsp.frame(zsp.UNWATCH, zsp.varint(1)) + zsp.frame(zsp.WATCH, zsp.varint(7) + b"\1" + zsp.put_key(c.tag(1, "x").ljust(40, b"\0")) + zsp.put_key(zsp.key_after(c.tag(1, "x"))) + b"\0")
+    for i, part in enumerate((body[:3], body[3:9], body[9:])):
+        op = (2 if i == 0 else 0) | (0x80 if i == 2 else 0)
+        c.sock.sendall(bytes([op, 0x80 | len(part)]) + bytes(4) + part)
+    c.until(lambda: 7 in c.windows)
+
+
 def test_durable_object():
     cloud = Cloud().start(ACCESS_TOKEN="sesame")
     _, (a, b) = space("p", "q", relay=cloud, options=["--credential=" + cloud.token])
