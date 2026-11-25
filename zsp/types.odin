@@ -214,6 +214,10 @@ cell_valid :: proc(c: ^Cell) -> bool {
 		if c.slot < DATA || get_u32(c.body) == 0 {
 			return false
 		}
+		// No more can it hold what is older than its row, for it may be taken for as old as that.
+		if bundle_at(c.body, 0).time < row_born(c.row) {
+			return false
+		}
 		for i in 1 ..< int(get_u32(c.body)) {
 			if !stamp_less(bundle_at(c.body, i - 1), bundle_at(c.body, i)) {
 				return false
@@ -249,6 +253,13 @@ cell_floor :: proc(c: ^Cell) -> Stamp {
 	case .Piece, .Bundle:
 	}
 	return {}
+}
+
+// When what a cell says was first written: of a bundle, what it absorbed. Whoever was to write that may have it absorbed
+// when they no longer are to write.
+@(require_results)
+cell_written :: proc(c: ^Cell) -> u64 {
+	return bundle_at(c.body, 0).time if c.kind == .Bundle else c.stamp.time
 }
 
 @(require_results)

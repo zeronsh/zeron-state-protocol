@@ -228,7 +228,36 @@ cell_open :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, by: ^By = nil) -> bool {
 	if by != nil {
 		by^ = from
 	}
+	if signed && c.kind == .Bundle {
+		bundle_cut(r, c, u64(from.member - 1))
+	}
 	return true
+}
+
+// Leaves out of an open bundle what its author had no right to write when it did, which would not have been taken
+// had it come by itself.
+@(private)
+bundle_cut :: proc(r: ^Roster, c: ^Cell, author: u64) {
+	scope := row_scope(c.row)
+	if author_allowed(r, author, scope, max(u64)) {
+		return // it still may
+	}
+	rd := Reader{buf = c.body, pos = clear_size(.Bundle, c.body)}
+	w := make([dynamic]byte, 0, len(c.body), context.temp_allocator)
+	append(&w, ..c.body[:rd.pos])
+	for rd.pos < len(rd.buf) {
+		from := rd.pos
+		stamp := read_stamp(&rd)
+		_ = read_u64(&rd)
+		_ = read_bytes(&rd)
+		if rd.bad {
+			break
+		}
+		if author_allowed(r, author, scope, stamp.time) {
+			append(&w, ..c.body[from:rd.pos])
+		}
+	}
+	c.body = w[:]
 }
 
 // Who wrote an open cell: a device, and whose name it goes by. Only a signed scope says; and for another than the
@@ -240,7 +269,7 @@ cell_author :: proc(r: ^Roster, c: ^Cell, by: By) -> (device: Key32, subject: []
 	}
 	m := &r.members[by.member - 1]
 	subject = m.subject
-	if len(by.as) > 0 && member_vouches(m, row_scope(c.row), c.stamp.time) {
+	if len(by.as) > 0 && member_vouches(m, row_scope(c.row), cell_written(c)) {
 		subject, vouched = by.as, true
 	}
 	return m.device, subject, vouched, true
@@ -282,7 +311,7 @@ cell_lawful :: proc(r: ^Roster, c: ^Cell) -> bool {
 	rd := Reader{buf = c.body, pos = clear_size(c.kind, c.body)}
 	if .Signed in info.flags {
 		author := read_varint(&rd)
-		if rd.bad || len(c.body) - rd.pos < SIGNATURE || !author_allowed(r, author, scope, c.stamp) {
+		if rd.bad || len(c.body) - rd.pos < SIGNATURE || !author_allowed(r, author, scope, cell_written(c)) {
 			return false
 		}
 	}
@@ -312,12 +341,12 @@ key_id :: proc(commit: Key32) -> u32 {
 }
 
 @(private)
-author_allowed :: proc(r: ^Roster, author: u64, scope: Scope, stamp: Stamp) -> bool {
+author_allowed :: proc(r: ^Roster, author: u64, scope: Scope, time: u64) -> bool {
 	if author >= u64(len(r.members)) {
 		return false
 	}
 	for g in r.members[author].grants {
-		if g.scope == scope && .Write in g.rights && (g.until == 0 || stamp.time <= g.until) {
+		if g.scope == scope && .Write in g.rights && (g.until == 0 || time <= g.until) {
 			return true
 		}
 	}

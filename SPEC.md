@@ -63,7 +63,7 @@ cannot touch any row made since by one who had heard. A row with a well-known id
 | 4 | Piece | 16–255 | none |
 | 5 | Bundle | 16–255 | n (4, ≥ 1) ‖ n stamps (16 each), strictly ascending |
 
-Every stamp a bundle names is less than its own. A bundle that names a bundle must also name everything that one names. It kills, and
+Every stamp a bundle names is less than its own, and none is older than its row. A bundle that names a bundle must also name everything that one names. It kills, and
 refuses, pieces and bundles only. A sealed body is at most 2²⁰ bytes; before sealing, clear prefix included, at most 2²⁰ − 192.
 
 ## 2 Encoding
@@ -162,17 +162,20 @@ row ‖ slot ‖ kind ‖ clear prefix. The bracketed parts exist in signed scop
 the signature, by that member's signer, covers row ‖ slot ‖ kind ‖ stamp ‖ body short of the signature. In a signed scope the plaintext is
 `as` (bytes, at most 64) ‖ what was written: for whom its author wrote it, if for another than its device belongs to, and otherwise nothing.
 
-**Whose a cell is**, in a signed scope: that of whom `as` names, if a grant of the author's there includes Vouch, with `until` zero or no less than the stamp time, and `as` is not
+**Whose a cell is**, in a signed scope: that of whom `as` names, if a grant of the author's there includes Vouch, with `until` zero or no less than when it was written, and `as` is not
 empty; otherwise its author's `subject`. Nothing is refused over it, and a relay sees none of it. In an unsigned scope a cell is nobody's. A host says for whom a local client is as it accepts it, and a node writes nothing there for
 anybody else without Vouch: that is *denied*. What is sealed again keeps its `as`.
 
 A replica accepts a cell from a peer only if
 
 - its scope is in the roster, and its key is one of the scope's and not void; and
-- in a signed scope, some grant of the author's there includes Write, with `until` zero or no less than the stamp time, and the
+- in a signed scope, some grant of the author's there includes Write, with `until` zero or no less than the time it was written, and the
   signature verifies; in an unsigned one, the *sending session* has Write there (a relay one dialled counts as having it), and the key is the
   current one, or the stamp time no greater than its epoch's `closed`; and
 - where the replica holds the scope's key, the seal opens. Otherwise garbage could win by claiming a late stamp.
+
+A cell was **written** at its stamp time, but a bundle when the first of what it names was: its author may put together what it had a right to write after that right has ended,
+as may well be before it hears. Whoever opens a bundle in a signed scope passes over what its author had no right to write at that stamp's time, or has none now.
 
 In a signed scope authority travels with the cell, so anyone may carry it. In an unsigned scope, to hold the key is to be a writer.
 
@@ -216,6 +219,9 @@ the same left, stop if its right is also the same and this piece's id is less th
 right is before `right`; place at the last position not skipped. Operations apply in order within a piece; one that refers to what is
 not yet present waits, with the rest of its piece, until it is. (Two open pieces may refer to each other, so pieces are never
 applied all-or-nothing.)
+
+A long text need not be a great many cells: whoever may write a piece may bundle it, at any time and however often, and nothing about the text is changed by it. (Here a node that has just written a piece bundles those
+that are loose once there are 128, and bundles of about a size once there are 16; in a signed scope its own, and those of one `as`, so that whose they are stands; with a stamp just after the last of them.)
 
 If two stamps claim one piece id — two writers that were once one virtual machine — the lesser keeps it and the other piece's id
 becomes its salt.

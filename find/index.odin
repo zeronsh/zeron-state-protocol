@@ -1317,6 +1317,12 @@ Dirty :: struct {
 	new:  map[zsp.Id]Arrived, // pieces
 }
 
+// Whether it says what the store does.
+@(require_results)
+index_level :: proc(x: ^Index) -> bool {
+	return x.tailing && !x.checking && x.cursor == x.n.events.next
+}
+
 // Brings the index level with the store, or so far towards it. True when it is.
 index_follow :: proc(x: ^Index, budget := max(int) / 1024) -> bool {
 	n := x.n

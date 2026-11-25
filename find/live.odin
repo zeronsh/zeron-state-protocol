@@ -769,7 +769,7 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 			break
 		}
 		if !l.ready || l.renew {
-			if !f.x.tailing || f.x.checking || !query_ready(&f.x, &l.q) {
+			if !index_level(&f.x) || !query_ready(&f.x, &l.q) {
 				if !l.ready {
 					answer_wait(l)
 				}
@@ -779,7 +779,7 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 			l.rows = pred_rows(index_scope(&f.x, l.q.scope), &l.q.where_)
 			l.ready, l.renew, l.stale, l.moved = true, false, true, true
 		}
-		if l.stale {
+		if l.stale && !f.x.checking {
 			l.stale = false
 			answer_send(l)
 			then := time.tick_now()

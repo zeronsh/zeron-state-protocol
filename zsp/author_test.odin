@@ -246,6 +246,23 @@ authors_are_who_they_are :: proc(t: ^testing.T) {
 	testing.expect_value(t, again.authors[again.by[zoe]], "zoe")
 	_ = reader_write(b, &gate, SHOWN, "no more")
 	testing.expect(t, gate.s.closing)
+	// So is what was put together since, of what was written then.
+	{
+		m := roster_member(&e.node.roster, b.keys.device)
+		until: u64
+		for g in m.grants {
+			until = g.until if g.until > until else until
+		}
+		testing.expect(t, until > 0)
+		c := Cell{zoe, 16, .Bundle, {until + 5, 1}, make([]byte, 20, context.temp_allocator)}
+		put_u32(c.body, 1)
+		for before in 0 ..< 2 {
+			put_u64(c.body[4:], until + 1 - u64(before))
+			no, _ := author_index(&b.keys, &e.node.roster)
+			_, subject, vouched, _ := cell_author(&e.node.roster, &c, {u32(no) + 1, transmute([]byte)string("zoe")})
+			testing.expect(t, vouched == (before == 1) && string(subject) == ("zoe" if before == 1 else "server"))
+		}
+	}
 	// And under a new key it is what it was.
 	change(t, &s, proc(s: ^Sim, d: ^Draft) {
 		d.scopes[1].rotate = true

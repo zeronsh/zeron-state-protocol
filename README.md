@@ -36,6 +36,9 @@ device somebody has, or by the host of one that serves many, if you let it vouch
 
 **The log is the database.** A sealed cell is appended once. The bytes on disk are the bytes on the wire are the bytes on the relay.
 
+**What was written long ago is written together.** A text typed a word at a time is a cell a second. Whoever writes the next has a hundred and more of them put into one, and those into one, so that a
+text of 8,000 pieces is at most some 200 cells to fetch, check and open, in three quarters of the room they took, or less; and everything that was ever said about it still holds, whoever is still on the old ones.
+
 **Nothing happens unless something happened.** An idle node makes no system calls. An idle link sends no packets and sets no timer.
 
 ## Measured
@@ -80,6 +83,7 @@ device somebody has, or by the host of one that serves many, if you let it vouch
 | the ten commonest names among 333,000 rows | 14 ms |
 | one more row, known to all of it | 0.12 to 0.17 ms |
 | opening it again | 11 to 19 ms |
+| a text in 8,000 pieces, opened and put together: unmerged, and as it is kept | 8 ms; 2 ms |
 | one word more in a text that is being written, of 200 words or 100,000 | 0.015 to 0.03 ms |
 
 ## Using it

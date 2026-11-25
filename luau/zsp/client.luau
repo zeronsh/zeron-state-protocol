@@ -67,6 +67,7 @@ type Asked = {
 	totals_of: { asking.Told },
 	observer: (Answer) -> (),
 	ids: { string },
+	said: Said?, -- while being sent afresh
 	shown: { [string]: boolean },
 	once: ((Answer) -> ())?, -- it is to be answered once, and this told
 	stopped: boolean, -- though the node may not know yet, and count on its rows being held
@@ -94,6 +95,7 @@ type Stored = {
 	views: { [any]: Row }, -- by table, until the row changes
 	dirty: { [number]: boolean }, -- slots with live text to send
 }
+type Said = { [string]: { [string]: boolean } }
 type Page = {
 	id: number,
 	window: Window,
@@ -105,7 +107,7 @@ type Page = {
 	after: number,
 	limit: number, -- as first asked for, until the node says what the page spans
 	back: boolean,
-	stale: { [string]: boolean }?, -- while being sent afresh: rows not yet mentioned
+	stale: Said?, -- while being sent afresh: rows, and which cells of each are there still
 }
 export type Window = {
 	key: string,
@@ -468,6 +470,13 @@ end
 function Client._on_scopes(self: Client, r: codec.Reader)
 	self:_heard(codec.take(r, 8))
 	table.clear(self.scopes)
+	for _, a in self.asked do
+		local said: Said = {}
+		for _, id in a.ids do
+			said[id] = {}
+		end
+		a.said = said
+	end
 	while r.pos < r.len do
 		local scope = codec.varint(r)
 		local rights = codec.u8(r)
@@ -695,10 +704,10 @@ end
 
 -- What is not mentioned before the next sync is gone.
 function Client._mark(self: Client, page: Page)
-	local stale = {}
+	local stale: Said = {}
 	for _, e in page.window.entries do
 		if e.key >= page.lo and e.key < page.hi then
-			stale[e.row.id] = true
+			stale[e.row.id] = {}
 		end
 	end
 	page.stale = stale
@@ -735,9 +744,11 @@ function Client._on_synced(self: Client, r: codec.Reader)
 	local stale = page.stale
 	page.stale = nil
 	if stale then
-		for id in stale do
+		for id, said in stale do
 			local row = self.rows[id]
-			if row and not self:_pending(id) then
+			if row and next(said) ~= nil then
+				self:_prune(row, said)
+			elseif row and not self:_pending(id) then
 				self:_unplace(row, page.lo, page.hi)
 			end
 		end
@@ -762,6 +773,32 @@ function Client._unplace(self: Client, row: Stored, lo: string, hi: string)
 		end
 	end
 	self:_place(row)
+end
+
+-- A row was said over again, whole: what was not said is there no longer, and nothing has said that it went. What is yet
+-- to be acknowledged may not have been there to say.
+function Client._prune(self: Client, row: Stored, said: { [string]: boolean })
+	if self:_pending(row.id) then
+		return
+	end
+	local some = false
+	for slot, cells in row.slots do
+		local gone = false
+		for stamp in cells do
+			if not said[stamp] then
+				cells[stamp] = nil
+				gone = true
+			end
+		end
+		if gone then
+			some = true
+			self:_rebuild(row, slot)
+		end
+	end
+	if some then
+		row.views = {}
+		self:_place(row)
+	end
 end
 
 function Client._pending(self: Client, id: string): boolean
@@ -1120,8 +1157,15 @@ function Client._on_cells(self: Client, r: codec.Reader)
 		local row = self:_row(id)
 		touched[row] = true
 		for _, page in self.pages do
-			if page.stale then
-				page.stale[id] = nil
+			local said = page.stale and page.stale[id]
+			if said then
+				said[stamp] = true
+			end
+		end
+		for _, a in self.asked do
+			local said = a.said and a.said[id]
+			if said then
+				said[stamp] = true
 			end
 		end
 		local author: Device? = nil
@@ -1144,6 +1188,10 @@ function Client._accept(self: Client, row: Stored, slot: number, kind: number, s
 				row.views = {}
 			end
 			cell.author = author
+		end
+		if cell and cell.body ~= body then
+			cell.body = body -- less of it, since its author may no longer have written the rest
+			self:_rebuild(row, slot)
 		end
 		return false
 	end
@@ -1264,6 +1312,7 @@ function Client.ask(self: Client, question: asking.Question, observer: (Answer) 
 		totals_of = {},
 		observer = observer,
 		ids = {},
+		said = nil,
 		shown = {},
 		stopped = false,
 		once = nil,
@@ -1322,6 +1371,7 @@ function Client.fetch(self: Client, question: asking.Question): Answer
 		totals_of = {},
 		observer = function() end,
 		ids = {},
+		said = nil,
 		shown = {},
 		once = function(made)
 			answer = made
@@ -1402,7 +1452,15 @@ function Client._on_answer(self: Client, r: codec.Reader)
 	for _ = 1, codec.varint(r) do
 		table.insert(ids, codec.take(r, 16))
 	end
+	local again = a.said
+	a.said = nil
 	self:_show(a, ids)
+	for _, id in ids do
+		local row = self.rows[id]
+		if again and again[id] and next(again[id]) ~= nil and row then
+			self:_prune(row, again[id])
+		end
+	end
 	self:_sweep()
 	local totals: { [string]: any } = {}
 	for i = 1, codec.varint(r) do

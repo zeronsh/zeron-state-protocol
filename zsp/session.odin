@@ -1535,6 +1535,12 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 	n.stale = &stale
 	node_commit(n, cells[:], s)
 	n.stale = nil
+	if s.role == .Open {
+		for c in cells {
+			as, _ := session_as(s, row_scope(c.row))
+			text_tidy(n, c, as)
+		}
+	}
 	s.seq_in = seq
 	s.ack_at = store_tail(&n.store)
 	// The sender holds something older than this side does, and would not otherwise hear of it.

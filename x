@@ -11,7 +11,7 @@ command -v python3 >/dev/null || PYTHON=python
 EXE=
 [ "${OS:-}" = Windows_NT ] && EXE=.exe
 STRICT="-vet -strict-style"
-SMALL="-define:ZSP_SEGMENT=262144" # so that tests roll and reclaim segments
+SMALL="-define:ZSP_SEGMENT=262144 -define:ZSP_LOOSE=12 -define:ZSP_ALIKE=3" # so that tests roll and reclaim segments
 
 wasm() {
 	odin build relay/wasm -target:js_wasm32 -o:size -out:relay/src/relay.wasm -no-entry-point $STRICT \

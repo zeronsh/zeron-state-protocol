@@ -267,6 +267,11 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 				continue
 			}
 			if cell_authentic(&n.roster, &c) if fork else cell_lawful(&n.roster, &c) {
+				if c.kind == .Bundle && .Signed in info.flags {
+					// Some of it may be, and the rest be there no longer, for whoever reads it.
+					swept = true
+					n.forgot += 1
+				}
 				continue
 			}
 			swept = true
@@ -317,7 +322,7 @@ cell_mine :: proc(n: ^Node, old: ^Roster, c: ^Cell) -> bool {
 	now, have := author_index(n.keys, &n.roster)
 	r := Reader{buf = c.body, pos = clear_size(c.kind, c.body)}
 	author := read_varint(&r)
-	return had && have && !r.bad && author == then && author_allowed(&n.roster, now, row_scope(c.row), c.stamp)
+	return had && have && !r.bad && author == then && author_allowed(&n.roster, now, row_scope(c.row), cell_written(c))
 }
 
 // Opens a cell sealed under an earlier roster, perhaps with a key that is no longer what it was.
@@ -391,6 +396,9 @@ node_write :: proc(n: ^Node, cells: []Cell, as: []byte = nil) -> bool {
 		return false
 	}
 	node_commit(n, cells, nil)
+	for c in cells {
+		text_tidy(n, c, as)
+	}
 	return true
 }
 

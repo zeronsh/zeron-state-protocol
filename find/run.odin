@@ -1024,7 +1024,7 @@ query_page :: proc(s: ^Scope, q: ^Query, rows: ^Set) -> []Hit {
 	many := false // a row may come up more than once
 	seen: Set
 	defer set_destroy(&seen)
-	many = h.path != "" || h.kind == .Order
+	many = h.path != "" || h.kind == .Order || h.kind == .Author
 	group := make([dynamic]Sorted)
 	defer delete(group)
 

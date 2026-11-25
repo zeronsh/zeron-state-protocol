@@ -448,4 +448,64 @@ do
 	assert(h.last(SERVE))
 end
 
+-- What a roster has made unlawful goes from the rows it was in, as they are said over again; and no more than that.
+do
+	local ANSWER = 34
+	local h = harness()
+	h.run()
+	h.greet()
+	local shown: any, found: any
+	h.client:window({ scope = 1, list = "a", table = Note }, function(s)
+		shown = s
+	end)
+	h.client:ask({ scope = 1, table = Note }, function(s)
+		found = s
+	end)
+	h.run()
+	local one, two = "\0\0\0\1" .. string.rep("1", 12), "\0\0\0\1" .. string.rep("2", 12)
+	local function cell(row: string, kind: number, slot: number, n: number, body: string): string
+		local w = codec.writer()
+		codec.put(w, string.char(kind) .. row .. string.char(slot) .. string.rep("\0", 15) .. string.char(n))
+		codec.put_bytes(w, body)
+		return codec.string(w)
+	end
+	local function place(row: string): string
+		return cell(row, 2, 1, 1, h.client:_tag(1, "a") .. codec.u64(1))
+	end
+	local function piece(n: number, ...: string): string
+		local out = {}
+		for i, s in { ... } do
+			table.insert(out, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" .. string.char(n + i) .. codec.u64(n + i) .. string.char(4 + #s) .. "\1\0\0" .. string.char(#s) .. s)
+		end
+		return "\0\0\0\1" .. string.rep("\0", 15) .. string.char(n) .. table.concat(out)
+	end
+	local function answer(...: string)
+		h.tell(ANSWER, "\1\1" .. string.char(select("#", ...)) .. "\0" .. string.char(select("#", ...)) .. table.concat({ ... }) .. "\0")
+	end
+	h.tell(CELLS, "\0" .. place(one) .. cell(one, 3, 16, 2, "kept") .. cell(one, 3, 17, 3, "gone"))
+	h.tell(CELLS, "\0" .. place(two) .. cell(two, 3, 16, 2, "gone") .. cell(two, 5, 17, 9, piece(4, "a", "b")))
+	answer(one, two)
+	assert(#shown.rows == 2 and #found.rows == 2 and shown.rows[1].body == "gone" and #shown.rows[2].body == 2)
+	local page, _, lo, hi = watch_of(h.last(WATCH))
+	synced(h, page, 1, lo, hi)
+	-- A range, from its beginning.
+	synced(h, page, 2, lo, hi)
+	h.tell(CELLS, "\0" .. place(one) .. cell(one, 3, 16, 2, "kept"))
+	h.tell(CELLS, "\0" .. place(two) .. cell(two, 3, 16, 2, "gone") .. cell(two, 5, 17, 9, piece(4, "a", "b")))
+	synced(h, page, 1, lo, hi)
+	assert(shown.rows[1].title == "kept" and shown.rows[1].body == "" and shown.rows[2].title == "gone")
+	-- An answer, when what may be read has changed. One that says nothing over again says nothing of what is gone.
+	h.greet()
+	answer(one, two)
+	assert(found.rows[2].title == "gone")
+	h.greet()
+	h.tell(CELLS, "\0" .. place(two) .. cell(two, 5, 17, 9, piece(4, "a")))
+	h.tell(CELLS, "\0" .. place(one) .. cell(one, 3, 16, 2, "kept"))
+	answer(one, two)
+	assert(found.rows[2].title == nil and found.rows[2].body == "a" and found.rows[1].title == "kept", "and of some of it, only that")
+	h.tell(CELLS, "\0" .. cell(one, 3, 17, 8, "new"))
+	answer(one, two)
+	assert(found.rows[1].title == "kept" and found.rows[1].body == "new", "it is as it was before from then on")
+end
+
 print("ok")
