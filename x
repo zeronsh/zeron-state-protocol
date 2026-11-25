@@ -29,7 +29,7 @@ check) # every platform, no code generated
 		odin check zspd -target:$t $STRICT && echo "ok   $t"
 	done
 	odin check relay/wasm -target:js_wasm32 -no-entry-point $STRICT && echo "ok   js_wasm32"
-	luau-analyze luau/zsp/init.luau && echo "ok   luau"
+	luau-analyze luau/zsp/init.luau examples/luau/workspace.luau && echo "ok   luau"
 	;;
 test)
 	# Side by side, since none needs another; each says what it has to say at its end.
@@ -39,6 +39,7 @@ test)
 	done
 	(odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 || echo zspd >>build/failed) &
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
+	(odin build examples/apps -out:build/apps$EXE -debug $STRICT || echo examples >>build/failed) &
 	[ -f relay/src/relay.wasm ] && [ -z "$(find zsp relay/wasm -name "*.odin" -newer relay/src/relay.wasm)" ] || wasm || echo wasm >>build/failed
 	wait
 	[ ! -f build/failed ]
@@ -46,6 +47,9 @@ test)
 	node tests/vectors.mjs vectors/vectors.json
 	lune run luau/tests/vectors.luau vectors/vectors.json
 	lune run luau/tests/client.luau
+	node examples/relay/test.mjs
+	$PYTHON examples/apps/test.py
+	$PYTHON examples/organization.py
 	end_to_end
 	;;
 build)

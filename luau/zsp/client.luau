@@ -523,6 +523,12 @@ end
 
 -- ---------------------------------------------------------------- windows
 
+-- Whether what is written in a scope may be read here, or written, or its methods called. "status" is told when it changes.
+function Client.may(self: Client, scope: number, what: "read" | "write" | "call"): boolean
+	local s = self.scopes[scope]
+	return s ~= nil and bit32.btest(s.rights, if what == "read" then 1 elseif what == "write" then 2 else 4)
+end
+
 function Client._tag(self: Client, scope: number, list: string): string
 	local s = self.scopes[scope]
 	assert(s, "no such scope")

@@ -132,7 +132,7 @@ Rights are bits: 1 Read, 2 Write, 4 Call. Every grant includes Read. Scope flag 
 invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
 a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed. `closed`
 says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
-`subject` is the consumer's name for whomever the device belongs to, opaque here. Members are never removed, only their grants
+`subject` is the consumer's name for whomever the device belongs to, opaque here. A roster is at most 2²² − 64 bytes. Members are never removed, only their grants
 ended, so that a member's index is for ever.
 
 **Scope keys.** Each scope has a 32-byte sealing key per epoch. For each member in order, for each grant in force in order,

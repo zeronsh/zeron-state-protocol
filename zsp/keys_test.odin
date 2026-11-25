@@ -190,3 +190,63 @@ handshake_is_noise :: proc(t: ^testing.T) {
 	plain, opened := channel_open(&answerer, sealed[:])
 	testing.expect(t, opened && string(plain) == string(payload[:]))
 }
+
+// A scope that is made is had by all who rule, so that they go on ruling.
+@(test)
+those_who_rule_have_every_scope :: proc(t: ^testing.T) {
+	root: Key32
+	root[0] = 9
+	k, a: Keyring
+	one, two: Key32
+	one[5], two[5] = 1, 2
+	keyring_init(&k, one)
+	keyring_init(&a, two)
+	defer keyring_destroy(&k)
+	defer keyring_destroy(&a)
+	none: Roster
+	d := draft_from(&none, 100)
+	home := draft_scope(&d)
+	draft_grant(&d, k.device, k.signer, home, {.Read, .Write}).owner = true
+	draft_grant(&d, a.device, a.signer, home, {.Read, .Write}).admin = true
+	space := ed25519_public(root)
+	first, ok := roster_sign(&k, root, &d, context.temp_allocator)
+	testing.expect(t, ok)
+	r, sound := roster_parse(first, space)
+	testing.expect(t, sound && roster_unwrap(&k, &r))
+	d = draft_from(&r, 200)
+	_ = draft_scope(&d)
+	second, again := roster_sign(&k, root, &d, context.temp_allocator)
+	testing.expect(t, again)
+	roster_destroy(&r)
+	r, sound = roster_parse(second, space)
+	testing.expect(t, sound && roster_unwrap(&a, &r))
+	d = draft_from(&r, 300)
+	_, signed := roster_sign(&a, nil, &d, context.temp_allocator)
+	testing.expect(t, signed)
+	roster_destroy(&r)
+}
+
+// A roster is sent whole, so one that could not be is none.
+@(test)
+rosters_fit_in_a_frame :: proc(t: ^testing.T) {
+	secret, root: Key32
+	secret[0], root[0] = 1, 2
+	k: Keyring
+	keyring_init(&k, secret)
+	defer keyring_destroy(&k)
+	none: Roster
+	d := draft_from(&none, 100)
+	m := draft_grant(&d, k.device, k.signer, draft_scope(&d), {.Read, .Write})
+	m.owner = true
+	m.subject = make([]byte, MAX_ROSTER, context.temp_allocator)
+	_, big := roster_sign(&k, root, &d, context.temp_allocator)
+	testing.expect(t, !big)
+	m.subject = m.subject[:MAX_ROSTER - 4096]
+	bytes, ok := roster_sign(&k, root, &d, context.temp_allocator)
+	testing.expect(t, ok)
+	r, sound := roster_parse(bytes, ed25519_public(root))
+	testing.expect(t, sound)
+	roster_destroy(&r)
+	_, sound = roster_parse(make([]byte, MAX_ROSTER + 1, context.temp_allocator), ed25519_public(root))
+	testing.expect(t, !sound)
+}

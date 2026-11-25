@@ -16,6 +16,8 @@ import "core:slice"
 // that a key belongs to some person, or that a person may use some relay, is authentication, and is
 // the host's: see Host.authenticate.
 
+MAX_ROSTER :: MAX_FRAME - 64 // bytes: it is sent whole
+
 Right :: enum u8 {
 	Read,
 	Write, // implies Read
@@ -196,7 +198,7 @@ roster_claims :: proc(bytes: []byte, space: Key32) -> (serial: u64, ok: bool) {
 // What is already known to be genuine in a roster held need not be proven again.
 @(require_results)
 roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Roster, ok: bool) {
-	if len(bytes) < 64 {
+	if len(bytes) < 64 || len(bytes) > MAX_ROSTER {
 		return
 	}
 	defer if !ok {
@@ -520,6 +522,12 @@ draft_scope :: proc(d: ^Draft, flags: Scope_Flags = {}) -> (id: Scope) {
 	}
 	id += 1
 	append(&d.scopes, Draft_Scope{id = id, flags = flags})
+	// Whoever draws up rosters must hold every scope.
+	for m in d.members {
+		if m.owner || m.admin {
+			draft_grant(d, m.device, m.signer, id, {.Read, .Write})
+		}
+	}
 	return
 }
 
@@ -739,6 +747,10 @@ roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := con
 	sig: [64]byte
 	ed25519.sign(&sk, w[:], sig[:])
 	append(&w, ..sig[:])
+	if len(w) > MAX_ROSTER {
+		delete(w)
+		return nil, false
+	}
 	return w[:], true
 }
 

@@ -26,6 +26,8 @@ USAGE :: `zspd - Zeron State Protocol node
   zspd scope <dir> [signed]                  add a scope to the space
   zspd admit <dir> <key> <scope> [read]      grant a device a scope: to read, write and call, or only read
   zspd revoke <dir> <key> [scope]            end a device's grants
+  zspd subject <dir> <key> <text>            say whose a device is: an account, a name, as you know them
+  zspd members <dir>                         list devices: key, rights in each scope, whose it is
   zspd admin <dir> <key> [off]               let a device do all of this but make admins and owners, or no longer
   zspd owner <dir> <key>                     make a device an owner too, for good
   zspd relay <dir> <key> <url>               name a relay for the space's devices to meet at
@@ -76,7 +78,11 @@ run :: proc() -> int {
 	case "scope":
 		ok = amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
 			id := zsp.draft_scope(&a.draft, {.Signed} if len(args) > 0 && args[0] == "signed" else {})
-			zsp.draft_grant(&a.draft, a.keys.device, a.keys.signer, id, {.Read, .Write, .Call})
+			for m in a.draft.members {
+				if m.owner || m.admin {
+					zsp.draft_grant(&a.draft, m.device, m.signer, id, {.Read, .Write, .Call})
+				}
+			}
 			buf: [10]byte
 			say(os.stdout, strconv.write_uint(buf[:], u64(id), 10), "\n")
 			return true
@@ -108,6 +114,19 @@ run :: proc() -> int {
 			zsp.draft_revoke(&a.draft, device, zsp.Scope(scope))
 			return true
 		})
+	case "subject":
+		ok = len(rest) == 2 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
+			key := parse_hex(args[0], 64) or_return
+			for &m in a.draft.members {
+				if string(m.device[:]) == string(key[:32]) {
+					m.subject = transmute([]byte)args[1]
+					return true
+				}
+			}
+			return false
+		})
+	case "members":
+		ok = members(dir)
 	case "admin":
 		ok = len(rest) >= 1 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
 			return appoint(a, args[0], false, len(args) < 2 || args[1] != "off")
@@ -220,6 +239,31 @@ print_key :: proc(dir: string) -> bool {
 	k: zsp.Keyring
 	zsp.keyring_init(&k, secret)
 	say(os.stdout, to_hex(k.device[:]), to_hex(k.signer[:]), "\n")
+	return true
+}
+
+// A line for each device: its key, what it may do, and whose it is.
+members :: proc(dir: string) -> bool {
+	space, name := read_space(dir) or_return
+	data, err := os.read_entire_file(in_dir(in_dir(dir, name), "roster"), context.temp_allocator)
+	if err != nil {
+		return false
+	}
+	r := zsp.roster_parse(data, space) or_return
+	for &m in r.members {
+		if !zsp.member_active(&m) {
+			continue
+		}
+		say(os.stdout, to_hex(m.device[:]), to_hex(m.signer[:]))
+		buf: [10]byte
+		for g in m.grants {
+			if g.until != 0 {
+				continue
+			}
+			say(os.stdout, " ", strconv.write_uint(buf[:], u64(g.scope), 10), ":", "r" if .Read in g.rights else "", "w" if .Write in g.rights else "", "c" if .Call in g.rights else "")
+		}
+		say(os.stdout, " owner" if m.owner else " admin" if m.admin else "", "\t", string(m.subject), "\n")
+	}
 	return true
 }
 

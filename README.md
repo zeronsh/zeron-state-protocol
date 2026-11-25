@@ -14,6 +14,7 @@ relay/     the same relay as a Cloudflare Durable Object: zsp/ compiled to wasm,
 luau/zsp/  the query client
 clients/   a whole client in the Python standard library, to show how little one needs
 vectors/   what two implementations must agree on
+docs/      how to lay out who sees what; examples/ has it running
 ```
 
 ## The idea
@@ -136,6 +137,11 @@ export default relay({ authenticate: async ({ space, device, credential, env }) 
 `cd relay && wrangler secret put RELAY_SECRET && wrangler deploy`; `GET /` then answers with the key devices pin: fetch it once, with something that checks certificates, as a browser or curl does.
 
 Embedding in Odin is the same question asked of `host.Config.authenticate`, or of `zsp.Host.authenticate` if you bring your own I/O.
+
+## Users, teams and organizations
+
+[docs/scoping.md](docs/scoping.md): what should be a space, a scope, a list or a column; how much fits; keeping a space the same as your own directory of people; guests, announcements, leavers; who may use a relay,
+and what each application on a machine may do. Its examples are in [examples/](examples) and are run with the tests.
 
 ## Working on it
 
