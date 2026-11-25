@@ -1,0 +1,312 @@
+package host
+
+import "core:crypto"
+import "core:encoding/hex"
+import "core:nbio"
+import "core:net"
+import "core:os"
+import "core:path/filepath"
+import "core:time"
+import "../pipe"
+import "../zsp"
+
+// One thread, one event loop, no polling: between events the process is asleep in the kernel, and the
+// only clock it ever sets is the nearest deadline something in flight has asked for.
+
+SYNC_DELAY :: 100 * time.Millisecond // how long commits may wait to share an fsync
+SHARED_BUFFER :: 64 << 10
+
+Config :: struct {
+	dir:          string,
+	full:         bool, // replicate everything
+	relay:        bool, // hold no keys and serve any space the authenticator lets in
+	listen:       Maybe(net.Endpoint), // WebSockets
+	udp_port:     Maybe(int), // links, on this port or any if zero
+	stun:         string, // host:port to ask for this machine's outside address
+	credential:   string, // presented to relays
+	// Authentication, which is wholly the embedder's: see zsp.Host.authenticate. `data` is passed back.
+	data:         rawptr,
+	authenticate: proc(data: rawptr, s: ^zsp.Session, credential: []byte),
+}
+
+Host :: struct {
+	using config: Config,
+	secret:       zsp.Key32,
+	device:       zsp.Key32,
+	spaces:       [dynamic]^Space,
+	streams:      [dynamic]^Stream,
+	listener:     net.TCP_Socket,
+	dialers:      [dynamic]^Dialer,
+	udp:          Udp,
+	shared:       []byte, // everything is received into this
+	sync_due:     time.Tick,
+	syncing:      bool, // sync_due is set
+	stopping:     bool,
+}
+
+Space :: struct {
+	host: ^Host,
+	node: zsp.Node,
+	keys: zsp.Keyring,
+	disk: File_Disk,
+	dir:  string,
+	seen: u64, // events already noticed by links_poke
+}
+
+@(private)
+file_in :: proc(dir, name: string) -> string {
+	path, _ := filepath.join({dir, name}, context.temp_allocator)
+	return path
+}
+
+// This machine's secret, created on first use.
+@(require_results)
+device_secret :: proc(dir: string) -> (secret: zsp.Key32, ok: bool) {
+	path := file_in(dir, "device.key")
+	if data, err := os.read_entire_file(path, context.temp_allocator); err == nil {
+		copy(secret[:], data)
+		return secret, len(data) == 32
+	}
+	if err := os.make_directory_all(dir); err != nil && !os.is_dir(dir) {
+		return
+	}
+	crypto.rand_bytes(secret[:])
+	return secret, save(path, secret[:])
+}
+
+save :: proc(path: string, bytes: []byte) -> bool {
+	// Whole or not at all.
+	partial := path_with(path, ".new")
+	f, err := os.open(partial, {.Write, .Create, .Trunc}, os.Permissions{.Read_User, .Write_User})
+	if err != nil {
+		return false
+	}
+	_, werr := os.write(f, bytes)
+	serr := os.sync(f)
+	os.close(f)
+	return werr == nil && serr == nil && os.rename(partial, path) == nil
+}
+
+@(private)
+path_with :: proc(path, suffix: string) -> string {
+	b := make([]byte, len(path) + len(suffix), context.temp_allocator)
+	copy(b, path)
+	copy(b[len(path):], suffix)
+	return string(b)
+}
+
+// Opens a space held by this machine. On a relay, any space may be opened by name.
+space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
+	id := id
+	for s in h.spaces {
+		if s.node.space == id {
+			return s
+		}
+	}
+	s := new(Space)
+	s.host = h
+	name := string(hex.encode(id[:], context.temp_allocator))
+	s.dir, _ = filepath.join({h.dir, name})
+	if !file_disk_open(&s.disk, s.dir) {
+		free(s)
+		return nil
+	}
+	keys: ^zsp.Keyring
+	if !h.relay {
+		zsp.keyring_init(&s.keys, h.secret)
+		keys = &s.keys
+	}
+	s.node.now = now_ms()
+	if !zsp.node_init(&s.node, file_disk(&s.disk), id, keys, h.full || h.relay) {
+		free(s)
+		return nil
+	}
+	if bytes, err := os.read_entire_file(file_in(s.dir, "roster"), context.temp_allocator); err == nil {
+		if !zsp.node_adopt(&s.node, bytes) {
+			report(.Warning, "the saved roster is not sound")
+		} else if !h.relay && !zsp.node_member(&s.node) {
+			report(.Warning, "this device does not belong to the space")
+		}
+	}
+	s.node.host = {
+		data         = s,
+		authenticate = space_authenticate,
+		roster       = proc(data: rawptr, bytes: []byte) {
+			s := (^Space)(data)
+			save(file_in(s.dir, "roster"), bytes)
+			dialers_refresh(s.host)
+		},
+		signal       = links_signalled,
+		presence     = proc(data: rawptr, online: []zsp.Key32) {
+			links_greet((^Space)(data), online)
+		},
+	}
+	append(&h.spaces, s)
+	return s
+}
+
+@(private)
+space_authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
+	h := (^Space)(data).host
+	switch {
+	case h.authenticate != nil:
+		h.authenticate(h.data, s, credential)
+	case s.role == .Peer:
+		zsp.session_accept(s)
+	case:
+		zsp.session_refuse(s)
+	}
+}
+
+space_close :: proc(s: ^Space) {
+	if !zsp.store_sync(&s.node.store) {
+		report(.Error, "could not sync the log")
+	}
+	// Leaving a short tail to replay is cheaper than writing pages for it.
+	if zsp.store_tail(&s.node.store) - s.node.checkpoint > 1 << 20 {
+		zsp.store_checkpoint(&s.node.store)
+	}
+	zsp.node_destroy(&s.node)
+	zsp.keyring_destroy(&s.keys)
+	delete(s.dir)
+	free(s)
+}
+
+@(require_results)
+now_ms :: proc() -> u64 {
+	return u64(time.time_to_unix_nano(time.now()) / 1_000_000)
+}
+
+@(private)
+now_us :: proc() -> pipe.Time {
+	return pipe.Time(time.tick_now()._nsec / 1000)
+}
+
+host_init :: proc(h: ^Host, config: Config) -> bool {
+	h.config = config
+	h.secret = device_secret(h.dir) or_return
+	h.device = zsp.x25519_public(h.secret)
+	h.shared = make([]byte, SHARED_BUFFER)
+	if err := nbio.acquire_thread_event_loop(); err != nil {
+		report(.Error, "the event loop failed")
+		return false
+	}
+	if at, ok := h.listen.?; ok {
+		// core:net's listener may reuse a port its last owner died holding; core:nbio's may not.
+		listener, err := net.listen_tcp(at)
+		for tries := 0; err == net.Bind_Error.Address_In_Use && tries < 20; tries += 1 {
+			// A process that died is still letting go of its ring.
+			time.sleep(50 * time.Millisecond)
+			listener, err = net.listen_tcp(at)
+		}
+		if err != nil {
+			report(.Error, "could not listen there")
+			return false
+		}
+		if aerr := nbio.associate_socket(listener); aerr != nil {
+			report(.Error, "could not listen there")
+			return false
+		}
+		h.listener = listener
+		nbio.accept(listener, stream_accepted)
+		nbio_host = h
+	}
+	if port, ok := h.udp_port.?; ok {
+		udp_open(h, port) or_return
+	}
+	return true
+}
+
+// The event loop is the thread's, and so is the host that runs on it.
+@(thread_local, private)
+nbio_host: ^Host
+
+host_run :: proc(h: ^Host) -> bool {
+	nbio_host = h
+	dialers_refresh(h)
+	for !h.stopping {
+		host_settle(h)
+		wait := nbio.NO_TIMEOUT
+		if due, ok := host_deadline(h); ok {
+			wait = max(time.tick_diff(time.tick_now(), due), 0)
+		}
+		if err := nbio.tick(wait); err != nil {
+			report(.Error, "the event loop failed")
+			return false
+		}
+		free_all(context.temp_allocator)
+	}
+	return true
+}
+
+host_destroy :: proc(h: ^Host) {
+	for len(h.streams) > 0 {
+		stream_close(h.streams[0])
+	}
+	udp_close(h)
+	for len(h.spaces) > 0 {
+		space_close(pop(&h.spaces))
+	}
+	for d in h.dialers {
+		dialer_free(d)
+	}
+	delete(h.streams)
+	delete(h.spaces)
+	delete(h.dialers)
+	delete(h.shared)
+	nbio.release_thread_event_loop()
+}
+
+// Everything that follows from the events of one tick, once.
+@(private)
+host_settle :: proc(h: ^Host) {
+	now := time.tick_now()
+	ms := now_ms()
+	if h.syncing && time.tick_diff(h.sync_due, now) >= 0 {
+		h.syncing = false
+		for s in h.spaces {
+			if !zsp.node_sync(&s.node) {
+				report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
+				h.stopping = true
+			}
+		}
+	}
+	dialers_run(h, now)
+	links_run(h)
+	for s in h.spaces {
+		s.node.now = ms
+	}
+	#reverse for s in h.streams {
+		stream_flush(s)
+	}
+	links_flush(h)
+	for s in h.spaces {
+		zsp.store_flush(&s.node.store)
+		if zsp.store_unsynced(&s.node.store) && !h.syncing {
+			h.syncing = true
+			h.sync_due = time.tick_add(now, SYNC_DELAY)
+		}
+	}
+}
+
+@(private)
+host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
+	earliest :: proc(due: ^time.Tick, ok: ^bool, t: time.Tick) {
+		if !ok^ || t._nsec < due._nsec {
+			due^ = t
+			ok^ = true
+		}
+	}
+	if h.syncing {
+		earliest(&due, &ok, h.sync_due)
+	}
+	for d in h.dialers {
+		if t, set := dialer_deadline(d); set {
+			earliest(&due, &ok, t)
+		}
+	}
+	if t := links_deadline(h); t != 0 {
+		earliest(&due, &ok, time.Tick{i64(t) * 1000})
+	}
+	return
+}

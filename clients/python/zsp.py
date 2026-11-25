@@ -1,0 +1,316 @@
+"""A Zeron State Protocol client in the Python standard library.
+
+It shows how little of SPEC.md a client needs: frames, cells, and the merge rule. No cryptography, because a
+client speaks to its own device's node; no storage, because the node is that.
+"""
+
+import base64, hashlib, os, socket, struct, time
+
+HELLO, ROSTER, WATCH, UNWATCH, RECON, WANT, CELLS, ACK, LIVE, SYNCED, SIGNAL, PRESENCE, ERROR, SERVE, CALL, FLOW = range(1, 17)
+GRAVE, PLACE, VALUE, PIECE, BUNDLE = range(1, 6)
+READ, WRITE, MAY_CALL = 1, 2, 4
+F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = range(5)
+DATA_WATCH, LIVE_WATCH, BACK, ADOPT, KNOWN = 1, 2, 4, 8, 16
+KEY_MAX = b"\xff" * 40
+
+
+def varint(n):
+    out = bytearray()
+    while n >= 0x80:
+        out.append(n & 0x7F | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+class Reader:
+    def __init__(self, buf):
+        self.buf, self.pos = buf, 0
+
+    def take(self, n):
+        if self.pos + n > len(self.buf):
+            raise ValueError("short")
+        self.pos += n
+        return self.buf[self.pos - n : self.pos]
+
+    def u8(self):
+        return self.take(1)[0]
+
+    def u64(self):
+        return struct.unpack(">Q", self.take(8))[0]
+
+    def varint(self):
+        v = shift = 0
+        while True:
+            b = self.u8()
+            v |= (b & 0x7F) << shift
+            if b < 0x80:
+                return v
+            shift += 7
+
+    def bytes(self):
+        return self.take(self.varint())
+
+    def key(self):
+        n = self.u8()
+        return KEY_MAX if n == 0xFF else self.take(n).ljust(40, b"\0")
+
+    def done(self):
+        return self.pos == len(self.buf)
+
+
+def put_key(k):
+    if k == KEY_MAX:
+        return b"\xff"
+    k = k.rstrip(b"\0")
+    return bytes([len(k)]) + k
+
+
+def frame(kind, body):
+    return varint(len(body) + 1) + bytes([kind]) + body
+
+
+def key_after(prefix):
+    """The least 40-byte key greater than every key with this prefix."""
+    n = int.from_bytes(prefix, "big") + 1
+    return n.to_bytes(len(prefix), "big").ljust(40, b"\0")
+
+
+class Client:
+    def __init__(self, address, credential, timeout=10):
+        host, port = address.rsplit(":", 1)
+        self.sock = socket.create_connection((host, int(port)), timeout)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall(
+            f"GET / HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n".encode()
+        )
+        self.raw, self.stream = b"", b""
+        while b"\r\n\r\n" not in self.raw:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("refused")
+            self.raw += chunk
+        head, self.raw = self.raw.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n")[0]:
+            raise ConnectionError(head.split(b"\r\n")[0].decode())
+        self.clock = self.seq = self.acked = 0
+        self.scopes = {}  # number -> (rights, list key)
+        self.rows = {}  # id -> {(slot, kind, stamp): body}
+        self.windows = {}  # watch id -> dict(lo, hi, before, after, settled)
+        self.lives = []  # (row, slot, piece, offset, bytes)
+        self.devices = []  # reachable: (key, subject), this one first
+        self.handlers = {}  # (scope, method) -> function(device, bytes) -> bytes
+        self.calls = {}  # id -> {"data": [], "ended": bool, "fault": int or None}
+        self.next_call = 0
+        self.send(HELLO, bytes([1, 0]) + bytes(32) + varint(0) + varint(len(credential)) + credential)
+        while self.step() != ROSTER:
+            pass
+
+    # -- the pipe
+
+    def send(self, kind, body):
+        data = frame(kind, body)
+        mask = os.urandom(4)
+        n = len(data)
+        head = bytes([0x82]) + (
+            bytes([n | 0x80]) if n < 126 else bytes([254]) + struct.pack(">H", n) if n < 65536 else bytes([255]) + struct.pack(">Q", n)
+        )
+        masked = (int.from_bytes(data, "big") ^ int.from_bytes((mask * (n // 4 + 1))[:n], "big")).to_bytes(n, "big")
+        self.sock.sendall(head + mask + masked)
+
+    def recv_message(self):
+        while True:
+            if len(self.raw) >= 2:
+                n, at = self.raw[1] & 0x7F, 2
+                if n == 126 and len(self.raw) >= 4:
+                    n, at = struct.unpack(">H", self.raw[2:4])[0], 4
+                elif n == 127 and len(self.raw) >= 10:
+                    n, at = struct.unpack(">Q", self.raw[2:10])[0], 10
+                elif n >= 126:
+                    at = 1 << 60
+                if len(self.raw) >= at + n:
+                    op, payload = self.raw[0] & 15, self.raw[at : at + n]
+                    self.raw = self.raw[at + n :]
+                    if op == 8:
+                        raise ConnectionError("closed")
+                    if op == 2:
+                        return payload
+                    continue
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("closed")
+            self.raw += chunk
+
+    def step(self):
+        """Handles one frame and returns its type."""
+        while True:
+            r = Reader(self.stream)
+            try:
+                body = r.bytes()
+                break
+            except ValueError:
+                self.stream += self.recv_message()
+        self.stream = self.stream[r.pos :]
+        r = Reader(body)
+        kind = r.u8()
+        if kind == ROSTER:
+            self.clock = max(self.clock, r.u64())
+            self.scopes = {}
+            while not r.done():
+                scope = r.varint()
+                rights = r.u8()
+                self.scopes[scope] = (rights, r.take(32))
+        elif kind == CELLS:
+            r.varint()
+            row = None
+            while not r.done():
+                tag = r.u8()
+                if not tag & 0x80:
+                    row = r.take(16)
+                self.merge(row, r.u8(), tag & 0x7F, r.take(16), r.bytes())
+        elif kind == ACK:
+            self.acked = r.varint()
+        elif kind == SYNCED:
+            window, flags = r.varint(), r.u8()
+            self.windows[window] = dict(
+                settled=flags & 1, restart=flags & 2, denied=flags & 4, lo=r.key(), hi=r.key(), before=r.varint(), after=r.varint()
+            )
+        elif kind == LIVE:
+            row, slot, piece, offset = r.take(16), r.u8(), r.take(8), r.varint()
+            r.take(16)
+            self.lives.append((row, slot, piece, offset, r.take(len(body) - r.pos)))
+        elif kind == PRESENCE:
+            self.devices = []
+            while not r.done():
+                self.devices.append((r.take(32), r.bytes()))
+        elif kind == CALL:
+            call, device, scope, method = r.varint(), r.take(32), r.varint(), r.bytes().decode()
+            answer = self.handlers[(scope, method)](device, r.take(len(body) - r.pos))
+            self.flow(call, 1, F_DATA, answer)
+            self.flow(call, 1, F_END)
+        elif kind == FLOW:
+            tag, what = r.varint(), r.u8()
+            payload = r.take(len(body) - r.pos)
+            call = self.calls.get(tag >> 1) if tag & 1 else None
+            if call is not None:
+                if what == F_DATA:
+                    call["data"].append(payload)
+                    self.flow(tag >> 1, 0, F_CREDIT, varint(len(payload)))
+                elif what == F_END:
+                    call["ended"] = True
+                elif what in (F_FAULT, F_CANCEL):
+                    call["ended"], call["fault"] = True, payload[0] if payload else None
+        elif kind == ERROR:
+            raise PermissionError(f"fault {r.u8()}")
+        return kind
+
+    def until(self, condition, timeout=10):
+        deadline = time.monotonic() + timeout
+        while not condition():
+            self.sock.settimeout(max(deadline - time.monotonic(), 0.001))
+            self.step()
+        return self
+
+    def drain(self, seconds):
+        """Handles whatever arrives for a while."""
+        deadline = time.monotonic() + seconds
+        try:
+            while True:
+                self.sock.settimeout(max(deadline - time.monotonic(), 0.001))
+                self.step()
+        except (TimeoutError, socket.timeout):  # one and the same, from Python 3.10
+            self.sock.settimeout(10)
+
+    # -- the merge rule
+
+    def merge(self, row, slot, kind, stamp, body):
+        self.clock = max(self.clock, struct.unpack(">Q", stamp[:8])[0])
+        cells = self.rows.setdefault(row, {})
+        if any(k == GRAVE for (_, k, _) in cells) and kind != GRAVE:
+            return
+        for (s, k, t), b in list(cells.items()):
+            if kind == GRAVE:
+                del cells[(s, k, t)]
+            elif s == slot:
+                if k in (PLACE, VALUE) and stamp <= t:
+                    return
+                if k == BUNDLE and stamp in stamps_of(b):
+                    return
+                if (kind in (PLACE, VALUE) and t < stamp) or (kind == BUNDLE and t in stamps_of(body)):
+                    del cells[(s, k, t)]
+        cells[(slot, kind, stamp)] = body
+
+    # -- what a client does
+
+    def tag(self, scope, name):
+        return struct.pack(">I", scope) + hashlib.sha256(self.scopes[scope][1] + name.encode()).digest()[:12]
+
+    def stamp(self):
+        self.clock = max(self.clock + 1, int(time.time() * 1000) << 16)
+        return struct.pack(">Q", self.clock) + os.urandom(8)
+
+    def new_id(self, scope):
+        return struct.pack(">II", scope, int(time.time())) + os.urandom(8)
+
+    def write(self, *cells):
+        """cells: (row, slot, kind, body). Applied here at once, acknowledged when durable."""
+        self.seq += 1
+        out, last = varint(self.seq), None
+        for row, slot, kind, body in cells:
+            stamp = self.stamp()
+            self.merge(row, slot, kind, stamp, body)
+            out += bytes([kind | (0x80 if row == last else 0)]) + (b"" if row == last else row)
+            out += bytes([slot]) + stamp + varint(len(body)) + body
+            last = row
+        self.send(CELLS, out)
+        return self.seq
+
+    def put(self, scope, name, order, values, row=None, slot=1):
+        row = row or self.new_id(scope)
+        place = (row, slot, PLACE, self.tag(scope, name) + struct.pack(">Q", order))
+        self.write(place, *((row, 16 + i, VALUE, v) for i, v in enumerate(values)))
+        return row
+
+    def live(self, row, slot, piece, offset, data):
+        self.send(LIVE, row + bytes([slot]) + piece + varint(offset) + bytes(16) + data)
+
+    def watch(self, window, scope, name, limit=0, back=True, lo=None, hi=None, live=True):
+        prefix = self.tag(scope, name)
+        lo = lo if lo is not None else prefix.ljust(40, b"\0")
+        hi = hi if hi is not None else key_after(prefix)
+        flags = DATA_WATCH | (LIVE_WATCH if live else 0) | (BACK if back else 0)
+        self.windows.pop(window, None)
+        self.send(WATCH, varint(window) + bytes([flags]) + put_key(lo) + put_key(hi) + varint(limit))
+
+    def flow(self, call, side, kind, payload=b""):
+        self.send(FLOW, varint(call << 1 | side) + bytes([kind]) + payload)
+
+    def serve(self, scope, method, handler):
+        self.handlers[(scope, method)] = handler
+        self.send(SERVE, varint(scope) + b"\1" + varint(len(method)) + method.encode())
+
+    def call(self, device, scope, method, body=b"", timeout=10):
+        self.next_call += 1
+        call = self.calls[self.next_call] = {"data": [], "ended": False, "fault": None}
+        self.send(CALL, varint(self.next_call) + device + varint(scope) + varint(len(method)) + method.encode() + body)
+        self.flow(self.next_call, 0, F_END)
+        self.until(lambda: call["ended"], timeout)
+        del self.calls[self.next_call]
+        return call
+
+    def list(self, scope, name):
+        """Rows of a list in order: (order, id, {slot: value})."""
+        prefix, out = self.tag(scope, name), []
+        for row, cells in self.rows.items():
+            for (slot, kind, _), body in cells.items():
+                if kind == PLACE and body[:16] == prefix:
+                    values = {s: b for (s, k, _), b in cells.items() if k == VALUE}
+                    out.append((struct.unpack(">Q", body[16:24])[0], row, values))
+        return sorted(out)
+
+
+def stamps_of(bundle):
+    n = struct.unpack(">I", bundle[:4])[0]
+    return {bundle[4 + i * 16 : 20 + i * 16] for i in range(n)}

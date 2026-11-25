@@ -1,0 +1,8 @@
+{
+  "name": "zsp-relay",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "miniflare": "^4.20260730.0"
+  }
+}

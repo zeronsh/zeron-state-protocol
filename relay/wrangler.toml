@@ -1,0 +1,17 @@
+name = "zsp-relay"
+main = "src/worker.js"
+compatibility_date = "2026-01-01"
+
+[build]
+command = "../x wasm"
+
+[[durable_objects.bindings]]
+name = "SPACE"
+class_name = "Space"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Space"]
+
+# wrangler secret put RELAY_SECRET    64 hex digits: openssl rand -hex 32
+# wrangler secret put ACCESS_TOKEN    optional

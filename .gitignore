@@ -1,0 +1,4 @@
+build/
+relay/node_modules/
+relay/src/relay.wasm
+.wrangler/

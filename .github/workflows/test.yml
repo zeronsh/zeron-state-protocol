@@ -1,0 +1,39 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: laytan/setup-odin@v2
+        with:
+          release: dev-2026-11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: tools
+        run: |
+          npm install --prefix relay
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get install -y -q lld; lune=linux-x86_64; luau=ubuntu ;;
+            macOS) brew install -q lld; lune=macos-aarch64; luau=macos ;;
+            Windows) lune=windows-x86_64; luau=windows ;;
+          esac
+          mkdir -p ~/tools && cd ~/tools
+          curl -sSLo lune.zip https://github.com/lune-org/lune/releases/download/v0.11.1/lune-0.11.1-$lune.zip && unzip -qo lune.zip
+          curl -sSLo luau.zip https://github.com/luau-lang/luau/releases/download/0.748/luau-$luau.zip && unzip -qo luau.zip
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+      - run: ./x check
+      - run: ./x test
+      - if: runner.os == 'Linux'
+        run: ./x nat

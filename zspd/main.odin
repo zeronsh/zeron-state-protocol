@@ -1,0 +1,450 @@
+/*
+zspd is one consumer of the protocol: a device's node, or a self-hosted relay, with the simplest
+authentication that is not none. Local clients present the token in `<dir>/token`; a relay, unless
+told which spaces it serves, serves any. An application with accounts embeds package host and answers
+Config.authenticate from its own.
+*/
+package main
+
+import "base:runtime"
+import "core:crypto"
+import "core:encoding/hex"
+import "core:net"
+import "core:os"
+import "core:path/filepath"
+import "core:strconv"
+import "core:strings"
+import "core:time"
+import "../host"
+import "../pipe"
+import "../zsp"
+
+USAGE :: `zspd - Zeron State Protocol node
+
+  zspd create <dir>                          make a space, with this device as its admin
+  zspd key <dir>                             print what an admin needs to admit this device
+  zspd scope <dir> [signed]                  add a scope to the space
+  zspd admit <dir> <key> <scope> [read]      grant a device a scope: to read, write and call, or only read
+  zspd revoke <dir> <key> [scope]            end a device's grants
+  zspd relay <dir> <key> <url>               name a relay for the space's devices to meet at
+  zspd join <dir> <space> <relay-key> <url>  become a device of a space that has admitted this one
+  zspd peer <dir> <roster-file>              join from a roster file instead of a relay
+  zspd run <dir> [options]                   run a device's node
+  zspd serve <dir> [options]                 run a relay
+
+  --listen=<addr:port>   serve WebSockets here (run: 127.0.0.1:0, serve: 0.0.0.0:8787)
+  --udp=<port>           use this port for direct links
+  --no-udp               make no direct links
+  --stun=<host:port>     learn this machine's outside address here
+  --partial              replicate only what local clients watch
+  --credential=<text>    present this to relays
+  --allow=<space,...>    serve only these spaces
+  --verbose
+`
+
+main :: proc() {
+	os.exit(run())
+}
+
+run :: proc() -> int {
+	args := os.args[1:]
+	if len(args) < 2 {
+		os.write_string(os.stderr, USAGE)
+		return 2
+	}
+	verbose := false
+	for a in args {
+		verbose ||= a == "--verbose"
+	}
+	// Standard output is for answers.
+	context.logger = {
+		lowest_level = .Debug if verbose else .Info,
+		procedure    = proc(_: rawptr, _: runtime.Logger_Level, text: string, _: runtime.Logger_Options, _ := #caller_location) {
+			say(os.stderr, text, "\n")
+		},
+	}
+	dir := args[1]
+	rest := args[2:]
+	ok := false
+	switch args[0] {
+	case "create":
+		ok = create(dir)
+	case "key":
+		ok = print_key(dir)
+	case "scope":
+		ok = amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
+			id := zsp.draft_scope(&a.draft, {.Signed} if len(args) > 0 && args[0] == "signed" else {})
+			zsp.draft_grant(&a.draft, a.keys.device, a.keys.signer, id, {.Read, .Write, .Call})
+			buf: [10]byte
+			say(os.stdout, strconv.write_uint(buf[:], u64(id), 10), "\n")
+			return true
+		})
+	case "admit":
+		ok = len(rest) >= 2 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
+			key := parse_hex(args[0], 64) or_return
+			scope := strconv.parse_u64(args[1]) or_return
+			device, signer: zsp.Key32
+			copy(device[:], key)
+			copy(signer[:], key[32:])
+			rights := zsp.Rights{.Read} if len(args) > 2 && args[2] == "read" else {.Read, .Write, .Call}
+			zsp.draft_grant(&a.draft, device, signer, zsp.Scope(scope), rights)
+			return true
+		})
+	case "revoke":
+		ok = len(rest) >= 1 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
+			key := parse_hex(args[0], 64) or_return
+			device: zsp.Key32
+			copy(device[:], key)
+			scope: u64
+			if len(args) > 1 {
+				scope = strconv.parse_u64(args[1]) or_return
+			}
+			zsp.draft_revoke(&a.draft, device, host.now_ms() << 16, zsp.Scope(scope))
+			return true
+		})
+	case "relay":
+		ok = len(rest) == 2 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
+			key := parse_hex(args[0], 32) or_return
+			r: zsp.Relay
+			copy(r.key[:], key)
+			r.url = space_url(args[1], a.space)
+			append(&a.draft.relays, r)
+			return true
+		})
+	case "join":
+		ok = len(rest) == 3 && join(dir, rest[0], rest[1], rest[2])
+	case "peer":
+		ok = len(rest) == 1 && join_from_roster(dir, rest[0])
+	case "run", "serve":
+		return serve(dir, rest, args[0] == "serve")
+	case:
+		os.write_string(os.stderr, USAGE)
+		return 2
+	}
+	if !ok {
+		say(os.stderr, args[0], " failed\n")
+		return 1
+	}
+	return 0
+}
+
+Admin :: struct {
+	keys:   zsp.Keyring,
+	roster: zsp.Roster,
+	draft:  zsp.Draft,
+	space:  string,
+}
+
+in_dir :: proc(dir, name: string) -> string {
+	path, _ := filepath.join({dir, name}, context.temp_allocator)
+	return path
+}
+
+say :: proc(to: ^os.File, parts: ..string) {
+	os.write_string(to, strings.concatenate(parts, context.temp_allocator))
+}
+
+@(require_results)
+parse_hex :: proc(s: string, size: int) -> (b: []byte, ok: bool) {
+	b = hex.decode(transmute([]byte)s, context.temp_allocator) or_return
+	return b, len(b) == size
+}
+
+to_hex :: proc(b: []byte) -> string {
+	return string(hex.encode(b, context.temp_allocator))
+}
+
+create :: proc(dir: string) -> bool {
+	secret := host.device_secret(dir) or_return
+	if os.exists(in_dir(dir, "space")) {
+		say(os.stderr, "there is a space here already\n")
+		return false
+	}
+	root: zsp.Key32
+	crypto.rand_bytes(root[:])
+	space := zsp.ed25519_public(root)
+	k: zsp.Keyring
+	zsp.keyring_init(&k, secret)
+	none: zsp.Roster
+	d := zsp.draft_from(&none)
+	home := zsp.draft_scope(&d)
+	zsp.draft_grant(&d, k.device, k.signer, home, {.Read, .Write, .Call}).admin = true
+	bytes := zsp.roster_sign(&k, root, &d, context.temp_allocator) or_return
+	name := to_hex(space[:])
+	if err := os.make_directory_all(in_dir(dir, name)); err != nil {
+		return false
+	}
+	host.save(in_dir(in_dir(dir, name), "roster"), bytes) or_return
+	host.save(in_dir(dir, "space"), transmute([]byte)name) or_return
+	say(os.stdout, name, "\n")
+	return true
+}
+
+print_key :: proc(dir: string) -> bool {
+	secret := host.device_secret(dir) or_return
+	k: zsp.Keyring
+	zsp.keyring_init(&k, secret)
+	say(os.stdout, to_hex(k.device[:]), to_hex(k.signer[:]), "\n")
+	return true
+}
+
+read_space :: proc(dir: string) -> (space: zsp.Key32, name: string, ok: bool) {
+	data, err := os.read_entire_file(in_dir(dir, "space"), context.temp_allocator)
+	if err != nil {
+		return
+	}
+	name = strings.trim_space(string(data))
+	bytes := parse_hex(name, 32) or_return
+	copy(space[:], bytes)
+	return space, name, true
+}
+
+// Publishes an amended roster: to disk, to the node running here, and through it to everyone.
+amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []string) -> bool) -> bool {
+	secret := host.device_secret(dir) or_return
+	space, name := read_space(dir) or_return
+	a: Admin
+	a.space = name
+	zsp.keyring_init(&a.keys, secret)
+	path := in_dir(in_dir(dir, name), "roster")
+	data, err := os.read_entire_file(path, context.temp_allocator)
+	if err != nil {
+		return false
+	}
+	a.roster = zsp.roster_parse(data, space) or_return
+	zsp.roster_unwrap(&a.keys, &a.roster) or_return
+	root, admin := a.keys.root.?
+	if !admin {
+		say(os.stderr, "this device is not an admin of the space\n")
+		return false
+	}
+	a.draft = zsp.draft_from(&a.roster)
+	change(&a, args) or_return
+	bytes := zsp.roster_sign(&a.keys, root, &a.draft, context.temp_allocator) or_return
+	if _, sound := zsp.roster_parse(bytes, space); !sound {
+		say(os.stderr, "that would make an unsound roster: only signed scopes may have readers who do not write\n")
+		return false
+	}
+	host.save(path, bytes) or_return
+	announce(dir, bytes)
+	return true
+}
+
+// Hands a roster to the node running here, if one is, so that the change takes effect at once.
+announce :: proc(dir: string, roster: []byte) {
+	address, aerr := os.read_entire_file(in_dir(dir, "address"), context.temp_allocator)
+	token, terr := os.read_entire_file(in_dir(dir, "token"), context.temp_allocator)
+	endpoint, ok := net.parse_endpoint(string(address))
+	if aerr != nil || terr != nil || !ok {
+		return
+	}
+	socket, err := net.dial_tcp(endpoint)
+	if err != nil {
+		return
+	}
+	defer net.close(socket)
+	request := pipe.ws_request(string(address), "/")
+	net.send_tcp(socket, transmute([]byte)request)
+	frames := make([dynamic]byte, context.temp_allocator)
+	at := zsp.frame_begin(&frames, .Hello)
+	append(&frames, zsp.VERSION, 0)
+	resize(&frames, len(frames) + 32)
+	zsp.write_varint(&frames, 0)
+	zsp.write_bytes(&frames, token)
+	zsp.frame_end(&frames, at)
+	at = zsp.frame_begin(&frames, .Roster)
+	append(&frames, ..roster)
+	zsp.frame_end(&frames, at)
+	message := make([dynamic]byte, context.temp_allocator)
+	pipe.ws_put(&message, .Binary, frames[:], true)
+	net.send_tcp(socket, message[:])
+	// Its answer says it has read this far.
+	buf: [4096]byte
+	net.set_option(socket, .Receive_Timeout, time.Second)
+	got := make([dynamic]byte, context.temp_allocator)
+	for {
+		n, rerr := net.recv_tcp(socket, buf[:])
+		if n <= 0 || rerr != nil {
+			return
+		}
+		append(&got, ..buf[:n])
+		head, whole := pipe.http_head(got[:])
+		if whole && len(got) > head.size {
+			return
+		}
+	}
+}
+
+join :: proc(dir, space, relay_key, url: string) -> bool {
+	_ = host.device_secret(dir) or_return
+	_ = parse_hex(space, 32) or_return
+	_ = parse_hex(relay_key, 32) or_return
+	if err := os.make_directory_all(in_dir(dir, space)); err != nil && !os.is_dir(in_dir(dir, space)) {
+		return false
+	}
+	host.save(in_dir(dir, "space"), transmute([]byte)space) or_return
+	return host.save(in_dir(dir, "relay"), transmute([]byte)strings.concatenate({relay_key, " ", space_url(url, space)}, context.temp_allocator))
+}
+
+// Where a relay keeps a space. A query the relay's proxy wants stays at the end.
+space_url :: proc(url, space: string) -> string {
+	base, query := url, ""
+	if i := strings.index_byte(url, '?'); i >= 0 {
+		base, query = url[:i], url[i:]
+	}
+	return strings.concatenate({strings.trim_suffix(base, "/"), "/", space, query}, context.temp_allocator)
+}
+
+join_from_roster :: proc(dir, file: string) -> bool {
+	_ = host.device_secret(dir) or_return
+	data, err := os.read_entire_file(file, context.temp_allocator)
+	if err != nil || len(data) < 38 {
+		return false
+	}
+	space: zsp.Key32
+	copy(space[:], data[6:])
+	roster := zsp.roster_parse(data, space) or_return
+	zsp.roster_destroy(&roster)
+	name := to_hex(space[:])
+	if merr := os.make_directory_all(in_dir(dir, name)); merr != nil && !os.is_dir(in_dir(dir, name)) {
+		return false
+	}
+	host.save(in_dir(in_dir(dir, name), "roster"), data) or_return
+	return host.save(in_dir(dir, "space"), transmute([]byte)name)
+}
+
+// This consumer's whole notion of authentication.
+Policy :: struct {
+	token:  string,
+	spaces: [dynamic]zsp.Key32,
+}
+
+authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
+	p := (^Policy)(data)
+	if s.role == .Open {
+		if len(p.token) > 0 && crypto.compare_constant_time(credential, transmute([]byte)p.token) == 1 {
+			zsp.session_accept(s, {{0, {.Read, .Write, .Call}, 0}})
+		} else {
+			zsp.session_refuse(s)
+		}
+		return
+	}
+	for id in p.spaces {
+		if id == s.node.space {
+			zsp.session_accept(s)
+			return
+		}
+	}
+	if len(p.spaces) == 0 {
+		zsp.session_accept(s)
+	} else {
+		zsp.session_refuse(s)
+	}
+}
+
+serve :: proc(dir: string, args: []string, relay: bool) -> int {
+	policy: Policy
+	config := host.Config {
+		dir          = dir,
+		full         = true,
+		relay        = relay,
+		udp_port     = 0,
+		data         = &policy,
+		authenticate = authenticate,
+	}
+	listen := "0.0.0.0:8787" if relay else "127.0.0.1:0"
+	for a in args {
+		eq := strings.index_byte(a, '=')
+		name, value := a, ""
+		if eq >= 0 {
+			name, value = a[:eq], a[eq + 1:]
+		}
+		switch name {
+		case "--listen":
+			listen = value
+		case "--udp":
+			port, ok := strconv.parse_int(value)
+			if !ok {
+				os.write_string(os.stderr, USAGE)
+				return 2
+			}
+			config.udp_port = port
+		case "--no-udp":
+			config.udp_port = nil
+		case "--stun":
+			config.stun = value
+		case "--partial":
+			config.full = false
+		case "--credential":
+			config.credential = value
+		case "--allow":
+			list := value
+			for hexed in strings.split_iterator(&list, ",") {
+				bytes, ok := parse_hex(hexed, 32)
+				if !ok {
+					os.write_string(os.stderr, USAGE)
+					return 2
+				}
+				id: zsp.Key32
+				copy(id[:], bytes)
+				append(&policy.spaces, id)
+			}
+		case "--verbose":
+		case:
+			os.write_string(os.stderr, USAGE)
+			return 2
+		}
+	}
+	at, ok := net.parse_endpoint(listen)
+	if !ok {
+		os.write_string(os.stderr, USAGE)
+		return 2
+	}
+	config.listen = at
+
+	h: host.Host
+	if !host.host_init(&h, config) {
+		return 1
+	}
+	defer host.host_destroy(&h)
+	if !relay {
+		space, _, have := read_space(dir)
+		if !have {
+			say(os.stderr, "no space here: create or join one first\n")
+			return 1
+		}
+		if host.space_open(&h, space) == nil {
+			say(os.stderr, "could not open the space\n")
+			return 1
+		}
+		if line, err := os.read_entire_file(in_dir(dir, "relay"), context.allocator); err == nil {
+			parts := strings.fields(string(line), context.temp_allocator)
+			key: zsp.Key32
+			if bytes, hexed := parse_hex(parts[0], 32); hexed && len(parts) == 2 {
+				copy(key[:], bytes)
+				host.dial(&h, h.spaces[0], key, parts[1])
+			}
+		}
+		policy.token = local_token(dir)
+	}
+	bound, _ := net.bound_endpoint(h.listener)
+	address := net.endpoint_to_string(bound, context.temp_allocator)
+	say(os.stdout, to_hex(h.device[:]), " listening on ws://", address, "\n")
+	if !relay {
+		host.save(in_dir(dir, "address"), transmute([]byte)address)
+	}
+	host.links_announce(&h)
+	return 0 if host.host_run(&h) else 1
+}
+
+local_token :: proc(dir: string) -> string {
+	path := in_dir(dir, "token")
+	if data, err := os.read_entire_file(path, context.allocator); err == nil {
+		return string(data)
+	}
+	b: [24]byte
+	crypto.rand_bytes(b[:])
+	token := strings.clone(to_hex(b[:]))
+	host.save(path, transmute([]byte)token)
+	return token
+}

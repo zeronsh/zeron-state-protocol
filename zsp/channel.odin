@@ -1,0 +1,225 @@
+package zsp
+
+import "core:crypto"
+import "core:crypto/chacha20poly1305"
+import "core:crypto/x25519"
+import "core:encoding/endian"
+
+// Every untrusted byte pipe is wrapped in Noise_IK_25519_ChaChaPoly_SHA256, whose one round trip
+// authenticates both ends. The prologue binds the channel to one space. Payloads are empty.
+//
+// core:crypto/noise is complete, and compiling all of it dominates the build; this is the one
+// pattern, checked against it.
+
+NOISE :: "Noise_IK_25519_ChaChaPoly_SHA256"
+HANDSHAKE_1 :: 96 // e, es, s, ss: 32 + (32 + 16) + 16
+HANDSHAKE_2 :: 48 // e, ee, se:    32 + 16
+
+Handshake :: struct {
+	hash, chain, key: Key32,
+	n:                u64,
+	secret, eph:      Key32,
+}
+
+// Transport keys, small and plain so that a hibernating host can persist them.
+Channel :: struct {
+	send, recv:     Key32,
+	send_n, recv_n: u64,
+	peer:           Key32,
+}
+
+@(require_results)
+x25519_public :: proc(secret: Key32) -> (public: Key32) {
+	secret := secret
+	x25519.scalarmult_basepoint(public[:], secret[:])
+	return
+}
+
+@(require_results)
+x25519_shared :: proc(secret, public: Key32) -> (shared: Key32, ok: bool) {
+	secret, public := secret, public
+	x25519.scalarmult(shared[:], secret[:], public[:])
+	ok = crypto.is_zero_constant_time(shared[:]) == 0
+	return
+}
+
+@(private)
+handshake_init :: proc(h: ^Handshake, secret, responder, space: Key32) {
+	space, responder := space, responder
+	copy(h.hash[:], NOISE)
+	h.chain = h.hash
+	h.hash = sha256(h.hash[:], transmute([]byte)string("zsp-1"), space[:])
+	h.hash = sha256(h.hash[:], responder[:])
+	h.secret = secret
+}
+
+@(private)
+handshake_mix_hash :: proc(h: ^Handshake, data: []byte) {
+	h.hash = sha256(h.hash[:], data)
+}
+
+@(private)
+handshake_mix_dh :: proc(h: ^Handshake, secret, public: Key32) -> bool {
+	shared := x25519_shared(secret, public) or_return
+	h.chain, h.key = handshake_hkdf(h, shared[:])
+	h.n = 0
+	return true
+}
+
+@(private)
+handshake_hkdf :: proc(h: ^Handshake, input: []byte) -> (a, b: Key32) {
+	prk := hmac256(h.chain[:], input)
+	a = hmac256(prk[:], {1})
+	b = hmac256(prk[:], a[:], {2})
+	return
+}
+
+@(private)
+handshake_seal :: proc(h: ^Handshake, out: []byte, plain: []byte) {
+	iv := channel_nonce(h.n)
+	h.n += 1
+	ctx: chacha20poly1305.Context = ---
+	chacha20poly1305.init(&ctx, h.key[:])
+	chacha20poly1305.seal(&ctx, out[:len(plain)], out[len(plain):], iv[:], h.hash[:], plain)
+	handshake_mix_hash(h, out)
+}
+
+@(private)
+handshake_open :: proc(h: ^Handshake, out: []byte, sealed: []byte) -> bool {
+	iv := channel_nonce(h.n)
+	h.n += 1
+	ctx: chacha20poly1305.Context = ---
+	chacha20poly1305.init(&ctx, h.key[:])
+	chacha20poly1305.open(&ctx, out, iv[:], h.hash[:], sealed[:len(out)], sealed[len(out):]) or_return
+	handshake_mix_hash(h, sealed)
+	return true
+}
+
+@(private)
+handshake_split :: proc(h: ^Handshake, initiator: bool) -> (c: Channel) {
+	c.send, c.recv = handshake_hkdf(h, nil)
+	if !initiator {
+		c.send, c.recv = c.recv, c.send
+	}
+	return
+}
+
+// The initiator's half. `peer` is the responder's expected key.
+@(require_results)
+handshake_start :: proc(h: ^Handshake, secret, peer, space: Key32, eph: Maybe(Key32) = nil) -> (first: [HANDSHAKE_1]byte, ok: bool) {
+	handshake_init(h, secret, peer, space)
+	if e, given := eph.?; given {
+		h.eph = e
+	} else {
+		crypto.rand_bytes(h.eph[:])
+	}
+	e, s := x25519_public(h.eph), x25519_public(secret)
+	copy(first[:], e[:])
+	handshake_mix_hash(h, e[:])
+	handshake_mix_dh(h, h.eph, peer) or_return
+	handshake_seal(h, first[32:80], s[:])
+	handshake_mix_dh(h, secret, peer) or_return
+	handshake_seal(h, first[80:], nil)
+	return first, true
+}
+
+@(require_results)
+handshake_finish :: proc(h: ^Handshake, second: []byte, peer: Key32) -> (c: Channel, ok: bool) {
+	if len(second) != HANDSHAKE_2 {
+		return
+	}
+	h := h^ // a forged answer must not spoil the real one
+	re: Key32
+	copy(re[:], second)
+	handshake_mix_hash(&h, re[:])
+	handshake_mix_dh(&h, h.eph, re) or_return
+	handshake_mix_dh(&h, h.secret, re) or_return
+	handshake_open(&h, nil, second[32:]) or_return
+	c = handshake_split(&h, true)
+	c.peer = peer
+	return c, true
+}
+
+// The responder's whole part.
+@(require_results)
+handshake_answer :: proc(secret, space: Key32, first: []byte, eph: Maybe(Key32) = nil) -> (second: [HANDSHAKE_2]byte, c: Channel, ok: bool) {
+	if len(first) != HANDSHAKE_1 {
+		return
+	}
+	h: Handshake
+	defer crypto.zero_explicit(&h, size_of(h))
+	handshake_init(&h, secret, x25519_public(secret), space)
+	re, rs: Key32
+	copy(re[:], first)
+	handshake_mix_hash(&h, re[:])
+	handshake_mix_dh(&h, secret, re) or_return
+	handshake_open(&h, rs[:], first[32:80]) or_return
+	handshake_mix_dh(&h, secret, rs) or_return
+	handshake_open(&h, nil, first[80:]) or_return
+
+	if e, given := eph.?; given {
+		h.eph = e
+	} else {
+		crypto.rand_bytes(h.eph[:])
+	}
+	e := x25519_public(h.eph)
+	copy(second[:], e[:])
+	handshake_mix_hash(&h, e[:])
+	handshake_mix_dh(&h, h.eph, re) or_return
+	handshake_mix_dh(&h, h.eph, rs) or_return
+	handshake_seal(&h, second[32:], nil)
+	c = handshake_split(&h, false)
+	c.peer = rs
+	return second, c, true
+}
+
+@(private)
+channel_nonce :: proc(n: u64) -> (iv: [12]byte) {
+	endian.unchecked_put_u64le(iv[4:], n)
+	return
+}
+
+// Appends ciphertext and tag for the next message in order.
+channel_seal :: proc(c: ^Channel, w: ^[dynamic]byte, plain: []byte, ad: []byte = nil) {
+	channel_seal_at(c, w, c.send_n, plain, ad)
+	c.send_n += 1
+}
+
+channel_seal_at :: proc(c: ^Channel, w: ^[dynamic]byte, n: u64, plain, ad: []byte) {
+	at := len(w)
+	resize(w, at + len(plain) + TAG)
+	iv := channel_nonce(n)
+	ctx: chacha20poly1305.Context = ---
+	chacha20poly1305.init(&ctx, c.send[:])
+	chacha20poly1305.seal(&ctx, w[at:][:len(plain)], w[at + len(plain):], iv[:], ad, plain)
+}
+
+// Seals all but the last TAG bytes of `buf` where they lie, and puts the tag after them.
+channel_seal_in_place :: proc(c: ^Channel, n: u64, buf, ad: []byte) {
+	body := buf[:len(buf) - TAG]
+	iv := channel_nonce(n)
+	ctx: chacha20poly1305.Context = ---
+	chacha20poly1305.init(&ctx, c.send[:])
+	chacha20poly1305.seal(&ctx, body, buf[len(body):], iv[:], ad, body)
+}
+
+// Opens the next message in order, in place.
+@(require_results)
+channel_open :: proc(c: ^Channel, sealed: []byte, ad: []byte = nil) -> (plain: []byte, ok: bool) {
+	plain = channel_open_at(c, c.recv_n, sealed, ad) or_return
+	c.recv_n += 1
+	return plain, true
+}
+
+@(require_results)
+channel_open_at :: proc(c: ^Channel, n: u64, sealed, ad: []byte) -> (plain: []byte, ok: bool) {
+	size := len(sealed) - TAG
+	if size < 0 {
+		return
+	}
+	iv := channel_nonce(n)
+	ctx: chacha20poly1305.Context = ---
+	chacha20poly1305.init(&ctx, c.recv[:])
+	chacha20poly1305.open(&ctx, sealed[:size], iv[:], ad, sealed[:size], sealed[size:]) or_return
+	return sealed[:size], true
+}
