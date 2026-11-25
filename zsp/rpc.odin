@@ -324,6 +324,7 @@ node_reach :: proc(n: ^Node) -> []Key32 {
 call_put :: proc(w: ^[dynamic]byte, s: ^Session, id: u64, device: Key32, scope: Scope, method: string, body: []byte) {
 	device := device
 	if s != nil {
+		flush_changes(s) // it may be about them
 		cells_close(s)
 	}
 	at := frame_begin(w, .Call)
@@ -689,6 +690,7 @@ tunnels_prune :: proc(s: ^Session) {
 @(private)
 post :: proc(s: ^Session, to: Key32, kind: Post, blob: []byte) {
 	to := to
+	flush_changes(s)
 	cells_close(s)
 	at := frame_begin(&s.out, .Signal)
 	append(&s.out, ..to[:])

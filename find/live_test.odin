@@ -60,7 +60,7 @@ client_hear :: proc(t: ^testing.T, c: ^Client) {
 			}
 			a := &c.answers[id]
 			a.flags = flags
-			if flags & ~u8(1) != 0 {
+			if flags & ~u8(33) != 0 {
 				break
 			}
 			a.total, a.first = int(zsp.read_varint(&f)), int(zsp.read_varint(&f))
@@ -145,9 +145,9 @@ client_open :: proc(w: ^World, f: ^Finder) -> (c: Client) {
 }
 
 @(private)
-client_ask :: proc(t: ^testing.T, c: ^Client, id: u64, question: []byte) {
+client_ask :: proc(t: ^testing.T, c: ^Client, id: u64, question: []byte, type := ASK) {
 	w := make([dynamic]byte, context.temp_allocator)
-	at := zsp.frame_begin(&w, zsp.Message(ASK))
+	at := zsp.frame_begin(&w, zsp.Message(type))
 	zsp.write_varint(&w, id)
 	append(&w, ..question)
 	zsp.frame_end(&w, at)
@@ -395,6 +395,29 @@ answers_stay_true :: proc(t: ^testing.T) {
 				continue
 			}
 			client_hear_out(t, &c, &f)
+			if rand.int_max(3) == 0 {
+				// Asked once: answered, with what was written just before, and that is all.
+				q := ask(&w) if rand.int_max(2) == 0 else ask_value_turned(&w)
+				world_write(t, &w)
+				before := len(f.live)
+				client_ask(t, &c, 100, q, FETCH)
+				for n := 0; n < 4000 && len(f.live) > before; n += 1 {
+					finder_run(&f, 1 + rand.int_max(200))
+				}
+				client_hear_out(t, &c, &f)
+				testing.expect(t, len(f.live) == before)
+				if !answer_check(t, &w, &f, &c, 100, q, 33) {
+					fmt.println("seed", seed, "step", step, "fetch")
+					return
+				}
+				for _ in 0 ..< 3 {
+					world_write(t, &w)
+				}
+				for !finder_run(&f) {
+				}
+				finder_run(&f)
+				client_hear_out(t, &c, &f)
+			}
 			// Live text is asked for wherever a row is shown, and nowhere once none is.
 			wanted := 0
 			for l in f.live {
@@ -584,6 +607,22 @@ questions_are_passed_on :: proc(t: ^testing.T) {
 				return
 			}
 			client_hear_out(t, &c, &g)
+			if rand.int_max(3) == 0 {
+				q := ask(&w) if rand.int_max(2) == 0 else ask_value_turned(&w)
+				before := len(g.live)
+				client_ask(t, &c, 100, q, FETCH)
+				if !link_settle(t, link, &f, &g) {
+					fmt.println("seed", seed, "step", step)
+					return
+				}
+				client_hear_out(t, &c, &g)
+				testing.expect(t, len(g.live) == before)
+				good := answer_check(t, &w, &f, &c, 100, q, 33) if link[0] != nil else answer_check_here(t, &p, &own, &c, 100, q, 32)
+				if !good {
+					fmt.println("seed", seed, "step", step, "fetch", link[0] != nil)
+					return
+				}
+			}
 			// Nothing is wanted but what is shown, and no call goes on that nobody needs.
 			wanted, calls := 0, 0
 			for l in g.live {
@@ -618,7 +657,7 @@ questions_are_passed_on :: proc(t: ^testing.T) {
 
 // With nobody to ask, an answer is what is held here, and says that it is.
 @(private)
-answer_check_here :: proc(t: ^testing.T, p: ^World, own: ^Finder, c: ^Client, id: u64, question: []byte) -> bool {
+answer_check_here :: proc(t: ^testing.T, p: ^World, own: ^Finder, c: ^Client, id: u64, question: []byte, flags := u8(0)) -> bool {
 	q, _ := query_parse(question)
 	index_follow(&own.x)
 	query_prepare(&own.x, &q)
@@ -630,7 +669,7 @@ answer_check_here :: proc(t: ^testing.T, p: ^World, own: ^Finder, c: ^Client, id
 	rows := pred_rows(s, &q.where_)
 	defer set_destroy(&rows)
 	told := &c.answers[id]
-	testing.expectf(t, told.flags == 0 && told.total == rows.count, "told %v of %d", told, rows.count)
+	testing.expectf(t, told.flags == flags && told.total == rows.count, "told %v of %d", told, rows.count)
 	return !testing.failed(t)
 }
 

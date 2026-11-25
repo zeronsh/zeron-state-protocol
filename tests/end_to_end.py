@@ -427,9 +427,14 @@ def test_questions_passed_on():
         print(f"     a change over there shows in an answer here in {1000 * (time.monotonic() - start):.1f} ms")
         cb.write((rows[2], 16, zsp.VALUE, b"nobody"))
         cb.until(lambda: cb.answers[1]["total"] == 111 and cb.answers[1]["rows"][0] == rows[0])
+        # Once, from over there, whatever is held here.
+        once = cb.fetch(1, zsp.begins(name, "person 1"), [zsp.by(name)], limit=5)
+        assert once["settled"] and once["total"] == 111 and len(once["cells"]) == 5
+        assert all(b"person 1" in b"".join(c.values()) for c in once["cells"].values())
         # With nobody to ask, what is here is the answer, and says so; and then not.
         a.stop()
         cb.until(lambda: not cb.answers[1].get("settled", True) and cb.answers[1]["total"] >= 20, 40) # not before it has been asked seven times
+        assert not cb.fetch(1, zsp.equals(name, "person 2"))["settled"]
         cb.ask(2, 1, zsp.equals(name, "person 2"))
         assert cb.answer(2)["rows"] == [rows[0]] and not cb.answers[2]["settled"]
         a.start()

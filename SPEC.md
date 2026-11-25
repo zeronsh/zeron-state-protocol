@@ -362,7 +362,8 @@ A call is a stream of messages each way. `device` is the callee's on the way out
 Call on that session. A call ends when both sides have sent End, or on Fault or Cancel. Each side may have 256 KiB of messages outstanding beyond what the
 other has credited; the first message counts. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
 
-Both devices need the Call right in the scope, and both check. A call takes a direct session with the device if there is one, else a tunnel (§13). It
+What a node committed before a call it sends on its way before it, and so does a relay: whoever is called has what the call is about, unless so much was committed at once that one of them has to
+compare afresh (§9). Both devices need the Call right in the scope, and both check. A call takes a direct session with the device if there is one, else a tunnel (§13). It
 stays on the path it began on: if that fails the call faults *lost*, and may or may not have happened. Faults: 1 denied, 2 unreachable, 3 unserved,
 4 lost, 5 overrun, 6 busy.
 
@@ -416,19 +417,22 @@ node makes for itself of what it holds, and may throw away. A node need not answ
 ```
 32 Ask      id varint ‖ question             stays asked; another with the same id replaces it
 33 Unask    id varint
+35 Fetch    id varint ‖ question             answered once
 34 Answer   id varint ‖ flags (1)
             flags 1 settled, or 0:   total varint ‖ first varint ‖ n varint ‖ n × row (16) ‖
                                      m varint ‖ m × { some (1) ‖ number (8) ‖ k varint ‖ k × { count varint ‖ value bytes } }
             flags 2 denied, 4 faulty:   nothing follows, and it is asked no longer
             flags 8 waiting:            hundredths (1), of an index being made
             flags 16 ended:             to Unask
+            flags 32 or 33:             as 0 or 1, and the only one, to Fetch
 ```
 
 An Answer follows whenever it differs from the last. `total` is how many rows there are, `first` how many of them come before those shown. Rows not shown
 before in any answer are sent whole, in Cells, directly ahead of it, with no other Answer between; what changes in a row shown, and live text in it, is sent as for a watch. A client therefore
 keeps a row while any answer shows it, those of a question it replaces until that is answered, and those of one it ends until that is said to be *ended*, for
 an answer on its way may count on them.
-*settled* says that a full replica gave the answer; otherwise it is true of what is held here. A client may ask about scopes it may read, in every part of a
+A Fetch is answered as an Ask is, once, when the index has been made and what the node had committed by then is in it, and is over: the rows it shows are not
+kept up. *settled* says that a full replica gave the answer; otherwise it is true of what is held here. A client may ask about scopes it may read, in every part of a
 question; one that asks about others is *denied*, as is one whose right ends.
 
 ```
@@ -484,7 +488,7 @@ A question has at most 8 orders, 64 totals, none of kind 6, sums only of kind 3,
 serve it, and it needs Read where others need Call, in every scope the question is about. The first message is the question. Each message back is an Answer without its id, and with
 each row's key, as in a Watch, in place of its id, any key of it. The partial replica watches those
 places, data and live, and answers its client once it holds the rows. It believes nothing else that would not be an answer to what it asked. A device that will not answer faults *unserved*, and another is asked; until one
-does, and when none can be reached, the answer is of what is held.
+does, and when none can be reached, the answer is of what is held. A Fetch waits for the other, if one can be reached, and for its rows to be confirmed.
 
 ## 16 Who handles what
 

@@ -502,6 +502,19 @@ do
 	end)
 	local typed = best.rows[1].id
 	assert(not a.rows[typed])
+	-- Once, with what was written just before, and no more than once.
+	a:write(1, function(change)
+		change.insert(Track, "tracks", 61, { name = "just now", length = 7000 })
+	end)
+	local once = a:fetch({ scope = 1, table = Track, where = w.is("name", "just now"), totals = { most = { "max", "length" } } })
+	assert(once.status == "ready" and #once.rows == 1 and once.rows[1].length == 7000 and once.totals.most == 7000)
+	eventually("it is known there too", function()
+		return b:fetch({ scope = 1, table = Track, where = w.over("length", 6000), limit = 1 }).total == 1
+	end)
+	a:write(1, function(change)
+		change.delete(once.rows[1].id)
+	end)
+	assert(once.rows[1].name == "just now" and a:fetch({ scope = 1, table = Track, where = w.is("name", "just now") }).total == 0)
 	local editor = a:text(typed, Track.words)
 	editor.append(" ju") -- before it is here
 	eventually("what is being edited is had", function()

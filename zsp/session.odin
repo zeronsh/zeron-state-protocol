@@ -1721,6 +1721,16 @@ session_unwants :: proc(s: ^Session, lo, hi: Key, data := false) {
 	}
 }
 
+// Whether some of what is wanted to be shown has yet to be confirmed by a full replica.
+session_awaits :: proc(s: ^Session, at: Key) -> bool {
+	for it in s.node.interests {
+		if it.session == s.id && it.watch.id == SHOWN && it.watch.data && it.waiting > 0 && it.watch.lo == at {
+			return true
+		}
+	}
+	return false
+}
+
 @(private)
 live_watched :: proc(s: ^Session, places: ^Places) -> bool {
 	for &w in s.watches {
@@ -1780,6 +1790,7 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 	if n.keys == nil {
 		for to in n.sessions {
 			if to.ready && to.peer == device {
+				flush_changes(to) // what was committed before goes before
 				cells_close(to)
 				at := frame_begin(&to.out, .Signal)
 				append(&to.out, ..s.peer[:])

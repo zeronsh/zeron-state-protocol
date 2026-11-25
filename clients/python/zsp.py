@@ -12,7 +12,7 @@ READ, WRITE, MAY_CALL = 1, 2, 4
 F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = range(5)
 DATA_WATCH, LIVE_WATCH, BACK, ADOPT, KNOWN = 1, 2, 4, 8, 16
 KEY_MAX = b"\xff" * 40
-ASK, UNASK, ANSWER = 32, 33, 34
+ASK, UNASK, ANSWER, FETCH = 32, 33, 34, 35
 BYTES, FOLD, NUMBER, BOOL, ID, WORDS, CREATED, MODIFIED, ORDER = range(1, 10)
 SUM, MIN, MAX, COUNT, FACET = range(1, 6)
 
@@ -305,7 +305,7 @@ class Client:
             which, flags = r.varint(), r.u8()
             if flags & 16:
                 self.answers.pop(which, None)
-            elif flags & ~1:
+            elif flags & 14:
                 self.answers[which] = dict(denied=flags & 2, faulty=flags & 4, waiting=r.u8() if flags & 8 else None)
             else:
                 a = self.answers[which] = dict(settled=flags & 1, total=r.varint(), first=r.varint())
@@ -408,6 +408,16 @@ class Client:
     def ask(self, which, *args, **more):
         """Asks a question, which stays asked: see `question`, and self.answers."""
         self.send(ASK, varint(which) + question(*args, **more))
+
+    def fetch(self, *args, **more):
+        """Asks a question once. Says what the answer was, and the rows in it as they were."""
+        self.next_fetch = getattr(self, "next_fetch", 1 << 20) + 1
+        which = self.next_fetch
+        self.send(FETCH, varint(which) + question(*args, **more))
+        self.until(lambda: self.answers.get(which, {}).get("rows") is not None or any(self.answers.get(which, {}).get(k) for k in ("denied", "faulty")))
+        a = self.answers.pop(which)
+        a["cells"] = {row: dict(self.rows[row]) for row in a.get("rows", ())}
+        return a
 
     def unask(self, which):
         self.send(UNASK, varint(which))

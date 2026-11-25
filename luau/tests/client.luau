@@ -315,6 +315,46 @@ do
 		h.client:ask({ scope = 1, table = Note, where = zsp.where.is("nothing", 1) }, function() end)
 	end))
 	assert(next(h.client.asked) == nil)
+	-- What is asked once is answered once, down whichever pipe, and let go of.
+	local got: any
+	local function fetch()
+		coroutine.wrap(function()
+			got = h.client:fetch({ scope = 1, table = Note })
+		end)()
+		h.run()
+	end
+	fetch()
+	local FETCH = 35
+	assert(not got and h.last(FETCH))
+	local id = codec.varint(codec.reader((h.last(FETCH) :: any).body))
+	flags(id, 8)
+	assert(not got)
+	h.self.closed()
+	h.run()
+	before = #h.self.said
+	for _, f in h.self.later do
+		f()
+	end
+	h.run()
+	h.greet()
+	assert(h.self.said[#h.self.said].kind == FETCH)
+	h.tell(CELLS, "\0" .. row(one, 4))
+	do
+		local w = codec.writer()
+		codec.put_varint(w, id)
+		codec.put(w, "\33\1\0\1" .. one .. "\0")
+		h.tell(ANSWER, codec.string(w))
+	end
+	assert(got.status == "ready" and got.rows[1].title == "title 4" and got.total == 1)
+	assert(h.client.rows[one] == nil and h.client.asked[id] == nil)
+	got = nil
+	fetch()
+	flags(id + 1, 2)
+	assert(got.status == "denied" and #got.rows == 0)
+	coroutine.wrap(function()
+		got = h.client:fetch({ scope = 5, table = Note })
+	end)()
+	assert(got.status == "denied")
 	-- A scope that cannot be read is known to be.
 	h.client:ask({ scope = 5, table = Note }, function(s)
 		a = s

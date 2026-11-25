@@ -321,3 +321,57 @@ tunnels_are_begun_again :: proc(t: ^testing.T) {
 	session_close(ca.s)
 	session_close(cb.s)
 }
+
+// Who is called has, by then, what the caller wrote before calling.
+@(test)
+calls_come_after_what_they_are_about :: proc(t: ^testing.T) {
+	for relayed in 0 ..< 2 {
+		state := seeded(u64(24 + relayed))
+		context.random_generator = rand.default_random_generator(&state)
+		s: Sim
+		sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
+		defer sim_destroy(&s)
+		a, b := s.nodes[0], s.nodes[1]
+		if relayed == 1 {
+			sim_link(&s, 0, 2)
+			sim_link(&s, 1, 2)
+		} else {
+			sim_link(&s, 0, 1)
+		}
+		sim_settle(&s)
+		ca, cb := Caller{s = sim_client(&s, a)}, Caller{s = sim_client(&s, b)}
+		defer caller_destroy(&ca)
+		defer caller_destroy(&cb)
+		caller_serve(&cb, 1, "echo")
+		settle(&s, &ca, &cb)
+		caller_call(&ca, 1, b.keys.device, 1, "echo", "first") // and a tunnel, where there is none yet
+		settle(&s, &ca, &cb)
+		for i in 0 ..< 30 {
+			a.node.now = sim_now(&s, a)
+			row := node_id(&a.node, 1)
+			body: [24]byte
+			list := list_tag(keyring_scope(&a.keys, 1), "a")
+			put_u64(body[:], list[0])
+			put_u64(body[8:], list[1])
+			testing.expect(t, node_write(&a.node, {{row, 1, .Place, node_stamp(&a.node), body[:]}}))
+			calls := len(cb.calls)
+			caller_call(&ca, u64(2 + i), b.keys.device, 1, "echo", "look")
+			for len(cb.calls) == calls {
+				for l in s.links {
+					sim_pass(&s, l.a, l.b)
+					sim_pass(&s, l.b, l.a)
+				}
+				caller_read(&cb)
+				caller_read(&ca)
+				if len(b.node.calls) > calls {
+					// It has come as far as the node.
+					testing.expect(t, row_places(&b.node.store, row).count == 1)
+				}
+			}
+			testing.expect(t, row_places(&b.node.store, row).count == 1)
+			s.now += 10
+		}
+		session_close(ca.s)
+		session_close(cb.s)
+	}
+}

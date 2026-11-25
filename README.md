@@ -116,6 +116,7 @@ local found = client:ask({
     render(answer.rows, answer.total, answer.totals.authors) -- again whenever it is no longer so
 end)
 found.move(50) -- another stretch of it
+local now = client:fetch({ scope = 1, table = Message, where = w.is("author", "ann") }) -- once, and no more
 
 local text = client:text(id, Message.body)
 text.append(token) -- seen everywhere at once; durable a piece at a time

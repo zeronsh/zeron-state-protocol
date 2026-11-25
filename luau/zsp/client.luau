@@ -11,7 +11,7 @@ local sha256 = require("./sha256")
 local text = require("./text")
 
 local HELLO, ROSTER, WATCH, UNWATCH, CELLS, ACK = 1, 2, 3, 4, 7, 8
-local ASK, UNASK, ANSWER = 32, 33, 34
+local ASK, UNASK, ANSWER, FETCH = 32, 33, 34, 35
 local LIVE, SYNCED, PRESENCE, ERROR, SERVE, CALL, FLOW = 9, 10, 12, 13, 14, 15, 16
 local GRAVE, PLACE, VALUE, PIECE, BUNDLE = 1, 2, 3, 4, 5
 local W_DATA, W_LIVE, W_BACK, W_ADOPT, W_COUNTS = 1, 2, 4, 8, 32
@@ -67,6 +67,7 @@ type Asked = {
 	observer: (Answer) -> (),
 	ids: { string },
 	shown: { [string]: boolean },
+	once: ((Answer) -> ())?, -- it is to be answered once, and this told
 	stopped: boolean, -- though the node may not know yet, and count on its rows being held
 	answer: Answer?,
 	status: any,
@@ -311,6 +312,9 @@ function Client.close(self: Client)
 	self:_flush()
 	if self.wire then
 		self.wire.close()
+	end
+	for _, a in table.clone(self.asked) do
+		self:_fetched(a) -- as far as it got
 	end
 end
 
@@ -1193,6 +1197,7 @@ function Client.ask(self: Client, question: asking.Question, observer: (Answer) 
 		ids = {},
 		shown = {},
 		stopped = false,
+		once = nil,
 		answer = nil,
 		status = "loading",
 		progress = 0,
@@ -1231,6 +1236,52 @@ function Client.ask(self: Client, question: asking.Question, observer: (Answer) 
 	})
 end
 
+-- Asks a question once, and waits for the answer: for a connection, should there be none, and for the index to be made.
+-- Called from a coroutine. Nothing is kept up afterwards, and the rows are as they were.
+function Client.fetch(self: Client, question: asking.Question): Answer
+	asking.write(question, function()
+		return string.rep("\0", 16)
+	end)
+	local thread = coroutine.running()
+	local answer: Answer? = nil
+	local waiting = false
+	self.next_ask += 1
+	local a: Asked = {
+		id = self.next_ask,
+		question = question,
+		schema = question.table :: any,
+		totals_of = {},
+		observer = function() end,
+		ids = {},
+		shown = {},
+		once = function(made)
+			answer = made
+			if waiting then
+				coroutine.resume(thread)
+			end
+		end,
+		stopped = false,
+		answer = nil,
+		status = "loading",
+		progress = 0,
+		total = 0,
+		first = 0,
+		totals = {},
+		changed = false,
+	}
+	self.asked[a.id] = a
+	if self.closed then
+		self:_fetched(a)
+	elseif self.ready then
+		self:_ask(a)
+	end
+	if not answer then
+		waiting = true
+		coroutine.yield()
+	end
+	return answer :: any
+end
+
 function Client._ask(self: Client, a: Asked)
 	local may = self.scopes[a.question.scope] ~= nil
 	local body, totals = asking.write(a.question, function(scope, name)
@@ -1244,13 +1295,14 @@ function Client._ask(self: Client, a: Asked)
 		a.status = "denied"
 		self:_show(a, {})
 		self:_touch_answer(a)
+		self:_fetched(a)
 		return
 	end
 	a.totals_of = totals
 	local w = codec.writer()
 	codec.put_varint(w, a.id)
 	codec.put(w, body)
-	self:_frame(ASK, w)
+	self:_frame(if a.once then FETCH else ASK, w)
 end
 
 function Client._on_answer(self: Client, r: codec.Reader)
@@ -1262,7 +1314,7 @@ function Client._on_answer(self: Client, r: codec.Reader)
 	if bit32.btest(flags, 16) then
 		self:_unasked(a)
 		return
-	elseif flags >= 2 then
+	elseif bit32.btest(flags, 14) then
 		if bit32.btest(flags, 8) then
 			a.status, a.progress = "indexing", codec.u8(r) / 100
 		else
@@ -1270,9 +1322,12 @@ function Client._on_answer(self: Client, r: codec.Reader)
 			self:_show(a, {})
 		end
 		self:_touch_answer(a)
+		if a.status ~= "indexing" then
+			self:_fetched(a)
+		end
 		return
 	end
-	a.status, a.progress = if flags == 1 then "ready" else "stale", 1
+	a.status, a.progress = if bit32.btest(flags, 1) then "ready" else "stale", 1
 	a.total, a.first = codec.varint(r), codec.varint(r)
 	local ids = {}
 	for _ = 1, codec.varint(r) do
@@ -1306,6 +1361,19 @@ function Client._on_answer(self: Client, r: codec.Reader)
 	end
 	a.totals = table.freeze(totals)
 	self:_touch_answer(a)
+	self:_fetched(a)
+end
+
+-- What was asked once has been answered, and is of no more concern.
+function Client._fetched(self: Client, a: Asked)
+	local once = a.once
+	if once then
+		a.once = nil
+		a.stopped = true
+		local answer = self:_answer(a)
+		self:_unasked(a)
+		once(answer)
+	end
 end
 
 -- Holds the rows of an answer, and lets go of those of the last.

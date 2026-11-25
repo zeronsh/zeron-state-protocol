@@ -13,6 +13,7 @@ import "../zsp"
 ASK :: 32 // id varint, question
 UNASK :: 33 // id varint
 ANSWER :: 34 // see answer_send
+FETCH :: 35 // as ASK, but answered once
 
 Answer_Flags :: bit_field u8 {
 	settled: bool | 1, // a full replica says so
@@ -20,7 +21,8 @@ Answer_Flags :: bit_field u8 {
 	faulty:  bool | 1, // makes no sense
 	waiting: bool | 1, // an index is being made, and nothing else is said but how much of it is
 	ended:   bool | 1, // is asked no longer, as was wished
-	_:       u8   | 3,
+	last:    bool | 1, // to what was only to be answered once
+	_:       u8   | 2,
 }
 
 Finder :: struct {
@@ -90,6 +92,8 @@ Live :: struct {
 	arena:   virtual.Arena, // the question
 	q:       Query,
 	anchor:  Maybe(Anchor),
+	once:    bool, // is to be answered, and no more
+	done:    bool, // and has been
 	ready:   bool, // answered at least once
 	joined:  bool, // what it holds for turns on other rows too
 	rows:    Set,
@@ -154,13 +158,13 @@ finder_asked :: proc(f: ^Finder, s: ^zsp.Session, type: u8, payload: []byte) -> 
 		return false
 	}
 	switch type {
-	case ASK:
+	case ASK, FETCH:
 		old := live_find(f, s, id)
 		if finder_many(f, s, {}) >= 1024 && old == nil {
 			return false
 		}
 		l := new(Live)
-		l.f, l.id, l.session = f, id, s
+		l.f, l.id, l.session, l.once = f, id, s, type == FETCH
 		if live_start(l, r.buf[r.pos:]) && old != nil {
 			// The client holds what was shown until it is answered anew.
 			l.shown, old.shown = old.shown, nil
@@ -752,8 +756,8 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 	}
 	now := time.tick_now()
 	for l in f.live {
-		if l.far.have {
-			continue
+		if l.far.have || (l.once && l.far.call != 0) {
+			continue // another answers
 		}
 		if f.pace && (l.stale || l.renew) && time.tick_diff(now, l.due) > 0 {
 			if w, some := f.wake.?; !some || time.tick_diff(l.due, w) > 0 {
@@ -788,6 +792,8 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 	#reverse for l in f.live {
 		if l.over {
 			answer_flag(l, {faulty = true})
+		}
+		if l.over || l.done {
 			live_free(l)
 		}
 	}
@@ -868,7 +874,7 @@ answer_send :: proc(l: ^Live) {
 	page := query_page(s, &l.q, &l.rows)
 	totals := query_totals(s, &l.q, &l.rows)
 	w := make([dynamic]byte, context.temp_allocator)
-	answer_begin(l, &w, {settled = f.settled})
+	answer_begin(l, &w, {settled = f.settled, last = l.once})
 	zsp.write_varint(&w, u64(l.rows.count))
 	first := max(l.rows.count - l.q.offset - len(page), 0) if l.q.from_end else min(l.q.offset, l.rows.count)
 	zsp.write_varint(&w, u64(first))
@@ -909,7 +915,7 @@ answer_send :: proc(l: ^Live) {
 	for hit, i in page {
 		ids[i] = hit.id
 	}
-	if l.session != nil {
+	if l.session != nil && !l.once {
 		live_wants(l, ids)
 	}
 	l.moved = false
@@ -935,6 +941,7 @@ answer_say :: proc(l: ^Live, ids: []zsp.Id, w: []byte) {
 	append(&l.shown, ..ids)
 	delete(l.said)
 	l.said = slice.clone(w)
+	l.done = l.once
 }
 
 // Where a row is, or if nowhere, somewhere it never will be.
@@ -1100,6 +1107,10 @@ far_whole :: proc(l: ^Live) -> bool {
 		if zsp.row_places(&l.f.n.store, zsp.key_row(k)).count == 0 && !zsp.is_graveyard(zsp.key_list(k)) {
 			return false
 		}
+		// What is held of it may be old. An answer that stays is put right; one that does not has to be right.
+		if l.once && zsp.session_awaits(l.session, k) {
+			return false
+		}
 	}
 	return true
 }
@@ -1109,7 +1120,7 @@ far_say :: proc(l: ^Live) {
 	r := zsp.Reader{buf = l.far.answer}
 	w := make([dynamic]byte, context.temp_allocator)
 	zsp.write_varint(&w, l.id)
-	append(&w, zsp.read_u8(&r))
+	append(&w, flag_byte({settled = zsp.read_u8(&r) & 1 != 0, last = l.once}))
 	zsp.write_varint(&w, zsp.read_varint(&r))
 	zsp.write_varint(&w, zsp.read_varint(&r))
 	n := int(zsp.read_varint(&r))
