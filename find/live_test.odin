@@ -900,16 +900,17 @@ dear_answers_are_paced :: proc(t: ^testing.T) {
 	finder_run(&f)
 	client_hear_out(t, &c, &f)
 	testing.expect(t, answer_check(t, &w, &f, &c, 1, q) && f.wake == nil)
-	// As if it had been dear.
+	// As if it had been dear: not again for an hour, however slowly the writes go here.
 	l := f.live[0]
-	l.due = time.tick_add(time.tick_now(), 60 * time.Millisecond)
+	l.due = time.tick_add(time.tick_now(), time.Hour)
 	for _ in 0 ..< 20 {
 		world_write(t, &w)
 	}
 	finder_run(&f)
 	client_hear_out(t, &c, &f)
 	testing.expect(t, c.answers[1].total == 0 && f.wake == l.due)
-	time.accurate_sleep(70 * time.Millisecond)
+	// And the hour gone by, as the host would wake it then.
+	l.due = time.tick_now()
 	finder_run(&f)
 	client_hear_out(t, &c, &f)
 	testing.expect(t, answer_check(t, &w, &f, &c, 1, q) && f.wake == nil)
