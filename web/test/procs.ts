@@ -87,3 +87,29 @@ export function zspdConnect(address: string): Connect {
   };
 }
 
+
+/** A TCP proxy to a relay, which counts connections and can swallow whatever is said on those it has, saying nothing. */
+export async function proxy(to: string): Promise<{ url: string; connections: () => number; swallow: () => void }> {
+  const { createServer, connect } = await import("node:net");
+  const target = new URL(to.replace(/^ws/, "http"));
+  const live = new Set<{ swallowed: boolean }>();
+  let count = 0;
+  const server = createServer((from) => {
+    count++;
+    const state = { swallowed: false };
+    live.add(state);
+    const there = connect(Number(target.port), target.hostname);
+    from.on("data", (d) => state.swallowed || there.write(d));
+    there.on("data", (d) => state.swallowed || from.write(d));
+    const end = () => (live.delete(state), from.destroy(), there.destroy());
+    from.on("close", end).on("error", end);
+    there.on("close", end).on("error", end);
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const port = (server.address() as { port: number }).port;
+  return {
+    url: `ws://127.0.0.1:${port}`,
+    connections: () => count,
+    swallow: () => live.forEach((s) => (s.swallowed = true)),
+  };
+}

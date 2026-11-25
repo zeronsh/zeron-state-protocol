@@ -205,7 +205,11 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 				shrink(&s.pieces)
 			}
 		case .Text:
-			return false // nothing here is said in text
+			// Nothing is said in text but this, by whoever cannot send a WebSocket's own ping: a browser.
+			if !fin || string(payload) != "ping" {
+				return false
+			}
+			stream_put(s, .Text, transmute([]byte)string("pong"))
 		case .Ping:
 			stream_put(s, .Pong, payload)
 		case .Close:

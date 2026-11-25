@@ -39,8 +39,10 @@ foreign host {
 	say :: proc(level: u32, ptr: [^]byte, len: int) ---
 }
 
-PING_IDLE :: 45_000 // ms: keeps middleboxes and edges from forgetting a quiet connection
-PONG_WAIT :: 15_000
+// Milliseconds: a connection quiet for so long is pinged, to keep middleboxes and edges from forgetting it; and one that
+// does not answer in so long is gone.
+ping_idle: f64 = 45_000
+pong_wait: f64 = 15_000
 SYNC_DELAY :: 100 // ms: commits that follow one another this closely share a sync
 MAX_PLAIN :: 60 << 10 // per Noise message
 PAGES_KEPT :: 2048 // of each kind, before the coldest are let go
@@ -185,6 +187,12 @@ data :: proc "c" () -> [^]byte {
 	return raw_data(message)
 }
 
+// How long a segment of the log is: the host's files must agree.
+@(export)
+segment :: proc "c" () -> f64 {
+	return f64(zsp.SEGMENT)
+}
+
 // What an admin needs to admit a device, from its secret: its key and its signer's, 64 bytes into `into`.
 @(export)
 identity :: proc "c" (secret: ^zsp.Key32, into: [^]byte) {
@@ -299,6 +307,12 @@ relay :: proc "c" (size: int) {
 	key: zsp.Key32
 	copy(key[:], message[:32])
 	dial_relay(key, string(message[32:size]), true)
+}
+
+// How long a connection to a relay may be quiet before it is pinged, and how long it then has to answer.
+@(export)
+keepalive :: proc "c" (idle, wait: f64) {
+	ping_idle, pong_wait = idle, wait
 }
 
 // Lets go of everything, and makes what was written durable. The node is not to be used again.
@@ -535,9 +549,9 @@ dialers_run :: proc(t: f64) {
 				d.failures = 0 // admitted, not merely answered
 			}
 			quiet := t - c.quiet_at
-			if c.pinged && quiet >= PONG_WAIT {
+			if c.pinged && quiet >= pong_wait {
 				conn_drop(c)
-			} else if !c.pinged && quiet >= PING_IDLE {
+			} else if !c.pinged && quiet >= ping_idle {
 				c.pinged = true
 				c.quiet_at = t
 				ping(c.id)
@@ -723,7 +737,7 @@ tick :: proc "c" () -> f64 {
 		if d.conn == nil && !d.dropped {
 			sooner(&wait, d.due - t)
 		} else if d.conn != nil {
-			sooner(&wait, d.conn.quiet_at + (PONG_WAIT if d.conn.pinged else PING_IDLE) - t)
+			sooner(&wait, d.conn.quiet_at + (pong_wait if d.conn.pinged else ping_idle) - t)
 		}
 	}
 	if w, ok := found_deadline(time.tick_now()); ok {

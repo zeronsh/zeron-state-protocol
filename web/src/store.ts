@@ -8,7 +8,6 @@
 
 import type { File, Volume } from "./volume.ts";
 
-export const SEGMENT = 16 << 20; // as zsp.SEGMENT
 export const PAGE = 4096; // as zsp.PAGE_SIZE and find.PAGE_SIZE
 const AHEAD = 2; // segments opened before they are needed
 
@@ -58,6 +57,8 @@ function crc32(bytes: Uint8Array): number {
 
 export class Store {
   readonly volume: Volume;
+  /** How long a segment is, as the node says. */
+  readonly segment: number;
   #segments = new Map<number, File>();
   #opening = new Map<number, Promise<void>>();
   #held = new Map<number, Held>();
@@ -70,17 +71,21 @@ export class Store {
   #kept = new Map<Kept, [Slot, Slot]>();
   #chain: Promise<void> = Promise.resolve(); // removals and openings, in the order they were asked for
   #closed = false;
+  #abandoned = false;
+  /** How often the ways round a file not yet open were taken: for tests, which must see that they were. */
+  static readonly counts = { held: 0, journaled: 0, replayed: 0 };
   /** Called when something that was waiting for a file is done, should anyone want to know. */
   onSettled?: () => void;
   /** Called with what went wrong in the background, which the node will meet next time it asks for durability. */
   failure?: unknown;
 
-  private constructor(volume: Volume) {
+  private constructor(volume: Volume, segment: number) {
     this.volume = volume;
+    this.segment = segment;
   }
 
-  static async open(volume: Volume): Promise<Store> {
-    const s = new Store(volume);
+  static async open(volume: Volume, segment: number): Promise<Store> {
+    const s = new Store(volume, segment);
     const names = await volume.list();
     for (const name of names) {
       const n = segmentNumber(name);
@@ -148,8 +153,8 @@ export class Store {
   // ---------------------------------------------------------------- the log
 
   logWrite(off: number, bytes: Uint8Array): boolean {
-    const n = Math.floor(off / SEGMENT);
-    const at = off % SEGMENT;
+    const n = Math.floor(off / this.segment);
+    const at = off % this.segment;
     let f = this.#segments.get(n);
     if (!f && !this.#held.has(n) && this.volume.openNow) {
       f = this.volume.openNow(segmentName(n), true)!;
@@ -166,6 +171,7 @@ export class Store {
   }
 
   #hold(n: number, at: number, bytes: Uint8Array): void {
+    Store.counts.held++;
     let h = this.#held.get(n);
     if (!h) this.#held.set(n, (h = { bytes: new Uint8Array(Math.max(1 << 16, at + bytes.length)), length: 0, journaled: 0 }));
     if (at + bytes.length > h.bytes.length) {
@@ -191,6 +197,10 @@ export class Store {
     const opening = this.#after(async () => {
       const f = (await this.volume.open(segmentName(n), true))!;
       this.#opening.delete(n);
+      if (this.#abandoned) {
+        f.close();
+        return;
+      }
       if (this.#dropped.delete(n)) {
         f.close();
         await this.volume.remove(segmentName(n));
@@ -224,8 +234,8 @@ export class Store {
   }
 
   logRead(off: number, into: Uint8Array): boolean {
-    const n = Math.floor(off / SEGMENT);
-    const at = off % SEGMENT;
+    const n = Math.floor(off / this.segment);
+    const at = off % this.segment;
     const h = this.#held.get(n);
     if (h) {
       if (at + into.length > h.length) return false;
@@ -240,9 +250,9 @@ export class Store {
     let end = 0;
     for (const [n, f] of this.#segments) {
       const size = f.size();
-      if (size > 0) end = Math.max(end, n * SEGMENT + size);
+      if (size > 0) end = Math.max(end, n * this.segment + size);
     }
-    for (const [n, h] of this.#held) if (h.length > 0) end = Math.max(end, n * SEGMENT + h.length);
+    for (const [n, h] of this.#held) if (h.length > 0) end = Math.max(end, n * this.segment + h.length);
     return end;
   }
 
@@ -260,12 +270,12 @@ export class Store {
   }
 
   logTruncate(off: number): void {
-    const last = Math.floor(off / SEGMENT);
+    const last = Math.floor(off / this.segment);
     for (const n of [...this.#segments.keys(), ...this.#held.keys()]) if (n > last) this.logDrop(n);
     const h = this.#held.get(last);
-    if (h) h.length = Math.min(h.length, off % SEGMENT), (h.journaled = Math.min(h.journaled, h.length));
+    if (h) h.length = Math.min(h.length, off % this.segment), (h.journaled = Math.min(h.journaled, h.length));
     const f = this.#segments.get(last);
-    if (f && f.size() > off % SEGMENT) f.truncate(off % SEGMENT), this.#dirty.add(f);
+    if (f && f.size() > off % this.segment) f.truncate(off % this.segment), this.#dirty.add(f);
   }
 
   logSync(): boolean {
@@ -294,6 +304,7 @@ export class Store {
       entry.set(part, 12);
       v.setUint32(12 + part.length, crc32(entry.subarray(0, 12 + part.length)));
       this.#journal.write(entry, this.#journalEnd);
+      Store.counts.journaled++;
       this.#journalEnd += entry.length;
       h.journaled = h.length;
     }
@@ -316,6 +327,7 @@ export class Store {
       if (!f) this.#segments.set(n, (f = (await this.volume.open(segmentName(n), true))!));
       f.write(all.subarray(at + 12, at + 12 + length), v.getUint32(4));
       touched.add(f);
+      Store.counts.replayed++;
       at += 16 + length;
     }
     for (const f of touched) f.flush();
@@ -365,6 +377,12 @@ export class Store {
   /** Whether everything written is where it belongs, rather than held or journaled. */
   get settled(): boolean {
     return this.#held.size === 0;
+  }
+
+  /** Writes nothing more, ever, as a machine that has lost its power does not. For tests. */
+  abandon(): void {
+    this.#abandoned = true;
+    this.#closed = true;
   }
 
   /** Closes every file, once whatever was being opened or removed is done. */

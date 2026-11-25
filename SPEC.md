@@ -250,8 +250,10 @@ Between devices, and between devices and relays, a pipe is wrapped in `Noise_IK_
 "zsp-1" ‖ space. The first message's payload is 8 bytes, zero but over links (§14); the second's is empty. The dialler knows the other's key: from the roster, or from whoever told it of the relay.
 
 Over WebSocket, each binary message is one Noise message: 104 bytes, 48 bytes, then transport messages of at most 65535 bytes, whose
-plaintexts concatenate into the pipe. The path is `/` and the space in hex. A message may come in several frames. TLS, where used, is for traversal; certificates need not
-be judged, for nothing rests on them, and no credential may be put where TLS alone protects it.
+plaintexts concatenate into the pipe. The path is `/` and the space in hex. A message may come in several frames. A text message `ping` is
+answered with `pong`, and nothing else is said in text: an idle connection must be heard from, and a browser cannot send a WebSocket's own
+ping. TLS, where used, is for traversal; certificates need not be judged, for nothing rests on them, and no credential may be put where TLS
+alone protects it.
 
 A **local client** speaks to its own device's node in the open, over a pipe the host trusts (loopback, a socket pair, shared memory):
 over WebSocket, at path `/`, without Noise. A node must refuse such a request that carries an `Origin` header unless told otherwise.

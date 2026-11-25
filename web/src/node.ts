@@ -33,6 +33,11 @@ export interface NodeOptions {
   credential?: string | Uint8Array;
   /** By default the platform's own. */
   WebSocket?: typeof WebSocket;
+  /**
+   * Milliseconds a connection to a relay may be quiet before it is pinged, 45,000, and then has to answer, 15,000: for
+   * networks that forget sooner.
+   */
+  keepalive?: { idle: number; wait: number };
   log?: (level: Level, text: string) => void;
 }
 
@@ -52,6 +57,8 @@ interface Exports {
   opened(id: number): void;
   closed(id: number): void;
   tick(): number;
+  keepalive(idle: number, wait: number): void;
+  segment(): number;
 }
 
 const HIGH = 256 << 10; // bytes in flight to a pipe before the node waits for it
@@ -74,13 +81,11 @@ export function spaceUrl(url: string, space: string): string {
 }
 
 export class Node {
-  /** This device's key, which peers know it by. */
-  readonly id: string;
-  /** What an admin needs to admit it: its key and its signer's. */
-  readonly key: string;
-  readonly store: Store;
+  #id = "";
+  #key = "";
+  #store!: Store;
   #options: NodeOptions;
-  #secret: Uint8Array;
+  #secret!: Uint8Array;
   #wasm?: Exports;
   #instance?: WebAssembly.Instance;
   #conns = new Map<number, Conn>();
@@ -96,32 +101,48 @@ export class Node {
   /** Told once if the node stops of itself: storage has failed, and nothing more can be made durable. */
   onFailure?: (error: Error) => void;
 
-  private constructor(options: NodeOptions, store: Store, secret: Uint8Array) {
+  private constructor(options: NodeOptions) {
     this.#options = options;
-    this.store = store;
-    this.#secret = secret;
     const wasm = this.#instantiate();
-    const at = wasm.buffer(96);
-    this.#bytes(at, 32).set(secret);
-    wasm.identity(at, at + 32);
-    const identity = this.#bytes(at + 32, 64).slice();
-    this.id = hex(identity.subarray(0, 32));
-    this.key = hex(identity);
-    store.onSettled = () => this.#kick();
+    if (options.keepalive) wasm.keepalive(options.keepalive.idle, options.keepalive.wait);
   }
 
   /** Opens the device kept in a volume, making it if there is none; and its node, if it belongs to a space. */
   static async open(options: NodeOptions): Promise<Node> {
-    const store = await Store.open(options.volume);
+    const d = new Node(options);
+    const wasm = d.#wasm!;
+    const store = (d.#store = await Store.open(options.volume, wasm.segment()));
     let secret = store.kept("device").latest;
     if (secret?.length !== 32) {
       secret = crypto.getRandomValues(new Uint8Array(32));
       store.keep("device", secret);
     }
-    const d = new Node(options, store, secret);
+    d.#secret = secret;
+    const at = wasm.buffer(96);
+    d.#bytes(at, 32).set(secret);
+    wasm.identity(at, at + 32);
+    const identity = d.#bytes(at + 32, 64).slice();
+    d.#id = hex(identity.subarray(0, 32));
+    d.#key = hex(identity);
+    store.onSettled = () => d.#kick();
     const space = store.kept("space").latest;
     if (space && space.length >= 32) d.#start(space);
     return d;
+  }
+
+  /** This device's key, which peers know it by. */
+  get id(): string {
+    return this.#id;
+  }
+
+  /** What an admin needs to admit it: its key and its signer's. */
+  get key(): string {
+    return this.#key;
+  }
+
+  /** Where it keeps what it holds. */
+  get store(): Store {
+    return this.#store;
   }
 
   /** The space this device is of, as 64 hex digits, once it has joined one. */
@@ -210,6 +231,16 @@ export class Node {
     }
   }
 
+  /** Stops at once, as a machine does that loses its power: nothing more is written, synced or said. For tests. */
+  abandon(): void {
+    this.#stopped = true;
+    clearTimeout(this.#timer);
+    clearTimeout(this.#draining);
+    for (const [, c] of this.#conns) if (c.kind === "socket") (c.ws.onclose = c.ws.onerror = c.ws.onmessage = null), c.ws.close();
+    this.#conns.clear();
+    this.#store.abandon();
+  }
+
   /** Stops the node, makes what it was given durable, and closes the store. */
   async close(): Promise<void> {
     if (this.#stopped) return;
@@ -236,7 +267,6 @@ export class Node {
   }
 
   #instantiate(): Exports {
-    const store = this.store;
     const view = (ptr: number, len: number) => this.#bytes(ptr, len);
     const log = (level: Level, text: string) => {
       if (this.#options.log) this.#options.log(level, text);
@@ -252,19 +282,19 @@ export class Node {
     };
     const decoder = new TextDecoder();
     const host = {
-      log_write: (off: number, ptr: number, len: number) => guard(() => store.logWrite(off, view(ptr, len)), false),
-      log_read: (off: number, ptr: number, len: number) => guard(() => store.logRead(off, view(ptr, len)), false),
-      log_end: () => store.logEnd(),
-      log_drop: (segment: number) => guard(() => store.logDrop(segment), undefined),
-      log_truncate: (off: number) => guard(() => store.logTruncate(off), undefined),
-      log_sync: () => store.logSync(),
-      page_read: (no: number, ptr: number) => guard(() => store.pageRead(no, view(ptr, 4096)), false),
-      page_write: (no: number, ptr: number, len: number) => guard(() => store.pageWrite(no, view(ptr, len)), false),
-      page_sync: () => store.pageSync(),
-      find_read: (no: number, ptr: number) => guard(() => store.findRead(no, view(ptr, 4096)), false),
-      find_write: (no: number, ptr: number, len: number) => guard(() => store.findWrite(no, view(ptr, len)), false),
-      find_sync: () => store.findSync(),
-      keep: (what: number, ptr: number, len: number) => guard(() => (store.keep(what === 0 ? "keys" : "roster", view(ptr, len).slice()), true), false),
+      log_write: (off: number, ptr: number, len: number) => guard(() => this.#store.logWrite(off, view(ptr, len)), false),
+      log_read: (off: number, ptr: number, len: number) => guard(() => this.#store.logRead(off, view(ptr, len)), false),
+      log_end: () => this.#store.logEnd(),
+      log_drop: (segment: number) => guard(() => this.#store.logDrop(segment), undefined),
+      log_truncate: (off: number) => guard(() => this.#store.logTruncate(off), undefined),
+      log_sync: () => this.#store.logSync(),
+      page_read: (no: number, ptr: number) => guard(() => this.#store.pageRead(no, view(ptr, 4096)), false),
+      page_write: (no: number, ptr: number, len: number) => guard(() => this.#store.pageWrite(no, view(ptr, len)), false),
+      page_sync: () => this.#store.pageSync(),
+      find_read: (no: number, ptr: number) => guard(() => this.#store.findRead(no, view(ptr, 4096)), false),
+      find_write: (no: number, ptr: number, len: number) => guard(() => this.#store.findWrite(no, view(ptr, len)), false),
+      find_sync: () => this.#store.findSync(),
+      keep: (what: number, ptr: number, len: number) => guard(() => (this.#store.keep(what === 0 ? "keys" : "roster", view(ptr, len).slice()), true), false),
       now: () => Date.now(),
       dial: (id: number, ptr: number, len: number) => this.#dial(id, decoder.decode(view(ptr, len))),
       send: (id: number, ptr: number, len: number) => this.#send(id, view(ptr, len)),

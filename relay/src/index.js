@@ -68,6 +68,8 @@ export class Space extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.#sql = ctx.storage.sql;
+    // A browser cannot send a WebSocket's own ping, so it says this, which is answered without waking anyone.
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     // Nothing is stored until someone admitted has something to store: merely knocking leaves no trace. Until
     // then a sleeping object's sockets remember which space it is.
     this.#made = this.#sql.exec("SELECT name FROM sqlite_master WHERE name = 'kept'").toArray().length > 0;

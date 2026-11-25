@@ -8,7 +8,7 @@ import { Client } from "../src/client.ts";
 import type { Connect, Wire } from "../src/node.ts";
 import { open } from "../src/nodejs.ts";
 import { live } from "./live.ts";
-import { cloud, eventually, exists, expectEqual, node, procs, TMP, token, zspd, zspdConnect } from "./procs.ts";
+import { cloud, eventually, exists, expectEqual, node, procs, proxy, TMP, token, zspd, zspdConnect } from "./procs.ts";
 
 // Pipes that can be broken, as a crash of the pipe breaks them.
 class Pipes {
@@ -84,6 +84,35 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
 }
 
 const tests: Record<string, () => Promise<void>> = {
+  // A browser cannot ping a WebSocket, so a web device says "ping", which every relay answers: a quiet connection is
+  // kept, and one that has quietly died is known to have, and dialled again.
+  async keepalive() {
+    for (const kind of ["zspd", "cloud"]) {
+      const relay = kind === "zspd" ? await node("serve", join(TMP, "k-relay")) : await cloud();
+      const through = await proxy(relay.url);
+      const owner = join(TMP, "k-owner-" + kind);
+      const sid = zspd("create", owner);
+      zspd("relay", owner, relay.key, through.url);
+      await node("run", owner);
+      const d = await open({ dir: join(TMP, "k-web-" + kind), keepalive: { idle: 300, wait: 300 }, log: () => {} });
+      zspd("admit", owner, d.key, "1");
+      await d.join(sid, { key: relay.key, url: through.url });
+      const c = d.client();
+      await eventually("it is admitted", () => c.may(1, "write"));
+      const before = through.connections();
+      await new Promise((done) => setTimeout(done, 1500));
+      expectEqual(through.connections(), before); // pinged, and answered, five times over
+      through.swallow();
+      await eventually("a connection that died without a word is dialled again", () => through.connections() > before, 3000);
+      await eventually("and works", async () => {
+        await c.write(1, (change) => change.insert({}, "x", 1, {}));
+        return true;
+      });
+      c.close();
+      await d.close();
+      for (const p of procs.splice(0)) p.kill();
+    }
+  },
   // The TypeScript client, of zspd, as the Luau client is: the same suite, the same answers.
   async zspd_clients() {
     const relay = await node("serve", join(TMP, "z-relay"));
