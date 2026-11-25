@@ -39,7 +39,7 @@ for _, v in vectors.lists do
 end
 
 for i, v in vectors.texts do
-	for round = 1, 6 do
+	for round = 1, if v.ordered then 1 else 6 do
 		local cells = table.clone(v.cells)
 		if round > 1 then
 			for j = #cells, 2, -1 do

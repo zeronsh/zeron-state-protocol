@@ -156,8 +156,9 @@ local function insert_run(t: Text, id: string, bytes: string, lpiece: string, lo
 	p.count += #bytes
 	p.rpiece, p.roffset = rpiece, roffset
 
-	local l = left_of(t, lpiece, loffset)
+	left_of(t, lpiece, loffset)
 	local r = right_of(t, rpiece, roffset)
+	local l = left_of(t, lpiece, loffset) -- again, for what was split may have been before it
 	local spans = t.spans
 	local at = l + 1
 	local scanning = false

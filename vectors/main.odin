@@ -181,6 +181,43 @@ texts :: proc() {
 				append(&all, zsp.Cell{{1, 1}, zsp.DATA, .Piece, stamp, body})
 			}
 		}
+		if doc % 3 == 0 {
+			// Pieces by someone who minds nothing: neighbours in any order, and of any piece. What they come to
+			// may turn on the order they come in, and is the same for the same.
+			ids: [dynamic]u64
+			for c in all {
+				append(&ids, zsp.get_u64(c.body))
+			}
+			so_far: zsp.Text
+			for &c in all {
+				zsp.text_apply(&so_far, &c)
+			}
+			for _ in 0 ..< 40 {
+				clock += 1
+				id := rand.uint64() | 1
+				w: [dynamic]byte
+				zsp.write_u64(&w, id)
+				for _ in 0 ..< 2 {
+					append(&w, 1) // insert, between two of whatever there is
+					for _ in 0 ..< 2 {
+						append(&w, 2)
+						zsp.write_u64(&w, rand.choice(ids[:]))
+						zsp.write_varint(&w, u64(rand.int_max(3)))
+					}
+					zsp.write_bytes(&w, {'A' + byte(rand.int_max(26)), 'Z'})
+				}
+				c := zsp.Cell{{1, 1}, zsp.DATA, .Piece, {clock, rand.uint64()}, w[:]}
+				if zsp.text_apply(&so_far, &c) != .Changed {
+					zsp.text_destroy(&so_far) // it speaks of what there is not: begin again without it
+					for &d in all {
+						zsp.text_apply(&so_far, &d)
+					}
+					continue
+				}
+				append(&all, c)
+				append(&ids, id)
+			}
+		}
 		if doc % 2 == 0 && len(all) > 4 {
 			n := len(all) / 2
 			bundle := zsp.text_bundle(all[:n])
@@ -202,7 +239,7 @@ texts :: proc() {
 			zsp.put_u64(s[8:], c.stamp.salt)
 			fmt.printf(`%s{{"kind": %d, "stamp": "%s", "body": "%s"}}`, ", " if i > 0 else "", int(c.kind), h(s[:]), h(c.body))
 		}
-		fmt.printfln(`], "text": "%s"}}%s`, string(w[:]), "," if doc + 1 < DOCS else "")
+		fmt.printfln(`], "ordered": %v, "text": "%s"}}%s`, doc % 3 == 0, string(w[:]), "," if doc + 1 < DOCS else "")
 	}
 	fmt.println("  ],")
 }
