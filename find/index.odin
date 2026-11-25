@@ -29,6 +29,7 @@ Index :: struct {
 	tailing:    bool, // which are all that has happened since
 	unsaved:    int, // rows gone over since it was last written
 	blob:       [dynamic]u32, // pages the catalogue is in
+	kept:       [dynamic]Kept, // where the marks of pages are
 	watchers:   [dynamic]Watcher,
 }
 
@@ -50,6 +51,12 @@ Watcher :: struct {
 	done:   proc(data: rawptr),
 }
 
+// A page of what marks pages.
+@(private)
+Kept :: struct {
+	no, mark: u32,
+}
+
 Scope :: struct {
 	x:       ^Index,
 	id:      zsp.Scope,
@@ -69,7 +76,8 @@ Filling :: struct {
 	bulk:  [4]Bulk,
 	id:    zsp.Id, // gone over so far
 	row:   u32, // the next
-	ended: int, // trees that are whole
+	merging: bool, // all of them are, and
+	ended: int, // so many trees are whole
 	again: map[zsp.Id]Slots, // what has changed meanwhile,
 	gone:  map[u32]bool, // and rows that are no more
 }
@@ -105,7 +113,7 @@ BATCH :: 1 << 17 // edits gathered before they are made
 @(private)
 HEADERS :: 2
 @(private)
-MAGIC :: 0x7a73_7066_696e_6432
+MAGIC :: 0x7a73_7066_696e_6433
 
 @(private)
 Header :: struct {
@@ -113,10 +121,12 @@ Header :: struct {
 	generation: u64,
 	upto:       u64,
 	serial:     u64,
+	forgot:     u64,
+	salt:       [16]byte,
 	next:       u32,
-	blob:       u32, // the first page of the catalogue
+	blob:       u32, // the first page of the catalogue,
+	mark:       u32, // and what marks it
 	size:       u32,
-	salt:       u32,
 }
 
 index_open :: proc(x: ^Index, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
@@ -133,7 +143,11 @@ index_open :: proc(x: ^Index, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
 		frame_free(x, no)
 	}
 	x.generation = best.generation
+	if best.generation > 0 {
+		pager_salt(x, best.salt)
+	}
 	if best.generation > 0 && catalogue_read(x, &best) {
+		x.forgot = best.forgot
 		x.upto, x.serial, x.next = best.upto, best.serial, best.next
 		if x.serial != n.roster.serial {
 			x.serial = max(u64) // what the roster has changed is not known
@@ -162,8 +176,12 @@ index_reset :: proc(x: ^Index) {
 	clear(&x.pending)
 	set_destroy(&x.fresh)
 	clear(&x.blob)
+	clear(&x.kept)
+	x.checking, x.unsaved = false, 0
+	x.forgot = x.n.forgot
+	pager_salt(x)
 	x.next = HEADERS
-	x.upto, x.serial, x.tailing, x.failed = 0, x.n.roster.serial, false, false
+	x.upto, x.serial, x.tailing, x.failed, x.unwritten = 0, x.n.roster.serial, false, false, false
 }
 
 index_close :: proc(x: ^Index) {
@@ -172,6 +190,7 @@ index_close :: proc(x: ^Index) {
 	}
 	delete(x.scopes)
 	delete(x.blob)
+	delete(x.kept)
 	delete(x.watchers)
 	pager_close(x)
 	x^ = {}
@@ -225,7 +244,7 @@ held_trees :: proc(h: ^Held) -> [4]^Tree {
 // Writes what is new, so that it need not be made again. The log must be durable so far.
 index_save :: proc(x: ^Index) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	if x.upto > x.n.synced {
+	if x.upto > x.n.synced || x.failed || x.checking {
 		return false
 	}
 	for s in x.scopes {
@@ -235,15 +254,40 @@ index_save :: proc(x: ^Index) -> bool {
 			}
 		}
 	}
+	for s in x.scopes {
+		if !s.built {
+			return false // not yet
+		}
+	}
 	w := make([dynamic]byte, context.temp_allocator)
+	// Everything else first, so that it is known what marks it; then the marks; and then the catalogue, which says
+	// where those are. Those two are marked by what leads to them.
+	pager_write(x) or_return
+	for stretch in x.altered {
+		for len(x.kept) <= int(stretch) {
+			append(&x.kept, Kept{})
+		}
+		if k := x.kept[stretch]; k.no != 0 {
+			append(&x.pending, k.no)
+		}
+		pg := new(Page)
+		defer free(pg)
+		lo := int(stretch) * MARKS
+		copy(([^]u32)(&pg.data)[:MARKS], x.marks[lo:min(lo + MARKS, len(x.marks))])
+		no := page_take(x)
+		x.kept[stretch] = {no, page_write(x, no, pg) or_return}
+	}
+	clear(&x.altered)
+	zsp.write_varint(&w, u64(len(x.kept)))
+	for k in x.kept {
+		zsp.write_varint(&w, u64(k.no))
+		zsp.write_varint(&w, u64(k.mark))
+	}
 	zsp.write_varint(&w, u64(len(x.scopes)))
 	put_tree :: proc(w: ^[dynamic]byte, t: Tree) {
 		zsp.write_varint(w, u64(t.root))
 	}
 	for s in x.scopes {
-		if !s.built {
-			return false // not yet
-		}
 		zsp.write_varint(&w, u64(s.id))
 		zsp.write_varint(&w, u64(s.next))
 		put_tree(&w, s.ids)
@@ -271,26 +315,26 @@ index_save :: proc(x: ^Index) -> bool {
 			zsp.write_varint(&w, u64(h.alive))
 		}
 	}
-	for no in x.blob {
-		page_drop(x, no)
-	}
+	append(&x.pending, ..x.blob[:])
 	clear(&x.blob)
 	// From the last page to the first, each naming the next.
-	ROOM :: LEAF_ROOM - 4
-	next: u32
+	ROOM :: LEAF_ROOM - 8
+	next, mark: u32
 	for at := (len(w) + ROOM - 1) / ROOM - 1; at >= 0; at -= 1 {
-		no, pg := page_new(x)
-		(^u32)(&pg.data)^ = next
-		copy(pg.data[4:], w[at * ROOM:])
-		append(&x.blob, no)
-		next = no
+		pg := new(Page)
+		defer free(pg)
+		([^]u32)(&pg.data)[0], ([^]u32)(&pg.data)[1] = next, mark
+		copy(pg.data[8:], w[at * ROOM:])
+		next = page_take(x)
+		mark = page_write(x, next, pg) or_return
+		append(&x.blob, next)
 	}
-	if !pager_write(x) || !x.disk.sync(x.disk.data) {
+	if !x.disk.sync(x.disk.data) {
 		x.failed = true
 		return false
 	}
 	x.generation += 1
-	h := Header{MAGIC, x.generation, x.upto, x.serial, x.next, next, u32(len(w)), 0}
+	h := Header{MAGIC, x.generation, x.upto, x.serial, x.forgot, x.salt, x.next, next, mark, u32(len(w))}
 	at := u32(x.generation % HEADERS)
 	// Written as any page is, so that it too is sealed.
 	f := new(Frame)
@@ -313,19 +357,30 @@ index_save :: proc(x: ^Index) -> bool {
 catalogue_read :: proc(x: ^Index, best: ^Header) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	bytes := make([dynamic]byte, context.temp_allocator)
-	for no := best.blob; no != 0 && len(bytes) < int(best.size); {
-		pg := page_get(x, no)
-		if x.failed {
-			return false
-		}
+	pg := new(Page)
+	defer free(pg)
+	no, mark := best.blob, best.mark
+	for no != 0 && len(bytes) < int(best.size) {
+		page_read(x, no, mark, pg) or_return
 		append(&x.blob, no)
-		append(&bytes, ..pg.data[4:])
-		no = (^u32)(&pg.data)^
+		append(&bytes, ..pg.data[8:])
+		no, mark = ([^]u32)(&pg.data)[0], ([^]u32)(&pg.data)[1]
 	}
 	if len(bytes) < int(best.size) {
 		return false
 	}
 	r := zsp.Reader{buf = bytes[:best.size]}
+	kept := zsp.read_count(&r)
+	for _ in 0 ..< kept {
+		k := Kept{u32(zsp.read_varint(&r)), u32(zsp.read_varint(&r))}
+		append(&x.kept, k)
+		if k.no == 0 {
+			pg^ = {}
+		} else {
+			page_read(x, k.no, k.mark, pg) or_return
+		}
+		append(&x.marks, ..([^]u32)(&pg.data)[:MARKS])
+	}
 	scopes := int(zsp.read_varint(&r))
 	for _ in 0 ..< scopes {
 		s := scope_make(x, zsp.Scope(zsp.read_varint(&r)))
@@ -374,7 +429,7 @@ free_find :: proc(x: ^Index) {
 	used := make([]bool, x.next)
 	defer delete(used)
 	mark :: proc(x: ^Index, used: []bool, no: u32) {
-		if no == 0 || int(no) >= len(used) {
+		if no == 0 || int(no) >= len(used) || used[no] {
 			return
 		}
 		used[no] = true
@@ -401,6 +456,9 @@ free_find :: proc(x: ^Index) {
 	}
 	for no in x.blob {
 		used[no] = true
+	}
+	for k in x.kept {
+		used[k.no] = true
 	}
 	for s in x.scopes {
 		mark(x, used, s.ids.root)
@@ -631,7 +689,7 @@ scope_step :: proc(s: ^Scope, budget: int) -> bool {
 	f := s.filling
 	n := s.x.n
 	left := budget
-	if f.ended == 0 {
+	if !f.merging {
 		scan := zsp.tree_scan(&n.store, n.cells, {f.id[0], f.id[1], max(u64), max(u64), max(u64)}, {(u64(s.id) + 1) << 32, 0, 0, 0, 0})
 		for leaf in zsp.tree_next(&scan) {
 			id := zsp.Id{leaf.key[0], leaf.key[1]}
@@ -653,9 +711,9 @@ scope_step :: proc(s: ^Scope, budget: int) -> bool {
 			}
 		}
 	}
+	f.merging = true // what is written from now on is gone over again once it is made
 	for f.ended < 2 {
 		if !bulk_end(&f.bulk[f.ended], left * 16) {
-			f.ended = max(f.ended, 0)
 			return false
 		}
 		f.ended += 1
@@ -690,7 +748,7 @@ held_begin :: proc(h: ^Held) {
 held_step :: proc(h: ^Held, budget: int) -> bool {
 	s, f := h.scope, h.filling
 	left := budget
-	if f.row < s.next {
+	if !f.merging {
 		c := cursor_make(s.x, s.rows, context.allocator)
 		defer cursor_destroy(&c)
 		cursor_seek(&c, {u64(f.row) << 32, 0})
@@ -716,7 +774,7 @@ held_step :: proc(h: ^Held, budget: int) -> bool {
 				clear(&edits)
 			}
 		}
-		f.row = s.next
+		f.row, f.merging = s.next, true
 	}
 	for f.ended < 4 {
 		if f.ended != 2 && !bulk_end(&f.bulk[f.ended], left * 16) {

@@ -1,6 +1,6 @@
 --!strict
 --!native
--- Questions, as tables to be composed, and as the bytes a node reads: SPEC.md 16.
+-- Questions, as tables to be composed, and as the bytes a node reads: SPEC.md 15.
 
 local codec = require("./codec")
 

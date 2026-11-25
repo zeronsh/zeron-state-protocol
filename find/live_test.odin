@@ -74,6 +74,16 @@ client_hear :: proc(t: ^testing.T, c: ^Client) {
 			}
 			delete(a.totals)
 			a.totals = slice.clone(f.buf[f.pos:])
+			many := zsp.read_varint(&f)
+			for i := u64(0); i < many && !f.bad; i += 1 {
+				_, _ = zsp.read_u8(&f), zsp.read_u64(&f)
+				facets := zsp.read_varint(&f)
+				for j := u64(0); j < facets && !f.bad; j += 1 {
+					_ = zsp.read_varint(&f)
+					_ = zsp.read_bytes(&f)
+				}
+			}
+			testing.expect(t, f.pos == len(f.buf))
 			testing.expect(t, !f.bad)
 		}
 	}
@@ -1003,5 +1013,440 @@ what_a_roster_takes_is_not_answered :: proc(t: ^testing.T) {
 			testing.expect(t, !slice.contains(mine[:], id))
 		}
 		testing.expect(t, answer_check(t, &w, &f, &c, 1, q[:]))
+	}
+}
+
+// Pages that are not what was last written are known not to be, and the answers are right all the same.
+@(test)
+pages_are_believed_only_if_they_are :: proc(t: ^testing.T) {
+	state := rand.create(101)
+	context.random_generator = rand.default_random_generator(&state)
+	ROUNDS :: max(#config(ZSP_FIND_SEEDS, 6) / 2, 10)
+	for round in 0 ..< ROUNDS {
+		w: World
+		world_make(t, &w)
+		defer world_destroy(&w)
+		Past :: struct {
+			pages: Memory_Disk,
+			was:   [dynamic]struct {no: u32, bytes: [PAGE_SIZE]byte},
+			open:  bool,
+		}
+		past: Past
+		defer {
+			memory_disk_destroy(&past.pages)
+			delete(past.was)
+		}
+		disk :: proc(p: ^Past) -> Disk {
+			d := memory_disk(&p.pages)
+			d.write = proc(data: rawptr, no: u32, bytes: []byte) -> bool {
+				p := (^Past)(data)
+				if pg, ok := p.pages.pages[no]; ok {
+					append(&p.was, struct {no: u32, bytes: [PAGE_SIZE]byte}{no, pg^})
+				}
+				pg, ok := p.pages.pages[no]
+				if !ok {
+					pg = new([PAGE_SIZE]byte)
+					p.pages.pages[no] = pg
+				}
+				copy(pg[:], bytes)
+				return true
+			}
+			d.data = p
+			return d
+		}
+		#assert(offset_of(Past, pages) == 0)
+		clean: Memory_Disk
+		own: Finder // looks on
+		finder_open(&own, &w.node, memory_disk(&clean), w.secret)
+		defer {
+			finder_close(&own)
+			memory_disk_destroy(&clean)
+		}
+		asked: [dynamic][]byte
+		defer {
+			for q in asked {
+				delete(q)
+			}
+			delete(asked)
+		}
+		for _ in 0 ..< 3 {
+			append(&asked, slice.clone(ask(&w) if len(w.rows) > 0 else []byte{1, 0, 1, 2, 1, 0, 0, 50, 0}))
+		}
+		for life in 0 ..< 5 {
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			f: Finder
+			finder_open(&f, &w.node, disk(&past), w.secret)
+			f.settled = true
+			c := client_open(&w, &f)
+			for q, i in asked {
+				client_ask(t, &c, u64(i), q)
+			}
+			for step in 0 ..< 6 {
+				many := rand.int_max(60)
+				for _ in 0 ..< many {
+					world_write(t, &w)
+				}
+				if rand.int_max(3) == 0 && len(past.was) > 0 {
+					// Somebody else has been at it.
+					for _ in 0 ..< 1 + step {
+						at := rand.choice(past.was[:])
+						if past.pages.pages[at.no] == nil {
+							continue
+						}
+						switch rand.int_max(4) {
+						case 0: // what it once was
+							past.pages.pages[at.no]^ = at.bytes
+						case 1: // what another was
+							if pg, ok := past.pages.pages[at.no / 2 + 1]; ok {
+								pg^ = at.bytes
+							}
+						case 2:
+							past.pages.pages[at.no][rand.int_max(PAGE_SIZE)] ~= 1 << uint(rand.int_max(8))
+						case 3:
+							free(past.pages.pages[at.no])
+							delete_key(&past.pages.pages, at.no)
+						}
+					}
+				}
+				for quiet, n := 0, 0; quiet < 3 && n < 4000; n += 1 {
+					quiet = quiet + 1 if finder_run(&f, 100) && !f.x.failed else 0
+				}
+				client_hear_out(t, &c, &f)
+				index_follow(&own.x)
+				for q, i in asked {
+					if !answer_check(t, &w, &own, &c, u64(i), q) {
+						fmt.println("round", round, "life", life, "step", step)
+						return
+					}
+				}
+				zsp.store_sync(&w.node.store)
+				if rand.int_max(2) == 0 {
+					index_save(&f.x)
+				}
+			}
+			zsp.session_close(c.session)
+			finder_close(&f)
+			client_free(&c)
+		}
+	}
+}
+
+// What another node says in a call is not believed for saying it.
+@(test)
+answers_from_afar_are_sound :: proc(t: ^testing.T) {
+	state := rand.create(103)
+	context.random_generator = rand.default_random_generator(&state)
+	w, p: World
+	world_make(t, &w, &p)
+	defer world_destroy(&w)
+	defer world_destroy(&p)
+	f, g: Finder
+	pages: [2]Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages[0]), w.secret)
+	finder_open(&g, &p.node, memory_disk(&pages[1]), p.secret)
+	f.settled = true
+	c := client_open(&p, &g)
+	elsewhere := client_open(&w, &f)
+	p.node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+		zsp.session_accept(s, {{0, {.Read, .Write}, 0}} if s.role == .Open else nil)
+	}
+	w.node.host.authenticate = p.node.host.authenticate
+	p.node.now = w.node.now
+	link := link_make(&p, &w)
+	defer {
+		zsp.session_close(link[0])
+		zsp.session_close(link[1])
+		zsp.session_close(c.session)
+		zsp.session_close(elsewhere.session)
+		finder_close(&f)
+		finder_close(&g)
+		client_free(&c)
+		client_free(&elsewhere)
+		for &d in pages {
+			memory_disk_destroy(&d)
+		}
+	}
+	for _ in 0 ..< 60 {
+		world_write(t, &w)
+	}
+	q := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&q, 1)
+	append(&q, u8(Op.All), 1, 2, 1, 0, 0, 10, 2, u8(Fn.Facet), u8(Kind.Bytes), 16, 0, 3, u8(Fn.Sum), u8(Kind.Number), 17, 0, 0)
+	client_ask(t, &c, 1, q[:])
+	testing.expect(t, link_settle(t, link, &f, &g))
+	client_hear_out(t, &c, &g)
+	testing.expect(t, answer_check(t, &w, &f, &c, 1, q[:]))
+	l := g.live[0]
+	good := slice.clone(l.far.answer, context.temp_allocator)
+	ROUNDS :: max(#config(ZSP_FIND_SEEDS, 6) * 50, 3000)
+	for round in 0 ..< ROUNDS {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		bad := make([dynamic]byte, context.temp_allocator)
+		switch round {
+		case 0:
+			append(&bad, 0x10, 0, 0, 0x80, 0x80, 4)
+		case 1:
+			append(&bad, 0, 0, 0, 0x80, 0x80, 0x80, 0x80, 0x10)
+		case 2:
+			append(&bad, 0, 0, 0, 0, 1, 1)
+		case:
+			append(&bad, ..good)
+			for _ in 0 ..< 1 + round % 4 {
+				switch rand.int_max(4) {
+				case 0:
+					bad[rand.int_max(len(bad))] = byte(rand.uint32())
+				case 1:
+					bad[rand.int_max(min(len(bad), 8))] = byte(rand.uint32())
+				case 2:
+					resize(&bad, 1 + rand.int_max(len(bad)))
+				case 3:
+					inject_at(&bad, rand.int_max(len(bad)), byte(rand.uint32()))
+				}
+			}
+		}
+		call := l.far.call
+		finder_flow(&g, call, .Data, bad[:])
+		finder_run(&g)
+		// Nothing is passed on that the client could not read, or that says what only its own node may.
+		client_hear_out(t, &c, &g)
+		flags := c.answers[1].flags
+		testing.expect(t, flags == 0 || flags == 1 || flags == 8)
+		testing.expect_value(t, len(c.answers), 1)
+		if l.far.call == 0 {
+			clear(&l.far.tried)
+			finder_run(&g)
+		}
+		if testing.failed(t) {
+			fmt.println("round", round, bad)
+			return
+		}
+		if round % 50 == 0 {
+			testing.expect(t, link_settle(t, link, &f, &g))
+			client_hear_out(t, &c, &g)
+		}
+	}
+	// And the next that is sound is taken.
+	for id in 0 ..< 2 {
+		_ = id
+		clear(&l.far.tried)
+		world_write(t, &w)
+		testing.expect(t, link_settle(t, link, &f, &g))
+	}
+	client_hear_out(t, &c, &g)
+	testing.expect(t, answer_check(t, &w, &f, &c, 1, q[:]))
+}
+
+// An answer that would be longer than one may be is not one; nor does what has grown stop what is passed on.
+@(test)
+answers_are_not_too_long :: proc(t: ^testing.T) {
+	state := rand.create(105)
+	context.random_generator = rand.default_random_generator(&state)
+	w, p: World
+	world_make(t, &w, &p)
+	defer world_destroy(&w)
+	defer world_destroy(&p)
+	f, g: Finder
+	pages: [2]Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages[0]), w.secret)
+	finder_open(&g, &p.node, memory_disk(&pages[1]), p.secret)
+	f.settled = true
+	c := client_open(&p, &g)
+	near := client_open(&w, &f)
+	p.node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+		zsp.session_accept(s, {{0, {.Read, .Write}, 0}} if s.role == .Open else nil)
+	}
+	w.node.host.authenticate = p.node.host.authenticate
+	p.node.now = w.node.now
+	link := link_make(&p, &w)
+	defer {
+		zsp.session_close(link[0])
+		zsp.session_close(link[1])
+		zsp.session_close(c.session)
+		zsp.session_close(near.session)
+		finder_close(&f)
+		finder_close(&g)
+		client_free(&c)
+		client_free(&near)
+		for &d in pages {
+			memory_disk_destroy(&d)
+		}
+	}
+	put :: proc(t: ^testing.T, w: ^World, n, size: int) {
+		id := zsp.node_id(&w.node, 1)
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(1, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		v := make([]byte, size, context.temp_allocator)
+		slice.fill(v, 'x')
+		zsp.put_u64(v[size - 8:], u64(n) << 8 | 1)
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}, {id, 16, .Value, zsp.node_stamp(&w.node), v}}))
+	}
+	q := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&q, 1)
+	append(&q, u8(Op.All), 1, 2, 1, 0, 0, 0, 1, u8(Fn.Facet), u8(Kind.Bytes), 16, 0)
+	zsp.write_varint(&q, 500)
+	client_ask(t, &c, 1, q[:])
+	client_ask(t, &near, 1, q[:])
+	for n in 0 ..< 250 {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		put(t, &w, n, 1200)
+		if n % 25 != 24 {
+			continue
+		}
+		testing.expect(t, link_settle(t, link, &f, &g))
+		client_hear_out(t, &c, &g)
+		client_hear_out(t, &near, &f)
+		if n < 200 {
+			// Each near twice the last that was said, and no less sure to come.
+			testing.expectf(t, c.answers[1].total == n + 1 && c.answers[1].flags == 1, "%d: %v", n, c.answers[1].total)
+		}
+	}
+	testing.expect(t, near.answers[1].flags == 4 && c.answers[1].flags & 5 != 1 && len(f.live) == 0)
+	// Nor is what is longest of all the death of anyone.
+	put(t, &w, 999, 60_000)
+	q2 := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&q2, 1)
+	append(&q2, u8(Op.All), 1, 2, 1, 0, 0, 0, 64)
+	for _ in 0 ..< 64 {
+		append(&q2, u8(Fn.Max), u8(Kind.Bytes), 16, 0, 0)
+	}
+	client_ask(t, &near, 2, q2[:])
+	for !finder_run(&f) {
+	}
+	finder_run(&f)
+	client_hear_out(t, &near, &f)
+	testing.expect(t, near.answers[2].flags == 4)
+	// What makes no sense is said to make none.
+	for bad in ([][]byte{
+		{1, u8(Op.Exists), u8(Kind.Words), 16, 0, 0, 0, 0, 1, 0},
+		{1, u8(Op.Range), u8(Kind.Words), 16, 0, 0, 0, 0, 0, 1, 0},
+		{1, u8(Op.In), u8(Kind.Words), 16, 0, 0, 0, 0, 0, 1, 0},
+		{0x81, 0x80, 0x80, 0x80, 0x10, 0, 0, 0, 0, 1, 0},
+		{1, u8(Op.Ref), u8(Kind.Id), 19, 0, 0, 0, 0, 0, 0, 1, 0},
+	}) {
+		client_ask(t, &near, 3, bad)
+		finder_run(&f)
+		client_hear_out(t, &near, &f)
+		testing.expectf(t, near.answers[3].flags == 4, "%v", bad)
+	}
+}
+
+// Cells are forgotten while nothing is asked, and nothing but a number kept says so.
+@(test)
+what_is_forgotten_meanwhile_is_gone :: proc(t: ^testing.T) {
+	state := rand.create(107)
+	context.random_generator = rand.default_random_generator(&state)
+	for asleep in 0 ..< 2 {
+		w, p: World
+		world_make(t, &w, &p, {.Signed})
+		defer world_destroy(&w)
+		defer world_destroy(&p)
+		pages: Memory_Disk
+		defer memory_disk_destroy(&pages)
+		f: Finder
+		finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+		f.settled = true
+		c := client_open(&w, &f)
+		for _ in 0 ..< 30 {
+			world_write(t, &w)
+		}
+		q := []byte{1, 0, 1, 2, 1, 0, 0, 50, 0}
+		client_ask(t, &c, 1, q)
+		for !finder_run(&f) {
+		}
+		finder_run(&f)
+		zsp.store_sync(&w.node.store)
+		testing.expect(t, index_save(&f.x))
+		zsp.session_close(c.session)
+		client_free(&c)
+		finder_close(&f)
+		// As when where they lay could not be read.
+		lost := w.rows[:0]
+		taken := make([dynamic]zsp.Id, context.temp_allocator)
+		for id, i in w.rows {
+			if i % 3 == 0 {
+				append(&taken, id)
+			}
+		}
+		_ = lost
+		zsp.store_lose(&w.node.store, taken[:])
+		if asleep == 1 {
+			testing.expect(t, zsp.store_checkpoint(&w.node.store))
+			zsp.node_destroy(&w.node)
+			w.node = {}
+			testing.expect(t, zsp.node_init(&w.node, zsp.memory_disk(&w.disk), w.space, &w.keys, true, 64))
+			testing.expect(t, zsp.node_resume(&w.node, nil, w.roster))
+			w.node.now = 1_700_001_000_000
+		}
+		finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+		f.settled = true
+		c = client_open(&w, &f)
+		client_ask(t, &c, 1, q)
+		for !finder_run(&f) {
+		}
+		finder_run(&f)
+		client_hear_out(t, &c, &f)
+		testing.expectf(t, answer_check(t, &w, &f, &c, 1, q), "%d", asleep)
+		zsp.session_close(c.session)
+		client_free(&c)
+		finder_close(&f)
+	}
+}
+
+// Rows are made while what was gone over is being put in order.
+@(test)
+what_comes_while_merging_is_there :: proc(t: ^testing.T) {
+	state := rand.create(109)
+	context.random_generator = rand.default_random_generator(&state)
+	for round in 0 ..< 6 {
+		w: World
+		world_make(t, &w)
+		defer world_destroy(&w)
+		put :: proc(t: ^testing.T, w: ^World) {
+			w.node.now += 1000
+			id := zsp.node_id(&w.node, 1)
+			append(&w.rows, id)
+			b := make([]byte, 24, context.temp_allocator)
+			l := list_of(1, 0)
+			zsp.put_u64(b, l[0])
+			zsp.put_u64(b[8:], l[1])
+			text := fmt.tprint(rand.int63(), rand.int63(), rand.int63(), "band")
+			testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}, {id, 16, .Value, zsp.node_stamp(&w.node), transmute([]byte)text[:20]}, {id, 20, .Value, zsp.node_stamp(&w.node), transmute([]byte)text}}))
+		}
+		for _ in 0 ..< 300 {
+			put(t, &w)
+		}
+		source := make([dynamic]byte, context.temp_allocator)
+		append(&source, 1, u8(Op.And), 2, u8(Op.Match), u8(Kind.Words), 20, 0, 0, 0, 4, 'b', 'a', 'n', 'd', u8(Op.Exists), u8(Kind.Bytes), 16, 0, 0, 0, 0, 50, 0)
+		q, ok := query_parse(source[:])
+		testing.expect(t, ok)
+		index_follow(&w.x)
+		query_prepare(&w.x, &q)
+		merging := 0
+		for !index_step(&w.x, 2 + round) {
+			for s in w.x.scopes {
+				now := s.filling != nil
+				for h in s.columns {
+					now ||= h.filling != nil
+				}
+				if now && rand.int_max(6) == 0 {
+					merging += 1
+					put(t, &w)
+				}
+			}
+		}
+		testing.expect(t, merging > 3)
+		s := index_scope(&w.x, 1)
+		testing.expect_value(t, s.all.count, len(w.rows))
+		testing.expect_value(t, tree_total(&w.x, s.rows).count, len(w.rows))
+		for h in s.columns {
+			testing.expect(t, h.kind != .Words || h.alive == len(w.rows))
+		}
+		got := pred_rows(s, &q.where_)
+		testing.expect_value(t, got.count, len(w.rows))
+		set_destroy(&got)
+		check_index(t, &w)
 	}
 }

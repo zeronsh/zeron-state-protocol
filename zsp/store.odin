@@ -41,7 +41,7 @@ Store :: struct {
 	synced:      u64, // durable up to here
 	serial:      u64, // of the roster this was last held against
 	serial_kept: u64,
-	forgot:      u64, // cells forgotten since it was opened, of which nothing is said in the log
+	forgot:      u64, // cells ever forgotten, of which nothing is said in the log
 	failed:      bool,
 
 	// Recent changes, for tailing. See events.odin.
@@ -54,6 +54,7 @@ Header :: struct {
 	log:        u64,
 	clock:      u64,
 	serial:     u64,
+	forgot:     u64,
 	shelf:      u32,
 	cells:      u32,
 	waste:      u32,
@@ -61,7 +62,7 @@ Header :: struct {
 	next:       u32,
 	sum:        u64,
 }
-MAGIC :: [8]byte{'z', 's', 'p', '-', 't', 'r', 'e', '1'}
+MAGIC :: [8]byte{'z', 's', 'p', '-', 't', 'r', 'e', '2'}
 HEADER_PAGES :: 2
 
 // Where a cell's body lies. Packed into a tree value.
@@ -121,6 +122,7 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 	s.generation = best.generation
 	s.clock = best.clock
 	s.serial, s.serial_kept = best.serial, best.serial
+	s.forgot = best.forgot
 	s.checkpoint = best.log
 	s.shelf.root, s.cells.root = best.shelf, best.cells
 	s.waste.root, s.outbox.root = best.waste, best.outbox
@@ -741,6 +743,7 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 		log        = store_tail(s),
 		clock      = s.clock,
 		serial     = s.serial,
+		forgot     = s.forgot,
 		shelf      = s.shelf.root,
 		cells      = s.cells.root,
 		waste      = s.waste.root,
@@ -837,6 +840,20 @@ evacuate :: proc(s: ^Store) -> []u64 {
 		forget(s, lost[:])
 	}
 	return victims[:]
+}
+
+when ODIN_TEST {
+	// Loses rows, as when where their cells lay cannot be read. For tests.
+	store_lose :: proc(s: ^Store, rows: []Id) {
+		lost := make([dynamic]Leaf, context.temp_allocator)
+		for row in rows {
+			scan := tree_scan(s, s.cells, {row[0], row[1], 0, 0, 0}, {row[0], row[1], max(u64), max(u64), max(u64)})
+			for leaf in tree_next(&scan) {
+				append(&lost, leaf)
+			}
+		}
+		forget(s, lost[:])
+	}
 }
 
 // Unholds cells, as though they had never come. Where they lay is not read: it may be unreadable.

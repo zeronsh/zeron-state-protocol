@@ -274,6 +274,42 @@ do
 	second.stop()
 	flags(2, 16)
 	assert(next(h.client.asked) == nil)
+	-- One that is stopped is not asked again when it might have been.
+	local third = h.client:ask({ scope = 1, table = Note }, function(s)
+		a = s
+	end)
+	flags(3, 2)
+	third.stop()
+	h.run()
+	local said = #h.self.said
+	local function scopes(...: number)
+		local w = codec.writer()
+		codec.put(w, string.rep("\0", 8))
+		for _, scope in { ... } do
+			codec.put_varint(w, scope)
+			codec.put(w, "\7" .. string.rep("k", 32))
+		end
+		h.tell(ROSTER, codec.string(w))
+	end
+	scopes(1)
+	for i = said + 1, #h.self.said do
+		assert(h.self.said[i].kind ~= ASK)
+	end
+	flags(3, 17)
+	assert(next(h.client.asked) == nil)
+	-- One that needs to read what cannot be is denied, and asked once it can.
+	local w = zsp.where
+	local joined = h.client:ask({ scope = 1, table = Note, where = w.refers("title", 2, w.in_list("inbox"), Note) }, function(s)
+		a = s
+	end)
+	h.run()
+	assert(a.status == "denied")
+	said = #h.self.said
+	scopes(1, 2)
+	h.run()
+	assert(h.self.said[#h.self.said].kind == ASK and #h.self.said == said + 1)
+	joined.stop()
+	flags(4, 16)
 	-- A question that makes no sense here is an error here.
 	assert(not pcall(function()
 		h.client:ask({ scope = 1, table = Note, where = zsp.where.is("nothing", 1) }, function() end)

@@ -117,7 +117,7 @@ query_parse :: proc(source: []byte, allocator := context.temp_allocator) -> (q: 
 	context.allocator = allocator
 	q.source = slice.clone(source)
 	r := zsp.Reader{buf = q.source}
-	q.scope = zsp.Scope(zsp.read_varint(&r))
+	q.scope = scope_parse(&r)
 	left := MAX_PREDS
 	q.where_ = pred_parse(&r, 0, &left)
 	q.which = q.source[:r.pos]
@@ -141,8 +141,8 @@ query_parse :: proc(source: []byte, allocator := context.temp_allocator) -> (q: 
 		}
 	}
 	q.from_end = zsp.read_u8(&r) != 0
-	q.offset = int(zsp.read_varint(&r) & 0xffff_ffff)
-	q.limit = min(int(zsp.read_varint(&r) & 0xffff_ffff), MAX_LIMIT)
+	q.offset = int(min(zsp.read_varint(&r), u64(max(i32))))
+	q.limit = int(min(zsp.read_varint(&r), MAX_LIMIT))
 	totals := zsp.read_count(&r)
 	if totals > 64 {
 		return
@@ -155,7 +155,7 @@ query_parse :: proc(source: []byte, allocator := context.temp_allocator) -> (q: 
 		}
 		a.fn = Fn(fn)
 		a.col = column_parse(&r)
-		a.top = min(int(zsp.read_varint(&r) & 0xffff), 1000)
+		a.top = int(min(zsp.read_varint(&r), MAX_LIMIT))
 		if !r.bad && (!column_sorted(a.col.kind) || (a.fn == .Sum && a.col.kind != .Number)) {
 			return
 		}
@@ -210,6 +210,16 @@ compared :: proc(kind: Kind, raw: []byte) -> []byte {
 }
 
 @(private)
+scope_parse :: proc(r: ^zsp.Reader) -> zsp.Scope {
+	v := zsp.read_varint(r)
+	if v == 0 || v >= u64(max(zsp.Scope)) {
+		r.bad = true
+		return 0
+	}
+	return zsp.Scope(v)
+}
+
+@(private)
 pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 	left^ -= 1
 	op := zsp.read_u8(r)
@@ -233,6 +243,7 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 	case .Range:
 		p.col = column_parse(r)
 		flags := zsp.read_u8(r)
+		r.bad ||= p.col.kind == .Words
 		b := &p.range
 		b.has_lo, b.has_hi, b.lo_in, b.hi_in = flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0
 		if b.has_lo {
@@ -244,6 +255,7 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 	case .In:
 		p.col = column_parse(r)
 		p.set = make([]Bound, zsp.read_count(r))
+		r.bad ||= p.col.kind == .Words
 		for &b in p.set {
 			b = bound_parse(r, p.col.kind)
 		}
@@ -256,6 +268,7 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 		}
 	case .Exists:
 		p.col = column_parse(r)
+		r.bad ||= p.col.kind == .Words
 	case .List:
 		p.list = {zsp.read_u64(r), zsp.read_u64(r)}
 	case .Match:
@@ -287,7 +300,7 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 		slice.sort_by(p.ids, id_less)
 	case .Ref, .Back:
 		p.col = column_parse(r)
-		p.scope = zsp.Scope(zsp.read_varint(r))
+		p.scope = scope_parse(r)
 		if p.op == .Back {
 			p.min, p.max = zsp.read_varint(r), zsp.read_varint(r)
 		}
@@ -451,10 +464,14 @@ leaf_answer :: proc(p: ^Pred, v: Value) -> Answer {
 			return .No
 		}
 		// Zeroes may be the value's, or only fill out the key.
-		if len(p.bytes) > 16 || (n > 0 && p.bytes[n - 1] == 0) {
-			return .Perhaps if v.rest != 0 else .No
+		if v.rest == 0 {
+			m := 16
+			for m > 0 && k[m - 1] == 0 {
+				m -= 1
+			}
+			return .Yes if m >= len(p.bytes) else .No
 		}
-		return .Yes
+		return .Perhaps if len(p.bytes) > 16 || (n > 0 && p.bytes[n - 1] == 0) else .Yes
 	case .Has:
 		if len(p.bytes) == 0 {
 			return .Yes

@@ -1028,7 +1028,7 @@ Bulk :: struct {
 }
 
 @(private)
-RUN :: 1 << 15
+RUN :: #config(ZSP_FIND_RUN, 1 << 15)
 @(private)
 RUNS :: 48 // read side by side
 

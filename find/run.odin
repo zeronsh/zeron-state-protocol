@@ -433,20 +433,22 @@ leaf_rows :: proc(s: ^Scope, p: ^Pred) -> Set {
 		}
 	} else {
 		lo, hi := leaf_span(p)
-		if p.op == .Range || p.op == .Exists {
+		if p.op == .Range && ((p.range.has_lo && lo == KEY_MAX) || (p.range.has_hi && p.range.hi.key == KEY_MAX)) {
+			tree_each(x, p.held.by_key, lo, KEY_MAX, &g, each) // no key lies beyond, to part those there from
+		} else if p.op == .Range || p.op == .Exists {
 			// Only what lies at a bound needs judging; all that lies between holds.
 			inner_lo, inner_hi := lo, hi
-			if p.range.has_lo && lo != KEY_MAX {
+			if p.range.has_lo {
 				inner_lo = key_next(lo)
 				tree_each(x, p.held.by_key, lo, inner_lo, &g, each)
 			}
-			if p.range.has_hi && hi != KEY_MAX {
+			if p.range.has_hi {
 				inner_hi = p.range.hi.key
 				if !key_less(inner_hi, inner_lo) {
 					tree_each(x, p.held.by_key, inner_hi, hi, &g, each)
 				}
 			}
-			if key_less(inner_lo, inner_hi) && !(p.range.has_lo && lo == KEY_MAX) {
+			if key_less(inner_lo, inner_hi) {
 				tree_subs(x, p.held.by_key, inner_lo, inner_hi, &g.out)
 			}
 		} else {
@@ -1166,9 +1168,31 @@ aggregate :: proc(s: ^Scope, a: ^Aggregate, rows: ^Set) -> (out: Sum_Of) {
 				e := cursor_prev(&c) or_break if most else cursor_next(&c) or_break
 				if set_has(rows, e.sub) {
 					out.number = f64(e.key.hi >> 32)
+					out.facets = make([]Facet, 1, context.temp_allocator)
+					out.facets[0] = {{number_key(out.number), 0}, 1, e.sub}
 					break
 				}
 			}
+		case .Facet:
+			Seconds :: struct {
+				rows:  ^Set,
+				best:  Best,
+				now:   Facet,
+			}
+			t := Seconds{rows = rows, best = {top = a.top, all = make([dynamic]Facet, context.temp_allocator)}}
+			tree_each(x, s.ids, KEY_MIN, KEY_MAX, &t, proc(data: rawptr, e: ^Entry) {
+				t := (^Seconds)(data)
+				if !set_has(t.rows, e.sub) {
+					return
+				}
+				if k := number_key(f64(e.key.hi >> 32)); k != t.now.key || t.now.count == 0 {
+					best_put(&t.best, t.now)
+					t.now = {{k, 0}, 0, e.sub}
+				}
+				t.now.count += 1
+			})
+			best_put(&t.best, t.now)
+			return {f64(t.best.kinds), t.best.kinds > 0, t.best.all[:]}
 		}
 		return
 	}
@@ -1239,33 +1263,15 @@ aggregate :: proc(s: ^Scope, a: ^Aggregate, rows: ^Set) -> (out: Sum_Of) {
 	case .Facet:
 		Tally :: struct {
 			using group: Group,
-			top:   int,
-			best:  [dynamic]Facet,
-			kinds: int,
+			best: Best,
 		}
-		t := Tally{group = {s = s, a = a, rows = rows}, top = a.top, best = make([dynamic]Facet, context.temp_allocator)}
+		t := Tally{group = {s = s, a = a, rows = rows}, best = {top = a.top, all = make([dynamic]Facet, context.temp_allocator)}}
 		defer delete(t.longs)
-		count :: proc(t: ^Tally, f: Facet) {
-			if f.count == 0 {
-				return
-			}
-			t.kinds += 1
-			at := len(t.best)
-			for at > 0 && t.best[at - 1].count < f.count {
-				at -= 1
-			}
-			if at < t.top {
-				inject_at(&t.best, at, f)
-				if len(t.best) > t.top {
-					pop(&t.best)
-				}
-			}
-		}
 		settle :: proc(t: ^Tally) {
-			count(t, t.short)
+			best_put(&t.best, t.short)
 			t.short = {}
 			for f in group_next(&t.group) {
-				count(t, f)
+				best_put(&t.best, f)
 			}
 		}
 		tree_each(x, h.by_key, KEY_MIN, KEY_MAX, &t, proc(data: rawptr, e: ^Entry) {
@@ -1277,9 +1283,35 @@ aggregate :: proc(s: ^Scope, a: ^Aggregate, rows: ^Set) -> (out: Sum_Of) {
 			group_add(&t.group, e)
 		})
 		settle(&t)
-		return {f64(t.kinds), t.kinds > 0, t.best[:]}
+		return {f64(t.best.kinds), t.best.kinds > 0, t.best.all[:]}
 	}
 	return
+}
+
+// The commonest, in order.
+@(private)
+Best :: struct {
+	top:   int,
+	all:   [dynamic]Facet,
+	kinds: int, // however common
+}
+
+@(private)
+best_put :: proc(b: ^Best, f: Facet) {
+	if f.count == 0 {
+		return
+	}
+	b.kinds += 1
+	at := len(b.all)
+	for at > 0 && b.all[at - 1].count < f.count {
+		at -= 1
+	}
+	if at < b.top {
+		inject_at(&b.all, at, f)
+		if len(b.all) > b.top {
+			pop(&b.all)
+		}
+	}
 }
 
 // Those that share a key, told apart by what comes after.

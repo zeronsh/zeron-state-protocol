@@ -309,7 +309,7 @@ json_walk :: proc(j: ^Json_Reader, path: string, each: proc(data: rawptr, kind: 
 				return
 			}
 			j.pos += 1
-			hit := !skip && path != "" && string(key) == name
+			hit := !skip && path != "" && string(json_unescape(key)) == name
 			json_walk(j, rest if hit else "\x00", each, data, c, depth + 1)
 		}
 	case '[':

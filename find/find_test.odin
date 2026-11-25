@@ -27,7 +27,7 @@ World :: struct {
 
 WORDS := []string{"apple", "apples", "apply", "banana", "band", "cherry", "Crème", "déjà", "elephant", "elegant", "fig", "grape", "grapefruit", "house", "mouse", "东京", "京都大学", "x", "don't", "counterrevolutionaries", "counterrevolutionary", "a"}
 TAGS := []string{"apple", "a long name that", "exactly sixteen!", "exactly sixteen!!", "exactly sixteen?", "a long name that goes on", "a long name that goes off"}
-NAMES := []string{"", "a", "A", "ab", "Ab", "abc", "Zoë", "zoe", "exactly sixteen!", "exactly sixteen!!", "exactly sixteen?", "EXACTLY SIXTEEN!", "a long name that goes on", "a long name that goes off", "n\x00", "n"}
+NAMES := []string{"a\x00b", "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe", "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff", "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01", "", "a", "A", "ab", "Ab", "abc", "Zoë", "zoe", "exactly sixteen!", "exactly sixteen!!", "exactly sixteen?", "EXACTLY SIXTEEN!", "a long name that goes on", "a long name that goes off", "n\x00", "n"}
 
 @(private)
 world_make :: proc(t: ^testing.T, w: ^World, partial: ^World = nil, flags := zsp.Scope_Flags{}) {
@@ -172,7 +172,7 @@ world_write :: proc(t: ^testing.T, w: ^World) {
 				put(&cells, 20, .Piece, b[:])
 			}
 		case 5:
-			json := fmt.tprintf(`{{"n":%v,"tags":["%s","%s","%s"],"deep":{{"on":%v,"name":"%s"}},"skip":[{{"n":9}}]}}`, rand.int_max(5), rand.choice(TAGS), rand.choice(TAGS), rand.choice(TAGS), rand.int_max(2) == 0, rand.choice(WORDS[:4]))
+			json := fmt.tprintf(`{{"\u006e":%v,"t\u0061gs":["%s","%s","%s"],"deep":{{"on":%v,"name":"%s"}},"skip":[{{"n":9}}]}}`, rand.int_max(5), rand.choice(TAGS), rand.choice(TAGS), rand.choice(TAGS), rand.int_max(2) == 0, rand.choice(WORDS[:4]))
 			put(&cells, 21, .Value, transmute([]byte)(json if rand.int_max(10) > 0 else "not json"))
 		}
 	}
@@ -967,17 +967,17 @@ check_query :: proc(t: ^testing.T, w: ^World, source: []byte) -> bool {
 		case .Sum:
 			good = abs(out.number - sum) < 1e-6 && out.some == (n > 0)
 		case .Min:
-			good = out.some == (n > 0) && (n == 0 || a.held == nil && out.number == key_number(least) || a.held != nil && out.facets[0].key == least)
+			good = out.some == (n > 0) && (n == 0 || out.facets[0].key == least)
 		case .Max:
-			good = out.some == (n > 0) && (n == 0 || a.held == nil && out.number == key_number(most) || a.held != nil && out.facets[0].key == most)
+			good = out.some == (n > 0) && (n == 0 || out.facets[0].key == most)
 		case .Count:
 			good = int(out.number) == have
 		case .Facet:
-			good = a.held == nil || int(out.number) == len(tally)
+			good = int(out.number) == len(tally)
 			for f, j in out.facets {
 				good &&= tally[f.key] == f.count && (j == 0 || out.facets[j - 1].count >= f.count)
 			}
-			good &&= a.held == nil || len(out.facets) == min(a.top, len(tally))
+			good &&= len(out.facets) == min(a.top, len(tally))
 		}
 		if !good {
 			testing.expectf(t, false, "%v: %v is not right (sum %v, %d have it)", a, out, sum, have)

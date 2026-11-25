@@ -6,6 +6,7 @@ the log; deleting one costs the time to make it again, and one that nobody asks 
 */
 package find
 
+import "base:runtime"
 import "core:crypto"
 import "core:crypto/aead"
 import "core:crypto/aegis"
@@ -51,7 +52,12 @@ Frame :: struct {
 
 Pager :: struct {
 	disk:    Disk,
-	cipher:  aead.Context,
+	key:     zsp.Key32,
+	salt:    [16]byte, // of this index, and never of another
+	cipher:  aead.Context, // of headers,
+	pages:   aead.Context, // and of everything else
+	marks:   [dynamic]u32, // of each page as it was last written: one that was written before is not it
+	altered: map[u32]bool, // stretches of those since they were last kept
 	open:    map[u32]^Frame, // as they rest on the disk
 	newest, oldest: ^Frame,
 	dirty:   map[u32]^Frame, // not there yet
@@ -61,14 +67,33 @@ Pager :: struct {
 	fresh:   Set, // made since the last: nothing that was committed leads to them
 	spare:   [dynamic]^Frame, // to be had again
 	failed:  bool,
+	unwritten: bool, // for there was no writing
 }
 
 @(private)
 pager_open :: proc(p: ^Pager, disk: Disk, key: zsp.Key32) {
 	key := key
 	p.disk = disk
+	p.key = key
 	aead.init(&p.cipher, .AEGIS_128L, key[:aegis.KEY_SIZE_128L])
 	p.next = HEADERS
+	pager_salt(p)
+}
+
+// Takes a salt, or a new one, and with it what pages are sealed by.
+@(private)
+pager_salt :: proc(p: ^Pager, salt: Maybe([16]byte) = nil) {
+	s, given := salt.?
+	if !given {
+		crypto.rand_bytes(s[:])
+	}
+	p.salt = s
+	key := zsp.hkdf256(p.salt[:], p.key[:], transmute([]byte)string("zsp-pages"))
+	aead.reset(&p.pages)
+	aead.init(&p.pages, .AEGIS_128L, key[:aegis.KEY_SIZE_128L])
+	crypto.zero_explicit(&key, size_of(key))
+	clear(&p.marks)
+	clear(&p.altered)
 }
 
 @(private)
@@ -88,6 +113,9 @@ pager_close :: proc(p: ^Pager) {
 	delete(p.pending)
 	set_destroy(&p.fresh)
 	aead.reset(&p.cipher)
+	aead.reset(&p.pages)
+	delete(p.marks)
+	delete(p.altered)
 	if p.disk.close != nil {
 		p.disk.close(p.disk.data)
 	}
@@ -124,16 +152,65 @@ page_get :: proc(p: ^Pager, no: u32) -> ^Page {
 		delete_key(&p.open, f.no)
 	}
 	f.no = no
-	bind := page_bind(no)
-	body := ([^]byte)(&f.page)[NONCE + TAG:PAGE_SIZE]
-	rests := p.disk.view(p.disk.data, no)
-	if len(rests) != PAGE_SIZE || !aead.open(&p.cipher, body, rests[:NONCE], bind[:], rests[NONCE + TAG:], rests[NONCE:][:TAG]) {
+	mark: Maybe(u32)
+	if no >= HEADERS {
+		mark = p.marks[no] if int(no) < len(p.marks) else 0
+	}
+	if !page_read(p, no, mark, &f.page) {
 		p.failed = true
-		f.page = {}
 	}
 	p.open[no] = f
 	frame_link(p, f)
 	return &f.page
+}
+
+// A page from where it rests, if that is it. Where a mark is given, it is the one that was written under that.
+@(private)
+page_read :: proc(p: ^Pager, no: u32, mark: Maybe(u32), into: ^Page) -> bool {
+	bind := page_bind(no)
+	body := ([^]byte)(into)[NONCE + TAG:PAGE_SIZE]
+	rests := p.disk.view(p.disk.data, no)
+	ok := len(rests) == PAGE_SIZE
+	if m, given := mark.?; ok && given {
+		ok = zsp.get_u32(rests) == m && m != 0
+	}
+	if !ok || !aead.open(&p.pages if no >= HEADERS else &p.cipher, body, rests[:NONCE], bind[:], rests[NONCE + TAG:], rests[NONCE:][:TAG]) {
+		into^ = {}
+		return false
+	}
+	return true
+}
+
+// Writes a page, and says what marks it.
+@(private)
+page_write :: proc(p: ^Pager, no: u32, pg: ^Page) -> (mark: u32, ok: bool) {
+	sealed := new(Page, context.temp_allocator)
+	sealed^ = pg^
+	for mark == 0 {
+		crypto.rand_bytes(sealed.nonce[:])
+		mark = zsp.get_u32(sealed.nonce[:])
+	}
+	bytes := ([^]byte)(sealed)[:PAGE_SIZE]
+	bind := page_bind(no)
+	body := bytes[NONCE + TAG:]
+	aead.seal(&p.pages if no >= HEADERS else &p.cipher, body, sealed.tag[:], sealed.nonce[:], bind[:], body)
+	if !p.disk.write(p.disk.data, no, bytes) {
+		p.failed, p.unwritten = true, true
+		return 0, false
+	}
+	return mark, true
+}
+
+MARKS :: 1000 // to a page
+
+// Notes what marks a page.
+@(private)
+mark_set :: proc(p: ^Pager, no, mark: u32) {
+	if int(no) >= len(p.marks) {
+		resize(&p.marks, int(no) + 1)
+	}
+	p.marks[no] = mark
+	p.altered[no / MARKS] = true
 }
 
 @(private)
@@ -182,6 +259,17 @@ frame_free :: proc(p: ^Pager, no: u32) {
 
 @(private)
 page_new :: proc(p: ^Pager) -> (no: u32, pg: ^Page) {
+	no = page_take(p)
+	f := frame_new(p)
+	f.no = no
+	p.dirty[no] = f
+	set_add(&p.fresh, no)
+	return no, &f.page
+}
+
+// A page that nothing is kept of here.
+@(private)
+page_take :: proc(p: ^Pager) -> (no: u32) {
 	if len(p.free) > 0 {
 		no = pop(&p.free)
 	} else {
@@ -189,11 +277,7 @@ page_new :: proc(p: ^Pager) -> (no: u32, pg: ^Page) {
 		p.next += 1
 	}
 	frame_free(p, no) // what it was before it was given up
-	f := frame_new(p)
-	f.no = no
-	p.dirty[no] = f
-	set_add(&p.fresh, no)
-	return no, &f.page
+	return
 }
 
 @(private)
@@ -212,17 +296,11 @@ page_drop :: proc(p: ^Pager, no: u32) {
 // Writes what is new. The caller then says where it begins.
 @(private)
 pager_write :: proc(p: ^Pager) -> bool {
-	sealed := new(Page, context.temp_allocator)
 	for no, f in p.dirty {
-		sealed^ = f.page
-		crypto.rand_bytes(sealed.nonce[:])
-		bytes := ([^]byte)(sealed)[:PAGE_SIZE]
-		bind := page_bind(no)
-		body := bytes[NONCE + TAG:]
-		aead.seal(&p.cipher, body, sealed.tag[:], sealed.nonce[:], bind[:], body)
-		if !p.disk.write(p.disk.data, no, bytes) {
-			p.failed = true
-			return false
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		mark := page_write(p, no, &f.page) or_return
+		if no >= HEADERS {
+			mark_set(p, no, mark)
 		}
 	}
 	for _, f in p.dirty {

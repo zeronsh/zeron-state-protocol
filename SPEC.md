@@ -425,7 +425,7 @@ node makes for itself of what it holds, and may throw away. A node need not answ
 ```
 
 An Answer follows whenever it differs from the last. `total` is how many rows there are, `first` how many of them come before those shown. Rows not shown
-before in any answer are sent whole, in Cells, ahead of it; what changes in a row shown, and live text in it, is sent as for a watch. A client therefore
+before in any answer are sent whole, in Cells, directly ahead of it, with no other Answer between; what changes in a row shown, and live text in it, is sent as for a watch. A client therefore
 keeps a row while any answer shows it, those of a question it replaces until that is answered, and those of one it ends until that is said to be *ended*, for
 an answer on its way may count on them.
 *settled* says that a full replica gave the answer; otherwise it is true of what is held here. A client may ask about scopes it may read, in every part of a
@@ -435,7 +435,7 @@ question; one that asks about others is *denied*, as is one whose right ends.
 question    scope varint ‖ where ‖ n varint ‖ n × order ‖ from end (1) ‖ offset varint ‖ limit varint ‖ m varint ‖ m × total
 order       0 ‖ descending (1) ‖ column        by a value. Rows with none come last either way
             1 ‖ descending (1)                 by how well they answer, best first
-            2 ‖ descending (1)                 by when they were made
+            2 ‖ descending (1)                 by when they were made, and within a second by the rest of their ids, so that nothing after it matters
 total       function (1: 1 sum, 2 min, 3 max, 4 count, 5 facet) ‖ column ‖ top varint
 column      kind (1) ‖ slot (1) ‖ path bytes   kinds 1 to 6
             7 created, or 8 modified           in seconds
@@ -454,7 +454,7 @@ column      kind (1) ‖ slot (1) ‖ path bytes   kinds 1 to 6
 | 9 order | its order in a list | u64, big-endian |
 
 With a path, the slot holds JSON and the path, names with dots between, says where in it; an array on the way stands for all it holds. A row may thus have many
-values, and a condition holds for it if it does for one of them. Ties in the order are settled by row id. With *from end* the offset and limit count back
+values, and a condition holds for it if it does for one of them. Ties in the order are settled by row id, the least first. An order by column kind 7 is order 2. A row that is nowhere (§1) is not there to be asked about. With *from end* the offset and limit count back
 from the last row. A number is meaningful where `some` is 1: for count, how many rows have a value; for facet, how many different values there are, the `top`
 commonest of which follow with how many rows have each; for min and max, the value itself follows too.
 
@@ -463,10 +463,10 @@ commonest of which follow with how many rows have each; for min and max, the val
 | 0 | | every row |
 | 1, 2 | n varint ‖ n × where | all of them, one of them |
 | 3 | where | not |
-| 4 | column ‖ flags (1: 1 lo, 2 hi, 4 lo itself, 8 hi itself) ‖ [lo bytes] ‖ [hi bytes] | from lo to hi |
-| 5 | column ‖ n varint ‖ n × bytes | one of these |
+| 4 | column ‖ flags (1: 1 lo, 2 hi, 4 lo itself, 8 hi itself) ‖ [lo bytes] ‖ [hi bytes] | from lo to hi; not kind 6 |
+| 5 | column ‖ n varint ‖ n × bytes | one of these; not kind 6 |
 | 6, 7 | column ‖ bytes | begins with, contains; kinds 1 and 2 |
-| 8 | column | has a value |
+| 8 | column | has a value; not kind 6 |
 | 9 | list (16) | is in a list |
 | 10 | column ‖ mode (1: 0 every word, 1 any, 2 a phrase) ‖ flags (1) ‖ text bytes | matches; kind 6 |
 | 11 | n varint ‖ n × row (16) | is one of these rows |
@@ -477,12 +477,13 @@ The flags of a match: 1, the last word may be only begun; 2, words may be parts 
 five letters at most one. A word is a run of letters and digits, without case or marks, the first 64 bytes of which count; an apostrophe between letters is
 passed over; scripts that write no spaces are taken in overlapping pairs. How well a row answers is Okapi BM25 (k₁ 1.2, b 0.75), its sole use being an order.
 
-A question has at most 8 orders, 64 totals, a limit of 1000, 4096 conditions 32 deep, and 4096 bytes of text to match; a session has at most 1024.
+A question has at most 8 orders, 64 totals, none of kind 6, sums only of kind 3, 4096 conditions 32 deep, and 4096 bytes of text to match, or it is *faulty*. A limit or a `top` above 1000 is taken for
+1000. An answer is at most 256 KiB: a question whose answer is longer is *faulty*, and is asked no longer. A session has at most 1024 questions.
 
 **Passing on.** A partial replica has a full one answer. It calls (§12) the device by the method with no name, which is for nodes themselves: no client may call or
 serve it, and it needs Read where others need Call, in every scope the question is about. The first message is the question. Each message back is an Answer without its id, and with
-each row's key (40) in place of its id, any key of it, or one in the graveyard at order zero for a row that is nowhere. The partial replica watches those
-places, data and live, and answers its client once it holds the rows. A device that will not answer faults *unserved*, and another is asked; until one
+each row's key, as in a Watch, in place of its id, any key of it. The partial replica watches those
+places, data and live, and answers its client once it holds the rows. It believes nothing else that would not be an answer to what it asked. A device that will not answer faults *unserved*, and another is asked; until one
 does, and when none can be reached, the answer is of what is held.
 
 ## 16 Who handles what

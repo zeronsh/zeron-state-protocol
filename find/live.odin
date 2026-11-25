@@ -37,7 +37,8 @@ Finder :: struct {
 	again:   [dynamic]^zsp.Session, // to be told everything afresh
 	calls:   [dynamic]Called, // questions from partial replicas, not yet looked at
 	pace:    bool, // an answer dear to find is not found again at once
-	wake:    Maybe(time.Tick), // when one held back will be
+	wake:    Maybe(time.Tick), // when there will be something to do
+	failed:  time.Tick, // when the index last had to be made again
 }
 
 @(private)
@@ -96,6 +97,7 @@ Live :: struct {
 	lives:   [dynamic][2]zsp.Key, // where those are, so that what is typed there comes here
 	moved:   bool, // one of those may be elsewhere
 	due:     time.Tick, // it may be found again
+	over:    bool, // the answer is longer than one may be
 	first:   int,
 	said:    []byte, // the last answer
 	stale:   bool, // the page may have changed
@@ -650,9 +652,38 @@ finder_backs :: proc(f: ^Finder) {
 	}
 }
 
+ANSWER_MOST :: zsp.CALL_WINDOW // bytes
+
+UNWRITTEN :: 5 * time.Second // between attempts to make an index there is no writing
+
 PACE :: 9 // an answer that took so long is let be for so many times as long,
 PACE_OVER :: time.Millisecond // if it took that,
 PACE_MOST :: 2 * time.Second // and for no longer
+
+// What was kept of the index cannot be trusted, or not be had: it is made again, and everything asked of that.
+@(private)
+finder_remake :: proc(f: ^Finder) {
+	for _, list in f.by_value {
+		delete(list)
+	}
+	clear(&f.by_value)
+	clear(&f.others)
+	clear(&f.anchors)
+	clear(&f.backs)
+	clear(&f.changed)
+	for _, a in f.before {
+		delete(a)
+	}
+	clear(&f.before)
+	index_reset(&f.x)
+	index_follow(&f.x)
+	for l in f.live {
+		l.ready, l.renew, l.waited = false, true, 0
+		query_prepare(&f.x, &l.q)
+		query_uses(&l.q, 1)
+		live_place(l)
+	}
+}
 
 // Does some of what there is to do, and says whatever follows from it. True when there is nothing left.
 finder_run :: proc(f: ^Finder, budget := 500) -> bool {
@@ -700,12 +731,23 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 		}
 		local ||= !l.far.have
 	}
+	f.wake = nil
+	if f.x.failed && local {
+		if f.x.unwritten && time.tick_since(f.failed) < UNWRITTEN && f.failed != {} {
+			f.wake = time.tick_add(f.failed, UNWRITTEN)
+			return true
+		}
+		f.failed = time.tick_now()
+		finder_remake(f)
+	}
 	level := !local || index_step(&f.x, budget)
 	for l in f.live {
 		// A column may be being made again, and what was asked of it meanwhile means nothing.
 		l.renew ||= l.ready && !query_ready(&f.x, &l.q)
 	}
-	f.wake = nil
+	if f.x.failed {
+		return false
+	}
 	now := time.tick_now()
 	for l in f.live {
 		if l.far.have {
@@ -716,6 +758,9 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 				f.wake = l.due
 			}
 			continue
+		}
+		if f.x.failed {
+			break
 		}
 		if !l.ready || l.renew {
 			if !f.x.tailing || f.x.checking || !query_ready(&f.x, &l.q) {
@@ -738,7 +783,13 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 			now = then
 		}
 	}
-	return level
+	#reverse for l in f.live {
+		if l.over {
+			answer_flag(l, {faulty = true})
+			live_free(l)
+		}
+	}
+	return level && !f.x.failed
 }
 
 // ---------------------------------------------------------------- answers
@@ -770,11 +821,6 @@ answer_post :: proc(l: ^Live, w: []byte) -> bool {
 		zsp.session_post(l.session, ANSWER, w)
 		return true
 	}
-	if len(w) > zsp.CALL_WINDOW {
-		zsp.node_flow(l.f.n, l.call, .Fault, {u8(zsp.Call_Fault.Overrun)})
-		l.call = 0
-		return true
-	}
 	if len(w) > zsp.node_granted(l.f.n, l.call) {
 		return false
 	}
@@ -803,6 +849,8 @@ answer_wait :: proc(l: ^Live) {
 		return
 	}
 	l.waited = done
+	delete(l.said)
+	l.said = nil // which the client has put by
 	w := make([dynamic]byte, context.temp_allocator)
 	answer_begin(l, &w, {waiting = true})
 	append(&w, u8(min(done, 99)))
@@ -836,10 +884,24 @@ answer_send :: proc(l: ^Live) {
 		append(&w, 1 if t.some else 0)
 		zsp.write_u64(&w, transmute(u64)t.number)
 		zsp.write_varint(&w, u64(len(t.facets)))
+		if len(w) > ANSWER_MOST {
+			break
+		}
 		for facet in t.facets {
 			zsp.write_varint(&w, u64(facet.count))
 			zsp.write_bytes(&w, facet_bytes(s, &l.q.totals[i], facet))
+			if len(w) > ANSWER_MOST {
+				break
+			}
 		}
+	}
+	if f.x.failed {
+		l.stale = true
+		return // none of it may be so
+	}
+	if len(w) > ANSWER_MOST {
+		l.over = true
+		return
 	}
 	ids := make([]zsp.Id, len(page), context.temp_allocator)
 	for hit, i in page {
@@ -913,7 +975,7 @@ far_run :: proc(l: ^Live) {
 		}
 	}
 	far_past(l)
-	if far.call != 0 && far.spent > zsp.CALL_WINDOW / 2 {
+	if far.call != 0 && far.spent > 0 {
 		w := make([dynamic]byte, context.temp_allocator)
 		zsp.write_varint(&w, u64(far.spent))
 		zsp.node_flow(f.n, far.call, .Credit, w[:])
@@ -926,8 +988,8 @@ far_run :: proc(l: ^Live) {
 		r := zsp.Reader{buf = next}
 		flags := Answer_Flags(zsp.read_u8(&r))
 		switch {
-		case flags.waiting: // what is here will do until it is done
-		case flags.denied || flags.faulty || !far_wants(l, &r):
+		case flags == {waiting = true}: // what is here will do until it is done
+		case u8(flags) > 1 || !far_sound(l, r) || !far_wants(l, &r):
 			zsp.node_flow(f.n, far.call, .Cancel)
 			far.call = 0
 			append(&far.tried, far.device)
@@ -944,12 +1006,42 @@ far_run :: proc(l: ^Live) {
 	}
 }
 
+// Whether an answer from afar, past its flags, is one to what was asked.
+@(private)
+far_sound :: proc(l: ^Live, r: zsp.Reader) -> bool {
+	r := r
+	_, _ = zsp.read_varint(&r), zsp.read_varint(&r)
+	n := zsp.read_varint(&r)
+	if r.bad || n > u64(l.q.limit) {
+		return false
+	}
+	for _ in 0 ..< n {
+		_ = zsp.read_key(&r)
+	}
+	if zsp.read_varint(&r) != u64(len(l.q.totals)) {
+		return false
+	}
+	for a in l.q.totals {
+		some := zsp.read_u8(&r)
+		_ = zsp.read_u64(&r)
+		facets := zsp.read_varint(&r)
+		if r.bad || some > 1 || facets > u64(max(a.top, 1)) {
+			return false
+		}
+		for _ in 0 ..< facets {
+			_ = zsp.read_varint(&r)
+			_ = zsp.read_bytes(&r)
+		}
+	}
+	return !r.bad && r.pos == len(r.buf)
+}
+
 // Reads where the rows of an answer are, and wants what is there.
 @(private)
 far_wants :: proc(l: ^Live, r: ^zsp.Reader) -> bool {
 	_, _ = zsp.read_varint(r), zsp.read_varint(r) // how many in all, and where these come among them
-	n := int(zsp.read_varint(r) & 0xffff)
-	if r.bad || n > 1000 || (len(r.buf) - r.pos) < n * 40 {
+	n := int(min(zsp.read_varint(r), MAX_LIMIT + 1))
+	if r.bad || n > MAX_LIMIT {
 		return false
 	}
 	keys := make([dynamic]zsp.Key, 0, n)

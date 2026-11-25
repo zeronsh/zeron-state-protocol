@@ -79,7 +79,7 @@ def key_after(prefix):
     return n.to_bytes(len(prefix), "big").ljust(40, b"\0")
 
 
-# -- questions, as bytes: SPEC.md 16
+# -- questions, as bytes: SPEC.md 15
 
 
 def column(kind, slot=0, path="", tag=b""):

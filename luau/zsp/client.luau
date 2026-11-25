@@ -457,7 +457,7 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 			end
 		end
 		for _, a in self.asked do
-			if a.status == "denied" then
+			if a.status == "denied" and not a.stopped then
 				self:_ask(a)
 			end
 		end
@@ -1232,14 +1232,20 @@ function Client.ask(self: Client, question: asking.Question, observer: (Answer) 
 end
 
 function Client._ask(self: Client, a: Asked)
-	if not self.scopes[a.question.scope] then
+	local may = self.scopes[a.question.scope] ~= nil
+	local body, totals = asking.write(a.question, function(scope, name)
+		if self.scopes[scope] then
+			return self:_tag(scope, name)
+		end
+		may = false
+		return string.rep("\0", 16)
+	end)
+	if not may then
 		a.status = "denied"
+		self:_show(a, {})
 		self:_touch_answer(a)
 		return
 	end
-	local body, totals = asking.write(a.question, function(scope, name)
-		return self:_tag(scope, name)
-	end)
 	a.totals_of = totals
 	local w = codec.writer()
 	codec.put_varint(w, a.id)
@@ -1253,7 +1259,7 @@ function Client._on_answer(self: Client, r: codec.Reader)
 		return
 	end
 	local flags = codec.u8(r)
-	if flags == 16 then
+	if bit32.btest(flags, 16) then
 		self:_unasked(a)
 		return
 	elseif flags >= 2 then
