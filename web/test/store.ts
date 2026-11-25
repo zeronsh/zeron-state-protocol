@@ -5,16 +5,17 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client, columns } from "../src/client.ts";
 import { Node } from "../src/node.ts";
 import { Store } from "../src/store.ts";
 import { MemoryVolume } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
 
-const ROOT = new URL("../../", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+const ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const BIN = process.env.ZSPD ?? join(ROOT, "build", process.platform === "win32" ? "zspd.exe" : "zspd");
-const module = await loadModule(new URL(process.argv[2], "file://" + process.cwd() + "/"));
+const module = await loadModule(pathToFileURL(resolve(process.argv[2])));
 const SEEDS = Number(process.argv[3] ?? 8);
 const FIRST = Number(process.argv[4] ?? 1);
 const TMP = mkdtempSync(join(tmpdir(), "zsp-store-"));

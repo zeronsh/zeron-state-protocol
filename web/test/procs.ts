@@ -4,9 +4,10 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Connect } from "../src/node.ts";
 
-export const ROOT = new URL("../../", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+export const ROOT = fileURLToPath(new URL("../../", import.meta.url));
 export const BIN = process.env.ZSPD ?? join(ROOT, "build", process.platform === "win32" ? "zspd.exe" : "zspd");
 export const TMP = mkdtempSync(join(tmpdir(), "zsp-web-"));
 export const procs: ChildProcess[] = [];
@@ -40,7 +41,7 @@ export function node(mode: "run" | "serve", dir: string, ...options: string[]): 
 }
 
 export function cloud(env: Record<string, string> = {}): Promise<Started> {
-  return started(spawn("node", [join(ROOT, "relay", "dev.mjs")], { ...log("cloud"), env: { ...process.env, ...env } }), "cloud");
+  return started(spawn(process.execPath, [join(ROOT, "relay", "dev.mjs")], { ...log("cloud"), env: { ...process.env, ...env } }), "cloud");
 }
 
 export const token = (dir: string) => readFileSync(join(dir, "token"), "utf8");

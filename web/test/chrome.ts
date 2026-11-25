@@ -3,7 +3,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 
 const CANDIDATES: Record<string, string[]> = {
   linux: ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"],
@@ -22,7 +22,7 @@ export function findChrome(): string | undefined {
     if (c.includes("/") || c.includes("\\")) {
       if (existsSync(c)) return c;
     } else {
-      for (const dir of (process.env.PATH ?? "").split(":")) if (existsSync(join(dir, c))) return join(dir, c);
+      for (const dir of (process.env.PATH ?? "").split(delimiter)) if (existsSync(join(dir, c))) return join(dir, c);
     }
   }
   return undefined;
@@ -63,10 +63,19 @@ export class Chrome {
   static async launch(): Promise<Chrome> {
     const bin = findChrome();
     if (!bin) throw new Error("no Chrome here: set CHROME to where it is");
+    try {
+      return await Chrome.#launch(bin, []);
+    } catch (e) {
+      // A machine may not give a browser what its sandbox is made of; nothing but the tests' own page is loaded here.
+      if (!/sandbox/i.test(String(e))) throw e;
+      return await Chrome.#launch(bin, ["--no-sandbox"]);
+    }
+  }
+
+  static async #launch(bin: string, more: string[]): Promise<Chrome> {
     const profile = mkdtempSync(join(tmpdir(), "zsp-chrome-"));
-    const p = spawn(bin, ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-gpu", "about:blank"], {
-      stdio: ["ignore", "ignore", "pipe"],
-    });
+    const flags = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-gpu", ...more];
+    const p = spawn(bin, [...flags, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
     const url = await new Promise<string>((resolve, reject) => {
       let err = "";
       p.stderr!.on("data", (d) => {

@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import * as codec from "../src/codec.ts";
@@ -254,7 +254,7 @@ for (let seed = FIRST; seed < FIRST + SEEDS; seed++) {
 const ran = performance.now();
 
 const input = JSON.stringify({ seeds: seeds.map((s) => ({ ops: s.ops.map((op) => ({ ...op, w: op.w + 1, ...(op.o === "apply" || op.o === "live" ? lua(op) : {}) })) })) });
-const luau = relative(here, join(root, "luau/zsp/text"));
+const luau = relative(here, join(root, "luau/zsp/text")).split(sep).join("/"); // as require takes it, on Windows too
 const theirs = execFileSync("lune", ["run", join(here, "text.luau"), luau], { input, maxBuffer: 1 << 30 }).toString().replace(/\n$/, "").split("\n");
 const replayed = performance.now();
 

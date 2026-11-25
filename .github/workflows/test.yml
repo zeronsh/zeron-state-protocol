@@ -27,6 +27,7 @@ jobs:
       - name: tools
         run: |
           npm install --prefix relay
+          npm ci --prefix web
           case "$RUNNER_OS" in
             Linux) sudo apt-get install -y -q lld; lune=linux-x86_64; luau=ubuntu ;;
             macOS) brew install -q lld; lune=macos-aarch64; luau=macos ;;
