@@ -11,9 +11,11 @@ RECON_FRAME :: 128 << 10 // say no more than this at once; the rest is said next
 WANT_FRAME :: 64 << 10
 WANT_HELD :: 2048 // do not list more of a row than this: have it sent whole
 MAX_LIVE :: 64 << 10
+MAX_LIVE_OPEN :: MAX_LIVE - 128 // before it is sealed
 LIVE_LATE :: 60 << 26 // a minute of stamp time: 60 * 1024 ms * 2^16
 LIST_MAX :: 32 // reconcile ranges this small by listing them
 FANOUT :: 16
+MAX_REFUSED :: 4096
 
 Role :: enum u8 {
 	Peer, // sealed cells over an authenticated channel
@@ -26,6 +28,7 @@ Fault :: enum u8 {
 	Denied    = 2,
 	Version   = 3,
 	Failed    = 4,
+	Clock     = 5, // one end's clock is wrong by more than can be allowed for
 }
 
 Session :: struct {
@@ -43,7 +46,7 @@ Session :: struct {
 	greeted:   bool, // their hello arrived
 	accepted:  bool, // the host vouches for the connection
 	ready:     bool, // and the roster for the peer
-	fault:     Fault,
+	fault:     Fault, // ours with them, or theirs with us
 	closing:   bool, // send what is queued, then close
 	roots:     [dynamic]Scope, // scopes this end watches whole
 	roots_gen: u64,
@@ -68,6 +71,7 @@ Session :: struct {
 	seq_in:    u64,
 	ack_at:    u64, // log position that makes seq_in durable
 	acked_in:  u64,
+	refused:   [dynamic]Id, // rows something of which was not taken since
 	unacked:   [dynamic]Unacked,
 	owed:      [dynamic]u64, // interests this peer has yet to say are level
 	online:    [dynamic]Key32, // latest presence
@@ -217,11 +221,22 @@ session_close :: proc(s: ^Session) {
 	delete(s.tasks)
 	delete(s.watches)
 	delete(s.unacked)
+	delete(s.refused)
 	for &it in n.interests {
-		#reverse for r, i in it.reports {
-			if r.session == s.id {
-				unordered_remove(&it.reports, i)
+		for r, i in it.reports {
+			if r.session != s.id {
+				continue
 			}
+			unordered_remove(&it.reports, i)
+			// The last to be heard stands, though it is gone: nobody knows better.
+			if to := node_session(n, it.session); to != nil && len(it.reports) > 0 {
+				for &w in to.watches {
+					if w.id == it.watch.id && w.data {
+						interest_beyond(n, &it, &w)
+					}
+				}
+			}
+			break
 		}
 	}
 	for id in s.owed {
@@ -356,7 +371,7 @@ session_frame :: proc(s: ^Session, frame: []byte) -> Fault {
 	case .Cells:
 		on_cells(s, &r)
 	case .Ack:
-		on_ack(s, read_varint(&r))
+		on_ack(s, &r)
 	case .Live:
 		on_live(s, &r)
 	case .Synced:
@@ -367,6 +382,9 @@ session_frame :: proc(s: ^Session, frame: []byte) -> Fault {
 		on_presence(s, &r)
 	case .Error:
 		s.closing = true
+		if code := read_u8(&r); s.fault == .None && code <= u8(max(Fault)) {
+			s.fault = Fault(code)
+		}
 	case .Serve:
 		on_serve(s, &r)
 	case .Call:
@@ -493,13 +511,18 @@ on_roster :: proc(s: ^Session, r: ^Reader) -> Fault {
 		node_adopt(n, bytes)
 		return .None
 	}
-	roster, ok := roster_parse(bytes, n.space)
+	serial, ok := roster_claims(bytes, n.space)
 	if !ok {
 		return .Malformed
 	}
-	s.peer_serial = max(s.peer_serial, roster.serial)
-	roster_destroy(&roster)
-	node_adopt(n, bytes)
+	s.peer_serial = max(s.peer_serial, serial)
+	if serial > n.roster.serial {
+		roster, sound := roster_parse(bytes, n.space, &n.roster)
+		if !sound {
+			return .Malformed
+		}
+		node_take(n, roster)
+	}
 	if n.keys != nil && !node_member(n) {
 		return .Denied // a device that does not belong has no peers
 	}
@@ -541,7 +564,19 @@ session_authorize :: proc(s: ^Session) {
 		return
 	}
 	if s.ready {
-		roots_send(s)
+		// Either end may have dropped what the other watched, or begun to withhold it, under a roster in between
+		// that the other never heard. Asking again costs a fingerprint.
+		if !s.paused {
+			roots_send(s, afresh = true)
+			for &it in n.interests {
+				if interest_concerns(n, it.session, s) {
+					interest_send(s, &it)
+				}
+			}
+		}
+		if !n.full && s.peer_full {
+			outbox_send(s)
+		}
 		return
 	}
 	s.ready = true
@@ -731,8 +766,17 @@ on_synced :: proc(s: ^Session, r: ^Reader) {
 	if id < INTEREST {
 		if !s.initiator {
 			// The dialler has compared everything and sent what this end lacked: this end is level too.
-			s.settled = true
-			node_balance(n)
+			flags := Synced_Flags(read_u8(r))
+			_, _ = read_key(r), read_key(r)
+			_, _ = read_varint(r), read_varint(r)
+			compared := false
+			for &w in s.watches {
+				compared ||= w.data && w.id < INTEREST
+			}
+			if !r.bad && s.peer_full && flags.settled && compared {
+				s.settled = true
+				node_balance(n)
+			}
 			return
 		}
 		if id / ROOT == s.roots_gen && s.roots_due > 0 && slice.contains(s.roots[:], Scope(id % ROOT)) {
@@ -792,15 +836,21 @@ interest_bound :: proc(s: ^Session, id: u64, lo, hi: Key, before, after: int) {
 			w.lo = lo if key_less(w.lo, lo) else w.lo
 			w.hi = hi if key_less(hi, w.hi) else w.hi
 			it.watch.lo, it.watch.hi, it.limit = w.lo, w.hi, 0
-			w.far, w.far_before, w.far_after = true, 0, 0
-			for r in it.reports {
-				w.far_before = max(w.far_before, r.before + store_range(&n.store, r.lo, w.lo).count)
-				w.far_after = max(w.far_after, r.after + store_range(&n.store, w.hi, r.hi).count)
-			}
+			interest_beyond(n, &it, &w)
 			if it.waiting == 0 && w.settled {
 				append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = true})
 			}
 		}
+	}
+}
+
+// What lies beyond a window, from all that has been reported of it.
+@(private)
+interest_beyond :: proc(n: ^Node, it: ^Interest, w: ^Watch) {
+	w.far, w.far_before, w.far_after = len(it.reports) > 0, 0, 0
+	for r in it.reports {
+		w.far_before = max(w.far_before, r.before + store_range(&n.store, r.lo, w.lo).count)
+		w.far_after = max(w.far_after, r.after + store_range(&n.store, w.hi, r.hi).count)
 	}
 }
 
@@ -1264,6 +1314,12 @@ cells_close :: proc(s: ^Session) {
 emit_cell :: proc(s: ^Session, c: ^Cell) {
 	n := s.node
 	if .Read not_in session_rights(s, row_scope(c.row)) {
+		// Not sent, so no acknowledgement to come is for the row as it now is.
+		#reverse for u, i in s.unacked {
+			if u.row == c.row {
+				ordered_remove(&s.unacked, i)
+			}
+		}
 		return
 	}
 	if s.role == .Open && !cell_open(n.keys, &n.roster, c) {
@@ -1303,8 +1359,13 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 		if !ok {
 			return
 		}
-		if !stamp_timely(c.stamp, n.now) || (s.role == .Open && len(c.body) > MAX_OPEN) {
+		if s.role == .Open && len(c.body) > MAX_OPEN {
 			r.bad = true
+			return
+		}
+		if !stamp_timely(c.stamp, n.now) {
+			// Nobody's fault for certain. Dialling again, until the clocks agree, sets it right.
+			session_fail(s, .Clock)
 			return
 		}
 		row = c.row
@@ -1314,6 +1375,13 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 				return
 			}
 		} else if !cell_welcome(s, c) {
+			if len(s.refused) == 0 || s.refused[len(s.refused) - 1] != c.row {
+				append(&s.refused, c.row)
+			}
+			if len(s.refused) > MAX_REFUSED {
+				session_fail(s, .Denied)
+				return
+			}
 			continue
 		}
 		append(&cells, c)
@@ -1322,7 +1390,8 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 		r.bad = true
 		return
 	}
-	stale := make([dynamic]Id, context.temp_allocator)
+	stale: [dynamic]Id // not in temporary memory, which merging gives back
+	defer delete(stale)
 	n.stale = &stale
 	node_commit(n, cells[:], s)
 	n.stale = nil
@@ -1351,21 +1420,33 @@ cell_welcome :: proc(s: ^Session, c: Cell) -> bool {
 	}
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	c := c
+	cell_lawful(&n.roster, &c) or_return
+	if !store_news(&n.store, c.row, c.slot, c.kind, c.stamp) {
+		return true // it goes no further whatever it says: most often, it came by two roads
+	}
 	cell_authentic(&n.roster, &c) or_return
 	// Where this node holds the key, garbage cannot win by claiming a late stamp.
 	return n.keys == nil || cell_open(n.keys, &n.roster, &c)
 }
 
 @(private)
-on_ack :: proc(s: ^Session, seq: u64) {
+on_ack :: proc(s: ^Session, r: ^Reader) {
 	n := s.node
+	seq := read_varint(r)
+	refused := make([dynamic]Id, context.temp_allocator)
+	for r.pos < len(r.buf) && !r.bad {
+		append(&refused, read_pair(r, Id))
+	}
+	if r.bad {
+		return
+	}
 	done := 0
 	for done < len(s.unacked) && s.unacked[done].seq <= seq {
 		done += 1
 	}
 	for u in s.unacked[:done] {
 		// A row written again since stays until its latest version is acknowledged too.
-		later := s.cursor < n.events.first
+		later := s.cursor < n.events.first || slice.contains(refused[:], u.row)
 		for v in s.unacked[done:] {
 			later ||= v.row == u.row
 		}
@@ -1452,7 +1533,7 @@ on_live :: proc(s: ^Session, r: ^Reader) {
 	}
 	scope := row_scope(l.row)
 	info := roster_scope(&n.roster, scope)
-	if info == nil || len(l.body) > MAX_LIVE {
+	if info == nil || len(l.body) > (MAX_LIVE_OPEN if s.role == .Open else MAX_LIVE) {
 		return
 	}
 	signed := .Signed in info.flags
@@ -1468,7 +1549,7 @@ on_live :: proc(s: ^Session, r: ^Reader) {
 		}
 	} else {
 		// Late is as good as never, and may be a replay.
-		if !stamp_timely(l.stamp, n.now) || l.stamp.time + LIVE_LATE < n.clock {
+		if !stamp_timely(l.stamp, n.now) || l.stamp.time + LIVE_LATE < max(n.clock, (max(n.now, LEAP_MS) - LEAP_MS) << 16) {
 			return
 		}
 		if !signed && .Write not_in session_rights(s, scope) {
@@ -1527,7 +1608,11 @@ live_open :: proc(n: ^Node, keys: ^Scope_Keys, signed: bool, l: ^Live) -> bool {
 	if signed {
 		r := Reader{buf = body}
 		author := read_varint(&r)
-		if r.bad || len(body) - r.pos < SIGNATURE || !author_allowed(&n.roster, author, row_scope(l.row), l.stamp) {
+		// What is live is now: a right that has ended is none.
+		if r.bad || len(body) - r.pos < SIGNATURE || author >= u64(len(n.roster.members)) {
+			return false
+		}
+		if .Write not_in member_rights(&n.roster.members[author], row_scope(l.row)) {
 			return false
 		}
 		rest := body[:len(body) - SIGNATURE]
@@ -1648,8 +1733,8 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 	}
 }
 
-// Tells every device on a relay who else is there.
-@(private)
+// Tells every device on a relay who else is there. The node does so itself, but when sessions are lost without
+// its knowing, as while it slept.
 presence_send :: proc(n: ^Node) {
 	for to in n.sessions {
 		if !to.ready || to.role != .Peer {
@@ -1762,8 +1847,12 @@ pump :: proc(s: ^Session) {
 	if s.seq_in > s.acked_in && n.synced >= s.ack_at {
 		at := frame_begin(&s.out, .Ack)
 		write_varint(&s.out, s.seq_in)
+		for row in s.refused {
+			write_pair(&s.out, row)
+		}
 		frame_end(&s.out, at)
 		s.acked_in = s.seq_in
+		clear(&s.refused)
 	}
 }
 
@@ -1788,8 +1877,9 @@ emit_change :: proc(s: ^Session, c: ^Change) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	n := s.node
 	// Was the row in view before, and is the peer sure to hold it whole?
-	was := s.initiator && s.peer_full
-	now := was
+	// A row that was nowhere until now was in nobody's, and may have cells that came before it did.
+	now := s.initiator && s.peer_full
+	was := now && (len(c.before) > 0 || len(c.after) == 0)
 	level := was && s.settled
 	for &w in s.watches {
 		if !w.data {
@@ -1887,21 +1977,18 @@ send_synced :: proc(s: ^Session, t: ^Task) {
 @(private)
 session_recompare :: proc(s: ^Session) {
 	n := s.node
-	if !s.ready || s.role == .Open {
+	if !s.ready {
 		return
 	}
 	flush_changes(s)
+	if s.role == .Open {
+		resync(s)
+		return
+	}
 	for &w in s.watches {
 		if w.data && key_less(w.lo, w.hi) {
 			w.level = false
 			recon_start(s, w.id, w.lo, w.hi, {count = 1}, store_range(&n.store, w.lo, w.hi))
-		}
-	}
-	if s.initiator && s.peer_full && !s.paused {
-		if n.full {
-			roots_send(s, afresh = true)
-		} else {
-			outbox_send(s)
 		}
 	}
 }
@@ -1919,7 +2006,11 @@ resync :: proc(s: ^Session) {
 		if s.role == .Open {
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, restart = true})
 			append(&s.tasks, Task{kind = .Fill, lo = w.lo, hi = w.hi})
-			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = true})
+			settled := true
+			for &it in n.interests {
+				settled &&= it.session != s.id || it.watch.id != w.id || it.waiting == 0
+			}
+			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = settled})
 		} else {
 			recon_start(s, w.id, w.lo, w.hi, {count = 1}, store_range(&n.store, w.lo, w.hi))
 		}

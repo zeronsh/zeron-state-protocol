@@ -19,6 +19,7 @@ PACKET :: 1200 // until a probe proves more
 PACKET_MAX :: 1452
 HEAD :: 13 // type, receiver, counter
 MIN_WINDOW :: 2 * PACKET
+MAX_EARLY :: 2048 // pieces held out of order, however small
 RECV_WINDOW :: 1 << 20
 SEND_BUFFER :: 1 << 20
 ACK_DELAY :: 5 * MS
@@ -157,9 +158,9 @@ link_init :: proc(l: ^Link) {
 	l.rtt_min = 1e12
 }
 
-link_dial :: proc(l: ^Link, secret, peer, space: zsp.Key32) -> bool {
+link_dial :: proc(l: ^Link, secret, peer, space: zsp.Key32, now: u64 = 1) -> bool {
 	link_init(l)
-	l.first = zsp.handshake_start(&l.handshake, secret, peer, space) or_return
+	l.first = zsp.handshake_start(&l.handshake, secret, peer, space, nil, now) or_return
 	l.channel.peer = peer
 	return true
 }
@@ -308,12 +309,16 @@ link_input :: proc(l: ^Link, packet: []byte, now: Time) -> bool {
 		}
 		newest := len(l.seen) == 0 || number >= l.seen[len(l.seen) - 1].hi
 		gap := len(l.seen) > 0 && number != l.seen[len(l.seen) - 1].hi
+		eliciting, kept := link_frames(l, plain, now)
+		if !kept {
+			return newest // as though it were lost: it will come again
+		}
 		range_add(&l.seen, number)
 		if len(l.seen) > 32 {
 			ordered_remove(&l.seen, 0)
 			l.seen_floor = l.seen[0].lo
 		}
-		if link_frames(l, plain, now) {
+		if eliciting {
 			l.ack_count += 1
 			if l.ack_count >= 2 || gap {
 				l.ack_due = now
@@ -326,9 +331,9 @@ link_input :: proc(l: ^Link, packet: []byte, now: Time) -> bool {
 	return false
 }
 
-// Returns whether the packet deserves an acknowledgement.
+// Returns whether the packet deserves an acknowledgement, and whether there was room for all of it.
 @(private)
-link_frames :: proc(l: ^Link, plain: []byte, now: Time) -> (eliciting: bool) {
+link_frames :: proc(l: ^Link, plain: []byte, now: Time) -> (eliciting: bool, kept := true) {
 	r := zsp.Reader{buf = plain}
 	for r.pos < len(r.buf) && !r.bad {
 		switch Frame(zsp.read_u8(&r)) {
@@ -342,7 +347,7 @@ link_frames :: proc(l: ^Link, plain: []byte, now: Time) -> (eliciting: bool) {
 			offset := zsp.read_varint(&r)
 			bytes := zsp.read_bytes(&r)
 			if !r.bad {
-				link_stream(l, offset, bytes)
+				kept &&= link_stream(l, offset, bytes)
 			}
 			eliciting = true
 		case .Datagram:
@@ -362,10 +367,10 @@ link_frames :: proc(l: ^Link, plain: []byte, now: Time) -> (eliciting: bool) {
 }
 
 @(private)
-link_stream :: proc(l: ^Link, offset: u64, bytes: []byte) {
+link_stream :: proc(l: ^Link, offset: u64, bytes: []byte) -> bool {
 	offset, bytes := offset, bytes
 	if offset > l.in_limit || offset + u64(len(bytes)) > l.in_limit {
-		return // beyond what was permitted
+		return false // beyond what was permitted
 	}
 	if offset <= l.in_next {
 		skip := min(l.in_next - offset, u64(len(bytes)))
@@ -377,30 +382,38 @@ link_stream :: proc(l: ^Link, offset: u64, bytes: []byte) {
 			link_deliver(l, e.bytes[skip:])
 			delete(e.bytes)
 		}
-		return
+		return true
 	}
-	// Kept without overlap, so that what is held never exceeds what was permitted.
-	at := len(l.early)
-	for at > 0 && l.early[at - 1].offset > offset {
-		at -= 1
-	}
-	if at > 0 {
-		end := l.early[at - 1].offset + u64(len(l.early[at - 1].bytes))
-		if end > offset {
-			skip := min(end - offset, u64(len(bytes)))
-			offset += skip
-			bytes = bytes[skip:]
+	// Kept without overlap, so that what is held never exceeds what was permitted; and all of it is, or the
+	// packet goes unacknowledged, for what is acknowledged does not come again.
+	for len(bytes) > 0 {
+		if len(l.early) >= MAX_EARLY {
+			return false
 		}
+		at := len(l.early)
+		for at > 0 && l.early[at - 1].offset > offset {
+			at -= 1
+		}
+		if at > 0 {
+			e := &l.early[at - 1]
+			if end := e.offset + u64(len(e.bytes)); end > offset {
+				skip := min(end - offset, u64(len(bytes)))
+				offset += skip
+				bytes = bytes[skip:]
+				continue
+			}
+		}
+		n := u64(len(bytes))
+		if at < len(l.early) {
+			n = min(n, l.early[at].offset - offset)
+		}
+		copied := make([]byte, n)
+		copy(copied, bytes)
+		inject_at(&l.early, at, Early{offset, copied})
+		offset += n
+		bytes = bytes[n:]
 	}
-	if at < len(l.early) && offset + u64(len(bytes)) > l.early[at].offset {
-		bytes = bytes[:l.early[at].offset - offset] // what lies past it will come again if it must
-	}
-	if len(bytes) == 0 {
-		return
-	}
-	copied := make([]byte, len(bytes))
-	copy(copied, bytes)
-	inject_at(&l.early, at, Early{offset, copied})
+	return true
 }
 
 @(private)

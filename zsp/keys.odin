@@ -75,8 +75,8 @@ aead_nonce :: proc(stamp: Stamp, slot: Slot, kind: u8) -> (iv: [24]byte) {
 
 // Appends epoch, ciphertext and tag.
 @(private)
-seal_append :: proc(w: ^[dynamic]byte, k: ^Scope_Keys, iv: ^[24]byte, bind, plain: []byte) {
-	epoch := len(k.epochs)
+seal_append :: proc(w: ^[dynamic]byte, k: ^Scope_Keys, iv: ^[24]byte, bind, plain: []byte, epoch := 0) {
+	epoch := epoch if epoch != 0 else len(k.epochs)
 	write_varint(w, u64(epoch))
 	aead_append(w, k.epochs[epoch - 1], iv, bind, plain)
 }
@@ -146,9 +146,9 @@ cell_signed :: proc(c: ^Cell, body: []byte) -> []byte {
 }
 
 // Replaces an open body with a sealed one, in temporary memory. In a signed scope the author's
-// index in the roster precedes the seal and a signature follows it.
+// index in the roster precedes the seal and a signature follows it. The epoch is the latest unless given.
 @(require_results)
-cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell) -> bool {
+cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, epoch := 0) -> bool {
 	scope := row_scope(c.row)
 	keys, info := keyring_scope(k, scope), roster_scope(r, scope)
 	if keys == nil || info == nil {
@@ -161,7 +161,7 @@ cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell) -> bool {
 	if .Signed in info.flags {
 		write_varint(&w, author_index(k, r) or_return)
 	}
-	seal_append(&w, keys, &iv, cell_bind(c), c.body[n:])
+	seal_append(&w, keys, &iv, cell_bind(c), c.body[n:], epoch)
 	if .Signed in info.flags {
 		sign_append(&w, k, cell_signed(c, w[:])) or_return
 	}
@@ -199,6 +199,19 @@ cell_open :: proc(k: ^Keyring, r: ^Roster, c: ^Cell) -> bool {
 // no keys, can check it. In an unsigned one the key is the authority, and ends when its epoch did.
 @(require_results)
 cell_authentic :: proc(r: ^Roster, c: ^Cell) -> bool {
+	cell_lawful(r, c) or_return
+	if .Signed not_in roster_scope(r, row_scope(c.row)).flags {
+		return true
+	}
+	rd := Reader{buf = c.body, pos = clear_size(c.kind, c.body)}
+	author := read_varint(&rd)
+	body := c.body[:len(c.body) - SIGNATURE]
+	return ed25519_verify(r.members[author].signer, cell_signed(c, body), c.body[len(body):])
+}
+
+// As much of that as can change once a cell has been found authentic.
+@(private)
+cell_lawful :: proc(r: ^Roster, c: ^Cell) -> bool {
 	scope := row_scope(c.row)
 	info := roster_scope(r, scope)
 	if info == nil {
@@ -213,11 +226,7 @@ cell_authentic :: proc(r: ^Roster, c: ^Cell) -> bool {
 		return epoch == u64(info.epoch) || c.stamp.time <= info.closed[epoch - 1]
 	}
 	author := read_varint(&rd)
-	if rd.bad || len(c.body) - rd.pos < SIGNATURE {
-		return false
-	}
-	body := c.body[:len(c.body) - SIGNATURE]
-	return author_allowed(r, author, scope, c.stamp) && ed25519_verify(r.members[author].signer, cell_signed(c, body), c.body[len(body):])
+	return !rd.bad && len(c.body) - rd.pos >= SIGNATURE && author_allowed(r, author, scope, c.stamp)
 }
 
 @(private)

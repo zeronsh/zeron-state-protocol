@@ -35,6 +35,7 @@ Stream :: struct {
 	role:      zsp.Role,
 	in_buf:    [dynamic]byte,
 	pieces:    [dynamic]byte, // of a message that comes in several frames
+	fragmented: bool, // more of pieces is to come
 	out:       [dynamic]byte,
 	sent:      int,
 	recv_op:   ^nbio.Operation,
@@ -91,7 +92,7 @@ stream_close :: proc(s: ^Stream) {
 		nbio.remove(s.send_op)
 	}
 	if s.session != nil {
-		zsp.session_close(s.session)
+		session_end(s.session)
 	}
 	if s.dialer != nil {
 		dialer_lost(s.dialer)
@@ -178,7 +179,7 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 		used += n
 		#partial switch op {
 		case .Binary, .Continue:
-			if (op == .Continue) != (len(s.pieces) > 0) || len(s.pieces) + len(payload) > pipe.MAX_MESSAGE {
+			if (op == .Continue) != s.fragmented || len(s.pieces) + len(payload) > pipe.MAX_MESSAGE {
 				return false
 			}
 			if fin && op == .Binary {
@@ -186,11 +187,14 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 				continue
 			}
 			append(&s.pieces, ..payload)
+			s.fragmented = !fin
 			if fin {
 				stream_message(s, s.pieces[:]) or_return
 				clear(&s.pieces)
 				shrink(&s.pieces)
 			}
+		case .Text:
+			return false // nothing here is said in text
 		case .Ping:
 			stream_put(s, .Pong, payload)
 		case .Close:

@@ -12,7 +12,7 @@ import "core:encoding/endian"
 // pattern, checked against it.
 
 NOISE :: "Noise_IK_25519_ChaChaPoly_SHA256"
-HANDSHAKE_1 :: 96 // e, es, s, ss: 32 + (32 + 16) + 16
+HANDSHAKE_1 :: 104 // e, es, s, ss: 32 + (32 + 16) + (8 + 16)
 HANDSHAKE_2 :: 48 // e, ee, se:    32 + 16
 
 Handshake :: struct {
@@ -26,6 +26,7 @@ Channel :: struct {
 	send, recv:     Key32,
 	send_n, recv_n: u64,
 	peer:           Key32,
+	began: u64, // when the initiator says it did
 }
 
 @(require_results)
@@ -104,9 +105,10 @@ handshake_split :: proc(h: ^Handshake, initiator: bool) -> (c: Channel) {
 	return
 }
 
-// The initiator's half. `peer` is the responder's expected key.
+// The initiator's half. `peer` is the responder's expected key. Where an old first message may be sent again by
+// anyone, `when_` tells it from a new one.
 @(require_results)
-handshake_start :: proc(h: ^Handshake, secret, peer, space: Key32, eph: Maybe(Key32) = nil) -> (first: [HANDSHAKE_1]byte, ok: bool) {
+handshake_start :: proc(h: ^Handshake, secret, peer, space: Key32, eph: Maybe(Key32) = nil, when_: u64 = 0) -> (first: [HANDSHAKE_1]byte, ok: bool) {
 	handshake_init(h, secret, peer, space)
 	if e, given := eph.?; given {
 		h.eph = e
@@ -119,7 +121,9 @@ handshake_start :: proc(h: ^Handshake, secret, peer, space: Key32, eph: Maybe(Ke
 	handshake_mix_dh(h, h.eph, peer) or_return
 	handshake_seal(h, first[32:80], s[:])
 	handshake_mix_dh(h, secret, peer) or_return
-	handshake_seal(h, first[80:], nil)
+	said: [8]byte
+	put_u64(said[:], when_)
+	handshake_seal(h, first[80:], said[:])
 	return first, true
 }
 
@@ -155,7 +159,8 @@ handshake_answer :: proc(secret, space: Key32, first: []byte, eph: Maybe(Key32) 
 	handshake_mix_dh(&h, secret, re) or_return
 	handshake_open(&h, rs[:], first[32:80]) or_return
 	handshake_mix_dh(&h, secret, rs) or_return
-	handshake_open(&h, nil, first[80:]) or_return
+	said: [8]byte
+	handshake_open(&h, said[:], first[80:]) or_return
 
 	if e, given := eph.?; given {
 		h.eph = e
@@ -170,6 +175,7 @@ handshake_answer :: proc(secret, space: Key32, first: []byte, eph: Maybe(Key32) 
 	handshake_seal(&h, second[32:], nil)
 	c = handshake_split(&h, false)
 	c.peer = rs
+	c.began = get_u64(said[:])
 	return second, c, true
 }
 

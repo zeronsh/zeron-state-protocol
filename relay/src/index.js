@@ -143,15 +143,18 @@ export class Space extends DurableObject {
     view(ptr + 32, 32).set(unhex(this.env.RELAY_SECRET));
     view(ptr + 64, roster.length).set(roster);
     if (!exports.init(ptr, ptr + 32, ptr + 64, roster.length)) throw new Error("storage is damaged");
+    let lost = false;
     for (const ws of this.ctx.getWebSockets()) {
       const { id, state } = ws.deserializeAttachment() ?? {};
       if (!state || !this.#put(state, (n) => exports.load(id, n))) {
         ws.close(1012, "resume by reconnecting");
+        lost = true;
         continue;
       }
       this.#sockets.set(id, ws);
       this.#next = Math.max(this.#next, id + 1);
     }
+    if (lost) exports.present(), this.#settle();
   }
 
   #put(bytes, then) {

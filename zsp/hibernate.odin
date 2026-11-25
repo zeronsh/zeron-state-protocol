@@ -6,7 +6,7 @@ package zsp
 // Appends the session's state. False when it is in the middle of something and must not sleep.
 @(require_results)
 session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
-	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || len(s.tasks) > 0 || s.closing {
+	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || len(s.tasks) > 0 || len(s.refused) > 0 || s.closing {
 		return false
 	}
 	n := s.node

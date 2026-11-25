@@ -21,11 +21,13 @@ import "../zsp"
 
 USAGE :: `zspd - Zeron State Protocol node
 
-  zspd create <dir>                          make a space, with this device as its admin
+  zspd create <dir>                          make a space, owned by this device
   zspd key <dir>                             print what an admin needs to admit this device
   zspd scope <dir> [signed]                  add a scope to the space
   zspd admit <dir> <key> <scope> [read]      grant a device a scope: to read, write and call, or only read
   zspd revoke <dir> <key> [scope]            end a device's grants
+  zspd admin <dir> <key> [off]               let a device do all of this but make admins and owners, or no longer
+  zspd owner <dir> <key>                     make a device an owner too, for good
   zspd relay <dir> <key> <url>               name a relay for the space's devices to meet at
   zspd join <dir> <space> <relay-key> <url>  become a device of a space that has admitted this one
   zspd peer <dir> <roster-file>              join from a roster file instead of a relay
@@ -95,12 +97,24 @@ run :: proc() -> int {
 			key := parse_hex(args[0], 64) or_return
 			device: zsp.Key32
 			copy(device[:], key)
+			if m := zsp.roster_member(&a.roster, device); m != nil && m.owner {
+				say(os.stderr, "an owner holds the key that is the space, and nothing can take that back\n")
+				return false
+			}
 			scope: u64
 			if len(args) > 1 {
 				scope = strconv.parse_u64(args[1]) or_return
 			}
 			zsp.draft_revoke(&a.draft, device, zsp.Scope(scope))
 			return true
+		})
+	case "admin":
+		ok = len(rest) >= 1 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
+			return appoint(a, args[0], false, len(args) < 2 || args[1] != "off")
+		})
+	case "owner":
+		ok = len(rest) == 1 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
+			return appoint(a, args[0], true, true)
 		})
 	case "relay":
 		ok = len(rest) == 2 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
@@ -133,6 +147,27 @@ Admin :: struct {
 	roster: zsp.Roster,
 	draft:  zsp.Draft,
 	space:  string,
+}
+
+// An admin or owner draws up rosters, and so must hold every scope's keys.
+appoint :: proc(a: ^Admin, key: string, owner, yes: bool) -> bool {
+	bytes := parse_hex(key, 64) or_return
+	device, signer: zsp.Key32
+	copy(device[:], bytes)
+	copy(signer[:], bytes[32:])
+	if yes {
+		for s in a.draft.scopes {
+			zsp.draft_grant(&a.draft, device, signer, s.id, {.Read, .Write, .Call})
+		}
+	}
+	for &m in a.draft.members {
+		if m.device == device {
+			m.owner ||= owner
+			m.admin = yes if !owner else m.admin
+			return true
+		}
+	}
+	return false
 }
 
 in_dir :: proc(dir, name: string) -> string {
@@ -168,7 +203,7 @@ create :: proc(dir: string) -> bool {
 	none: zsp.Roster
 	d := zsp.draft_from(&none, host.now_ms() << 16)
 	home := zsp.draft_scope(&d)
-	zsp.draft_grant(&d, k.device, k.signer, home, {.Read, .Write, .Call}).admin = true
+	zsp.draft_grant(&d, k.device, k.signer, home, {.Read, .Write, .Call}).owner = true
 	bytes := zsp.roster_sign(&k, root, &d, context.temp_allocator) or_return
 	name := to_hex(space[:])
 	if err := os.make_directory_all(in_dir(dir, name)); err != nil {
@@ -213,14 +248,17 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 	}
 	a.roster = zsp.roster_parse(data, space) or_return
 	zsp.roster_unwrap(&a.keys, &a.roster) or_return
-	root, admin := a.keys.root.?
-	if !admin {
+	if !zsp.keyring_rules(&a.keys, &a.roster) {
 		say(os.stderr, "this device is not an admin of the space\n")
 		return false
 	}
 	a.draft = zsp.draft_from(&a.roster, max(host.now_ms() << 16, host.clock_of(in_dir(dir, name)), running_clock(dir)))
 	change(&a, args) or_return
-	bytes := zsp.roster_sign(&a.keys, root, &a.draft, context.temp_allocator) or_return
+	bytes, signed := zsp.roster_sign(&a.keys, a.keys.root, &a.draft, context.temp_allocator)
+	if !signed {
+		say(os.stderr, "only an owner can do that, or an admin who may read every scope\n")
+		return false
+	}
 	if _, sound := zsp.roster_parse(bytes, space); !sound {
 		say(os.stderr, "that would make an unsound roster: only signed scopes may have readers who do not write\n")
 		return false

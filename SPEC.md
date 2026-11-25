@@ -47,7 +47,10 @@ it has one.
 **Stamps.** A writer's clock is `max(clock + 1, now)`, where `clock` also advances past the time of every stamp seen. Every
 cell gets its own time and fresh salt. A stamp is at once a cell's version, its tie-break and its AEAD nonce, so it must never
 be reused; because the salt is drawn anew from the operating system, even a forked virtual machine does not. Times at or
-above 2⁶³ are invalid, and a stamp more than ten years (3650 days) ahead of the receiver's clock, or of 2025 if its clock says earlier, is refused.
+above 2⁶³ are invalid. A stamp more than fifteen minutes ahead of the receiver's clock ends the session with *clock*: one of the two is wrong by
+more than can be allowed for, and dialling again will do once they agree. **Nothing is older than its row**: a cell whose time is before the first
+moment of its row's creation second is invalid, whatever its kind. So whoever may no longer write, and can only pretend to have written earlier,
+cannot touch any row made since. A row with a well-known id has creation time zero.
 
 **Slots.** 0 grave, 1–15 places, 16–255 data. Slots are the application's columns.
 
@@ -78,48 +81,65 @@ frame = length (varint) ‖ type (1) ‖ payload          length counts type and
 ```
 
 A pipe carries frames as a byte stream in any fragmentation. Unknown frame types are ignored. The cells of one frame, each counted as 48
-bytes and its sealed body, come to at most 2²³.
+bytes and its sealed body, come with 8 more to at most 2²³.
 
 ## 3 Keys and the roster
 
 HKDF is RFC 5869 with SHA-256 and one 32-byte block; `derive(k, info)` = HKDF(salt = none, k, info).
 
 A **device** is an X25519 key pair, from which: Ed25519 seed = derive(secret, "zsp-sign").
-A **space** is an Ed25519 key pair; its public key is its name, 32 bytes.
+A **space** is an Ed25519 key pair; its public key is its name, 32 bytes. Whoever holds the private one **owns** the space, and nothing can take
+that back. Its owners name **admins**, who govern it day to day, and can be unmade.
 
-The **roster** says who may do what. It is a document signed by the space:
+The **charter** says who owns and who administers, and is signed by the space:
 
 ```
-"zsp-r1" ‖ space (32) ‖ serial varint
+term varint ≥ 1 ‖ ephemeral (32)
+n varint, n × owner   { device (32), signer (32), wrap (48) }      the space's signing seed, wrapped as below with nonce 0
+n varint, n × admin   { signer (32) }
+signature (64, Ed25519 over "zsp-charter" ‖ space ‖ everything before it)
+```
+
+The **roster** says who may do what. It is a document signed by the space or by an admin the charter in it names:
+
+```
+"zsp-r1" ‖ space (32) ‖ charter bytes ‖ serial varint
 n varint, n × scope   { id varint, flags (1), epoch varint ≥ 1,
                         (epoch − 1) × closed varint }                        ascending ids, ascending times
-n varint, n × member  { device (32), signer (32), admin (1), subject bytes,
+n varint, n × member  { device (32), signer (32), subject bytes,
                         n varint, n × grant { scope varint, rights (1), until varint } }
 n varint, n × relay   { key (32), url bytes }
 ephemeral (32)
-wraps (48 each)   history (48 each)   signature (64, Ed25519 over everything before it)
+wraps (48 each)   history (48 each)
+by varint              0 the space, else the charter's admin of that number, from 1
+signature (64, Ed25519 over everything before it)
 ```
+
+A serial is term × 2⁴⁴ + count × 2²⁰ + 20 random bits, its term being the charter's. Of two valid rosters the higher serial wins: a new charter
+outranks whatever was signed under an old one, however high it counts; and of two rosters drawn up at once, all agree which it is, and the other's
+change is to be made again. An admin carries the charter over untouched, and must hold every scope's keys. An owner recovers the seed from the charter,
+member or not, so that no admin can shut owners out. With all but that an admin is trusted, the times at which grants are said to have ended included.
 
 Rights are bits: 1 Read, 2 Write, 4 Call. Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
 invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
 a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed. `closed`
 says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
 `subject` is the consumer's name for whomever the device belongs to, opaque here. Members are never removed, only their grants
-ended, so that a member's index is for ever. Of two valid rosters the higher serial wins.
+ended, so that a member's index is for ever.
 
-**Scope keys.** Each scope has a 32-byte sealing key per epoch. For each member in order, for each grant in force in order, then
-once more if admin, `wraps` holds 48 bytes: ChaCha20-Poly1305 under
+**Scope keys.** Each scope has a 32-byte sealing key per epoch. For each member in order, for each grant in force in order,
+`wraps` holds 48 bytes: ChaCha20-Poly1305 under
 
 ```
 wrap key = HKDF(salt = SHA-256(ephemeral ‖ device), X25519(ephemeral, device), "zsp-wrap")
-nonce    = 0 (4) ‖ scope (8), or 0 for the admin's, which is the space's signing seed
+nonce    = 0 (4) ‖ scope (8)
 ```
 
 of the scope's current sealing key. For each scope in order, `history` holds its earlier epochs' keys in order, each
 ChaCha20-Poly1305 under derive(current key, "zsp-history") with nonce 0 (4) ‖ epoch − 1 (8). A scope's **list key** is
 derive(first epoch's key, "zsp-list").
 
-Ending a grant must raise the scope's epoch. Admitting a device need not.
+Ending a grant must raise the scope's epoch, but for one in a signed scope that only loses Write. Admitting a device need not.
 
 ## 4 Cells
 
@@ -143,13 +163,18 @@ A replica accepts a cell from a peer only if
 
 In a signed scope authority travels with the cell, so anyone may carry it. In an unsigned scope, to hold the key is to be a writer.
 
-On adopting a roster a replica looks again at cells later than any epoch or grant it ends. In an unsigned scope, one that is no longer acceptable is
-sealed again under the current key, with the same stamp, by a replica that can open it, since someone may merely not have heard; otherwise
-it is dropped. Replicas then reconcile afresh. Where a cell is held already, another body for the same identity is ignored.
+On adopting a roster, and on starting with one it has not yet held its cells against, a replica looks again at cells later than any epoch or grant
+it ends. In an unsigned scope, one that is no longer acceptable is sealed again, with the same stamp, under the key in force at that stamp's
+time, by a replica that can open it, since someone may merely not have heard; otherwise it is dropped. A partial replica offers again
+all it holds in that scope, for who took it may be gone. Then, whatever the roster changed, each side watches afresh. Where a cell is
+held already, another body for the same identity is ignored.
 
-So: a revoked device can open nothing sealed afterwards, and nobody who has heard accepts what it writes later. What it gave to someone who had *not* heard stands,
-and it can still put an earlier time on new writing, for no clock here is trusted; a colluding relay could deliver that. Revocation ends
-access and bounds damage; it does not undo the past. List tags do not change on rotation, so a revoked device can still recognise them.
+So: a revoked device can open nothing sealed afterwards; nobody who has heard accepts what it writes later; and no row made later can be touched by it,
+whatever time it pretends and whoever carries it. To rows older than its revocation it can still put new writing with an earlier time, deletions included,
+for no clock here is trusted: it could as well have done so while it might. In an unsigned scope, what it gave to someone who had *not* heard stands, since
+nobody can tell it from anyone else's; in a signed one it is dropped when they hear, though not what it had meanwhile killed on every replica there
+is. Revocation ends access and bounds damage; it does not undo the past. List tags do not change on rotation, so a revoked device can still
+recognise them.
 
 A relay sees: scopes, list tags, orders, stamps, sizes. It can order and page; it cannot read, name, move, alter or forge.
 Orders are public to it, so derive them from time or rank rather than content.
@@ -160,7 +185,7 @@ A slot holding text is at most one `Value` (a whole text) and `Piece`s and `Bund
 that set alone. Elements are UTF-8 bytes; applications edit at character boundaries.
 
 A piece's open body is id (8, random, nonzero) ‖ operations. A bundle's, after its clear prefix, is any number of
-stamp (16) ‖ id (8) ‖ operations (bytes), ascending by stamp. A `Value` acts as a piece whose id is its salt and whose one operation
+stamp (16) ‖ id (8) ‖ operations (bytes), ascending by stamp. A `Value` acts as a piece whose id is its salt, or 1 if that is zero, and whose one operation
 inserts its body into an empty text.
 
 ```
@@ -196,9 +221,9 @@ An implementation with a counting tree answers any range in logarithmic time, an
 ## 7 Channels
 
 Between devices, and between devices and relays, a pipe is wrapped in `Noise_IK_25519_ChaChaPoly_SHA256` with prologue
-"zsp-1" ‖ space and empty payloads. The dialler knows the other's key: from the roster, or from whoever told it of the relay.
+"zsp-1" ‖ space. The first message's payload is 8 bytes, zero but over links (§14); the second's is empty. The dialler knows the other's key: from the roster, or from whoever told it of the relay.
 
-Over WebSocket, each binary message is one Noise message: 96 bytes, 48 bytes, then transport messages of at most 65535 bytes, whose
+Over WebSocket, each binary message is one Noise message: 104 bytes, 48 bytes, then transport messages of at most 65535 bytes, whose
 plaintexts concatenate into the pipe. The path is `/` and the space in hex. A message may come in several frames. TLS, where used, is for traversal; certificates need not
 be judged, for nothing rests on them, and no credential may be put where TLS alone protects it.
 
@@ -230,11 +255,12 @@ device it no longer allows gives up its keys.
 
 ```
 7 Cells    sequence varint ‖ cells       applied atomically, in order
-8 Ack      sequence varint               everything up to here is durable
-13 Error   code (1): 1 malformed, 2 denied, 3 version, 4 failed.  The sender closes.
+8 Ack      sequence varint ‖ rows (16 each)   everything up to here is durable, but that something of these rows was not accepted
+13 Error   code (1): 1 malformed, 2 denied, 3 version, 4 failed, 5 clock.  The sender closes.
 ```
 
-A peer that is a full replica is sent everything its dialler commits. Otherwise a session is sent what it watches.
+A peer that is a full replica is sent everything its dialler commits. Otherwise a session is sent what it watches. A partial replica keeps owing a row
+named in an Ack.
 
 If an offered cell was refused because something had killed it, the receiver sends back the row as it has it: the sender held something
 old and would not otherwise hear.
@@ -257,8 +283,8 @@ fingerprint of the range: equal, and there is nothing to send; a count of zero, 
 local client may omit it and be sent everything. With *adopt* the watcher is already level, as when it splits one range into two.
 
 A row that comes into a watched range is sent whole. So is one that moves while any watch on it has yet to sync, for it may have
-slipped from a part not yet compared to one already passed. A row that leaves is sent the cell that moved it. Cells that arrived ahead of their
-row's first place become visible with it, and the row is then sent to everyone, its sender included.
+slipped from a part not yet compared to one already passed. A row that was nowhere comes into every range at once. A row that leaves is sent the cell that moved it. Cells that arrived ahead of their
+row's first place become visible with it, and the row is then sent whole to everyone, its sender included.
 
 An owner that cannot keep up may drop what it owes a watch and instead reconcile it afresh; to a local client it says Synced with *restart*, resends
 the range, and says Synced again: rows not mentioned between are gone. *settled* says that a full replica has confirmed the range, or that none can
@@ -267,7 +293,8 @@ ends, its watches end with Synced *denied*; to a local client, a new Roster come
 
 A **full replica** watches, on each session it dials, every scope it can read, whole. A **partial replica** watches what its local clients watch, and
 keeps what it wrote on record until a full replica acknowledges it. When all a dialler's whole-scope watches are level, and it has sent all the other
-lacked, it says so: Synced with id 0, settled, empty keys and zero counts.
+lacked, it says so: Synced with id 0, settled, empty keys and zero counts. The other heeds it from a full replica that has such a watch here. When the
+roster changes, all of these are asked for afresh: either end may have dropped one under a roster the other never heard.
 
 With *counts* the owner says Synced again whenever, after a burst of changes, how much lies before or after differs from what it last said. A
 partial replica relays to its client the bounds and counts a full replica gives it, closing the window to those bounds, for what it holds
@@ -303,8 +330,8 @@ wants the row in turn, with *final* set, which is not answered so. Wants are sen
 Operations of a piece still being written, from a byte offset in its operation stream, always whole. They are hints: never
 stored, never acknowledged, droppable at any point. A gap is ignored; the piece itself will follow. Between peers the body is
 [author varint] ‖ epoch varint ‖ ciphertext ‖ tag ‖ [signature], the brackets in signed scopes, sealed as in §4 under a fresh stamp with kind 0x40 and associated
-data *a* = row ‖ slot ‖ piece ‖ offset (8); the signature covers *a* ‖ 0x40 ‖ stamp ‖ the body short of it. Only the current epoch's key is accepted, and no stamp more than a minute
-behind the receiver's clock. From a local client the stamp is zero. The body is at most 64 KiB.
+data *a* = row ‖ slot ‖ piece ‖ offset (8); the signature covers *a* ‖ 0x40 ‖ stamp ‖ the body short of it. Only the current epoch's key is accepted, only an author whose right to write is in force, and no stamp more than a minute
+behind the latest the receiver has seen, nor sixteen behind its clock. From a local client the stamp is zero, and the body at most 2¹⁶ − 128 bytes; between peers it is at most 2¹⁶.
 
 Live frames go only to watches with **live** that cover the row. A node forwards its clients' live watches to its peers, and a relay
 forwards each device's to the others, so a frame nobody will see is never sent. A node does not forward between peers unless it is a relay. A
@@ -356,8 +383,9 @@ A link is an ordered byte stream and datagrams (live frames) over UDP. First byt
 0x42 second (sender's id ‖ receiver's id ‖ Noise 2), 0x43 data (receiver's id ‖ counter (8, little-endian) ‖ ciphertext, the 13 bytes before it being
 associated data), 0x44 beacon. Anything lower is STUN. The source of a genuine data packet newer than any before it is thenceforth the
 peer's address; a packet seen before, or too old to tell, is dropped. A live link gives way to a new knock only when that proves itself with data.
+The payload of Noise 1 is a stamp time drawn by the dialler, and a knock no later than the last from that device is ignored: anyone may have kept an old one.
 
-Data frames: 0 padding to the end · 1 ping · 2 ack (largest varint, run varint, then (gap, run) pairs, a zero gap, then the highest stream offset permitted) ·
+A packet there is no room for goes unacknowledged. Data frames: 0 padding to the end · 1 ping · 2 ack (largest varint, run varint, then (gap, run) pairs, a zero gap, then the highest stream offset permitted) ·
 3 stream (offset varint, bytes) · 4 datagram (bytes) · 5 close. Runs count downward from the largest. Loss recovery is RFC 9002's; congestion control is
 the sender's affair. A link with nothing in flight sends nothing.
 

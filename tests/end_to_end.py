@@ -197,6 +197,10 @@ def test_lan_without_relay():
     cb.until(lambda: len(cb.list(1, "x")) == 1)
 
 
+def refused(*args):
+    return subprocess.run([BIN, *args], capture_output=True).returncode != 0
+
+
 def test_permissions():
     relay, (a, b, c) = space("i", "j", "k")
     ca = a.client()
@@ -230,6 +234,18 @@ def test_permissions():
         raise SystemExit("a reader wrote")
     except PermissionError:
         pass
+
+    # An admin governs without owning; may not appoint; and, unmade, governs no more.
+    zspd("admin", a.dir, zspd("key", b.dir))
+    cb = b.client()
+    cb.until(lambda: cb.scopes.get(two, [0])[0] & zsp.WRITE)
+    three = int(zspd("scope", b.dir))
+    zspd("admit", b.dir, zspd("key", a.dir), str(three))
+    ca.until(lambda: three in ca.scopes)
+    assert refused("admin", b.dir, zspd("key", c.dir)) and refused("revoke", b.dir, zspd("key", a.dir))
+    zspd("admin", a.dir, zspd("key", b.dir), "off")
+    time.sleep(0.5)
+    assert refused("scope", b.dir)
 
     # The wrong token, and a web page, are refused.
     for attempt in (lambda: zsp.Client(a.address, b"wrong"),):
@@ -388,6 +404,10 @@ def test_durable_object():
     c = Node("r", "run", "--no-udp", "--credential=" + cloud.token)
     zspd("admit", a.dir, zspd("key", c.dir), "1")
     zspd("join", c.dir, zspd_space(a), cloud.key, cloud.url)
+    # And one without the credential, which in all this time is told nothing.
+    d = Node("s", "run", "--no-udp")
+    zspd("join", d.dir, zspd_space(a), cloud.key, cloud.url)
+    d.start()
     a.start()
     time.sleep(2)
     a.stop()
@@ -396,12 +416,6 @@ def test_durable_object():
     cc.until(lambda: cc.scopes)  # told as soon as the node is
     cc.watch(1, 1, "chat")
     cc.until(lambda: len(cc.list(1, "chat")) == 300)
-
-    # Without the credential, nothing.
-    d = Node("s", "run", "--no-udp")
-    zspd("join", d.dir, zspd_space(a), cloud.key, cloud.url)
-    d.start()
-    time.sleep(2)
     assert not os.path.exists(os.path.join(d.dir, zspd_space(a), "roster"))
 
 

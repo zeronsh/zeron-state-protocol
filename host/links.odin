@@ -47,7 +47,7 @@ Peer :: struct {
 	link:       ^pipe.Link, // open, or being dialled
 	answer:     ^pipe.Link, // answered, not yet confirmed
 	session:    ^zsp.Session,
-	answered:   time.Tick, // when `answer` was made
+	knocked:    u64, // the latest knock heard, by the knocker's clock
 	address:    pipe.Address, // where it was last heard from
 	far:        bool, // beyond a NAT
 	used:       time.Tick,
@@ -214,13 +214,20 @@ udp_input :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 				if l == nil || l.local != id {
 					continue
 				}
+				session := p.session
 				if pipe.link_input(l, packet, now_us()) {
 					peer_heard(p, l, from)
+				}
+				if p.session != nil && p.session != session {
+					report(.Debug, "linked directly ", net.endpoint_to_string(address_to(from), context.temp_allocator))
 				}
 				return
 			}
 		}
 		return
+	}
+	if h.relay {
+		return // it says where others are, and links to nobody: its spaces come and go
 	}
 	#partial switch pipe.Type(packet[0]) {
 	case .First:
@@ -270,13 +277,13 @@ peer_answer :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 			continue
 		}
 		p := peer_for(s, l.channel.peer)
-		// A stranger; or someone's old knock, over and over. A live link is not disturbed by either: it
-		// gives way only when the new one proves itself.
-		if p == nil || (p.answer != nil && time.tick_since(p.answered) < time.Second) {
+		// A stranger; or a knock heard before, which anyone may have kept. And a live link is not disturbed
+		// even by a new one until that proves itself.
+		if p == nil || l.channel.began <= p.knocked {
 			pipe.link_destroy(&l)
 			return
 		}
-		p.answered = time.tick_now()
+		p.knocked = l.channel.began
 		if p.answer == nil {
 			p.answer = new(pipe.Link)
 		} else {
@@ -312,7 +319,7 @@ peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
 		if p.session != nil {
 			session := p.session
 			p.session = nil
-			zsp.session_close(session)
+			session_end(session)
 		}
 		if p.link != nil {
 			pipe.link_destroy(p.link)
@@ -326,7 +333,6 @@ peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
 	p.session.datagram = proc(data: rawptr, frame: []byte) -> bool {
 		return pipe.link_datagram((^Peer)(data).link, frame)
 	}
-	report(.Debug, "linked directly ", net.endpoint_to_string(address_to(p.address), context.temp_allocator))
 }
 
 @(private)
@@ -353,7 +359,7 @@ peer_drop :: proc(p: ^Peer) {
 	if p.session != nil {
 		session := p.session
 		p.session = nil
-		zsp.session_close(session)
+		session_end(session)
 	}
 	for l in ([]^pipe.Link{p.link, p.answer}) {
 		if l != nil {
@@ -464,7 +470,7 @@ links_signalled :: proc(data: rawptr, from: zsp.Key32, blob: []byte) {
 peer_knock :: proc(p: ^Peer) {
 	if peer_dials(p) && p.link == nil {
 		p.link = new(pipe.Link)
-		if !pipe.link_dial(p.link, p.space.host.secret, p.device, p.space.node.space) {
+		if !pipe.link_dial(p.link, p.space.host.secret, p.device, p.space.node.space, zsp.node_stamp(&p.space.node).time) {
 			free(p.link)
 			p.link = nil
 			return

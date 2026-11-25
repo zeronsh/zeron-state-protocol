@@ -51,6 +51,7 @@ Space :: struct {
 	disk: File_Disk,
 	dir:  string,
 	seen: u64, // events already noticed by links_poke
+	warned: bool, // of a clock
 }
 
 @(private)
@@ -268,6 +269,16 @@ host_destroy :: proc(h: ^Host) {
 	nbio.release_thread_event_loop()
 }
 
+@(private)
+session_end :: proc(session: ^zsp.Session) {
+	s := (^Space)(session.node.host.data)
+	if session.fault == .Clock && !s.warned {
+		s.warned = true // once is enough: dialling again is all there is to do until it is set
+		report(.Warning, "this machine's clock and another's differ by more than a quarter of an hour: nothing passes between them")
+	}
+	zsp.session_close(session)
+}
+
 // Everything that follows from the events of one tick, once.
 @(private)
 host_settle :: proc(h: ^Host) {
@@ -280,6 +291,12 @@ host_settle :: proc(h: ^Host) {
 				report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
 				h.stopping = true
 			}
+		}
+	}
+	for s in h.spaces {
+		if s.node.failed {
+			report(.Error, "storage failed; stopping rather than going on with what may be lost")
+			h.stopping = true
 		}
 	}
 	dialers_run(h, now)

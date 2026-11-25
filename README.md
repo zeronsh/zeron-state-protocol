@@ -39,18 +39,18 @@ operation is sync, resume, paging, scrollbars and recovery. There are no version
 | a running daemon | 0.4 MB private, one thread |
 | an idle daemon | 0 wakeups, on Linux, macOS and Windows alike; one ping per relay per 45 s |
 | written to disk | 560 bytes a row, 1.8 × the row itself, indexes and all |
-| one small durable write | 0.25 ms; 4 KB, the one block it lies in |
-| opening the store | 4 ms |
-| a page of 50 rows found, read, decrypted | 0.12 ms |
+| one small durable write | 0.26 ms; 4 KB, the one block it lies in |
+| opening the store | 4 to 5 ms |
+| a page of 50 rows found, read, decrypted | 0.14 ms |
 | fingerprint of any range of the million | 0.2 µs |
 | two level replicas of 20,000 rows reconnecting | under 400 bytes |
 | one difference among 20,000 | under 6 KB |
 | a streamed token, device to relay to device's screen | 1 ms |
 | a call to another device through a relay | 0.15 ms on one machine; between continents, the ping |
-| a link | 430 MB/s, one core doing both ends |
-| checking all six platforms | 0.6 s |
-| building the daemon | 1.1 s, or 5 s optimised; on an M5 Max, 0.3 s and 4.9 s |
-| building and running the core's tests | 1.8 s; everything, 7 s |
+| a link | 400 MB/s, one core doing both ends |
+| checking all six platforms | 1 s |
+| building the daemon | 1 s, or 10 s optimised; on an M5 Max, 0.3 s and 4.9 s |
+| building and running the core's tests | 5 s; everything, 9 s |
 
 ## Using it
 
@@ -64,6 +64,7 @@ zspd run ~/.zsp                             # this device's node
 zspd key ~/.zsp                             # on another device,
 zspd admit ~/.zsp <that> 1                  # on this one, at once, running or not,
 zspd join ~/.zsp <space> <relay key> ws://host:8787 && zspd run ~/.zsp     # and there
+zspd admin ~/.zsp <that>                    # let it admit others; `off` to take that back
 ```
 
 ```luau
@@ -101,8 +102,8 @@ Embedding in Odin is the same question asked of `host.Config.authenticate`, or o
 
 ## Working on it
 
-`./x check` type-checks every platform, `./x test` runs everything, `./x sim 10000` runs ten thousand seeded networks that fragment, partition, crash and
-conflict, `./x nat` punches through real NATs in network namespaces, `./x slow` watches a Durable Object sleep. Needs `odin` (dev-2026-11), `wasm-ld`, `lune`, `luau-analyze`, `node`, `python3`.
+`./x check` type-checks every platform, `./x test` runs everything, `./x sim 10000` runs ten thousand seeded networks that fragment, partition, crash, lose
+unsynced disk, disagree on the time, have rights given and taken away, and conflict, `./x nat` punches through real NATs in network namespaces, `./x slow` watches a Durable Object sleep. Needs `odin` (dev-2026-11), `wasm-ld`, `lune`, `luau-analyze`, `node`, `python3`.
 
 ## License
 

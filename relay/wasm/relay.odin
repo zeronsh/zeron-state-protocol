@@ -151,6 +151,13 @@ received :: proc "c" (id: u32, size: int) -> bool {
 	return zsp.session_input(c.session, plain)
 }
 
+// Some connections were lost while this slept: tells the rest.
+@(export)
+present :: proc "c" () {
+	context = runtime.default_context()
+	zsp.presence_send(&node)
+}
+
 @(export)
 verdict :: proc "c" (id: u32, yes: bool) {
 	context = runtime.default_context()

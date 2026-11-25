@@ -1,13 +1,14 @@
 #+build !js
 package zsp
 
+import "core:hash/xxhash"
 import "core:math/rand"
 import "core:slice"
 import "core:testing"
 
 @(private)
 random_id :: proc(space: int) -> Id {
-	return {1 << 32 | u64(rand.int_max(space)) + 1, 7}
+	return {1 << 32, u64(rand.int_max(space)) + 1}
 }
 
 @(private)
@@ -94,16 +95,21 @@ random_cell :: proc(rows, times: int) -> (c: Cell) {
 @(private)
 Census :: struct {
 	shelf, cells: Sum,
+	bodies:       u64,
 }
 
 @(private)
-census :: proc(s: ^Store) -> (c: Census) {
+census :: proc(s: ^Store, shelved := false) -> (c: Census) {
 	c.shelf = store_range(s, KEY_MIN, KEY_MAX)
 	scan := tree_scan(s, s.cells, KEY_MIN, KEY_MAX)
 	for leaf in tree_next(&scan) {
 		cell, at := cell_unkey(leaf)
+		if shelved && row_places(s, cell.row).count == 0 {
+			continue // it is nowhere, and may differ there
+		}
 		cell.body = log_bytes(s, at.off, at.len)
 		c.cells.print += cell_print(&cell)
+		c.bodies += xxhash.XXH64(cell.body) * cell.stamp.salt
 		c.cells.count += 1
 	}
 	return
@@ -238,7 +244,7 @@ torn_tail_is_discarded :: proc(t: ^testing.T) {
 	store_flush(&s)
 	want := census(&s)
 	two := random_cell(400, 1000)
-	two.row = {1 << 32 | 999, 999}
+	two.row = {1 << 32, 999}
 	store_commit(&s, {two})
 	store_flush(&s)
 	store_close(&s)

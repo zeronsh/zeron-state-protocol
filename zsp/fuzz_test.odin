@@ -86,7 +86,7 @@ parsers_survive_noise :: proc(t: ^testing.T) {
 	defer keyring_destroy(&k)
 	none: Roster
 	d := draft_from(&none, 100)
-	draft_grant(&d, k.device, k.signer, draft_scope(&d), {.Write}).admin = true
+	draft_grant(&d, k.device, k.signer, draft_scope(&d), {.Write}).owner = true
 	good, _ := roster_sign(&k, root, &d)
 	defer delete(good)
 	for _ in 0 ..< FUZZ * 40 {

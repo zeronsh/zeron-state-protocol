@@ -2,6 +2,8 @@
 package zsp
 
 import "core:crypto"
+import "core:crypto/ecdh"
+import "core:crypto/noise"
 import "core:crypto/ed25519"
 import "core:testing"
 
@@ -58,7 +60,7 @@ roster_grants_and_revokes :: proc(t: ^testing.T) {
 	d := draft_from(&none, 100)
 	home := draft_scope(&d)
 	shown := draft_scope(&d, {.Signed})
-	draft_grant(&d, a.device, a.signer, home, {.Write}).admin = true
+	draft_grant(&d, a.device, a.signer, home, {.Write}).owner = true
 	draft_grant(&d, b.device, b.signer, home, {.Write})
 	draft_grant(&d, a.device, a.signer, shown, {.Write})
 	draft_grant(&d, c.device, c.signer, shown, {.Read}).subject = transmute([]byte)string("user:c")
@@ -150,19 +152,41 @@ channel_round_trip :: proc(t: ^testing.T) {
 	testing.expect(t, !wrong)
 }
 
-// Output of core:crypto/noise for these keys.
+// Byte for byte what core:crypto/noise says, payload and all.
 @(test)
-handshake_vector :: proc(t: ^testing.T) {
+handshake_is_noise :: proc(t: ^testing.T) {
 	i, r, ie, re, space: Key32
 	for n in 0 ..< 32 {
 		i[n], r[n], ie[n], re[n], space[n] = byte(n + 1), byte(n * 3 + 5), byte(n * 7 + 2), byte(n * 11 + 9), byte(n)
 	}
 	h: Handshake
-	first, ok := handshake_start(&h, i, x25519_public(r), space, ie)
-	second, _, answered := handshake_answer(r, space, first[:], re)
+	first, ok := handshake_start(&h, i, x25519_public(r), space, ie, 0x0102030405060708)
+	second, answerer, answered := handshake_answer(r, space, first[:], re)
 	c, done := handshake_finish(&h, second[:], x25519_public(r))
 	testing.expect(t, ok && answered && done)
-	testing.expect_value(t, get_u64(first[88:]), 0x5d96af5fb5c276ea)
-	testing.expect_value(t, get_u64(second[40:]), 0xcec5910e449c3dea)
-	testing.expect_value(t, get_u64(c.send[:]), 0x33ce2916ca3c1202)
+	testing.expect_value(t, answerer.began, 0x0102030405060708)
+
+	s, e: ecdh.Private_Key
+	rs: ecdh.Public_Key
+	public := x25519_public(r)
+	testing.expect(t, ecdh.private_key_set_bytes(&s, .X25519, i[:]) && ecdh.private_key_set_bytes(&e, .X25519, ie[:]))
+	testing.expect(t, ecdh.public_key_set_bytes(&rs, .X25519, public[:]))
+	prologue := make([dynamic]byte, context.temp_allocator)
+	append(&prologue, "zsp-1")
+	append(&prologue, ..space[:])
+	state: noise.Handshake_State
+	testing.expect_value(t, noise.handshake_init(&state, true, prologue[:], &s, &rs, NOISE, nil, &e), noise.Status.Ok)
+	payload := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	theirs, _ := noise.handshake_write_message(&state, payload[:], nil, context.temp_allocator)
+	testing.expect(t, string(theirs) == string(first[:]))
+	_, status := noise.handshake_read_message(&state, second[:], nil, context.temp_allocator)
+	testing.expect_value(t, status, noise.Status.Handshake_Complete)
+	cs: noise.Cipher_States
+	testing.expect_value(t, noise.handshake_split(&state, &cs), noise.Status.Ok)
+	wrote, _ := noise.seal_message(&cs, nil, payload[:], nil, context.temp_allocator)
+	sealed := make([dynamic]byte, context.temp_allocator)
+	channel_seal(&c, &sealed, payload[:])
+	testing.expect(t, string(wrote) == string(sealed[:]))
+	plain, opened := channel_open(&answerer, sealed[:])
+	testing.expect(t, opened && string(plain) == string(payload[:]))
 }

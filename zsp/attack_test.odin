@@ -146,7 +146,7 @@ big_frames_are_survived :: proc(t: ^testing.T) {
 	cells := make([]Cell, 4000)
 	defer delete(cells)
 	for &c, i in cells {
-		c = {{1 << 32 | u64(i), 1}, GRAVE, .Grave, {u64(i) + 1, 1}, nil}
+		c = {{1 << 32, u64(i) + 1}, GRAVE, .Grave, {u64(i) + 1, 1}, nil}
 	}
 	session_input(ui, raw_cells(cells))
 	session_close(ui)
@@ -293,7 +293,7 @@ downgrades_keep_history :: proc(t: ^testing.T) {
 	none: Roster
 	d := draft_from(&none, 100)
 	shown := draft_scope(&d, {.Signed})
-	draft_grant(&d, a.device, a.signer, shown, {.Write}).admin = true
+	draft_grant(&d, a.device, a.signer, shown, {.Write}).owner = true
 	draft_grant(&d, b.device, b.signer, shown, {.Write})
 	r1 := test_publish(t, &a, root, space, &d)
 	defer roster_destroy(&r1)
@@ -421,7 +421,7 @@ rotation_is_not_retroactive :: proc(t: ^testing.T) {
 	d := draft_from(&none, 1)
 	home := draft_scope(&d)
 	for x, i in ([]^Sim_Node{&a, &b, &c}) {
-		draft_grant(&d, x.keys.device, x.keys.signer, home, {.Write}).admin = i == 0
+		draft_grant(&d, x.keys.device, x.keys.signer, home, {.Write}).owner = i == 0
 	}
 	first, _ := roster_sign(&a.keys, root, &d, context.temp_allocator)
 	for x in ([]^Sim_Node{&a, &b, &c}) {
@@ -457,7 +457,8 @@ rotation_is_not_retroactive :: proc(t: ^testing.T) {
 	// When b hears, its own late writing is sealed anew, under the same identity, and is welcome.
 	before := census(&b.node.store)
 	testing.expect(t, node_adopt(&b.node, second))
-	testing.expect_value(t, census(&b.node.store), before)
+	after := census(&b.node.store)
+	testing.expect(t, after.shelf == before.shelf && after.cells == before.cells && after.bodies != before.bodies)
 	scan := tree_scan(&b.node, b.node.cells, KEY_MIN, KEY_MAX)
 	for leaf in tree_next(&scan) {
 		cell, at := cell_unkey(leaf)
@@ -499,4 +500,639 @@ text_trusts_bytes :: proc(t: ^testing.T) {
 	z: Text
 	defer text_destroy(&z)
 	testing.expect_value(t, text_apply(&z, &nobody), Text_Result.Same)
+}
+
+// ---------------------------------------------------------------- the second review
+
+@(private)
+test_amend :: proc(s: ^Sim, x: ^Sim_Node, change: proc(s: ^Sim, d: ^Draft)) -> bool {
+	d := draft_from(&x.node.roster, max(x.node.clock, x.node.now << 16))
+	change(s, &d)
+	bytes, ok := roster_sign(&x.keys, s.root, &d, context.temp_allocator)
+	return ok && node_adopt(&x.node, bytes)
+}
+
+// Sets every clock right.
+@(private)
+sim_level :: proc(s: ^Sim) {
+	for x in s.nodes {
+		x.skew = 0
+		x.node.now = s.now
+	}
+}
+
+// A hushed relay is asked about a scope that came to be while it was hushed.
+@(test)
+hushed_relays_hear_of_new_scopes :: proc(t: ^testing.T) {
+	state := seeded(50)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 3, 0, 1, 64)
+	defer sim_destroy(&s)
+	sim_link(&s, 0, 3)
+	sim_link(&s, 1, 3)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	testing.expect(t, s.links[0].a.paused)
+	// The relay has a scope, and a row in it, that the first has yet to hear of; which it does, from elsewhere.
+	third, relay, first := s.nodes[2], s.nodes[3], s.nodes[0]
+	testing.expect(t, test_amend(&s, third, proc(s: ^Sim, d: ^Draft) {
+		id := draft_scope(d)
+		for x in s.nodes {
+			if !x.relay {
+				draft_grant(d, x.keys.device, x.keys.signer, id, {.Write})
+			}
+		}
+	}))
+	body: [24]byte
+	put_u64(body[:], 3 << 32 | 5)
+	put_u64(body[8:], 5)
+	c := Cell{node_id(&third.node, 3), PLACE, .Place, node_stamp(&third.node), body[:]}
+	testing.expect(t, node_write(&third.node, {c}))
+	testing.expect(t, cell_seal(&third.keys, &third.node.roster, &c))
+	testing.expect(t, node_adopt(&relay.node, third.node.roster.bytes))
+	store_commit(&relay.node.store, {c})
+	for x in relay.node.sessions {
+		x.cursor = relay.node.events.next // sent, while it was asked to hush
+	}
+	testing.expect(t, node_adopt(&first.node, third.node.roster.bytes))
+	testing.expect(t, !s.links[0].a.paused)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&first.node.store, scope_lo(3), scope_hi(3)).count, 1)
+}
+
+// Nobody may be made to send what others will not take; and while clocks disagree, dialling again is enough.
+@(test)
+a_writer_cannot_outrun_the_clock :: proc(t: ^testing.T) {
+	state := seeded(51)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 1, 64)
+	defer sim_destroy(&s)
+	a, b, relay := s.nodes[0], s.nodes[1], s.nodes[2]
+	s.now += 1000
+	for x in s.nodes {
+		x.node.now = s.now
+	}
+	relay.node.now -= 50 // a little behind
+	put :: proc(n: ^Node) -> bool {
+		body := make([]byte, 24, context.temp_allocator)
+		put_u64(body, 1 << 32 | 5)
+		put_u64(body[8:], 5)
+		return node_write(n, {{node_id(n, 1), PLACE, .Place, node_stamp(n), body}})
+	}
+	// As late a stamp as a will take.
+	b.node.clock = (s.now + LEAP_MS) << 16 | 0xfffe
+	testing.expect(t, put(&b.node))
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	testing.expect(t, put(&a.node))
+	sim_cut(&s, 0)
+	sim_link(&s, 0, 2)
+	pass_all(&s)
+	testing.expect(t, s.links[0].b.fault == .Clock || s.links[0].b.fault == .None)
+	sim_cut(&s, 0)
+	for x in s.nodes {
+		x.node.now += 60
+	}
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	testing.expect_value(t, census(&relay.node.store), census(&a.node.store))
+	// And what is further ahead than that, nobody takes.
+	far := Cell{node_id(&b.node, 1), DATA, .Value, {(s.now + 60 * 60 * 1000) << 16, 1}, nil}
+	testing.expect(t, !stamp_timely(far.stamp, s.now))
+}
+
+// Whoever has lost the right to write cannot touch what was made since, whatever time they pretend it is.
+@(test)
+the_past_cannot_kill_the_future :: proc(t: ^testing.T) {
+	row := Id{1 << 32 | 1_700_000_100, 5}
+	old := Cell{row, GRAVE, .Grave, {1_700_000_099_999 << 16, 1}, nil}
+	testing.expect(t, !cell_valid(&old))
+	old.stamp.time = 1_700_000_100_000 << 16
+	testing.expect(t, cell_valid(&old))
+	piece := Cell{row, DATA, .Piece, {1, 1}, nil}
+	testing.expect(t, !cell_valid(&piece))
+}
+
+// A device that first meets a newer roster as it starts holds what it has against it all the same; and what
+// was written since the last checkpoint counts towards what time it is.
+@(test)
+starting_is_hearing :: proc(t: ^testing.T) {
+	state := seeded(53)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 1, 64)
+	defer sim_destroy(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_level(&s)
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	sim_cut(&s, 1)
+	testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+		d.scopes[0].rotate = true
+	}))
+	s.now += 10_000
+	sim_put(&s, b, 1) // has not heard
+	store_sync(&b.node.store)
+	testing.expect_value(t, store_clock(memory_disk(&b.disk)), b.node.clock)
+	node_destroy(&b.node)
+	delete(b.roster)
+	b.roster = make([]byte, len(a.node.roster.bytes))
+	copy(b.roster, a.node.roster.bytes)
+	sim_boot(&s, b)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	sim_check(&s)
+	testing.expect_value(t, store_range(&a.node.store, KEY_MIN, KEY_MAX).count, 1)
+	// Having done so once, it does not again.
+	testing.expect_value(t, b.node.serial, b.node.roster.serial)
+	testing.expect_value(t, b.node.serial_kept, b.node.roster.serial)
+}
+
+// Whether or not its disk can keep up, a device that hears of a revocation acts on it.
+@(test)
+a_failing_disk_does_not_admit_the_revoked :: proc(t: ^testing.T) {
+	state := seeded(54)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	a := s.nodes[0]
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	sim_put(&s, a, 1)
+	before := a.roster
+	a.disk.fail = true
+	testing.expect(t, !test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+		draft_revoke(d, s.nodes[1].keys.device)
+	}))
+	testing.expect(t, !s.links[0].b.ready && a.node.failed)
+	testing.expect_value(t, raw_data(a.roster), raw_data(before)) // not kept, and so heard again
+	a.disk.fail = false
+}
+
+// A client on this machine sees what a roster makes unlawful go.
+@(test)
+clients_see_what_is_forgotten :: proc(t: ^testing.T) {
+	state := seeded(55)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_level(&s)
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	body: [24]byte
+	put_u64(body[:], 2 << 32 | 5)
+	put_u64(body[8:], 5)
+	s.now += 1000
+	b.node.now = s.now
+	testing.expect(t, node_write(&b.node, {{node_id(&b.node, 2), PLACE, .Place, node_stamp(&b.node), body[:]}}))
+	sim_settle(&s)
+	ui := session_open(&a.node, .Open, false)
+	defer session_close(ui)
+	a.node.host.authenticate = proc(_: rawptr, s: ^Session, _: []byte) {
+		session_accept(s, {{2, {.Read, .Write}, 0}})
+	}
+	hello := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&hello, .Hello)
+	append(&hello, VERSION, 0)
+	resize(&hello, len(hello) + 32)
+	append(&hello, 0, 0)
+	frame_end(&hello, at)
+	testing.expect(t, session_input(ui, hello[:]))
+	sim_watch(ui, 1, list_lo({2 << 32 | 5, 5}), list_hi({2 << 32 | 5, 5}), 0, {data = true})
+	session_sent(ui, len(session_output(ui)))
+	// b's right turns out to have ended before that.
+	d := draft_from(&a.node.roster, (s.now - 500) << 16)
+	draft_grant(&d, b.keys.device, b.keys.signer, 2, {.Read})
+	bytes, ok := roster_sign(&a.keys, s.root, &d, context.temp_allocator)
+	testing.expect(t, ok && node_adopt(&a.node, bytes))
+	testing.expect_value(t, store_range(&a.node.store, KEY_MIN, KEY_MAX).count, 0)
+	restarted := false
+	out := session_output(ui)
+	r := Reader{buf = out}
+	for r.pos < len(out) {
+		frame := read_bytes(&r)
+		f := Reader{buf = frame[1:]}
+		restarted ||= Message(frame[0]) == .Synced && read_varint(&f) == 1 && Synced_Flags(read_u8(&f)).restart
+	}
+	testing.expect(t, restarted)
+}
+
+// Live text needs a right that stands, not one that stood; and as much may be said as may be sealed.
+@(test)
+live_text_needs_a_standing_right :: proc(t: ^testing.T) {
+	state := seeded(56)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	row := node_id(&a.node, 2)
+	l := Live{row = row, slot = DATA, piece = 7, body = {2, 1, 'x'}, stamp = node_stamp(&b.node)}
+	testing.expect(t, live_seal(&b.node, keyring_scope(b.node.keys, 2), true, &l))
+	again := l
+	testing.expect(t, live_open(&a.node, keyring_scope(a.node.keys, 2), true, &again))
+	testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+		d.now = max(u64) >> 2 // however late it is said to have ended
+		draft_grant(d, s.nodes[1].keys.device, s.nodes[1].keys.signer, 2, {.Read})
+	}))
+	again = l
+	testing.expect(t, !live_open(&a.node, keyring_scope(a.node.keys, 2), true, &again))
+
+	big := Live{row = row, slot = DATA, piece = 8, body = make([]byte, MAX_LIVE_OPEN, context.temp_allocator), stamp = node_stamp(&a.node)}
+	testing.expect(t, live_seal(&a.node, keyring_scope(a.node.keys, 2), true, &big) && len(big.body) <= MAX_LIVE)
+}
+
+// Damage is found in every form: rotted, zeroed, or cut short; and whatever was in it is forgotten unread.
+@(test)
+evacuation_finds_all_damage :: proc(t: ^testing.T) {
+	for damage in 0 ..< 4 {
+		m: Memory_Disk
+		defer memory_disk_destroy(&m)
+		s: Store
+		testing.expect(t, store_open(&s, memory_disk(&m)))
+		defer store_close(&s)
+		body: [SEGMENT / 128]byte
+		first: int
+		for i in 0 ..< 40 {
+			place: [24]byte
+			put_u64(place[:], 1 << 32 | 5)
+			put_u64(place[8:], 5)
+			put_u64(place[16:], u64(i))
+			store_commit(&s, {{{1 << 32, u64(i) + 1}, PLACE, .Place, {u64(i) + 1, 1}, place[:]}, {{1 << 32, u64(i) + 1}, DATA, .Value, {u64(i) + 1, 2}, body[:]}})
+			if i == 0 {
+				first = len(s.buf)
+			}
+		}
+		store_flush(&s)
+		for i in 0 ..< 400 {
+			store_commit(&s, {{{1 << 32, 9999}, DATA, .Value, {u64(i) + 1000, 1}, body[:]}})
+			store_flush(&s)
+		}
+		testing.expect(t, store_tail(&s) / SEGMENT > 1)
+		log := &m.log[0]
+		switch damage {
+		case 0:
+			log[200] ~= 1
+		case 1:
+			for &x in log[:first] {
+				x = 0
+			}
+		case 2:
+			resize(log, first) // at the end of a record
+		case 3:
+			resize(log, first + 20) // in the middle of a placement
+		}
+		for _ in 0 ..< 4 {
+			testing.expectf(t, store_checkpoint(&s), "damage %d", damage)
+		}
+		held := 0
+		scan := tree_scan(&s, s.cells, KEY_MIN, KEY_MAX)
+		for leaf in tree_next(&scan) {
+			_, at := cell_unkey(leaf)
+			testing.expectf(t, len(log_bytes(&s, at.off, at.len)) == at.len, "damage %d", damage)
+			held += 1
+		}
+		testing.expectf(t, !s.failed && held >= (3 if damage > 1 else 79), "damage %d: %d held, failed %v", damage, held, s.failed)
+		check_shelf(t, &s)
+	}
+}
+
+// What a dead process wrote is there to read, and not yet there to stay.
+@(test)
+what_is_found_is_not_yet_kept :: proc(t: ^testing.T) {
+	m: Memory_Disk
+	defer memory_disk_destroy(&m)
+	s: Store
+	testing.expect(t, store_open(&s, memory_disk(&m)))
+	one := random_cell(4, 10)
+	store_commit(&s, {one})
+	testing.expect(t, store_flush(&s))
+	store_close(&s) // the process dies; the system still has it
+	testing.expect(t, store_open(&s, memory_disk(&m)))
+	testing.expect(t, store_unsynced(&s))
+	testing.expect(t, store_checkpoint(&s))
+	testing.expect_value(t, m.kept, memory_disk_end(&m)) // before any page said it was there
+	store_close(&s)
+}
+
+// The dialler's word that all was compared counts when something was, and it said so.
+@(test)
+level_is_not_for_the_asking :: proc(t: ^testing.T) {
+	state := seeded(57)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	at_a := s.links[0].b
+	testing.expect(t, at_a.settled)
+	for short in ([]bool{true, false}) {
+		at_a.settled = false
+		w := make([dynamic]byte, context.temp_allocator)
+		at := frame_begin(&w, .Synced)
+		append(&w, 0, 1)
+		if !short {
+			append(&w, 0, 0, 0, 0)
+			for &x in at_a.watches {
+				x.data = false
+			}
+		}
+		frame_end(&w, at)
+		session_input(at_a, w[:])
+		testing.expect(t, !at_a.settled)
+	}
+}
+
+// An acknowledgement says what it does not cover, so that a right regained finds what it was owed.
+@(test)
+refusals_are_not_acknowledged :: proc(t: ^testing.T) {
+	state := seeded(58)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 1, 1, 1, 64)
+	defer sim_destroy(&s)
+	a, phone, relay := s.nodes[0], s.nodes[1], s.nodes[2]
+	sim_level(&s)
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	// The relay hears that the phone may not write; the phone has not yet, and writes.
+	testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+		d.now = 1 << 62
+		draft_revoke(d, s.nodes[1].keys.device, 1)
+	}))
+	out := session_output(s.links[0].a)
+	copied := make([]byte, len(out), context.temp_allocator)
+	copy(copied, out)
+	session_sent(s.links[0].a, len(out))
+	session_input(s.links[0].b, copied)
+	testing.expect_value(t, relay.node.roster.serial, a.node.roster.serial)
+	sim_put(&s, phone, 1)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&a.node.store, KEY_MIN, KEY_MAX).count, 0)
+	testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+		draft_grant(d, s.nodes[1].keys.device, s.nodes[1].keys.signer, 1, {.Write})
+	}))
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&a.node.store, KEY_MIN, KEY_MAX).count, 1)
+}
+
+// A right lost and regained, by one who was there all along, brings what was missed between.
+@(test)
+rights_regained_bring_what_was_missed :: proc(t: ^testing.T) {
+	state := seeded(59)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 3, 0, 1, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	sim_link(&s, 0, 3)
+	sim_link(&s, 2, 3)
+	sim_link(&s, 1, 2) // and one that is dialled by the one who loses it
+	sim_settle(&s)
+	testing.expect(t, test_amend(&s, s.nodes[0], proc(s: ^Sim, d: ^Draft) {
+		draft_revoke(d, s.nodes[2].keys.device, 1)
+	}))
+	sim_settle(&s)
+	sim_put(&s, s.nodes[0], 1)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&s.nodes[2].node.store, KEY_MIN, KEY_MAX).count, 0)
+	testing.expect(t, test_amend(&s, s.nodes[0], proc(s: ^Sim, d: ^Draft) {
+		draft_grant(d, s.nodes[2].keys.device, s.nodes[2].keys.signer, 1, {.Write})
+	}))
+	sim_settle(&s)
+	sim_check(&s)
+}
+
+// Which key a late cell is sealed under again does not depend on which rosters a device happened to hear.
+@(test)
+resealing_is_canonical :: proc(t: ^testing.T) {
+	state := seeded(60)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 3, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, b, c := s.nodes[0], s.nodes[1], s.nodes[2]
+	rotate :: proc(s: ^Sim, d: ^Draft) {
+		d.scopes[0].rotate = true
+	}
+	testing.expect(t, test_amend(&s, a, rotate))
+	s.now += 1000
+	sim_put(&s, b, 1)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	sim_cut(&s, 0)
+	testing.expect(t, node_adopt(&b.node, a.node.roster.bytes))
+	s.now += 1000
+	a.node.now = s.now
+	testing.expect(t, test_amend(&s, a, rotate))
+	testing.expect(t, node_adopt(&b.node, a.node.roster.bytes)) // has heard both
+	testing.expect(t, node_adopt(&c.node, a.node.roster.bytes)) // only the second
+	testing.expect_value(t, census(&b.node.store), census(&c.node.store))
+}
+
+// An admin governs, and can be unmade; an owner cannot, least of all by an admin.
+@(test)
+admins_come_and_go :: proc(t: ^testing.T) {
+	root, space := test_root()
+	a, b, c := test_keyring(), test_keyring(), test_keyring()
+	defer keyring_destroy(&a)
+	defer keyring_destroy(&b)
+	defer keyring_destroy(&c)
+	none: Roster
+	d := draft_from(&none, 100)
+	home := draft_scope(&d)
+	draft_grant(&d, a.device, a.signer, home, {.Write}).owner = true
+	draft_grant(&d, b.device, b.signer, home, {.Write}).admin = true
+	r1 := test_publish(t, &a, root, space, &d)
+	defer roster_destroy(&r1)
+	testing.expect(t, roster_unwrap(&a, &r1) && roster_unwrap(&b, &r1))
+	testing.expect(t, a.root == root && b.root == nil)
+	testing.expect(t, keyring_rules(&a, &r1) && keyring_rules(&b, &r1) && !keyring_rules(&c, &r1))
+
+	// An admin may admit, and may rotate.
+	d = draft_from(&r1, 200)
+	draft_grant(&d, c.device, c.signer, home, {.Write})
+	d.scopes[0].rotate = true
+	bytes, ok := roster_sign(&b, nil, &d, context.temp_allocator)
+	testing.expect(t, ok)
+	r2, sound := roster_parse(bytes, space)
+	defer roster_destroy(&r2)
+	testing.expect(t, sound && r2.serial > r1.serial && roster_unwrap(&c, &r2) && roster_unwrap(&a, &r2) && roster_unwrap(&b, &r2))
+
+	// But may make no admin, and nobody else may sign at all.
+	d = draft_from(&r2, 300)
+	d.members[2].admin = true
+	_, ok = roster_sign(&b, nil, &d, context.temp_allocator)
+	testing.expect(t, !ok)
+	d = draft_from(&r2, 300)
+	_, ok = roster_sign(&c, nil, &d, context.temp_allocator)
+	testing.expect(t, !ok)
+
+	// Nor leave the owner out: the charter goes with every roster, and the owner's key is in it.
+	d = draft_from(&r2, 300)
+	ordered_remove(&d.members, 0)
+	_, ok = roster_sign(&b, nil, &d, context.temp_allocator)
+	testing.expect(t, !ok) // and one who signed it regardless
+	d.owners = nil
+	bytes, ok = roster_sign(&b, nil, &d, context.temp_allocator)
+	testing.expect(t, ok)
+	coup, parsed := roster_parse(bytes, space)
+	defer roster_destroy(&coup)
+	testing.expect(t, parsed && !roster_unwrap(&a, &coup) && a.root == root)
+
+	// The owner unmakes the admin, and no serial the admin can reach outranks that.
+	testing.expect(t, roster_unwrap(&a, &r2))
+	d = draft_from(&r2, 400)
+	draft_revoke(&d, b.device)
+	r3 := test_publish(t, &a, root, space, &d)
+	defer roster_destroy(&r3)
+	testing.expect(t, roster_unwrap(&a, &r3) && !keyring_rules(&b, &r3))
+	d = draft_from(&r2, 500)
+	d.last |= 1 << TERM_SHIFT - 1
+	d.last &~= 1 << COUNT_SHIFT
+	bytes, ok = roster_sign(&b, nil, &d, context.temp_allocator)
+	if ok {
+		late, _ := roster_parse(bytes, space)
+		testing.expect(t, late.serial < r3.serial)
+		roster_destroy(&late)
+	}
+
+	// One who lacks a scope's keys cannot sign for it, rather than losing them for everyone.
+	d = draft_from(&r3, 600)
+	stranger := test_keyring()
+	defer keyring_destroy(&stranger)
+	_, ok = roster_sign(&stranger, root, &d, context.temp_allocator)
+	testing.expect(t, !ok)
+}
+
+// Whoever offers what has been superseded is sent what superseded it, all of it.
+@(test)
+the_stale_are_told :: proc(t: ^testing.T) {
+	state := seeded(61)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	rows: [200]Id
+	old := make([]Cell, len(rows), context.temp_allocator)
+	for &row, i in rows {
+		row = node_id(&b.node, 1)
+		old[i] = {row, DATA, .Value, node_stamp(&b.node), nil}
+		testing.expect(t, cell_seal(&b.keys, &b.node.roster, &old[i]))
+	}
+	for row in rows {
+		c := Cell{row, DATA, .Value, node_stamp(&a.node), nil}
+		c.stamp.time += 1 << 20
+		testing.expect(t, cell_seal(&a.keys, &a.node.roster, &c))
+		store_commit(&a.node.store, {c})
+	}
+	at_a := s.links[0].b
+	testing.expect(t, session_input(at_a, raw_cells(old)))
+	testing.expect_value(t, len(at_a.tasks) - at_a.task_head, len(rows))
+	for task, i in at_a.tasks[at_a.task_head:] {
+		testing.expect_value(t, task.row, rows[i])
+	}
+}
+
+// Cells that came before their row's first place go with it to everyone, whoever brought the place.
+@(test)
+rows_come_into_view_whole :: proc(t: ^testing.T) {
+	state := seeded(62)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 1, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, b, relay := s.nodes[0], s.nodes[1], s.nodes[2]
+	body: [24]byte
+	put_u64(body[:], 1 << 32 | 5)
+	put_u64(body[8:], 5)
+	row := node_id(&b.node, 1)
+	place := Cell{row, PLACE, .Place, node_stamp(&b.node), body[:]}
+	piece := Cell{row, DATA, .Piece, node_stamp(&b.node), nil}
+	testing.expect(t, node_write(&b.node, {place}))
+	testing.expect(t, cell_seal(&b.keys, &b.node.roster, &piece))
+	store_commit(&a.node.store, {piece})
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	sim_check(&s)
+	testing.expect_value(t, census(&relay.node.store).cells.count, 2)
+}
+
+// What was withheld from a peer is not acknowledged by it, along with what was not.
+@(test)
+what_is_withheld_is_still_owed :: proc(t: ^testing.T) {
+	state := seeded(63)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 1, 1, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	phone := s.nodes[1]
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	at_phone := s.links[0].a
+	sim_put(&s, phone, 1)
+	out := session_output(at_phone)
+	copied := make([]byte, len(out), context.temp_allocator)
+	copy(copied, out)
+	session_sent(at_phone, len(out))
+	// On its way; and now the row changes, while the peer may not read it.
+	kept := at_phone.grants[0]
+	at_phone.grants[0].rights = {}
+	scan := tree_scan(&phone.node, phone.node.cells, KEY_MIN, KEY_MAX)
+	leaf, _ := tree_next(&scan)
+	row := Id{leaf.key[0], leaf.key[1]}
+	testing.expect(t, node_write(&phone.node, {{row, DATA, .Value, node_stamp(&phone.node), nil}}))
+	_ = session_output(at_phone)
+	testing.expect(t, session_input(s.links[0].b, copied))
+	sim_settle(&s)
+	testing.expect(t, phone.node.outbox.root != 0)
+	at_phone.grants[0] = kept
+	outbox_send(at_phone)
+	sim_settle(&s)
+	testing.expect_value(t, census(&s.nodes[0].node.store), census(&phone.node.store))
+	testing.expect_value(t, phone.node.outbox.root, 0)
+}
+
+// What a device that has gone had taken charge of, and told nobody, is offered again by whoever gave it.
+@(test)
+the_revoked_take_nothing_with_them :: proc(t: ^testing.T) {
+	state := seeded(64)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 1, 1, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, phone := s.nodes[0], s.nodes[2]
+	sim_link(&s, 2, 1)
+	sim_settle(&s)
+	sim_put(&s, phone, 1)
+	sim_settle(&s)
+	testing.expect_value(t, phone.node.outbox.root, 0)
+	sim_cut(&s, 0)
+	s.now += 1000
+	a.node.now = s.now
+	testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {
+		draft_revoke(d, s.nodes[1].keys.device)
+	}))
+	sim_link(&s, 0, 3)
+	sim_link(&s, 2, 3)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&a.node.store, KEY_MIN, KEY_MAX).count, 1)
+	testing.expect_value(t, phone.node.outbox.root, 0)
 }

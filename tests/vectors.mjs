@@ -114,7 +114,7 @@ for (const c of v.cells) {
   dhMix(dh(x.initiator_ephemeral, rs));
   const s1 = put(is);
   dhMix(dh(x.initiator, rs));
-  const s2 = put(Buffer.alloc(0));
+  const s2 = put(x.when);
   assert.deepEqual(Buffer.concat([ie, s1, s2]), x.first);
   mix(re);
   dhMix(dh(x.initiator_ephemeral, re));

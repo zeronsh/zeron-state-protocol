@@ -95,29 +95,30 @@ node_destroy :: proc(n: ^Node) {
 // one it no longer allows, its keys go and its clients are told. (What it already holds is the host's to
 // keep or wipe.)
 node_adopt :: proc(n: ^Node, bytes: []byte) -> bool {
-	r := roster_parse(bytes, n.space) or_return
-	if r.serial <= n.roster.serial {
-		roster_destroy(&r)
+	if serial := roster_claims(bytes, n.space) or_return; serial <= n.roster.serial {
 		return false
 	}
-	old_keys: Keyring
-	if n.keys != nil {
-		old_keys.scopes = n.keys.scopes
-		n.keys.scopes = {}
-		if !roster_unwrap(n.keys, &r) {
-			keyring_clear(n.keys)
-			n.keys.root = nil
-		}
+	r := roster_parse(bytes, n.space, &n.roster) or_return
+	return node_take(n, r)
+}
+
+// Takes a roster that is genuine and newer.
+@(private)
+node_take :: proc(n: ^Node, r: Roster) -> bool {
+	r := r
+	if n.keys != nil && !roster_unwrap(n.keys, &r) {
+		keyring_clear(n.keys)
 	}
 	old := n.roster
 	n.roster = r
-	swept := roster_sweep(n, &old, &old_keys)
+	swept := roster_sweep(n, &old)
 	roster_destroy(&old)
-	keyring_destroy(&old_keys)
-	if swept && !store_checkpoint(&n.store) {
-		return false // or a crash could bring back, under this roster, what it made unlawful
-	}
-	if n.host.roster != nil {
+	// The trees say which roster they have been held against, and are written first: or a crash could bring
+	// back, under this roster, what it made unlawful. A store that fails at this has failed, and its host must
+	// begin again from what it has; but who may be here is settled already.
+	n.serial = n.roster.serial
+	ok := n.serial == n.serial_kept || store_checkpoint(&n.store)
+	if ok && n.host.roster != nil {
 		n.host.roster(n.host.data, n.roster.bytes)
 	}
 	for s in n.sessions {
@@ -132,9 +133,10 @@ node_adopt :: proc(n: ^Node, bytes: []byte) -> bool {
 			session_recompare(s)
 		}
 	}
+	node_balance(n) // there may be scopes a hushed relay was never asked about
 	rpc_roster_changed(n)
 	reach_tell(n)
-	return true
+	return ok
 }
 
 // Whether the roster allows this device anything at all.
@@ -146,18 +148,22 @@ node_member :: proc(n: ^Node) -> bool {
 
 // A roster can make unlawful what was accepted before it was heard: cells later than the end of the key
 // or the right they were written by. One sealed under an old key by someone who merely had not heard is
-// sealed again, under the new key, its identity unchanged, by every device that can; what cannot be is
+// sealed again, under a key that had not, its identity unchanged, by every device that can; what cannot be is
 // dropped. Either way all replicas come to hold the same.
 @(private)
-roster_sweep :: proc(n: ^Node, old: ^Roster, old_keys: ^Keyring) -> (swept: bool) {
+roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
+	if n.serial == n.roster.serial {
+		return // what is held was held against this very one, before a restart
+	}
+	lost: [dynamic]Leaf // not in temporary memory, which is given back below
+	defer delete(lost)
 	for info in n.roster.scopes {
+		// With no roster to compare with, every end is new.
 		was := roster_scope(old, info.id)
-		if was == nil {
-			continue
-		}
+		epoch := was.epoch if was != nil else 1
 		from := max(u64)
-		if .Signed not_in info.flags && info.epoch > was.epoch {
-			from = info.closed[was.epoch - 1]
+		if .Signed not_in info.flags && info.epoch > epoch {
+			from = info.closed[epoch - 1]
 		}
 		if .Signed in info.flags {
 			for m in n.roster.members {
@@ -172,7 +178,6 @@ roster_sweep :: proc(n: ^Node, old: ^Roster, old_keys: ^Keyring) -> (swept: bool
 		if from == max(u64) {
 			continue
 		}
-		swept = true
 		late := make([dynamic]Leaf, context.temp_allocator)
 		scan := tree_scan(n, n.cells, scope_lo(info.id), scope_hi(info.id))
 		for leaf in tree_next(&scan) {
@@ -180,17 +185,31 @@ roster_sweep :: proc(n: ^Node, old: ^Roster, old_keys: ^Keyring) -> (swept: bool
 				append(&late, leaf)
 			}
 		}
+		if n.partial {
+			// Whoever took what this holds may be among those who have gone, and may have told nobody.
+			scan = tree_scan(n, n.shelf, scope_lo(info.id), scope_hi(info.id))
+			for leaf in tree_next(&scan) {
+				row := key_row(leaf.key)
+				tree_put(n, &n.outbox, {row[0], row[1], 0, 0, 0}, {})
+			}
+		}
 		for leaf in late {
 			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 			c, at := cell_unkey(leaf)
 			c.body = log_bytes(&n.store, at.off, at.len)
-			if c.body == nil || cell_authentic(&n.roster, &c) {
+			if c.body == nil || cell_lawful(&n.roster, &c) {
 				continue
 			}
-			c.body = slice.clone(c.body, context.temp_allocator)
-			again := c
-			if n.keys != nil && .Signed not_in info.flags && cell_open(old_keys, &n.roster, &again) && cell_seal(n.keys, &n.roster, &again) {
-				store_replace(&n.store, &again)
+			swept = true
+			// Under the key that was in force at its time: the same, whichever rosters a device heard or missed.
+			epoch := 1
+			for epoch < int(info.epoch) && c.stamp.time > info.closed[epoch - 1] {
+				epoch += 1
+			}
+			if n.keys != nil && .Signed not_in info.flags && cell_open(n.keys, &n.roster, &c) && cell_seal(n.keys, &n.roster, &c, epoch) {
+				if !store_replace(&n.store, &c) {
+					return // the checkpoint to come fails too
+				}
 				// Someone who had heard already may have refused it, and will take it now.
 				places := row_places(&n.store, c.row)
 				ring_push(&n.events, {c.row, c.slot, c.kind, c.stamp, 0}, &places, &places)
@@ -198,10 +217,11 @@ roster_sweep :: proc(n: ^Node, old: ^Roster, old_keys: ^Keyring) -> (swept: bool
 					tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
 				}
 			} else {
-				forget(&n.store, leaf)
+				append(&lost, leaf)
 			}
 		}
 	}
+	forget(&n.store, lost[:])
 	return
 }
 
@@ -227,12 +247,16 @@ node_stamp :: proc(n: ^Node) -> (s: Stamp) {
 node_id :: proc(n: ^Node, scope: Scope) -> Id {
 	b: [8]byte
 	node_random(n, b[:])
+	n.clock = max(n.clock, n.now << 16) // should the clock be set back, the row is still no younger than its cells
 	return {u64(scope) << 32 | u64(u32(n.now / 1000)), get_u64(b[:])}
 }
 
 // Writes open cells on behalf of this node itself. False, and nothing written, if it may not.
 node_write :: proc(n: ^Node, cells: []Cell) -> bool {
 	for &c in cells {
+		if c.stamp.time > n.clock && !stamp_timely(c.stamp, n.now) {
+			return false // not from node_stamp
+		}
 		if len(c.body) > MAX_OPEN || !cell_valid(&c) || !node_may_write(n, row_scope(c.row)) || !cell_seal(n.keys, &n.roster, &c) {
 			return false
 		}
@@ -357,7 +381,12 @@ interest_send :: proc(to: ^Session, it: ^Interest) {
 outbox_send :: proc(s: ^Session) {
 	scan := tree_scan(s.node, s.node.outbox, KEY_MIN, KEY_MAX)
 	for leaf in tree_next(&scan) {
-		append(&s.tasks, Task{kind = .Row, row = {leaf.key[0], leaf.key[1]}})
+		// What may not be written now is kept, in case that changes.
+		row := Id{leaf.key[0], leaf.key[1]}
+		info := roster_scope(&s.node.roster, row_scope(row))
+		if info != nil && (.Signed in info.flags || node_may_write(s.node, info.id)) {
+			append(&s.tasks, Task{kind = .Row, row = row})
+		}
 	}
 }
 

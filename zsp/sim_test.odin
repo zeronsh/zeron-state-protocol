@@ -1,6 +1,7 @@
 #+build !js
 package zsp
 
+import "base:runtime"
 import "core:fmt"
 import "core:math/rand"
 import "core:slice"
@@ -18,6 +19,7 @@ Sim_Node :: struct {
 	relay:  bool,
 	full:   bool,
 	roster: []byte, // as persisted
+	skew:   i64, // of its clock, in milliseconds
 }
 
 @(private)
@@ -60,6 +62,7 @@ sim_init :: proc(t: ^testing.T, s: ^Sim, full, partial, relays, ring: int) {
 		x.secret = x.keys.secret
 		x.relay = i >= full + partial
 		x.full = i < full || x.relay
+		x.skew = rand.int63_max(600_000) - 300_000
 		append(&s.nodes, x)
 		if !x.relay {
 			draft_grant(&d, x.keys.device, x.keys.signer, home, {.Write, .Call})
@@ -87,14 +90,14 @@ sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 		if s.role == .Peer {
 			session_accept(s)
 		} else if string(credential) == "let me in" {
-			session_accept(s, {{1, {.Read, .Write, .Call}, 0}})
+			session_accept(s, {{0, {.Read, .Write, .Call}, 0}})
 		} else {
 			session_refuse(s)
 		}
 	}
-	x.node.now = s.now
+	x.node.now = sim_now(s, x)
 	if x.roster != nil {
-		assert(node_adopt(&x.node, x.roster))
+		assert(node_adopt(&x.node, x.roster) && !x.node.failed)
 	} else if !x.relay {
 		assert(node_adopt(&x.node, s.roster))
 	}
@@ -106,13 +109,48 @@ sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 	}
 }
 
-// The first device draws new keys, as after a revocation; the others hear of it when they hear of it.
 @(private)
-sim_rotate :: proc(s: ^Sim) {
+sim_now :: proc(s: ^Sim, x: ^Sim_Node) -> u64 {
+	return u64(i64(s.now) + x.skew)
+}
+
+// The first device changes who may do what, or draws new keys; the others hear of it when they hear of it.
+@(private)
+sim_rotate :: proc(s: ^Sim, restore := false) {
 	x := s.nodes[0]
-	x.node.now = s.now
-	d := draft_from(&x.node.roster, max(x.node.clock, s.now << 16))
-	d.scopes[rand.int_max(2)].rotate = true
+	x.node.now = sim_now(s, x)
+	d := draft_from(&x.node.roster, max(x.node.clock, x.node.now << 16))
+	who := s.nodes[1 + rand.int_max(len(s.nodes) - 1)]
+	switch r := rand.int_max(6); {
+	case restore:
+		for y, i in s.nodes {
+			if !y.relay {
+				draft_grant(&d, y.keys.device, y.keys.signer, 1, {.Write, .Call})
+				draft_grant(&d, y.keys.device, y.keys.signer, 2, {.Write} if i < 2 else {.Read})
+				for z in d.scopes[2:] {
+					draft_grant(&d, y.keys.device, y.keys.signer, z.id, {.Write})
+				}
+			}
+		}
+	case r < 2:
+		d.scopes[rand.int_max(2)].rotate = true
+	case r == 2 && !who.relay:
+		draft_grant(&d, who.keys.device, who.keys.signer, 2, {.Read})
+	case r == 3 && !who.relay:
+		draft_grant(&d, who.keys.device, who.keys.signer, 2, {.Write})
+	case r == 4 && !who.relay:
+		// All but the scope it stays a member by.
+		draft_revoke(&d, who.keys.device, 1)
+	case r == 5 && len(d.scopes) < 4:
+		id := draft_scope(&d)
+		for y in s.nodes {
+			if !y.relay {
+				draft_grant(&d, y.keys.device, y.keys.signer, id, {.Write})
+			}
+		}
+	case !who.relay:
+		draft_grant(&d, who.keys.device, who.keys.signer, 1, {.Write, .Call})
+	}
 	bytes, ok := roster_sign(&x.keys, s.root, &d)
 	defer delete(bytes)
 	testing.expect(s.t, ok && node_adopt(&x.node, bytes))
@@ -210,14 +248,17 @@ sim_settle :: proc(s: ^Sim) {
 @(private)
 sim_write :: proc(s: ^Sim, x: ^Sim_Node) {
 	s.now += u64(rand.int_max(30))
-	x.node.now = s.now + u64(rand.int_max(5)) // clocks disagree
+	x.node.now = sim_now(s, x) // clocks disagree
 	body := make([]byte, 24 + rand.int_max(200), context.temp_allocator)
 	for &b in body {
 		b = byte(rand.uint32())
 	}
-	scope := Scope(1 + rand.int_max(5) / 4)
+	scope := Scope(1 + rand.int_max(9) / 4)
 	if !node_may_write(&x.node, scope) {
 		scope = 1
+	}
+	if !node_may_write(&x.node, scope) {
+		return
 	}
 	put_u64(body, u64(scope) << 32 | u64(1 + rand.int_max(6)))
 	put_u64(body[8:], 77)
@@ -286,12 +327,23 @@ sim_write :: proc(s: ^Sim, x: ^Sim_Node) {
 }
 
 @(private)
-sim_check :: proc(s: ^Sim) {
+sim_check :: proc(s: ^Sim, looked := false) {
 	want: Maybe(Census)
 	for x, i in s.nodes {
-		if !x.full {
+		testing.expectf(s.t, !x.node.failed && x.node.roster.serial == s.nodes[0].node.roster.serial, "node %d missed a roster, or failed", i)
+		scan := tree_scan(&x.node, x.node.cells, KEY_MIN, KEY_MAX)
+		for leaf in tree_next(&scan) {
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			c, at := cell_unkey(leaf)
+			c.body = log_bytes(&x.node.store, at.off, at.len)
+			// Signatures are checked once: the others hold the very same bytes, as will be seen.
+			sound := cell_valid(&c) && (cell_authentic(&x.node.roster, &c) if i == 0 else cell_lawful(&x.node.roster, &c))
+			sound &&= (x.relay || cell_open(&x.keys, &x.node.roster, &c))
+			testing.expectf(s.t, sound, "node %d holds what nobody may", i)
+		}
+		if !x.full && !looked {
 			// A partial replica may lag a full one, but never knows better.
-			scan := tree_scan(&x.node, x.node.cells, KEY_MIN, KEY_MAX)
+			scan = tree_scan(&x.node, x.node.cells, KEY_MIN, KEY_MAX)
 			for leaf in tree_next(&scan) {
 				c, _ := cell_unkey(leaf)
 				news := store_news(&s.nodes[0].node.store, c.row, c.slot, c.kind, c.stamp)
@@ -299,15 +351,38 @@ sim_check :: proc(s: ^Sim) {
 			}
 			continue
 		}
-		got := census(&x.node.store)
+		check_shelf(s.t, &x.node.store)
+		got := census(&x.node.store, shelved = true)
 		w, have := want.?
 		if !have {
 			want = got
 			continue
 		}
 		testing.expectf(s.t, got == w, "node %d differs: %v %v", i, got, w)
-		check_shelf(s.t, &x.node.store)
 	}
+}
+
+// Has every partial replica look at everything, which is to say that it must come to hold the same as a full one.
+// What it only happens to have cached may be more than anyone else has kept: a writer that died before its
+// disk had what it had already said.
+@(private)
+sim_look :: proc(s: ^Sim) {
+	lookers := make([dynamic]^Session, context.temp_allocator)
+	for x in s.nodes {
+		if !x.full {
+			ui := sim_client(s, x)
+			for info in x.node.roster.scopes {
+				sim_watch(ui, u64(info.id), scope_lo(info.id), scope_hi(info.id), 0, {data = true, known = true})
+			}
+			append(&lookers, ui)
+		}
+	}
+	sim_settle(s)
+	sim_check(s, looked = true)
+	for ui in lookers {
+		session_close(ui)
+	}
+	sim_settle(s)
 }
 
 @(private)
@@ -343,8 +418,20 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 			if rand.int_max(2) == 0 {
 				store_checkpoint(&x.node.store)
 			}
-			store_flush(&x.node.store)
+			if rand.int_max(2) == 0 {
+				store_flush(&x.node.store)
+			}
 			node_destroy(&x.node)
+			// Of what was written and not synced, some may be there and some not.
+			if end := memory_disk_end(&x.disk); end > x.disk.kept && x.disk.kept / SEGMENT == end / SEGMENT {
+				d := memory_disk(&x.disk)
+				d.log_truncate(&x.disk, x.disk.kept + u64(rand.int_max(int(end - x.disk.kept) + 1)))
+			}
+			if x != s.nodes[0] && rand.int_max(3) == 0 {
+				// And someone gave it the latest roster meanwhile.
+				delete(x.roster)
+				x.roster = slice.clone(s.nodes[0].node.roster.bytes)
+			}
 			sim_boot(s, x)
 		case:
 			if len(s.links) > 0 {
@@ -371,16 +458,35 @@ network_converges :: proc(t: ^testing.T) {
 		sim_init(t, &s, full = 3, partial = 1, relays = 1 + seed % 2, ring = 8 if seed % 3 == 0 else 256)
 		defer sim_destroy(&s)
 		sim_chaos(&s, 800)
-		// Heal, through the relays alone.
+		// Heal, through the relays alone, or with them hushed.
+		direct := seed % 4 == 3
+		sim_rotate(&s, restore = true)
 		for i in 0 ..< len(s.nodes) {
 			for j in 0 ..< len(s.nodes) {
-				if !s.nodes[i].relay && s.nodes[j].relay {
+				if !s.nodes[i].relay && (s.nodes[j].relay || (direct && s.nodes[j].full && i != j)) {
 					sim_link(&s, i, j)
 				}
 			}
 		}
 		sim_settle(&s)
-		sim_check(&s)
+		sim_look(&s)
+		// And go on, whole, through changes of everything.
+		for _ in 0 ..< 30 {
+			switch rand.int_max(8) {
+			case 0:
+				sim_rotate(&s)
+			case 1:
+				sim_settle(&s)
+			case:
+				if x := rand.choice(s.nodes[:]); !x.relay {
+					sim_write(&s, x)
+				}
+			}
+			free_all(context.temp_allocator)
+		}
+		sim_rotate(&s, restore = true)
+		sim_settle(&s)
+		sim_look(&s)
 		if testing.failed(t) {
 			fmt.println("seed", seed)
 			return
@@ -400,7 +506,7 @@ reconcile_is_logarithmic :: proc(t: ^testing.T) {
 	x := s.nodes[0]
 	for i in 0 ..< 20_000 {
 		s.now += 3
-		x.node.now = s.now
+		x.node.now = sim_now(&s, x)
 		body: [24]byte
 		put_u64(body[:], 1 << 32 | u64(i % 10) + 1)
 		put_u64(body[16:], u64(i))
@@ -536,7 +642,7 @@ partial_replica :: proc(t: ^testing.T) {
 @(private)
 sim_put :: proc(s: ^Sim, x: ^Sim_Node, order: u64) {
 	s.now += 3
-	x.node.now = s.now
+	x.node.now = sim_now(s, x)
 	body: [24]byte
 	put_u64(body[:], 1 << 32 | 5)
 	put_u64(body[8:], 5)

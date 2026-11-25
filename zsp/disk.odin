@@ -25,6 +25,8 @@ Memory_Disk :: struct {
 	writes:      int,
 	bytes:       int,
 	syncs:       int,
+	kept:        u64, // the log's end when it was last synced
+	fail:        bool, // writes and syncs, from now on
 }
 
 memory_disk :: proc(m: ^Memory_Disk) -> Disk {
@@ -32,6 +34,9 @@ memory_disk :: proc(m: ^Memory_Disk) -> Disk {
 		data = m,
 		log_write = proc(data: rawptr, off: u64, bytes: []byte) -> bool {
 			m := (^Memory_Disk)(data)
+			if m.fail {
+				return false
+			}
 			seg := off / SEGMENT
 			if seg not_in m.log {
 				m.log[seg] = make([dynamic]byte)
@@ -55,12 +60,8 @@ memory_disk :: proc(m: ^Memory_Disk) -> Disk {
 			}
 			return copy(into, b[at:]) == len(into)
 		},
-		log_end = proc(data: rawptr) -> (end: u64) {
-			m := (^Memory_Disk)(data)
-			for seg, b in m.log {
-				end = max(end, seg * SEGMENT + u64(len(b)))
-			}
-			return
+		log_end = proc(data: rawptr) -> u64 {
+			return memory_disk_end((^Memory_Disk)(data))
 		},
 		log_drop = proc(data: rawptr, segment: u64) {
 			m := (^Memory_Disk)(data)
@@ -80,8 +81,10 @@ memory_disk :: proc(m: ^Memory_Disk) -> Disk {
 			}
 		},
 		log_sync = proc(data: rawptr) -> bool {
-			(^Memory_Disk)(data).syncs += 1
-			return true
+			m := (^Memory_Disk)(data)
+			m.syncs += 1
+			m.kept = memory_disk_end(m)
+			return !m.fail
 		},
 		page = proc(data: rawptr, no: u32) -> ^Page {
 			return (^Memory_Disk)(data).pages[no]
@@ -99,11 +102,20 @@ memory_disk :: proc(m: ^Memory_Disk) -> Disk {
 			return true
 		},
 		page_sync = proc(data: rawptr) -> bool {
-			(^Memory_Disk)(data).syncs += 1
-			return true
+			m := (^Memory_Disk)(data)
+			m.syncs += 1
+			return !m.fail
 		},
 		close = proc(data: rawptr) {},
 	}
+}
+
+@(private)
+memory_disk_end :: proc(m: ^Memory_Disk) -> (end: u64) {
+	for seg, b in m.log {
+		end = max(end, seg * SEGMENT + u64(len(b)))
+	}
+	return
 }
 
 memory_disk_destroy :: proc(m: ^Memory_Disk) {

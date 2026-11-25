@@ -16,6 +16,7 @@ import "core:slice"
 
 SEGMENT :: #config(ZSP_SEGMENT, 16 << 20)
 RECORD_HEAD :: 8
+ROLLED :: max(u32) // where a record's size would be, says that the segment ends here
 MAX_RECORD :: SEGMENT / 2
 CHECKPOINT_TAIL :: SEGMENT / 4 // log bytes replayed at worst on open
 CHECKPOINT_DIRTY :: 1024 // pages held in memory at worst
@@ -38,6 +39,8 @@ Store :: struct {
 	flushed:     int,
 	checkpoint:  u64, // replay starts here
 	synced:      u64, // durable up to here
+	serial:      u64, // of the roster this was last held against
+	serial_kept: u64,
 	failed:      bool,
 
 	// Recent changes, for tailing. See events.odin.
@@ -49,6 +52,7 @@ Header :: struct {
 	generation: u64,
 	log:        u64,
 	clock:      u64,
+	serial:     u64,
 	shelf:      u32,
 	cells:      u32,
 	waste:      u32,
@@ -115,6 +119,7 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 	best := store_header(disk)
 	s.generation = best.generation
 	s.clock = best.clock
+	s.serial, s.serial_kept = best.serial, best.serial
 	s.checkpoint = best.log
 	s.shelf.root, s.cells.root = best.shelf, best.cells
 	s.waste.root, s.outbox.root = best.waste, best.outbox
@@ -152,10 +157,21 @@ store_header :: proc(disk: Disk) -> (best: Header) {
 	return
 }
 
-// The latest stamp time a store had seen when it was last checkpointed, without opening it.
+// The latest stamp time a store has seen, without opening it.
 @(require_results)
 store_clock :: proc(disk: Disk) -> u64 {
-	return store_header(disk).clock
+	h := store_header(disk)
+	log_scan(disk, h.log, &h.clock, proc(data: rawptr, _: u64, body: []byte) {
+		clock := (^u64)(data)
+		r := Reader{buf = body}
+		row: Id
+		for r.pos < len(r.buf) {
+			c := read_cell(&r, row) or_break
+			row = c.row
+			clock^ = max(clock^, c.stamp.time)
+		}
+	})
+	return h.clock
 }
 
 @(private)
@@ -197,49 +213,58 @@ find_free :: proc(s: ^Store) {
 // only what follows the last good record, and so is torn or nothing, is cut off.
 @(private)
 replay :: proc(s: ^Store) -> bool {
-	end := s.disk.log_end(s.disk.data)
 	s.buf_base = max(u64) // nothing is buffered yet
-	tail := s.checkpoint
-	for at := s.checkpoint; at < end; at = (at / SEGMENT + 1) * SEGMENT {
+	tail := log_scan(s.disk, s.checkpoint, s, proc(data: rawptr, pos: u64, body: []byte) {
+		replay_record((^Store)(data), pos, body)
+	})
+	if tail < s.disk.log_end(s.disk.data) {
+		s.disk.log_truncate(s.disk.data, tail)
+	}
+	ring_clear(&s.events)
+	s.buf_base = tail
+	// What was only found there may be in the system's keeping rather than the disk's: whoever wrote it died.
+	s.synced = s.checkpoint
+	return true
+}
+
+// Finds every sound record from an offset on. Returns the end of the last.
+@(private)
+log_scan :: proc(disk: Disk, from: u64, data: rawptr, each: proc(data: rawptr, pos: u64, body: []byte)) -> (tail: u64) {
+	end := disk.log_end(disk.data)
+	tail = from
+	for at := from; at < end; at = (at / SEGMENT + 1) * SEGMENT {
 		size := min(end, (at / SEGMENT + 1) * SEGMENT) - at
 		// Only the last segment is known to reach this far; others end where their records do.
 		part := make([]byte, size)
 		defer delete(part)
-		for !s.disk.log_read(s.disk.data, at, part[:size]) {
-				size = log_size(s, at, size)
+		for !disk.log_read(disk.data, at, part[:size]) {
+			size = log_size(disk, at, size)
 			if size == 0 {
 				break
 			}
 		}
-		pos := 0
-		for pos < int(size) {
+		for pos := 0; pos < int(size); {
 			n := record_at(part[pos:size])
 			if n == 0 {
 				pos += 1
 				continue
 			}
-			replay_record(s, at + u64(pos), part[pos + RECORD_HEAD:][:n])
+			each(data, at + u64(pos), part[pos + RECORD_HEAD:][:n])
 			pos += RECORD_HEAD + n
 			tail = at + u64(pos)
 		}
 	}
-	if tail < end {
-		s.disk.log_truncate(s.disk.data, tail)
-	}
-	ring_clear(&s.events)
-	s.buf_base = tail
-	s.synced = tail
-	return true
+	return
 }
 
 // The most that can be read from an offset, at most `size`.
 @(private)
-log_size :: proc(s: ^Store, at, size: u64) -> u64 {
+log_size :: proc(disk: Disk, at, size: u64) -> u64 {
 	lo, hi := u64(0), size
 	b: [1]byte
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
-		if s.disk.log_read(s.disk.data, at + mid - 1, b[:]) {
+		if disk.log_read(disk.data, at + mid - 1, b[:]) {
 			lo = mid
 		} else {
 			hi = mid - 1
@@ -307,12 +332,9 @@ store_commit :: proc(s: ^Store, cells: []Cell, origin: u32 = 0) -> (accepted: in
 	assert(size <= MAX_RECORD)
 	tail := store_tail(s)
 	if tail % SEGMENT + u64(size) > SEGMENT {
-		if !store_flush(s) {
+		if !log_roll(s) {
 			return 0
 		}
-		s.buf_base = (tail / SEGMENT + 1) * SEGMENT
-		clear(&s.buf)
-		s.flushed = 0
 	} else if len(s.buf) > BUFFER_KEEP && s.flushed == len(s.buf) {
 		s.buf_base = tail
 		clear(&s.buf)
@@ -584,6 +606,22 @@ waste_add :: proc(s: ^Store, off: u64, n: int) {
 	tree_put(s, &s.waste, k, v + {u64(n + 36), 0})
 }
 
+// Goes on in a fresh segment, having marked where this one ends, so that it can be told from one cut short.
+@(private)
+log_roll :: proc(s: ^Store) -> bool {
+	tail := store_tail(s)
+	if SEGMENT - tail % SEGMENT >= RECORD_HEAD {
+		mark: [RECORD_HEAD]byte
+		put_u32(mark[:], ROLLED)
+		append(&s.buf, ..mark[:])
+	}
+	store_flush(s) or_return
+	s.buf_base = (tail / SEGMENT + 1) * SEGMENT
+	clear(&s.buf)
+	s.flushed = 0
+	return true
+}
+
 // Hands buffered records to the disk. Cheap; call once per burst of work.
 store_flush :: proc(s: ^Store) -> bool {
 	if s.flushed < len(s.buf) {
@@ -621,7 +659,7 @@ store_wants_checkpoint :: proc(s: ^Store) -> bool {
 
 // Writes the trees, so that the log before this point need never be replayed.
 store_checkpoint :: proc(s: ^Store) -> bool {
-	if s.checkpoint == store_tail(s) && len(s.dirty) == 0 {
+	if s.checkpoint == store_tail(s) && len(s.dirty) == 0 && s.serial == s.serial_kept {
 		return true
 	}
 	victims := evacuate(s)
@@ -644,6 +682,7 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 		generation = s.generation + 1,
 		log        = store_tail(s),
 		clock      = s.clock,
+		serial     = s.serial,
 		shelf      = s.shelf.root,
 		cells      = s.cells.root,
 		waste      = s.waste.root,
@@ -662,7 +701,7 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 	}
 
 	s.generation = h.generation
-	s.checkpoint = h.log
+	s.checkpoint, s.serial_kept = h.log, h.serial
 	for no in nos {
 		free(s.dirty[no])
 	}
@@ -696,29 +735,40 @@ evacuate :: proc(s: ^Store) -> []u64 {
 	}
 	seg := victims[0]
 	base := seg * SEGMENT
-	size := log_size(s, base, SEGMENT)
+	size := log_size(s.disk, base, SEGMENT)
 	part := make([]byte, size)
 	defer delete(part)
 	if size > 0 && !s.disk.log_read(s.disk.data, base, part) {
 		s.failed = true
 		return nil
 	}
-	damaged := false
-	for pos := 0; pos < len(part); {
+	pos, whole := 0, false
+	for pos < len(part) {
 		n := record_at(part[pos:])
 		if n == 0 {
-			damaged ||= part[pos] != 0
-			pos += 1
-			continue
+			whole = len(part) - pos >= 4 && get_u32(part[pos:]) == ROLLED
+			break
 		}
 		if !relocate(s, base + u64(pos + RECORD_HEAD), part[pos + RECORD_HEAD:][:n]) {
 			return nil
 		}
 		pos += RECORD_HEAD + n
 	}
-	if damaged {
-		// What lay in the damage is gone from here. Not holding it is better than holding it unread:
-		// a replica that does not have a cell is sent it again.
+	if !whole && pos < SEGMENT - RECORD_HEAD {
+		// Some of it is damaged, or missing. The rest may lie past the damage.
+		for pos < len(part) {
+			n := record_at(part[pos:])
+			if n == 0 {
+				pos += 1
+				continue
+			}
+			if !relocate(s, base + u64(pos + RECORD_HEAD), part[pos + RECORD_HEAD:][:n]) {
+				return nil
+			}
+			pos += RECORD_HEAD + n
+		}
+		// What was not found is gone from here. Not holding it is better than holding it unread: a replica that
+		// does not have a cell is sent it again.
 		lost := make([dynamic]Leaf, context.temp_allocator)
 		all := tree_scan(s, s.cells, KEY_MIN, KEY_MAX)
 		for leaf in tree_next(&all) {
@@ -726,43 +776,44 @@ evacuate :: proc(s: ^Store) -> []u64 {
 				append(&lost, leaf)
 			}
 		}
-		for leaf in lost {
-			forget(s, leaf)
-		}
+		forget(s, lost[:])
 	}
 	return victims[:]
 }
 
-// Unholds a cell, as though it had never come.
+// Unholds cells, as though they had never come. Where they lay is not read: it may be unreadable.
 @(private)
-forget :: proc(s: ^Store, leaf: Leaf) {
-	c, at := cell_unkey(leaf)
-	before := row_places(s, c.row)
-	// The row's print is summed anew: its places may be among what is unreadable.
-	tree_delete(s, &s.cells, leaf.key)
-	waste_add(s, at.off, at.len)
-	after := row_places(s, c.row)
-	print := row_print(s, c.row)
-	if c.kind == .Place || c.kind == .Grave {
-		// Its own place may no longer be readable: find the row's entries by looking.
-		lost := make([dynamic]Key, context.temp_allocator)
-		scan := tree_scan(s, s.shelf, scope_lo(row_scope(c.row)), scope_hi(row_scope(c.row)))
+forget :: proc(s: ^Store, lost: []Leaf) {
+	if len(lost) == 0 {
+		return
+	}
+	rows := make(map[Id]bool, context.temp_allocator) // to whether its places are in doubt
+	doubt := false
+	for leaf in lost {
+		c, at := cell_unkey(leaf)
+		tree_delete(s, &s.cells, leaf.key)
+		waste_add(s, at.off, at.len)
+		shelved := c.kind == .Place || c.kind == .Grave
+		rows[c.row] = rows[c.row] || shelved
+		doubt ||= shelved
+	}
+	if doubt {
+		old := make([dynamic]Key, context.temp_allocator)
+		scan := tree_scan(s, s.shelf, KEY_MIN, KEY_MAX)
 		for entry in tree_next(&scan) {
-			if key_row(entry.key) == c.row && !slice.contains(after.keys[:after.count], entry.key) {
-				append(&lost, entry.key)
+			if rows[key_row(entry.key)] {
+				append(&old, entry.key)
 			}
 		}
-		for k in lost {
+		for k in old {
 			tree_delete(s, &s.shelf, k)
 		}
 	}
-	for k in before.keys[:before.count] {
-		if !slice.contains(after.keys[:after.count], k) {
-			tree_delete(s, &s.shelf, k)
+	for row in rows {
+		places, print := row_places(s, row), row_print(s, row)
+		for k in places.keys[:places.count] {
+			tree_put(s, &s.shelf, k, print)
 		}
-	}
-	for k in after.keys[:after.count] {
-		tree_put(s, &s.shelf, k, print)
 	}
 }
 
@@ -773,10 +824,7 @@ store_replace :: proc(s: ^Store, c: ^Cell) -> bool {
 	old := tree_get(s, s.cells, key) or_return
 	tail := store_tail(s)
 	if tail % SEGMENT + u64(record_size({c^})) > SEGMENT {
-		store_flush(s) or_return
-		s.buf_base = (tail / SEGMENT + 1) * SEGMENT
-		clear(&s.buf)
-		s.flushed = 0
+		log_roll(s) or_return
 	}
 	start := len(s.buf)
 	append(&s.buf, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -794,10 +842,7 @@ store_replace :: proc(s: ^Store, c: ^Cell) -> bool {
 relocate :: proc(s: ^Store, base: u64, body: []byte) -> bool {
 	tail := store_tail(s)
 	if tail % SEGMENT + u64(len(body) * 2 + RECORD_HEAD) > SEGMENT {
-		store_flush(s) or_return
-		s.buf_base = (tail / SEGMENT + 1) * SEGMENT
-		clear(&s.buf)
-		s.flushed = 0
+		log_roll(s) or_return
 	}
 	start := len(s.buf)
 	append(&s.buf, 0, 0, 0, 0, 0, 0, 0, 0)

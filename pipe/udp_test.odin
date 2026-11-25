@@ -284,3 +284,47 @@ link_packs_to_the_brim :: proc(t: ^testing.T) {
 		for net_step(&n) {}
 	}
 }
+
+// Out of order, overlapping, in crumbs: all that was accepted arrives, and what is held is bounded.
+@(test)
+link_holds_what_it_accepts :: proc(t: ^testing.T) {
+	state := rand.create(11)
+	context.random_generator = rand.default_random_generator(&state)
+	for _ in 0 ..< 12 {
+		n: Net
+		net_init(t, &n)
+		defer net_destroy(&n)
+		l := &n.links[1]
+		want: [400]byte
+		for &b in want {
+			b = byte(rand.uint32())
+		}
+		have: [400]bool
+		for _ in 0 ..< 30 {
+			lo := 1 + rand.int_max(398)
+			hi := lo + 1 + rand.int_max(min(80, 400 - lo))
+			if link_stream(l, u64(lo), want[lo:hi]) {
+				for &h in have[lo:hi] {
+					h = true
+				}
+			}
+		}
+		testing.expect_value(t, len(n.got[1]), 0)
+		link_stream(l, 0, want[:1])
+		for h, i in have {
+			if i > 0 && !h {
+				link_stream(l, u64(i), want[i:][:1])
+			}
+		}
+		testing.expect(t, string(n.got[1][:]) == string(want[:]))
+	}
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	refused := 0
+	crumb := [1]byte{7}
+	for i := u64(RECV_WINDOW) - 1; i > 1; i -= 2 {
+		refused += 0 if link_stream(&n.links[1], i, crumb[:]) else 1
+	}
+	testing.expect(t, len(n.links[1].early) <= MAX_EARLY && refused > 0)
+}

@@ -118,12 +118,14 @@ lists :: proc() {
 handshake :: proc() {
 	hs: zsp.Handshake
 	i, r, ie, re, space := key_of(1), key_of(40), key_of(80), key_of(120), key_of(200)
-	first, _ := zsp.handshake_start(&hs, i, zsp.x25519_public(r), space, ie)
+	first, _ := zsp.handshake_start(&hs, i, zsp.x25519_public(r), space, ie, 1700000000000 << 16)
 	second, _, _ := zsp.handshake_answer(r, space, first[:], re)
+	said: [8]byte
+	zsp.put_u64(said[:], 1700000000000 << 16)
 	c, _ := zsp.handshake_finish(&hs, second[:], zsp.x25519_public(r))
 	fmt.printfln(
-		`  "handshake": {{"initiator": "%s", "responder": "%s", "initiator_ephemeral": "%s", "responder_ephemeral": "%s", "space": "%s", "first": "%s", "second": "%s", "send": "%s", "recv": "%s"}},`,
-		h(i[:]), h(r[:]), h(ie[:]), h(re[:]), h(space[:]), h(first[:]), h(second[:]), h(c.send[:]), h(c.recv[:]),
+		`  "handshake": {{"initiator": "%s", "responder": "%s", "initiator_ephemeral": "%s", "responder_ephemeral": "%s", "space": "%s", "when": "%s", "first": "%s", "second": "%s", "send": "%s", "recv": "%s"}},`,
+		h(i[:]), h(r[:]), h(ie[:]), h(re[:]), h(space[:]), h(said[:]), h(first[:]), h(second[:]), h(c.send[:]), h(c.recv[:]),
 	)
 }
 

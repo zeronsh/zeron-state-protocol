@@ -19,8 +19,6 @@ wasm() {
 }
 
 end_to_end() {
-	odin build zspd -out:build/zspd$EXE -debug $STRICT
-	[ -f relay/src/relay.wasm ] || wasm
 	[ -d relay/node_modules ] || (cd relay && npm install --silent)
 	$PYTHON tests/end_to_end.py "$@"
 }
@@ -34,9 +32,16 @@ check) # every platform, no code generated
 	luau-analyze luau/zsp/init.luau && echo "ok   luau"
 	;;
 test)
-	odin test zsp -out:build/zsp-test$EXE $STRICT $SMALL
-	odin test pipe -out:build/pipe-test$EXE $STRICT
-	odin build vectors -out:build/vectors$EXE $STRICT
+	# Side by side, since none needs another; each says what it has to say at its end.
+	rm -f build/failed
+	for p in zsp pipe host; do
+		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &
+	done
+	(odin build zspd -out:build/zspd$EXE -debug $STRICT || echo zspd >>build/failed) &
+	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
+	[ -f relay/src/relay.wasm ] && [ -z "$(find zsp relay/wasm -name "*.odin" -newer relay/src/relay.wasm)" ] || wasm || echo wasm >>build/failed
+	wait
+	[ ! -f build/failed ]
 	build/vectors$EXE | cmp - vectors/vectors.json
 	node tests/vectors.mjs vectors/vectors.json
 	lune run luau/tests/vectors.luau vectors/vectors.json
@@ -62,6 +67,6 @@ bench)
 	build/bench$EXE build/bench-data
 	;;
 nat) odin build zspd -out:build/zspd -debug $STRICT && sudo tests/nat.sh && sudo env NAT_B=--random-fully EXPECT_RELAY=1 tests/nat.sh ;;
-slow) end_to_end slow_hibernation ;;
+slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT && end_to_end slow_hibernation ;;
 *) sed -n 2p "$0" && exit 2 ;;
 esac

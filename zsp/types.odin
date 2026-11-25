@@ -62,10 +62,9 @@ KEY_MAX :: Key{max(u64), max(u64), max(u64), max(u64), max(u64)} // reserved: ex
 MAX_CELL :: 1 << 20 // a body at rest and between devices
 MAX_OPEN :: MAX_CELL - 128 // and before it is sealed, and perhaps signed
 
-// A stamp this far ahead of the clock is refused, lest one drag every clock to the end of time. It is far,
-// because a clock may be wrong in earnest, and merely ahead does no harm.
-LEAP_MS :: 10 * 365 * 24 * 3600 * 1000
-DAWN_MS :: 1_735_689_600_000 // 2025: a clock that says earlier has not been set
+// A stamp further ahead of the clock than this is refused. Clocks follow stamps, so what one device's clock
+// may be off by, every device's may; and it is how long a right may outlive its revocation.
+LEAP_MS :: 15 * 60 * 1000
 MAX_PLACES :: int(PLACE_LAST)
 
 @(require_results)
@@ -97,6 +96,12 @@ place_key :: proc "contextless" (list: List, order: u64, row: Id) -> Key {
 @(require_results)
 row_scope :: #force_inline proc "contextless" (row: Id) -> Scope {
 	return Scope(row[0] >> 32)
+}
+
+// The least stamp time a cell of this row may have.
+@(require_results)
+row_born :: #force_inline proc "contextless" (row: Id) -> u64 {
+	return (row[0] & 0xffff_ffff) * 1000 << 16
 }
 
 @(require_results)
@@ -190,6 +195,11 @@ cell_valid :: proc(c: ^Cell) -> bool {
 	if scope := row_scope(c.row); scope == 0 || scope == max(Scope) {
 		return false
 	}
+	// Nothing is older than its row. So whoever has lost the right to write, and can only pretend to have
+	// written earlier, cannot touch what was made since.
+	if c.stamp.time < row_born(c.row) {
+		return false
+	}
 	switch c.kind {
 	case .Grave:
 		return c.slot == GRAVE
@@ -214,7 +224,7 @@ cell_valid :: proc(c: ^Cell) -> bool {
 
 @(require_results)
 stamp_timely :: proc "contextless" (s: Stamp, now_ms: u64) -> bool {
-	return s.time >> 16 <= max(now_ms, DAWN_MS) + LEAP_MS
+	return s.time >> 16 <= now_ms + LEAP_MS
 }
 
 @(require_results)
