@@ -62,7 +62,7 @@ holds little asks one that holds everything, and says whose answer it has.
 
 | | |
 |---|---|
-| memory, holding the rows and an index of all of it | 5.3 MB private, of which the rows take 3.9 |
+| memory, holding the rows and an index of all of it | 5.5 MB private, of which the rows take 3.9 |
 | on disk | 255 bytes a row, for five columns, one of them every word |
 | making it, when first asked | 1 s, and 2 s for each column; 11 s for the words; never more than a few tens of ms at a time |
 | everything, newest first | 3 µs |
@@ -75,7 +75,7 @@ holds little asks one that holds everything, and says whose answer it has.
 | the sum of every number | 2 µs |
 | the ten commonest names among 333,000 rows | 14 ms |
 | one more row, known to all of it | 0.12 to 0.17 ms |
-| opening it again | 11 to 17 ms |
+| opening it again | 11 to 19 ms |
 
 ## Using it
 

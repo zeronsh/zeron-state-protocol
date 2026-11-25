@@ -207,6 +207,7 @@ MARKS :: 1000 // to a page
 @(private)
 mark_set :: proc(p: ^Pager, no, mark: u32) {
 	if int(no) >= len(p.marks) {
+		reserve(&p.marks, (int(no) | 0x3fff) + 1) // a step at a time, neither copied for each nor doubled
 		resize(&p.marks, int(no) + 1)
 	}
 	p.marks[no] = mark
