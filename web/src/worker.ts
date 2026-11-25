@@ -123,7 +123,7 @@ function heard(s: Shout): void {
     const done = waiting.get(s.answer);
     unheard.delete(s.answer);
     waiting.delete(s.answer);
-    done?.(s);
+    done?.({ value: s.value, error: s.error });
   } else if (device && "ask" in s) {
     channel.postMessage({ answer: s.ask, ...answer(s.op, s.args) } satisfies Shout);
   } else if (device && "open" in s) {

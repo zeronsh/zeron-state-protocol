@@ -2,51 +2,13 @@
 // can meet runs test/live.ts: the TypeScript client against zspd as the Luau client is, and web devices against zspd
 // devices through a relay of zspd's and through the Durable Object. `node test/end_to_end.ts [names...]`
 
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "../src/client.ts";
 import type { Connect, Wire } from "../src/node.ts";
 import { open } from "../src/nodejs.ts";
 import { live } from "./live.ts";
-
-const ROOT = new URL("../../", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
-const BIN = process.env.ZSPD ?? join(ROOT, "build", process.platform === "win32" ? "zspd.exe" : "zspd");
-const TMP = mkdtempSync(join(tmpdir(), "zsp-web-"));
-const procs: ChildProcess[] = [];
-
-const zspd = (...args: string[]) => execFileSync(BIN, args, { encoding: "utf8" }).trim();
-
-interface Started {
-  key: string;
-  address: string;
-  url: string;
-  p: ChildProcess;
-}
-
-function started(p: ChildProcess, name: string): Promise<Started> {
-  procs.push(p);
-  return new Promise((resolve, reject) => {
-    let out = "";
-    p.stdout!.on("data", (d) => {
-      out += d;
-      const m = /(\w{64}) listening on ws:\/\/(\S+)/.exec(out);
-      if (m) resolve({ key: m[1], address: m[2], url: "ws://127.0.0.1:" + m[2].split(":").pop(), p });
-    });
-    p.on("exit", (code) => reject(new Error(`${name} exited with ${code}`)));
-  });
-}
-
-const log = (name: string) => ({ stdio: ["ignore", "pipe", "ignore"] as ["ignore", "pipe", "ignore"], name });
-
-function node(mode: "run" | "serve", dir: string, ...options: string[]): Promise<Started> {
-  return started(spawn(BIN, [mode, dir, "--listen=127.0.0.1:0", "--no-udp", ...options], log(dir)), dir);
-}
-
-function cloud(env: Record<string, string> = {}): Promise<Started> {
-  return started(spawn("node", [join(ROOT, "relay", "dev.mjs")], { ...log("cloud"), env: { ...process.env, ...env } }), "cloud");
-}
+import { cloud, eventually, exists, expectEqual, node, procs, TMP, token, zspd, zspdConnect } from "./procs.ts";
 
 // Pipes that can be broken, as a crash of the pipe breaks them.
 class Pipes {
@@ -75,46 +37,6 @@ class Pipes {
       e.closed();
     }
   }
-}
-
-// A local client of zspd, over a WebSocket, as the Luau client is.
-function zspdConnect(address: string): Connect {
-  return (receive, closed) => {
-    const ws = new WebSocket("ws://" + address + "/");
-    ws.binaryType = "arraybuffer";
-    const early: Uint8Array[] = [];
-    let gone = false;
-    ws.onopen = () => {
-      for (const d of early.splice(0)) ws.send(d.slice());
-    };
-    ws.onmessage = (e) => receive(new Uint8Array(e.data as ArrayBuffer));
-    ws.onclose = ws.onerror = () => {
-      if (!gone) (gone = true), closed();
-    };
-    return {
-      send: (data) => (ws.readyState === 1 ? ws.send(data.slice()) : early.push(data.slice())),
-      close: () => ws.close(),
-    };
-  };
-}
-
-const token = (dir: string) => readFileSync(join(dir, "token"), "utf8");
-const exists = (path: string) => {
-  try {
-    readFileSync(path);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-async function eventually(what: string, f: () => boolean | Promise<boolean>, ms = 10000): Promise<void> {
-  const until = Date.now() + ms;
-  while (Date.now() < until) {
-    if (await f()) return;
-    await new Promise((done) => setTimeout(done, 20));
-  }
-  throw new Error("never: " + what);
 }
 
 // A space as live.ts wants it: scope 1, and scope 2 signed, in which b may vouch; a goes by "ann" and b by "bob".
@@ -159,10 +81,6 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
     clients.push(new Client({ connect: pipes.wrap(connect), credential, linger: 200 }));
   }
   return { a: clients[0], b: clients[1], breakPipes: () => pipes.break(), close: () => Promise.all(closers.map((f) => f())) };
-}
-
-function expectEqual(a: unknown, b: unknown): void {
-  if (a !== b) throw new Error(`${a} is not ${b}`);
 }
 
 const tests: Record<string, () => Promise<void>> = {

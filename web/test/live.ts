@@ -18,6 +18,13 @@ const Message = { author: c.string(16), body: c.text(17), stars: c.number(18) };
 
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 const now = () => performance.now();
+// Lets everything else that is waiting happen, and no more: in Node and in a browser alike.
+const turn = () =>
+  new Promise<void>((done) => {
+    const c = new MessageChannel();
+    c.port1.onmessage = () => (c.port1.close(), done());
+    c.port2.postMessage(0);
+  });
 
 class Never extends Error {}
 
@@ -108,7 +115,7 @@ export async function live({ a, b, breakPipes, say = console.log }: Sides): Prom
     editor.append(token);
     if (i === 10) {
       const clock = now();
-      while (last().body !== said && now() - clock < 5000) await new Promise<void>((done) => setImmediate(done));
+      while (last().body !== said && now() - clock < 5000) await turn();
       started = now() - clock;
       check(started < 100, "tokens are seen at once");
     }

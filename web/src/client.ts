@@ -461,8 +461,8 @@ export class Client {
       credential: typeof credential === "string" ? utf8.encode(credential) : credential,
       linger: host.linger ?? 5000,
       random: host.random ?? ((n) => crypto.getRandomValues(new Uint8Array(n))),
-      now: host.now ?? Date.now,
-      defer: host.defer ?? queueMicrotask,
+      now: host.now ?? (() => Date.now()),
+      defer: host.defer ?? ((f) => queueMicrotask(f)),
       after:
         host.after ??
         ((ms, f) => {

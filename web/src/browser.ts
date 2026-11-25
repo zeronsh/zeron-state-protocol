@@ -28,13 +28,16 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   const worker = new Worker(options.worker ?? new URL("./worker.js", import.meta.url), { type: "module", name: "zsp" });
   let asked = 0;
   const answers = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  const fail = (error: Error) => {
+    for (const a of answers.values()) a.reject(error);
+    answers.clear();
+    options.onFailure?.(error);
+  };
+  worker.onerror = (e) => fail(new Error(e.message || "the worker could not be started"));
   worker.onmessage = (e: MessageEvent<Report>) => {
     const r = e.data;
     if ("failed" in r) {
-      const error = new Error(r.failed);
-      for (const a of answers.values()) a.reject(error);
-      answers.clear();
-      options.onFailure?.(error);
+      fail(new Error(r.failed));
       return;
     }
     const a = answers.get(r.answer);
