@@ -737,7 +737,7 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 		}
 		local ||= !l.far.have
 	}
-	f.wake = nil
+	f.wake = index_cool(&f.x, time.tick_now())
 	if f.x.failed && local {
 		if f.x.unwritten && time.tick_since(f.failed) < UNWRITTEN && f.failed != {} {
 			f.wake = time.tick_add(f.failed, UNWRITTEN)

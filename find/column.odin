@@ -69,6 +69,7 @@ column_reads :: proc(c: ^Column, slot: zsp.Slot) -> bool {
 // A row's cells, opened as they are asked for. Temporary memory.
 Row :: struct {
 	n:     ^zsp.Node,
+	x:     ^Index, // which may have some of it open
 	id:    zsp.Id,
 	slots: [8]struct {
 		slot:  zsp.Slot,
@@ -79,19 +80,20 @@ Row :: struct {
 	new:   ^Arrived, // pieces that have come since it was last read, where that is known
 }
 
-// Pieces of one text that have come.
-@(private)
-Arrived :: struct {
-	slot:   zsp.Slot,
-	stamps: [8]zsp.Stamp,
-	count:  int, // more than there is room for: it is not known which
-}
-
 // What a slot holds, as bytes: a value, or a text as it stands. Temporary memory.
 row_slot :: proc(r: ^Row, slot: zsp.Slot) -> (bytes: []byte, have: bool) {
 	for &s in r.slots[:min(r.next, len(r.slots))] {
 		if s.slot == slot {
 			return s.bytes, s.have
+		}
+	}
+	if r.x != nil {
+		if hot := hot_find(r.x, r.id, slot); hot != nil && hot.level {
+			out := make([dynamic]byte, context.temp_allocator)
+			zsp.text_read(&hot.text, &out)
+			r.slots[r.next % len(r.slots)] = {slot, out[:], true}
+			r.next += 1
+			return out[:], true
 		}
 	}
 	scan := zsp.row_scan(&r.n.store, r.id, slot, slot)
@@ -129,41 +131,6 @@ row_slot :: proc(r: ^Row, slot: zsp.Slot) -> (bytes: []byte, have: bool) {
 	r.slots[r.next % len(r.slots)] = {slot, bytes, have}
 	r.next += 1
 	return
-}
-
-// What a text was before what has come, as far as the cells tell, and what it is now. Temporary memory.
-@(private)
-row_before :: proc(r: ^Row, slot: zsp.Slot) -> (was, now: []byte, ok: bool) {
-	if r.new == nil || r.new.slot != slot || r.new.count > len(r.new.stamps) {
-		return
-	}
-	stamps := r.new.stamps[:r.new.count]
-	text: zsp.Text
-	defer zsp.text_destroy(&text)
-	late := make([dynamic]zsp.Cell, context.temp_allocator)
-	scan := zsp.row_scan(&r.n.store, r.id, slot, slot)
-	for c in zsp.row_next(&r.n.store, &scan) {
-		c := c
-		if !zsp.cell_open(r.n.keys, &r.n.roster, &c) {
-			continue
-		}
-		if slice.contains(stamps, c.stamp) {
-			c.body = slice.clone(c.body, context.temp_allocator)
-			append(&late, c)
-		} else {
-			zsp.text_apply(&text, &c)
-		}
-	}
-	out := make([dynamic]byte, context.temp_allocator)
-	zsp.text_read(&text, &out)
-	for &c in late {
-		zsp.text_apply(&text, &c)
-	}
-	then := make([dynamic]byte, 0, len(out) + 256, context.temp_allocator)
-	zsp.text_read(&text, &then)
-	r.slots[r.next % len(r.slots)] = {slot, then[:], true}
-	r.next += 1
-	return out[:], then[:], true
 }
 
 // The values a row has in a column: none, one, or for what reaches into arrays any number. Ascending, each

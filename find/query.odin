@@ -694,7 +694,7 @@ pred_cells :: proc(p: ^Pred, r: ^Row) -> bool {
 		for v in row_values(r, &p.col) {
 			id := zsp.Id{v.key.hi, v.key.lo}
 			if zsp.row_scope(id) == p.scope && id_there(r.n, id) {
-				other := Row{n = r.n, id = id}
+				other := Row{n = r.n, x = r.x, id = id}
 				if pred_cells(&p.kids[0], &other) {
 					return true
 				}
@@ -711,7 +711,7 @@ pred_cells :: proc(p: ^Pred, r: ^Row) -> bool {
 				continue
 			}
 			last = id
-			other := Row{n = r.n, id = id}
+			other := Row{n = r.n, x = r.x, id = id}
 			for v in row_values(&other, &p.col) {
 				if v.key == {r.id[0], r.id[1]} && pred_cells(&p.kids[0], &other) {
 					count += 1

@@ -77,7 +77,7 @@ holds little asks one that holds everything, and says whose answer it has.
 | the ten commonest names among 333,000 rows | 14 ms |
 | one more row, known to all of it | 0.12 to 0.17 ms |
 | opening it again | 11 to 19 ms |
-| one word more in a text of 200; of 20,000 | 0.02 ms; 0.3 ms, or 13 ms if it was written in 8,000 pieces |
+| one word more in a text that is being written, of 200 words or 100,000 | 0.015 to 0.03 ms |
 
 ## Using it
 

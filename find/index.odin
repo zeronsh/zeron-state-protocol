@@ -30,6 +30,7 @@ Index :: struct {
 	unsaved:    int, // rows gone over since it was last written
 	blob:       [dynamic]u32, // pages the catalogue is in
 	kept:       [dynamic]Kept, // where the marks of pages are
+	hot:        [dynamic]^Hot, // texts that are being edited
 	watchers:   [dynamic]Watcher,
 }
 
@@ -113,7 +114,7 @@ BATCH :: 1 << 17 // edits gathered before they are made
 @(private)
 HEADERS :: 2
 @(private)
-MAGIC :: 0x7a73_7066_696e_6434
+MAGIC :: 0x7a73_7066_696e_6435
 
 @(private)
 Header :: struct {
@@ -163,6 +164,7 @@ index_open :: proc(x: ^Index, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
 // Forgets everything. It is made again as it is asked for.
 @(private)
 index_reset :: proc(x: ^Index) {
+	hot_clear(x)
 	for s in x.scopes {
 		scope_free(s)
 	}
@@ -187,6 +189,8 @@ index_reset :: proc(x: ^Index) {
 }
 
 index_close :: proc(x: ^Index) {
+	hot_clear(x)
+	delete(x.hot)
 	for s in x.scopes {
 		scope_free(s)
 	}
@@ -654,6 +658,7 @@ index_want :: proc(x: ^Index, scope: zsp.Scope, c: ^Column) -> ^Held {
 }
 
 index_drop :: proc(x: ^Index, h: ^Held) {
+	hot_clear(x)
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	if h.built {
 		held_clear(h)
@@ -762,7 +767,7 @@ held_step :: proc(h: ^Held, budget: int) -> bool {
 			number := u32(e.key.hi >> 32)
 			f.row = number + 1
 			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-			row := Row{n = s.x.n, id = {u64(s.id) << 32 | e.key.hi & 0xffff_ffff, e.key.lo}}
+			row := Row{n = s.x.n, x = s.x, id = {u64(s.id) << 32 | e.key.hi & 0xffff_ffff, e.key.lo}}
 			held_read(h, number, &row, fresh = true)
 			for &edits, i in h.edits {
 				if i == 2 {
@@ -791,7 +796,7 @@ held_step :: proc(h: ^Held, budget: int) -> bool {
 	for id in f.again {
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		if row, ok := row_number(s, id); ok {
-			r := Row{n = s.x.n, id = id}
+			r := Row{n = s.x.n, x = s.x, id = id}
 			held_read(h, row, &r, fresh = false)
 		}
 	}
@@ -848,7 +853,8 @@ row_reread :: proc(s: ^Scope, id: zsp.Id, slots: ^Slots, new: ^Arrived = nil) {
 	} else {
 		row = row_admit(s, id)
 	}
-	r := Row{n = x.n, id = id, new = new}
+	r := Row{n = x.n, x = x, id = id, new = new}
+	hot_unsettle(x, id, slots)
 	for h in s.columns {
 		if f := h.filling; f != nil {
 			if !there && f.row > row {
@@ -872,6 +878,7 @@ row_reread :: proc(s: ^Scope, id: zsp.Id, slots: ^Slots, new: ^Arrived = nil) {
 			held_read(h, row, &r, fresh = !known)
 		}
 	}
+	hot_settle(x, id, there)
 	if !there {
 		append(&s.edits[0], Edit{entry = {key = id_key(id), sub = row}, gone = true})
 		append(&s.edits[1], Edit{entry = {key = row_key(row, id)}, gone = true})
@@ -1009,8 +1016,10 @@ text_bury :: proc(h: ^Held, row: u32) {
 @(private)
 words_read :: proc(h: ^Held, row: u32, r: ^Row, fresh: bool) {
 	if !fresh && h.path == "" {
-		if was, now, ok := row_before(r, h.slot); ok && words_reread(h, row, was, now) {
-			return
+		if text, old, known := held_text_hash(h, row); known {
+			if all, told := text_delta(h, r, old); told && words_change(h, row, text, old, all[:]) {
+				return
+			}
 		}
 	}
 	bytes: []byte
@@ -1028,7 +1037,7 @@ words_read :: proc(h: ^Held, row: u32, r: ^Row, fresh: bool) {
 		}, &all, nil)
 		bytes, have = all[:], len(all) > 0
 	}
-	hash := bytes_hash(bytes)
+	hash := words_hash(bytes) if have else 0
 	if !fresh {
 		if _, old, ok := held_text_hash(h, row); ok {
 			if have && old == hash {
@@ -1079,53 +1088,15 @@ words_read :: proc(h: ^Held, row: u32, r: ^Row, fresh: bool) {
 	h.alive += 1
 }
 
-// Reads of a text only where it has changed, if what it is said to have been is what was read of it.
+// Puts by what has changed of a text's words.
 @(private)
-words_reread :: proc(h: ^Held, row: u32, was, now: []byte) -> bool {
-	text, old := held_text_hash(h, row) or_return
-	if bytes_hash(was) != old {
-		return false
-	}
-	hash := bytes_hash(now)
-	if hash == old {
-		return true
-	}
-	// No word reaches over white space.
-	white :: proc(b: byte) -> bool {
-		return b == ' ' || b == '\n' || b == '\t' || b == '\r'
-	}
-	least := min(len(was), len(now))
-	lo, hi := 0, 0
-	for lo < least && was[lo] == now[lo] {
-		lo += 1
-	}
-	for lo > 0 && !white(was[lo - 1]) {
-		lo -= 1
-	}
-	for hi < least - lo && was[len(was) - 1 - hi] == now[len(now) - 1 - hi] {
-		hi += 1
-	}
-	for hi > 0 && !white(was[len(was) - hi]) {
-		hi -= 1
-	}
-	Change :: struct {
-		key: Key,
-		by:  int,
-	}
-	all := make([dynamic]Change, context.temp_allocator)
-	for part, i in ([][]byte{was[lo:len(was) - hi], now[lo:len(now) - hi]}) {
-		it := words(part)
-		for w in words_next(&it) {
-			w := w
-			k, _ := bytes_key(w.bytes[:w.len])
-			append(&all, Change{k, i * 2 - 1})
-		}
-	}
-	slice.sort_by(all[:], proc(a, b: Change) -> bool {return key_less(a.key, b.key)})
+words_change :: proc(h: ^Held, row: u32, text: u32, old: u64, all: []Delta) -> bool {
+	slice.sort_by(all, proc(a, b: Delta) -> bool {return key_less(a.key, b.key)})
 	entry, _ := text_entry(h, text)
-	length := int(entry.length)
+	length, hash := int(entry.length), old
 	for c in all {
 		length += c.by
+		hash += word_hash(c.key) * u64(c.by)
 	}
 	if length <= 0 {
 		return false // it has no words, and so is nothing
@@ -1149,16 +1120,13 @@ words_reread :: proc(h: ^Held, row: u32, was, now: []byte) -> bool {
 			}
 		}
 	}
+	if hash == old {
+		return true
+	}
 	h.length = h.length - u64(entry.length) + u64(length)
 	append(&h.edits[0], Edit{entry = {{u64(row) << 32, old}, text, 0}, gone = true}, Edit{entry = {{u64(row) << 32, hash}, text, 0}})
 	append(&h.edits[2], Edit{entry = {{u64(text), u64(length) << 32 | u64(row + 1)}, 0, 0}})
 	return true
-}
-
-@(private)
-bytes_hash :: proc(s: []byte) -> u64 {
-	h := zsp.sha256(s)
-	return zsp.get_u64(h[:])
 }
 
 // ---------------------------------------------------------------- making edits
@@ -1356,6 +1324,7 @@ index_follow :: proc(x: ^Index, budget := max(int) / 1024) -> bool {
 	if x.forgot != n.forgot || x.serial == max(u64) {
 		// Rows may be gone that nothing said were.
 		x.forgot, x.checking, x.check_scope, x.check_row = n.forgot, true, 0, 0
+		hot_clear(x)
 	}
 	x.serial = n.roster.serial
 	if x.checking {
@@ -1379,19 +1348,20 @@ index_follow :: proc(x: ^Index, budget := max(int) / 1024) -> bool {
 				continue
 			}
 			new, had := d.new[c.row]
-			switch {
-			case c.kind != .Piece:
-				if had && new.slot != c.slot {
-					continue
-				}
-				new = {slot = c.slot, count = max(int) / 2}
-			case !had:
+			is_text := c.kind == .Piece || c.kind == .Bundle
+			if !had || (is_text && new.slot != c.slot && new.count > len(new.cells)) {
 				new = {slot = c.slot}
+			}
+			if new.slot != c.slot {
+				continue // of one text only: another is read again
+			}
+			switch {
+			case !is_text:
+				new.count = max(int) / 2
+			case new.count < len(new.cells):
+				new.cells[new.count] = {c.stamp, c.kind}
 				fallthrough
-			case new.slot == c.slot:
-				if new.count < len(new.stamps) {
-					new.stamps[new.count] = c.stamp
-				}
+			case:
 				new.count += 1
 			}
 			d.new[c.row] = new

@@ -468,7 +468,7 @@ leaf_rows :: proc(s: ^Scope, p: ^Pred) -> Set {
 @(private)
 row_cells :: proc(s: ^Scope, p: ^Pred, row: u32) -> bool {
 	id, ok := row_id(s, row)
-	r := Row{n = s.x.n, id = id}
+	r := Row{n = s.x.n, x = s.x, id = id}
 	return ok && leaf_cells(p, &r)
 }
 
@@ -912,7 +912,7 @@ sorted_compare :: proc(s: ^Scope, q: ^Query, a, b: ^Sorted) -> int {
 long_compare :: proc(s: ^Scope, o: ^Sort, a, b: zsp.Id) -> int {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	best :: proc(s: ^Scope, o: ^Sort, id: zsp.Id) -> (out: []byte) {
-		r := Row{n = s.x.n, id = id}
+		r := Row{n = s.x.n, x = s.x, id = id}
 		for v, i in row_bytes(&r, &o.col) {
 			if i == 0 || (bytes.compare(v, out) < 0) != o.desc {
 				out = v
@@ -1343,7 +1343,7 @@ group_add :: proc(g: ^Group, e: ^Entry) {
 	case SEVERAL:
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		id, _ := row_id(g.s, e.sub)
-		r := Row{n = g.s.x.n, id = id}
+		r := Row{n = g.s.x.n, x = g.s.x, id = id}
 		seen := make([dynamic]u64, context.temp_allocator)
 		for b in row_bytes(&r, &g.a.col) {
 			if v := bytes_value(b); v.key == e.key && !slice.contains(seen[:], v.rest) {
@@ -1427,7 +1427,7 @@ facet_bytes :: proc(s: ^Scope, a: ^Aggregate, facet: Facet) -> []byte {
 	case .Bytes, .Fold:
 		if facet.rest != 0 {
 			id, _ := row_id(s, facet.row)
-			r := Row{n = s.x.n, id = id}
+			r := Row{n = s.x.n, x = s.x, id = id}
 			for v in row_bytes(&r, &a.col) {
 				if bytes_value(v) == facet.value {
 					return v

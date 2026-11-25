@@ -1622,7 +1622,7 @@ texts_are_read_again_only_where_they_change :: proc(t: ^testing.T) {
 		query_prepare(&w.x, &q)
 		index_finish(&w.x)
 		h := q.where_.kids[0].held
-		again, edits := 0, 0
+		again, edits, opened := 0, 0, 0
 		for step in 0 ..< 150 {
 			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 			many := 1 + rand.int_max(3)
@@ -1668,6 +1668,25 @@ texts_are_read_again_only_where_they_change :: proc(t: ^testing.T) {
 				}
 			}
 			switch rand.int_max(25) {
+			case 4: // another piece by the name of one there is, and of before it
+				d := &docs[rand.int_max(len(docs))]
+				scan := zsp.row_scan(&w.node.store, d.id, 20, 20)
+				for c in zsp.row_next(&w.node.store, &scan) {
+					c := c
+					if c.kind != .Piece || rand.int_max(3) > 0 || !zsp.cell_open(&w.keys, &w.node.roster, &c) {
+						continue
+					}
+					b := make([dynamic]byte, context.temp_allocator)
+					append(&b, ..c.body[:8])
+					append(&b, 1, 0, 0)
+					zsp.write_bytes(&b, transmute([]byte)string("twin fig "))
+					before := c.stamp
+					before.time -= 1
+					if before.time > zsp.row_born(d.id) {
+						write(t, &w, {{d.id, 20, .Piece, before, b[:]}})
+					}
+					break
+				}
 			case 2, 3: // what was written is gathered up
 				d := &docs[rand.int_max(len(docs))]
 				cells := make([dynamic]zsp.Cell, context.temp_allocator)
@@ -1698,6 +1717,15 @@ texts_are_read_again_only_where_they_change :: proc(t: ^testing.T) {
 			before := h.next_text
 			index_finish(&w.x)
 			again += max(int(h.next_text) - int(before), 0) // unless the words were all read again
+			for hot in w.x.hot {
+				// What is kept open is what there is too.
+				r := Row{n = &w.node, id = hot.id}
+				bytes, _ := row_slot(&r, hot.slot)
+				kept := make([dynamic]byte, context.temp_allocator)
+				zsp.text_read(&hot.text, &kept)
+				testing.expect(t, hot.level && string(kept[:]) == string(bytes))
+				opened += 1
+			}
 			// What is kept is what there is, and nothing else is.
 			s := index_scope(&w.x, 1)
 			for &k in q.where_.kids {
@@ -1742,6 +1770,7 @@ texts_are_read_again_only_where_they_change :: proc(t: ^testing.T) {
 				return
 			}
 		}
+		testing.expect(t, HOT_LEAST > 0 || opened > 0)
 		testing.expectf(t, again * 3 < edits, "read in whole %d times, of %d", again, edits)
 	}
 }
