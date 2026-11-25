@@ -52,6 +52,7 @@ Space :: struct {
 	dir:  string,
 	seen: u64, // events already noticed by links_poke
 	warned: bool, // of a clock
+	found: ^Found, // while anyone is asking anything
 }
 
 @(private)
@@ -165,6 +166,9 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 			links_greet((^Space)(data), online)
 		},
 	}
+	if !h.relay {
+		s.node.host.questions = questions(s)
+	}
 	append(&h.spaces, s)
 	return s
 }
@@ -183,6 +187,7 @@ space_authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
 }
 
 space_close :: proc(s: ^Space) {
+	found_close(s)
 	if !zsp.store_sync(&s.node.store) {
 		report(.Error, "could not sync the log")
 	}
@@ -315,6 +320,7 @@ host_settle :: proc(h: ^Host) {
 	links_run(h)
 	for s in h.spaces {
 		s.node.now = ms
+		found_run(s, now)
 	}
 	#reverse for s in h.streams {
 		stream_flush(s)
@@ -355,6 +361,11 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 	}
 	for d in h.dialers {
 		if t, set := dialer_deadline(d); set {
+			earliest(&due, &ok, t)
+		}
+	}
+	for s in h.spaces {
+		if t, set := found_deadline(s, time.tick_now()); set {
 			earliest(&due, &ok, t)
 		}
 	}

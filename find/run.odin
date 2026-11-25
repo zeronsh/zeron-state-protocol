@@ -25,6 +25,29 @@ query_prepare :: proc(x: ^Index, q: ^Query) {
 	index_want_scope(x, q.scope)
 }
 
+// Says that a question is asking of its columns, or no longer is.
+query_uses :: proc(q: ^Query, by: int) {
+	preds :: proc(p: ^Pred, by: int) {
+		if p.held != nil {
+			p.held.uses += by
+		}
+		for &k in p.kids {
+			preds(&k, by)
+		}
+	}
+	preds(&q.where_, by)
+	for o in q.order {
+		if o.held != nil {
+			o.held.uses += by
+		}
+	}
+	for a in q.totals {
+		if a.held != nil {
+			a.held.uses += by
+		}
+	}
+}
+
 // Whether all that a question needs is whole.
 @(require_results)
 query_ready :: proc(x: ^Index, q: ^Query) -> bool {

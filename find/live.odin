@@ -128,6 +128,7 @@ finder_asked :: proc(f: ^Finder, s: ^zsp.Session, type: u8, payload: []byte) -> 
 		}
 		index_follow(&f.x)
 		query_prepare(&f.x, &l.q)
+		query_uses(&l.q, 1)
 		live_place(l)
 		l.renew = true
 	case UNASK:
@@ -279,6 +280,7 @@ live_free :: proc(l: ^Live) {
 			}
 		}
 	}
+	query_uses(&l.q, -1)
 	set_destroy(&l.rows)
 	delete(l.shown)
 	delete(l.said)

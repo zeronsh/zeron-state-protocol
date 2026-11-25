@@ -90,7 +90,12 @@ Held :: struct {
 	dead:   int, // texts that are gone, and whose words are yet to go
 	edits:  [4][dynamic]Edit,
 	asked:  u64, // when last of use
+	uses:   int, // questions now asking of it
 }
+
+// Columns nobody has asked of for so many seconds are not kept.
+@(private)
+UNASKED :: 30 * 24 * 3600
 
 @(private)
 DEAD :: #config(ZSP_FIND_DEAD, 4096) // texts that are gone, and whose words are put up with
@@ -222,6 +227,13 @@ index_save :: proc(x: ^Index) -> bool {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	if x.upto > x.n.synced {
 		return false
+	}
+	for s in x.scopes {
+		#reverse for h in s.columns {
+			if h.built && h.uses == 0 && h.asked + UNASKED < x.n.now / 1000 {
+				index_drop(x, h)
+			}
+		}
 	}
 	w := make([dynamic]byte, context.temp_allocator)
 	zsp.write_varint(&w, u64(len(x.scopes)))
@@ -651,6 +663,7 @@ scope_step :: proc(s: ^Scope, budget: int) -> bool {
 	index_relieve(s.x)
 	s.filling = nil
 	s.built = true
+	s.x.unsaved += int(s.next)
 	for id, slots in f.again {
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		slots := slots
@@ -714,6 +727,7 @@ held_step :: proc(h: ^Held, budget: int) -> bool {
 	index_relieve(s.x)
 	h.filling = nil
 	h.built = true
+	s.x.unsaved += int(s.next)
 	for id in f.again {
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		if row, ok := row_number(s, id); ok {

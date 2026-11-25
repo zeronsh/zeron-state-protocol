@@ -12,6 +12,9 @@ READ, WRITE, MAY_CALL = 1, 2, 4
 F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = range(5)
 DATA_WATCH, LIVE_WATCH, BACK, ADOPT, KNOWN = 1, 2, 4, 8, 16
 KEY_MAX = b"\xff" * 40
+ASK, UNASK, ANSWER = 32, 33, 34
+BYTES, FOLD, NUMBER, BOOL, ID, WORDS, CREATED, MODIFIED, ORDER = range(1, 10)
+SUM, MIN, MAX, COUNT, FACET = range(1, 6)
 
 
 def varint(n):
@@ -76,6 +79,101 @@ def key_after(prefix):
     return n.to_bytes(len(prefix), "big").ljust(40, b"\0")
 
 
+# -- questions, as bytes: SPEC.md 16
+
+
+def column(kind, slot=0, path="", tag=b""):
+    if kind in (CREATED, MODIFIED):
+        return bytes([kind])
+    return bytes([kind]) + (tag if kind == ORDER else bytes([slot]) + put_bytes(path.encode()))
+
+
+def put_bytes(b):
+    return varint(len(b)) + b
+
+
+def put_value(v):
+    if isinstance(v, bool):
+        v = b"\1" if v else b"\0"
+    elif isinstance(v, (int, float)):
+        v = struct.pack(">d", v)
+    elif isinstance(v, str):
+        v = v.encode()
+    return put_bytes(v)
+
+
+ALL = b"\0"
+
+
+def every(*of):
+    return b"\1" + varint(len(of)) + b"".join(of)
+
+
+def some(*of):
+    return b"\2" + varint(len(of)) + b"".join(of)
+
+
+def no(of):
+    return b"\3" + of
+
+
+def between(col, lo=None, hi=None, lo_in=True, hi_in=True):
+    flags = (lo is not None) | (hi is not None) << 1 | lo_in << 2 | hi_in << 3
+    return b"\4" + col + bytes([flags]) + (put_value(lo) if lo is not None else b"") + (put_value(hi) if hi is not None else b"")
+
+
+def equals(col, v):
+    return between(col, v, v)
+
+
+def among(col, *of):
+    return b"\5" + col + varint(len(of)) + b"".join(map(put_value, of))
+
+
+def begins(col, s):
+    return b"\6" + col + put_bytes(s.encode())
+
+
+def contains(col, s):
+    return b"\7" + col + put_bytes(s.encode())
+
+
+def exists(col):
+    return b"\x08" + col
+
+
+def in_list(tag):
+    return b"\x09" + tag
+
+
+def matches(col, text, mode=0, prefix=False, inside=False, edits=0):
+    return b"\x0a" + col + bytes([mode, prefix | inside << 1 | edits << 2]) + put_bytes(text.encode())
+
+
+def rows(*ids):
+    return b"\x0b" + varint(len(ids)) + b"".join(ids)
+
+
+def refers(col, scope, where):
+    return b"\x0c" + col + varint(scope) + where
+
+
+def referred(col, scope, where, least=1, most=2**64 - 1):
+    return b"\x0d" + col + varint(scope) + varint(least) + varint(most) + where
+
+
+def by(col, desc=False):
+    return b"\0" + bytes([desc]) + col
+
+
+BEST, NEWEST, OLDEST = b"\1\0", b"\2\1", b"\2\0"
+
+
+def question(scope, where=ALL, order=(NEWEST,), offset=0, limit=50, from_end=False, totals=()):
+    out = varint(scope) + where + varint(len(order)) + b"".join(order) + bytes([from_end]) + varint(offset) + varint(limit)
+    return out + varint(len(totals)) + b"".join(bytes([fn]) + col + varint(top) for fn, col, top in totals)
+
+
 class Client:
     def __init__(self, address, credential, timeout=10):
         host, port = address.rsplit(":", 1)
@@ -100,6 +198,7 @@ class Client:
         self.rows = {}  # id -> {(slot, kind, stamp): body}
         self.windows = {}  # watch id -> dict(lo, hi, before, after, settled)
         self.lives = []  # (row, slot, piece, offset, bytes)
+        self.answers = {}  # question id -> dict(rows, total, first, settled, totals), or what is said instead
         self.devices = []  # reachable: (key, subject), this one first
         self.handlers = {}  # (scope, method) -> function(device, bytes) -> bytes
         self.calls = {}  # id -> {"data": [], "ended": bool, "fault": int or None}
@@ -202,6 +301,17 @@ class Client:
                     call["ended"] = True
                 elif what in (F_FAULT, F_CANCEL):
                     call["ended"], call["fault"] = True, payload[0] if payload else None
+        elif kind == ANSWER:
+            which, flags = r.varint(), r.u8()
+            if flags & ~1:
+                self.answers[which] = dict(denied=flags & 2, faulty=flags & 4, waiting=r.u8() if flags & 8 else None)
+            else:
+                a = self.answers[which] = dict(settled=flags & 1, total=r.varint(), first=r.varint())
+                a["rows"] = [r.take(16) for _ in range(r.varint())]
+                a["totals"] = []
+                for _ in range(r.varint()):
+                    have, number = r.u8(), struct.unpack(">d", r.take(8))[0]
+                    a["totals"].append((number if have else None, [(r.varint(), r.bytes()) for _ in range(r.varint())]))
         elif kind == ERROR:
             raise PermissionError(f"fault {r.u8()}")
         return kind
@@ -292,6 +402,17 @@ class Client:
     def serve(self, scope, method, handler):
         self.handlers[(scope, method)] = handler
         self.send(SERVE, varint(scope) + b"\1" + varint(len(method)) + method.encode())
+
+    def ask(self, which, *args, **more):
+        """Asks a question, which stays asked: see `question`, and self.answers."""
+        self.send(ASK, varint(which) + question(*args, **more))
+
+    def unask(self, which):
+        self.send(UNASK, varint(which))
+
+    def answer(self, which):
+        self.until(lambda: "rows" in self.answers.get(which, {}))
+        return self.answers[which]
 
     def call(self, device, scope, method, body=b"", timeout=10):
         self.next_call += 1

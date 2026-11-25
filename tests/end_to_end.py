@@ -1,6 +1,6 @@
 """Real processes on real sockets: a relay, devices and clients. Run by `./x test`."""
 
-import os, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request
+import os, re, shutil, socket, struct, subprocess, sys, tempfile, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "clients", "python"))
@@ -334,6 +334,64 @@ def knock(address, path):
     )
     assert b" 101 " in k.recv(500)
     return k
+
+
+def test_questions():
+    relay, (a, b) = space("ba", "bb")
+    ca, cb = a.client(), b.client()
+    name, age, text = zsp.column(zsp.FOLD, 16), zsp.column(zsp.NUMBER, 17), zsp.column(zsp.WORDS, 20)
+    friend = zsp.column(zsp.ID, 19)
+
+    def person(c, n, years, says, knows=None):
+        row = c.new_id(1)
+        cells = [(row, 1, zsp.PLACE, c.tag(1, "people") + struct.pack(">Q", 0)), (row, 16, zsp.VALUE, n.encode())]
+        cells += [(row, 17, zsp.VALUE, struct.pack(">d", years)), (row, 20, zsp.VALUE, says.encode())]
+        c.write(*cells, *([(row, 19, zsp.VALUE, knows)] if knows else []))
+        return row
+
+    ann = person(ca, "Ann", 30, "the quick brown fox")
+    bob = person(ca, "bob", 41, "jumps over the lazy dog", ann)
+    cat = person(ca, "Cat", 25, "a quick answer, over and out", bob)
+    cb.ask(1, 1, zsp.matches(text, "quick"), [zsp.by(age)])
+    cb.answer(1)
+    cb.until(lambda: cb.answers[1].get("rows") == [cat, ann])
+    assert cb.answers[1]["total"] == 2 and cb.answers[1]["settled"]
+    # The rows come with it, though nothing is watched, and change as they change.
+    assert any(body == b"Ann" for body in cb.rows[ann].values())
+    ca.write((ann, 20, zsp.VALUE, b"slow"))
+    cb.until(lambda: cb.answers[1]["rows"] == [cat])
+    ca.write((bob, 20, zsp.VALUE, b"QUICK!"), (bob, 17, zsp.VALUE, struct.pack(">d", 7)))
+    cb.until(lambda: cb.answers[1]["rows"] == [bob, cat])
+    # All together, with sums.
+    cb.ask(2, 1, zsp.every(zsp.no(zsp.equals(name, "CAT")), zsp.between(age, 5, 35)), totals=[(zsp.SUM, age, 0), (zsp.FACET, name, 5)])
+    assert set(cb.answer(2)["rows"]) == {ann, bob} and cb.answers[2]["totals"][0][0] == 37
+    assert sorted(cb.answers[2]["totals"][1][1]) == [(1, b"ann"), (1, b"bob")]
+    # By what they refer to, and what refers to them.
+    cb.ask(3, 1, zsp.refers(friend, 1, zsp.equals(name, "ann")))
+    assert cb.answer(3)["rows"] == [bob]
+    cb.ask(4, 1, zsp.referred(friend, 1, zsp.ALL))
+    assert set(cb.answer(4)["rows"]) == {ann, bob}
+    cb.ask(5, 1, zsp.matches(text, "anwser", edits=1))
+    assert cb.answer(5)["rows"] == [cat]
+    # One is deleted, and gone from them all; and what makes no sense, or is not allowed, is said to be so.
+    ca.write((cat, 0, zsp.GRAVE, b""))
+    cb.until(lambda: cb.answers[1]["rows"] == [bob] and cb.answers[5]["rows"] == [])
+    cb.ask(6, 9)
+    cb.until(lambda: cb.answers.get(6, {}).get("denied"))
+    cb.send(zsp.ASK, b"\7nonsense")
+    cb.until(lambda: cb.answers.get(7, {}).get("faulty"))
+    # What was kept of it is made again if it is gone, or is rubbish; either way the answers are the same.
+    for damage in (False, True):
+        b.stop()
+        if damage:
+            with open(os.path.join(b.dir, zspd_space(a), "find"), "wb") as f:
+                f.write(os.urandom(50000))
+        person(ca, "Dee", 50, "quick quick quick")
+        b.start()
+        cb = b.client()
+        cb.ask(1, 1, zsp.matches(text, "quick"), [zsp.by(age)], totals=[(zsp.COUNT, age, 0)])
+        cb.until(lambda: cb.answers.get(1, {}).get("total") == (3 if damage else 2))
+        assert cb.answers[1]["rows"][0] == bob
 
 
 def test_knocking_leaves_no_trace():
