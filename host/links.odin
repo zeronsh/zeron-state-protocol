@@ -610,6 +610,7 @@ links_run :: proc(h: ^Host) {
 			peer_send_candidates(p)
 		}
 		if p.link != nil && p.link.state == .Closed {
+			report(.Debug, "no longer linked to ", net.endpoint_to_string(address_to(p.address), context.temp_allocator))
 			peer_drop(p)
 		}
 		if p.session != nil {
