@@ -87,8 +87,8 @@ found_run :: proc(s: ^Space, now: time.Tick) {
 @(private)
 found_save :: proc(s: ^Space) {
 	x := &s.found.finder.x
-	if x.unsaved > 0 && x.tailing && zsp.store_sync(&s.node.store) {
-		find.index_save(x)
+	if x.unsaved > 0 && x.tailing && zsp.store_sync(&s.node.store) && !find.index_save(x) {
+		s.found.more ||= x.failed // it has to be made again
 	}
 }
 

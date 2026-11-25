@@ -1171,7 +1171,7 @@ answers_from_afar_are_sound :: proc(t: ^testing.T) {
 	}
 	q := make([dynamic]byte, context.temp_allocator)
 	zsp.write_varint(&q, 1)
-	append(&q, u8(Op.All), 1, 2, 1, 0, 0, 10, 2, u8(Fn.Facet), u8(Kind.Bytes), 16, 0, 3, u8(Fn.Sum), u8(Kind.Number), 17, 0, 0)
+	append(&q, u8(Op.All), 1, 2, 1, 0, 0, 10, 3, u8(Fn.Facet), u8(Kind.Bytes), 16, 0, 3, u8(Fn.Sum), u8(Kind.Number), 17, 0, 0, u8(Fn.Min), u8(Kind.Number), 17, 0, 0)
 	client_ask(t, &c, 1, q[:])
 	testing.expect(t, link_settle(t, link, &f, &g))
 	client_hear_out(t, &c, &g)
@@ -1189,6 +1189,37 @@ answers_from_afar_are_sound :: proc(t: ^testing.T) {
 			append(&bad, 0, 0, 0, 0x80, 0x80, 0x80, 0x80, 0x10)
 		case 2:
 			append(&bad, 0, 0, 0, 0, 1, 1)
+		case 3, 4, 5:
+			// A value, where there is none to a sum; one that is too short; and one row by two keys.
+			append(&bad, 1, 2, 0, 2 if round == 5 else 0)
+			if round == 5 {
+				k := l.far.keys[0]
+				zsp.write_key(&bad, k)
+				k[2] += 1
+				zsp.write_key(&bad, k)
+			}
+			append(&bad, 3)
+			for i in 0 ..< 3 {
+				append(&bad, 1)
+				resize(&bad, len(bad) + 8)
+				switch {
+				case i == 1 && round == 3:
+					append(&bad, 1, 1, 8)
+					resize(&bad, len(bad) + 8)
+				case i == 2 && round == 4:
+					append(&bad, 1, 1, 7)
+					resize(&bad, len(bad) + 7)
+				case:
+					append(&bad, 0)
+				}
+			}
+			refused := l.far.call
+			finder_flow(&g, l.far.call, .Data, bad[:])
+			finder_run(&g)
+			testing.expectf(t, l.far.call != refused, "%d", round)
+			clear(&l.far.tried)
+			testing.expect(t, link_settle(t, link, &f, &g))
+			continue
 		case:
 			append(&bad, ..good)
 			for _ in 0 ..< 1 + round % 4 {
@@ -1449,4 +1480,63 @@ what_comes_while_merging_is_there :: proc(t: ^testing.T) {
 		set_destroy(&got)
 		check_index(t, &w)
 	}
+}
+
+// What cannot be synced is not made over and over; and what has fallen far behind is followed a little at a time.
+@(test)
+index_is_patient :: proc(t: ^testing.T) {
+	state := rand.create(111)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	pages: Memory_Disk
+	defer memory_disk_destroy(&pages)
+	f: Finder
+	q := []byte{1, 0, 1, 2, 1, 0, 0, 50, 0}
+	for _ in 0 ..< 20 {
+		world_write(t, &w)
+	}
+	for life in 0 ..< 3 {
+		disk := memory_disk(&pages)
+		if life == 0 {
+			disk.sync = proc(_: rawptr) -> bool {return false}
+		}
+		finder_open(&f, &w.node, disk, w.secret)
+		f.settled = true
+		c := client_open(&w, &f)
+		client_ask(t, &c, 1, q)
+		if life == 2 {
+			testing.expect(t, len(f.x.scopes) > 0 && !f.x.tailing) // not all at once
+		}
+		for !finder_run(&f) {
+		}
+		finder_run(&f)
+		client_hear_out(t, &c, &f)
+		testing.expect(t, answer_check(t, &w, &f, &c, 1, q))
+		zsp.store_sync(&w.node.store)
+		testing.expect(t, index_save(&f.x) == (life > 0))
+		if life == 0 {
+			f.failed = time.tick_now()
+			for _ in 0 ..< 10 {
+				testing.expect(t, finder_run(&f) && f.x.failed && f.wake != nil)
+			}
+		}
+		zsp.session_close(c.session)
+		client_free(&c)
+		finder_close(&f)
+		for _ in 0 ..< 200 {
+			world_write(t, &w)
+		}
+	}
+	// And one with a page it cannot read is not opened as though it could.
+	x: Index
+	index_open(&x, &w.node, memory_disk(&pages), w.secret)
+	testing.expect(t, len(x.scopes) > 0)
+	root := x.scopes[0].ids.root
+	index_close(&x)
+	pages.pages[root][100] ~= 1
+	index_open(&x, &w.node, memory_disk(&pages), w.secret)
+	testing.expect(t, len(x.scopes) == 0 && !x.failed && len(x.free) == 0)
+	index_close(&x)
 }

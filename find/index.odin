@@ -146,14 +146,16 @@ index_open :: proc(x: ^Index, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
 	if best.generation > 0 {
 		pager_salt(x, best.salt)
 	}
-	if best.generation > 0 && catalogue_read(x, &best) {
+	whole := best.generation > 0 && catalogue_read(x, &best)
+	if whole {
 		x.forgot = best.forgot
 		x.upto, x.serial, x.next = best.upto, best.serial, best.next
 		if x.serial != n.roster.serial {
 			x.serial = max(u64) // what the roster has changed is not known
 		}
 		free_find(x)
-	} else {
+	}
+	if !whole || x.failed {
 		index_reset(x)
 	}
 }
@@ -330,7 +332,7 @@ index_save :: proc(x: ^Index) -> bool {
 		append(&x.blob, next)
 	}
 	if !x.disk.sync(x.disk.data) {
-		x.failed = true
+		x.failed, x.unwritten = true, true
 		return false
 	}
 	x.generation += 1
@@ -343,7 +345,7 @@ index_save :: proc(x: ^Index) -> bool {
 	frame_free(x, at)
 	x.dirty[at] = f
 	if !pager_write(x) || !x.disk.sync(x.disk.data) {
-		x.failed = true
+		x.failed, x.unwritten = true, true
 		return false
 	}
 	append(&x.free, ..x.pending[:])

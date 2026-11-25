@@ -204,12 +204,14 @@ live_start :: proc(l: ^Live, source: []byte) -> bool {
 	if l.session != nil && !f.settled {
 		l.far.source = slice.clone(source)
 	}
-	index_follow(&f.x)
+	if len(f.x.scopes) == 0 {
+		index_follow(&f.x) // begins from here. Otherwise it is followed a little at a time
+	}
 	query_prepare(&f.x, &l.q)
 	query_uses(&l.q, 1)
 	live_place(l)
 	l.renew = true
-	if query_ready(&f.x, &l.q) {
+	if f.x.tailing && query_ready(&f.x, &l.q) {
 		// Where another asks the same, in whatever order and whatever part of it, it is known already which.
 		for other in f.live {
 			if other != l && other.ready && !other.renew && !other.far.have && string(other.q.which) == string(l.q.which) {
@@ -652,7 +654,7 @@ finder_backs :: proc(f: ^Finder) {
 	}
 }
 
-ANSWER_MOST :: zsp.CALL_WINDOW // bytes
+ANSWER_MOST :: zsp.CALL_WINDOW - 16 // bytes, short of what a question's id may take
 
 UNWRITTEN :: 5 * time.Second // between attempts to make an index there is no writing
 
@@ -1025,15 +1027,32 @@ far_sound :: proc(l: ^Live, r: zsp.Reader) -> bool {
 		some := zsp.read_u8(&r)
 		_ = zsp.read_u64(&r)
 		facets := zsp.read_varint(&r)
-		if r.bad || some > 1 || facets > u64(max(a.top, 1)) {
+		most := 0
+		#partial switch a.fn {
+		case .Min, .Max:
+			most = 1
+		case .Facet:
+			most = a.top
+		}
+		if r.bad || some > 1 || facets > u64(most) {
 			return false
 		}
 		for _ in 0 ..< facets {
 			_ = zsp.read_varint(&r)
-			_ = zsp.read_bytes(&r)
+			// As long as a value of its kind is.
+			v := zsp.read_bytes(&r)
+			switch a.col.kind {
+			case .Bytes, .Fold, .Words:
+			case .Number, .Created, .Modified, .Order:
+				r.bad ||= len(v) != 8
+			case .Bool:
+				r.bad ||= len(v) != 1 || v[0] > 1
+			case .Id:
+				r.bad ||= len(v) != 16
+			}
 		}
 	}
-	return !r.bad && r.pos == len(r.buf)
+	return !r.bad && r.pos == len(r.buf) && len(r.buf) <= ANSWER_MOST
 }
 
 // Reads where the rows of an answer are, and wants what is there.
@@ -1046,14 +1065,15 @@ far_wants :: proc(l: ^Live, r: ^zsp.Reader) -> bool {
 	}
 	keys := make([dynamic]zsp.Key, 0, n)
 	new := make(map[zsp.Key]bool, context.temp_allocator)
+	rows := make(map[zsp.Id]bool, context.temp_allocator)
 	for _ in 0 ..< n {
 		k := zsp.read_key(r)
-		if zsp.key_scope(k) != l.q.scope || zsp.row_scope(zsp.key_row(k)) != l.q.scope || k in new {
+		if zsp.key_scope(k) != l.q.scope || zsp.row_scope(zsp.key_row(k)) != l.q.scope || zsp.key_row(k) in rows {
 			delete(keys)
 			return false
 		}
 		append(&keys, k)
-		new[k] = true
+		new[k], rows[zsp.key_row(k)] = true, true
 	}
 	for k in l.far.keys {
 		if k in new {
