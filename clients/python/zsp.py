@@ -334,7 +334,10 @@ class Client:
         deadline = time.monotonic() + timeout
         while not condition():
             self.sock.settimeout(max(deadline - time.monotonic(), 0.001))
-            self.step()
+            try:
+                self.step()
+            except socket.timeout as e:  # a TimeoutError only from Python 3.10
+                raise TimeoutError(*e.args) from e
         return self
 
     def drain(self, seconds):
