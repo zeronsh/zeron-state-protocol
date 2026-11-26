@@ -1,6 +1,7 @@
 #+build windows
 package host
 
+
 import "base:runtime"
 import "core:nbio"
 import "core:slice"
@@ -225,6 +226,11 @@ process_start :: proc(spec: Process_Spec, events: Process_Events) -> (p: ^Proces
 		}
 	}
 
+	if spec.pty {
+		// Whether Ctrl-C is ignored is handed down to whatever starts, and this process may have been started so (a
+		// service, or a group of its own): a terminal's programs must hear the Ctrl-C typed into it all the same.
+		win.SetConsoleCtrlHandler(nil, false)
+	}
 	command := process_command_line(argv)
 	pi: win.PROCESS_INFORMATION
 	if !win.CreateProcessW(win.utf8_to_wstring(path), command, nil, nil, win.BOOL(inherit), flags, process_environment(spec), win.utf8_to_wstring(dir), &info.StartupInfo, &pi) {
@@ -299,8 +305,8 @@ process_read :: proc(p: ^Process, want: bool) {
 }
 
 process_input :: proc(p: ^Process, bytes: []byte) -> int {
-	if p.freed || p.input == nil || p.ending {
-		return 0
+	if p.freed || p.input == nil || p.ending || p.reaped || sync.atomic_load(&p.ended) {
+		return 0 // nobody is there to take it, whatever its pipe says
 	}
 	n := min(len(bytes), process_input_room(p))
 	append(&p.held, ..bytes[:n])
@@ -309,7 +315,7 @@ process_input :: proc(p: ^Process, bytes: []byte) -> int {
 }
 
 process_input_room :: proc(p: ^Process) -> int {
-	if p.freed || p.input == nil || p.ending {
+	if p.freed || p.input == nil || p.ending || p.reaped || sync.atomic_load(&p.ended) {
 		return 0
 	}
 	return max(PROCESS_INPUT - len(p.writing) - len(p.held), 0)

@@ -1,5 +1,6 @@
 package host
 
+import "core:fmt"
 import "core:nbio"
 import "core:os"
 import "core:path/filepath"
@@ -728,6 +729,7 @@ process_interrupts_a_terminal :: proc(t: ^testing.T) {
 	process_signal(r.p, .Interrupt)
 	testing.expect(t, ran_send(&r, exit))
 	if !testing.expect(t, ran_until(&r, ran_exited)) {
+		fmt.eprintfln("TERMINAL SAID: %q", string(r.out[max(len(r.out) - 1500, 0):]))
 		return
 	}
 	testing.expect_value(t, r.exit.code, 6)
@@ -741,8 +743,9 @@ process_stops_and_goes_on :: proc(t: ^testing.T) {
 	}
 	defer nbio.release_thread_event_loop()
 	when ODIN_OS == .Windows {
-		argv := []string{"findstr", "^"}
-		line := "zsp-line\r\n"
+		// cmd says each echo at once; findstr, writing to a pipe, holds back until its input ends.
+		argv := []string{"cmd", "/d", "/q"}
+		line := "echo zsp-line\r\n"
 	} else {
 		argv := []string{"cat"}
 		line := "zsp-line\n"
@@ -767,7 +770,11 @@ process_stops_and_goes_on :: proc(t: ^testing.T) {
 	if !testing.expect(t, ran_until(&r, ran_exited)) {
 		return
 	}
-	testing.expect_value(t, string(r.out[:]), line)
+	when ODIN_OS == .Windows {
+		testing.expectf(t, strings.contains(string(r.out[:]), "zsp-line\r\n"), "%q", string(r.out[:]))
+	} else {
+		testing.expect_value(t, string(r.out[:]), line)
+	}
 	testing.expect_value(t, r.exit, Exit{})
 }
 
