@@ -58,6 +58,7 @@ Port_Watch :: struct {
 	owed:   bool, // something has changed that there was no room to say
 	ended:  bool, // this side has ended: it is freed when the other has
 	once:   bool, // asked with no lease: answered once, and never kept up, whatever it asks after
+	heard:  bool, // the other side has ended: freed when this one has
 }
 
 offer_destroy :: proc(o: ^Offer) {
@@ -445,6 +446,10 @@ ports_called :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, firs
 	}
 	w.on_end = proc(h: ^Call_Handler, call: u64) {
 		w := (^Port_Watch)(h)
+		if w.once && !w.ended {
+			w.heard = true // asked once, and said all it will as it asked: answered all the same, then over
+			return
+		}
 		if !w.ended {
 			call_end(w.ports.space, w.call)
 			watcher_drop(w)
@@ -462,6 +467,9 @@ ports_called :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, firs
 		w := (^Port_Watch)(h)
 		if w.owed {
 			watcher_tell(w)
+			if w.once && !w.owed {
+				w.ports.telling = true // said at last: over, as soon as the host next looks
+			}
 		}
 	}
 	append(&p.watchers, w)
@@ -555,9 +563,12 @@ offers_run :: proc(p: ^Ports, now: time.Tick) {
 		}
 	}
 	#reverse for w in p.watchers {
-		if time.tick_diff(w.until, now) >= 0 {
+		if time.tick_diff(w.until, now) >= 0 && !(w.once && w.owed) {
 			call_end(p.space, w.call) // a lease of 0 ends here, once said
 			watcher_drop(w)
+			if w.heard {
+				free(w) // over both ways
+			}
 		}
 	}
 }

@@ -1193,6 +1193,17 @@ def test_ports():
         call.send(zsp.varint(600))
         once.append(call)
     eventually("each is over", lambda: all(c["ended"] or c["fault"] is not None for c in once) or ca.step() and False, timeout=5)
+    # And so it is said to one that says all it will as it asks, as a call of one message does: answered all the same.
+    asked = []
+    for _ in range(20):
+        call = ca.open(bytes.fromhex(b.key), 1, "zsp.ports", zsp.varint(0))
+        call.end()
+        asked.append(call)
+    for call in asked:
+        said = b""
+        while (message := call.read(5)) is not None:
+            said += message
+        assert call["fault"] is None and port in [e["port"] for e in zsp.entries(zsp.Reader(said))], (said, call)
     # A name of letters past ASCII goes as its bytes: the device refuses it as no name, not as no frame.
     said = []
     host = ca.host
