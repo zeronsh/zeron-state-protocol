@@ -382,17 +382,25 @@ review_list_is_whole :: proc(t: ^testing.T) {
 @(test)
 review_space_closed_while_dialling :: proc(t: ^testing.T) {
 	w: World
-	testing.expect(t, world_init(t, &w))
+	testing.expect(t, world_init(t, &w, udp = false))
 	defer world_destroy(&w)
 	l, lerr := net.listen_tcp({net.IP4_Loopback, 0})
 	testing.expect(t, lerr == nil)
 	defer net.close(l)
 	bound, _ := net.bound_endpoint(l)
+	h := &w.hosts[1]
 	sp := world_space(&w, 1)
 	b := bridge_new(sp, 42)
 	bridge_dial(b, {net.IP4_Loopback, bound.port})
+	// As a relay lets a space go: once nothing else of it is left, here nobody's connection, nor any dialling for it.
+	for len(h.streams) > 0 {
+		stream_close(h.streams[0])
+	}
+	for len(h.dialers) > 0 {
+		dialer_free(pop(&h.dialers))
+	}
+	ordered_remove(&h.spaces, 0)
 	space_close(sp)
-	ordered_remove(&w.hosts[1].spaces, 0)
 	// Abandoned, dialling still: it must hold nothing of the space, which is gone.
 	testing.expect(t, b.abandoned && b.sp == nil, "an abandoned dial holds its space")
 	// And it ends, letting go of all it has, without touching it.
@@ -534,4 +542,28 @@ review_exec_credits_whole_messages :: proc(t: ^testing.T) {
 	call_consumed(a, 777, 100) // what taking the held input credits
 	c := host_call_find(a, 777)
 	testing.expectf(t, c.used == 110, "%d credited of 110", c.used)
+}
+
+// A connection reset as it is joined: the bridge is over before bridge returns, which says so rather than handing
+// back what is gone; and nothing is left behind. (Found by the ports chat, with ASan.)
+@(test)
+review_bridge_reset_at_once :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	l, lerr := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, lerr == nil)
+	defer net.close(l)
+	bound, _ := net.bound_endpoint(l)
+	c, cerr := net.dial_tcp(net.Endpoint{net.IP4_Loopback, bound.port})
+	testing.expect(t, cerr == nil)
+	accepted, _, aerr := net.accept_tcp(l)
+	testing.expect(t, aerr == nil)
+	socket_abort(accepted) // reset, at once
+	time.sleep(50 * time.Millisecond)
+	sp := world_space(&w, 1)
+	prelude := make([]byte, 4 << 20, context.temp_allocator) // more than any socket takes before it hears the reset
+	b := bridge(sp, 0, c, prelude)
+	testing.expectf(t, b == nil, "a bridge already over was handed back")
+	testing.expect_value(t, len(sp.bridges), 0)
 }

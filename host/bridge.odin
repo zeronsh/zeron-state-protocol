@@ -63,6 +63,8 @@ Bridge :: struct {
 	written:     int, // of pending
 	refused:     bool, // the call was answered with a failure, and waits to be over
 	abandoned:   bool, // over while dialling: the dial is left to finish, and the bridge freed then
+	attaching:   bool, // within bridge_attach, which frees it, if it is over by then, as it returns
+	gone:        bool, // let go of while attaching
 	eof:         bool, // the socket said all it will, and so has the call
 	heard_end:   bool, // the call said all it will
 	shut:        bool, // and the socket has been told
@@ -91,22 +93,24 @@ Bridge :: struct {
 Forward :: Bridge
 
 // Joins a call this host is an end of to a connected socket, which the bridge then owns. `prelude` is written to the
-// socket before anything else.
+// socket before anything else. Nil if it is over before this returns, as when the socket fails at once.
 bridge :: proc(sp: ^Space, call: u64, socket: net.TCP_Socket, prelude: []byte = nil) -> ^Bridge {
 	b := bridge_new(sp, call)
 	if c := host_call_find(sp, call); c != nil {
 		c.handler = &b.handler
 		b.heard_end = c.heard_end // the other side may have said all it will already
 	}
-	bridge_attach(b, socket, prelude)
+	if !bridge_attach(b, socket, prelude) {
+		return nil // over already, as a connection reset at once is
+	}
 	return b
 }
 
 // Joins a connected socket, accepted here, to a port on a device: a zsp.tcp call in a scope. The forward owns the
 // socket, and closes it with a reset if the port cannot be reached. `done` is told how it ended, once.
 // `inspect`, if given, sees what the socket sends until it lets it through or rejects it; what comes back flows
-// from the start, for some protocols speak first. If the call cannot be made at all, `done` is told so before forward
-// returns, and forward returns nil.
+// from the start, for some protocols speak first. If the call cannot be made at all, or the forward is over before
+// forward returns, `done` is told so first, and forward returns nil.
 forward :: proc(
 	sp: ^Space,
 	device: zsp.Key32,
@@ -140,7 +144,9 @@ forward :: proc(
 	// What the socket said already goes first, as credit allows; the rest of it waits its turn.
 	append(&b.held, ..early)
 	b.early = len(early)
-	bridge_attach(b, socket, nil)
+	if !bridge_attach(b, socket, nil) {
+		return nil // over already, and `done` told so
+	}
 	return b
 }
 
@@ -273,22 +279,32 @@ bridge_new :: proc(sp: ^Space, call: u64) -> ^Bridge {
 }
 
 @(private)
-bridge_attach :: proc(b: ^Bridge, socket: net.TCP_Socket, prelude: []byte) {
+bridge_attach :: proc(b: ^Bridge, socket: net.TCP_Socket, prelude: []byte) -> (alive: bool) {
+	// What is done here may end it, and whoever called still holds it: so it is freed, if so, only on the way out.
+	b.attaching = true
 	b.socket, b.connected = socket, true
 	net.set_blocking(socket, false)
 	net.set_option(socket, .TCP_Nodelay, true)
 	socket_lowat(socket, 32 << 10)
 	append(&b.prelude, ..prelude)
 	bridge_flush(b)
-	if b.waiting {
-		// Not before `forward` has returned: an inspector may want what it returns, to reject it.
-		b.recv_op = nbio.poll_poly(b.socket, .Receive, b, proc(op: ^nbio.Operation, b: ^Bridge) {
-			b.recv_op = nil
+	if !b.over {
+		if b.waiting {
+			// Not before `forward` has returned: an inspector may want what it returns, to reject it.
+			b.recv_op = nbio.poll_poly(b.socket, .Receive, b, proc(op: ^nbio.Operation, b: ^Bridge) {
+				b.recv_op = nil
+				bridge_read(b)
+			})
+		} else {
 			bridge_read(b)
-		})
-		return
+		}
 	}
-	bridge_read(b)
+	b.attaching = false
+	if b.gone {
+		bridge_free(b)
+		return false
+	}
+	return true
 }
 
 @(private)
@@ -300,6 +316,10 @@ bridge_free :: proc(b: ^Bridge) {
 				break
 			}
 		}
+	}
+	if b.attaching {
+		b.gone = true // freed as bridge_attach returns
+		return
 	}
 	if b.dialling != nil {
 		// A dial taken back may have connected all the same, and then nobody would close what it made: so it is
