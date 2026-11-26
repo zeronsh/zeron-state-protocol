@@ -99,6 +99,7 @@ export class Space extends DurableObject {
     this.#sockets.clear();
     this.#wasm = undefined;
     this.#epoch++;
+    this.#storage.cancel();
     this.#broken = false;
     this.#full = Date.now();
     console.log(FULL);
@@ -277,6 +278,7 @@ export class Space extends DurableObject {
       this.#wasm = undefined;
       this.#epoch++;
       this.#sockets.clear();
+      this.#storage.cancel();
       if (cold) this.#storage.forget();
       this.#begin() && this.#settle();
     }

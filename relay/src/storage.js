@@ -279,9 +279,14 @@ export class Storage {
     }
   }
 
+  // What a node that has been let go of asked for and was not yet started is not: nothing it did not finish is done.
+  cancel() {
+    this.#queue = [];
+  }
+
   // Lets go of everything cached, here and in SQLite, and of whatever was to be started: for measuring.
   forget() {
-    this.#queue = [];
+    this.cancel();
     if (!this.#made) return;
     for (const kind of [0, 1]) {
       this.write(`DELETE FROM cache${kind}`);

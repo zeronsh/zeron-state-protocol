@@ -203,10 +203,27 @@ async function r2_finishes(seed) {
   assert.ok(s.stats.puts >= 2 && s.stats.gets >= 1);
 }
 
+// A node let go of: what it asked for and was not yet started is never started.
+async function cancelled_is_not_started(seed) {
+  const { s, host, memory, bucket } = harness(seed);
+  memory.fill(3, 0, 8192);
+  host.log_write(0, 0, 1);
+  host.start(1, 3, 9, 0, 0, 0, 8192); // a pack
+  host.start(2, 5, 0, 0, 0, 0, 0); // a delete
+  s.cancel();
+  let heard = 0;
+  s.run(() => heard++);
+  await new Promise((go) => setTimeout(go, 20));
+  assert.equal(heard, 0);
+  assert.equal(bucket.objects.size, 0);
+  assert.ok(!s.busy);
+}
+
 for (let seed = first; seed < first + seeds; seed++) {
   await log_matches(seed);
   await cache_is_sound(seed);
   if (seed % 8 === 0) await full_fails_cleanly(seed);
   if (seed % 10 === 0) await r2_finishes(seed);
+  if (seed === first) await cancelled_is_not_started(seed);
 }
 console.log(`ok   relay storage held to its model over ${seeds} seeds`);
