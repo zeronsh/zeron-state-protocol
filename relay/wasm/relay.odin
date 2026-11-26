@@ -263,9 +263,18 @@ exposed :: proc(s: ^zsp.Session, payload: []byte) {
 	if r.bad || n > 16 || id == 0 {
 		return
 	}
-	labels_drop(id)
+	// What it no longer exposes is let go, and what is new is claimed: what it says again is left as it is, for a release
+	// and a claim of the same label could reach the label's own object either way round.
+	before := make([dynamic]string, context.temp_allocator)
+	#reverse for l, i in labels {
+		if l.conn == id {
+			append(&before, l.label)
+			unordered_remove(&labels, i)
+		}
+	}
 	w := make([dynamic]byte, context.temp_allocator)
 	zsp.write_varint(&w, n)
+	kept := make([dynamic]string, context.temp_allocator)
 	for _ in 0 ..< n {
 		prefix := string(zsp.read_bytes(&r))
 		nonce_bytes := zsp.read_take(&r, zsp.EXPOSE_NONCE)
@@ -287,12 +296,29 @@ exposed :: proc(s: ^zsp.Session, payload: []byte) {
 		url := ""
 		if status == 0 {
 			append(&labels, Label{zsp_clone(label), id, s.peer})
-			label_claim(raw_data(label), len(label))
+			was := false
+			for b in before {
+				was ||= b == label
+			}
+			if !was {
+				label_claim(raw_data(label), len(label))
+			}
+			append(&kept, label)
 			url = zsp_concat("https://", label, ".", domain)
 		}
 		zsp.write_bytes(&w, transmute([]byte)label)
 		append(&w, status)
 		zsp.write_bytes(&w, transmute([]byte)url)
+	}
+	for b in before {
+		gone := true
+		for k in kept {
+			gone &&= k != b
+		}
+		if gone {
+			label_release(raw_data(b), len(b))
+		}
+		delete(b)
 	}
 	zsp.session_say(s, zsp.EXPOSE + 1, w[:])
 }
@@ -311,12 +337,12 @@ zsp_concat :: proc(parts: ..string) -> string {
 	return string(w[:])
 }
 
-// A connection has gone, or said again what it exposes: what it exposed goes.
+// A connection has gone: what it exposed is reached here no longer. The label's own object still leads here, which is
+// harmless (it leads nowhere else, and here nobody answers for it) and right when the device comes back, as it will.
 @(private)
 labels_drop :: proc(id: u32) {
 	#reverse for l, i in labels {
 		if l.conn == id {
-			label_release(raw_data(l.label), len(l.label))
 			delete(l.label)
 			unordered_remove(&labels, i)
 		}
