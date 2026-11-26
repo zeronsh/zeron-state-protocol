@@ -766,7 +766,7 @@ remote_store_made_from_a_whole_log :: proc(t: ^testing.T) {
 }
 
 // A device catching up is sent rows in order, a few at a time; the log they lie in is read ahead, further each time,
-// so that it costs a read an extent or so, not one a block.
+// so that it costs a read an extent or so, not one a block, and the next is asked for before it is wanted.
 @(test)
 remote_catching_up_reads_ahead :: proc(t: ^testing.T) {
 	state := seeded(5)
@@ -797,7 +797,7 @@ remote_catching_up_reads_ahead :: proc(t: ^testing.T) {
 		delete(c.bytes)
 	}
 	clear(&x.remote.blocks)
-	before := x.remote.stats.log_gets
+	before, missed := x.remote.stats.log_gets, x.remote.missed
 	Fill :: struct {
 		from: Key,
 		done: bool,
@@ -818,11 +818,16 @@ remote_catching_up_reads_ahead :: proc(t: ^testing.T) {
 			}
 			f.done = true
 		})
+		// As a host does after each burst: what was wanted is asked for, and some of what was asked for comes.
+		remote_ops(&x.remote)
+		model_tick(&x.host, &x.remote, 1)
 		remote_rest(&x.remote)
 	}
 	bytes := ROWS * (len(big) + 100)
 	gets := x.remote.stats.log_gets - before
 	testing.expectf(t, gets <= bytes / EXTENT + 4, "%d reads of the log for %d extents of it", gets, bytes / EXTENT + 1)
+	// And it reads ahead of the reader too, so that the reader seldom waits.
+	testing.expectf(t, x.remote.missed - missed <= 20, "the reader waited %d times", x.remote.missed - missed)
 }
 
 // A host woken with nothing at hand replays the log past the checkpoint in a few rounds of fetching, not one a record:

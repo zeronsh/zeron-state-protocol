@@ -393,6 +393,11 @@ remote_block :: proc(r: ^Remote, b: u64) -> (bytes: []byte, ok: bool) {
 	r.tick += 1
 	if c, have := &r.blocks[b]; have {
 		c.used = r.tick
+		// Reading on through what was read ahead: past half of it, the next stretch is asked for, so that it has come
+		// by the time it is wanted.
+		if r.ahead >= 2 * LOG_BLOCK && b < r.read_to && b + r.ahead / 2 >= r.read_to && r.read_to < r.local_from && r.read_to not_in r.blocks && r.read_to not_in r.getting_blocks {
+			r.want_blocks[r.read_to] = {}
+		}
 		return c.bytes, true
 	}
 	// The host's own cache holds whole blocks only.

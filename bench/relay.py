@@ -106,8 +106,8 @@ def main():
     e.zspd("join", p.dir, sid, cloud.key, cloud.url)
     p.start()
     e.eventually("it hears who belongs", lambda: os.path.exists(os.path.join(p.dir, sid, "roster")), 60)
-    for which, back, window in (("latest", True, 7), ("earliest", False, 8)):
-        urllib.request.urlopen(urllib.request.Request(cloud.url.replace("ws", "http", 1) + "/" + sid + "?evict", headers={"User-Agent": "zsp-bench"})).read()
+    for which, back, window, how in (("latest", True, 7, "warm"), ("earliest", False, 8, "warm"), ("latest", True, 9, "cold"), ("earliest", False, 10, "cold")):
+        urllib.request.urlopen(urllib.request.Request(cloud.url.replace("ws", "http", 1) + "/" + sid + "?evict=" + how, headers={"User-Agent": "zsp-bench"})).read()
         s0 = stats(cloud, sid)
         cw = p.client()
         t = time.monotonic()
@@ -116,9 +116,9 @@ def main():
         took = time.monotonic() - t
         s1 = stats(cloud, sid)
         d = spent(s0, s1)
-        results[f"window {which}"] = {"ms": took * 1e3, **d}
-        print(f"a window of the {which} 50 from a relay woken cold: {took * 1e3:.0f} ms")
-        line(f"window of the {which} 50", d)
+        results[f"window {which} {how}"] = {"ms": took * 1e3, **d}
+        print(f"a window of the {which} 50 from a relay woken {'with its own cache' if how == 'warm' else 'with nothing at hand'}: {took * 1e3:.0f} ms")
+        line(f"window of the {which} 50, {how}", d)
         cw.sock.close()
 
     # A device that has it all already, back: one fingerprint, and what that costs the relay.
@@ -131,6 +131,10 @@ def main():
     results["reconnect"] = d
     line("a device back, level", d)
 
+    if cloud.p is None:
+        probe = json.loads(urllib.request.urlopen(urllib.request.Request(cloud.url.replace("ws", "http", 1) + "/" + sid + "?probe", headers={"User-Agent": "zsp-bench"})).read())
+        results["R2 from the object, ms"] = probe
+        print("R2 from the object:", ", ".join(f"{k} {v} ms" for k, v in probe.items()))
     s = stats(cloud, sid)
     st = s["storage"]
     results["at rest"] = {"sqlite_bytes": s["sqlite"], "memory_bytes": s["node"] and s["memory"], "r2_put_mb": st["put"] / 1e6}
