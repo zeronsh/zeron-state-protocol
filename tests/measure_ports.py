@@ -51,9 +51,10 @@ class Sink:
 
 
 def two(udp):
-    relay = Node("m-relay", "serve", "--no-udp").start()
+    tag = "u" if udp else "r"
+    relay = Node("m-relay" + tag, "serve", "--no-udp").start()
     devices = []
-    for i, name in enumerate(("ma", "mb")):
+    for i, name in enumerate(("ma" + tag, "mb" + tag)):
         d = Node(name, "run", *([] if udp else ["--no-udp"]), "--loopback=127.%d.0" % (95 + i), "--dns=127.0.0.1:%d" % free_port(),
                  "--catch=127.0.0.1:0", "--proxy=127.0.0.1:%d" % free_port())
         d.dns = d.options[-3].split("=")[1]
