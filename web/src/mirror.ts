@@ -252,6 +252,26 @@ function frozen<T extends object>(v: T): T {
   return Object.freeze(v);
 }
 
+// A value read from a column, unchangeable all the way down, so that what is shown cannot be changed in place and differ
+// from what is held; for a change is made by setting, or in a draft, which hands out a copy. Bytes cannot be frozen, and
+// each reading of them is a copy of its own.
+function settled<T>(v: T): T {
+  if (typeof v !== "object" || v === null || ArrayBuffer.isView(v) || Object.isFrozen(v)) return v;
+  for (const x of Object.values(v)) settled(x);
+  return Object.freeze(v);
+}
+
+// Whether a column holds the same with these two as it does: the very same, or what is written of them is.
+function sameValue(c: Column<any>, a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || a === null || typeof b !== "object" || b === null) return false;
+  try {
+    return sameBytes(c.encode(a), c.encode(b));
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------- what a row is in
 
 interface Where {
@@ -359,7 +379,7 @@ function framesOf(c: Column<any>, t: text.Text | undefined): { values: unknown[]
     }
     let v: unknown, fine = true;
     try {
-      v = c.decode(bytes.subarray(at + used, at + used + n));
+      v = settled(c.decode(bytes.subarray(at + used, at + used + n)));
     } catch {
       fine = false;
     }
@@ -722,7 +742,7 @@ export function open<S extends MapSchema<any>>(client: Client, options: { scope:
     const cell = latest(row, c.slot);
     if (!cell || cell.body.length === 0) return undefined;
     try {
-      return c.decode(cell.body);
+      return settled(c.decode(cell.body));
     } catch {
       return undefined; // what does not read as one of its kind is nothing
     }
@@ -758,8 +778,10 @@ export function open<S extends MapSchema<any>>(client: Client, options: { scope:
 
   // A map: the same object as before if nothing in it is other than it was.
   const buildMap = (s: MapSchema, id: string): Obj => {
-    const was = nodes.get(id);
-    if (was !== undefined && !dirtyNode.has(id) && schemaOf.get(id) === s && !plain) return was;
+    // What was made of the row for another shape of map is not this one, though they share an id: as maps do before the
+    // scope's key is known, when there is nothing in any of them.
+    const was = schemaOf.get(id) === s ? nodes.get(id) : undefined;
+    if (was !== undefined && !dirtyNode.has(id) && !plain) return was;
     dirtyNode.delete(id);
     schemaOf.set(id, s);
     const row = alive(id);
@@ -1340,10 +1362,12 @@ export function open<S extends MapSchema<any>>(client: Client, options: { scope:
         const c = s.columns[i];
         if (!c || c.who) continue;
         const name = s.names[i];
-        const v = n[name], ov = old ? old[name] : undefined;
+        // A text is always a string, and one not given is empty: written as an edit, so that what others type meanwhile
+        // is kept, as for any other.
+        const v = c.text && !made && n[name] === undefined ? "" : n[name], ov = old ? old[name] : undefined;
         if (c.text && !made && typeof v === "string") {
-          if (v !== ov) edit(id, c.slot, v);
-        } else if (!Object.is(v, ov) || made) {
+          if (v !== ov && !(v === "" && ov === undefined)) edit(id, c.slot, v);
+        } else if (!sameValue(c, v, ov) || made) {
           if (v !== undefined) {
             values[name] = v;
             some = true;
@@ -2045,6 +2069,13 @@ class Drafts {
     const v = st.orig[key];
     const i = st.schema.at.get(key);
     const b = i !== undefined ? st.schema.boxes[i] : key === "children" ? st.tree : undefined;
+    if (!b && i !== undefined && typeof v === "object" && v !== null && st.schema.columns[i]) {
+      // What a column holds, JSON or bytes, may be changed in place in a draft: so it is a copy, which counts as written,
+      // and is written if what it comes to is other than what it was.
+      const copy = structuredClone(v);
+      (st.writes ??= new Map()).set(key, copy);
+      return copy;
+    }
     if (!b || typeof v !== "object" || v === null || !built.has(v)) return v;
     let d = st.kids?.get(key);
     if (!d) (st.kids ??= new Map()).set(key, (d = this.#box(b, v)));
