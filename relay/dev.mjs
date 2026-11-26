@@ -25,6 +25,7 @@ const mf = new Miniflare({
     ...(process.env.CACHE_BYTES && { CACHE_BYTES: process.env.CACHE_BYTES }),
     ...(process.env.PAGES_KEPT && { PAGES_KEPT: process.env.PAGES_KEPT }),
     ...(process.env.BLOCKS_KEPT && { BLOCKS_KEPT: process.env.BLOCKS_KEPT }),
+    ...(process.env.CHECKPOINT_TAIL && { CHECKPOINT_TAIL: process.env.CHECKPOINT_TAIL }),
     STATS: "1",
   },
   // A bucket for what the objects' own storage does not keep, unless NO_R2 says to see what happens without one.

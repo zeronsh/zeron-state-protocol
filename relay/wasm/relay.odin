@@ -35,7 +35,7 @@ foreign host {
 	now :: proc() -> f64 ---
 }
 
-CHECKPOINT_TAIL :: 256 << 10 // what waking may have to replay
+checkpoint_tail: u64 = 256 << 10 // what waking may have to replay
 MAX_PLAIN :: 60 << 10
 
 Conn :: struct {
@@ -54,9 +54,12 @@ conns: map[u32]^Conn
 message: [dynamic]byte // handed in and out
 
 @(export)
-init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len: int, roster: [^]byte, roster_len: int, page_budget, block_budget: int, local_keep, local_most: f64) -> bool {
+init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len: int, roster: [^]byte, roster_len: int, page_budget, block_budget: int, local_keep, local_most, tail: f64) -> bool {
 	context = runtime.default_context()
 	secret = secret_ptr^
+	if tail > 0 {
+		checkpoint_tail = u64(tail)
+	}
 	h := zsp.Remote_Host {
 		log_write = proc(_: rawptr, off: u64, bytes: []byte) -> bool {
 			return log_write(f64(off), raw_data(bytes), len(bytes))
@@ -219,7 +222,7 @@ settle :: proc "c" () -> int {
 		zsp.store_sync(&node.store)
 	}
 	zsp.node_retry(&node)
-	if !node.store.replaying && zsp.store_tail(&node.store) - node.checkpoint > CHECKPOINT_TAIL {
+	if !node.store.replaying && zsp.store_tail(&node.store) - node.checkpoint > checkpoint_tail {
 		remote.want_checkpoint = true
 	}
 	zsp.remote_work(&remote)
@@ -249,7 +252,7 @@ stats :: proc "c" () -> int {
 	context = runtime.default_context()
 	clear(&message)
 	st := remote.stats
-	for v in ([?]u64{u64(st.gets), u64(st.puts), u64(st.deletes), st.got, st.put, u64(st.checkpoints), u64(st.extents), u64(st.fetched_pages), u64(st.local_hits), u64(st.relocated), u64(len(node.store.dirty)), u64(st.log_gets), remote.uploaded, remote.local_from, zsp.store_tail(&node.store) if !node.store.replaying else 0}) {
+	for v in ([?]u64{u64(st.gets), u64(st.puts), u64(st.deletes), st.got, st.put, u64(st.checkpoints), u64(st.extents), u64(st.fetched_pages), u64(st.local_hits), u64(st.relocated), u64(len(node.store.dirty)), u64(st.log_gets), remote.uploaded, remote.local_from, zsp.store_tail(&node.store) if !node.store.replaying else 0, node.store.checkpoint}) {
 		zsp.write_u64(&message, v)
 	}
 	return len(message)

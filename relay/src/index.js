@@ -150,7 +150,7 @@ export class Space extends DurableObject {
     // And writing waits for R2, should it fall behind, before this storage holds more of the log than 64 MiB, or half of
     // what may be kept here: a space R2 can keep never fills it.
     const most = limit > 0 ? Math.min(64 << 20, Math.floor(limit / 2)) : 64 << 20;
-    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length, pages, blocks, keep, most)) {
+    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length, pages, blocks, keep, most, Number(this.env.CHECKPOINT_TAIL ?? 0))) {
       throw exports.failed() ? new Full(FULL) : new Error("storage is damaged");
     }
     let lost = false;
@@ -306,7 +306,7 @@ export class Space extends DurableObject {
     if (this.#wasm) {
       const n = this.#wasm.stats();
       const d = new DataView(this.#view(this.#wasm.data(), n).slice().buffer);
-      const names = ["gets", "puts", "deletes", "got", "put", "checkpoints", "extents", "fetched_pages", "local_hits", "relocated", "dirty", "log_gets", "uploaded", "local_from", "tail"];
+      const names = ["gets", "puts", "deletes", "got", "put", "checkpoints", "extents", "fetched_pages", "local_hits", "relocated", "dirty", "log_gets", "uploaded", "local_from", "tail", "checkpoint"];
       out.node = Object.fromEntries(names.map((k, i) => [k, Number(d.getBigUint64(i * 8, false))]));
       out.memory = this.#wasm.memory.buffer.byteLength;
     }
