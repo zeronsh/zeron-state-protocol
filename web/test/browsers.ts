@@ -159,6 +159,24 @@ const tests: Record<string, () => Promise<void>> = {
     await eventually("a zspd device has it all", () => titles === "one,two,three");
     there.close();
   },
+  // A tab that goes takes with it what it was doing on another tab's node: what it served is served no longer, and a call
+  // to it is answered so, rather than never.
+  async browser_tab_gone() {
+    const relay = await node("serve", join(TMP, "tg-relay"));
+    const s = await space("tg", relay);
+    const leader = await page();
+    await browserDevice(leader, "tg", s, relay, "ann", false);
+    const follower = await page();
+    await call(follower, "device", "tg");
+    await call(follower, "serve", "tg", "where", "here");
+    expectEqual(await call<string>(leader, "request", "tg", "where", 5000), "here");
+    await follower.close();
+    pages.splice(pages.indexOf(follower), 1);
+    // One in flight as it goes may be lost; none goes unanswered, and the next is told there is nobody to answer.
+    const first = await call<string>(leader, "request", "tg", "where", 5000);
+    if (first !== "fault lost" && first !== "fault unserved") throw new Error(`a call to a tab that has gone: ${first}`);
+    expectEqual(await call<string>(leader, "request", "tg", "where", 5000), "fault unserved");
+  },
   // A device is what it was after its tabs have all gone, with no relay to be had: its key, and what it held.
   async browser_restart() {
     const relay = await node("serve", join(TMP, "br-relay"));

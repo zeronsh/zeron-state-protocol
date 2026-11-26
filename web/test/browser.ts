@@ -72,6 +72,23 @@ const zsp = {
     await devices.get(name)?.close();
     devices.delete(name);
   },
+  /** Answers a method of scope 1 with a word, through this tab's client of a device. */
+  async serve(name: string, method: string, word: string): Promise<void> {
+    const c = clientOf(name);
+    for (let i = 0; i < 1000 && !c.may(1, "call"); i++) await sleep(10);
+    c.serve(1, method, (call) => (call.send(word), call.finish()));
+    await sleep(100); // said to the node
+  },
+  /** Calls a method of scope 1 on this very device: its answer, "fault …", or "nothing" if there was none in time. */
+  async request(name: string, method: string, ms: number): Promise<string> {
+    const c = clientOf(name);
+    for (let i = 0; i < 1000 && !(c.may(1, "call") && c.me()); i++) await sleep(10);
+    const answer = c.request(c.me()!.id, 1, method).then(
+      (b) => new TextDecoder().decode(b),
+      (e: { fault: string }) => "fault " + e.fault,
+    );
+    return Promise.race([answer, sleep(ms).then(() => "nothing")]);
+  },
   /** Writes notes to a list of scope 1, and resolves once they are durable on the device. */
   async put(name: string, list: string, titles: string[]): Promise<void> {
     const c = clientOf(name);

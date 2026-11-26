@@ -6,7 +6,8 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Node, spaceUrl } from "../src/node.ts";
-import { MemoryVolume } from "../src/volume.ts";
+import { Client } from "../src/client.ts";
+import { MemoryVolume, type File } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
 import { BIN } from "./procs.ts";
 
@@ -38,6 +39,26 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await again.close();
 }
 
+// Nonsense, or a roster that is not its space's, does not make a device of a space; and it can join one after.
+{
+  const volume = new MemoryVolume();
+  const node = await Node.open({ volume, module, log: () => {} });
+  const forged = new Uint8Array(200);
+  forged.set(new TextEncoder().encode("zsp-r1"));
+  crypto.getRandomValues(forged.subarray(6));
+  assert(!node.adopt(forged));
+  assert.equal(node.space, undefined, "a forged roster made it of a space");
+  const owner = join(TMP, "forged-owner");
+  const space = execFileSync(BIN, ["create", owner], { encoding: "utf8" }).trim();
+  execFileSync(BIN, ["admit", owner, node.key, "1"]);
+  await node.close();
+  const again = await Node.open({ volume, module, log: () => {} });
+  assert.equal(again.space, undefined, "and is so after a restart");
+  assert(again.adopt(readFileSync(join(owner, space, "roster"))));
+  assert.equal(again.space, space);
+  await again.close();
+}
+
 // By a roster alone, and a member at once.
 {
   const owner = join(TMP, "owner");
@@ -49,6 +70,40 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   assert(node.member);
   assert(!node.adopt(new Uint8Array(100)), "nonsense is not a roster");
   await node.close();
+}
+
+// What it cannot keep of the space, it does not go on without: keys it could not keep would be lost at the next start, and
+// with them everything sealed under them, so the change is refused, the node stops, and nothing more is said durable.
+{
+  let failing = false;
+  class Failing extends MemoryVolume {
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f || !/^(keys|roster)\./.test(name)) return f;
+      const write = f.write.bind(f);
+      f.write = (b, at) => {
+        if (failing) throw new Error("the disk is full");
+        return write(b, at);
+      };
+      return f;
+    }
+  }
+  const volume = new Failing();
+  volume.openNow = undefined; // through open, which is watched
+  const node = await Node.open({ volume, module, log: () => {} });
+  let failure: Error | undefined;
+  node.onFailure = (e) => (failure = e);
+  node.create();
+  const client = new Client({ connect: node.connect });
+  while (!client.may(1, "write")) await new Promise((done) => setTimeout(done, 1));
+  failing = true;
+  assert.throws(() => node.scope(true), /storage has failed/);
+  let durable = false;
+  void client.write(1, (change) => change.insert({}, "x", 1, {})).then(() => (durable = true));
+  await new Promise((done) => setTimeout(done, 300));
+  assert(failure, "it says that it has stopped");
+  assert(!durable, "and says nothing more is durable");
+  client.close();
 }
 
 // Where a relay keeps a space, a proxy's query staying at the end.

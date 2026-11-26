@@ -261,13 +261,16 @@ start :: proc "c" (full: bool) -> bool {
 	}
 	node.host = {
 		keep = proc(_: rawptr, bytes: []byte) {
+			// Keys learnt and not kept are lost at the next start, and with them all sealed under them: storage has failed.
 			if !keep(0, raw_data(bytes), len(bytes)) {
-				report(.Error, "could not keep the keys")
+				report(.Error, "could not keep the keys; stopping rather than going on with what may be lost")
+				failed = true
 			}
 		},
 		roster = proc(_: rawptr, bytes: []byte) {
 			if !keep(1, raw_data(bytes), len(bytes)) {
-				report(.Error, "could not keep the roster")
+				report(.Error, "could not keep the roster; stopping rather than going on with what may be lost")
+				failed = true
 			}
 			dialers_refresh()
 		},
@@ -295,11 +298,29 @@ member :: proc "c" () -> bool {
 	return zsp.node_member(&node)
 }
 
+// Whether the buffer holds a genuine roster, signed for the space it names; it need not be held by a node to be asked.
+@(export)
+genuine :: proc "c" (size: int) -> bool {
+	context = ctx()
+	defer free_all(context.temp_allocator)
+	b := message[:size]
+	if len(b) < 38 {
+		return false
+	}
+	space: zsp.Key32
+	copy(space[:], b[6:38])
+	r, ok := zsp.roster_parse(b, space)
+	if ok {
+		zsp.roster_destroy(&r)
+	}
+	return ok
+}
+
 // Adopts a roster in the buffer, if it is genuine and newer: how a device joins without a relay.
 @(export)
 adopt :: proc "c" (size: int) -> bool {
 	context = ctx()
-	return zsp.node_adopt(&node, message[:size])
+	return !failed && zsp.node_adopt(&node, message[:size]) && !failed
 }
 
 // Keeps a session with a relay, whether or not the roster names it: how a new device reaches the first one it was
@@ -832,6 +853,7 @@ NOT_ADMIN :: -3 // this device may not sign rosters
 NOT_OWNER :: -4 // only an owner may do that, or an admin who may read every scope
 UNSOUND :: -5 // the roster would not be sound: as readers who do not write, where a scope is not signed
 NOT_TAKEN :: -6
+STORAGE :: -7 // storage has failed, and the node has stopped
 
 // Amends the roster, as zspd's commands do, and adopts it, which says it to everyone. The buffer holds what the change
 // needs. Returns a scope's number for Scope, else zero; or why not, below zero.
@@ -842,6 +864,12 @@ govern :: proc "c" (op: Govern, size: int) -> int {
 	if !started {
 		return NOT_STARTED
 	}
+	if failed {
+		return STORAGE
+	}
+	// Now, and no earlier: a node told nothing for a while has an old idea of the time, and a grant ended at that time
+	// would undo what was rightly written since.
+	node.now = u64(now())
 	if !zsp.keyring_rules(&keys, &node.roster) {
 		return NOT_ADMIN
 	}
@@ -923,8 +951,8 @@ govern :: proc "c" (op: Govern, size: int) -> int {
 		return UNSOUND
 	}
 	zsp.roster_destroy(&parsed)
-	if !zsp.node_adopt(&node, bytes) {
-		return NOT_TAKEN
+	if !zsp.node_adopt(&node, bytes) || failed {
+		return STORAGE if failed else NOT_TAKEN
 	}
 	return result
 }

@@ -94,6 +94,32 @@ function watched(client: Client, list: string): () => number {
 }
 
 const tests: Record<string, () => Promise<void>> = {
+  // An owner that has heard nothing for a while revokes a member: what that member rightly wrote meanwhile stands. A grant
+  // ends when it is ended, not when its node last heard anything.
+  async revoke_when_quiet() {
+    const relay = await node("serve", join(TMP, "q-relay"));
+    const owner = await open({ dir: join(TMP, "q-owner"), udp: false, log: () => {} }); // no relay: it hears nothing
+    const sid = await owner.create();
+    expectEqual(await owner.scope(true), 2);
+    const [alice, bob] = [await open({ dir: join(TMP, "q-alice"), udp: false, log: () => {} }), await open({ dir: join(TMP, "q-bob"), udp: false, log: () => {} })];
+    for (const d of [alice, bob]) await owner.admit(d.key, 1), await owner.admit(d.key, 2);
+    const roster = () => owner.node.store.kept("roster").latest!;
+    for (const d of [alice, bob]) await d.join(sid, relay), await d.adopt(roster());
+    const ca = new Client({ connect: alice.connect }), cb = new Client({ connect: bob.connect });
+    await eventually("both may write in the signed scope", () => ca.may(2, "write") && cb.may(2, "write"));
+    await new Promise((done) => setTimeout(done, 1500));
+    const Note = { title: columns.string(16) };
+    let rows = 0;
+    ca.window({ scope: 2, list: "notes", table: Note }, (st) => (rows = st.rows.length));
+    await cb.write(2, (change) => change.insert(Note, "notes", 1, { title: "before" }));
+    await eventually("alice has bob's row", () => rows === 1);
+    await owner.revoke(bob.key, 2);
+    await alice.adopt(roster());
+    await new Promise((done) => setTimeout(done, 500));
+    expectEqual(rows, 1);
+    for (const c of [ca, cb]) c.close();
+    for (const d of [owner, alice, bob]) await d.close();
+  },
   // Introduced by a relay, a web device and a zspd device link directly, and need it no more.
   async web_links() {
     const relay = await node("serve", join(TMP, "l-relay"));

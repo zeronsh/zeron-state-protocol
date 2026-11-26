@@ -3,13 +3,18 @@
 //
 // So segments are opened ahead of need. Should the log outrun that, what is written to a segment not yet open is held
 // here; and should it have to be durable before the segment is open, it is put in the journal, which is always open, and
-// written where it belongs when the segment is. At the next start the journal is played first. Nothing said to be durable
-// ever is not.
+// written where it belongs when the segment is. The journal says only what is held: when a segment's file has what was
+// held of it, or it is dropped or cut short, the journal says so before anything more is done to it, and is emptied when
+// nothing is held. At the next start it is played first, into the files of what was still held, and nothing else.
+// Nothing said to be durable ever is not, and nothing let go of comes back.
 
 import type { File, Volume } from "./volume.ts";
 
 export const PAGE = 4096; // as zsp.PAGE_SIZE and find.PAGE_SIZE
 const AHEAD = 2; // segments opened before they are needed
+const WRITTEN = 1, FORGOTTEN = 2, TRUNCATED = 3; // what an entry of the journal says
+const HEAD = 13; // of an entry
+const EMPTY = new Uint8Array(0);
 
 /** Small things, each kept whole: written to whichever of two files does not hold the latest, so a torn write loses nothing. */
 export type Kept = "device" | "space" | "keys" | "roster";
@@ -206,20 +211,18 @@ export class Store {
         await this.volume.remove(segmentName(n));
         return;
       }
-      this.#segments.set(n, f);
       const h = this.#held.get(n);
       if (h) {
-        // What was held is written where it belongs, and once that is durable the journal need not say it.
+        // What was held is written where it belongs; once that is durable the journal need not say it, and must not,
+        // before anything else is written to the file, or a replay would write it over what came after.
         f.write(h.bytes.subarray(0, h.length), 0);
+        f.truncate(h.length);
         f.flush();
         this.#held.delete(n);
-        if (this.#held.size === 0 && this.#journalEnd > 0) {
-          this.#journal.truncate(0);
-          this.#journal.flush();
-          this.#journalEnd = 0;
-        }
-        this.onSettled?.();
+        this.#forget(n, h);
       }
+      this.#segments.set(n, f);
+      if (h) this.onSettled?.();
     });
     this.#opening.set(n, opening);
   }
@@ -257,7 +260,11 @@ export class Store {
   }
 
   logDrop(n: number): void {
-    this.#held.delete(n);
+    const h = this.#held.get(n);
+    if (h) {
+      this.#held.delete(n);
+      this.#forget(n, h);
+    }
     const f = this.#segments.get(n);
     if (f) {
       f.close();
@@ -273,7 +280,14 @@ export class Store {
     const last = Math.floor(off / this.segment);
     for (const n of [...this.#segments.keys(), ...this.#held.keys()]) if (n > last) this.logDrop(n);
     const h = this.#held.get(last);
-    if (h) h.length = Math.min(h.length, off % this.segment), (h.journaled = Math.min(h.journaled, h.length));
+    if (h && h.length > off % this.segment) {
+      h.length = off % this.segment;
+      if (h.journaled > h.length) {
+        h.journaled = h.length;
+        this.#record(TRUNCATED, last, h.length);
+        this.#journal.flush();
+      }
+    }
     const f = this.#segments.get(last);
     if (f && f.size() > off % this.segment) f.truncate(off % this.segment), this.#dirty.add(f);
   }
@@ -291,46 +305,87 @@ export class Store {
     }
   }
 
-  // Entries of the journal: segment (4) ‖ offset (4) ‖ length (4) ‖ bytes ‖ crc (4) of all before it.
+  // Entries of the journal: kind (1) ‖ segment (4) ‖ offset (4) ‖ length (4) ‖ bytes ‖ crc (4) of all before it. Bytes
+  // written at an offset of a held segment; a segment no longer held, whose file has all of it or which is dropped; or a
+  // held segment cut short at an offset, and no bytes.
+  #record(kind: number, n: number, offset: number, part: Uint8Array = EMPTY): void {
+    const entry = new Uint8Array(HEAD + part.length + 4);
+    const v = new DataView(entry.buffer);
+    v.setUint8(0, kind);
+    v.setUint32(1, n);
+    v.setUint32(5, offset);
+    v.setUint32(9, part.length);
+    entry.set(part, HEAD);
+    v.setUint32(HEAD + part.length, crc32(entry.subarray(0, HEAD + part.length)));
+    this.#journal.write(entry, this.#journalEnd);
+    this.#journalEnd += entry.length;
+  }
+
   #journalHeld(): void {
     for (const [n, h] of this.#held) {
       if (h.journaled >= h.length) continue;
-      const part = h.bytes.subarray(h.journaled, h.length);
-      const entry = new Uint8Array(12 + part.length + 4);
-      const v = new DataView(entry.buffer);
-      v.setUint32(0, n);
-      v.setUint32(4, h.journaled);
-      v.setUint32(8, part.length);
-      entry.set(part, 12);
-      v.setUint32(12 + part.length, crc32(entry.subarray(0, 12 + part.length)));
-      this.#journal.write(entry, this.#journalEnd);
+      this.#record(WRITTEN, n, h.journaled, h.bytes.subarray(h.journaled, h.length));
       Store.counts.journaled++;
-      this.#journalEnd += entry.length;
       h.journaled = h.length;
     }
     this.#journal.flush();
   }
 
-  // Puts what the journal holds where it belongs: at the start, before anything reads the log.
+  // A segment is held no longer. With nothing held the journal says nothing; else it says that this one is not, durably,
+  // if it ever said it was.
+  #forget(n: number, h: Held): void {
+    if (this.#held.size === 0) {
+      if (this.#journalEnd > 0) {
+        this.#journal.truncate(0);
+        this.#journal.flush();
+        this.#journalEnd = 0;
+      }
+    } else if (h.journaled > 0) {
+      this.#record(FORGOTTEN, n, 0);
+      this.#journal.flush();
+    }
+  }
+
+  // Puts what the journal holds where it belongs: at the start, before anything reads the log. What it says is played in
+  // memory, and only what was still held at the end is written, to its segment, whole.
   async #replay(): Promise<void> {
     const size = this.#journal.size();
     if (size === 0) return;
     const all = new Uint8Array(size);
     this.#journal.read(all, 0);
-    const touched = new Set<File>();
-    for (let at = 0; at + 16 <= size; ) {
+    const images = new Map<number, { bytes: Uint8Array; length: number }>();
+    for (let at = 0; at + HEAD + 4 <= size; ) {
       const v = new DataView(all.buffer, at);
-      const length = v.getUint32(8);
-      if (at + 16 + length > size || v.getUint32(12 + length) !== crc32(all.subarray(at, at + 12 + length))) break; // torn: never said to be durable
-      const n = v.getUint32(0);
+      const kind = v.getUint8(0), n = v.getUint32(1), offset = v.getUint32(5), length = v.getUint32(9);
+      if (at + HEAD + length + 4 > size || v.getUint32(HEAD + length) !== crc32(all.subarray(at, at + HEAD + length))) break; // torn: never said to be durable
+      if (kind === WRITTEN) {
+        let image = images.get(n);
+        if (!image) images.set(n, (image = { bytes: new Uint8Array(offset + length), length: 0 }));
+        if (offset + length > image.bytes.length) {
+          const grown = new Uint8Array(Math.max(offset + length, image.bytes.length * 2));
+          grown.set(image.bytes.subarray(0, image.length));
+          image.bytes = grown;
+        }
+        image.bytes.set(all.subarray(at + HEAD, at + HEAD + length), offset);
+        image.length = Math.max(image.length, offset + length);
+      } else if (kind === FORGOTTEN) {
+        images.delete(n);
+      } else if (kind === TRUNCATED) {
+        const image = images.get(n);
+        if (image) image.length = Math.min(image.length, offset);
+      } else {
+        break; // what this does not know it did not write
+      }
+      at += HEAD + length + 4;
+    }
+    for (const [n, image] of images) {
       let f = this.#segments.get(n);
       if (!f) this.#segments.set(n, (f = (await this.volume.open(segmentName(n), true))!));
-      f.write(all.subarray(at + 12, at + 12 + length), v.getUint32(4));
-      touched.add(f);
+      f.write(image.bytes.subarray(0, image.length), 0);
+      f.truncate(image.length);
+      f.flush();
       Store.counts.replayed++;
-      at += 16 + length;
     }
-    for (const f of touched) f.flush();
     this.#journal.truncate(0);
     this.#journal.flush();
   }

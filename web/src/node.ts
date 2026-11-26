@@ -75,6 +75,7 @@ interface Exports {
   tick(): number;
   keepalive(idle: number, wait: number): void;
   segment(): number;
+  genuine(size: number): number;
   create(): number;
   govern(op: number, size: number): number;
   members(): number;
@@ -114,6 +115,7 @@ const REFUSED: Record<number, string> = {
   [-4]: "only an owner can do that, or an admin who may read every scope",
   [-5]: "that would make an unsound roster: only signed scopes may have readers who do not write",
   [-6]: "the roster was not taken",
+  [-7]: "storage has failed, and the node has stopped",
 };
 
 const HIGH = 256 << 10; // bytes in flight to a pipe before the node waits for it
@@ -235,7 +237,10 @@ export class Node {
   /** Becomes a device of a space by its roster alone, as `zspd peer` does; for there is no relay, or none yet. */
   adopt(roster: Uint8Array): boolean {
     if (this.#space === undefined) {
-      if (roster.length < 38) return false;
+      // Taken for the space it names only if it is that space's: anything else would leave this device of no space at all.
+      const wasm = this.#wasm!;
+      this.#bytes(wasm.buffer(roster.length), roster.length).set(roster);
+      if (roster.length < 38 || !wasm.genuine(roster.length)) return false;
       this.store.keep("space", roster.slice(6, 38));
       this.#start(roster.slice(6, 38));
     }

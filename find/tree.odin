@@ -1066,10 +1066,7 @@ bulk_run :: proc(b: ^Bulk) {
 bulk_end :: proc(b: ^Bulk, budget := max(int)) -> bool {
 	if b.merging.p == nil {
 		bulk_run(b)
-		b.edits = {}
-		if arena_used(&b.arena) {
-			arena_destroy(&b.arena)
-		}
+		bulk_free_edits(b)
 	}
 	left := budget
 	for {
@@ -1096,11 +1093,20 @@ bulk_end :: proc(b: ^Bulk, budget := max(int)) -> bool {
 	return true
 }
 
-// Gives it up.
-bulk_abandon :: proc(b: ^Bulk) {
+// The edits are in the arena, which goes with them; or, where none could be had, on the heap.
+@(private)
+bulk_free_edits :: proc(b: ^Bulk) {
 	if arena_used(&b.arena) {
 		arena_destroy(&b.arena)
+	} else {
+		delete(b.edits)
 	}
+	b.edits = {}
+}
+
+// Gives it up.
+bulk_abandon :: proc(b: ^Bulk) {
+	bulk_free_edits(b)
 	if b.merging.p != nil {
 		for &r in b.merging.from {
 			run_end(&r)

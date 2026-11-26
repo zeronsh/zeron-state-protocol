@@ -165,6 +165,9 @@ function connect(port: MessagePort): void {
   let heardBack = false;
   const early: Say[] = [];
   let open = true;
+  // Held for as long as the pipe is: the leader waits for it, and so learns when this end has gone, tab and all.
+  let letGo!: () => void;
+  const held = new Promise<void>((done) => (letGo = done));
   const breakOff = () => {
     if (!open) return;
     open = false;
@@ -174,6 +177,7 @@ function connect(port: MessagePort): void {
     far.close();
     toTab({ close: true });
     port.close();
+    letGo();
   };
   carried.add(breakOff);
   port.onmessage = (e: MessageEvent<Say>) => {
@@ -192,18 +196,31 @@ function connect(port: MessagePort): void {
     if ("close" in say) breakOff();
     else if ("data" in say) toTab(say);
   };
-  shout(name, { open: name });
+  void navigator.locks.request(name, () => {
+    if (open) shout(name, { open: name });
+    return held;
+  });
 }
 
-// A pipe from another tab's worker, on a channel of its own.
+// A pipe from another tab's worker, on a channel of its own, for as long as that worker holds the pipe's lock: once it lets
+// go, by breaking the pipe off or by being gone with its tab, the lock is had here, and the pipe is closed. Said again, it
+// is the same pipe.
+const served = new Set<string>();
 function serve(c: BroadcastChannel): void {
+  const name = c.name;
+  if (served.has(name)) return c.close();
+  served.add(name);
   const wire = attach(
     (say) => c.postMessage(say),
     () => c.close(),
   );
-  if (!wire) return;
+  if (!wire) return void served.delete(name);
   c.postMessage({ credit: 0 } satisfies Say); // that it is heard
   c.onmessage = (e: MessageEvent<Say>) => onSay(wire, e.data);
+  void navigator.locks.request(name, () => {
+    served.delete(name);
+    onSay(wire, { close: true });
+  });
 }
 
 // Joins a pipe to the node. What is sent it counts against its room until its client's end says it has dealt with it.
