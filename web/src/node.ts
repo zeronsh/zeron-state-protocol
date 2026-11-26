@@ -59,7 +59,43 @@ interface Exports {
   tick(): number;
   keepalive(idle: number, wait: number): void;
   segment(): number;
+  create(): number;
+  govern(op: number, size: number): number;
+  members(): number;
 }
+
+/** What a device may be granted in a scope, beyond reading, which every grant includes. */
+export interface Rights {
+  write?: boolean;
+  call?: boolean;
+  /** To be believed about for whom it writes and calls. */
+  vouch?: boolean;
+}
+
+/** A member of the space, as its roster says. */
+export interface Member {
+  /** Its key, as `key` gives it: device and signer. */
+  readonly key: string;
+  readonly id: string;
+  readonly owner: boolean;
+  readonly admin: boolean;
+  /** Whether anything is in force for it. */
+  readonly active: boolean;
+  /** Whose it is. */
+  readonly subject: string;
+  /** Its rights in force, by scope. */
+  readonly grants: ReadonlyMap<number, Required<Rights> & { read: boolean }>;
+}
+
+const GOVERN = { scope: 1, admit: 2, revoke: 3, subject: 4, admin: 5, owner: 6, relay: 7 } as const;
+const REFUSED: Record<number, string> = {
+  [-1]: "this device is of no space yet",
+  [-2]: "no such member, or no sense",
+  [-3]: "this device is not an admin of the space",
+  [-4]: "only an owner can do that, or an admin who may read every scope",
+  [-5]: "that would make an unsound roster: only signed scopes may have readers who do not write",
+  [-6]: "the roster was not taken",
+};
 
 const HIGH = 256 << 10; // bytes in flight to a pipe before the node waits for it
 const DRAIN_POLL = 4; // ms between looks at a WebSocket's backlog, while it has one: nothing says when it drains
@@ -140,6 +176,11 @@ export class Node {
     return this.#key;
   }
 
+  /** Bytes of memory the node has, all of which it may be using. */
+  get memory(): number {
+    return this.#wasm?.memory.buffer.byteLength ?? 0;
+  }
+
   /** Where it keeps what it holds. */
   get store(): Store {
     return this.#store;
@@ -183,6 +224,119 @@ export class Node {
     const ok = wasm.adopt(roster.length) !== 0;
     this.#kick();
     return ok;
+  }
+
+  /** Makes a space this device owns, as `zspd create` does, and becomes its first device. Returns its name. */
+  create(): string {
+    if (this.#space !== undefined) throw new Error("this device is of a space already");
+    const wasm = this.#wasm!;
+    this.#bytes(wasm.buffer(32), 32).set(this.#secret);
+    const n = wasm.create();
+    if (n < 32) throw new Error("could not make a space");
+    const made = this.#bytes(wasm.data(), n).slice();
+    this.store.keep("space", made.subarray(0, 32));
+    this.#start(made.subarray(0, 32));
+    if (!this.adopt(made.subarray(32))) throw new Error("could not take the space's first roster");
+    return this.#space!;
+  }
+
+  /** Adds a scope, signed or not: what one key opens. Returns its number. */
+  scope(signed = false): number {
+    return this.#govern(GOVERN.scope, Uint8Array.of(signed ? 1 : 0));
+  }
+
+  /** Lets a device, by the key it says, read a scope, and unless said otherwise write and call there. */
+  admit(key: string, scope: number, rights: Rights = { write: true, call: true }): void {
+    const b = new Uint8Array(69);
+    b.set(Node.#parseKey(key, 64));
+    new DataView(b.buffer).setUint32(64, scope, true);
+    b[68] = 1 | (rights.write ? 2 : 0) | (rights.call ? 4 : 0) | (rights.vouch ? 8 : 0);
+    this.#govern(GOVERN.admit, b);
+  }
+
+  /** Ends a device's grants, by its key or id, in a scope or every scope; the scope's key changes, so that it can read nothing written after. */
+  revoke(key: string, scope = 0): void {
+    const b = new Uint8Array(36);
+    b.set(Node.#device(key));
+    new DataView(b.buffer).setUint32(32, scope, true);
+    this.#govern(GOVERN.revoke, b);
+  }
+
+  /** Says whose a device is, by its key or id: an account, a name, as you know them. */
+  subject(key: string, subject: string): void {
+    const name = utf8.encode(subject);
+    const b = new Uint8Array(32 + name.length);
+    b.set(Node.#device(key));
+    b.set(name, 32);
+    this.#govern(GOVERN.subject, b);
+  }
+
+  /** Lets a device govern the space but for making admins and owners, or no longer. */
+  admin(key: string, on = true): void {
+    const b = new Uint8Array(65);
+    b.set(Node.#parseKey(key, 64));
+    b[64] = on ? 1 : 0;
+    this.#govern(GOVERN.admin, b);
+  }
+
+  /** Makes a device an owner too, for good. */
+  owner(key: string): void {
+    this.#govern(GOVERN.owner, Node.#parseKey(key, 64));
+  }
+
+  /** Names a relay for the space's devices to meet at, by its key and URL, the space being put after it. */
+  relay(key: string, url: string): void {
+    const at = utf8.encode(spaceUrl(url, this.#space ?? ""));
+    const b = new Uint8Array(32 + at.length);
+    b.set(Node.#parseKey(key, 32));
+    b.set(at, 32);
+    this.#govern(GOVERN.relay, b);
+  }
+
+  /** Who is in the space, by the roster this device holds. */
+  members(): Member[] {
+    const wasm = this.#wasm!;
+    const n = wasm.members();
+    const b = this.#bytes(wasm.data(), n).slice();
+    const v = new DataView(b.buffer);
+    const out: Member[] = [];
+    const decoder = new TextDecoder();
+    for (let at = 0; at < n; ) {
+      const key = hex(b.subarray(at, at + 64));
+      const flags = b[at + 64];
+      const sl = v.getUint32(at + 65, true);
+      const subject = decoder.decode(b.subarray(at + 69, at + 69 + sl));
+      at += 69 + sl;
+      const grants = new Map<number, Required<Rights> & { read: boolean }>();
+      for (let k = v.getUint32(at, true), p = at + 4; k > 0; k--, p += 5) {
+        const r = b[p + 4];
+        grants.set(v.getUint32(p, true), { read: (r & 1) !== 0, write: (r & 2) !== 0, call: (r & 4) !== 0, vouch: (r & 8) !== 0 });
+      }
+      at += 4 + grants.size * 5;
+      out.push(Object.freeze({ key, id: key.slice(0, 64), owner: (flags & 1) !== 0, admin: (flags & 2) !== 0, active: (flags & 4) !== 0, subject, grants }));
+    }
+    return out;
+  }
+
+  // A device by its key, or by its id: the key's first half.
+  static #device(key: string): Uint8Array {
+    return Node.#parseKey(key.length === 128 ? key.slice(0, 64) : key, 32);
+  }
+
+  static #parseKey(key: string, bytes: number): Uint8Array {
+    if (!new RegExp(`^[0-9a-f]{${bytes * 2}}$`).test(key)) {
+      throw new Error(bytes === 64 ? "a device's key is 128 hex digits, as `key` gives it" : "a key is 64 hex digits");
+    }
+    return unhex(key);
+  }
+
+  #govern(op: number, payload: Uint8Array): number {
+    const wasm = this.#wasm!;
+    this.#bytes(wasm.buffer(payload.length), payload.length).set(payload);
+    const r = wasm.govern(op, payload.length);
+    this.#kick();
+    if (r < 0) throw new Error(REFUSED[r] ?? "the roster could not be changed");
+    return r;
   }
 
   /** Opens a pipe to the node for a client. Undefined until the device is of a space. */

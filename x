@@ -46,6 +46,7 @@ end_to_end() {
 web_test() {
 	cd web
 	node test/client.ts
+	node test/node.ts
 	node test/vectors.ts ../vectors/vectors.json
 	node test/ask.ts
 	for t in text store end_to_end browsers; do

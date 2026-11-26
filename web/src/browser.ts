@@ -3,7 +3,7 @@
 
 import { Client } from "./client.ts";
 import type { Device, Relay } from "./index.ts";
-import type { Connect } from "./node.ts";
+import type { Connect, Member, Rights } from "./node.ts";
 import type { Command, Op, Report, Say } from "./worker.ts";
 
 export * from "./index.ts";
@@ -97,6 +97,15 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     },
     adopt: (roster: Uint8Array) => ask<boolean>("adopt", roster),
     member: () => ask<boolean>("member"),
+    create: async () => (space = await ask<string>("create")),
+    scope: (signed?: boolean) => ask<number>("scope", signed),
+    admit: (key: string, scope: number, rights?: Rights) => ask<void>("admit", key, scope, rights),
+    revoke: (key: string, scope?: number) => ask<void>("revoke", key, scope),
+    subject: (key: string, subject: string) => ask<void>("subject", key, subject),
+    admin: (key: string, on?: boolean) => ask<void>("admin", key, on),
+    owner: (key: string) => ask<void>("owner", key),
+    relay: (key: string, url: string) => ask<void>("relay", key, url),
+    members: () => ask<Member[]>("members"),
     connect,
     client: (host = {}) => new Client({ ...host, connect }),
     close: async () => worker.terminate(),

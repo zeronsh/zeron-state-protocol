@@ -6,7 +6,7 @@
 
 /// <reference lib="webworker" />
 
-import { Node, type FarWire } from "./node.ts";
+import { Node, type FarWire, type Rights } from "./node.ts";
 import { OpfsVolume } from "./volume-opfs.ts";
 import { loadModule } from "./wasm.ts";
 
@@ -25,7 +25,7 @@ export interface Options {
 export type Command = { open: Options } | { connect: MessagePort } | { ask: number; op: Op; args: unknown[] };
 
 /** What a device can be asked to do, by whichever tab. */
-export type Op = "identity" | "join" | "adopt" | "member";
+export type Op = "identity" | "join" | "adopt" | "member" | "create" | "scope" | "admit" | "revoke" | "subject" | "admin" | "owner" | "relay" | "members";
 
 /** What a worker tells its tab. */
 export type Report = { answer: number; value?: unknown; error?: string } | { failed: string };
@@ -103,6 +103,24 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
         return { value: d.adopt(args[0] as Uint8Array) };
       case "member":
         return { value: d.member };
+      case "create":
+        return { value: d.create() };
+      case "scope":
+        return { value: d.scope(args[0] as boolean | undefined) };
+      case "admit":
+        return { value: d.admit(args[0] as string, args[1] as number, args[2] as Rights | undefined) };
+      case "revoke":
+        return { value: d.revoke(args[0] as string, args[1] as number | undefined) };
+      case "subject":
+        return { value: d.subject(args[0] as string, args[1] as string) };
+      case "admin":
+        return { value: d.admin(args[0] as string, args[1] as boolean | undefined) };
+      case "owner":
+        return { value: d.owner(args[0] as string) };
+      case "relay":
+        return { value: d.relay(args[0] as string, args[1] as string) };
+      case "members":
+        return { value: d.members() };
     }
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) };

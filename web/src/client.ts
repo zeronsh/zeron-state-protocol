@@ -1185,7 +1185,7 @@ export class Client {
       const author = tag & 64 ? this.#authors.get(codec.varint(r)) : undefined;
       this.#accept(row, slot, tag % 64, stamp, body, author);
     }
-    for (const row of touched) this.#place(row);
+    this.#placeAll(touched);
   }
 
   #accept(row: Stored, slot: number, kind: number, stamp: string, body: Uint8Array, author?: Device): boolean {
@@ -1281,6 +1281,20 @@ export class Client {
     if (row.pages <= 0 && row.held.size === 0 && (row.dead || !this.#isPending(row.id))) {
       if (this.#asked.size > 0 && !row.dead) this.#loose.add(row.id);
       else this.#rows.delete(row.id);
+    }
+  }
+
+  // Places rows, each once. Many at once go into windows at once: sorted together, rather than each moving all after it.
+  #placeAll(rows: Set<Stored>): void {
+    if (rows.size > 64) this.#bulk = new Map();
+    for (const row of rows) this.#place(row);
+    const bulk = this.#bulk;
+    this.#bulk = undefined;
+    if (bulk) {
+      for (const [window, add] of bulk) {
+        window.entries.push(...add);
+        window.entries.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0));
+      }
     }
   }
 
@@ -1691,6 +1705,11 @@ export class Client {
     return row ? this.#text(row, slot) : undefined;
   }
 
+  /** The key of a scope, of which its lists' tags are made, once it is known; undefined until then. Not to be changed. */
+  scopeKey(scope: number): Uint8Array | undefined {
+    return this.#scopes.get(scope)?.key;
+  }
+
   /** What is held, for tests: rows, questions, windows and pages, by what this client and its node call them. */
   static internals(c: Client): { rows: ReadonlyMap<string, Stored>; asked: ReadonlyMap<number, unknown>; windows: ReadonlyMap<string, unknown>; pages: ReadonlyMap<number, unknown> } {
     return { rows: c.#rows, asked: c.#asked, windows: c.#windows, pages: c.#pages };
@@ -1830,20 +1849,12 @@ export class Client {
       if (cells.length > 0) this.#sendCells(cells, resolve);
       else this.#host.defer(resolve);
     }
-    // Many rows at once go into windows at once: sorted together, rather than each moving all after it.
-    if (rows.size > 64) this.#bulk = new Map();
+    const placing = new Set<Stored>();
     for (const id of rows) {
       const row = this.#rows.get(id);
-      if (row) this.#place(row);
+      if (row) placing.add(row);
     }
-    const bulk = this.#bulk;
-    this.#bulk = undefined;
-    if (bulk) {
-      for (const [window, add] of bulk) {
-        window.entries.push(...add);
-        window.entries.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0));
-      }
-    }
+    this.#placeAll(placing);
     return result;
   }
 

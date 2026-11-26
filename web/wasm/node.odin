@@ -43,7 +43,7 @@ foreign host {
 // does not answer in so long is gone.
 ping_idle: f64 = 45_000
 pong_wait: f64 = 15_000
-SYNC_DELAY :: 100 // ms: commits that follow one another this closely share a sync
+SYNC_MOST :: 100 // ms: the longest a commit waits to share a sync with others
 MAX_PLAIN :: 60 << 10 // per Noise message
 PAGES_KEPT :: 2048 // of each kind, before the coldest are let go
 FIND_LINGER :: 10 * time.Second
@@ -82,10 +82,12 @@ next_conn: u32 = 1
 dialers: [dynamic]^Dialer
 tree_pages, find_pages: Pages
 message: [dynamic]byte // handed in and out
-synced_at: f64 // when the log was last synced
+synced_at: f64 // when the log was last synced, by the clock of `now`
+sync_took: f64 // and how long that took, in milliseconds
 sync_due: Maybe(f64)
 found: ^Found
 failed: bool
+started: bool
 
 @(private)
 Found :: struct {
@@ -280,6 +282,7 @@ start :: proc "c" (full: bool) -> bool {
 		questions = questions(),
 	}
 	synced_at = now()
+	started = true
 	dialers_refresh()
 	free_all(context.temp_allocator)
 	return true
@@ -319,6 +322,10 @@ keepalive :: proc "c" (idle, wait: f64) {
 @(export)
 stop :: proc "c" () {
 	context = ctx()
+	if !started {
+		return // of no space yet: there is nothing to stop
+	}
+	started = false
 	found_close()
 	for _, c in conns {
 		if c.session != nil {
@@ -687,15 +694,6 @@ tick :: proc "c" () -> f64 {
 	}
 	t := now()
 	node.now = u64(t)
-	if due, ok := sync_due.?; ok && t >= due {
-		sync_due = nil
-		synced_at = t
-		if !zsp.node_sync(&node) {
-			report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
-			failed = true
-			return -2
-		}
-	}
 	if node.failed {
 		report(.Error, "storage failed; stopping rather than going on with what may be lost")
 		failed = true
@@ -714,8 +712,27 @@ tick :: proc "c" () -> f64 {
 	}
 	zsp.store_flush(&node.store)
 	if zsp.store_unsynced(&node.store) && sync_due == nil {
-		// At once if the last was a while ago; else shared with whatever else comes meanwhile.
-		sync_due = max(t, synced_at + SYNC_DELAY)
+		// At once, unless syncing would then be busy more than half the time: so one writer waits for one sync, and many
+		// writing at once share them, however fast or slow the disk.
+		sync_due = max(t, synced_at + min(sync_took, SYNC_MOST))
+	}
+	if due, ok := sync_due.?; ok && now() >= due {
+		sync_due = nil
+		began := time.tick_now()
+		synced := zsp.node_sync(&node)
+		sync_took = f64(time.tick_since(began)) / f64(time.Millisecond)
+		synced_at = now()
+		if !synced {
+			report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
+			failed = true
+			return -2
+		}
+		// What was waiting for it may now be said.
+		for id in ids {
+			if c := conns[id] or_else nil; c != nil {
+				conn_flush(c)
+			}
+		}
 	}
 	pages_rest(&tree_pages)
 	pages_rest(&find_pages)
@@ -744,4 +761,183 @@ tick :: proc "c" () -> f64 {
 		sooner(&wait, f64(w) / f64(time.Millisecond))
 	}
 	return wait
+}
+
+// ---------------------------------------------------------------- governing the space
+
+// Makes a space this device owns, as `zspd create` does: the buffer holds the device's secret, and is given back
+// holding the space's name (32) and its first roster. Returns that length.
+@(export)
+create :: proc "c" () -> int {
+	context = ctx()
+	defer free_all(context.temp_allocator)
+	secret: zsp.Key32
+	copy(secret[:], message[:32])
+	root: zsp.Key32
+	crypto.rand_bytes(root[:])
+	space := zsp.ed25519_public(root)
+	k: zsp.Keyring
+	zsp.keyring_init(&k, secret)
+	defer zsp.keyring_destroy(&k)
+	none: zsp.Roster
+	d := zsp.draft_from(&none, u64(now()) << 16)
+	home := zsp.draft_scope(&d)
+	zsp.draft_grant(&d, k.device, k.signer, home, {.Read, .Write, .Call}).owner = true
+	bytes, ok := zsp.roster_sign(&k, root, &d, context.temp_allocator)
+	crypto.zero_explicit(&root, size_of(root))
+	crypto.zero_explicit(&secret, size_of(secret))
+	if !ok {
+		return 0
+	}
+	clear(&message)
+	append(&message, ..space[:])
+	append(&message, ..bytes)
+	return len(message)
+}
+
+Govern :: enum u32 {
+	Scope = 1, // signed (1): a new scope, whose number is given back
+	Admit, // device (32), signer (32), scope (u32), rights (1: 1 read, 2 write, 4 call, 8 vouch)
+	Revoke, // device (32), scope (u32, 0 for every one)
+	Subject, // device (32), and the rest: whose it is
+	Admin, // device (32), signer (32), on (1)
+	Owner, // device (32), signer (32)
+	Relay, // key (32), and the rest: its URL, the space's place there included
+}
+
+// Why governing failed.
+NOT_STARTED :: -1
+NO_SUCH :: -2 // nonsense, or no such member
+NOT_ADMIN :: -3 // this device may not sign rosters
+NOT_OWNER :: -4 // only an owner may do that, or an admin who may read every scope
+UNSOUND :: -5 // the roster would not be sound: as readers who do not write, where a scope is not signed
+NOT_TAKEN :: -6
+
+// Amends the roster, as zspd's commands do, and adopts it, which says it to everyone. The buffer holds what the change
+// needs. Returns a scope's number for Scope, else zero; or why not, below zero.
+@(export)
+govern :: proc "c" (op: Govern, size: int) -> int {
+	context = ctx()
+	defer free_all(context.temp_allocator)
+	if !started {
+		return NOT_STARTED
+	}
+	if !zsp.keyring_rules(&keys, &node.roster) {
+		return NOT_ADMIN
+	}
+	b := message[:size]
+	key :: proc(b: []byte, at: int) -> (k: zsp.Key32) {
+		copy(k[:], b[at:at + 32])
+		return
+	}
+	u32le :: proc(b: []byte, at: int) -> u32 {
+		return u32(b[at]) | u32(b[at + 1]) << 8 | u32(b[at + 2]) << 16 | u32(b[at + 3]) << 24
+	}
+	need := [Govern]int{.Scope = 1, .Admit = 69, .Revoke = 36, .Subject = 32, .Admin = 65, .Owner = 64, .Relay = 32}
+	if op < .Scope || op > .Relay || size < need[op] {
+		return NO_SUCH
+	}
+	// No earlier than anything this device has seen: what others wrote before then stands.
+	d := zsp.draft_from(&node.roster, max(node.now << 16, node.clock))
+	result := 0
+	switch op {
+	case .Scope:
+		id := zsp.draft_scope(&d, {.Signed} if b[0] != 0 else {})
+		for m in d.members {
+			if m.owner || m.admin {
+				zsp.draft_grant(&d, m.device, m.signer, id, {.Read, .Write, .Call})
+			}
+		}
+		result = int(id)
+	case .Admit:
+		rights := transmute(zsp.Rights)b[68] + {.Read}
+		zsp.draft_grant(&d, key(b, 0), key(b, 32), zsp.Scope(u32le(b, 64)), rights)
+	case .Revoke:
+		device := key(b, 0)
+		if m := zsp.roster_member(&node.roster, device); m == nil || m.owner {
+			return NO_SUCH // an owner holds the key that is the space, and nothing can take that back
+		}
+		zsp.draft_revoke(&d, device, zsp.Scope(u32le(b, 32)))
+	case .Subject:
+		device := key(b, 0)
+		found_it := false
+		for &m in d.members {
+			if m.device == device {
+				m.subject = b[32:]
+				found_it = true
+			}
+		}
+		if !found_it {
+			return NO_SUCH
+		}
+	case .Admin, .Owner:
+		device, signer := key(b, 0), key(b, 32)
+		owner := op == .Owner
+		yes := owner || b[64] != 0
+		if yes {
+			// An admin or owner draws up rosters, and so must hold every scope's keys.
+			for s in d.scopes {
+				zsp.draft_grant(&d, device, signer, s.id, {.Read, .Write, .Call})
+			}
+		}
+		found_it := false
+		for &m in d.members {
+			if m.device == device {
+				m.owner ||= owner
+				m.admin = yes if !owner else m.admin
+				found_it = true
+			}
+		}
+		if !found_it {
+			return NO_SUCH
+		}
+	case .Relay:
+		append(&d.relays, zsp.Relay{key(b, 0), string(b[32:])})
+	}
+	bytes, signed := zsp.roster_sign(&keys, keys.root, &d, context.temp_allocator)
+	if !signed {
+		return NOT_OWNER
+	}
+	parsed, sound := zsp.roster_parse(bytes, node.space)
+	if !sound {
+		return UNSOUND
+	}
+	zsp.roster_destroy(&parsed)
+	if !zsp.node_adopt(&node, bytes) {
+		return NOT_TAKEN
+	}
+	return result
+}
+
+// Who is in the space, into the buffer: for each member, device (32), signer (32), flags (1: 1 owner, 2 admin, 4 active),
+// subject (u32 length and bytes), then its grants in force (u32 count, and each scope (u32) and rights (1)). Returns the length.
+@(export)
+members :: proc "c" () -> int {
+	context = ctx()
+	clear(&message)
+	if !started {
+		return 0
+	}
+	put32 :: proc(w: ^[dynamic]byte, v: u32) {
+		append(w, byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24))
+	}
+	for &m in node.roster.members {
+		append(&message, ..m.device[:])
+		append(&message, ..m.signer[:])
+		append(&message, (1 if m.owner else 0) | (2 if m.admin else 0) | (4 if zsp.member_active(&m) else 0))
+		put32(&message, u32(len(m.subject)))
+		append(&message, ..m.subject)
+		n := 0
+		for g in m.grants {
+			n += 1 if g.until == 0 else 0
+		}
+		put32(&message, u32(n))
+		for g in m.grants {
+			if g.until == 0 {
+				put32(&message, u32(g.scope))
+				append(&message, transmute(u8)g.rights)
+			}
+		}
+	}
+	return len(message)
 }

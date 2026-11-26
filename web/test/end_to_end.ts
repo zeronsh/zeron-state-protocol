@@ -85,6 +85,61 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
 }
 
 const tests: Record<string, () => Promise<void>> = {
+  // A web device makes the space and governs it: zspd devices are admitted to it as to any other.
+  async web_governs() {
+    const relay = await node("serve", join(TMP, "g-relay"));
+    const a = await open({ dir: join(TMP, "g-a"), log: () => {} });
+    const sid = await a.create();
+    await a.relay(relay.key, relay.url);
+    expectEqual(await a.scope(true), 2);
+    const dir = join(TMP, "g-b");
+    const bob = zspd("key", dir);
+    await a.admit(bob, 1);
+    await a.admit(bob, 2, { write: true, call: true, vouch: true });
+    await a.subject(a.key, "ann");
+    await a.subject(bob, "bob");
+    zspd("join", dir, sid, relay.key, relay.url);
+    const b = await node("run", dir);
+    await eventually("it hears who belongs", () => exists(join(dir, sid, "roster")));
+    const pipes = new Pipes();
+    const ca = new Client({ connect: pipes.wrap(a.connect), linger: 200 });
+    const cb = new Client({ connect: pipes.wrap(zspdConnect(b.address)), credential: token(dir), linger: 200 });
+    await live({ a: ca, b: cb, breakPipes: () => pipes.break(), say: () => {} });
+    const members = await a.members();
+    expectEqual(members.length, 2);
+    const them = members.find((m) => m.key === bob)!;
+    expectEqual(them.subject, "bob");
+    expectEqual(them.grants.get(2)?.vouch, true);
+    expectEqual(members.find((m) => m.key === a.key)!.owner, true);
+
+    // Another web device, made an admin, governs; unmade, does not.
+    const c = await open({ dir: join(TMP, "g-c"), log: () => {} });
+    await a.admit(c.key, 1);
+    await c.join(sid, relay);
+    const cc = new Client({ connect: c.connect, linger: 200 });
+    await eventually("c may write", () => cc.may(1, "write"));
+    await a.admin(c.key);
+    await eventually("c hears that it is an admin", async () => (await c.members()).some((m) => m.key === c.key && m.admin));
+    const three = await c.scope();
+    await eventually("a hears of the scope c made", () => ca.may(three, "write"));
+    await a.admin(c.key, false);
+    await eventually("c hears that it is not", async () => (await c.members()).some((m) => m.key === c.key && !m.admin));
+    await c.scope().then(
+      () => Promise.reject(new Error("an admin no more made a scope")),
+      () => {},
+    );
+    // Revoked, it is told so, and reads nothing written after.
+    let rows = 0, status = "";
+    cc.window({ scope: 1, list: "after", table: {} }, (st) => ((rows = st.rows.length), (status = st.status)));
+    await a.revoke(c.key);
+    await eventually("c is told", () => status === "denied");
+    await ca.write(1, (change) => change.insert({}, "after", 1, {}));
+    await new Promise((done) => setTimeout(done, 500));
+    expectEqual(rows, 0);
+    for (const x of [ca, cb, cc]) x.close();
+    await a.close();
+    await c.close();
+  },
   // A browser cannot ping a WebSocket, so a web device says "ping", which every relay answers: a quiet connection is
   // kept, and one that has quietly died is known to have, and dialled again.
   async keepalive() {
