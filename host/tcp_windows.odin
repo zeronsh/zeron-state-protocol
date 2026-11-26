@@ -1,6 +1,7 @@
 package host
 
 import "core:encoding/endian"
+import "core:mem"
 import win "core:sys/windows"
 import "../pipe"
 
@@ -50,7 +51,7 @@ tcp_entries :: proc() -> (out: [dynamic]Tcp_Entry, ok: bool) {
 				return
 			}
 			size += size / 4 + 1024 // room for sockets made meanwhile
-			buf = make([]byte, size, context.temp_allocator)
+			buf, _ = mem.make_aligned([]byte, int(size), 16, context.temp_allocator) // the table is of words
 		}
 		if len(buf) < 4 {
 			continue // none of this family
@@ -108,7 +109,8 @@ process_user :: proc(process: win.HANDLE) -> []byte {
 	if size == 0 {
 		return nil
 	}
-	buf := make([]byte, size, context.temp_allocator)
+	// Of pointers and words, so aligned as they are: on a byte, the system says it cannot reach it (998).
+	buf, _ := mem.make_aligned([]byte, int(size), 16, context.temp_allocator)
 	if !win.GetTokenInformation(token, .TokenUser, raw_data(buf), size, &size) {
 		return nil
 	}

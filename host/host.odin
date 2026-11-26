@@ -387,6 +387,7 @@ session_end :: proc(session: ^zsp.Session) {
 		s.warned = true // once is enough: dialling again is all there is to do until it is set
 		report(.Warning, "this machine's clock and another's differ by more than a quarter of an hour: nothing passes between them")
 	}
+	report(.Debug, fmt.tprint("a session ended: ", session.role, " ", session.fault))
 	zsp.session_close(session)
 }
 
