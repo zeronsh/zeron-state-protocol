@@ -99,20 +99,21 @@ def main():
     print(f"a new device has all {mb:.0f} MB in {took:.1f} s: {mb / took:.1f} MB/s")
     line("catching up", d)
 
-    # A device that keeps only what its screen shows, served a window of the latest 50 by a relay woken with nothing
-    # at hand but its manifest and its log's tail; then one far back.
-    p = e.Node("rp", "run", "--credential=" + cloud.token, "--no-udp", "--partial")
-    e.zspd("admit", a.dir, e.zspd("key", p.dir), "1")
-    e.zspd("join", p.dir, sid, cloud.key, cloud.url)
-    p.start()
-    e.eventually("it hears who belongs", lambda: os.path.exists(os.path.join(p.dir, sid, "roster")), 60)
-    for which, back, window, how in (("latest", True, 7, "warm"), ("earliest", False, 8, "warm"), ("latest", True, 9, "cold"), ("earliest", False, 10, "cold")):
+    # A device that keeps only what its screen shows, new each time, served a window of 50 by a relay woken from
+    # eviction: with its own cache, as it is, or with nothing at hand but its manifest and its log's tail.
+    for i, (which, back, how) in enumerate((("latest", True, "warm"), ("earliest", False, "warm"), ("latest", True, "cold"), ("earliest", False, "cold"))):
+        p = e.Node(f"rp{i}", "run", "--credential=" + cloud.token, "--no-udp", "--partial")
+        e.zspd("admit", a.dir, e.zspd("key", p.dir), "1")
+        e.zspd("join", p.dir, sid, cloud.key, cloud.url)
+        p.start()
+        e.eventually("it hears who belongs", lambda: os.path.exists(os.path.join(p.dir, sid, "roster")), 60)
+        time.sleep(1)
         urllib.request.urlopen(urllib.request.Request(cloud.url.replace("ws", "http", 1) + "/" + sid + "?evict=" + how, headers={"User-Agent": "zsp-bench"})).read()
         s0 = stats(cloud, sid)
         cw = p.client()
         t = time.monotonic()
-        cw.watch(window, 1, "bench", limit=50, back=back)
-        cw.until(lambda: window in cw.windows and len(cw.list(1, "bench")) >= 50, timeout=60)
+        cw.watch(7, 1, "bench", limit=50, back=back)
+        cw.until(lambda: 7 in cw.windows and len(cw.list(1, "bench")) >= 50, timeout=60)
         took = time.monotonic() - t
         s1 = stats(cloud, sid)
         d = spent(s0, s1)
@@ -120,6 +121,7 @@ def main():
         print(f"a window of the {which} 50 from a relay woken {'with its own cache' if how == 'warm' else 'with nothing at hand'}: {took * 1e3:.0f} ms")
         line(f"window of the {which} 50, {how}", d)
         cw.sock.close()
+        p.stop()
 
     # A device that has it all already, back: one fingerprint, and what that costs the relay.
     s0 = stats(cloud, sid)
