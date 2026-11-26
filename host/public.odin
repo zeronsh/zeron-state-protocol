@@ -358,6 +358,15 @@ public_out_read :: proc(c: ^Public_Out) {
 				return
 			}
 			append(&c.pending, ..plain[:])
+			if c.tls.peer_closed {
+				// It has said all it will (close_notify), and waits for the answer: as if it had shut its side.
+				c.ended_in = true
+				if c.call == 0 {
+					public_out_close(c, reset = false)
+					return
+				}
+				break
+			}
 		} else if c.call == 0 {
 			append(&c.head, ..bytes)
 			end := strings.index(string(c.head[:]), "\r\n\r\n")

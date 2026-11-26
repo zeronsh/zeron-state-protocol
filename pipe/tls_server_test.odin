@@ -274,3 +274,39 @@ tls_server_one_change_cipher_spec :: proc(t: ^testing.T) {
 	testing.expect(t, !tls_accept(&s, {20, 3, 3, 0, 1, 1}, &plain, &to_c, find, &id))
 	testing.expect_value(t, s.alert, 10)
 }
+
+// A client that says close_notify has said all it will: what it said before is read, what after is not, and it is
+// still written to, for it waits for the answer (RFC 8446 §6.1).
+@(test)
+tls_server_half_closed :: proc(t: ^testing.T) {
+	id: Tls_Identity
+	testing.expect(t, tls_identity_load(&id, #load("../tests/certs/p256.pem"), #load("../tests/certs/p256.key")))
+	defer tls_identity_destroy(&id)
+	c: Tls
+	s: Tls_Server
+	defer tls_destroy(&c)
+	defer tls_server_destroy(&s)
+	opened(t, &c, &s, &id)
+	to_s, to_c, plain := make([dynamic]byte, context.temp_allocator), make([dynamic]byte, context.temp_allocator), make([dynamic]byte, context.temp_allocator)
+	tls_write(&c, transmute([]byte)string("GET /"), &to_s)
+	tls_seal(&c.send, 21, {1, 0}, &to_s)
+	tls_write(&c, transmute([]byte)string("after"), &to_s)
+	testing.expect(t, tls_accept(&s, to_s[:], &plain, &to_c, find, &id))
+	testing.expect(t, s.peer_closed && s.state == .Open)
+	testing.expect_value(t, string(plain[:]), "GET /")
+	testing.expect(t, tls_accept(&s, {23, 3, 3, 0, 1, 0}, &plain, &to_c, find, &id))
+	tls_server_write(&s, transmute([]byte)string("answer"), &to_c)
+	clear(&plain)
+	clear(&to_s)
+	testing.expect(t, tls_input(&c, to_c[:], &plain, &to_s))
+	testing.expect_value(t, string(plain[:]), "answer")
+	// Any other alert ends it.
+	c2: Tls
+	s2: Tls_Server
+	defer tls_destroy(&c2)
+	defer tls_server_destroy(&s2)
+	opened(t, &c2, &s2, &id)
+	clear(&to_s)
+	tls_seal(&c2.send, 21, {2, 40}, &to_s)
+	testing.expect(t, !tls_accept(&s2, to_s[:], &plain, &to_c, find, &id))
+}

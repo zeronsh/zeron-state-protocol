@@ -53,6 +53,7 @@ Tls_Server :: struct {
 	alert:      u8, // why it ended, if it was this end's doing
 	update_owed: bool, // the client asked for a KeyUpdate: one is sent, however many it asked for at once
 	ccs_seen:   bool, // its one change_cipher_spec, for middleboxes' sake: a second is refused
+	peer_closed: bool, // it said close_notify: it will say no more, and may yet hear what is sent it (RFC 8446 §6.1)
 }
 
 // What a server says for a name: the identity to prove, or nil to refuse.
@@ -261,6 +262,9 @@ RETRY := [32]byte{
 // Consumes bytes from the wire: plaintext is appended to `plain`, what to send back to `w`. False when the connection is
 // over, after an alert, if any, has been put in `w`.
 tls_accept :: proc(t: ^Tls_Server, bytes: []byte, plain, w: ^[dynamic]byte, find: Tls_Find, data: rawptr) -> bool {
+	if t.peer_closed {
+		return true // what comes after close_notify is nothing
+	}
 	append(&t.input, ..bytes)
 	used := 0
 	defer tls_update(t, w) // once, for all this asked
@@ -315,6 +319,12 @@ tls_accept :: proc(t: ^Tls_Server, bytes: []byte, plain, w: ^[dynamic]byte, find
 		}
 		switch type {
 		case 21:
+			if t.state == .Open && len(body) == 2 && body[1] == 0 {
+				// close_notify: the client has said all it will, and waits for the answer. What follows it is not read.
+				t.peer_closed = true
+				used = len(t.input)
+				return true
+			}
 			t.state = .Closed
 			return false
 		case 22:

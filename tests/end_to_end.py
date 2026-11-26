@@ -1357,6 +1357,45 @@ def public_get(port, name, path="/", alpn=None):
         return int(head.split()[1]), body, s.selected_alpn_protocol()
 
 
+def public_get_closing(port, name):
+    """A GET over TLS whose client says close_notify at once after it, in the same write, and then reads the answer, as
+    RFC 8446 lets it. The answer's bytes."""
+    import ssl
+
+    context = ssl.create_default_context(cafile=os.path.join(CERTS, "p256.pem"))
+    inward, outward = ssl.MemoryBIO(), ssl.MemoryBIO()
+    tls = context.wrap_bio(inward, outward, server_hostname=name)
+    with socket.create_connection(("127.0.0.1", port), 5) as raw:
+        while True:
+            try:
+                tls.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                raw.sendall(outward.read())
+                inward.write(raw.recv(65536))
+        raw.sendall(outward.read())
+        tls.write(f"GET / HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n".encode())
+        try:
+            tls.unwrap()
+        except ssl.SSLWantReadError:
+            pass
+        raw.sendall(outward.read())  # the request and close_notify, together
+        got = b""
+        while True:
+            try:
+                got += tls.read(65536)
+                continue
+            except ssl.SSLWantReadError:
+                pass
+            except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+                break
+            data = raw.recv(65536)
+            if not data:
+                break
+            inward.write(data)
+        return got
+
+
 def test_expose():
     """A port exposed to the public through a relay, at a name of its own, by TLS and by plain HTTP; with where each
     connection came from if asked; at the pace of the slower side; and no more once taken back."""
@@ -1387,6 +1426,8 @@ def test_expose():
     assert public_get(https, name.upper()) [:2] == (200, b"hello, public")
     assert http_get("127.0.0.1", plain, host=name) == (200, b"hello, public")
     assert http_get("127.0.0.1", plain, host="nobody.expose.test")[0] == 404
+    # A client that says it is done as it asks is answered all the same.
+    assert public_get_closing(https, name).endswith(b"hello, public")
     # A port that resets each connection as it accepts it: the public hears nothing from it, and the device and relay
     # go on as before.
     resets = socket.create_server(("127.0.0.1", free_port()))
