@@ -13,8 +13,8 @@ import "../zsp"
 // each port it offers, and whatever connects there is forwarded to it. So any application reaches any device by
 // name, as if it were on the network, and two devices may offer the same port.
 //
-// What a device offers is asked once when it can first be reached, and kept up for as long as anyone here seems
-// to want it (its name looked up, a connection made), and no longer: an idle space costs nothing.
+// What a device offers is asked when anyone here seems to want it (its name looked up, a connection made, a client
+// asking), and kept up for as long as that lasts, and no longer: an idle space costs nothing.
 
 SETUP_HINT :: "; see zspd setup" when ODIN_OS == .Darwin else ""
 INTEREST :: 60 * time.Second // how long a look or a connection keeps a device's list kept up
@@ -166,11 +166,11 @@ ports_roster :: proc(sp: ^Space) {
 	}
 }
 
-// Who can be reached has changed: those newly reachable are asked what they offer; those gone are listened for no
-// longer, so that whoever connects is told at once.
+// Who can be reached has changed: those gone are listened for no longer, so that whoever connects is told at once.
+// Those newly reachable are asked nothing until anybody here wants them (ports_wanted): a quiet space costs nothing,
+// however many devices come and go.
 @(private)
 ports_reach :: proc(p: ^Ports, reach: []zsp.Key32) {
-	sp := p.space
 	for r in p.remotes {
 		r.reachable = slice.contains(reach, r.device) && remote_scope(r) != 0
 	}
@@ -180,13 +180,6 @@ ports_reach :: proc(p: ^Ports, reach: []zsp.Key32) {
 			remote_drop(r)
 		}
 	}
-	for device in reach {
-		r := remote_for(p, device)
-		if r != nil && !r.known && r.call == 0 && !r.unserved {
-			remote_ask(r, 0)
-		}
-	}
-	_ = sp
 }
 
 @(private)

@@ -840,10 +840,27 @@ def slow_expose_hibernation():
     assert "woke with 1 sockets" in cloud.p.stdout.read() + open(os.path.join(TMP, "cloud.log")).read()
 
 
+given_ports = set()
+
+
 def free_port(host="127.0.0.1"):
-    with socket.socket() as s:
-        s.bind((host, 0))
-        return s.getsockname()[1]
+    """A port nothing listens on, for a node to listen on later. Not one the system would give (port 0): those are
+    the ephemeral ports every outgoing connection takes one of, so one could be taken between now and the node's
+    listening, and the node would go without. These are below every system's ephemeral range (Linux's 32768,
+    macOS's and Windows's 49152), and handed out once each."""
+    import random
+
+    while True:
+        port = random.randrange(20000, 32768)
+        if port in given_ports:
+            continue
+        with socket.socket() as s:
+            try:
+                s.bind((host, port))
+            except OSError:
+                continue
+        given_ports.add(port)
+        return port
 
 
 def bindable(address):
@@ -1202,10 +1219,10 @@ def public_get(port, name, path="/", alpn=None):
         context.set_alpn_protocols(alpn)
     with socket.create_connection(("127.0.0.1", port), 5) as raw, context.wrap_socket(raw, server_hostname=name) as s:
         s.sendall(f"GET {path} HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n".encode())
-        got = b""
+        got = bytearray()  # not bytes, which would copy all it has at every record: a crawl, for a large body
         while data := s.recv(65536):
             got += data
-        head, _, body = got.partition(b"\r\n\r\n")
+        head, _, body = bytes(got).partition(b"\r\n\r\n")
         return int(head.split()[1]), body, s.selected_alpn_protocol()
 
 
