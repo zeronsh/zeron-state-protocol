@@ -1706,6 +1706,10 @@ def test_durable_object_expose():
         assert got.startswith(b"HTTP/1.1 200 ") and b"ok" in got.partition(b"\r\n\r\n")[2], (path, got)
     for path in ("/bad-length", "/two-lengths", "/101"):
         assert ask(path).startswith(b"HTTP/1.1 502 "), path
+    assert ask("/205").startswith(b"HTTP/1.1 205 "), ask("/205")
+    for path in ("/chunk-negative", "/chunk-garbage"):  # a body cut short, never one made up
+        got = ask(path)
+        assert b"HELLO" not in got.partition(b"\r\n\r\n")[2], (path, got)
     assert b"ok" in ask("/keep").partition(b"\r\n\r\n")[2]
     eventually("the port's connection is let go once its answer has come", lambda: quirky.closed.get("/keep"))
     for ip in ("1:2:3:4:5:6:7:8:9", "::ffff:192.0.2.1", "nonsense", "300.1.1.1"):
@@ -1759,6 +1763,9 @@ class Quirky:
             "/bad-length": b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nhello",
             "/two-lengths": b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 5\r\n\r\nhello",
             "/101": b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n",
+            "/205": b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n",
+            "/chunk-negative": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-2\r\n5\r\n5\r\nHELLO\r\n0\r\n\r\n",
+            "/chunk-garbage": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5GARBAGE\r\nHELLO\r\n0\r\n\r\n",
             "/keep": b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",  # and the connection kept, asked or not
             "/huge": b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
             b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n\x82\x7f\x00\x00\x01\x00\x00\x00\x00\x00",

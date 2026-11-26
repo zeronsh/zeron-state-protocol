@@ -118,8 +118,10 @@ export class Call {
   }
 
   cancel() {
-    if (!this.ended || !this.fault) this.pipe.say(this.id, 3);
-    this.fault ??= "cancelled";
+    if (this.fault) return; // over already: nothing to say
+    this.pipe.say(this.id, 3);
+    this.fault = "cancelled";
+    this.wake(); // whoever waits to read or write hears it is over
   }
 }
 
@@ -192,14 +194,17 @@ function body(call, framing, length) {
               if (buf.length > 4096 || !(await more())) return controller.error(new Error("a chunk makes no sense"));
               continue;
             }
-            const line = dec.decode(buf.subarray(0, eol)).trim();
+            const line = dec.decode(buf.subarray(0, eol)).replace(/\r$/, "");
             buf = buf.subarray(eol + 1);
             if (chunk === -2) {
+              if (line !== "") return controller.error(new Error("a chunk makes no sense")); // its CRLF, and nothing else
               chunk = 0;
               continue;
             }
-            const size = parseInt(line.split(";")[0], 16);
-            if (Number.isNaN(size)) return controller.error(new Error("a chunk makes no sense"));
+            // Hex digits, then extensions if any: nothing else is a size (not "-2", not "5GARBAGE").
+            const sizeText = line.split(";")[0].trim();
+            if (!/^[0-9a-fA-F]{1,15}$/.test(sizeText)) return controller.error(new Error("a chunk makes no sense"));
+            const size = parseInt(sizeText, 16);
             if (size === 0) return done(controller); // trailers, if any, go unread
             chunk = size;
           }
@@ -282,7 +287,7 @@ export async function serve(request, label, open) {
       if (!HOP.has(lower)) headers.append(name, value);
     }
     if (framingOut !== "chunked" && said !== null) (framingOut = "length"), (left = said);
-    const empty = request.method === "HEAD" || head.status === 204 || head.status === 304 || head.status < 200;
+    const empty = request.method === "HEAD" || [204, 205, 304].includes(head.status); // as fetch has them: no body
     if (empty) call.cancel();
     return new Response(empty ? null : body(call, framingOut, left), { status: head.status, statusText: head.reason, headers });
   } catch (e) {
@@ -358,12 +363,22 @@ async function socket(request, url, call) {
           if (f.fin) {
             const whole = cat(...parts);
             parts = [];
-            server.send(first === 1 ? dec.decode(whole) : whole);
+            try {
+              server.send(first === 1 ? dec.decode(whole) : whole);
+            } catch {
+              closed = true; // the public has gone meanwhile
+              call.cancel();
+              return;
+            }
           }
         }
       }
     }
-    if (!closed) server.close(1011, "what is exposed here was lost");
+    if (!closed) {
+      try {
+        server.close(1011, "what is exposed here was lost");
+      } catch {}
+    }
   })();
   const headers = new Headers();
   for (const [name, value] of head.headers) if (name.toLowerCase() === "sec-websocket-protocol") headers.set(name, value);
