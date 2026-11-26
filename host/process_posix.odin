@@ -6,6 +6,7 @@ import "core:nbio"
 import "core:net"
 import "core:strings"
 import "core:sys/posix"
+import "core:time"
 
 // A process on Linux, macOS or FreeBSD: a session and process group of its own, its pipes or its terminal made
 // non-blocking and waited on through the event loop, and a descriptor that becomes readable once it has ended (a
@@ -594,7 +595,12 @@ process_reap :: proc(p: ^Process) {
 		r = posix.waitpid(p.pid, &status, {.NOHANG})
 	}
 	if r == 0 {
-		process_await(p) // not yet, after all
+		// Said to have ended, and not yet to be reaped, as macOS may say it a moment early: what the watch had to say
+		// it has said, and a kqueue's will say no more, so it is asked again in a moment rather than waited on.
+		p.watch_op = nbio.timeout_poly(time.Millisecond, p, proc(op: ^nbio.Operation, p: ^Process) {
+			p.watch_op = nil
+			process_reap(p)
+		})
 		return
 	}
 	switch {

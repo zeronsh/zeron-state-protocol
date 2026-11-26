@@ -16,9 +16,10 @@ process_has_only_its_stdio :: proc(t: ^testing.T) {
 		return
 	}
 	defer nbio.release_thread_event_loop()
-	// One this process would leave to any child that did not close it: dup's copy is not closed by an exec.
-	open := posix.dup(2)
-	if !testing.expect(t, open >= 0) {
+	// One this process would leave to any child that did not close it: dup's copy is not closed by an exec. Numbered
+	// high, above those a shell keeps for itself as it redirects (bash's from 10, and 255), and below any limit.
+	open := posix.dup2(2, 900)
+	if !testing.expect(t, open == 900) {
 		return
 	}
 	defer posix.close(open)
