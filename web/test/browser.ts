@@ -62,6 +62,10 @@ const zsp = {
     devices.set(name, d);
     return { id: d.id, key: d.key, space: d.space };
   },
+  /** The same, with its node found at that URL, should this tab's worker come to run it. */
+  async deviceWith(name: string, wasm: string): Promise<void> {
+    devices.set(name, await open({ name, wasm: new URL(wasm, location.href), onFailure: (e) => failures.push(e.message) }));
+  },
   async join(name: string, space: string, relay: { key: string; url: string }): Promise<void> {
     await devices.get(name)!.join(space, relay);
   },

@@ -26,8 +26,13 @@ execFileSync(process.execPath, [join(WEB, "build.ts"), "--test"], { stdio: "inhe
 
 // The test page, and what it loads, from this origin.
 const TYPES: Record<string, string> = { ".js": "text/javascript", ".wasm": "application/wasm", ".html": "text/html" };
+const held: (() => void)[] = []; // asked for held.wasm, which is not there: said so when let go
 const site = http((req, res) => {
   const path = new URL(req.url!, "http://x").pathname;
+  if (path === "/held.wasm") {
+    held.push(() => res.writeHead(404).end());
+    return;
+  }
   if (path === "/") {
     res.writeHead(200, { "content-type": "text/html" });
     res.end('<!doctype html><meta charset="utf-8"><script type="module" src="/test.js"></script>');
@@ -226,6 +231,26 @@ const tests: Record<string, () => Promise<void>> = {
     const next = await call<string>(follower, "scopeOrError", "fa");
     // Either it was done, and said so, or it was not done at all.
     expectEqual(next, said.startsWith("error") ? "2" : "3");
+  },
+  // And what a worker was asked while it opened the store, when the opening fails, is not done by the next either.
+  async browser_failed_opening() {
+    const first = await page();
+    await call(first, "device", "fo");
+    await call(first, "create", "fo");
+    const second = await page();
+    await call(second, "deviceWith", "fo", "/held.wasm"); // whose worker, given the store, cannot load the node
+    await first.close();
+    pages.splice(pages.indexOf(first), 1);
+    await eventually("the second opens the store", async () => held.length > 0);
+    await call(second, "scopeLater", "fo"); // asked as it does
+    await new Promise((done) => setTimeout(done, 100));
+    for (const go of held.splice(0)) go();
+    await eventually("the second is told", async () => (await call<string[]>(second, "failures")).length > 0);
+    await eventually("and what it asked is answered", async () => (await call<string[]>(second, "asked")).length > 0);
+    expectEqual((await call<string[]>(second, "asked"))[0].slice(0, 6), "error:");
+    const third = await page();
+    await call(third, "device", "fo");
+    expectEqual(await call<string>(third, "scopeOrError", "fo"), "2"); // or 3, should what failed be done after all
   },
   // Whichever tab joins, makes or adopts a space, every tab's device says it is of it.
   async browser_space_told() {

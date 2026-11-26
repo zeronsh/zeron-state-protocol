@@ -84,8 +84,9 @@ function open(o: Options): void {
   });
 }
 
-// Every tab hears that the node has stopped, its storage having failed.
+// Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
 function fail(message: string): void {
+  failedAsks(message);
   self.postMessage({ failed: message } satisfies Report);
   channel.postMessage({ failed: message } satisfies Shout);
 }
@@ -156,6 +157,13 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
   }
 }
 
+// Whatever was asked of a node that stopped, or of one that never came to be, and not answered, was not done, and the tab
+// is told it failed: it is not to be done by the next, either.
+function failedAsks(message: string): void {
+  for (const [id, done] of waiting) unheard.delete(id), done({ error: message });
+  waiting.clear();
+}
+
 // Says something to the leader, and again to every new one until it is answered: one opening its store hears nothing.
 function shout(id: string, s: Shout): void {
   unheard.set(id, s);
@@ -164,10 +172,7 @@ function shout(id: string, s: Shout): void {
 
 function heard(s: Shout): void {
   if ("failed" in s) {
-    // Whatever was asked of the node that stopped, and not answered, was not done, and the tab is told it failed: it is
-    // not to be done by the next, either.
-    for (const [id, done] of waiting) unheard.delete(id), done({ error: s.failed });
-    waiting.clear();
+    failedAsks(s.failed);
     self.postMessage({ failed: s.failed } satisfies Report);
   } else if ("space" in s) {
     self.postMessage({ space: s.space } satisfies Report);
