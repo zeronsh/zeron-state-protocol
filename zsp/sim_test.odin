@@ -812,6 +812,10 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 					x.roster = slice.clone(newest.bytes)
 				}
 			}
+			// And it may come back the other kind of replica: what it wrote as the one, the other must not lose.
+			if i != 0 && !x.relay && rand.int_max(3) == 0 {
+				x.full = !x.full
+			}
 			// What it had learnt, it has kept.
 			keyring_destroy(&x.keys)
 			keyring_init(&x.keys, x.secret)
@@ -1081,6 +1085,122 @@ partial_replica :: proc(t: ^testing.T) {
 	}
 	said, done = settled(ui)
 	testing.expect(t, said && done)
+}
+
+// A device that was a full replica and is now a partial one loses nothing it wrote meanwhile, however long ago its store
+// was checkpointed; and the other way about. One whose store does not say that its outbox is whole, as one kept before
+// every replica kept one, goes on as a full replica until it is level with another, and is partial from then on.
+@(test)
+partial_after_full :: proc(t: ^testing.T) {
+	state := seeded(12)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, laptop := s.nodes[0], s.nodes[1]
+	count :: proc(x: ^Sim_Node) -> int {
+		return store_range(&x.node.store, KEY_MIN, KEY_MAX).count
+	}
+
+	// A full replica writes while it reaches nobody, its store is checkpointed, and it starts again as a partial one.
+	for i in 0 ..< 20 {
+		sim_put(&s, laptop, u64(i))
+	}
+	sim_restart(&s, laptop, full = false)
+	testing.expect(t, !laptop.node.full)
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect_value(t, count(big), 20)
+	testing.expect_value(t, laptop.node.outbox.root, 0)
+
+	// A partial replica writes while it reaches nobody, and starts again as a full one, and then as a partial one.
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	for i in 100 ..< 110 {
+		sim_put(&s, laptop, u64(i))
+	}
+	sim_restart(&s, laptop, full = true)
+	sim_restart(&s, laptop, full = false)
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect_value(t, count(big), 30)
+
+	// A store kept as a full replica's before there were outboxes, which writes while it reaches nobody.
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	sim_restart(&s, laptop, full = true)
+	for i in 200 ..< 205 {
+		sim_put(&s, laptop, u64(i))
+	}
+	clear_map_outbox(&laptop.node)
+	sim_restart(&s, laptop, full = false, older = true)
+	testing.expect(t, laptop.node.full && laptop.node.becoming && !laptop.node.whole) // full until level with one
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect_value(t, count(big), 35)
+	testing.expect(t, laptop.node.whole)
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	sim_restart(&s, laptop, full = false)
+	testing.expect(t, !laptop.node.full && !laptop.node.becoming)
+	sim_put(&s, laptop, 300)
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect_value(t, count(big), 36)
+}
+
+// Forgets what is in the outbox, as a store kept before full replicas kept one would never have had it.
+@(private)
+clear_map_outbox :: proc(n: ^Node) {
+	keys := make([dynamic]Key, context.temp_allocator)
+	scan := tree_scan(n, n.outbox, KEY_MIN, KEY_MAX)
+	for leaf in tree_next(&scan) {
+		append(&keys, leaf.key)
+	}
+	for k in keys {
+		tree_delete(n, &n.outbox, k)
+	}
+}
+
+// Stops a device cleanly, its store checkpointed, and starts it again, as a full replica or a partial one; and, if
+// `older`, as though its store had been kept by a node that knew nothing of the tail of its header.
+@(private)
+sim_restart :: proc(s: ^Sim, x: ^Sim_Node, full: bool, older := false) {
+	i := 0
+	for y, j in s.nodes {
+		if y == x {
+			i = j
+		}
+	}
+	#reverse for l, j in s.links {
+		if l.an == i || l.bn == i {
+			sim_cut(s, j)
+		}
+	}
+	testing.expect(s.t, store_sync(&x.node.store) && store_checkpoint(&x.node.store))
+	node_destroy(&x.node)
+	if older {
+		for no in Page_No(0) ..< HEADER_PAGES {
+			if pg := x.disk.pages[no]; pg != nil {
+				tail := ([^]byte)(rawptr(uintptr(pg) + size_of(Header)))[:size_of(Header_Tail)]
+				slice.zero(tail)
+			}
+		}
+	}
+	keyring_destroy(&x.keys)
+	keyring_init(&x.keys, x.secret)
+	if x.kept != nil {
+		testing.expect(s.t, keyring_load(&x.keys, x.kept))
+	}
+	x.full = full
+	sim_boot(s, x)
 }
 
 @(private)

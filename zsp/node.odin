@@ -16,6 +16,7 @@ Node :: struct {
 	roster:      Roster,
 	space:       Key32,
 	full:        bool, // replicate everything, rather than what local clients watch
+	becoming:    bool, // asked to be partial, and full until the outbox is whole
 	now:         u64, // milliseconds; the host advances this
 	sessions:    [dynamic]^Session,
 	interests:   [dynamic]Interest,
@@ -111,8 +112,15 @@ node_init :: proc(n: ^Node, disk: Disk, space: Key32, keys: ^Keyring, full: bool
 	n.keys = keys
 	n.full = full
 	n.next_id = 1
-	n.partial = !full
-	return store_open(&n.store, disk, ring)
+	n.own = keys != nil
+	store_open(&n.store, disk, ring) or_return
+	if !full && n.own && !n.whole {
+		// What it wrote as a full replica, or before outboxes were kept whatever a replica was, may be held by nobody
+		// else, and is not named in the outbox: it goes on as a full replica until it is level with one, and so has
+		// offered all it holds, and is a partial one from its next start. See node_level.
+		n.full, n.becoming = true, true
+	}
+	return true
 }
 
 node_destroy :: proc(n: ^Node) {
@@ -350,7 +358,7 @@ sweep_step :: proc(n: ^Node, old: ^Roster, budget: int) -> (done: bool) {
 	if !w.started {
 		w.started = true
 		w.cursor = scope_lo(plan.scope)
-		if info != nil && n.partial && node_wrote(n, info) {
+		if info != nil && !n.full && node_wrote(n, info) {
 			// Whoever took what this holds may be among those who have gone, and may have told nobody.
 			scan := tree_scan(n, n.shelf, scope_lo(plan.scope), scope_hi(plan.scope))
 			for leaf in tree_next(&scan) {
@@ -408,7 +416,7 @@ sweep_step :: proc(n: ^Node, old: ^Roster, budget: int) -> (done: bool) {
 			// Someone who had heard already may have refused it, and will take it now.
 			places := row_places(&n.store, c.row)
 			ring_push(&n.events, {c.row, c.slot, c.kind, c.stamp, 0}, &places, &places)
-			if n.partial {
+			if n.own {
 				tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
 			}
 		} else {
@@ -529,7 +537,7 @@ node_commit :: proc(n: ^Node, cells: []Cell, from: ^Session) -> int {
 	if len(n.typing) > 0 {
 		typing_committed(n, cells)
 	}
-	if accepted > 0 && !n.full && (from == nil || from.role == .Open) {
+	if accepted > 0 && n.own && (from == nil || from.role == .Open) {
 		for c in cells {
 			tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
 		}
@@ -646,6 +654,31 @@ interest_send :: proc(to: ^Session, it: ^Interest) {
 		append(&to.owed, it.id)
 	}
 	send_watch(to, it.id, it.watch.lo, it.watch.hi, {live = it.watch.live, data = data, back = it.back, counts = data && it.watch.counts}, it.limit)
+}
+
+// Whether what a full replica watches whole on a session is every scope it may write in: then, once level, the peer
+// holds all it ever wrote there.
+@(private)
+roots_whole :: proc(s: ^Session) -> bool {
+	n := s.node
+	for &k in n.keys.scopes {
+		if node_may_write(n, k.scope) && !slice.contains(s.roots[:], k.scope) {
+			return false
+		}
+	}
+	return true
+}
+
+// A full replica has brought another level, sent it all it lacked, and heard that it holds it: whatever this one
+// wrote, the other holds, and from now on the outbox names all that nobody else is known to hold. (Rows refused
+// were refused for something that killed them, and are sent back.)
+@(private)
+node_level :: proc(s: ^Session) {
+	n := s.node
+	if n.whole || !n.own || s.level_at == 0 || s.acked_out + 1 < s.level_at {
+		return
+	}
+	n.whole = true // and, if it is becoming partial, it is one from its next start
 }
 
 // Rows awaiting their first full replica go out again on every new connection to one.

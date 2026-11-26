@@ -60,6 +60,8 @@ Session :: struct {
 	roots_due: int, // how many of them are yet to be brought level
 	settled:   bool, // none
 	told:      bool, // and the responder has been told that all of it was sent
+	level_at:  u64, // the last cells sent by then, plus one, if what was watched whole was every scope this one writes in
+	acked_out: u64, // the last cells the peer has said are durable
 	hushed:    u64, // roster serial under which it was paused
 	paused:    bool, // everyone who could write is reachable without this session
 
@@ -1559,7 +1561,7 @@ emit_cell :: proc(s: ^Session, c: ^Cell) {
 			}
 		}
 	}
-	if !n.full && s.peer_full {
+	if n.own && s.peer_full {
 		if _, ok := tree_get(n, n.outbox, {c.row[0], c.row[1], 0, 0, 0}); ok {
 			append(&s.unacked, Unacked{s.seq_out, c.row})
 		}
@@ -1683,6 +1685,8 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 	if r.bad {
 		return
 	}
+	s.acked_out = max(s.acked_out, seq)
+	node_level(s)
 	done := 0
 	for done < len(s.unacked) && s.unacked[done].seq <= seq {
 		done += 1
@@ -2347,6 +2351,10 @@ pump :: proc(s: ^Session) {
 		at := frame_begin(&s.out, .Synced)
 		append(&s.out, 0, 1, 0, 0, 0, 0)
 		frame_end(&s.out, at)
+		if roots_whole(s) {
+			s.level_at = s.seq_out + 1
+			node_level(s)
+		}
 	}
 	if s.task_head == len(s.tasks) && len(s.tasks) > 0 {
 		clear(&s.tasks)

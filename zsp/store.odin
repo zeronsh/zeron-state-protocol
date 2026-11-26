@@ -27,9 +27,12 @@ Store :: struct {
 	shelf:       Tree,
 	cells:       Tree,
 	waste:       Tree,
-	outbox:      Tree, // rows a partial replica has yet to place in a full one
+	outbox:      Tree, // rows of this replica's own writing that no full replica is yet known to hold
 	repair:      Tree, // rows whose shelf entries are to be sought out, where storage may answer "not yet"
-	partial:     bool,
+	used:        Tree, // of a partial replica: each list it holds rows of, to when it was last watched: see retain.odin
+	own:         bool, // its clients write here, and the outbox is kept
+	whole:       bool, // the outbox names all that this replica wrote and no full one is known to hold
+	whole_kept:  bool, // as the last checkpoint says
 	stale:       ^[dynamic]Id, // when set, collects rows whose offered cells were dominated
 	clock:       u64, // highest stamp time seen
 	generation:  u64,
@@ -79,6 +82,19 @@ Header :: struct {
 }
 MAGIC :: [8]byte{'z', 's', 'p', '-', 't', 'r', 'e', '3'} // a store of another is made again from its log
 HEADER_PAGES :: 2
+
+// After the header, in its block, and so written with it: what a store that is a device's, rather than a relay's, has
+// come to keep since. One written before there was any is all zeroes, which its sum never is, and is read as nothing.
+// (The header itself is also written into a relay's manifests, and so stays as it was.)
+Header_Tail :: struct {
+	flags: Tail_Flags,
+	used:  Page_No,
+	sum:   u64,
+}
+Tail_Flags :: bit_field u64 {
+	whole: bool | 1, // the outbox is whole: see Store.whole
+	_:     u64  | 63,
+}
 
 // Where a cell's body lies. Packed into a tree value.
 @(private)
@@ -133,7 +149,7 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 	s.disk = disk
 	ring_init(&s.events, ring)
 
-	best := store_header(disk)
+	best, tail := store_header(disk)
 	s.generation = best.generation
 	s.clock = best.clock
 	s.serial, s.serial_kept = best.serial, best.serial
@@ -142,6 +158,11 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 	s.shelf.root, s.cells.root = best.shelf, best.cells
 	s.waste.root, s.outbox.root = best.waste, best.outbox
 	s.repair.root = best.repair
+	s.used.root = tail.used
+	s.whole, s.whole_kept = tail.flags.whole, tail.flags.whole
+	if best.generation == 0 && s.own {
+		s.whole = true // nothing was ever written here: there is nothing it could have missed
+	}
 	s.next = max(best.next, HEADER_PAGES)
 	if s.remote != nil {
 		s.next = TEMP_PAGES // pages are numbered for where they go only at a checkpoint
@@ -178,7 +199,7 @@ store_close :: proc(s: ^Store) {
 }
 
 @(private)
-store_header :: proc(disk: Disk) -> (best: Header) {
+store_header :: proc(disk: Disk) -> (best: Header, tail: Header_Tail) {
 	for i in Page_No(0) ..< HEADER_PAGES {
 		pg := disk.page(disk.data, i)
 		if pg == nil {
@@ -187,6 +208,10 @@ store_header :: proc(disk: Disk) -> (best: Header) {
 		h := (^Header)(pg)^
 		if h.magic == MAGIC && h.sum == header_sum(&h) && h.generation >= best.generation {
 			best = h
+			tail = (^Header_Tail)(rawptr(uintptr(pg) + size_of(Header)))^
+			if tail.sum != tail_sum(&best, &tail) {
+				tail = {}
+			}
 		}
 	}
 	return
@@ -252,7 +277,7 @@ store_since :: proc(s: ^Store, from: u64, budget: int, data: rawptr, each: proc(
 // The latest stamp time a store has seen, without opening it.
 @(require_results)
 store_clock :: proc(disk: Disk) -> u64 {
-	h := store_header(disk)
+	h, _ := store_header(disk)
 	log_scan(disk, h.log, &h.clock, proc(data: rawptr, _: u64, body: []byte) {
 		clock := (^u64)(data)
 		r := Reader{buf = body}
@@ -272,6 +297,15 @@ header_sum :: proc(h: ^Header) -> u64 {
 	return xxhash.XXH64(b)
 }
 
+// Of the tail and the header it follows, so that it is never taken for another's; and never zero.
+@(private)
+tail_sum :: proc(h: ^Header, t: ^Header_Tail) -> u64 {
+	b: [offset_of(Header_Tail, sum) + 8]byte
+	copy(b[:], ([^]byte)(t)[:offset_of(Header_Tail, sum)])
+	put_u64(b[offset_of(Header_Tail, sum):], h.sum)
+	return xxhash.XXH64(b[:]) | 1
+}
+
 // Everything the roots do not reach is free. Only branches are read.
 @(private)
 find_free :: proc(s: ^Store) {
@@ -289,7 +323,7 @@ find_free :: proc(s: ^Store) {
 			mark(s, used, e.child, level - 1)
 		}
 	}
-	for t in ([]Tree{s.shelf, s.cells, s.waste, s.outbox, s.repair}) {
+	for t in ([]Tree{s.shelf, s.cells, s.waste, s.outbox, s.repair, s.used}) {
 		if t.root != 0 {
 			mark(s, used, t.root, int(page(s, t.root).level))
 		}
@@ -392,8 +426,8 @@ replay_record :: proc(s: ^Store, pos: u64, body: []byte) {
 		off := pos + RECORD_HEAD + u64(r.pos - len(c.body))
 		if !apply(s, &c, off, 0, true) {
 			waste_add(s, off, len(c.body))
-		} else if s.partial {
-			// Whether it was acknowledged is not recorded; offering it again is harmless.
+		} else if s.own {
+			// Whether it was acknowledged, or written here at all, is not recorded; offering it again is harmless.
 			tree_put(s, &s.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
 		}
 	}
@@ -752,7 +786,7 @@ store_sync :: proc(s: ^Store) -> bool {
 
 @(require_results)
 store_wants_checkpoint :: proc(s: ^Store) -> bool {
-	return store_tail(s) - s.checkpoint > CHECKPOINT_TAIL || len(s.dirty) > CHECKPOINT_DIRTY || s.serial != s.serial_kept
+	return store_tail(s) - s.checkpoint > CHECKPOINT_TAIL || len(s.dirty) > CHECKPOINT_DIRTY || s.serial != s.serial_kept || s.whole != s.whole_kept
 }
 
 // Writes the trees, so that the log before this point need never be replayed.
@@ -762,7 +796,7 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 		s.remote.want_checkpoint = true
 		return !s.failed
 	}
-	if s.replaying || (s.checkpoint == store_tail(s) && len(s.dirty) == 0 && s.serial == s.serial_kept) {
+	if s.replaying || (s.checkpoint == store_tail(s) && len(s.dirty) == 0 && s.serial == s.serial_kept && s.whole == s.whole_kept) {
 		return true
 	}
 	// Where storage may answer "not yet", evacuation is a job of its own (evac_steps), done before.
@@ -796,8 +830,11 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 		next       = s.next,
 	}
 	h.sum = header_sum(&h)
+	tail := Header_Tail{flags = {whole = s.whole}, used = s.used.root}
+	tail.sum = tail_sum(&h, &tail)
 	block: [512]byte
 	copy(block[:], ([^]byte)(&h)[:size_of(h)])
+	copy(block[size_of(h):], ([^]byte)(&tail)[:size_of(tail)])
 	ok := s.disk.page_sync(s.disk.data)
 	ok = ok && s.disk.page_write(s.disk.data, Page_No(h.generation % HEADER_PAGES), block[:])
 	ok = ok && s.disk.page_sync(s.disk.data)
@@ -808,6 +845,7 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 
 	s.generation = h.generation
 	s.checkpoint, s.serial_kept = h.log, h.serial
+	s.whole_kept = tail.flags.whole
 	for no in nos {
 		free(s.dirty[no])
 	}
