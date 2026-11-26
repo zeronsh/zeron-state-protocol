@@ -130,6 +130,7 @@ transfer_on_data :: proc(t: ^Transfer, bytes: []byte) -> bool {
 			}
 			// What the other end has, it has checked; its hashes, here, are read again, for the file's.
 			t.from, t.at = from, 0
+			t.result.resumed = from
 			buf := make([]byte, FILE_READ, context.temp_allocator)
 			for t.at < from {
 				n := min(FILE_READ, int(from - t.at), CHUNK - t.hashing.filled)
