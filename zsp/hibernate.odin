@@ -16,6 +16,11 @@ session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 	if s.cursor != n.events.next || s.counts_due || s.recompare || s.seq_in > s.acked_in || (s.greeted && !s.accepted) {
 		return false
 	}
+	// Nor a call it carries, which is not saved: woken, the node would number its next call as one the other side still
+	// has open. It reconnects, and the other side hears that its calls are over.
+	if node_calling(n, s) {
+		return false
+	}
 	write_varint(w, u64(s.id))
 	write_u8(
 		w,

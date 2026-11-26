@@ -297,7 +297,7 @@ export async function serve(request, label, open) {
     if (framingOut !== "chunked" && said !== null) (framingOut = "length"), (left = said);
     const empty = request.method === "HEAD" || [204, 205, 304].includes(head.status); // as fetch has them: no body
     // Its length, where that is what it is: the body's, or for a HEAD or a 304, the one it would have.
-    if (said !== null && framingOut === "length" && head.status !== 204) headers.set("content-length", String(said));
+    if (said !== null && framingOut === "length" && head.status !== 204 && head.status !== 205) headers.set("content-length", String(said));
     if (empty) call.cancel();
     return new Response(empty ? null : body(call, framingOut, left), { status: head.status, statusText: head.reason, headers });
   } catch (e) {

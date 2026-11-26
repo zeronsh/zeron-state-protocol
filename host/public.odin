@@ -154,6 +154,11 @@ public_exposed :: proc(sp: ^Space, s: ^zsp.Session, payload: []byte) {
 	if !zsp.expose_frame_sound(payload, MAX_EXPOSURES) {
 		return // nothing of a frame that is not all sound is taken: it changes nothing
 	}
+	for p in sp.node.sessions {
+		if p.peer == s.peer && p.id > s.id && p.ready && !p.closing && p.role == .Peer {
+			return // late, on a session it has since come back from: what it says on its newest is what holds
+		}
+	}
 	r := zsp.Reader{buf = payload}
 	n := zsp.read_varint(&r)
 	// All the device exposes here, on whichever session said it: one it has come back on while the last is not yet known

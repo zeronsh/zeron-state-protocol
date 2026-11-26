@@ -261,6 +261,11 @@ exposed :: proc(s: ^zsp.Session, payload: []byte) {
 	if id == 0 || !zsp.expose_frame_sound(payload, 16) {
 		return // nothing of a frame that is not all sound is taken: it changes nothing
 	}
+	for _, c in conns {
+		if c.session != nil && c.session.peer == s.peer && c.session.id > s.id && c.session.ready && !c.session.closing {
+			return // late, on a connection it has since come back from: what it says on its newest is what holds
+		}
+	}
 	r := zsp.Reader{buf = payload}
 	n := zsp.read_varint(&r)
 	// What it no longer exposes is let go, and what is new is claimed: what it says again is left as it is, for a release

@@ -91,7 +91,7 @@ function relay(env = {}, seed = () => {}) {
     waitUntil: (p) => void Promise.resolve(p).catch(() => {}),
   };
   const space = new Space(ctx, { RELAY_SECRET: SECRET, EXPOSE_DOMAIN: "expose.test", STATS: "1", ...env });
-  const r = { space, store, stale: false, ends: [] };
+  const r = { space, store, stale: false, ends: [], conns: [] };
   r.server = createServer((_, res) => res.writeHead(426).end());
   r.server.on("upgrade", (req, socket) => {
     const accept = createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
@@ -99,6 +99,9 @@ function relay(env = {}, seed = () => {}) {
     const res = space.fetch(new Request("http://relay" + req.url, { headers: { Upgrade: "websocket" } }));
     if (!res.switched) return void socket.destroy();
     const ws = [...sockets].pop();
+    // What a connection says may be held, and its end too, to be had later: as what is still on its way.
+    const conn = { ws, hold: false, held: [], heldEnd: null };
+    r.conns.push(conn);
     ws.onsend = (data) => frame(socket, Buffer.from(data));
     ws.onclose = () => (sockets.delete(ws), socket.destroy());
     const end = () => {
@@ -120,11 +123,12 @@ function relay(env = {}, seed = () => {}) {
         const op = buf[0] & 15;
         buf = buf.subarray(at + 4 + n);
         if (op === 8) return void (socket.end(), end());
-        if (op === 2) space.webSocketMessage(ws, data.buffer.slice(data.byteOffset, data.byteOffset + data.length));
+        const message = data.buffer.slice(data.byteOffset, data.byteOffset + data.length);
+        if (op === 2) conn.hold ? conn.held.push(message) : space.webSocketMessage(ws, message);
       }
     });
     socket.on("error", () => {});
-    socket.on("close", () => (r.stale ? r.ends.push(end) : end()));
+    socket.on("close", () => (conn.hold ? (conn.heldEnd = end) : r.stale ? r.ends.push(end) : end()));
   });
   return r;
 }
@@ -204,6 +208,52 @@ try {
   const after = await get(r, label, "/fast");
   if (after.status !== 200) (failed = true), console.log(`FAIL after its last connection went: ${after.status} ${await after.text()}`);
   else await after.arrayBuffer();
+
+  // What a device said on its last connection, still on its way when it comes back on another: when it comes, it does
+  // not undo what the device says on its newest, nor does the last one's going then take its labels.
+  const last = r.conns.at(-1);
+  last.hold = true;
+  z("expose", dir, String(backend.address().port + 1), "name=two");
+  await eventually("said on the last", () => last.held.length > 0);
+  procs.shift().kill("SIGKILL");
+  procs.push(await device(dir));
+  await eventually("exposed on the newest", () => (z("exposures", dir).match(/https:\/\//g) ?? []).length === 2);
+  await eventually("the last one's end on its way", () => last.heldEnd !== null);
+  for (const message of last.held.splice(0)) r.space.webSocketMessage(last.ws, message);
+  last.hold = false;
+  last.heldEnd();
+  const late = await get(r, label, "/fast");
+  if (late.status !== 200) (failed = true), console.log(`FAIL after what was late on its last connection: ${late.status} ${await late.text()}`);
+  else await late.arrayBuffer();
+
+  // A node evicted while a call is under way: the device hears that its calls are over (its connection goes, and it
+  // comes back), and lets go of its end of them, rather than keep them for ever, and meet a later call by the number
+  // of one it still has open.
+  // The device writes down each public connection as it ends: that this one has is how it is seen let go.
+  const closes = () => {
+    try {
+      return readFileSync(join(dir, space, "audit.log"), "utf8").split("\n").filter((l) => l.includes('"service":"public"') && l.includes('"event":"close"')).length;
+    } catch {
+      return 0;
+    }
+  };
+  const held = new Promise((done) => (arrived = done));
+  const pending = get(r, label, "/slow");
+  await held;
+  await later(300);
+  const before = closes();
+  assert.equal((await r.space.fetch(new Request(`http://relay/${space}?evict`))).status, 200);
+  await pending.then((res) => res.arrayBuffer()).catch(() => {});
+  try {
+    await eventually("its end of the call let go", () => closes() > before, 5000);
+  } catch {
+    (failed = true), console.log("FAIL a call under way when the node was evicted: the device kept its end of it");
+  }
+  await eventually("reached again", async () => {
+    const res = await get(r, label, "/fast");
+    await res.arrayBuffer();
+    return res.status === 200;
+  });
 
   // Full: nobody is let in for a while, and the public neither, nor does the public wake the node to be full again.
   // A space kept here before, whose storage is now full: as it wakes, it finds so.

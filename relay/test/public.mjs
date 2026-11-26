@@ -172,5 +172,18 @@ for (const method of ["GET", "HEAD"]) {
   await res.arrayBuffer();
 }
 
+// A 205 has no body, so no length but none: whatever the port said of one is not passed on.
+{
+  const call = new Call(pipe(), 1);
+  setTimeout(() => {
+    call.flow(0, new Uint8Array([0]));
+    call.flow(0, enc.encode("HTTP/1.1 205 Reset Content\r\nContent-Length: 5\r\n\r\nhello"));
+    call.flow(1, new Uint8Array());
+  }, 10);
+  const res = await serve(new Request("https://app.example.test/", { method: "POST", body: "x" }), "app", () => call);
+  check("a 205's length", res.headers.get("content-length") === null, String(res.headers.get("content-length")));
+  await res.arrayBuffer();
+}
+
 if (failed) process.exit(1);
 console.log("ok   relay/test/public.mjs");

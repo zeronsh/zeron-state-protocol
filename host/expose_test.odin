@@ -334,6 +334,12 @@ public_exposed_by_a_device_come_back :: proc(t: ^testing.T) {
 	testing.expect_value(t, status_of(&last), 0)
 	public_exposed(&ts.space, &now, frame[:])
 	testing.expect_value(t, status_of(&now), 0) // its own, not taken
+	// What the last says late, once it has come back on another, changes nothing: what it says on its newest holds.
+	now.ready, now.role = true, .Peer
+	append(&ts.space.node.sessions, &now)
+	defer clear(&ts.space.node.sessions)
+	nothing := []byte{0}
+	public_exposed(&ts.space, &last, nothing)
 	public_session_closed(&ts.host, &ts.space, last.id)
 	testing.expect_value(t, len(ts.host.public.labels), 1)
 	if len(ts.host.public.labels) == 1 {
