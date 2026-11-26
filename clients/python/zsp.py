@@ -1339,7 +1339,8 @@ class Client:
 
     def expose(self, port, name="", proxy=False):
         """Exposes a port of this machine to the public, through every relay that will, under a fresh name."""
-        return self.exposures(b"\x01" + struct.pack(">H", port) + varint(len(name)) + name.encode() + bytes([1 if proxy else 0]))
+        prefix = name.encode()  # its length in bytes, as every length on the wire is
+        return self.exposures(b"\x01" + struct.pack(">H", port) + varint(len(prefix)) + prefix + bytes([1 if proxy else 0]))
 
     def unexpose(self, port):
         return self.exposures(b"\x02" + struct.pack(">H", port))

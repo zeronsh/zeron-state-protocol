@@ -29,7 +29,8 @@ async function main(): Promise<void> {
   const ca = new Client({ connect: zspdConnect(na.address), credential: token(a) });
   const cb = new Client({ connect: zspdConnect(nb.address), credential: token(b) });
   let devices = 0;
-  cb.on("devices", (d) => (devices = d.length));
+  let ids: string[] = [];
+  cb.on("devices", (d) => ((devices = d.length), (ids = d.map((x) => x.id))));
   await eventually("both hear of both", () => devices === 2);
   const listener = createServer((s) => s.end("x"));
   await new Promise<void>((done) => listener.listen(0, "127.0.0.1", done));
@@ -40,6 +41,8 @@ async function main(): Promise<void> {
     const nodes = await cb.nodes();
     const me = nodes.find((n) => n.here)!, other = nodes.find((n) => !n.here)!;
     if (me.address !== "127.0.0.1" || !me.name.endsWith(".id.zsp.internal") || !/^127\.77\.0\.\d+$/.test(other.address)) throw new Error(JSON.stringify(nodes));
+    // Its devices by the ids the client has for them everywhere: 64 hex digits.
+    if (!nodes.every((n) => /^[0-9a-f]{64}$/.test(n.id) && ids.includes(n.id))) throw new Error(`ids: ${JSON.stringify(nodes.map((n) => n.id))} ${ids}`);
 
     // Nothing is offered unless it is; then it is, listed as it listens.
     if ((await ca.offers()).length !== 0) throw new Error("offered unasked");
@@ -48,6 +51,25 @@ async function main(): Promise<void> {
     if ((await ca.offer({ lo: 1000, hi: 2000, scope: 1, host: "10.0.0.4" })).length !== 2) throw new Error("a host's offer");
     await fails("this machine is no host", "denied", ca.offer({ lo: 22, scope: 1, host: "127.0.0.1" }));
     await fails("a scope it may not call in", "denied", cb.offer({ lo: 22, scope: 9 }));
+    // To one device, by its id; and no port that is not one, rather than one it wraps round to.
+    const one = await ca.offer({ lo: port + 2, scope: 1, device: other.id === me.id ? me.id : nodes.find((n) => !n.here)!.id });
+    if (!one.some((o) => o.lo === port + 2 && o.device === nodes.find((n) => !n.here)!.id)) throw new Error(JSON.stringify(one));
+    await ca.unoffer({ lo: port + 2, scope: 1, device: nodes.find((n) => !n.here)!.id });
+    for (const bad of [65616, 0, 1.5, -80]) {
+      let threw = false;
+      try {
+        await ca.offer({ lo: bad, scope: 1 });
+      } catch (e) {
+        threw = e instanceof RangeError;
+      }
+      try {
+        await ca.expose(bad);
+        threw = false;
+      } catch (e) {
+        threw &&= e instanceof RangeError;
+      }
+      if (!threw) throw new Error(`port ${bad} was taken`);
+    }
     await eventually("the offer is heard", async () => (await cb.nodes()).some((n) => n.ports.some((p) => p.port === port && p.name === "web" && p.scope === 1)), 15000);
     if ((await ca.unoffer({ lo: 1000, hi: 2000, scope: 1, host: "10.0.0.4" })).length !== 1) throw new Error("taken back");
 

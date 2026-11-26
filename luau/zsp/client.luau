@@ -2428,12 +2428,18 @@ function Client.nodes(self: Client): ({ Node }?, string?)
 	return table.freeze(out), nil
 end
 
+-- A TCP port as the wire has it, two bytes: one of 1 to 65535, or none at all (not one taken modulo 65536).
+local function put_port(w: codec.Writer, port: number)
+	if type(port) ~= "number" or port ~= math.floor(port) or port < 1 or port > 65535 then
+		error("a port is a whole number from 1 to 65535", 3)
+	end
+	codec.put_u8(w, port // 256)
+	codec.put_u8(w, port % 256)
+end
+
 local function put_offer(w: codec.Writer, o: Offer)
-	local hi = o.hi or o.lo
-	codec.put_u8(w, o.lo // 256)
-	codec.put_u8(w, o.lo % 256)
-	codec.put_u8(w, hi // 256)
-	codec.put_u8(w, hi % 256)
+	put_port(w, o.lo)
+	put_port(w, o.hi or o.lo)
 	codec.put_varint(w, o.scope)
 	codec.put(w, o.device or string.rep("\0", 32))
 	codec.put_bytes(w, o.host or "")
@@ -2511,8 +2517,7 @@ end
 function Client.expose(self: Client, port: number, options: { name: string?, proxy: boolean? }?): ({ Exposure }?, string?)
 	local w = codec.writer()
 	codec.put_u8(w, 1)
-	codec.put_u8(w, port // 256)
-	codec.put_u8(w, port % 256)
+	put_port(w, port)
 	codec.put_bytes(w, options and options.name or "")
 	codec.put_u8(w, if options and options.proxy then 1 else 0)
 	return self:_exposures(codec.string(w))
@@ -2520,7 +2525,10 @@ end
 
 -- Takes a port back from the public: whoever is using it is cut off, and its name is nobody's for ever.
 function Client.unexpose(self: Client, port: number): ({ Exposure }?, string?)
-	return self:_exposures(string.char(2, port // 256, port % 256))
+	local w = codec.writer()
+	codec.put_u8(w, 2)
+	put_port(w, port)
+	return self:_exposures(codec.string(w))
 end
 
 function Client._serve(self: Client, key: string, on: boolean)

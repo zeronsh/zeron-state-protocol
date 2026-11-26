@@ -42,6 +42,12 @@ function rowId(id: string): string {
 }
 const toBytes = (data: Uint8Array | string): Uint8Array => (typeof data === "string" ? utf8.encode(data) : data);
 
+// A TCP port as the wire has it, two bytes: one of 1 to 65535, or none at all (not one taken modulo 65536).
+function port16(port: number): Uint8Array {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new RangeError("a port is a whole number from 1 to 65535");
+  return new Uint8Array([port >> 8, port & 255]);
+}
+
 // ---------------------------------------------------------------- what the host lends
 
 export interface Host {
@@ -2077,7 +2083,7 @@ export class Client {
     const r = await this.#hostCall("zsp.nodes", new Uint8Array());
     const out: NodeInfo[] = [];
     for (let n = codec.varint(r); n > 0; n--) {
-      const id = codec.takeBinary(r, 32), name = fromUtf8.decode(codec.bytes(r)), a = codec.take(r, 4), flags = codec.u8(r);
+      const id = codec.hex(codec.take(r, 32)), name = fromUtf8.decode(codec.bytes(r)), a = codec.take(r, 4), flags = codec.u8(r);
       out.push(Object.freeze({
         id, name, address: Array.from(a).join("."), here: !!(flags & 1), reachable: !!(flags & 2), direct: !!(flags & 4),
         subject: fromUtf8.decode(codec.bytes(r)), ports: readPorts(r),
@@ -2090,19 +2096,21 @@ export class Client {
     const w = codec.writer();
     codec.putU8(w, op);
     if (o) {
-      const hi = o.hi ?? o.lo;
-      codec.put(w, new Uint8Array([o.lo >> 8, o.lo & 255, hi >> 8, hi & 255]));
+      codec.put(w, port16(o.lo));
+      codec.put(w, port16(o.hi ?? o.lo));
+      if (!Number.isInteger(o.scope) || o.scope < 1) throw new RangeError("a scope is a whole number from 1");
       codec.putVarint(w, o.scope);
-      codec.put(w, o.device ? codec.bytesOf(o.device) : new Uint8Array(32));
+      if (o.device !== undefined && !DEVICE_ID.test(o.device)) throw new RangeError("a device's id is 64 hex digits");
+      codec.put(w, o.device !== undefined ? codec.unhex(o.device) : new Uint8Array(32)); // as devices and calls have it
       codec.putBytes(w, utf8.encode(o.host ?? ""));
       codec.putBytes(w, utf8.encode(o.name ?? ""));
       codec.putU8(w, o.proxy ? 1 : 0);
     }
     const r = await this.#hostCall("zsp.offers", w.buf.subarray(0, w.pos));
     const out: Offer[] = [];
-    const none = "\0".repeat(32);
+    const none = "0".repeat(64);
     for (let n = codec.varint(r); n > 0; n--) {
-      const pair = codec.take(r, 4), scope = codec.varint(r), device = codec.takeBinary(r, 32);
+      const pair = codec.take(r, 4), scope = codec.varint(r), device = codec.hex(codec.take(r, 32));
       const host = fromUtf8.decode(codec.bytes(r)), name = fromUtf8.decode(codec.bytes(r)), flags = codec.u8(r);
       out.push(Object.freeze({
         lo: (pair[0] << 8) | pair[1], hi: (pair[2] << 8) | pair[3], scope, device: device === none ? undefined : device,
@@ -2134,7 +2142,7 @@ export class Client {
       const p = codec.take(r, 2), name = fromUtf8.decode(codec.bytes(r)), flags = codec.u8(r), label = fromUtf8.decode(codec.bytes(r));
       const relays: RelayExposure[] = [];
       for (let m = codec.varint(r); m > 0; m--) {
-        relays.push(Object.freeze({ relay: codec.takeBinary(r, 32), status: codec.u8(r), url: fromUtf8.decode(codec.bytes(r)) }));
+        relays.push(Object.freeze({ relay: codec.hex(codec.take(r, 32)), status: codec.u8(r), url: fromUtf8.decode(codec.bytes(r)) }));
       }
       out.push(Object.freeze({ port: (p[0] << 8) | p[1], name, proxy: !!(flags & 1), label, relays: Object.freeze(relays) }));
     }
@@ -2149,7 +2157,8 @@ export class Client {
   /** Exposes a port of this machine to the public, under a fresh name; `proxy` says where each connection came from. */
   expose(port: number, options: { name?: string; proxy?: boolean } = {}): Promise<readonly Exposure[]> {
     const w = codec.writer();
-    codec.put(w, new Uint8Array([1, port >> 8, port & 255]));
+    codec.putU8(w, 1);
+    codec.put(w, port16(port));
     codec.putBytes(w, utf8.encode(options.name ?? ""));
     codec.putU8(w, options.proxy ? 1 : 0);
     return this.#exposures(w.buf.subarray(0, w.pos));
@@ -2157,7 +2166,7 @@ export class Client {
 
   /** Takes a port back from the public: whoever is using it is cut off, and its name is nobody's for ever. */
   unexpose(port: number): Promise<readonly Exposure[]> {
-    return this.#exposures(new Uint8Array([2, port >> 8, port & 255]));
+    return this.#exposures(new Uint8Array([2, ...port16(port)]));
   }
 
   /** Answers a method within a scope. The handler gets the call and its first message. Returns a way to stop. */
@@ -2311,7 +2320,7 @@ export interface Port {
 
 /** A device of the space as this one reaches it (SPEC §17). */
 export interface NodeInfo {
-  readonly id: string;
+  readonly id: string; // 64 hex digits, as `devices` and calls have it
   readonly name: string; // <name>.<suffix>, or <id>.id.<suffix>: what any application here reaches it by
   readonly address: string; // 127.a.b.c
   readonly here: boolean;

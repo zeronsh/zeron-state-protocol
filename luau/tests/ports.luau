@@ -137,6 +137,12 @@ assert(twice == "denied", "exposed already")
 assert(#check(a:unexpose(port)) == 1 and #check(a:unexpose(port + 1)) == 0)
 local _, never = a:unexpose(port)
 assert(never == "denied")
+-- No port that is not one, rather than one it wraps round to.
+for _, bad in { 65616, 0, 1.5, -80 } do
+	assert(not pcall(a.offer, a, { lo = bad, scope = 1 }), `offered {bad}`)
+	assert(not pcall(a.expose, a, bad), `exposed {bad}`)
+	assert(not pcall(a.unexpose, a, bad), `unexposed {bad}`)
+end
 print("ok")
 end
 

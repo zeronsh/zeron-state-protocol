@@ -1193,6 +1193,15 @@ def test_ports():
         call.send(zsp.varint(600))
         once.append(call)
     eventually("each is over", lambda: all(c["ended"] or c["fault"] is not None for c in once) or ca.step() and False, timeout=5)
+    # A name of letters past ASCII goes as its bytes: the device refuses it as no name, not as no frame.
+    said = []
+    host = ca.host
+    ca.host = lambda method, body=b"": said.append(body) or [b"\x00"]
+    try:
+        ca.expose(port, name="café")
+    finally:
+        ca.host = host
+    assert said[0] == b"\x01" + struct.pack(">H", port) + zsp.varint(5) + "café".encode() + b"\x00", said
     # What a device offers is among the services it lists, to whoever it offers it.
     listed = ca.call(bytes.fromhex(b.key), 1, "zsp.services")
     data = b"".join(listed["data"])
