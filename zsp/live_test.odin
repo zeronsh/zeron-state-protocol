@@ -250,7 +250,12 @@ typing_is_kept_whole_or_not_at_all :: proc(t: ^testing.T) {
 // a piece sealed, or the text written over, is not given a reader afterwards as if it were still being typed.
 @(test)
 what_is_written_ends_what_was_typed :: proc(t: ^testing.T) {
-	for overwrite in ([]bool{false, true}) {
+	How :: enum {
+		Sealed,
+		Overwritten,
+		Bundled, // sealed with another into one cell, as tidying does, and only so said to the reader
+	}
+	for how in How {
 		state := seeded(72)
 		context.random_generator = rand.default_random_generator(&state)
 		s: Sim
@@ -279,18 +284,29 @@ what_is_written_ends_what_was_typed :: proc(t: ^testing.T) {
 		defer delete(body)
 		write_u64(&body, 7)
 		append(&body, "old")
-		testing.expect(t, node_write(&w.node, {{row, DATA, .Piece, node_stamp(&w.node), body[:]}}))
-		if overwrite {
+		if how == .Bundled {
+			other: [dynamic]byte
+			defer delete(other)
+			write_u64(&other, 8)
+			append(&other, "x")
+			pieces := []Cell{{row, DATA, .Piece, node_stamp(&w.node), body[:]}, {row, DATA, .Piece, node_stamp(&w.node), other[:]}}
+			bundle := text_bundle(pieces, context.temp_allocator)
+			bundle.stamp = node_stamp(&w.node)
+			testing.expect(t, node_write(&w.node, {bundle}))
+		} else {
+			testing.expect(t, node_write(&w.node, {{row, DATA, .Piece, node_stamp(&w.node), body[:]}}))
+		}
+		if how == .Overwritten {
 			testing.expect(t, node_write(&w.node, {{row, DATA, .Value, node_stamp(&w.node), transmute([]byte)string("new")}}))
 		}
 		settle(&s, &seen, ..uis[:])
-		testing.expectf(t, len(w.node.typing) == 0 && len(r.node.typing) == 0, "overwrite %v: kept after it was written: %d and %d", overwrite, len(w.node.typing), len(r.node.typing))
+		testing.expectf(t, len(w.node.typing) == 0 && len(r.node.typing) == 0, "%v: kept after it was written: %d and %d", how, len(w.node.typing), len(r.node.typing))
 		late := sim_client(&s, r)
 		append(&uis, late)
 		defer session_close(late)
 		sim_watch(late, 1, list_lo(LIST), list_hi(LIST), 50, {data = true, live = true, known = true})
 		settle(&s, &seen, ..uis[:])
-		testing.expectf(t, read(&seen, late, row) == "", "overwrite %v: a late reader was given what was written already as being typed", overwrite)
+		testing.expectf(t, read(&seen, late, row) == "", "%v: a late reader was given what was written already as being typed", how)
 	}
 }
 
@@ -367,4 +383,56 @@ pieces_from_peers_are_kept_apart :: proc(t: ^testing.T) {
 	frame(n, one, row, 3, 6, "gh") // ahead of what came between
 	frame(n, one, row, 3, 4, "ef")
 	testing.expectf(t, kept(n, 3) == "abcdef", "by two roads: kept %q", kept(n, 3))
+}
+
+// A row moved, while a piece is typed in it, to where a reader watches what is typed is given it from the start: by a
+// peer that holds the row already, and so is sent only where it now is, as by any other.
+@(test)
+a_row_moved_into_view_brings_its_open_piece :: proc(t: ^testing.T) {
+	for relayed in ([]bool{false, true}) {
+		state := seeded(74)
+		context.random_generator = rand.default_random_generator(&state)
+		s: Sim
+		sim_init(t, &s, 2, 0, 1 if relayed else 0, 64)
+		defer sim_destroy(&s)
+		seen: Seen
+		defer seen_destroy(&seen)
+		uis: [dynamic]^Session
+		defer delete(uis)
+		if relayed {
+			sim_link(&s, 0, 2)
+			sim_link(&s, 1, 2)
+		} else {
+			sim_link(&s, 0, 1)
+		}
+		w, r := s.nodes[0], s.nodes[1]
+		elsewhere := List{1 << 32 | 6, 6}
+		place :: proc(x: ^Sim_Node, row: Id, list: List) {
+			body: [24]byte
+			put_u64(body[:], list[0])
+			put_u64(body[8:], list[1])
+			put_u64(body[16:], 1)
+			node_write(&x.node, {{row, PLACE, .Place, node_stamp(&x.node), body[:]}})
+		}
+		row := node_id(&w.node, 1)
+		place(w, row, elsewhere)
+		settle(&s, &seen, ..uis[:])
+		writer := sim_client(&s, w)
+		defer session_close(writer)
+		reader := sim_client(&s, r)
+		defer session_close(reader)
+		append(&uis, writer, reader)
+		sim_watch(reader, 1, list_lo(LIST), list_hi(LIST), 50, {data = true, live = true, known = true})
+		settle(&s, &seen, ..uis[:])
+		type(writer, row, 0, "ab") // where nobody watches
+		settle(&s, &seen, ..uis[:])
+		s.now += 3
+		w.node.now = sim_now(&s, w)
+		place(w, row, LIST) // and now where the reader does
+		settle(&s, &seen, ..uis[:])
+		type(writer, row, 2, "cd")
+		settle(&s, &seen, ..uis[:])
+		got := read(&seen, reader, row)
+		testing.expectf(t, got == "abcd", "relayed %v: the reader has %q of %q", relayed, got, "abcd")
+	}
 }

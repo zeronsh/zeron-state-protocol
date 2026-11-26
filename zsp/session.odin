@@ -1551,6 +1551,14 @@ emit_cell :: proc(s: ^Session, c: ^Cell) {
 		write_varint(&s.out, u64(author))
 	}
 	s.cells.row = c.row
+	if c.kind == .Place && len(n.typing) > 0 {
+		for x in n.typing {
+			if x.row == c.row {
+				s.typing_due = true // moved, perhaps to where the session watches what is typed
+				break
+			}
+		}
+	}
 	if !n.full && s.peer_full {
 		if _, ok := tree_get(n, n.outbox, {c.row[0], c.row[1], 0, 0, 0}); ok {
 			append(&s.unacked, Unacked{s.seq_out, c.row})
@@ -2028,7 +2036,7 @@ typing_keep :: proc(n: ^Node, s: ^Session, l: ^Live, mine: bool) {
 	}
 	x := &n.typing[at]
 	have := u64(len(x.ops))
-	if l.offset + u64(len(l.body)) > TYPING_BYTES || (mine && l.offset > have) {
+	if l.offset > TYPING_BYTES || u64(len(l.body)) > TYPING_BYTES - l.offset || (mine && l.offset > have) {
 		delete(x.ops)
 		unordered_remove(&n.typing, at) // what is kept would be too long, or not the piece from its start
 		return
@@ -2051,7 +2059,7 @@ typing_committed :: proc(n: ^Node, cells: []Cell) {
 					unordered_remove(&n.typing, i)
 				}
 			}
-		case .Piece:
+		case .Piece, .Bundle:
 			kept := false
 			for x in n.typing {
 				kept ||= x.row == c.row && x.slot == c.slot
@@ -2061,16 +2069,36 @@ typing_committed :: proc(n: ^Node, cells: []Cell) {
 			}
 			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 			open := c
-			if !cell_open(n.keys, &n.roster, &open) || len(open.body) < 8 {
+			if !cell_open(n.keys, &n.roster, &open) {
 				continue
 			}
-			piece := get_u64(open.body)
-			#reverse for &x, i in n.typing {
-				if x.row == c.row && x.slot == c.slot && x.piece == piece {
-					delete(x.ops)
-					unordered_remove(&n.typing, i)
+			// A piece names itself first; a bundle is of pieces, each a stamp, its name and its operations.
+			if c.kind == .Piece {
+				if len(open.body) >= 8 {
+					typing_forget(n, c.row, c.slot, get_u64(open.body))
+				}
+			} else {
+				r := Reader{buf = open.body, pos = clear_size(.Bundle, open.body)}
+				for r.pos < len(r.buf) {
+					_ = read_stamp(&r)
+					piece := read_u64(&r)
+					_ = read_bytes(&r)
+					if r.bad {
+						break
+					}
+					typing_forget(n, c.row, c.slot, piece)
 				}
 			}
+		}
+	}
+}
+
+@(private)
+typing_forget :: proc(n: ^Node, row: Id, slot: Slot, piece: u64) {
+	#reverse for &x, i in n.typing {
+		if x.row == row && x.slot == slot && x.piece == piece {
+			delete(x.ops)
+			unordered_remove(&n.typing, i)
 		}
 	}
 }
