@@ -39,6 +39,26 @@ frozen objects and arrays, and `update` hands out a draft that copies only what 
 opening it, as a question is: `m.ask(client, { scope, name, schema }, ["tasks", id, "steps"], { where, order, limit }, (found) =>
 render(found.rows))`, typed by the schema and the path, which names items and nodes by their ids in hex.
 
+What devices share of themselves (SPEC.md §16) is had through the same client:
+
+```ts
+await zspdClient.setShares("files 1 docs write /srv/docs\nshell 1 terminal commands\n"); // its own device's, to its own clients
+await client.services(device, 1);                       // [{ kind: "files", name: "docs", read: true, write: true }, …]
+await client.get(device, 1, "docs/report.pdf", "report.pdf", { signal, onProgress }); // taken up where it stopped, checked
+await client.put(device, 1, "notes.txt", "docs/notes.txt", { replace: true });
+await client.getTree(device, 1, "docs", "copy");        // and putTree: what is there already is passed over
+const { code, stdout } = await client.run(device, 1, ["git", "status"], { cwd: "/srv/repo" });
+const p = client.exec(device, 1, ["tail", "-f", "log"]);  // p.output, p.errors: read as they come; p.write, p.signal, p.exit
+const t = client.terminal(device, 1, { rows, cols });     // t.onOutput = (d) => (term.write(d, () => t.consumed(d.length)), false)
+const s = client.connect(device, 1, 5432);                // a byte stream; in Node, bridge(s, socket)
+```
+
+What comes in a call is credited only as it is taken: read from a `Reading`, or told to a listener that returns nothing, or that
+returns false and says `consumed` once it is done; a transfer credits what it has written to its folder. So a reader that does not
+keep up holds up what it reads, with no more than a call's window between. What is written goes only as there is room, and a write's
+promise resolves once it has. Files are kept in a `Folder`: the disk in Node (`NodeFolder`), the origin private file system in a
+browser (`OpfsFolder`), or memory; a file being fetched is kept beside where it is going, as `<name>.zsp-part`, until it is whole.
+
 ## How it is put together
 
 **The client speaks to the node as every client does.** `Client` is the local client of SPEC.md §8, over a pipe: to the node in
@@ -90,11 +110,13 @@ builds `web/dist` (zsp.js, worker.js and node.wasm, side by side: each finds the
 | test | holds |
 |---|---|
 | `test/client.ts` | the client to `luau/tests/client.luau`: what it says and makes of what it is told, by a node made of nothing |
-| `test/vectors.ts`, `text.ts`, `ask.ts` | to `vectors.json`; text to `text.luau` step by step over random edits; questions to `ask.luau` byte for byte |
+| `test/vectors.ts`, `text.ts`, `ask.ts` | to `vectors.json`, services and the hashing of files among it; text to `text.luau` step by step over random edits; questions to `ask.luau` byte for byte |
+| `test/streams.ts` | calls' credit, and processes, terminals and connections, by a node made of nothing; a connection bridged to a real socket |
 | `test/mirror_model.ts` | structured state to its model, and what is asked about to what a node finds, as `luau/tests/mirror_model.luau` |
 | `test/store.ts` | what is said to be durable, through crashes at any moment, small segments, and files that open late |
 | `test/node.ts` | a device on its own |
 | `test/end_to_end.ts` | `test/live.ts`, which is `luau/tests/live.luau`, over every way devices meet: the client of zspd; web devices with zspd devices through zspd's relay and the Durable Object; two web devices; a space a web device governs; keepalive; direct links, and beacons with no relay |
-| `test/browsers.ts` | headless Chrome: the live suite against a zspd device and between browser devices through the Durable Object; tabs sharing a device and handing it on; a device the same after a restart, with no relay |
+| `test/services.ts` | what zspd devices share, through zspd's relay: files both ways, resumed, refused; services and shares; commands and terminals; connections; a reader that never reads |
+| `test/browsers.ts` | headless Chrome: the live suite against a zspd device and between browser devices through the Durable Object; tabs sharing a device and handing it on; a device the same after a restart, with no relay; files fetched into the origin's file system, resumed, and sent back |
 
 Chrome is found where the platform keeps it, or at `$CHROME`; without it, `test/browsers.ts` says so and passes, but in CI it fails.
