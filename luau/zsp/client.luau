@@ -7,10 +7,8 @@
 
 local asking = require("./ask")
 local codec = require("./codec")
-local services = require("./services")
 local sha256 = require("./sha256")
 local text = require("./text")
-local transfer = require("./transfer")
 
 local HELLO, ROSTER, WATCH, UNWATCH, CELLS, ACK = 1, 2, 3, 4, 7, 8
 local ASK, UNASK, ANSWER, FETCH = 32, 33, 34, 35
@@ -21,7 +19,6 @@ local F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = 0, 1, 2, 3, 4
 local CALL_WINDOW = 262144
 local WINDOW_MOST = 16 * CALL_WINDOW -- what a receiver may credit ahead
 local WINDOW_QUICK = 0.25 -- seconds: a window used up within this grows
-local MESSAGE = 65536 -- what a stream's bytes are sent in, at most
 local MAX_OPEN = 1048576 - 192
 local ZERO32 = string.rep("\0", 32)
 
@@ -39,7 +36,6 @@ export type Host = {
 	defer: (f: () -> ()) -> (), -- runs f soon, once the current work is done
 	after: (seconds: number, f: () -> ()) -> () -> (), -- runs f later; returns a way to cancel it
 	linger: number?, -- seconds a window nobody observes stays warm: 5
-	files: transfer.Files?, -- for get and put to go through; without them, they take and give buffers
 }
 
 export type Column = {
@@ -149,6 +145,11 @@ export type Call = {
 	method: string,
 	subject: string?, -- of one that is answered: whom whoever calls goes by
 }
+export type Call_Options = {
+	-- Of the link stream the call takes, 0 most urgent to 7 least: 3 if not said. Something typed at as it is
+	-- answered might say 1, a bulk copy 6.
+	urgency: number?,
+}
 type Live_Call = {
 	call: Call,
 	side: number,
@@ -161,63 +162,6 @@ type Live_Call = {
 	window: number, -- what the other side may have outstanding
 	used: number, -- of it, consumed since the window last grew
 	since: number,
-}
-
--- A process on a device, with pipes (exec) or a terminal of its own (terminal). Output is credited as on_output and
--- on_error are done with it, as a call's data is: returning false keeps it until `consumed`.
-export type Process = {
-	send: (input: string) -> (),
-	write: (input: string) -> (), -- the same: what is typed at a terminal
-	close_input: () -> (), -- no more input: its stdin is closed (a terminal's user would send ^D)
-	signal: (signal: number | string) -> (), -- by POSIX number or name: "interrupt", "terminate", "hangup", ...
-	kill: () -> (), -- the kill signal, to it and all it started; its exit is still told
-	resize: (rows: number, columns: number) -> (), -- a terminal's
-	close: () -> (), -- a terminal hung up: no more input, and the hangup signal
-	cancel: () -> (), -- given up on at once: it is killed, with all it started, and nothing more is told
-	consumed: (n: number) -> (),
-	room: () -> number,
-	on_output: ((data: string) -> ...boolean)?, -- and a terminal's output
-	on_error: ((data: string) -> ...boolean)?,
-	on_exit: ((code: number, signal: number) -> ())?, -- signal 0 unless one ended it
-	on_fail: ((why: string, reason: string) -> ())?, -- it could not be run, or its end is not known
-	on_room: (() -> ())?,
-	call: Call,
-}
-
--- A TCP connection, made by a device on this one's behalf.
-export type Stream = {
-	send: (data: string) -> (),
-	close: () -> (), -- no more from here: a half-close
-	reset: () -> (), -- ended at once, both ways
-	consumed: (n: number) -> (),
-	room: () -> number,
-	on_open: (() -> ())?, -- the port was reached
-	on_data: ((data: string) -> ...boolean)?,
-	on_end: (() -> ())?, -- no more from there
-	on_close: ((why: string?, reason: string) -> ())?, -- over: why is nil when both ends closed as they should
-	on_room: (() -> ())?,
-	call: Call,
-}
-
-export type Service = services.Service
-export type Entry = services.Entry
-export type Files = transfer.Files
-export type File = transfer.File
-export type Transfer = transfer.Transfer
-export type Result = transfer.Result
-export type Resume = transfer.Resume
-export type Put_Options = transfer.Put_Options
-export type Exec_Options = {
-	env: { string }?, -- NAME=value over the host's own; NAME alone removes it
-	folder: string?, -- where it starts; the user's home if not said
-	input: string?, -- run: given it, and then no more
-}
-export type Terminal_Options = {
-	rows: number?, -- 24
-	columns: number?, -- 80
-	term: string?, -- "xterm-256color"
-	env: { string }?,
-	folder: string?,
 }
 
 local Faults = { "denied", "unreachable", "unserved", "lost", "overrun", "busy" }
@@ -2267,8 +2211,20 @@ function Client._consume(self: Client, id: number, live: Live_Call, n: number)
 	self:_flow(id, live.side, F_CREDIT, codec.string(w))
 end
 
+local function urgency_of(options: Call_Options?): number
+	local u = if options then options.urgency else nil
+	if u == nil then
+		return 3
+	end
+	if type(u) ~= "number" or u ~= math.floor(u) or u < 0 or u > 7 then
+		error("an urgency is a whole number from 0 to 7", 3)
+	end
+	return u
+end
+
 -- Calls a method on a device. Set on_data, on_end and on_fault on the result before yielding.
-function Client.call(self: Client, device: string, scope: number, method: string, data: string): Call
+function Client.call(self: Client, device: string, scope: number, method: string, data: string, options: Call_Options?): Call
+	local urgency = urgency_of(options)
 	self.next_call += 1
 	local id = self.next_call
 	local live = self:_call(id, 0, device, method)
@@ -2288,13 +2244,16 @@ function Client.call(self: Client, device: string, scope: number, method: string
 	codec.put_varint(w, scope)
 	codec.put_bytes(w, method)
 	codec.put_bytes(w, "") -- for whom is for the node to say
+	codec.put_u8(w, urgency)
 	codec.put(w, data)
 	self:_frame(CALL, w)
 	return live.call
 end
 
--- Makes a call and yields until it is over: every message that came, in order, or nil and why not.
-function Client._gather(self: Client, device: string, scope: number, method: string, data: string): ({ string }?, string?)
+-- One question, one answer; yields the coroutine it is called from. Returns the answer, every message that came put
+-- together, or nil and why not.
+function Client.request(self: Client, device: string, scope: number, method: string, data: string, options: Call_Options?): (string?, string?)
+	urgency_of(options) -- one out of range is the fault of whoever asked
 	local thread = coroutine.running()
 	local messages: { string } = {}
 	local fault: string? = nil
@@ -2307,7 +2266,7 @@ function Client._gather(self: Client, device: string, scope: number, method: str
 			end
 		end
 	end
-	local call = self:call(device, scope, method, data)
+	local call = self:call(device, scope, method, data, options)
 	call.on_data = function(d: string)
 		table.insert(messages, d)
 	end
@@ -2322,15 +2281,6 @@ function Client._gather(self: Client, device: string, scope: number, method: str
 		coroutine.yield()
 	end
 	if fault then
-		return nil, fault
-	end
-	return messages, nil
-end
-
--- One question, one answer; yields the coroutine it is called from. Returns the answer, or nil and why not.
-function Client.request(self: Client, device: string, scope: number, method: string, data: string): (string?, string?)
-	local messages, fault = self:_gather(device, scope, method, data)
-	if not messages then
 		return nil, fault
 	end
 	return table.concat(messages), nil
@@ -2351,223 +2301,6 @@ function Client.serve(self: Client, scope: number, method: string, handler: (Cal
 			end
 		end
 	end
-end
-
--- ---------------------------------------------------------------- this device's host: names, ports, exposures (§17)
-
-export type Port = { read port: number, read scope: number, read host: string, read name: string }
-export type Node = {
-	read id: string, -- the device's key
-	read name: string, -- <name>.<suffix>, or <id>.id.<suffix>: what any application here reaches it by
-	read address: string, -- 127.a.b.c
-	read here: boolean, -- this device
-	read reachable: boolean,
-	read direct: boolean, -- linked directly, rather than through a relay
-	read subject: string,
-	read ports: { Port }, -- what it offers this device
-}
-export type Offer = { read lo: number, read hi: number?, read scope: number, read device: string?, read host: string?, read name: string?, read proxy: boolean? }
-export type Relay_Exposure = { read relay: string, read status: number, read url: string }
-export type Exposure = { read port: number, read name: string, read proxy: boolean, read label: string, read relays: { Relay_Exposure } }
-
--- Calls a zsp.* method of this device's own host, in a scope this client may call in. Yields.
-function Client._host(self: Client, method: string, data: string): (codec.Reader?, string?)
-	local scope: number? = nil
-	for s, info in self.scopes do
-		if bit32.band(info.rights, 4) ~= 0 and (scope == nil or s < scope) then
-			scope = s
-		end
-	end
-	local me = self.devices[1]
-	if not scope or not me then
-		return nil, "unreachable"
-	end
-	local answer, fault = self:request(me.id, scope :: number, method, data)
-	if not answer then
-		return nil, fault
-	end
-	return codec.reader(answer), nil
-end
-
-local function u16(r: codec.Reader): number
-	local hi = codec.u8(r)
-	return hi * 256 + codec.u8(r)
-end
-
--- A count of things each at least a byte long: no more than there are bytes left, nor NaN (a varint too long).
-local function count(r: codec.Reader): number
-	local n = codec.varint(r)
-	if n ~= n or n > r.len - r.pos then
-		error("malformed", 0)
-	end
-	return n
-end
-
--- A scope as the wire has it: a whole number from 1, below 2^32 (not NaN or infinity, from a varint too long).
-local function scope_of(r: codec.Reader): number
-	local s = codec.varint(r)
-	if s ~= s or s < 1 or s >= 2 ^ 32 then
-		error("malformed", 0)
-	end
-	return s
-end
-
--- Reads an answer whole or not at all: nil and "malformed" for one that is short, longer, or not what it is read as.
-local function answer<T>(r: codec.Reader, read: (codec.Reader) -> T): (T?, string?)
-	local ok, v = pcall(read, r)
-	if not ok or r.pos ~= r.len then
-		return nil, "malformed"
-	end
-	return v, nil
-end
-
-local function read_ports(r: codec.Reader): { Port }
-	local out: { Port } = {}
-	for _ = 1, count(r) do
-		table.insert(out, table.freeze({ port = u16(r), scope = scope_of(r), host = codec.bytes(r), name = codec.bytes(r) }))
-	end
-	return table.freeze(out)
-end
-
--- Every device of the space, as this one reaches it: its name, its address here, whether it can be reached, and what
--- it offers this device. Yields; nil and why not, if it cannot be asked.
-function Client.nodes(self: Client): ({ Node }?, string?)
-	local r, fault = self:_host("zsp.nodes", "")
-	if not r then
-		return nil, fault
-	end
-	return answer(r, function(r: codec.Reader): { Node }
-		local out: { Node } = {}
-		for _ = 1, count(r) do
-			local id, name = codec.take(r, 32), codec.bytes(r)
-			local a = codec.take(r, 4)
-			local flags = codec.u8(r)
-			table.insert(out, table.freeze({
-				id = id,
-				name = name,
-				address = `{string.byte(a, 1)}.{string.byte(a, 2)}.{string.byte(a, 3)}.{string.byte(a, 4)}`,
-				here = bit32.band(flags, 1) ~= 0,
-				reachable = bit32.band(flags, 2) ~= 0,
-				direct = bit32.band(flags, 4) ~= 0,
-				subject = codec.bytes(r),
-				ports = read_ports(r),
-			}))
-		end
-		return table.freeze(out)
-	end)
-end
-
--- A TCP port as the wire has it, two bytes: one of 1 to 65535, or none at all (not one taken modulo 65536).
-local function put_port(w: codec.Writer, port: number)
-	if type(port) ~= "number" or port ~= math.floor(port) or port < 1 or port > 65535 then
-		error("a port is a whole number from 1 to 65535", 3)
-	end
-	codec.put_u8(w, port // 256)
-	codec.put_u8(w, port % 256)
-end
-
-local function put_offer(w: codec.Writer, o: Offer)
-	put_port(w, o.lo)
-	put_port(w, o.hi or o.lo)
-	if type(o.scope) ~= "number" or o.scope ~= math.floor(o.scope) or o.scope < 1 or o.scope >= 2 ^ 32 then
-		error("a scope is a whole number from 1", 3) -- not one the wire would wrap round to another
-	end
-	if o.device ~= nil and (type(o.device) ~= "string" or #o.device ~= 32) then
-		error("a device is its 32-byte key", 3) -- else what follows would be read as part of it
-	end
-	codec.put_varint(w, o.scope)
-	codec.put(w, o.device or string.rep("\0", 32))
-	codec.put_bytes(w, o.host or "")
-	codec.put_bytes(w, o.name or "")
-	codec.put_u8(w, if o.proxy then 1 else 0)
-end
-
-function Client._offers(self: Client, op: number, o: Offer?): ({ Offer }?, string?)
-	local w = codec.writer()
-	codec.put_u8(w, op)
-	if o then
-		put_offer(w, o)
-	end
-	local r, fault = self:_host("zsp.offers", codec.string(w))
-	if not r then
-		return nil, fault
-	end
-	return answer(r, function(r: codec.Reader): { Offer }
-		local out: { Offer } = {}
-		for _ = 1, count(r) do
-			local lo, hi, scope, device = u16(r), u16(r), scope_of(r), codec.take(r, 32)
-			local host, name, flags = codec.bytes(r), codec.bytes(r), codec.u8(r)
-			table.insert(out, table.freeze({
-				lo = lo,
-				hi = hi,
-				scope = scope,
-				device = if device == string.rep("\0", 32) then nil else device,
-				host = if host == "" then nil else host,
-				name = if name == "" then nil else name,
-				proxy = bit32.band(flags, 1) ~= 0,
-			}))
-		end
-		return table.freeze(out)
-	end)
-end
-
--- What this device offers others of its space: ports of this machine (or, with host, of another, from here), to
--- whoever may call in a scope, or to one device. Nothing is offered unless it is. Each yields, and gives the offers as
--- they then are.
-function Client.offers(self: Client): ({ Offer }?, string?)
-	return self:_offers(0, nil)
-end
-
-function Client.offer(self: Client, o: Offer): ({ Offer }?, string?)
-	return self:_offers(1, o)
-end
-
--- Takes an offer back: whoever is using it is cut off.
-function Client.unoffer(self: Client, o: Offer): ({ Offer }?, string?)
-	return self:_offers(2, o)
-end
-
-function Client._exposures(self: Client, data: string): ({ Exposure }?, string?)
-	local r, fault = self:_host("zsp.expose", data)
-	if not r then
-		return nil, fault
-	end
-	return answer(r, function(r: codec.Reader): { Exposure }
-		local out: { Exposure } = {}
-		for _ = 1, count(r) do
-			local port, name, flags, label = u16(r), codec.bytes(r), codec.u8(r), codec.bytes(r)
-			local relays: { Relay_Exposure } = {}
-			for _ = 1, count(r) do
-				table.insert(relays, table.freeze({ relay = codec.take(r, 32), status = codec.u8(r), url = codec.bytes(r) }))
-			end
-			table.insert(out, table.freeze({ port = port, name = name, proxy = bit32.band(flags, 1) ~= 0, label = label, relays = table.freeze(relays) }))
-		end
-		return table.freeze(out)
-	end)
-end
-
--- What this device exposes to the public, through relays that will: for each, where (url, when status is 0). Yields.
-function Client.exposures(self: Client): ({ Exposure }?, string?)
-	return self:_exposures("\0")
-end
-
--- Exposes a port of this machine to the public, under a fresh name; `proxy` says where each connection came from
--- first (PROXY protocol v2). Yields, and gives what is exposed as it then is.
-function Client.expose(self: Client, port: number, options: { name: string?, proxy: boolean? }?): ({ Exposure }?, string?)
-	local w = codec.writer()
-	codec.put_u8(w, 1)
-	put_port(w, port)
-	codec.put_bytes(w, options and options.name or "")
-	codec.put_u8(w, if options and options.proxy then 1 else 0)
-	return self:_exposures(codec.string(w))
-end
-
--- Takes a port back from the public: whoever is using it is cut off, and its name is nobody's for ever.
-function Client.unexpose(self: Client, port: number): ({ Exposure }?, string?)
-	local w = codec.writer()
-	codec.put_u8(w, 2)
-	put_port(w, port)
-	return self:_exposures(codec.string(w))
 end
 
 function Client._serve(self: Client, key: string, on: boolean)
@@ -2638,345 +2371,6 @@ function Client._on_flow(self: Client, r: codec.Reader)
 			call.on_fault(Faults[code] or "cancelled")
 		end
 	end
-end
-
--- ---------------------------------------------------------------- services
-
--- Calls a method a device's host serves, and yields until it is over: what followed the status, or nil, why not and
--- the reason given.
-function Client._hosted(self: Client, device: string, scope: number, method: string, data: string): (string?, string, string)
-	local messages, fault = self:_gather(device, scope, method, data)
-	if not messages then
-		return nil, fault :: string, ""
-	end
-	local status, rest = services.status(table.concat(messages))
-	if status ~= "ok" then
-		return nil, status, rest
-	end
-	return rest, "ok", ""
-end
-
--- This device, and a scope its client may call in, for what is asked of its own host.
-function Client._own(self: Client): (string?, number)
-	local me = self.authors[0]
-	local best: number? = nil
-	for scope in self.scopes do
-		if self:may(scope, "call") and (not best or scope < best) then
-			best = scope
-		end
-	end
-	if not me or not best then
-		return nil, 0
-	end
-	return me.id, best :: number
-end
-
--- What a device lets this one do on it, in a scope: its terminals and commands, its shares of files, and the ports it
--- offers. Yields; returns them, or nil, why not and the reason given.
-function Client.services(self: Client, device: string, scope: number): ({ Service }?, string?, string?)
-	local said, why, reason = self:_hosted(device, scope, "zsp.services", "")
-	if not said then
-		return nil, why, reason
-	end
-	local list = services.services(said)
-	if not list then
-		return nil, "malformed", ""
-	end
-	return list, nil, nil
-end
-
--- What this device shares, as text: a line for each, as `shell <scope> [terminal] [commands]` or
--- `files <scope> <name> read|write <path>`. Yields; returns it, or nil, why not and the reason given.
-function Client.shares(self: Client): (string?, string?, string?)
-	local device, scope = self:_own()
-	if not device then
-		return nil, if self.ready then "denied" else "unreachable", ""
-	end
-	local said, why, reason = self:_hosted(device, scope, "zsp.share", "")
-	if not said then
-		return nil, why, reason
-	end
-	return said, nil, nil
-end
-
--- Puts new shares in place of this device's, as `shares` gives them: in force at once, and every call they no longer
--- allow ended. Yields; returns true, or false, why not and the reason given.
-function Client.set_shares(self: Client, shares: string): (boolean, string?, string?)
-	local device, scope = self:_own()
-	if not device then
-		return false, if self.ready then "denied" else "unreachable", ""
-	end
-	-- What says nothing at all is still something to put in place, which no empty first message can be.
-	local said, why, reason = self:_hosted(device, scope, "zsp.share", if shares == "" then "\n" else shares)
-	if not said then
-		return false, why, reason
-	end
-	return true, nil, nil
-end
-
--- A folder of a share of files ("" for the shares themselves). Yields; returns its entries, or nil, why not and the
--- reason given.
-function Client.list(self: Client, device: string, scope: number, path: string): ({ Entry }?, string?, string?)
-	local said, why, reason = self:_hosted(device, scope, "zsp.list", services.list(path))
-	if not said then
-		return nil, why, reason
-	end
-	local entries = services.entries(said)
-	if not entries then
-		return nil, "malformed", ""
-	end
-	return entries, nil, nil
-end
-
--- Fetches a file of a share: to a path, through the host's files, taking up where a fetch there before broke off; or,
--- given no path, into memory, taking up from what one that broke off gave as its result's `resume`.
-function Client.get(self: Client, device: string, scope: number, path: string, to: (string | Resume)?): Transfer
-	return transfer.get(function(first: string): transfer.Call?
-		return self:call(device, scope, "zsp.get", first)
-	end, self.host.defer, self.host.files, path, to)
-end
-
--- Sends a file to a share: from a path, through the host's files, or from a buffer. The other end takes it up where
--- the same file sent before broke off.
-function Client.put(self: Client, device: string, scope: number, from: string | buffer, path: string, options: Put_Options?): Transfer
-	return transfer.put(function(first: string): transfer.Call?
-		return self:call(device, scope, "zsp.put", first)
-	end, self.host.defer, self.host.now() * 1000, self.host.files, from, path, options)
-end
-
-function Client._process(self: Client, device: string, scope: number, method: string, first: string): Process
-	local call = self:call(device, scope, method, first)
-	local begun, exited, failed = false, false, false
-	local function send(input: string)
-		for at = 1, #input, MESSAGE do
-			call.send(services.input(string.sub(input, at, at + MESSAGE - 1)))
-		end
-	end
-	local function signal(s: number | string)
-		local n = if type(s) == "number" then s else services.SIGNALS[s]
-		assert(n, "no such signal")
-		call.send(services.signal(n))
-	end
-	local p: Process = {
-		send = send,
-		write = send,
-		close_input = call.finish,
-		signal = signal,
-		kill = function()
-			signal(services.SIGNALS.kill)
-		end,
-		resize = function(rows: number, columns: number)
-			call.send(services.resize(rows, columns))
-		end,
-		close = function()
-			signal(services.SIGNALS.hangup)
-			call.finish()
-		end,
-		cancel = function()
-			failed = true -- nothing more is told
-			call.cancel()
-		end,
-		consumed = call.consumed,
-		room = call.room,
-		on_output = nil,
-		on_error = nil,
-		on_exit = nil,
-		on_fail = nil,
-		on_room = nil,
-		call = call,
-	}
-	local function fail(why: string, reason: string)
-		if not exited and not failed then
-			failed = true
-			if p.on_fail then
-				p.on_fail(why, reason)
-			end
-		end
-	end
-	call.on_data = function(message: string): ...boolean
-		if not begun then
-			begun = true
-			local status, reason = services.status(message)
-			if status ~= "ok" then
-				fail(status, reason)
-			end
-			return true
-		end
-		local tag = string.byte(message)
-		if tag == 1 or tag == 2 then
-			local f = if tag == 1 then p.on_output else p.on_error
-			if f and f(string.sub(message, 2)) == false then
-				call.consumed(1) -- its tag; what it tags, once the consumer says
-				return false
-			end
-		elseif tag == 3 then
-			local code, ended_by = services.exited(string.sub(message, 2))
-			if not code then
-				fail("malformed", "")
-			elseif not exited and not failed then
-				exited = true
-				if p.on_exit then
-					p.on_exit(code, ended_by)
-				end
-			end
-		end
-		return true
-	end
-	call.on_end = function()
-		fail("failed", "it ended with no exit")
-		call.finish() -- it is gone: there is no one to say more to
-	end
-	call.on_fault = function(fault: string)
-		fail(fault, "")
-	end
-	call.on_room = function()
-		if p.on_room then
-			p.on_room()
-		end
-	end
-	return p
-end
-
--- Runs a command on a device, with pipes: argv is the program and its arguments, never through a shell.
-function Client.exec(self: Client, device: string, scope: number, argv: { string }, options: Exec_Options?): Process
-	local o: Exec_Options = options or {}
-	return self:_process(device, scope, "zsp.exec", services.exec(argv, o.env, o.folder))
-end
-
--- Runs a command and yields until it has exited: its code, the signal that ended it (0 if none), and all it wrote to
--- its stdout and stderr. If it could not be run, or its end is not known, the code is nil, and why and the reason given
--- follow what it wrote.
-function Client.run(self: Client, device: string, scope: number, argv: { string }, options: Exec_Options?): (number?, number, string, string, string?, string?)
-	local thread = coroutine.running()
-	local out, err = {}, {}
-	local code: number?, ended_by = nil, 0
-	local why: string?, reason: string? = nil, nil
-	local waiting, settled = false, false
-	local function settle()
-		if not settled then
-			settled = true
-			if waiting then
-				coroutine.resume(thread)
-			end
-		end
-	end
-	local p = self:exec(device, scope, argv, options)
-	p.on_output = function(data: string)
-		table.insert(out, data)
-	end
-	p.on_error = function(data: string)
-		table.insert(err, data)
-	end
-	p.on_exit = function(c: number, s: number)
-		code, ended_by = c, s
-		settle()
-	end
-	p.on_fail = function(w: string, r: string)
-		why, reason = w, r
-		settle()
-	end
-	local input = options and options.input
-	if input and input ~= "" then
-		p.send(input)
-	end
-	p.close_input()
-	if not settled then
-		waiting = true
-		coroutine.yield()
-	end
-	return code, ended_by, table.concat(out), table.concat(err), why, reason
-end
-
--- Opens a terminal on a device, running the user's shell.
-function Client.terminal(self: Client, device: string, scope: number, options: Terminal_Options?): Process
-	local o: Terminal_Options = options or {}
-	return self:_process(device, scope, "zsp.pty", services.pty(o.rows or 24, o.columns or 80, o.term or "xterm-256color", o.env, o.folder))
-end
-
--- Opens a TCP connection, made by a device to a port of its own (host nil) or one it reaches, if it offers it.
-function Client.connect(self: Client, device: string, scope: number, port: number, host: string?): Stream
-	local call = self:call(device, scope, "zsp.tcp", services.tcp(port, host))
-	local begun, opened, mine, theirs, over = false, false, false, false, false
-	local closed: (why: string?, reason: string) -> ()
-	local s: Stream = {
-		send = function(data: string)
-			for at = 1, #data, MESSAGE do
-				call.send(string.sub(data, at, at + MESSAGE - 1))
-			end
-		end,
-		close = function()
-			if not mine then
-				mine = true
-				call.finish()
-				if theirs and opened then
-					closed(nil, "")
-				end
-			end
-		end,
-		reset = function()
-			over = true -- nothing more is told
-			call.cancel()
-		end,
-		consumed = call.consumed,
-		room = call.room,
-		on_open = nil,
-		on_data = nil,
-		on_end = nil,
-		on_close = nil,
-		on_room = nil,
-		call = call,
-	}
-	function closed(why: string?, reason: string)
-		if not over then
-			over = true
-			if s.on_close then
-				s.on_close(why, reason)
-			end
-		end
-	end
-	call.on_data = function(data: string): ...boolean
-		if not begun then
-			begun = true
-			local status, reason = services.status(data)
-			if status ~= "ok" then
-				closed(status, reason)
-				return true
-			end
-			opened = true
-			if s.on_open then
-				s.on_open()
-			end
-			return true
-		end
-		local f = s.on_data
-		if over or not f then
-			return true
-		end
-		return f(data)
-	end
-	call.on_end = function()
-		theirs = true
-		if not opened then
-			closed(if begun then "failed" else "malformed", "")
-			call.finish()
-			return
-		end
-		if s.on_end and not over then
-			s.on_end()
-		end
-		if mine then
-			closed(nil, "")
-		end
-	end
-	call.on_fault = function(fault: string)
-		closed(if fault == "cancelled" then "reset" else fault, "")
-	end
-	call.on_room = function()
-		if s.on_room then
-			s.on_room()
-		end
-	end
-	return s
 end
 
 return table.freeze({ connect = new_client, columns = columns })

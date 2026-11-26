@@ -458,7 +458,7 @@ do
 	assert(caller == "zoe")
 	h.client:call(string.rep("e", 32), 2, "m", "hello")
 	h.run()
-	assert(string.sub((h.last(CALL) :: any).body, -8) == "\1m\0hello", "and for whom is not for it to say")
+	assert(string.sub((h.last(CALL) :: any).body, -9) == "\1m\0\3hello", "and for whom is not for it to say; its urgency is 3")
 	assert(h.last(SERVE))
 end
 
@@ -658,6 +658,554 @@ do
 	end
 	assert(asked({ typos = 1.5 }) == asked({ typos = 1 }), "one and a half is one")
 	assert(asked({ typos = 1.5 }) ~= asked({ typos = 1, inside = true }), "and not one inside words")
+end
+
+-- ---------------------------------------------------------------- calls
+
+-- Calls against a node made of nothing, which plays the device called and whoever calls this client: what the client
+-- says, what it makes of what it is told, and that it credits only what is done with, so that a reader that never reads
+-- holds no more than its window.
+
+local CALL, FLOW, AUTHOR = 15, 16, 17
+local F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = 0, 1, 2, 3, 4
+local WINDOW = 262144
+local DEVICE = string.rep("d", 32)
+
+-- A call as the other end sees it: one the client made, or one made of it.
+type Remote = {
+	id: number,
+	device: string,
+	scope: number,
+	method: string,
+	urgency: number,
+	first: string,
+	granted: number, -- what it may send yet
+	got: { string }, -- what the client sent, in order
+	taken: number, -- of those, looked at
+	credited: number, -- all the client has credited
+	ended: boolean, -- the client said End
+	cancelled: boolean,
+	fault: number?, -- the client faulted it, with this code
+	over: boolean, -- this side said End or faulted
+	side: number, -- what this end speaks as: 1 for a call the client made, 0 for one made of it
+}
+
+local function remote(id: number, side: number): Remote
+	return {
+		id = id,
+		device = DEVICE,
+		scope = 0,
+		method = "",
+		urgency = -1,
+		first = "",
+		granted = WINDOW,
+		got = {},
+		taken = 0,
+		credited = 0,
+		ended = false,
+		cancelled = false,
+		fault = nil,
+		over = false,
+		side = side,
+	}
+end
+
+local function call_harness()
+	local self = {
+		receive = nil :: any,
+		closed = nil :: any,
+		deferred = {} :: { () -> () },
+		remotes = {} :: { Remote },
+		mine = {} :: { [number]: Remote }, -- calls the client made, by id
+		theirs = {} :: { [number]: Remote }, -- calls made of the client, by id
+		calls = 0, -- frames that opened one
+		pumps = {} :: { () -> boolean },
+		clock = 1800000000,
+	}
+	local function said(kind: number, r: codec.Reader)
+		if kind == CALL then
+			self.calls += 1
+			local c = remote(codec.varint(r), 1)
+			c.device = codec.take(r, 32)
+			c.scope = codec.varint(r)
+			c.method = codec.bytes(r)
+			assert(codec.bytes(r) == "", "for whom is for the node to say")
+			c.urgency = codec.u8(r)
+			c.first = codec.rest(r)
+			table.insert(self.remotes, c)
+			self.mine[c.id] = c
+		elseif kind == FLOW then
+			local tag = codec.varint(r)
+			local flow = codec.u8(r)
+			local c = if tag % 2 == 0 then self.mine[tag // 2] else self.theirs[tag // 2]
+			assert(c, "a flow of a call there is none of")
+			if flow == F_DATA then
+				table.insert(c.got, codec.rest(r))
+			elseif flow == F_CREDIT then
+				local n = codec.varint(r)
+				c.granted += n
+				c.credited += n
+			elseif flow == F_END then
+				assert(not c.ended, "End said twice")
+				c.ended = true
+			elseif flow == F_CANCEL then
+				c.cancelled = true
+			elseif flow == F_FAULT then
+				c.fault = codec.u8(r)
+			end
+		end
+	end
+	local client = zsp.connect({
+		credential = "x",
+		now = function(): number
+			return self.clock
+		end,
+		random = function(n: number): string
+			return string.rep("r", n)
+		end,
+		defer = function(f: () -> ())
+			table.insert(self.deferred, f)
+		end,
+		after = function(_: number, _f: () -> ())
+			return function() end
+		end,
+		connect = function(receive: any, closed: any)
+			self.receive, self.closed = receive, closed
+			return {
+				send = function(data: buffer)
+					local r = codec.reader(data)
+					while r.pos < r.len do
+						local b = codec.reader(codec.bytes(r))
+						said(codec.u8(b), b)
+					end
+				end,
+				close = function() end,
+			}
+		end,
+	})
+	local h = {}
+	-- Runs what was put off, and whatever plays the other end, until nothing more happens.
+	function h.run()
+		while true do
+			local moved = false
+			while #self.deferred > 0 do
+				(table.remove(self.deferred, 1) :: () -> ())()
+				moved = true
+			end
+			for _, pump in table.clone(self.pumps) do
+				if pump() then
+					moved = true
+				end
+			end
+			if not moved then
+				return
+			end
+		end
+	end
+	function h.tell(kind: number, body: string)
+		local w = codec.writer()
+		codec.put_bytes(w, string.char(kind) .. body)
+		self.receive(codec.string(w))
+	end
+	function h.greet()
+		h.tell(ROSTER, string.rep("\0", 8) .. "\1\7" .. string.rep("k", 32))
+		h.tell(AUTHOR, "\0" .. string.rep("m", 32) .. "\3ann")
+		h.run()
+	end
+	local function flow(r: Remote, kind: number, payload: string)
+		local w = codec.writer()
+		codec.put_varint(w, r.id * 2 + r.side)
+		codec.put_u8(w, kind)
+		codec.put(w, payload)
+		h.tell(FLOW, codec.string(w))
+	end
+	-- What the other end says: only what it has credit for.
+	function h.reply(r: Remote, message: string)
+		assert(not r.over, "said after the end")
+		assert(#message <= r.granted, `overrun: {#message} with {r.granted} granted`)
+		r.granted -= #message
+		flow(r, F_DATA, message)
+	end
+	function h.finish(r: Remote)
+		r.over = true
+		flow(r, F_END, "")
+	end
+	function h.fault(r: Remote, code: number)
+		r.over = true
+		flow(r, F_FAULT, string.char(code))
+	end
+	function h.cancel(r: Remote)
+		r.over = true
+		flow(r, F_CANCEL, "")
+	end
+	function h.credit(r: Remote, n: number)
+		local w = codec.writer()
+		codec.put_varint(w, n)
+		flow(r, F_CREDIT, codec.string(w))
+	end
+	-- Someone calls the client, as the node passes a call on: with no urgency, which was the caller's to say.
+	function h.call_in(id: number, scope: number, method: string, subject: string, first: string): Remote
+		local c = remote(id, 0)
+		c.scope, c.method, c.first = scope, method, first
+		c.granted -= #first
+		self.theirs[id] = c
+		local w = codec.writer()
+		codec.put_varint(w, id)
+		codec.put(w, DEVICE)
+		codec.put_varint(w, scope)
+		codec.put_bytes(w, method)
+		codec.put_bytes(w, subject)
+		codec.put(w, first)
+		h.tell(CALL, codec.string(w))
+		return c
+	end
+	-- The next of what the client sent that has not been looked at.
+	function h.next(r: Remote): string?
+		if r.taken < #r.got then
+			r.taken += 1
+			return r.got[r.taken]
+		end
+		return nil
+	end
+	function h.last(method: string?): Remote
+		for i = #self.remotes, 1, -1 do
+			if not method or self.remotes[i].method == method then
+				return self.remotes[i]
+			end
+		end
+		error(`no call of {method}`)
+	end
+	function h.pump(f: () -> boolean)
+		table.insert(self.pumps, f)
+	end
+	-- Runs f as a coroutine, as an application would, and says whether it is done and what it returned.
+	function h.spawn(f: () -> ...any): { done: boolean, values: { any } }
+		local out = { done = false, values = {} :: { any } }
+		local thread = coroutine.create(function()
+			out.values = table.pack(f())
+			out.done = true
+		end)
+		local ok, why = coroutine.resume(thread)
+		assert(ok, why)
+		return out
+	end
+	h.client = client
+	h.self = self
+	return h
+end
+
+-- What on_data keeps is not credited until it is done with; what it is done with is, at once.
+do
+	local h = call_harness()
+	h.greet()
+	local call = h.client:call(DEVICE, 1, "m", "hi")
+	local got = 0
+	call.on_data = function(d: string)
+		got += #d
+		return false
+	end
+	h.run()
+	local r = h.last("m")
+	assert(r.first == "hi" and r.device == DEVICE and r.scope == 1)
+	local piece = string.rep("x", 65536)
+	for _ = 1, 4 do
+		h.reply(r, piece)
+	end
+	h.run()
+	assert(got == WINDOW and r.granted == 0 and r.credited == 0, "nothing kept is credited")
+	assert(not pcall(h.reply, r, "x"), "and the other end can send no more")
+	call.consumed(65536)
+	h.run()
+	assert(r.credited == 65536 and r.granted == 65536)
+	call.on_data = nil -- told to nobody: done with
+	h.reply(r, piece)
+	h.run()
+	assert(r.credited == 2 * 65536)
+end
+
+-- A reader that keeps up has its window grown, to 4 MiB ahead and no more.
+do
+	local h = call_harness()
+	h.greet()
+	local call = h.client:call(DEVICE, 1, "m", "")
+	local got = 0
+	call.on_data = function(d: string)
+		got += #d
+	end
+	h.run()
+	local r = h.last("m")
+	local piece = string.rep("y", 65536)
+	for _ = 1, 400 do
+		h.reply(r, piece)
+		h.run()
+	end
+	assert(got == 400 * 65536)
+	assert(r.credited - got == 16 * WINDOW - WINDOW, `ahead by {r.credited - got}`)
+	-- One that is slow does not.
+	local slow = h.client:call(DEVICE, 1, "m", "")
+	slow.on_data = function() end
+	h.run()
+	local s = h.last("m")
+	for _ = 1, 40 do
+		h.reply(s, piece)
+		h.self.clock += 1
+		h.run()
+	end
+	assert(s.credited == 40 * 65536, `credited {s.credited}`)
+end
+
+-- What is sent waits for credit, and room says how much may go at once.
+do
+	local h = call_harness()
+	h.greet()
+	local call = h.client:call(DEVICE, 1, "m", string.rep("f", 1000))
+	assert(call.room() == WINDOW - 1000, "the first message counts")
+	local roomed = 0
+	call.on_room = function()
+		roomed += 1
+	end
+	for _ = 1, 5 do
+		call.send(string.rep("z", 65536))
+	end
+	h.run()
+	local r = h.last("m")
+	assert(#r.got == 3 and call.room() == 0)
+	call.finish()
+	h.run()
+	assert(not r.ended, "End waits behind what waits for credit")
+	h.credit(r, 200000)
+	h.run()
+	assert(#r.got == 5 and r.ended and roomed == 1)
+end
+
+-- The other end sends all it may, as fast as it may; a reader that never reads holds no more than its window, and one
+-- that reads slowly is given no more than it reads. Then each end says it is done, in turn.
+do
+	local h = call_harness()
+	h.greet()
+	local call = h.client:call(DEVICE, 1, "m", "hello")
+	local got, ended, faulted = 0, false, false
+	call.on_data = function(d: string)
+		got += #d
+		return false -- a reader that never reads
+	end
+	call.on_end = function()
+		ended = true
+	end
+	call.on_fault = function()
+		faulted = true
+	end
+	call.send("what speaks first need not wait") -- for an answer, before it
+	h.run()
+	local r = h.last("m")
+	assert(r.first == "hello" and h.next(r) == "what speaks first need not wait")
+	local sent = 0
+	h.pump(function(): boolean
+		if r.over or r.granted == 0 or sent >= 8 * WINDOW then
+			return false
+		end
+		local n = math.min(r.granted, 65536)
+		h.reply(r, string.rep("s", n))
+		sent += n
+		return true
+	end)
+	h.run()
+	assert(got == WINDOW and sent == got, `held {got}`)
+	h.self.clock += 1 -- slowly: its window stays as it is
+	call.consumed(got)
+	h.run()
+	assert(got == 2 * WINDOW, `held {got}`)
+	call.on_data = nil
+	call.consumed(WINDOW)
+	h.run()
+	assert(sent == 8 * WINDOW)
+	-- Half-closed each way, in turn: the call is over once both have said so.
+	h.finish(r)
+	h.run()
+	assert(ended and not r.ended and h.client.calls[r.id], "theirs is done, and not mine")
+	call.send("still")
+	call.finish()
+	h.run()
+	assert(h.next(r) == "still" and r.ended and h.client.calls[r.id] == nil and not faulted)
+	call.send("too late")
+	h.run()
+	assert(h.next(r) == nil, "nothing is sent after the end")
+end
+
+-- A request: every message that came, put together however it was divided; or nil and why not.
+do
+	local h = call_harness()
+	h.greet()
+	local run = h.spawn(function()
+		return h.client:request(DEVICE, 1, "list", "docs")
+	end)
+	h.run()
+	local r = h.last("list")
+	assert(r.first == "docs" and r.ended, "asked, with nothing more to say")
+	h.reply(r, "one, ")
+	h.reply(r, "two, ")
+	h.reply(r, "three")
+	assert(not run.done)
+	h.finish(r)
+	h.run()
+	assert(run.done and run.values[1] == "one, two, three" and run.values[2] == nil)
+	assert(h.client.calls[r.id] == nil, "and let go of")
+	for code, why in { "denied", "unreachable", "unserved", "lost", "overrun", "busy" } do
+		run = h.spawn(function()
+			return h.client:request(DEVICE, 1, "list", "")
+		end)
+		h.run()
+		h.reply(h.last("list"), "partly")
+		h.fault(h.last("list"), code)
+		h.run()
+		assert(run.done and run.values[1] == nil and run.values[2] == why, `{code} is {why}, not {run.values[2]}`)
+	end
+	run = h.spawn(function()
+		return h.client:request(DEVICE, 1, "list", "")
+	end)
+	h.run()
+	h.cancel(h.last("list"))
+	h.run()
+	assert(run.done and run.values[1] == nil and run.values[2] == "cancelled")
+	-- Before there is a pipe, there is nobody to ask.
+	local h2 = call_harness()
+	run = h2.spawn(function()
+		return h2.client:request(DEVICE, 1, "list", "")
+	end)
+	h2.run()
+	assert(run.done and run.values[1] == nil and run.values[2] == "unreachable" and h2.self.calls == 0)
+	-- And a first message too big for any window is overrun, and never sent.
+	run = h.spawn(function()
+		return h.client:request(DEVICE, 1, "list", string.rep("x", WINDOW + 1))
+	end)
+	local calls = h.self.calls
+	h.run()
+	assert(run.done and run.values[2] == "overrun" and h.self.calls == calls)
+end
+
+-- How urgent a call is, is the caller's to say, 0 to 7: 3 if it says nothing. What is not one of those is refused at
+-- once, and nothing is sent.
+do
+	local h = call_harness()
+	h.greet()
+	h.client:call(DEVICE, 1, "m", "")
+	h.run()
+	assert(h.last("m").urgency == 3)
+	for _, u in { 0, 1, 6, 7 } do
+		h.client:call(DEVICE, 1, "m", "x", { urgency = u })
+		h.run()
+		assert(h.last("m").urgency == u and h.last("m").first == "x", `urgency {u}`)
+	end
+	h.client:call(DEVICE, 1, "m", "", {})
+	h.run()
+	assert(h.last("m").urgency == 3)
+	local run = h.spawn(function()
+		return h.client:request(DEVICE, 1, "q", "y", { urgency = 6 })
+	end)
+	h.run()
+	local r = h.last("q")
+	assert(r.urgency == 6 and r.first == "y")
+	h.reply(r, "z")
+	h.finish(r)
+	h.run()
+	assert(run.values[1] == "z")
+	local calls = h.self.calls
+	for _, u in { 8, -1, 1.5, 0 / 0, math.huge, "1" :: any, true :: any } do
+		assert(not pcall(function()
+			h.client:call(DEVICE, 1, "m", "", { urgency = u })
+		end), `urgency {tostring(u)} is refused`)
+		assert(not pcall(function()
+			h.client:request(DEVICE, 1, "m", "", { urgency = u })
+		end), `and by request: {tostring(u)}`)
+	end
+	h.run()
+	assert(h.self.calls == calls, "and nothing was sent")
+end
+
+-- Calls made of the client: the handler is given the call, its first message and whom its caller goes by; it answers as
+-- far as it is credited; what it is sent is credited as it is done with; a method nobody serves is unserved.
+do
+	local h = call_harness()
+	h.greet()
+	local served: any, first: string?, held = nil, nil, {}
+	local stop = h.client:serve(1, "echo", function(call, data)
+		served, first = call, data
+		call.on_data = function(d: string)
+			table.insert(held, d)
+			return false
+		end
+	end)
+	h.run()
+	local r = h.call_in(5, 1, "echo", "zoe", "hello")
+	h.run()
+	assert(first == "hello" and served.subject == "zoe" and served.method == "echo" and served.device == DEVICE)
+	assert(r.credited == 5, "the first message is always taken")
+	h.reply(r, string.rep("i", 1000))
+	h.run()
+	assert(#held == 1 and r.credited == 5, "what is kept is not credited")
+	served.consumed(1000)
+	h.run()
+	assert(r.credited == 1005)
+	for _ = 1, 5 do
+		served.send(string.rep("o", 65536))
+	end
+	served.finish()
+	h.run()
+	assert(#r.got == 4 and not r.ended, "no more than its credit")
+	h.credit(r, 65536)
+	h.run()
+	assert(#r.got == 5 and r.ended)
+	h.finish(r)
+	h.run()
+	assert(h.client.answers[5] == nil, "over both ways, and let go of")
+	-- Cancelled by the caller: told so, and nothing more goes.
+	local why: string? = nil
+	r = h.call_in(6, 1, "echo", "", "")
+	h.run()
+	served.on_fault = function(f: string)
+		why = f
+	end
+	h.cancel(r)
+	h.run()
+	assert(why == "cancelled" and h.client.answers[6] == nil)
+	served.send("gone")
+	h.run()
+	assert(#r.got == 0)
+	-- Another scope, another method, or one no longer served: unserved.
+	for i, c in { { scope = 2, method = "echo" }, { scope = 1, method = "other" } } do
+		r = h.call_in(10 + i, c.scope, c.method, "", "x")
+		h.run()
+		assert(r.fault == 3, `{c.scope}/{c.method} is unserved`)
+	end
+	stop()
+	h.run()
+	r = h.call_in(20, 1, "echo", "", "x")
+	h.run()
+	assert(r.fault == 3, "no longer served")
+end
+
+-- The pipe breaks: every call, made or answered, is lost to it; and what is served is served again down the next one.
+do
+	local h = call_harness()
+	h.greet()
+	local faults: { string } = {}
+	local made = h.client:call(DEVICE, 1, "m", "")
+	made.on_fault = function(f: string)
+		table.insert(faults, "made " .. f)
+	end
+	h.client:serve(1, "echo", function(call)
+		call.on_fault = function(f: string)
+			table.insert(faults, "answered " .. f)
+		end
+	end)
+	h.run()
+	h.call_in(1, 1, "echo", "", "")
+	h.run()
+	h.self.closed()
+	h.run()
+	table.sort(faults)
+	assert(table.concat(faults, ", ") == "answered lost, made lost", table.concat(faults, ", "))
+	assert(next(h.client.calls) == nil and next(h.client.answers) == nil)
 end
 
 print("ok")

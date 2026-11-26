@@ -9,15 +9,7 @@ local text = require("@self/text")
 export type Client = client.Client
 export type Device = client.Device
 export type Call = client.Call
-export type Process = client.Process
-export type Stream = client.Stream
-export type Service = client.Service
-export type Entry = client.Entry
-export type Files = client.Files
-export type File = client.File
-export type Transfer = client.Transfer
-export type Result = client.Result
-export type Resume = client.Resume
+export type Call_Options = client.Call_Options
 
 return table.freeze({
 	connect = client.connect,

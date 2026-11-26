@@ -6,10 +6,9 @@ local process = require("@lune/process")
 local serde = require("@lune/serde")
 
 local codec = require("../zsp/codec")
-local services = require("../zsp/services")
 local sha256 = require("../zsp/sha256")
 local text = require("../zsp/text")
-local transfer = require("../zsp/transfer")
+local zsp = require("../zsp")
 
 local vectors = serde.decode("json", fs.readFile(process.args[1]))
 
@@ -145,108 +144,67 @@ do
 	assert(took[2] < 3 * took[1], `the last took {took[2]} steps, the first {took[1]}`)
 end
 
--- Hashed piece by piece as at once, across blocks and their ends.
+-- Frames as the client writes them, through its own pipe: a call, with its urgency, and credit for a message taken.
 do
-	local s = string.rep("abcdefghij", 50)
-	for _, pieces in { { 1 }, { 63, 1, 64 }, { 55 }, { 56 }, { 64, 64 }, { 7, 200 } } do
-		local h = sha256.stream()
-		local at, i = 1, 1
-		while at <= #s do
-			local n = pieces[(i - 1) % #pieces + 1]
-			h.update(if i % 2 == 0 then buffer.fromstring(string.sub(s, at, at + n - 1)) else string.sub(s, at, at + n - 1))
-			at += n
-			i += 1
+	local sent: { string } = {}
+	local receive: any
+	local deferred: { () -> () } = {}
+	local client = zsp.connect({
+		credential = "x",
+		now = function(): number
+			return 1800000000
+		end,
+		random = function(n: number): string
+			return string.rep("r", n)
+		end,
+		defer = function(f: () -> ())
+			table.insert(deferred, f)
+		end,
+		after = function(_: number, _f: () -> ())
+			return function() end
+		end,
+		connect = function(r: any, _closed: any)
+			receive = r
+			return {
+				send = function(data: buffer)
+					table.insert(sent, buffer.tostring(data))
+				end,
+				close = function() end,
+			}
+		end,
+	})
+	local function run()
+		while #deferred > 0 do
+			(table.remove(deferred, 1) :: () -> ())()
 		end
-		assert(h.final() == sha256(s), `in pieces of {table.concat(pieces, ", ")}`)
 	end
-	for n = 50, 70 do
-		local h = sha256.stream()
-		h.update(string.rep("x", n))
-		assert(h.final() == sha256(string.rep("x", n)), `{n} bytes`)
+	local function tell(kind: number, body: string)
+		local w = codec.writer()
+		codec.put_bytes(w, string.char(kind) .. body)
+		receive(codec.string(w))
+		run()
 	end
-end
+	run()
+	tell(2, string.rep("\0", 8) .. "\1\7" .. string.rep("k", 32)) -- a roster: scope 1, all rights
+	local v = vectors.local_call
+	table.clear(sent)
+	local _ = client:call(bytes(v.device), v.scope, v.method, bytes(v.first), { urgency = v.urgency })
+	assert(v.id == 1 and v["for"] == "", "the vector is of the first call, for whom the node says")
+	run()
+	assert(hex(table.concat(sent)) == v.frame, `a call: {hex(table.concat(sent))} should be {v.frame}`)
 
--- Files hashed in chunks, fed in pieces of every kind, each chunk's hash and the file's as vectors.json has them.
-for _, v in vectors.files do
-	local data = buffer.create(v.size)
-	for i = 0, v.size - 1 do
-		buffer.writeu8(data, i, (i * 7 + i // 251) % 256)
-	end
-	for _, piece in { 65536, 1000003, 777 } do
-		if piece == 777 and v.size > transfer.CHUNK + 1 then
-			continue -- as well hashed by the others, and slow in pieces so small
-		end
-		local chunks, file = transfer.hashes(data, piece)
-		assert(#chunks == #v.chunks, `{v.size} bytes: {#chunks} chunks`)
-		for i, c in chunks do
-			assert(hex(c) == v.chunks[i], `{v.size} bytes: chunk {i}`)
-		end
-		assert(hex(file) == v.file, `{v.size} bytes in pieces of {piece}`)
-	end
-end
-
--- What services say, byte for byte: written as they should be, and read back.
-do
-	local said: { [string]: string } = {}
-	for _, v in vectors.services do
-		said[v.message] = bytes(v.bytes)
-	end
-	local function same(name: string, got: string)
-		assert(said[name], `no vector "{name}"`)
-		assert(got == said[name], `{name}: {hex(got)} should be {hex(said[name])}`)
-	end
-	same("zsp.tcp to port 22 of 127.0.0.1", services.tcp(22, "127.0.0.1"))
-	same("zsp.exec ls -l /tmp, LANG=C and without HOME, in /srv", services.exec({ "ls", "-l", "/tmp" }, { "LANG=C", "HOME" }, "/srv"))
-	same("zsp.pty 24 rows by 80, xterm-256color, the user's shell, COLORTERM=truecolor", services.pty(24, 80, "xterm-256color", { "COLORTERM=truecolor" }))
-	same("zsp.get docs/report.pdf from 3 MiB, as it was", services.get("docs/report.pdf", 3 * 1048576, "\170\187\204"))
-	same("zsp.put docs/new/report.pdf of 2.5 MiB, replacing, making folders", services.put("docs/new/report.pdf", 2621440, 1700000000123, "\1\2\3\4", true, true))
-	same("zsp.list docs/sub", services.list("docs/sub"))
-	local entry = { name = "a.txt", kind = "file" :: "file", size = 1234, modified = 1700000000000 }
-	same("an entry: a.txt, 1234 bytes", services.entry(entry))
-	local entries = services.entries(said["an entry: a.txt, 1234 bytes"]) :: { services.Entry }
-	assert(#entries == 1 and entries[1].name == "a.txt" and entries[1].kind == "file" and entries[1].size == 1234 and entries[1].modified == 1700000000000)
-
-	local offered: { services.Service } = {
-		{ kind = "shell", terminal = true, commands = true },
-		{ kind = "files", name = "docs", read = true, write = true },
-		{ kind = "tcp", port = 22, host = "", name = "ssh" },
-	}
-	same("zsp.services: terminals and commands, docs to read and write, port 22 as ssh", services.status_of("ok", services.listed(offered)))
-	local status, rest = services.status(said["zsp.services: terminals and commands, docs to read and write, port 22 as ssh"])
-	local listed = services.services(rest) :: { any }
-	assert(status == "ok" and #listed == 3)
-	assert(listed[1].kind == "shell" and listed[1].terminal and listed[1].commands)
-	assert(listed[2].kind == "files" and listed[2].name == "docs" and listed[2].read and listed[2].write)
-	assert(listed[3].kind == "tcp" and listed[3].port == 22 and listed[3].host == "" and listed[3].name == "ssh")
-
-	same("status: ok", services.status_of("ok"))
-	same("status: denied, with a reason", services.status_of("denied", "not shared with you"))
-	local why, reason = services.status(said["status: denied, with a reason"])
-	assert(why == "denied" and reason == "not shared with you")
-
-	local got = { size = 2621440, modified = 1700000000123, identity = "\170\187\204", from = 1048576 }
-	same("zsp.get answered: 2.5 MiB, from 1 MiB", services.status_of("ok", services.got_of(got)))
-	local _, answer = services.status(said["zsp.get answered: 2.5 MiB, from 1 MiB"])
-	local read = services.got(answer) :: services.Got
-	assert(read.size == got.size and read.modified == got.modified and read.identity == got.identity and read.from == got.from)
-	same("zsp.put answered: from 2 MiB", services.status_of("ok", services.number_of(2 * 1048576)))
-	assert(services.number(string.sub(said["zsp.put answered: from 2 MiB"], 2)) == 2 * 1048576)
-
-	same("input: ls", services.input("ls\n"))
-	same("signal: interrupt", services.signal(services.SIGNALS.interrupt))
-	same("resize: 50 rows by 132", services.resize(50, 132))
-	same("output: hi", services.output("hi"))
-	same("errors: no", services.errors("no"))
-	same("exited 1", services.exit(1, 0))
-	same("killed by 9", services.exit(0, 9))
-	local code, signal = services.exited(string.sub(said["killed by 9"], 2))
-	assert(code == 0 and signal == 9)
-	code, signal = services.exited(string.sub(said["exited 1"], 2))
-	assert(code == 1 and signal == 0)
-
-	local hash = bytes("5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8")
-	same("a chunk's hash follows its bytes", services.chunk(hash))
-	same("the end of a file sent whole, with its hash", services.done("ok", hash))
+	local c = vectors.credit
+	assert(c.callee, "credit from the end that answers")
+	client:serve(1, "m", function() end)
+	run()
+	tell(15, "\1" .. string.rep("d", 32) .. "\1\1m\0") -- call 1, of m in scope 1, with nothing first
+	table.clear(sent)
+	local w = codec.writer()
+	codec.put_varint(w, c.id * 2 + 0) -- spoken by whoever called
+	codec.put_u8(w, 0) -- data
+	codec.put(w, string.rep("x", c.bytes))
+	tell(16, codec.string(w))
+	assert(hex(table.concat(sent)) == c.frame, `credit: {hex(table.concat(sent))} should be {c.frame}`)
 end
 
 print("ok")

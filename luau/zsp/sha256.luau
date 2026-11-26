@@ -1,8 +1,7 @@
 --!strict
 --!native
 --!optimize 2
--- FIPS 180-4, for naming lists and checking files. Nothing secret passes through here twice. Called, it hashes a
--- string at once; `stream` hashes what is given it piece by piece, for what is too big to hold.
+-- FIPS 180-4, for naming lists and documents. Nothing secret passes through here twice. Called, it hashes a string.
 
 local K = buffer.create(256)
 do
@@ -97,57 +96,7 @@ local function digest(message: string): string
 	return words(state)
 end
 
-export type Stream = {
-	update: (data: string | buffer) -> (),
-	final: () -> string, -- the hash of all that was given; nothing more may be
-}
-
-local function stream(): Stream
-	local state = initial()
-	local pending = buffer.create(64) -- what does not yet make a whole block
-	local filled = 0
-	local total = 0
-	local function update(data: string | buffer)
-		local b = if type(data) == "string" then buffer.fromstring(data) else data
-		local n = buffer.len(b)
-		total += n
-		local at = 0
-		if filled > 0 then
-			local take = math.min(64 - filled, n)
-			buffer.copy(pending, filled, b, 0, take)
-			filled += take
-			at = take
-			if filled < 64 then
-				return
-			end
-			blocks(state, pending, 0, 64)
-			filled = 0
-		end
-		local whole = (n - at) // 64 * 64
-		if whole > 0 then
-			blocks(state, b, at, at + whole)
-			at += whole
-		end
-		if at < n then
-			buffer.copy(pending, 0, b, at, n - at)
-			filled = n - at
-		end
-	end
-	local function final(): string
-		local bits = total * 8
-		local tail = buffer.create(if filled < 56 then 64 else 128)
-		buffer.copy(tail, 0, pending, 0, filled)
-		buffer.writeu8(tail, filled, 128)
-		local len = buffer.len(tail)
-		buffer.writeu32(tail, len - 8, bit32.byteswap(bits // 4294967296))
-		buffer.writeu32(tail, len - 4, bit32.byteswap(bits % 4294967296))
-		blocks(state, tail, 0, len)
-		return words(state)
-	end
-	return { update = update, final = final }
-end
-
-return setmetatable({ stream = stream }, {
+return setmetatable({}, {
 	__call = function(_, message: string): string
 		return digest(message)
 	end,
