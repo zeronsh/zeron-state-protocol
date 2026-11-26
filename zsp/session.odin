@@ -63,6 +63,7 @@ Session :: struct {
 	busy:      bool, // within session_input
 	stalled:   bool, // a frame in input read what storage did not yet have: see lazy.odin
 	recompare: bool, // session_recompare is owed, where storage may answer "not yet"
+	beyond_due: bool, // and what lies beyond its windows is to be counted, as when it was revived
 	out:       [dynamic]byte,
 	sent:      int,
 	tasks:     [dynamic]Task, // bulk work, done as the pipe drains
@@ -930,6 +931,22 @@ watch_beyond :: proc(n: ^Node, w: ^Watch) -> (before, after: int) {
 	}
 	list := key_list(w.lo)
 	return store_range(&n.store, list_lo(list), w.lo).count, store_range(&n.store, w.hi, list_hi(list)).count
+}
+
+// Counts what lies beyond each window, as when a session was revived: read, then kept, should nothing be missing.
+@(private)
+beyond_count :: proc(s: ^Session) {
+	missed := store_misses(&s.node.store)
+	beyond := make([][2]int, len(s.watches), context.temp_allocator)
+	for &w, i in s.watches {
+		beyond[i][0], beyond[i][1] = watch_beyond(s.node, &w)
+	}
+	if store_misses(&s.node.store) != missed {
+		return
+	}
+	for &w, i in s.watches {
+		w.before, w.after = beyond[i][0], beyond[i][1]
+	}
 }
 
 // Once per burst of changes, however many there were.
@@ -2081,7 +2098,11 @@ node_balance :: proc(n: ^Node) {
 pump :: proc(s: ^Session) {
 	n := s.node
 	go := true
-	if s.recompare {
+	if s.beyond_due {
+		go = unit_step(s, proc(s: ^Session, _: ^Task) {beyond_count(s)})
+		s.beyond_due &&= !go
+	}
+	if go && s.recompare {
 		go = unit_step(s, proc(s: ^Session, _: ^Task) {session_recompare(s)})
 		s.recompare &&= !go
 	}

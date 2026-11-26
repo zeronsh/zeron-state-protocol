@@ -918,3 +918,77 @@ remote_keeps_the_latest_log_at_hand :: proc(t: ^testing.T) {
 	recent: [1000]byte
 	testing.expect(t, memory_disk(&x.host.local).log_read(&x.host.local, tail - 2000, recent[:]))
 }
+
+// A relay woken from eviction, with nothing cached, revives its sessions without reading what it does not have: what
+// lies beyond a window it serves is counted when the session is next pumped, in a step.
+@(test)
+remote_relay_revives_sessions_cold :: proc(t: ^testing.T) {
+	state := seeded(13)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	s.lazy = .Remote
+	sim_init(t, &s, 1, 1, 1, 64)
+	defer sim_destroy(&s)
+	relay := s.nodes[2]
+	relay.remote.host.fail = 0
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	for i in 0 ..< 300 {
+		sim_put(&s, s.nodes[0], u64(i))
+		if i % 20 == 0 {
+			sim_settle(&s)
+		}
+	}
+	// A device that keeps only a window has the relay watch it, and count what lies beyond.
+	list := List{1 << 32 | 5, 5} // as sim_put places rows
+	ui := sim_client(&s, s.nodes[1])
+	sim_watch(ui, 9, place_key(list, 100, {}), place_key(list, 200, {}), 0, {data = true, counts = true})
+	sim_settle(&s)
+	relay.remote.remote.want_checkpoint = true
+	sim_settle(&s)
+	at_relay: ^Session
+	for l in s.links {
+		if l.an == 1 {
+			at_relay = l.b
+		}
+	}
+	saved := make([dynamic]byte, context.temp_allocator)
+	testing.expect(t, session_save(at_relay, &saved))
+	// Evicted: memory gone, its own cache too; what it wrote durably stays.
+	session_close(ui)
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	node_destroy(&relay.node)
+	remote_close(&relay.remote.remote)
+	for kind in Cached {
+		for _, b in relay.remote.host.cache[kind] {
+			delete(b)
+		}
+		clear(&relay.remote.host.cache[kind])
+	}
+	sim_boot(&s, relay)
+	revived, ok := session_load(&relay.node, saved[:])
+	testing.expect(t, ok)
+	testing.expect_value(t, relay.remote.remote.unguarded, 0)
+	testing.expect(t, !relay.node.failed)
+	// And when it is pumped, with the store caught up, what lies beyond is what lies beyond.
+	for _ in 0 ..< 1000 {
+		node_retry(&relay.node)
+		remote_work(&relay.remote.remote)
+		_ = session_output(revived)
+		remote_ops(&relay.remote.remote)
+		if model_tick(&relay.remote.host, &relay.remote.remote, 1 << 20) == 0 && !revived.beyond_due && !relay.node.store.replaying {
+			break
+		}
+	}
+	testing.expect(t, !revived.beyond_due && !relay.node.failed)
+	testing.expect_value(t, relay.remote.remote.unguarded, 0)
+	counted := false
+	for w in revived.watches {
+		counted ||= w.before > 0 && w.after > 0
+	}
+	testing.expect(t, counted)
+	session_close(revived)
+}

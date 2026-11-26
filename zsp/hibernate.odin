@@ -57,6 +57,9 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 	s.seq_in = read_varint(&r)
 	s.acked_in = read_varint(&r)
 	s.cursor = n.events.next
+	// Where storage may answer "not yet", what lies beyond each window is counted when the session is next pumped,
+	// in a step: nothing may be read here.
+	s.beyond_due = store_lazy(&n.store)
 	for r.pos < len(r.buf) && !r.bad {
 		x: Watch
 		x.id = read_varint(&r)
@@ -71,7 +74,9 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 			append(&n.interests, Interest{id = id, session = s.id, watch = w})
 			n.next_watch = max(n.next_watch, id & ~INTEREST)
 		}
-		x.before, x.after = watch_beyond(n, &x)
+		if !store_lazy(&n.store) {
+			x.before, x.after = watch_beyond(n, &x)
+		}
 		append(&s.watches, x)
 	}
 	m := roster_member(&n.roster, s.peer)
