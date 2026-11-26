@@ -256,7 +256,17 @@ forward_refused :: proc(t: ^testing.T) {
 	e: Echo
 	testing.expect(t, echo_start(&e))
 	defer echo_stop(&e)
-	w.hosts[2].port_permitted = permit_open_port
+	// Whether B ever let a connection through to the echo: not counted at the echo, which others may knock at, as a
+	// device of another test dialling a relay that was at that port before it may.
+	@(thread_local) echo_port, reached: int
+	echo_port, reached = e.port, 0
+	w.hosts[2].port_permitted = proc(sp: ^Space, caller: zsp.Key32, scope: zsp.Scope, port: u16, target: string) -> (bool, bool) {
+		ok, proxy := permit_open_port(sp, caller, scope, port, target)
+		if ok && int(port) == echo_port {
+			reached += 1
+		}
+		return ok, proxy
+	}
 	// Nothing listens on the port the echo had before it: offered, but refused.
 	free_port := u16(0)
 	{
@@ -289,7 +299,7 @@ forward_refused :: proc(t: ^testing.T) {
 			return len(world_space(w, 1).bridges) + len(world_space(w, 2).bridges) + len(world_space(w, 1).calls) + len(world_space(w, 2).calls) == 0
 		}))
 	}
-	testing.expect_value(t, sync.atomic_load(&e.accepted), 0)
+	testing.expect_value(t, reached, 0)
 }
 
 @(private)

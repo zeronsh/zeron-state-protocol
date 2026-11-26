@@ -113,7 +113,8 @@ def test_files():
     # A big file, then a folder, fetched; and again, which fetches nothing.
     out = ok("get", a.dir, "fl-b", "docs/big.bin", here + "/")
     assert f"{len(big)} bytes" in out and digest(os.path.join(here, "big.bin")) == hashlib.sha256(big).digest(), out
-    assert os.path.getmtime(os.path.join(here, "big.bin")) == os.path.getmtime(os.path.join(docs, "big.bin")) // 0.001 * 0.001
+    # The sender's time to the ms, as it is sent: compared in whole ns, as floats of seconds may differ in their last bit.
+    assert os.stat(os.path.join(here, "big.bin")).st_mtime_ns == os.stat(os.path.join(docs, "big.bin")).st_mtime_ns // 1_000_000 * 1_000_000
     ok("get", a.dir, "fl-b", "docs/tree", os.path.join(here, "tree"))
     assert tree(os.path.join(here, "tree")) == tree(os.path.join(docs, "tree"))
     again = ok("get", a.dir, "fl-b", "docs/tree", os.path.join(here, "tree"))
