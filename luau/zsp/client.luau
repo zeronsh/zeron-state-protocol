@@ -2353,6 +2353,176 @@ function Client.serve(self: Client, scope: number, method: string, handler: (Cal
 	end
 end
 
+-- ---------------------------------------------------------------- this device's host: names, ports, exposures (§17)
+
+export type Port = { read port: number, read scope: number, read host: string, read name: string }
+export type Node = {
+	read id: string, -- the device's key
+	read name: string, -- <name>.<suffix>, or <id>.id.<suffix>: what any application here reaches it by
+	read address: string, -- 127.a.b.c
+	read here: boolean, -- this device
+	read reachable: boolean,
+	read direct: boolean, -- linked directly, rather than through a relay
+	read subject: string,
+	read ports: { Port }, -- what it offers this device
+}
+export type Offer = { read lo: number, read hi: number?, read scope: number, read device: string?, read host: string?, read name: string?, read proxy: boolean? }
+export type Relay_Exposure = { read relay: string, read status: number, read url: string }
+export type Exposure = { read port: number, read name: string, read proxy: boolean, read label: string, read relays: { Relay_Exposure } }
+
+-- Calls a zsp.* method of this device's own host, in a scope this client may call in. Yields.
+function Client._host(self: Client, method: string, data: string): (codec.Reader?, string?)
+	local scope: number? = nil
+	for s, info in self.scopes do
+		if bit32.band(info.rights, 4) ~= 0 and (scope == nil or s < scope) then
+			scope = s
+		end
+	end
+	local me = self.devices[1]
+	if not scope or not me then
+		return nil, "unreachable"
+	end
+	local answer, fault = self:request(me.id, scope :: number, method, data)
+	if not answer then
+		return nil, fault
+	end
+	return codec.reader(answer), nil
+end
+
+local function u16(r: codec.Reader): number
+	local hi = codec.u8(r)
+	return hi * 256 + codec.u8(r)
+end
+
+local function read_ports(r: codec.Reader): { Port }
+	local out: { Port } = {}
+	for _ = 1, codec.varint(r) do
+		table.insert(out, table.freeze({ port = u16(r), scope = codec.varint(r), host = codec.bytes(r), name = codec.bytes(r) }))
+	end
+	return table.freeze(out)
+end
+
+-- Every device of the space, as this one reaches it: its name, its address here, whether it can be reached, and what
+-- it offers this device. Yields; nil and why not, if it cannot be asked.
+function Client.nodes(self: Client): ({ Node }?, string?)
+	local r, fault = self:_host("zsp.nodes", "")
+	if not r then
+		return nil, fault
+	end
+	local out: { Node } = {}
+	for _ = 1, codec.varint(r) do
+		local id, name = codec.take(r, 32), codec.bytes(r)
+		local a = codec.take(r, 4)
+		local flags = codec.u8(r)
+		table.insert(out, table.freeze({
+			id = id,
+			name = name,
+			address = `{string.byte(a, 1)}.{string.byte(a, 2)}.{string.byte(a, 3)}.{string.byte(a, 4)}`,
+			here = bit32.band(flags, 1) ~= 0,
+			reachable = bit32.band(flags, 2) ~= 0,
+			direct = bit32.band(flags, 4) ~= 0,
+			subject = codec.bytes(r),
+			ports = read_ports(r),
+		}))
+	end
+	return table.freeze(out), nil
+end
+
+local function put_offer(w: codec.Writer, o: Offer)
+	local hi = o.hi or o.lo
+	codec.put_u8(w, o.lo // 256)
+	codec.put_u8(w, o.lo % 256)
+	codec.put_u8(w, hi // 256)
+	codec.put_u8(w, hi % 256)
+	codec.put_varint(w, o.scope)
+	codec.put(w, o.device or string.rep("\0", 32))
+	codec.put_bytes(w, o.host or "")
+	codec.put_bytes(w, o.name or "")
+	codec.put_u8(w, if o.proxy then 1 else 0)
+end
+
+function Client._offers(self: Client, op: number, o: Offer?): ({ Offer }?, string?)
+	local w = codec.writer()
+	codec.put_u8(w, op)
+	if o then
+		put_offer(w, o)
+	end
+	local r, fault = self:_host("zsp.offers", codec.string(w))
+	if not r then
+		return nil, fault
+	end
+	local out: { Offer } = {}
+	for _ = 1, codec.varint(r) do
+		local lo, hi, scope, device = u16(r), u16(r), codec.varint(r), codec.take(r, 32)
+		local host, name, flags = codec.bytes(r), codec.bytes(r), codec.u8(r)
+		table.insert(out, table.freeze({
+			lo = lo,
+			hi = hi,
+			scope = scope,
+			device = if device == string.rep("\0", 32) then nil else device,
+			host = if host == "" then nil else host,
+			name = if name == "" then nil else name,
+			proxy = bit32.band(flags, 1) ~= 0,
+		}))
+	end
+	return table.freeze(out), nil
+end
+
+-- What this device offers others of its space: ports of this machine (or, with host, of another, from here), to
+-- whoever may call in a scope, or to one device. Nothing is offered unless it is. Each yields, and gives the offers as
+-- they then are.
+function Client.offers(self: Client): ({ Offer }?, string?)
+	return self:_offers(0, nil)
+end
+
+function Client.offer(self: Client, o: Offer): ({ Offer }?, string?)
+	return self:_offers(1, o)
+end
+
+-- Takes an offer back: whoever is using it is cut off.
+function Client.unoffer(self: Client, o: Offer): ({ Offer }?, string?)
+	return self:_offers(2, o)
+end
+
+function Client._exposures(self: Client, data: string): ({ Exposure }?, string?)
+	local r, fault = self:_host("zsp.expose", data)
+	if not r then
+		return nil, fault
+	end
+	local out: { Exposure } = {}
+	for _ = 1, codec.varint(r) do
+		local port, name, flags, label = u16(r), codec.bytes(r), codec.u8(r), codec.bytes(r)
+		local relays: { Relay_Exposure } = {}
+		for _ = 1, codec.varint(r) do
+			table.insert(relays, table.freeze({ relay = codec.take(r, 32), status = codec.u8(r), url = codec.bytes(r) }))
+		end
+		table.insert(out, table.freeze({ port = port, name = name, proxy = bit32.band(flags, 1) ~= 0, label = label, relays = table.freeze(relays) }))
+	end
+	return table.freeze(out), nil
+end
+
+-- What this device exposes to the public, through relays that will: for each, where (url, when status is 0). Yields.
+function Client.exposures(self: Client): ({ Exposure }?, string?)
+	return self:_exposures("\0")
+end
+
+-- Exposes a port of this machine to the public, under a fresh name; `proxy` says where each connection came from
+-- first (PROXY protocol v2). Yields, and gives what is exposed as it then is.
+function Client.expose(self: Client, port: number, options: { name: string?, proxy: boolean? }?): ({ Exposure }?, string?)
+	local w = codec.writer()
+	codec.put_u8(w, 1)
+	codec.put_u8(w, port // 256)
+	codec.put_u8(w, port % 256)
+	codec.put_bytes(w, options and options.name or "")
+	codec.put_u8(w, if options and options.proxy then 1 else 0)
+	return self:_exposures(codec.string(w))
+end
+
+-- Takes a port back from the public: whoever is using it is cut off, and its name is nobody's for ever.
+function Client.unexpose(self: Client, port: number): ({ Exposure }?, string?)
+	return self:_exposures(string.char(2, port // 256, port % 256))
+end
+
 function Client._serve(self: Client, key: string, on: boolean)
 	local slash = string.find(key, "/", 1, true) :: number
 	local w = codec.writer()

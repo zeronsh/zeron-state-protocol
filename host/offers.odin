@@ -229,7 +229,8 @@ offers_change :: proc(sp: ^Space, o: Offer, remove: bool) -> bool {
 		return false
 	}
 	o := o
-	if !offer_sound(&o) {
+	// An offer in a scope this device may not call in could never be taken up: it is refused, not kept for nothing.
+	if !offer_sound(&o) || (!remove && .Call not_in zsp.device_rights(&sp.node, sp.host.device, o.scope)) {
 		return false
 	}
 	at := -1

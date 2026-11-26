@@ -374,6 +374,19 @@ def test_luau_services():
     assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stdout[-2000:] + p.stderr
 
 
+def test_luau_ports():
+    """The Luau client's names, ports and exposures."""
+    _, (a, b) = space("lp", "lq")
+    port = free_port()
+    Service("127.0.0.1", port, says=b"x")
+    args = []
+    for d in (a, b):
+        with open(os.path.join(d.dir, "token")) as f:
+            args += [d.address, f.read()]
+    p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "ports.luau"), *args, str(port)], capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stdout + p.stderr
+
+
 def test_mirror():
     _, (a, b) = space("ma", "mb")
     args = []
@@ -1003,6 +1016,11 @@ def test_ports():
     if direct:
         assert http_get(bee, port) is None
     assert cb.offers() == []
+    try:
+        cb.offer(22, 9)  # a scope it may not call in: an offer that could never be taken up
+        raise AssertionError("an offer in no scope of its own was made")
+    except PermissionError:
+        pass
     cb.offer((port, port + 1), 1, name="web")
     cb.offer(quiet, 1)
     assert [o["ports"] for o in cb.offers()] == [(port, port + 1), (quiet, quiet)]

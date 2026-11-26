@@ -18,6 +18,10 @@ nodes_called :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, firs
 	}
 	b := make([dynamic]byte, context.temp_allocator)
 	nodes_put(sp, &b)
+	// Whoever asks what devices offer would know it as it is: each is kept up for a while, and asked again.
+	for device in zsp.node_reach(&sp.node) {
+		ports_wanted(sp, device)
+	}
 	return call_answer(sp, call, b[:]), {}
 }
 
