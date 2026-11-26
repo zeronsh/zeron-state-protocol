@@ -33,7 +33,7 @@ web_deps() {
 	[ -d web/node_modules ] || (cd web && npm ci --silent)
 }
 relay_deps() {
-	[ -d relay/node_modules ] || (cd relay && npm install --silent)
+	[ -d relay/node_modules ] || (cd relay && npm ci --silent)
 }
 stale() { # whether a file is older than any Odin it is built from
 	[ ! -f "$1" ] || [ -n "$(find zsp find pipe web/wasm -name "*.odin" -newer "$1")" ]
