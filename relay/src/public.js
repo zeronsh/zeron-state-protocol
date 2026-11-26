@@ -1,0 +1,410 @@
+import { DurableObject } from "cloudflare:workers";
+
+// The public's way in to what a device exposes, on a Durable Object (SPEC §17): an HTTP request, or a WebSocket, as
+// the bytes of HTTP/1.1 in a zsp.public call to the device, and its answer back as a Response. Nothing is kept but
+// what is in flight: the request's body is read only as the device grants room for it, and the device is granted
+// room only as the answer is taken. Cloudflare terminates TLS, so the relay sees what passes, as any reverse proxy
+// that holds the certificate must.
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const HOP = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te", "trailer", "proxy-authorization", "proxy-authenticate", "host", "content-length"]);
+const HEAD_MAX = 64 << 10;
+const WS_QUEUE = 1 << 20; // a WebSocket's messages may wait this much for room, and no more: the platform says nothing of its own
+
+const cat = (...parts) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) out.set(p, at), (at += p.length);
+  return out;
+};
+
+/** A zsp.public call, as the bytes the device says in it and the room it gives. `pipe` is the space's wasm. */
+export class Call {
+  constructor(pipe, id) {
+    this.pipe = pipe;
+    this.id = id;
+    this.queue = []; // what the device said, not yet taken
+    this.ended = false; // the device has said all
+    this.fault = null;
+    this.status = null; // the device's first word: connected, or why not
+    this.waiting = []; // readers and those waiting for room
+    this.owed = 0; // room to give back, once out of the node's own turn
+  }
+
+  // Gives room back: never from within the node, which is speaking when it tells of flow.
+  give(n) {
+    if (n <= 0) return;
+    if (!this.owed) queueMicrotask(() => {
+      const n = this.owed;
+      this.owed = 0;
+      if (!this.fault) this.pipe.credit(this.id, n);
+    });
+    this.owed += n;
+  }
+
+  // What the device says: kind 0 Data, 1 End, 2 Fault, 3 Cancel, 4 Credit.
+  flow(kind, bytes) {
+    if (kind === 0) {
+      if (this.status === null) {
+        this.status = bytes[0] ?? 255;
+        this.give(1);
+        bytes = bytes.subarray(1);
+        if (!bytes.length) return this.wake();
+      }
+      this.queue.push({ bytes, given: false });
+    } else if (kind === 1) this.ended = true;
+    else if (kind === 2 || kind === 3) this.fault = kind === 2 ? `fault ${bytes[0]}` : "cancelled";
+    this.wake();
+  }
+
+  wake() {
+    const waiting = this.waiting;
+    this.waiting = [];
+    for (const w of waiting) w();
+  }
+
+  next() {
+    return new Promise((resolve) => this.waiting.push(resolve));
+  }
+
+  /** Whether the device connected. */
+  async connected() {
+    while (this.status === null && !this.fault && !this.ended) await this.next();
+    return this.status === 0;
+  }
+
+  /** The next bytes the device says, or null once it has said all; room is given back as they are taken. */
+  async read() {
+    while (!this.queue.length) {
+      if (this.ended || this.fault) return null;
+      await this.next();
+    }
+    const { bytes, given } = this.queue.shift();
+    if (!given) this.give(bytes.length);
+    return bytes;
+  }
+
+  /** Puts bytes back, as when more was read than a head: their room was given already. */
+  unread(bytes) {
+    if (bytes.length) this.queue.unshift({ bytes, given: true });
+  }
+
+  /** Says bytes to the device, waiting for room as it must. False if the call is over. */
+  async write(bytes) {
+    for (let at = 0; at < bytes.length; ) {
+      if (this.fault) return false;
+      const room = this.pipe.room(this.id);
+      if (room <= 0) {
+        await this.next();
+        continue;
+      }
+      const n = Math.min(room, bytes.length - at, 60 << 10);
+      if (!this.pipe.send(this.id, bytes.subarray(at, at + n))) return false;
+      at += n;
+    }
+    return true;
+  }
+
+  end() {
+    this.endedOut = true;
+    this.pipe.say(this.id, 1);
+  }
+
+  /** Over, both ways. */
+  get done() {
+    return this.fault !== null || (this.ended && this.endedOut);
+  }
+
+  cancel() {
+    if (!this.ended || !this.fault) this.pipe.say(this.id, 3);
+    this.fault ??= "cancelled";
+  }
+}
+
+// Reads a response's head: status, headers, and the rest of what was read.
+async function readHead(call) {
+  let got = new Uint8Array(0);
+  for (;;) {
+    const end = findHeadEnd(got);
+    if (end >= 0) {
+      const lines = dec.decode(got.subarray(0, end)).split("\r\n");
+      const [, code, ...reason] = lines[0].split(" ");
+      const headers = [];
+      for (const line of lines.slice(1)) {
+        const colon = line.indexOf(":");
+        if (colon > 0) headers.push([line.slice(0, colon).trim(), line.slice(colon + 1).trim()]);
+      }
+      call.unread(got.subarray(end + 4));
+      return { status: Number(code), reason: reason.join(" "), headers };
+    }
+    if (got.length > HEAD_MAX) return null;
+    const more = await call.read();
+    if (!more) return null;
+    got = cat(got, more);
+  }
+}
+
+function findHeadEnd(b) {
+  for (let i = 3; i < b.length; i++) if (b[i] === 10 && b[i - 1] === 13 && b[i - 2] === 10 && b[i - 3] === 13) return i - 3;
+  return -1;
+}
+
+// The body of a response, as a stream that pulls from the device only as it is read.
+function body(call, framing, length) {
+  let left = length, chunk = 0, buf = new Uint8Array(0);
+  const more = async () => {
+    const b = await call.read();
+    if (!b) return false;
+    buf = cat(buf, b);
+    return true;
+  };
+  return new ReadableStream(
+    {
+      async pull(controller) {
+        if (framing === "length") {
+          if (left === 0) return controller.close();
+          if (!buf.length && !(await more())) return controller.error(new Error("the device ended short"));
+          const n = Math.min(left, buf.length);
+          controller.enqueue(buf.subarray(0, n));
+          buf = buf.subarray(n);
+          left -= n;
+          if (left === 0) controller.close();
+        } else if (framing === "chunked") {
+          for (;;) {
+            if (chunk > 0) {
+              if (!buf.length && !(await more())) return controller.error(new Error("the device ended short"));
+              const n = Math.min(chunk, buf.length);
+              controller.enqueue(buf.subarray(0, n));
+              buf = buf.subarray(n);
+              chunk -= n;
+              if (chunk === 0) chunk = -2; // its CRLF to come
+              return;
+            }
+            const eol = buf.indexOf(10);
+            if (eol < 0) {
+              if (buf.length > 4096 || !(await more())) return controller.error(new Error("a chunk makes no sense"));
+              continue;
+            }
+            const line = dec.decode(buf.subarray(0, eol)).trim();
+            buf = buf.subarray(eol + 1);
+            if (chunk === -2) {
+              chunk = 0;
+              continue;
+            }
+            const size = parseInt(line.split(";")[0], 16);
+            if (Number.isNaN(size)) return controller.error(new Error("a chunk makes no sense"));
+            if (size === 0) return controller.close(); // trailers, if any, go unread
+            chunk = size;
+          }
+        } else {
+          if (buf.length) {
+            controller.enqueue(buf);
+            buf = new Uint8Array(0);
+            return;
+          }
+          const b = await call.read();
+          if (b) controller.enqueue(b);
+          else controller.close();
+        }
+      },
+      cancel() {
+        call.cancel();
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+function requestHead(request, url, extra) {
+  let head = `${request.method} ${url.pathname}${url.search} HTTP/1.1\r\nHost: ${url.host}\r\n`;
+  for (const [name, value] of request.headers) {
+    const lower = name.toLowerCase();
+    if (!HOP.has(lower) && !lower.startsWith("cf-") && !lower.startsWith("sec-websocket-") && !lower.startsWith("x-zsp-")) head += `${name}: ${value}\r\n`;
+  }
+  return head + extra + "\r\n";
+}
+
+/**
+ * Answers a request from the public with what the device that exposes `label` says to it. `open` makes the call:
+ * open(label, address) gives a Call, or null if the label is nobody's here.
+ */
+export async function serve(request, label, open) {
+  const url = new URL(request.headers.get("x-zsp-url") ?? request.url); // as the public asked it
+  const ip = request.headers.get("cf-connecting-ip") ?? "";
+  const call = open(label, ip);
+  if (!call) return new Response("nothing is exposed here\n", { status: 404 });
+  try {
+    if (!(await call.connected())) {
+      call.cancel();
+      return new Response("what is exposed here is not answering\n", { status: 502 });
+    }
+    if (request.headers.get("upgrade")?.toLowerCase() === "websocket") return await socket(request, url, call);
+    const length = request.headers.get("content-length");
+    const hasBody = request.body && !["GET", "HEAD"].includes(request.method);
+    const framing = hasBody ? (length !== null ? `Content-Length: ${length}\r\n` : "Transfer-Encoding: chunked\r\n") : "";
+    if (!(await call.write(enc.encode(requestHead(request, url, framing + "Connection: close\r\n"))))) throw new Error("lost");
+    if (hasBody) {
+      const reader = request.body.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (length === null) {
+          if (value.length && !(await call.write(cat(enc.encode(value.length.toString(16) + "\r\n"), value, enc.encode("\r\n"))))) throw new Error("lost");
+        } else if (!(await call.write(value))) throw new Error("lost");
+      }
+      if (length === null && !(await call.write(enc.encode("0\r\n\r\n")))) throw new Error("lost");
+    }
+    call.end();
+    const head = await readHead(call);
+    if (!head) {
+      call.cancel();
+      return new Response("what is exposed here said nothing sensible\n", { status: 502 });
+    }
+    const headers = new Headers();
+    let framingOut = "close", left = 0;
+    for (const [name, value] of head.headers) {
+      const lower = name.toLowerCase();
+      if (lower === "transfer-encoding" && value.toLowerCase().includes("chunked")) framingOut = "chunked";
+      else if (lower === "content-length" && framingOut !== "chunked") (framingOut = "length"), (left = Number(value));
+      if (!HOP.has(lower)) headers.append(name, value);
+    }
+    const empty = request.method === "HEAD" || head.status === 204 || head.status === 304 || head.status < 200;
+    if (empty) call.cancel();
+    return new Response(empty ? null : body(call, framingOut, left), { status: head.status, statusText: head.reason, headers });
+  } catch (e) {
+    call.cancel();
+    return new Response("what is exposed here was lost\n", { status: 502 });
+  }
+}
+
+// A WebSocket from the public, as one with the device: the upgrade is asked of it, and frames are said again either way.
+async function socket(request, url, call) {
+  const key = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+  let extra = `Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${key}\r\n`;
+  const protocol = request.headers.get("sec-websocket-protocol");
+  if (protocol) extra += `Sec-WebSocket-Protocol: ${protocol}\r\n`;
+  if (!(await call.write(enc.encode(requestHead(request, url, extra))))) throw new Error("lost");
+  const head = await readHead(call);
+  if (!head || head.status !== 101) {
+    call.cancel();
+    return new Response("what is exposed here would not take a WebSocket\n", { status: 502 });
+  }
+  const { 0: client, 1: server } = new WebSocketPair();
+  server.accept();
+  let queued = 0, chain = Promise.resolve(), closed = false;
+  const say = (opcode, payload) => {
+    const frame = wsFrame(opcode, payload);
+    queued += frame.length;
+    if (queued > WS_QUEUE) return server.close(1009, "too much at once"), call.cancel();
+    chain = chain.then(async () => {
+      await call.write(frame);
+      queued -= frame.length;
+    });
+  };
+  server.addEventListener("message", (e) => say(typeof e.data === "string" ? 1 : 2, typeof e.data === "string" ? enc.encode(e.data) : new Uint8Array(e.data)));
+  server.addEventListener("close", (e) => {
+    if (closed) return;
+    closed = true;
+    say(8, cat(new Uint8Array([(e.code ?? 1000) >> 8, (e.code ?? 1000) & 255]), enc.encode(e.reason ?? "")));
+    chain.then(() => call.end());
+  });
+  (async () => {
+    let buf = new Uint8Array(0), parts = [], first = 0;
+    for (;;) {
+      const b = await call.read();
+      if (!b) break;
+      buf = cat(buf, b);
+      for (;;) {
+        const f = wsTake(buf);
+        if (!f) break;
+        buf = buf.subarray(f.used);
+        if (f.opcode === 9) say(10, f.payload); // ping: pong
+        else if (f.opcode === 8) {
+          closed = true;
+          const code = f.payload.length >= 2 ? (f.payload[0] << 8) | f.payload[1] : 1000;
+          try {
+            server.close(code === 1005 || code === 1006 ? 1000 : code, dec.decode(f.payload.subarray(2)));
+          } catch {}
+          call.end();
+          return;
+        } else if (f.opcode === 0 || f.opcode === 1 || f.opcode === 2) {
+          if (f.opcode) first = f.opcode;
+          parts.push(f.payload);
+          if (f.fin) {
+            const whole = cat(...parts);
+            parts = [];
+            server.send(first === 1 ? dec.decode(whole) : whole);
+          }
+        }
+      }
+    }
+    if (!closed) server.close(1011, "what is exposed here was lost");
+  })();
+  const headers = new Headers();
+  for (const [name, value] of head.headers) if (name.toLowerCase() === "sec-websocket-protocol") headers.set(name, value);
+  return new Response(null, { status: 101, webSocket: client, headers });
+}
+
+// A frame as a client says it: masked.
+function wsFrame(opcode, payload) {
+  const n = payload.length;
+  const head = n < 126 ? [0x80 | opcode, 0x80 | n] : n < 65536 ? [0x80 | opcode, 0x80 | 126, n >> 8, n & 255] : [0x80 | opcode, 0x80 | 127, 0, 0, 0, 0, (n >>> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255];
+  const mask = crypto.getRandomValues(new Uint8Array(4));
+  const out = new Uint8Array(head.length + 4 + n);
+  out.set(head);
+  out.set(mask, head.length);
+  for (let i = 0; i < n; i++) out[head.length + 4 + i] = payload[i] ^ mask[i & 3];
+  return out;
+}
+
+// A frame as a server says it, if all of it is here.
+function wsTake(b) {
+  if (b.length < 2) return null;
+  let n = b[1] & 127, at = 2;
+  if (n === 126) {
+    if (b.length < 4) return null;
+    (n = (b[2] << 8) | b[3]), (at = 4);
+  } else if (n === 127) {
+    if (b.length < 10) return null;
+    (n = b[6] * 2 ** 24 + ((b[7] << 16) | (b[8] << 8) | b[9])), (at = 10);
+  }
+  const masked = b[1] & 128;
+  const mask = masked ? b.subarray(at, at + 4) : null;
+  if (masked) at += 4;
+  if (b.length < at + n) return null;
+  let payload = b.subarray(at, at + n);
+  if (mask) payload = payload.map((x, i) => x ^ mask[i & 3]);
+  return { fin: !!(b[0] & 128), opcode: b[0] & 15, payload, used: at + n };
+}
+
+/** The label a host names, if it is under the domain the public reaches devices at. */
+export function labelOf(host, domain) {
+  if (!domain || !host) return null;
+  const name = host.toLowerCase().replace(/:\d+$/, "").replace(/\.$/, "");
+  if (!name.endsWith("." + domain.toLowerCase())) return null;
+  const label = name.slice(0, -domain.length - 1);
+  return /^[a-z0-9-]{1,63}$/.test(label) ? label : null;
+}
+
+/** Where a label leads: the space whose device exposes it, kept for as long as that lasts. */
+export class Label extends DurableObject {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const storage = this.ctx.storage;
+    if (url.pathname === "/claim" || url.pathname === "/release") {
+      // Only from a space's own object, which works the label out from the space and the device's proven key: nobody
+      // else can name another's label, and a request from the public never comes here by this path.
+      const space = url.searchParams.get("space");
+      const had = await storage.get("space");
+      if (url.pathname === "/claim") {
+        if (had && had !== space) return new Response("taken\n", { status: 409 });
+        await storage.put("space", space);
+      } else if (had === space) await storage.delete("space");
+      return new Response("ok\n");
+    }
+    const space = await storage.get("space");
+    if (!space) return new Response("nothing is exposed here\n", { status: 404 });
+    return this.env.SPACE.get(this.env.SPACE.idFromName(space)).fetch(new Request(new URL(`/${space}`, request.url), request));
+  }
+}

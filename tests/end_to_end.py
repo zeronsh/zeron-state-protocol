@@ -908,15 +908,31 @@ def http_get(address, port, host=None, origin=None, proxy=None):
             s = socket.create_connection((address, port), 3)
         with s:
             extra = f"Origin: {origin}\r\n" if origin else ""
-            s.sendall(f"GET / HTTP/1.1\r\nHost: {host or address}:{port}\r\n{extra}\r\n".encode())
+            s.sendall(f"GET / HTTP/1.1\r\nHost: {host or address}:{port}\r\nConnection: close\r\n{extra}\r\n".encode())
             got = b""
-            while data := s.recv(65536):
+            while data := s.recv(65536):  # until the answer is whole, as framed, or the connection ends
                 got += data
+                head, sep, rest = got.partition(b"\r\n\r\n")
+                lower = head.lower()
+                if sep and b"transfer-encoding: chunked" in lower and rest.endswith(b"0\r\n\r\n"):
+                    break
+                if sep and b"content-length:" in lower:
+                    length = int(lower.split(b"content-length:")[1].split(b"\r\n")[0])
+                    if len(rest) >= length:
+                        break
     except OSError:
         return None
     if not got:
         return None
     head, _, body = got.partition(b"\r\n\r\n")
+    if b"transfer-encoding: chunked" in head.lower():
+        whole = b""
+        while body:
+            size, _, body = body.partition(b"\r\n")
+            if int(size, 16) == 0:
+                break
+            whole, body = whole + body[: int(size, 16)], body[int(size, 16) + 2 :]
+        body = whole
     return int(head.split()[1]), body
 
 
@@ -1188,6 +1204,165 @@ def test_expose():
     with open(os.path.join(a.dir, zspd_space(a), "audit.log")) as f:
         audit = f.read()
     assert '"service":"public"' in audit and '"peer":"127.0.0.1:' in audit and '"detail":"-%d"' % big in audit
+
+
+class Echo:
+    """A WebSocket server that says back what it hears, and the body of a POST it is sent."""
+
+    def __init__(self, port):
+        import threading
+
+        self.sock = socket.create_server(("127.0.0.1", port))
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        import threading
+
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.one, args=(c,), daemon=True).start()
+
+    def one(self, c):
+        import base64, hashlib
+
+        try:
+            with c:
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    head += c.recv(4096)
+                head, _, rest = head.partition(b"\r\n\r\n")
+                lines = head.decode().split("\r\n")
+                headers = {k.lower(): v.strip() for k, _, v in (line.partition(":") for line in lines[1:])}
+                if headers.get("upgrade", "").lower() != "websocket":
+                    if headers.get("transfer-encoding") == "chunked":
+                        body = b""
+                        while not rest.endswith(b"0\r\n\r\n"):
+                            rest += c.recv(65536)
+                        while True:
+                            size, _, rest = rest.partition(b"\r\n")
+                            if int(size, 16) == 0:
+                                break
+                            body, rest = body + rest[: int(size, 16)], rest[int(size, 16) + 2 :]
+                    else:
+                        body = rest
+                        while len(body) < int(headers.get("content-length", 0)):
+                            body += c.recv(65536)
+                    out = hashlib.sha256(body).hexdigest().encode() + b" " + lines[0].split()[1].encode()
+                    c.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n" % (len(out), out))
+                    return
+                accept = base64.b64encode(hashlib.sha1(headers["sec-websocket-key"].encode() + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+                c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+                buf = rest
+                while True:
+                    while len(buf) < 2 or len(buf) < ws_frame_size(buf):
+                        data = c.recv(65536)
+                        if not data:
+                            return
+                        buf += data
+                    n = ws_frame_size(buf)
+                    opcode, payload = ws_payload(buf[:n])
+                    buf = buf[n:]
+                    if opcode == 8:
+                        c.sendall(ws_frame(8, payload, mask=False))
+                        return
+                    c.sendall(ws_frame(opcode, payload.upper() if opcode == 1 else payload, mask=False))
+        except OSError:
+            pass
+
+
+def ws_frame(opcode, payload, mask=True):
+    n = len(payload)
+    head = bytes([0x80 | opcode]) + (bytes([n | (0x80 if mask else 0)]) if n < 126 else bytes([126 | (0x80 if mask else 0)]) + struct.pack(">H", n) if n < 65536 else bytes([127 | (0x80 if mask else 0)]) + struct.pack(">Q", n))
+    if not mask:
+        return head + payload
+    key = os.urandom(4)
+    return head + key + bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+
+
+def ws_frame_size(b):
+    n, at = b[1] & 127, 2
+    if n == 126:
+        if len(b) < 4:
+            return 1 << 30
+        n, at = struct.unpack(">H", b[2:4])[0], 4
+    elif n == 127:
+        if len(b) < 10:
+            return 1 << 30
+        n, at = struct.unpack(">Q", b[2:10])[0], 10
+    return at + (4 if b[1] & 128 else 0) + n
+
+
+def ws_payload(b):
+    n, at = b[1] & 127, 2
+    if n == 126:
+        at = 4
+    elif n == 127:
+        at = 10
+    if b[1] & 128:
+        key, at = b[at : at + 4], at + 4
+        return b[0] & 15, bytes(x ^ key[i % 4] for i, x in enumerate(b[at:]))
+    return b[0] & 15, b[at:]
+
+
+def test_durable_object_expose():
+    """What a device exposes, reached through the relay on Durable Objects: a GET, a POST of unknown length, a large
+    answer at the reader's pace, a WebSocket, and nothing once taken back."""
+    cloud = Cloud().start(EXPOSE_DOMAIN="expose.test")
+    _, (a,) = space("dx", relay=cloud)
+    ca = a.client()
+    web, echo = free_port(), free_port()
+    data = os.urandom(3 << 20)
+    Service("127.0.0.1", web, says=data)
+    Echo(echo)
+    ca.expose(web, name="web")
+    ca.expose(echo, name="echo")
+    eventually("the relay says where", lambda: [r["status"] for e in ca.exposures() for r in e["relays"]] == [0, 0])
+    labels = {e["port"]: e["label"] for e in ca.exposures()}
+    assert all(r["url"] == "https://%s.expose.test" % labels[e["port"]] for e in ca.exposures() for r in e["relays"])
+    host, port = cloud.address.split(":")
+    assert http_get(host, int(port), host=labels[web] + ".expose.test") == (200, data)
+    assert http_get(host, int(port), host="nobody.expose.test")[0] == 404
+
+    # A body of unknown length goes as chunks, and comes back so.
+    s = socket.create_connection((host, int(port)), 5)
+    body = os.urandom(200000)
+    s.sendall(f"POST /up?x=1 HTTP/1.1\r\nHost: {labels[echo]}.expose.test\r\nTransfer-Encoding: chunked\r\n\r\n".encode())
+    for at in range(0, len(body), 50000):
+        part = body[at : at + 50000]
+        s.sendall(b"%x\r\n%s\r\n" % (len(part), part))
+    s.sendall(b"0\r\n\r\n")
+    got = b""
+    while not got.endswith(b"0\r\n\r\n") and b"/up?x=1" not in got:
+        got += s.recv(65536)
+    import hashlib
+
+    assert hashlib.sha256(body).hexdigest().encode() + b" /up?x=1" in got, got[:300]
+    s.close()
+
+    # A WebSocket, either way.
+    s = socket.create_connection((host, int(port)), 5)
+    s.sendall(f"GET /ws HTTP/1.1\r\nHost: {labels[echo]}.expose.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+              "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += s.recv(4096)
+    head, _, buf = head.partition(b"\r\n\r\n")
+    assert b" 101 " in head.split(b"\r\n")[0], head
+    for message in (b"hello", b"x" * 70000):
+        s.sendall(ws_frame(1, message))
+        while len(buf) < 2 or len(buf) < ws_frame_size(buf):
+            buf += s.recv(65536)
+        n = ws_frame_size(buf)
+        opcode, payload = ws_payload(buf[:n])
+        buf = buf[n:]
+        assert opcode == 1 and payload == message.upper(), (opcode, payload[:20])
+    s.close()
+
+    ca.unexpose(web)
+    eventually("taken back", lambda: http_get(host, int(port), host=labels[web] + ".expose.test")[0] in (404, 502))
 
 
 def test_expose_nowhere():

@@ -33,6 +33,11 @@ foreign host {
 	// Answered by `verdict`, now or later.
 	authenticate :: proc(conn: u32, device: ^zsp.Key32, ptr: [^]byte, len: int) ---
 	now :: proc() -> f64 ---
+	// A label is exposed here now, or no longer: the host has the public's way in to it lead here.
+	label_claim :: proc(ptr: [^]byte, len: int) ---
+	label_release :: proc(ptr: [^]byte, len: int) ---
+	// What a device says in a call from the public: kind (zsp.Flow), and the message.
+	public_flow :: proc(call: f64, kind: u8, ptr: [^]byte, len: int) ---
 }
 
 MAX_PLAIN :: 60 << 10
@@ -49,6 +54,14 @@ Conn :: struct {
 node: zsp.Node
 remote: zsp.Remote
 secret: zsp.Key32
+domain: string // where the public reaches what devices expose: <label>.<domain>; "" for nowhere
+labels: [dynamic]Label
+
+Label :: struct {
+	label:  string, // owned
+	conn:   u32,
+	device: zsp.Key32,
+}
 conns: map[u32]^Conn
 message: [dynamic]byte // handed in and out
 
@@ -111,6 +124,14 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len
 	}
 	node.host.roster = proc(_: rawptr, bytes: []byte) {
 		save_roster(raw_data(bytes), len(bytes))
+	}
+	node.host.exposure = proc(_: rawptr, s: ^zsp.Session, type: u8, payload: []byte) {
+		if type == zsp.EXPOSE {
+			exposed(s, payload)
+		}
+	}
+	node.host.calls.flow = proc(_: rawptr, call: u64, kind: zsp.Flow, payload: []byte) {
+		public_flow(f64(call), u8(kind), raw_data(payload), len(payload))
 	}
 	node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, credential: []byte) {
 		for id, c in conns {
@@ -204,10 +225,156 @@ closed :: proc "c" (id: u32) {
 		return
 	}
 	delete_key(&conns, id)
+	labels_drop(id)
 	if c.session != nil {
 		zsp.session_close(c.session)
 	}
 	free(c)
+}
+
+// ---------------------------------------------------------------- exposure (§17)
+
+// Where the public reaches what devices expose: a domain, whose names <label>.<domain> lead to this relay.
+@(export)
+expose_domain :: proc "c" (size: int) {
+	context = runtime.default_context()
+	delete(domain)
+	domain = string(clone_bytes(message[:size]))
+}
+
+@(private)
+clone_bytes :: proc(b: []byte) -> []byte {
+	c := make([]byte, len(b))
+	copy(c, b)
+	return c
+}
+
+// 40 Expose, from a device: all it exposes here, replacing what it said before. Answered with 41 Exposed.
+@(private)
+exposed :: proc(s: ^zsp.Session, payload: []byte) {
+	id: u32
+	for k, c in conns {
+		if c.session == s {
+			id = k
+		}
+	}
+	r := zsp.Reader{buf = payload}
+	n := zsp.read_varint(&r)
+	if r.bad || n > 16 || id == 0 {
+		return
+	}
+	labels_drop(id)
+	w := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&w, n)
+	for _ in 0 ..< n {
+		prefix := string(zsp.read_bytes(&r))
+		nonce_bytes := zsp.read_take(&r, zsp.EXPOSE_NONCE)
+		if r.bad || !zsp.exposure_prefix_valid(prefix) {
+			return
+		}
+		nonce: [zsp.EXPOSE_NONCE]byte
+		copy(nonce[:], nonce_bytes)
+		label := zsp.exposure_label(node.space, s.peer, prefix, nonce)
+		status := u8(1 if domain == "" else 0)
+		for l in labels {
+			if l.label == label {
+				status = 2
+			}
+		}
+		if status == 0 && len(labels) >= 4096 {
+			status = 3
+		}
+		url := ""
+		if status == 0 {
+			append(&labels, Label{zsp_clone(label), id, s.peer})
+			label_claim(raw_data(label), len(label))
+			url = zsp_concat("https://", label, ".", domain)
+		}
+		zsp.write_bytes(&w, transmute([]byte)label)
+		append(&w, status)
+		zsp.write_bytes(&w, transmute([]byte)url)
+	}
+	zsp.session_say(s, zsp.EXPOSE + 1, w[:])
+}
+
+@(private)
+zsp_clone :: proc(s: string) -> string {
+	return string(clone_bytes(transmute([]byte)s))
+}
+
+@(private)
+zsp_concat :: proc(parts: ..string) -> string {
+	w := make([dynamic]byte, context.temp_allocator)
+	for p in parts {
+		append(&w, p)
+	}
+	return string(w[:])
+}
+
+// A connection has gone, or said again what it exposes: what it exposed goes.
+@(private)
+labels_drop :: proc(id: u32) {
+	#reverse for l, i in labels {
+		if l.conn == id {
+			label_release(raw_data(l.label), len(l.label))
+			delete(l.label)
+			unordered_remove(&labels, i)
+		}
+	}
+}
+
+// Calls the device whose label is in the buffer, for the public at an address (16 bytes, then the port, big-endian)
+// after it: label bytes ‖ address (18). The call, or zero if the label is nobody's here or the call cannot be made.
+@(export)
+public_open :: proc "c" (size: int) -> f64 {
+	context = runtime.default_context()
+	r := zsp.Reader{buf = message[:size]}
+	label := string(zsp.read_bytes(&r))
+	_ = zsp.read_take(&r, 18)
+	if !zsp.read_done(&r) {
+		return 0
+	}
+	for l in labels {
+		if l.label == label {
+			node.now = u64(now())
+			return f64(zsp.node_call_method(&node, l.device, 0, "zsp.public", message[:size]))
+		}
+	}
+	return 0
+}
+
+// How much may be said in a call yet.
+@(export)
+public_room :: proc "c" (call: f64) -> int {
+	context = runtime.default_context()
+	return zsp.node_granted(&node, u64(call))
+}
+
+// Says what is in the buffer in a call: within its room, or nothing.
+@(export)
+public_send :: proc "c" (call: f64, size: int) -> bool {
+	context = runtime.default_context()
+	if size > zsp.node_granted(&node, u64(call)) {
+		return false
+	}
+	zsp.node_flow(&node, u64(call), .Data, message[:size])
+	return true
+}
+
+// 1 End, 3 Cancel; or 4 Credit for so many bytes taken.
+@(export)
+public_say :: proc "c" (call: f64, kind: u8, credit: int) {
+	context = runtime.default_context()
+	switch kind {
+	case 1:
+		zsp.node_flow(&node, u64(call), .End)
+	case 3:
+		zsp.node_flow(&node, u64(call), .Cancel)
+	case 4:
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, u64(credit))
+		zsp.node_flow(&node, u64(call), .Credit, w[:])
+	}
 }
 
 // Makes what has been accepted durable, goes on with whatever waited for what has come, and starts whatever is due.

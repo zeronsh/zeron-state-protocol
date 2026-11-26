@@ -7,6 +7,9 @@
 import { DurableObject } from "cloudflare:workers";
 import module from "./relay.wasm";
 import { Storage, Full, hex } from "./storage.js";
+import { Call, Label, labelOf, serve } from "./public.js";
+
+export { Label };
 
 const FULL = "this relay can keep no more of this space";
 
@@ -14,6 +17,13 @@ const FULL = "this relay can keep no more of this space";
 // theirs kept, and they reconnect; an object hibernates only once quiet for longer, and a timer due holds it awake.
 const KEEP_AFTER = 100;
 
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const varint = (n) => {
+  const out = [];
+  for (; n >= 128; n = Math.floor(n / 128)) out.push((n % 128) | 128);
+  return [...out, n];
+};
 const unhex = (s) => Uint8Array.from(s.match(/../g) ?? [], (b) => parseInt(b, 16));
 
 function instantiate(host) {
@@ -70,6 +80,7 @@ export class Space extends DurableObject {
   #ending = new Set(); // connections whose input failed: let go of once what they have to hear is said, if anything is
   #kept = new Set(); // connections whose attachment holds what they are now, for waking after hibernation
   #keeping = 0; // the epoch whose keeping them again is due, if any
+  #calls = new Map(); // zsp.public calls under way -> Call
 
   constructor(ctx, env) {
     super(ctx, env);
@@ -135,6 +146,14 @@ export class Space extends DurableObject {
       },
       authenticate: (id, device, ptr, len) => this.#judge(id, hex(view(device, 32)), view(ptr, len).slice()),
       now: () => Date.now(),
+      label_claim: (ptr, len) => this.#label("claim", dec.decode(view(ptr, len))),
+      label_release: (ptr, len) => this.#label("release", dec.decode(view(ptr, len))),
+      public_flow: (call, kind, ptr, len) => {
+        const c = this.#calls.get(call);
+        if (!c) return;
+        c.flow(kind, view(ptr, len).slice());
+        if (kind === 2 || kind === 3 || (kind === 1 && c.done)) this.#calls.delete(call);
+      },
     }));
     this.#done = (op, ok, absent, bytes, full) => {
       if (epoch !== this.#epoch || !this.#wasm) return; // an earlier node's, let go of
@@ -163,6 +182,7 @@ export class Space extends DurableObject {
     if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length, pages, blocks, keep, most, Number(this.env.QUIET_TAIL ?? 0))) {
       throw exports.failed() ? new Full(FULL) : new Error("storage is damaged");
     }
+    if (this.env.EXPOSE_DOMAIN) this.#put(enc.encode(this.env.EXPOSE_DOMAIN), (n) => exports.expose_domain(n));
     let lost = false;
     for (const ws of this.ctx.getWebSockets()) {
       const { id, state } = ws.deserializeAttachment() ?? {};
@@ -197,9 +217,56 @@ export class Space extends DurableObject {
     );
   }
 
+  // Where the public's way in to a label leads, as a label's own object keeps it (public.js).
+  #label(what, label) {
+    if (!this.env.LABEL) return;
+    const at = this.env.LABEL.get(this.env.LABEL.idFromName(label));
+    this.ctx.waitUntil(at.fetch(`https://label/${what}?space=${hex(this.#space)}`).catch(() => {}));
+  }
+
+  // A zsp.public call to the device that exposes a label, for the public at an address; null if nobody does.
+  #open(label, ip) {
+    const address = new Uint8Array(18);
+    const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(ip);
+    if (v4) address.set([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, ...v4.slice(1).map(Number)]);
+    else if (ip.includes(":")) {
+      const halves = ip.split("::"), head = halves[0] ? halves[0].split(":") : [], tail = halves[1] ? halves[1].split(":") : [];
+      const words = [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail];
+      words.forEach((w, i) => address.set([parseInt(w, 16) >> 8, parseInt(w, 16) & 255], i * 2));
+    }
+    const name = enc.encode(label);
+    const first = new Uint8Array([...varint(name.length), ...name, ...address]);
+    const id = this.#put(first, (n) => this.#wasm.public_open(n));
+    if (!id) return null;
+    const pipe = {
+      room: (call) => this.#wasm.public_room(call),
+      send: (call, bytes) => {
+        const ok = this.#put(bytes, (n) => this.#wasm.public_send(call, n));
+        this.#settle();
+        return ok;
+      },
+      say: (call, kind, credit = 0) => {
+        this.#wasm?.public_say(call, kind, credit);
+        if (kind === 3 || this.#calls.get(call)?.done) this.#calls.delete(call);
+        if (this.#wasm) this.#settle();
+      },
+      credit: (call, n) => pipe.say(call, 4, n),
+    };
+    const call = new Call(pipe, id);
+    this.#calls.set(id, call);
+    this.#settle(); // the call goes to the device at once
+    return call;
+  }
+
   fetch(request) {
     const url = new URL(request.url);
     this.#space ??= unhex(url.pathname.slice(1));
+    const label = request.headers.get("x-zsp-label");
+    if (label) {
+      // The public, for what a device exposes: it was sent here by the label's own object.
+      if (!this.#wasm && (!this.#begin() || (this.#settle(), !this.#wasm))) return new Response(FULL + "\n", { status: 507 });
+      return serve(request, label, (label, ip) => this.#open(label, ip));
+    }
     if (this.env.STATS === "1" && url.searchParams.has("stats")) return this.#stats();
     if (this.env.STATS === "1" && url.searchParams.has("evict")) return this.#evict(url.searchParams.get("evict"));
     if (this.env.STATS === "1" && url.searchParams.has("probe")) return this.#storage.probe().then((t) => new Response(JSON.stringify(t) + "\n"));
@@ -401,6 +468,19 @@ export function relay({ authenticate, admit } = {}) {
   policy = authenticate;
   return {
     async fetch(request, env) {
+      // The public, for a label of EXPOSE_DOMAIN: to the label's own object, which knows whose it is.
+      const label = labelOf(request.headers.get("host") ?? new URL(request.url).host, env.EXPOSE_DOMAIN);
+      if (label) {
+        if (!env.LABEL) return new Response("nothing is exposed here\n", { status: 404 });
+        const on = new Request("https://label/public", request);
+        on.headers.set("x-zsp-label", label);
+        on.headers.set("x-zsp-url", request.url);
+        return env.LABEL.get(env.LABEL.idFromName(label)).fetch(on);
+      }
+      // Nobody but the relay says what a request is for.
+      request = new Request(request);
+      request.headers.delete("x-zsp-label");
+      request.headers.delete("x-zsp-url");
       const { pathname } = new URL(request.url);
       if (pathname === "/") return new Response(publicKey(env.RELAY_SECRET) + "\n");
       if (!/^\/[0-9a-f]{64}$/.test(pathname)) return new Response("no such space\n", { status: 404 });

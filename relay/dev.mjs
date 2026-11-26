@@ -14,6 +14,7 @@ const mf = new Miniflare({
     { type: "ESModule", path: "worker.js", contents: text("worker.js") },
     { type: "ESModule", path: "index.js", contents: text("index.js") },
     { type: "ESModule", path: "storage.js", contents: text("storage.js") },
+    { type: "ESModule", path: "public.js", contents: text("public.js") },
     { type: "CompiledWasm", path: "relay.wasm", contents: readFileSync(at("relay.wasm")) },
   ],
   compatibilityDate: "2026-01-01",
@@ -27,11 +28,12 @@ const mf = new Miniflare({
     ...(process.env.BLOCKS_KEPT && { BLOCKS_KEPT: process.env.BLOCKS_KEPT }),
     ...(process.env.QUIET_TAIL && { QUIET_TAIL: process.env.QUIET_TAIL }),
     ...(process.env.QUIET_MS && { QUIET_MS: process.env.QUIET_MS }),
+    ...(process.env.EXPOSE_DOMAIN && { EXPOSE_DOMAIN: process.env.EXPOSE_DOMAIN }),
     STATS: "1",
   },
   // A bucket for what the objects' own storage does not keep, unless NO_R2 says to see what happens without one.
   ...(!process.env.NO_R2 && { r2Buckets: ["STORE"], r2Persist: process.env.PERSIST ?? false }),
-  durableObjects: { SPACE: { className: "Space", useSQLite: true } },
+  durableObjects: { SPACE: { className: "Space", useSQLite: true }, LABEL: { className: "Label", useSQLite: true } },
   durableObjectsPersist: process.env.PERSIST ?? false,
 });
 const url = await mf.ready;
