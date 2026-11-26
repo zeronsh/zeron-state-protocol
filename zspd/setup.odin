@@ -104,7 +104,9 @@ setup :: proc(args: []string) -> int {
 	return 0
 }
 
-DNS_PORT :: 5053 when ODIN_OS == .Linux || ODIN_OS == .FreeBSD else 53
+// Port 53 is root's to bind at an address of its own, everywhere but Windows (macOS lets anyone have it only at the
+// wildcard): so a node run by its user answers at 5053, and the system is told so. Windows asks no other port.
+DNS_PORT :: 53 when ODIN_OS == .Windows else 5053
 
 // Says a step, and unless this is a dry run, takes it.
 @(private = "file")

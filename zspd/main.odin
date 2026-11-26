@@ -91,7 +91,7 @@ USAGE :: `zspd - Zeron State Protocol node
   --names=<suffix>       run: find devices as <name>.<suffix> (zsp.internal)
   --no-names             run: give devices no names or addresses here
   --loopback=<127.a.b>   run: the first of the addresses devices are given (127.77.0)
-  --dns=<addr:port>      run: answer for names here (127.77.0.1:53, or :5053 where 53 needs root)
+  --dns=<addr:port>      run: answer for names here (127.77.0.1:5053; :53 on Windows)
   --catch=<addr:port>    run, Linux: where zspd setup sends connections to devices' addresses (127.0.0.1:5054)
   --proxy=<addr:port>    run: be a SOCKS 5 and HTTP proxy to devices here (127.0.0.1:1080); --no-proxy for none
   --trust-local-users    run: let anyone on this machine reach other devices' ports, not only this user
