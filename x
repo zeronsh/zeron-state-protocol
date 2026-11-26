@@ -125,6 +125,7 @@ test)
 	node tests/relay_settle.mjs && node tests/relay_checkpoints.mjs
 	node tests/relay_keep.mjs
 	node bench/aead_wasm/run.mjs simd check # zsp's ChaCha20-Poly1305 held to core's in WebAssembly, as the relay runs it
+	node relay/test/public.mjs
 	$PYTHON examples/apps/test.py
 	$PYTHON examples/organization.py
 	end_to_end

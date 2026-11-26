@@ -221,7 +221,8 @@ function body(call, framing, length) {
           }
           const b = await call.read();
           if (b) controller.enqueue(b);
-          else controller.close();
+          else if (call.fault) fail(controller, "the device was lost"); // an end that is not one: the body is cut short
+          else done(controller);
         }
       },
       cancel() {
@@ -258,7 +259,8 @@ export async function serve(request, label, open) {
     if (request.headers.get("upgrade")?.toLowerCase() === "websocket") return await socket(request, url, call);
     const length = request.headers.get("content-length");
     const hasBody = request.body && !["GET", "HEAD"].includes(request.method);
-    const framing = hasBody ? (length !== null ? `Content-Length: ${length}\r\n` : "Transfer-Encoding: chunked\r\n") : "";
+    // A request with no body says so where it could have one (a POST, a PUT), as servers ask of HTTP/1.1.
+    const framing = hasBody ? (length !== null ? `Content-Length: ${length}\r\n` : "Transfer-Encoding: chunked\r\n") : ["GET", "HEAD"].includes(request.method) ? "" : "Content-Length: 0\r\n";
     if (!(await call.write(enc.encode(requestHead(request, url, framing + "Connection: close\r\n"))))) throw new Error("lost");
     if (hasBody) {
       const reader = request.body.getReader();
@@ -320,7 +322,13 @@ async function socket(request, url, call) {
   const say = (opcode, payload) => {
     const frame = wsFrame(opcode, payload);
     queued += frame.length;
-    if (queued > WS_QUEUE) return server.close(1009, "too much at once"), call.cancel();
+    if (queued > WS_QUEUE) {
+      closed = true; // and nothing more is said of it, when the close comes
+      try {
+        server.close(1009, "too much at once");
+      } catch {}
+      return call.cancel();
+    }
     chain = chain.then(async () => {
       await call.write(frame);
       queued -= frame.length;
@@ -380,10 +388,12 @@ async function socket(request, url, call) {
       }
     }
     if (!closed) {
+      closed = true;
       try {
         server.close(1011, "what is exposed here was lost");
       } catch {}
     }
+    call.cancel(); // the port has gone: the call goes with it, whatever was said of it
   })();
   const headers = new Headers();
   for (const [name, value] of head.headers) if (name.toLowerCase() === "sec-websocket-protocol") headers.set(name, value);
