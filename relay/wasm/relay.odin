@@ -256,7 +256,7 @@ done :: proc "c" (id: u32, ok, absent: bool, size: int) {
 	free_all(context.temp_allocator)
 }
 
-// What it has cost so far, and where its log stands, into the buffer: fifteen numbers.
+// What it has cost so far, and where its log stands, into the buffer: sixteen numbers.
 @(export)
 stats :: proc "c" () -> int {
 	context = runtime.default_context()
