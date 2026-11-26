@@ -31,7 +31,9 @@ USAGE :: `zspd - Zeron State Protocol node
                                              and commands, or of files
   zspd revoke <dir> <key> [scope]            end a device's grants
   zspd subject <dir> <key> <text>            say whose a device is: an account, a name, as you know them
-  zspd members <dir>                         list devices: key, rights in each scope, whose it is
+  zspd name <dir> <key> [name]               name a device, as other devices will reach it: <name>.zsp.internal;
+                                             without a name, unname it
+  zspd members <dir>                         list devices: key, @name, rights in each scope, whose it is
   zspd admin <dir> <key> [off]               let a device do all of this but make admins and owners, or no longer
   zspd owner <dir> <key>                     make a device an owner too, for good
   zspd relay <dir> <key> <url>               name a relay for the space's devices to meet at
@@ -175,6 +177,28 @@ run :: proc() -> int {
 					m.subject = transmute([]byte)args[1]
 					return true
 				}
+			}
+			return false
+		})
+	case "name":
+		ok = len(rest) >= 1 && len(rest) <= 2 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
+			key, hexed := parse_hex(args[0], 64)
+			if !hexed {
+				key = parse_hex(args[0], 32) or_return
+			}
+			device: zsp.Key32
+			copy(device[:], key)
+			name := args[1] if len(args) > 1 else ""
+			if zsp.draft_name(&a.draft, device, name) {
+				return true
+			}
+			switch {
+			case name != "" && !zsp.name_valid(name):
+				say(os.stderr, "a name is 1 to 63 lower-case letters, digits and hyphens, with no hyphen at either end\n")
+			case zsp.roster_member(&a.roster, device) == nil:
+				say(os.stderr, "no such device\n")
+			case:
+				say(os.stderr, "another device has that name\n")
 			}
 			return false
 		})
@@ -324,6 +348,9 @@ members :: proc(dir: string) -> bool {
 			continue
 		}
 		say(os.stdout, to_hex(m.device[:]), to_hex(m.signer[:]))
+		if len(m.hostname) > 0 {
+			say(os.stdout, " @", string(m.hostname))
+		}
 		buf: [10]byte
 		for g in m.grants {
 			if g.until != 0 {

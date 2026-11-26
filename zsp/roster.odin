@@ -41,6 +41,7 @@ Member :: struct {
 	owner:   bool, // holds the space's signing key, and keeps it
 	admin:   bool, // may sign rosters
 	subject: []byte, // whom the host says this is; opaque here
+	hostname: []byte, // what the device is called in the space, a DNS label, if anything: see name_valid
 	// In the order given. At most one per scope is in force; the rest say what was once allowed, and so
 	// what was rightly written.
 	grants:  []Grant,
@@ -191,7 +192,7 @@ ed25519_verify :: proc(public: Key32, msg, sig: []byte) -> bool {
 @(require_results)
 roster_claims :: proc(bytes: []byte, space: Key32) -> (serial: u64, ok: bool) {
 	rd := Reader{buf = bytes}
-	if string(read_take(&rd, 6)) != "zsp-r1" || read_key32(&rd) != space {
+	if _, known := roster_version(read_take(&rd, 6)); !known || read_key32(&rd) != space {
 		return
 	}
 	_ = read_bytes(&rd)
@@ -211,7 +212,8 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 	r.bytes = slice.clone(bytes)
 	body, sig := r.bytes[:len(bytes) - 64], r.bytes[len(bytes) - 64:]
 	rd := Reader{buf = r.bytes[:len(body)]}
-	if string(read_take(&rd, 6)) != "zsp-r1" || read_key32(&rd) != space {
+	named, known := roster_version(read_take(&rd, 6))
+	if !known || read_key32(&rd) != space {
 		return
 	}
 	r.space = space
@@ -271,6 +273,17 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 			m.owner ||= o.device == m.device
 		}
 		m.subject = read_bytes(&rd)
+		if named {
+			m.hostname = read_bytes(&rd)
+			if len(m.hostname) > 0 && !name_valid(string(m.hostname)) {
+				return
+			}
+			for other in r.members[:i] {
+				if len(m.hostname) > 0 && string(other.hostname) == string(m.hostname) {
+					return
+				}
+			}
+		}
 		m.grants = make([]Grant, read_count(&rd))
 		for &g, j in m.grants {
 			g.scope = Scope(read_varint(&rd))
@@ -319,6 +332,47 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 	}
 	ok = ed25519_verify(space if by == 0 else r.admins[by - 1], body, sig)
 	return
+}
+
+// A roster that names no device is as it always was; one that names any says so first, and gives every member a name, if only an empty one.
+@(private, require_results)
+roster_version :: proc(magic: []byte) -> (named, known: bool) {
+	switch string(magic) {
+	case "zsp-r1":
+		return false, true
+	case "zsp-r2":
+		return true, true
+	}
+	return
+}
+
+// A name is one DNS label as a resolver would compare it: 1 to 63 lower-case letters, digits and hyphens, with no
+// hyphen at either end. So it means the same to every application that looks it up, and no two can be confused.
+@(require_results)
+name_valid :: proc(name: string) -> bool {
+	if len(name) == 0 || len(name) > 63 || name[0] == '-' || name[len(name) - 1] == '-' {
+		return false
+	}
+	for c in transmute([]byte)name {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// The member a name is given to, if any.
+@(require_results)
+roster_named :: proc(r: ^Roster, name: string) -> ^Member {
+	if len(name) == 0 {
+		return nil
+	}
+	for &m in r.members {
+		if string(m.hostname) == name {
+			return &m
+		}
+	}
+	return nil
 }
 
 @(private)
@@ -611,7 +665,36 @@ draft_revoke :: proc(d: ^Draft, device: Key32, scope: Scope = 0) {
 				}
 			}
 		}
+		if !member_active(&m) {
+			m.hostname = nil // a name goes with the last grant, and may be given again
+		}
 	}
+}
+
+// Names a device, or with "" unnames it. Refused if the name is not one, or is another's in force; one whose
+// grants have all ended gives it up.
+draft_name :: proc(d: ^Draft, device: Key32, name: string) -> bool {
+	if name != "" && !name_valid(name) {
+		return false
+	}
+	m: ^Member
+	for &x in d.members {
+		if x.device == device {
+			m = &x
+		} else if name != "" && string(x.hostname) == name && member_active(&x) {
+			return false
+		}
+	}
+	if m == nil {
+		return false
+	}
+	for &x in d.members {
+		if x.device != device && name != "" && string(x.hostname) == name {
+			x.hostname = nil
+		}
+	}
+	m.hostname = transmute([]byte)name
+	return true
 }
 
 // Whether these keys may sign the next roster after this one.
@@ -699,7 +782,11 @@ roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := con
 	defer if !ok {
 		delete(w)
 	}
-	append(&w, "zsp-r1")
+	named := false
+	for m in d.members {
+		named ||= len(m.hostname) > 0
+	}
+	append(&w, "zsp-r2" if named else "zsp-r1")
 	append(&w, ..space[:])
 	write_bytes(&w, charter)
 	write_varint(&w, serial)
@@ -736,6 +823,9 @@ roster_sign :: proc(k: ^Keyring, root: Maybe(Key32), d: ^Draft, allocator := con
 		append(&w, ..device[:])
 		append(&w, ..theirs[:])
 		write_bytes(&w, m.subject)
+		if named {
+			write_bytes(&w, m.hostname)
+		}
 		write_varint(&w, u64(len(m.grants)))
 		for g in m.grants {
 			write_varint(&w, u64(g.scope))
