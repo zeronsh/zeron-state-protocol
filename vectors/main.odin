@@ -4,7 +4,6 @@ the file is current and that the other implementations agree with it.
 */
 package vectors
 
-import "core:crypto/sha2"
 import "core:encoding/endian"
 import "core:encoding/hex"
 import "core:fmt"
@@ -32,9 +31,7 @@ main :: proc() {
 	handshake()
 	texts()
 	links()
-	files()
-	services()
-	names()
+	calls()
 	fmt.println(`  "version": 1`)
 	fmt.println("}")
 }
@@ -341,210 +338,25 @@ links :: proc() {
 	fmt.printfln(`  "link_packet": {{"key": "%s", "receiver": "decafbad", "counter": 77, "frames": "%s", "packet": "%s"}},`, h(c.send[:]), h(plain), h(packet))
 }
 
-// Files hashed in chunks (§16): each chunk of a MiB by SHA-256, the file by SHA-256 of the chunks' hashes. The content of
-// each is byte i = i * 7 + i / 251, mod 256.
-files :: proc() {
-	CHUNK :: 1 << 20
-	sizes := []int{0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK + CHUNK / 2}
-	fmt.println(`  "files": [`)
-	for size, n in sizes {
-		data := make([]byte, size)
-		for &x, i in data {
-			x = byte(i * 7 + i / 251)
-		}
-		file: sha2.Context_256
-		sha2.init_256(&file)
-		fmt.printf(`    {{"size": %d, "chunks": [`, size)
-		for at, k := 0, 0; at < size; at, k = at + CHUNK, k + 1 {
-			chunk: [32]byte
-			one: sha2.Context_256
-			sha2.init_256(&one)
-			sha2.update(&one, data[at:min(at + CHUNK, size)])
-			sha2.final(&one, chunk[:])
-			sha2.update(&file, chunk[:])
-			fmt.printf(`%s"%s"`, ", " if k > 0 else "", h(chunk[:]))
-		}
-		whole: [32]byte
-		sha2.final(&file, whole[:])
-		fmt.printfln(`], "file": "%s"}}%s`, h(whole[:]), "," if n + 1 < len(sizes) else "")
-	}
-	fmt.println("  ],")
-}
-
-// What services say (§16), byte for byte.
-services :: proc() {
-	Message :: struct {
-		name:  string,
-		bytes: []byte,
-	}
-	w :: proc() -> [dynamic]byte {return {}}
-	strs :: proc(w: ^[dynamic]byte, s: ..string) {
-		zsp.write_varint(w, u64(len(s)))
-		for x in s {
-			zsp.write_bytes(w, transmute([]byte)x)
-		}
-	}
-	exec := w()
-	append(&exec, 0)
-	strs(&exec, "ls", "-l", "/tmp")
-	strs(&exec, "LANG=C", "HOME")
-	zsp.write_bytes(&exec, transmute([]byte)string("/srv"))
-	pty := w()
-	append(&pty, 0, 24, 0, 80)
-	zsp.write_bytes(&pty, transmute([]byte)string("xterm-256color"))
-	strs(&pty)
-	strs(&pty, "COLORTERM=truecolor")
-	zsp.write_bytes(&pty, nil)
-	get := w()
-	zsp.write_bytes(&get, transmute([]byte)string("docs/report.pdf"))
-	zsp.write_varint(&get, 3 << 20)
-	zsp.write_bytes(&get, {0xaa, 0xbb, 0xcc})
-	put := w()
-	zsp.write_bytes(&put, transmute([]byte)string("docs/new/report.pdf"))
-	zsp.write_varint(&put, 2621440)
-	zsp.write_varint(&put, 1700000000123)
-	zsp.write_bytes(&put, {1, 2, 3, 4})
-	append(&put, 3)
-	list := w()
-	zsp.write_bytes(&list, transmute([]byte)string("docs/sub"))
-	entry := w()
-	append(&entry, 1)
-	zsp.write_bytes(&entry, transmute([]byte)string("a.txt"))
-	zsp.write_varint(&entry, 1234)
-	zsp.write_varint(&entry, 1700000000000)
-	listed := w()
-	append(&listed, 0, 1, 3, 2, 3)
-	zsp.write_bytes(&listed, transmute([]byte)string("docs"))
-	append(&listed, 3, 0, 22)
-	zsp.write_bytes(&listed, nil)
-	zsp.write_bytes(&listed, transmute([]byte)string("ssh"))
-	exit := w()
-	append(&exit, 3)
-	zsp.write_varint(&exit, 1)
-	append(&exit, 0)
-	killed := w()
-	append(&killed, 3)
-	zsp.write_varint(&killed, 0)
-	append(&killed, 9)
-	got := w()
-	append(&got, 0)
-	zsp.write_varint(&got, 2621440)
-	zsp.write_varint(&got, 1700000000123)
-	zsp.write_bytes(&got, {0xaa, 0xbb, 0xcc})
-	zsp.write_varint(&got, 1 << 20)
-	from := w()
-	append(&from, 0)
-	zsp.write_varint(&from, 2 << 20)
-	denied := w()
-	append(&denied, 1)
-	append(&denied, "not shared with you")
-	messages := []Message {
-		{"zsp.tcp to port 22 of 127.0.0.1", {0, 22, '1', '2', '7', '.', '0', '.', '0', '.', '1'}},
-		{"zsp.exec ls -l /tmp, LANG=C and without HOME, in /srv", exec[:]},
-		{"zsp.pty 24 rows by 80, xterm-256color, the user's shell, COLORTERM=truecolor", pty[:]},
-		{"zsp.get docs/report.pdf from 3 MiB, as it was", get[:]},
-		{"zsp.put docs/new/report.pdf of 2.5 MiB, replacing, making folders", put[:]},
-		{"zsp.list docs/sub", list[:]},
-		{"an entry: a.txt, 1234 bytes", entry[:]},
-		{"zsp.services: terminals and commands, docs to read and write, port 22 as ssh", listed[:]},
-		{"status: ok", {0}},
-		{"status: denied, with a reason", denied[:]},
-		{"zsp.get answered: 2.5 MiB, from 1 MiB", got[:]},
-		{"zsp.put answered: from 2 MiB", from[:]},
-		{"input: ls", {0, 'l', 's', '\n'}},
-		{"signal: interrupt", {1, 2}},
-		{"resize: 50 rows by 132", {2, 0, 50, 0, 132}},
-		{"output: hi", {1, 'h', 'i'}},
-		{"errors: no", {2, 'n', 'o'}},
-		{"exited 1", exit[:]},
-		{"killed by 9", killed[:]},
-		{"a chunk's hash follows its bytes", {2, 0x5e, 0x88, 0x48, 0x98, 0xda, 0x28, 0x04, 0x71, 0x51, 0xd0, 0xe5, 0x6f, 0x8d, 0xc6, 0x29, 0x27, 0x73, 0x60, 0x3d, 0x0d, 0x6a, 0xab, 0xbd, 0xd6, 0x2a, 0x11, 0xef, 0x72, 0x1d, 0x15, 0x42, 0xd8}},
-		{"the end of a file sent whole, with its hash", {3, 0, 0x5e, 0x88, 0x48, 0x98, 0xda, 0x28, 0x04, 0x71, 0x51, 0xd0, 0xe5, 0x6f, 0x8d, 0xc6, 0x29, 0x27, 0x73, 0x60, 0x3d, 0x0d, 0x6a, 0xab, 0xbd, 0xd6, 0x2a, 0x11, 0xef, 0x72, 0x1d, 0x15, 0x42, 0xd8}},
-	}
-	fmt.println(`  "services": [`)
-	for m, i in messages {
-		fmt.printfln(`    {{"message": "%s", "bytes": "%s"}}%s`, m.name, h(m.bytes), "," if i + 1 < len(messages) else "")
-	}
-	fmt.println("  ],")
-}
-
-// Names, addresses and exposure (§17): what a device works out for itself, and what two of them must agree on.
-names :: proc() {
-	fmt.println(`  "names": {`)
-	fmt.print(`    "ids": [`)
-	for n in 0 ..< 4 {
-		k: zsp.Keyring
-		zsp.keyring_init(&k, key_of(byte(n * 40 + 1)))
-		id := zsp.name_id(k.device)
-		fmt.printf(`%s{{"device": "%s", "id": "%s"}}`, ", " if n > 0 else "", h(k.device[:]), string(id[:]))
-	}
-	fmt.println(`],`)
-	// The address of the member at an index, from 127.a.b: 127.a.(b + (index + 2) / 256).((index + 2) mod 256).
-	fmt.print(`    "addresses": [`)
-	cases := [][3]int{{77, 0, 0}, {77, 0, 1}, {77, 0, 253}, {77, 0, 254}, {77, 0, 1000}, {90, 3, 7}}
-	for c, i in cases {
-		v := c[2] + 2
-		fmt.printf(`%s{{"loopback": "127.%d.%d", "index": %d, "address": "127.%d.%d.%d"}}`, ", " if i > 0 else "", c[0], c[1], c[2], c[0], c[1] + v / 256, v % 256)
-	}
-	fmt.println(`],`)
-	fmt.print(`    "labels": [`)
-	prefixes := []string{"", "web", "a-b-c"}
-	for n in 0 ..< 3 {
-		space, device := key_of(byte(200 + n)), key_of(byte(100 + n))
-		nonce: [zsp.EXPOSE_NONCE]byte
-		for &b, i in nonce {
-			b = byte(i * 7 + n)
-		}
-		prefix := prefixes[n]
-		fmt.printf(`%s{{"space": "%s", "device": "%s", "prefix": "%s", "nonce": "%s", "label": "%s"}}`, ", " if n > 0 else "", h(space[:]), h(device[:]), prefix, h(nonce[:]), zsp.exposure_label(space, device, prefix, nonce))
-	}
-	fmt.println(`],`)
-	// zsp.ports: n varint ‖ n × { port (2) ‖ scope varint ‖ host bytes ‖ name bytes }
-	entries := [?]struct {
-		port:  u16,
-		scope: u64,
-		host:  string,
-		name:  string,
-	}{{22, 1, "", "ssh"}, {5432, 300, "10.0.0.4", ""}, {65535, 1 << 31, "", ""}}
-	w: [dynamic]byte
-	zsp.write_varint(&w, u64(len(entries)))
-	fmt.print(`    "entries": {"list": [`)
-	for e, i in entries {
-		append(&w, byte(e.port >> 8), byte(e.port))
-		zsp.write_varint(&w, e.scope)
-		zsp.write_bytes(&w, transmute([]byte)e.host)
-		zsp.write_bytes(&w, transmute([]byte)e.name)
-		fmt.printf(`%s{{"port": %d, "scope": %d, "host": "%s", "name": "%s"}}`, ", " if i > 0 else "", e.port, e.scope, e.host, e.name)
-	}
-	fmt.printfln(`], "wire": "%s"}},`, h(w[:]))
-	// An offer, as zsp.offers says it: lo (2) ‖ hi (2) ‖ scope varint ‖ device (32) ‖ host bytes ‖ name bytes ‖ flags (1)
-	offer: [dynamic]byte
-	append(&offer, 0x1f, 0x40, 0x1f, 0x4a)
-	zsp.write_varint(&offer, 3)
-	dev := key_of(7)
-	append(&offer, ..dev[:])
-	zsp.write_bytes(&offer, nil)
-	zsp.write_bytes(&offer, transmute([]byte)string("dev"))
-	append(&offer, 1)
-	fmt.printfln(`    "offer": {{"lo": 8000, "hi": 8010, "scope": 3, "device": "%s", "host": "", "name": "dev", "proxy": true, "wire": "%s"}},`, h(dev[:]), h(offer[:]))
-	// A roster that names devices: zsp-r2, a name after each member's subject.
-	owner, other: zsp.Keyring
-	zsp.keyring_init(&owner, key_of(11))
-	zsp.keyring_init(&other, key_of(12))
-	root := key_of(13)
-	none: zsp.Roster
-	d := zsp.draft_from(&none, 1700000000000 << 16)
-	d.random = proc(into: []byte) {
-		for &b, i in into {
-			b = byte(i * 13 + 5)
-		}
-	}
-	home := zsp.draft_scope(&d)
-	zsp.draft_grant(&d, owner.device, owner.signer, home, {.Write, .Call}).owner = true
-	zsp.draft_grant(&d, other.device, other.signer, home, {.Write, .Call})
-	_ = zsp.draft_name(&d, other.device, "desk")
-	roster, _ := zsp.roster_sign(&owner, root, &d)
-	space := zsp.ed25519_public(root)
-	fmt.printfln(`    "roster": {{"space": "%s", "names": ["", "desk"], "bytes": "%s"}}`, h(space[:]), h(roster))
-	fmt.println(`  },`)
+// A local client's Call (§12), which says how urgent it is, and a Flow: frames as a pipe carries them.
+calls :: proc() {
+	device := key_of(70)
+	call := make([dynamic]byte)
+	at := zsp.frame_begin(&call, .Call)
+	zsp.write_varint(&call, 1)
+	append(&call, ..device[:])
+	zsp.write_varint(&call, 300)
+	zsp.write_bytes(&call, transmute([]byte)string("echo"))
+	zsp.write_bytes(&call, nil)
+	zsp.write_u8(&call, 1)
+	append(&call, "hi")
+	zsp.frame_end(&call, at)
+	credit := make([dynamic]byte)
+	at = zsp.frame_begin(&credit, .Flow)
+	zsp.write_varint(&credit, 1 << 1 | 1)
+	zsp.write_u8(&credit, u8(zsp.Flow.Credit))
+	zsp.write_varint(&credit, 65536)
+	zsp.frame_end(&credit, at)
+	fmt.printfln(`  "local_call": {{"id": 1, "device": "%s", "scope": 300, "method": "echo", "for": "", "urgency": 1, "first": "6869", "frame": "%s"}},`, h(device[:]), h(call[:]))
+	fmt.printfln(`  "credit": {{"id": 1, "callee": true, "bytes": 65536, "frame": "%s"}},`, h(credit[:]))
 }

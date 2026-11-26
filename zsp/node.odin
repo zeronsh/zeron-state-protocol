@@ -45,11 +45,10 @@ Host :: struct {
 	roster:       proc(data: rawptr, bytes: []byte), // a newer roster was adopted: persist it
 	signal:       proc(data: rawptr, from: Key32, blob: []byte), // from another member, via a relay
 	presence:     proc(data: rawptr, online: []Key32),
-	// A message between a device and a relay of what the device exposes to the public (types EXPOSE onwards).
-	exposure:     proc(data: rawptr, s: ^Session, type: u8, payload: []byte),
 	questions:    Questions,
-	// A call to a method the host serves itself (see hosted). Take it, answering nil, or say why not; what the host
-	// says in it goes by node_flow, and may be said at once. The node has checked rights to call already.
+	// A call to this device, from another or from a local client, which the host may answer itself: take it, answering
+	// nil, or say why not; .Unserved passes it on to a local client that serves the method, if any. What the host says
+	// in it goes by node_flow, and may be said at once. The node has checked rights to call already.
 	method:       proc(data: rawptr, call: u64, from: Caller_Info, scope: Scope, method: string, first: []byte) -> Maybe(Call_Fault),
 	// What is said in calls whose end is the host: as a method's server, or as a caller by node_call_method.
 	flow:         proc(data: rawptr, call: u64, kind: Flow, payload: []byte),

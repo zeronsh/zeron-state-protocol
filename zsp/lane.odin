@@ -30,19 +30,9 @@ Lane :: struct {
 	heard:   bool, // the other end has ended its side
 }
 
-// How urgent a call is, by its method: what someone is typing into first, what is copied in bulk last. What may be
-// either, a command or a port, is in the middle with everything else, where what has lately said little goes first.
-method_urgency :: proc(method: string) -> u8 {
-	switch method {
-	case "zsp.pty":
-		return 1
-	case "zsp.get", "zsp.put":
-		return 6
-	case "":
-		return 4 // between nodes themselves
-	}
-	return 3
-}
+URGENCY :: 3 // a call's lane, unless its caller says otherwise
+URGENCY_NODES :: 4 // of calls between nodes themselves
+URGENCY_LEAST :: 7
 
 // What a session has produced on its own stream, sent or not.
 @(private)

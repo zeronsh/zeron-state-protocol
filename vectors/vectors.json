@@ -81,44 +81,7 @@
     {"frame": "header: urgency 1, after 300", "bytes": "01ac02"}
   ],
   "link_packet": {"key": "3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b", "receiver": "decafbad", "counter": 77, "frames": "0304e8070568656c6c6f01", "packet": "43adfbcade4d00000000000000476b40aad7f93441a68ba858c16554f40db7e3a546247b7fd9c454"},
-  "files": [
-    {"size": 0, "chunks": [], "file": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
-    {"size": 1, "chunks": ["6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"], "file": "1406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a"},
-    {"size": 1048575, "chunks": ["f026d0087f9ff402b3a63fa604c0f5943093fd9b7a0d1044c57dac59785d4e86"], "file": "e1410636ccd3afe1d4bf57cb6b355ba5c8a0a727b927e4b0c41b0d29c51e5c96"},
-    {"size": 1048576, "chunks": ["07f4465ef6fe98070beaf8d8d01454b5d11f6cd4ff86a139d92cd031b46ddfdc"], "file": "87c51d8df8c08ae3aef390ad634b258177ec139262c7c9bd23f6ee553a4bc10c"},
-    {"size": 1048577, "chunks": ["07f4465ef6fe98070beaf8d8d01454b5d11f6cd4ff86a139d92cd031b46ddfdc", "4ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc33260"], "file": "99541925ae307285cfcff8411df09bff987636d574e5e76fe6fd78ca5eea0300"},
-    {"size": 2621440, "chunks": ["07f4465ef6fe98070beaf8d8d01454b5d11f6cd4ff86a139d92cd031b46ddfdc", "2a845af73a736cfe6eff25de173253b704ce63b1750e50e120262289317e3d53", "8523a1f6417c4b6e699d1f3287203b0c746b5db43a439fbc38701a19d55055b5"], "file": "1568f2437762dfb35c17213276434fc53cf481e97cd97f7d440a74e1354a0831"}
-  ],
-  "services": [
-    {"message": "zsp.tcp to port 22 of 127.0.0.1", "bytes": "00163132372e302e302e31"},
-    {"message": "zsp.exec ls -l /tmp, LANG=C and without HOME, in /srv", "bytes": "0003026c73022d6c042f746d7002064c414e473d4304484f4d45042f737276"},
-    {"message": "zsp.pty 24 rows by 80, xterm-256color, the user's shell, COLORTERM=truecolor", "bytes": "001800500e787465726d2d323536636f6c6f72000113434f4c4f525445524d3d74727565636f6c6f7200"},
-    {"message": "zsp.get docs/report.pdf from 3 MiB, as it was", "bytes": "0f646f63732f7265706f72742e7064668080c00103aabbcc"},
-    {"message": "zsp.put docs/new/report.pdf of 2.5 MiB, replacing, making folders", "bytes": "13646f63732f6e65772f7265706f72742e7064668080a001fbd095ffbc31040102030403"},
-    {"message": "zsp.list docs/sub", "bytes": "08646f63732f737562"},
-    {"message": "an entry: a.txt, 1234 bytes", "bytes": "0105612e747874d20980d095ffbc31"},
-    {"message": "zsp.services: terminals and commands, docs to read and write, port 22 as ssh", "bytes": "000103020304646f63730300160003737368"},
-    {"message": "status: ok", "bytes": "00"},
-    {"message": "status: denied, with a reason", "bytes": "016e6f7420736861726564207769746820796f75"},
-    {"message": "zsp.get answered: 2.5 MiB, from 1 MiB", "bytes": "008080a001fbd095ffbc3103aabbcc808040"},
-    {"message": "zsp.put answered: from 2 MiB", "bytes": "0080808001"},
-    {"message": "input: ls", "bytes": "006c730a"},
-    {"message": "signal: interrupt", "bytes": "0102"},
-    {"message": "resize: 50 rows by 132", "bytes": "0200320084"},
-    {"message": "output: hi", "bytes": "016869"},
-    {"message": "errors: no", "bytes": "026e6f"},
-    {"message": "exited 1", "bytes": "030100"},
-    {"message": "killed by 9", "bytes": "030009"},
-    {"message": "a chunk's hash follows its bytes", "bytes": "025e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"},
-    {"message": "the end of a file sent whole, with its hash", "bytes": "03005e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"}
-  ],
-  "names": {
-    "ids": [{"device": "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c", "id": "a6rxzpauecj4rn2v"}, {"device": "46b1880a0dca97ae1618d3d8c04cc51b10fd08c1cd8839c1bbf4bd7fe014005d", "id": "i2yyqcqnzkl24fqy"}, {"device": "0233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614", "id": "aiz7abxpjpwritva"}, {"device": "ff32c150195988671fcfd84fac64903190b70cad38eb2a730106a2069d5fde7b", "id": "74zmcuazlgegoh6p"}],
-    "addresses": [{"loopback": "127.77.0", "index": 0, "address": "127.77.0.2"}, {"loopback": "127.77.0", "index": 1, "address": "127.77.0.3"}, {"loopback": "127.77.0", "index": 253, "address": "127.77.0.255"}, {"loopback": "127.77.0", "index": 254, "address": "127.77.1.0"}, {"loopback": "127.77.0", "index": 1000, "address": "127.77.3.234"}, {"loopback": "127.90.3", "index": 7, "address": "127.90.3.9"}],
-    "labels": [{"space": "c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7", "device": "6465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80818283", "prefix": "", "nonce": "00070e151c232a31383f464d545b6269", "label": "li4gzlkk353dbjiw"}, {"space": "c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8", "device": "65666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f8081828384", "prefix": "web", "nonce": "01080f161d242b323940474e555c636a", "label": "web-k5qyry6mbpxqp6zr"}, {"space": "cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9", "device": "666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485", "prefix": "a-b-c", "nonce": "020910171e252c333a41484f565d646b", "label": "a-b-c-eetnsrdfyx54hnsz"}],
-    "entries": {"list": [{"port": 22, "scope": 1, "host": "", "name": "ssh"}, {"port": 5432, "scope": 300, "host": "10.0.0.4", "name": ""}, {"port": 65535, "scope": 2147483648, "host": "", "name": ""}], "wire": "0300160100037373681538ac020831302e302e302e3400ffff80808080080000"},
-    "offer": {"lo": 8000, "hi": 8010, "scope": 3, "device": "0708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526", "host": "", "name": "dev", "proxy": true, "wire": "1f401f4a030708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526000364657601"},
-    "roster": {"space": "7633a8e7735016558461d49ad3c83bcbe85ca1bc39c1d0f66958beda0772b027", "names": ["", "desk"], "bytes": "7a73702d72327633a8e7735016558461d49ad3c83bcbe85ca1bc39c1d0f66958beda0772b027d30101c25e8b84378b21071d603dfce3f947b162b6e715240344db0a18d99259a6de2301e34fdd9be280c51c1af294096ddb061557e421e4e302e9319f86fed85a99e0537b27929182753f7dc37462d638b587cf0c3a73480c889b2c548238504d790ffd10743e954d7f73842a952604325f0483b03b49ab58897bac14c27be4309c7be2e6403635c934c92b9db14068459a9e74002addbc1343c38afe77ad481cd03ac951d6cbfe88ad645972ec1f5a0edfc816fe4a5a10db87ff9afc98e0a7fe4bbfdb0407cb7ffc3cac6078ef09befbb37a0f0ea1a2c1808080040101000118e5fb6035e0270caee456b545550c6efdd764e893b4effd31a8113324cf0f1902e34fdd9be280c51c1af294096ddb061557e421e4e302e9319f86fed85a99e0537b27929182753f7dc37462d638b587cf0c3a73480c889b2c548238504d790ffd000001010700a6c5ed3bcc9fc7ebf8c4fc3eed9a4b43748b1780074aa74de8b89d9f50f00349a3da4c5ecf6d7d2e410b581e4660a45fae89a6314fdeaad4b0a1ef5b7b76d0d000046465736b0101070000c25e8b84378b21071d603dfce3f947b162b6e715240344db0a18d99259a6de23421e5a58b67da2c58c350661b1fcc64b32b73ed8118f81e349e1ba60c3a0b21edc82309d5d099983f8b625ccc37ef849134be3df2da27b477e6b301c01a8c9c9b85e850950b4e7e03fa2fa080af4184b03b6eadf0b12131d0ae7d87e8b036324007587a4df0a9bd422f502f46e4737f465cc7418cccf743a28769a49fc6876dcc3c3441db0e7a9bddf0e101205a9d29ebf33c43dcc65ca74bb00bdd87b3649080d"}
-  },
+  "local_call": {"id": 1, "device": "464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465", "scope": 300, "method": "echo", "for": "", "urgency": 1, "first": "6869", "frame": "2d0f01464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465ac02046563686f00016869"},
+  "credit": {"id": 1, "callee": true, "bytes": 65536, "frame": "06100304808004"},
   "version": 1
 }

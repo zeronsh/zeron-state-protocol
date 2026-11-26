@@ -465,25 +465,9 @@ session_frame :: proc(s: ^Session, frame: []byte) -> Fault {
 		if q := &n.host.questions; frame[0] >= QUESTION && s.role == .Open && q.asked != nil {
 			return .None if q.asked(q.data, s, frame[0], frame[1:]) else .Malformed
 		}
-		if frame[0] >= EXPOSE && frame[0] < EXPOSE + 8 && s.role == .Peer && n.host.exposure != nil {
-			n.host.exposure(n.host.data, s, frame[0], frame[1:]) // between a device and a relay: the host's
-		}
 		return .None // unknown messages are for a later version
 	}
 	return .Malformed if r.bad else .None
-}
-
-// The least of the eight message types a device and a relay say to each other of what the device exposes, which are
-// their hosts' affair (§17).
-EXPOSE :: 40
-
-// Says a message of one of those types.
-session_say :: proc(s: ^Session, type: u8, payload: []byte) {
-	flush_changes(s)
-	cells_close(s)
-	at := frame_begin(&s.out, Message(type))
-	append(&s.out, ..payload)
-	frame_end(&s.out, at)
 }
 
 // ---------------------------------------------------------------- greeting

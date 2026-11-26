@@ -5,6 +5,7 @@ import "core:crypto"
 import "core:crypto/ecdh"
 import "core:crypto/noise"
 import "core:crypto/ed25519"
+import "core:slice"
 import "core:testing"
 
 @(private)
@@ -226,76 +227,52 @@ those_who_rule_have_every_scope :: proc(t: ^testing.T) {
 	roster_destroy(&r)
 }
 
-// A roster is sent whole, so one that could not be is none.
+// A roster is zsp-r1 and nothing else, and its rights are those §3 names: another version, or a right nobody knows,
+// is refused however soundly it is signed.
 @(test)
-roster_names :: proc(t: ^testing.T) {
+rosters_are_what_they_were :: proc(t: ^testing.T) {
 	root, space := test_root()
-	a, b, c := test_keyring(), test_keyring(), test_keyring()
+	a, b := test_keyring(), test_keyring()
 	defer keyring_destroy(&a)
 	defer keyring_destroy(&b)
-	defer keyring_destroy(&c)
 	none: Roster
 	d := draft_from(&none, 100)
 	home := draft_scope(&d)
 	draft_grant(&d, a.device, a.signer, home, {.Write}).owner = true
-	draft_grant(&d, b.device, b.signer, home, {.Write})
-	draft_grant(&d, c.device, c.signer, home, {.Write})
-
-	// A roster that names nobody is what it always was, byte for byte.
+	draft_grant(&d, b.device, b.signer, home, {.Write, .Call, .Vouch})
 	plain, signed := roster_sign(&a, root, &d, context.temp_allocator)
 	testing.expect(t, signed && string(plain[:6]) == "zsp-r1")
-
-	testing.expect(t, draft_name(&d, b.device, "desk-top"))
-	testing.expect(t, draft_name(&d, c.device, "laptop"))
-	testing.expect(t, !draft_name(&d, a.device, "laptop")) // another's, while it is in force
-	testing.expect(t, name_valid("id") && !device_name_valid("id")) // a label of a domain, but no device's
-	for bad in ([]string{"", "id", "Laptop", "-x", "x-", "a.b", "a b", "\x00", "0123456789012345678901234567890123456789012345678901234567890123"}) {
-		testing.expectf(t, !draft_name(&d, a.device, bad) || bad == "", "%q is not a name", bad)
-	}
-	named, ok := roster_sign(&a, root, &d, context.temp_allocator)
-	testing.expect(t, ok && string(named[:6]) == "zsp-r2")
-	serial, claimed := roster_claims(named, space)
-	testing.expect(t, claimed && serial > 0)
-	r, sound := roster_parse(named, space)
-	defer roster_destroy(&r)
+	r, sound := roster_parse(plain, space)
 	testing.expect(t, sound)
-	testing.expect_value(t, string(roster_member(&r, b.device).hostname), "desk-top")
-	testing.expect_value(t, string(roster_member(&r, c.device).hostname), "laptop")
-	testing.expect_value(t, string(roster_member(&r, a.device).hostname), "")
-	testing.expect(t, roster_named(&r, "laptop") == roster_member(&r, c.device))
-	testing.expect(t, roster_named(&r, "nobody") == nil)
+	roster_destroy(&r)
 
-	// Nobody can be named so as to be taken for another, nor by anything a resolver would read otherwise.
-	twice := draft_from(&r, 200)
-	for &m in twice.members {
-		if m.device == a.device {
-			m.hostname = transmute([]byte)string("laptop")
-		}
+	// The same, signed afresh by the space, under another version.
+	resign :: proc(root: Key32, bytes: []byte) -> []byte {
+		root := root
+		sk: ed25519.Private_Key
+		_ = ed25519.private_key_set_bytes(&sk, root[:])
+		ed25519.sign(&sk, bytes[:len(bytes) - 64], bytes[len(bytes) - 64:])
+		return bytes
 	}
-	bytes, _ := roster_sign(&a, root, &twice, context.temp_allocator)
-	_, parsed := roster_parse(bytes, space)
-	testing.expect(t, !parsed)
-	upper := draft_from(&r, 200)
-	for &m in upper.members {
-		if m.device == a.device {
-			m.hostname = transmute([]byte)string("Ann")
-		}
-	}
-	bytes, _ = roster_sign(&a, root, &upper, context.temp_allocator)
-	_, parsed = roster_parse(bytes, space)
-	testing.expect(t, !parsed)
+	other := slice.clone(plain, context.temp_allocator)
+	copy(other, "zsp-r2")
+	_, sound = roster_parse(resign(root, other), space)
+	testing.expect(t, !sound)
+	copy(other, "zsp-r1")
+	r, sound = roster_parse(resign(root, other), space)
+	testing.expect(t, sound) // and so it is the version alone that was refused
+	roster_destroy(&r)
 
-	// A name is let go with its device's last grant, and may then be given to another.
-	gone := draft_from(&r, 300)
-	draft_revoke(&gone, c.device)
-	testing.expect(t, draft_name(&gone, a.device, "laptop"))
-	again, _ := roster_sign(&a, root, &gone, context.temp_allocator)
-	r2, fine := roster_parse(again, space)
-	defer roster_destroy(&r2)
-	testing.expect(t, fine)
-	testing.expect(t, roster_named(&r2, "laptop") == roster_member(&r2, a.device))
-	testing.expect_value(t, string(roster_member(&r2, c.device).hostname), "")
-	testing.expect(t, draft_name(&gone, a.device, "")) // and none at all
+	for bit in ([]u8{16, 32, 64, 128}) {
+		odd := draft_from(&none, 100)
+		scope := draft_scope(&odd)
+		draft_grant(&odd, a.device, a.signer, scope, {.Write}).owner = true
+		draft_grant(&odd, b.device, b.signer, scope, transmute(Rights)(transmute(u8)Rights{.Read, .Write} | bit))
+		bytes, ok := roster_sign(&a, root, &odd, context.temp_allocator)
+		testing.expect(t, ok)
+		_, sound = roster_parse(bytes, space)
+		testing.expectf(t, !sound, "a grant with right %d is refused", bit)
+	}
 }
 
 @(test)

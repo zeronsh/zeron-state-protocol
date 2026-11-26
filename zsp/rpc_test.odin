@@ -90,8 +90,17 @@ caller_serve :: proc(c: ^Caller, scope: Scope, method: string) -> bool {
 
 @(private)
 caller_call :: proc(c: ^Caller, id: u64, device: Key32, scope: Scope, method, body: string) {
+	device := device
 	w := make([dynamic]byte, context.temp_allocator)
-	call_put(&w, nil, id, device, scope, method, c.claim, transmute([]byte)body)
+	at := frame_begin(&w, .Call)
+	write_varint(&w, id)
+	append(&w, ..device[:])
+	write_varint(&w, u64(scope))
+	write_bytes(&w, transmute([]byte)method)
+	write_bytes(&w, c.claim)
+	write_u8(&w, URGENCY) // a local client says how urgent
+	append(&w, ..transmute([]byte)body)
+	frame_end(&w, at)
 	session_input(c.s, w[:])
 }
 
@@ -409,9 +418,9 @@ hosts_speak_at_once :: proc(t: ^testing.T) {
 			}
 		}
 	}
-	keep := node_call_method(&a.node, b.keys.device, 1, "zsp.x", nil)
-	q := node_call_method(&a.node, b.keys.device, 1, "zsp.x", nil)
-	p := node_call_method(&a.node, b.keys.device, 1, "zsp.x", nil)
+	keep := node_call_method(&a.node, b.keys.device, 1, "x", nil)
+	q := node_call_method(&a.node, b.keys.device, 1, "x", nil)
+	p := node_call_method(&a.node, b.keys.device, 1, "x", nil)
 	testing.expect(t, keep != 0 && q != 0 && p != 0)
 	sim_settle(&s)
 	testing.expect_value(t, len(hb.calls), 3)

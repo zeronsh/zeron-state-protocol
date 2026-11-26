@@ -57,7 +57,6 @@ Call :: struct {
 	ends:    [2]End,
 	scope:   Scope,
 	own:     bool, // between the nodes themselves
-	public:  bool, // a relay's, for something a device makes public, which no grant governs
 	urgency: u8, // of the lanes it takes
 }
 
@@ -97,9 +96,6 @@ on_serve :: proc(s: ^Session, r: ^Reader) {
 		r.bad = true
 		return
 	}
-	if hosted(method) {
-		return // the host's own, which no client may stand in for
-	}
 	for x, i in n.serving {
 		if x.session == s.id && x.scope == scope && x.method == method {
 			delete(x.method)
@@ -121,8 +117,11 @@ on_call :: proc(s: ^Session, r: ^Reader, lane: ^Lane = nil) {
 	scope := Scope(read_varint(r))
 	method := string(read_bytes(r))
 	who := read_bytes(r)
+	local := s.role == .Open
+	// A local client says how urgent its call is; a peer's lane says so for it.
+	urgency := read_u8(r) if local else (lane.urgency if lane != nil else URGENCY)
 	body := read_take(r, len(r.buf) - r.pos)
-	if r.bad || n.keys == nil || len(who) > MAX_AS {
+	if r.bad || n.keys == nil || len(who) > MAX_AS || urgency > URGENCY_LEAST {
 		r.bad = true
 		return
 	}
@@ -141,16 +140,11 @@ on_call :: proc(s: ^Session, r: ^Reader, lane: ^Lane = nil) {
 			return
 		}
 	}
-	local := s.role == .Open
 	caller := s.peer
 	own := method == ""
 	need := Right.Read if own else Right.Call
 	allowed := need in (session_rights(s, scope) if local else device_rights(n, caller, scope))
-	// A relay this device dialled may call it for what it makes public, and for nothing else.
-	public := method == PUBLIC && scope == 0 && !local && s.peer_relay
-	if public {
-		allowed = true
-	} else if local {
+	if local {
 		allowed &&= !own && .Call in device_rights(n, n.keys.device, scope) && .Call in device_rights(n, device, scope)
 		// A client is for whom the host says it is, and not for whom it says.
 		may: bool
@@ -172,38 +166,11 @@ on_call :: proc(s: ^Session, r: ^Reader, lane: ^Lane = nil) {
 	}
 	from.granted -= len(body)
 	n.next_call += 1
-	c := Call{scope = scope, own = own, public = public, urgency = lane.urgency if lane != nil else method_urgency(method)}
+	c := Call{scope = scope, own = own, urgency = urgency}
 	c.ends[CALLER] = from
 	to := &c.ends[CALLEE]
 	to.id = n.next_call
 	to.granted = CALL_WINDOW
-
-	if hosted(method) && (!local || device == n.keys.device) {
-		if n.host.method == nil {
-			refuse(n, from, .Unserved)
-			return
-		}
-		to.session, to.host = SELF, true
-		if public {
-			who = nil
-		} else if caller = caller if !local else n.keys.device; len(who) == 0 || !device_vouches(n, caller, scope) {
-			m := roster_member(&n.roster, caller)
-			who = m.subject if m != nil else nil
-		}
-		append(&n.calls, c)
-		info := Caller_Info{device = caller, local = s if local else nil, who = who, relay = public}
-		if f, refused := n.host.method(n.host.data, to.id, info, scope, method, body).?; refused {
-			// Taken back, unless what the host said in the meantime already ended it.
-			for x, i in n.calls {
-				if x.ends[CALLEE].session == SELF && x.ends[CALLEE].id == to.id {
-					unordered_remove(&n.calls, i)
-					refuse(n, from, f)
-					break
-				}
-			}
-		}
-		return
-	}
 
 	if own {
 		q := &n.host.questions
@@ -217,6 +184,37 @@ on_call :: proc(s: ^Session, r: ^Reader, lane: ^Lane = nil) {
 		return
 	}
 	if !local || device == n.keys.device {
+		// Answered here: by the host, if it serves the method, and otherwise by a local client that does.
+		if caller = caller if !local else n.keys.device; len(who) == 0 || !device_vouches(n, caller, scope) {
+			m := roster_member(&n.roster, caller)
+			who = m.subject if m != nil else nil
+		}
+		if n.host.method != nil {
+			to.session, to.host = SELF, true
+			append(&n.calls, c)
+			info := Caller_Info{device = caller, local = s if local else nil, who = who}
+			f, refused := n.host.method(n.host.data, to.id, info, scope, method, body).?
+			if !refused {
+				return
+			}
+			// Taken back, unless what the host said in the meantime already ended it.
+			found := false
+			for x, i in n.calls {
+				if x.ends[CALLEE].session == SELF && x.ends[CALLEE].id == to.id {
+					unordered_remove(&n.calls, i)
+					found = true
+					break
+				}
+			}
+			if !found {
+				return
+			}
+			if f != .Unserved {
+				refuse(n, from, f)
+				return
+			}
+			to.session, to.host = 0, false
+		}
 		server: ^Session
 		for x in n.serving {
 			if x.scope == scope && x.method == method {
@@ -229,10 +227,6 @@ on_call :: proc(s: ^Session, r: ^Reader, lane: ^Lane = nil) {
 		}
 		to.session = server.id
 		append(&n.calls, c)
-		if caller = caller if !local else n.keys.device; len(who) == 0 || !device_vouches(n, caller, scope) {
-			m := roster_member(&n.roster, caller)
-			who = m.subject if m != nil else nil
-		}
 		call_put(&server.out, server, to.id, caller, scope, method, who, body)
 		return
 	}
@@ -296,7 +290,7 @@ node_call :: proc(n: ^Node, device: Key32, scope: Scope, body: []byte) -> u64 {
 		return 0
 	}
 	n.next_call += 2
-	c := Call{scope = scope, own = true, urgency = method_urgency("")}
+	c := Call{scope = scope, own = true, urgency = URGENCY_NODES}
 	c.ends[CALLER] = {session = SELF, id = n.next_call - 1, granted = CALL_WINDOW - len(body)}
 	c.ends[CALLEE] = {id = n.next_call, granted = CALL_WINDOW}
 	if _, failed := call_out(n, &c, device, "", nil, body).?; failed {
@@ -305,22 +299,17 @@ node_call :: proc(n: ^Node, device: Key32, scope: Scope, body: []byte) -> u64 {
 	return n.next_call - 1
 }
 
-// Calls a device by a method its host serves (names beginning "zsp."), as this node's host. 0 if it cannot be.
-// What is said back goes to Host.flow. A relay may call a device it serves, by PUBLIC in scope 0, and by nothing else.
-node_call_method :: proc(n: ^Node, device: Key32, scope: Scope, method: string, body: []byte) -> u64 {
-	if !hosted(method) || len(method) > MAX_METHOD || len(n.calls) >= MAX_CALLS || len(body) > CALL_WINDOW {
+// Calls another device by a method, as this node's host, on a lane of the urgency given (0 most urgent, 7 least). 0 if
+// it cannot be. What is said back goes to Host.flow.
+node_call_method :: proc(n: ^Node, device: Key32, scope: Scope, method: string, body: []byte, urgency: u8 = URGENCY) -> u64 {
+	if n.keys == nil || len(method) == 0 || len(method) > MAX_METHOD || len(n.calls) >= MAX_CALLS || len(body) > CALL_WINDOW || urgency > URGENCY_LEAST {
 		return 0
 	}
-	public := n.keys == nil
-	if public {
-		if method != PUBLIC || scope != 0 {
-			return 0
-		}
-	} else if device == n.keys.device || .Call not_in device_rights(n, n.keys.device, scope) || .Call not_in device_rights(n, device, scope) {
+	if device == n.keys.device || .Call not_in device_rights(n, n.keys.device, scope) || .Call not_in device_rights(n, device, scope) {
 		return 0
 	}
 	n.next_call += 2
-	c := Call{scope = scope, public = public, urgency = method_urgency(method)}
+	c := Call{scope = scope, urgency = urgency}
 	c.ends[CALLER] = {host = true, session = SELF, id = n.next_call - 1, granted = CALL_WINDOW - len(body)}
 	c.ends[CALLEE] = {id = n.next_call, granted = CALL_WINDOW}
 	if _, failed := call_out(n, &c, device, method, nil, body).?; failed {
@@ -329,20 +318,11 @@ node_call_method :: proc(n: ^Node, device: Key32, scope: Scope, method: string, 
 	return n.next_call - 1
 }
 
-// Whether the host serves a method itself.
-hosted :: proc(method: string) -> bool {
-	return strings.has_prefix(method, "zsp.")
-}
-
-// By which a relay reaches what a device makes public.
-PUBLIC :: "zsp.public"
-
 // Who called a method the host serves.
 Caller_Info :: struct {
 	device: Key32, // the calling device; this one's own for a local client
 	local:  ^Session, // when a local client of this node called its own device
 	who:    []byte, // for whom, as §12 settles it
-	relay:  bool, // a relay called, for something made public
 }
 
 // Says something in a call this node is an end of.
@@ -607,8 +587,8 @@ rpc_roster_changed :: proc(n: ^Node) {
 	outer: for {
 		for &c, i in n.calls {
 			key := Caller_Key{c.ends[CALLER].session, c.ends[CALLER].id}
-			if c.public || slice.contains(still[:], key) {
-				continue // no grant governs it, or it was looked at
+			if slice.contains(still[:], key) {
+				continue // looked at already
 			}
 			need := Right.Read if c.own else Right.Call
 			allowed := need in device_rights(n, n.keys.device, c.scope)
