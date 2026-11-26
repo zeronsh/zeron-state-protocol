@@ -30,8 +30,9 @@ touched, which copies them into the next pack, and is soon deleted in its turn.
 A read of a page or a stretch of log that is not in memory or the object's cache does not wait. It answers "not yet", and whatever was
 being done is undone, wholly, and done again once what it wanted has come (zsp/lazy.odin): a frame from a device, a unit of what is sent to
 one, a record replayed on waking, a step of larger work. Pages are fetched sixteen at once with their neighbours in the pack, which are their
-neighbours in the tree. The log is read ahead further each time a device reads on through it, up to an extent, and the next stretch is asked
-for before it is reached. A record replayed on waking that misses has those after it replayed too, and undone with it, so that everything
+neighbours in the tree. The log is read ahead further each time a device reads on through it, up to an extent, for each of
+several devices at once, and the next stretch is asked for before it is reached; what was read ahead is kept until it is
+read. A record replayed on waking that misses has those after it replayed too, and undone with it, so that everything
 they miss is fetched in one round. Nothing polls, and nothing blocks: R2 says when it is done, and whatever waited goes on.
 
 ## What is durable when

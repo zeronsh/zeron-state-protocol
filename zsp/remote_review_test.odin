@@ -973,3 +973,117 @@ review_warm_wake_of_a_small_pack_asks_nothing :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, gets == 0, "%d gets on a warm wake of a pack of %d pages", gets, cached)
 }
+
+// A log of rows, put in object storage and let go of here, for reading back.
+@(private)
+review_log_store :: proc(t: ^testing.T, x: ^Remote_Store, blocks: int) -> (bytes: int) {
+	remote_store_open(t, x, 2048, blocks)
+	ROWS :: 300
+	big := make([]byte, 6 << 10)
+	defer delete(big)
+	for i in 0 ..< ROWS {
+		body: [24]byte
+		put_u64(body[:], 1 << 32 | 1)
+		put_u64(body[16:], u64(i))
+		row := Id{1 << 32 | u64(i), 7}
+		cells := [2]Cell{{row, PLACE, .Place, {u64(i) * 2 + 1, 1}, body[:]}, {row, DATA, .Value, {u64(i) * 2 + 2, 1}, big}}
+		remote_store_step(t, x, &cells, proc(s: ^Store, data: rawptr) {store_commit(s, (^[2]Cell)(data)[:])})
+		testing.expect(t, store_sync(&x.store))
+		remote_store_turn(x, 1 << 20)
+		free_all(context.temp_allocator)
+	}
+	for _ in 0 ..< 5 {
+		x.remote.want_checkpoint = true
+		remote_store_settle(t, x)
+	}
+	for _, c in x.remote.blocks {
+		delete(c.bytes)
+	}
+	clear(&x.remote.blocks)
+	return ROWS * (len(big) + 100)
+}
+
+// A reader of rows in order, from a row on: a step reads the next few.
+@(private)
+Review_Reader :: struct {
+	from: Key,
+	to:   Key,
+	done: bool,
+}
+
+@(private)
+review_read_on :: proc(t: ^testing.T, x: ^Remote_Store, f: ^Review_Reader) {
+	remote_store_step(t, x, f, proc(s: ^Store, data: rawptr) {
+		f := (^Review_Reader)(data)
+		scan := tree_scan(s, s.shelf, f.from, f.to)
+		rows := 0
+		for leaf in tree_next(&scan) {
+			cs := row_scan(s, key_row(leaf.key))
+			for _ in row_next(s, &cs) {}
+			if rows += 1; rows == 4 {
+				f.from = key_next(leaf.key)
+				return
+			}
+		}
+		f.done = true
+	})
+}
+
+// A reader slower than what it reads ahead, on a host with room for little: what was read ahead and not yet read is
+// kept until it is, rather than let go of and read again.
+@(test)
+review_slow_reader_keeps_what_it_has_not_read :: proc(t: ^testing.T) {
+	state := seeded(5)
+	context.random_generator = rand.default_random_generator(&state)
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	bytes := review_log_store(t, &x, 1)
+	defer remote_store_close(&x)
+	before := x.remote.stats.log_gets
+	f := Review_Reader{KEY_MIN, KEY_MAX, false}
+	for !f.done {
+		review_read_on(t, &x, &f)
+		remote_ops(&x.remote)
+		model_tick(&x.host, &x.remote, 1 << 20)
+		remote_rest(&x.remote)
+	}
+	gets := x.remote.stats.log_gets - before
+	testing.expectf(t, gets <= bytes / EXTENT + 6, "%d reads of the log for %d extents of it", gets, bytes / EXTENT + 1)
+}
+
+// Two readers at once, each on through its own part of the log: each is read ahead of, as one alone would be.
+@(test)
+review_readers_read_ahead_each :: proc(t: ^testing.T) {
+	state := seeded(5)
+	context.random_generator = rand.default_random_generator(&state)
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	bytes := review_log_store(t, &x, 256)
+	defer remote_store_close(&x)
+	before := x.remote.stats.log_gets
+	middle: Key
+	{
+		// The row half way along the shelf.
+		i := 0
+		scan := tree_scan(&x.store, x.store.shelf, KEY_MIN, KEY_MAX)
+		for leaf in tree_next(&scan) {
+			if i += 1; i == 150 {
+				middle = leaf.key
+				break
+			}
+		}
+	}
+	readers := [2]Review_Reader{{KEY_MIN, middle, false}, {middle, KEY_MAX, false}}
+	for !readers[0].done || !readers[1].done {
+		for &f in readers {
+			if !f.done {
+				review_read_on(t, &x, &f)
+			}
+		}
+		remote_ops(&x.remote)
+		model_tick(&x.host, &x.remote, 1 << 20)
+		remote_rest(&x.remote)
+	}
+	gets := x.remote.stats.log_gets - before
+	testing.expectf(t, gets <= bytes / EXTENT + 8, "%d reads of the log for %d extents of it", gets, bytes / EXTENT + 1)
+}

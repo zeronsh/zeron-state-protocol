@@ -25,7 +25,7 @@ PACK_SHIFT :: 20 // a pack holds at most 2^20 pages
 TEMP_PAGES :: Page_No(1) << 62 // numbers for pages not yet in any pack
 EXTENT :: #config(ZSP_EXTENT, min(SEGMENT / 4, 1 << 20)) // the log is put in object storage in pieces of this size
 #assert(SEGMENT % EXTENT == 0 && EXTENT % LOG_BLOCK == 0)
-LOG_BLOCK :: min(64 << 10, EXTENT) // a read of the log fetches at least this much
+LOG_BLOCK :: #config(ZSP_LOG_BLOCK, min(64 << 10, EXTENT)) // a read of the log fetches at least this much
 LOCAL_KEEP :: #config(ZSP_LOCAL_KEEP, 4 << 20) // the log's latest bytes, kept by the host though in object storage: what is shown
 LOCAL_MOST :: 64 << 20 // the most of the log the host holds, should object storage fall behind, before writing waits for it
 PAGE_RUN :: 16 // a read of a page fetches its neighbours in the pack too
@@ -118,7 +118,19 @@ Cached_Page :: struct {
 Log_Block :: struct {
 	bytes: []byte, // shorter than LOG_BLOCK where the object ends
 	used:  u64,
+	read:  bool, // since it came: else it was read ahead, and is yet to be
 }
+
+// A reader reading on through the log, as a device catching up does: read further ahead of each time it reads on.
+@(private)
+Read_Stream :: struct {
+	to:    u64, // where what was last fetched for it ends
+	ahead: u64, // how far beyond what is wanted it reads
+	used:  u64,
+}
+
+READ_STREAMS :: 4 // readers read ahead of at once, each as though alone
+UNREAD_KEPT :: 2 * EXTENT / LOG_BLOCK // blocks read ahead and not yet read, kept whatever the budget
 
 @(private)
 Inflight :: struct {
@@ -183,8 +195,7 @@ Remote :: struct {
 	want_blocks:   map[u64]struct{},
 	getting_pages: map[u64]u32, // a run's first page -> op
 	getting_blocks: map[u64]u32, // a block -> op
-	read_to:       u64, // where the last read of the log ended
-	ahead:         u64, // how far beyond what is wanted it reads
+	streams:       [READ_STREAMS]Read_Stream,
 	ready:         [dynamic]^Remote_Op, // started by remote_ops
 
 	// The checkpoint under way, if any, and the bookkeeping that precedes one.
@@ -429,18 +440,20 @@ remote_log_read :: proc(data: rawptr, off: u64, into: []byte) -> bool {
 remote_block :: proc(r: ^Remote, b: u64) -> (bytes: []byte, ok: bool) {
 	r.tick += 1
 	if c, have := &r.blocks[b]; have {
-		c.used = r.tick
+		c.used, c.read = r.tick, true
 		// Reading on through what was read ahead: past half of it, the next stretch is asked for, so that it has come
 		// by the time it is wanted.
-		if r.ahead >= 2 * LOG_BLOCK && b < r.read_to && b + r.ahead / 2 >= r.read_to && r.read_to < r.local_from && r.read_to not_in r.blocks && r.read_to not_in r.getting_blocks {
-			r.want_blocks[r.read_to] = {}
+		for st in r.streams {
+			if st.ahead >= 2 * LOG_BLOCK && b < st.to && b + st.ahead / 2 >= st.to && st.to < r.local_from && st.to not_in r.blocks && st.to not_in r.getting_blocks {
+				r.want_blocks[st.to] = {}
+			}
 		}
 		return c.bytes, true
 	}
 	// The host's own cache holds whole blocks only.
 	buf := make([]byte, LOG_BLOCK)
 	if r.host.cache_get(r.host.data, .Log, b, buf) {
-		r.blocks[b] = {buf, r.tick}
+		r.blocks[b] = {buf, r.tick, true}
 		r.stats.local_hits += 1
 		return buf, true
 	}
@@ -499,15 +512,34 @@ remote_ops :: proc(r: ^Remote) {
 			// Reading on from where the last read ended, as a device catching up does: read further ahead each time, up
 			// to the rest of the extent; else a little.
 			first, end := blocks[i], blocks[j - 1] + LOG_BLOCK
-			r.ahead = min(max(r.ahead, LOG_BLOCK) * 2, EXTENT) if first == r.read_to else 2 * LOG_BLOCK
-			end = min(max(end, first + r.ahead), (first / EXTENT + 1) * EXTENT)
+			st: ^Read_Stream
+			for &c in r.streams {
+				if c.to == first {
+					st = &c
+					break
+				}
+			}
+			if st != nil {
+				st.ahead = min(max(st.ahead, LOG_BLOCK) * 2, EXTENT)
+			} else {
+				// A reader not reading on from where any other was: in place of the one longest unheard of.
+				st = &r.streams[0]
+				for &c in r.streams[1:] {
+					if c.used < st.used {
+						st = &c
+					}
+				}
+				st.ahead = 2 * LOG_BLOCK
+			}
+			end = min(max(end, first + st.ahead), (first / EXTENT + 1) * EXTENT)
 			for b := blocks[j - 1] + LOG_BLOCK; b < end; b += LOG_BLOCK {
 				if b in r.blocks || b in r.getting_blocks {
 					end = b
 					break
 				}
 			}
-			r.read_to = end
+			r.tick += 1
+			st.to, st.used = end, r.tick
 			op := remote_op(r, .Get_Log)
 			r.stats.log_gets += 1
 			op.number = first / EXTENT
@@ -618,7 +650,7 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 				continue
 			}
 			r.tick += 1
-			r.blocks[b] = {slice.clone(bytes[lo:hi]), r.tick}
+			r.blocks[b] = {slice.clone(bytes[lo:hi]), r.tick, false}
 			// Kept by the host when read here and there, as for a window: what is shown is shown again. Not when read
 			// on and on, as a device catching up reads: that is seldom read twice, and a row written costs more than
 			// reading it again.
@@ -774,16 +806,34 @@ remote_rest :: proc(r: ^Remote) {
 		}
 	}
 	if len(r.blocks) > r.block_budget {
-		order := make([dynamic]Use, 0, len(r.blocks), context.temp_allocator)
+		// What has been read goes first: a block read ahead is about to be, and letting it go before it is would have
+		// it fetched again. Of those, only more than UNREAD_KEPT, as of a reader that went away.
+		read := make([dynamic]Use, 0, len(r.blocks), context.temp_allocator)
+		unread := make([dynamic]Use, 0, len(r.blocks), context.temp_allocator)
+		waiting := 0
 		for b, c in r.blocks {
+			waiting += 0 if c.read else 1
 			if c.used < r.rested {
-				append(&order, Use{b, c.used})
+				append(&read if c.read else &unread, Use{b, c.used})
 			}
 		}
-		slice.sort_by(order[:], by_use)
-		for o in order[:min(len(order), len(r.blocks) - r.block_budget * 3 / 4)] {
+		slice.sort_by(read[:], by_use)
+		slice.sort_by(unread[:], by_use)
+		target := r.block_budget * 3 / 4
+		for o in read {
+			if len(r.blocks) <= target {
+				break
+			}
 			delete(r.blocks[o.key].bytes)
 			delete_key(&r.blocks, o.key)
+		}
+		for o in unread {
+			if len(r.blocks) <= target || waiting <= UNREAD_KEPT {
+				break
+			}
+			delete(r.blocks[o.key].bytes)
+			delete_key(&r.blocks, o.key)
+			waiting -= 1
 		}
 	}
 	r.rested = r.tick
