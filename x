@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams|aead]|nat|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams|aead]|nat|system|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -184,6 +184,16 @@ bench)
 	fi
 	;;
 nat) odin build zspd -out:build/zspd -debug $STRICT && sudo tests/nat.sh && sudo env NAT_B=--random-fully EXPECT_RELAY=1 tests/nat.sh ;;
+system) # names and addresses as every application here has them: zspd setup, as root, and taken back after
+	odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000
+	SUDO=sudo
+	[ "${OS:-}" = Windows_NT ] && SUDO= # an Administrator already, or nothing here works
+	$SUDO build/zspd$EXE setup
+	r=0
+	$PYTHON tests/system.py || r=$?
+	$SUDO build/zspd$EXE setup --undo
+	exit $r
+	;;
 slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 && end_to_end slow_hibernation ;;
 *) sed -n 2p "$0" && exit 2 ;;
 esac

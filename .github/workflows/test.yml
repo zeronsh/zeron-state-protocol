@@ -41,5 +41,7 @@ jobs:
       # What node needs, ./x installs, as it would on a fresh checkout anywhere.
       - run: ./x check
       - run: ./x test
+      # Names and addresses as every application has them, after zspd setup, which it takes back.
+      - run: ./x system
       - if: runner.os == 'Linux'
         run: ./x nat

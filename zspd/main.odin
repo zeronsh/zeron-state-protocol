@@ -49,6 +49,9 @@ USAGE :: `zspd - Zeron State Protocol node
   zspd unoffer <dir> <port[-port]> <scope> [device=<key>] [host=<address>]
                                              take an offer back: whoever is using it is cut off
   zspd offers <dir>                          list what this device offers
+  zspd setup [--undo] [--dry-run] [run's --names, --loopback, --dns, --catch] [--devices=<n>]
+                                             as root, once: have every application here find devices by name
+                                             and reach them by address; says each step as it takes it
   zspd run <dir> [options]                   run a device's node
   zspd serve <dir> [options]                 run a relay
 
@@ -99,6 +102,9 @@ main :: proc() {
 
 run :: proc() -> int {
 	args := os.args[1:]
+	if len(args) >= 1 && args[0] == "setup" {
+		return setup(args[1:])
+	}
 	if len(args) < 2 {
 		os.write_string(os.stderr, USAGE)
 		return 2
@@ -656,14 +662,12 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		case "--no-names":
 			config.names = ""
 		case "--loopback":
-			parts := strings.split(value, ".", context.temp_allocator)
-			a, aok := strconv.parse_uint(parts[1] if len(parts) == 3 else "", 10)
-			b, bok := strconv.parse_uint(parts[2] if len(parts) == 3 else "", 10)
-			if len(parts) != 3 || parts[0] != "127" || !aok || !bok || a > 255 || b > 255 {
+			base, parsed := parse_loopback(value)
+			if !parsed {
 				os.write_string(os.stderr, USAGE)
 				return 2
 			}
-			config.loopback = {byte(a), byte(b)}
+			config.loopback = base
 		case "--dns":
 			dns = value
 		case "--catch":
@@ -689,8 +693,7 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	if config.names != "" {
 		if dns == "" {
 			base := config.loopback
-			port := 5053 when ODIN_OS == .Linux || ODIN_OS == .FreeBSD else 53
-			config.dns = net.Endpoint{net.IP4_Address{127, base[0], base[1], 1}, port}
+			config.dns = net.Endpoint{net.IP4_Address{127, base[0], base[1], 1}, DNS_PORT}
 		} else if ep, parsed := net.parse_endpoint(dns); parsed {
 			config.dns = ep
 		} else {
@@ -988,4 +991,29 @@ offer :: proc(dir: string, args: []string, remove: bool) -> bool {
 	}
 	append(&lines, "")
 	return host.save(path, transmute([]byte)strings.join(lines[:], "\n", context.temp_allocator))
+}
+
+// 127.a.b, as --loopback takes it.
+parse_loopback :: proc(value: string) -> (base: [2]byte, ok: bool) {
+	parts := strings.split(value, ".", context.temp_allocator)
+	if len(parts) != 3 || parts[0] != "127" {
+		return
+	}
+	a, aok := strconv.parse_uint(parts[1], 10)
+	b, bok := strconv.parse_uint(parts[2], 10)
+	if !aok || !bok || a > 255 || b > 255 {
+		return
+	}
+	return {byte(a), byte(b)}, true
+}
+
+parse_int :: proc(value: string) -> (int, bool) {
+	return strconv.parse_int(value, 10)
+}
+
+// A private IPv6 address (RFC 4193) with a global id of its own, drawn now.
+draw_ula :: proc() -> string {
+	g: [5]byte
+	crypto.rand_bytes(g[:])
+	return fmt.tprintf("fd%02x:%02x%02x:%02x%02x::1", g[0], g[1], g[2], g[3], g[4])
 }

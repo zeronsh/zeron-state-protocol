@@ -1295,10 +1295,13 @@ class Client:
 
     def host(self, method, body=b""):
         """Calls a zsp.* method of this device's own host, in a scope this client may call in."""
-        scope = next(s for s, (rights, _) in sorted(self.scopes.items()) if rights & 4)
-        until = time.monotonic() + 5
-        while not self.devices and time.monotonic() < until:
-            self.step()
+        callable = lambda: next((s for s, (rights, _) in sorted(self.scopes.items()) if rights & 4), None)
+        until = time.monotonic() + 10  # a device that has just joined has yet to hear what it may do
+        while (callable() is None or not self.devices) and time.monotonic() < until:
+            self.drain(0.05)
+        scope = callable()
+        if scope is None:
+            raise PermissionError("this client may call in no scope")
         answer = self.call(self.devices[0][0], scope, method, body)
         if answer["fault"] is not None:
             raise PermissionError(f"{method}: fault {answer['fault']}")
