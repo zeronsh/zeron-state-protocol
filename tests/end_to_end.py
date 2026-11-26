@@ -2111,6 +2111,74 @@ def client_hello(name):
     return struct.pack(">BHH", 22, 0x0301, len(hello)) + hello
 
 
+def test_public_outlives_its_device():
+    """A device answers and leaves while the public is still reading the answer: the relay keeps what it is serving,
+    space and all, until the public has read it, and touches nothing it has let go."""
+    import threading
+
+    def window():  # what a sender here may put out to a reader that reads nothing
+        srv = socket.create_server(("127.0.0.1", 0))
+        cli = socket.socket()
+        cli.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        cli.connect(srv.getsockname())
+        acc, _ = srv.accept()
+        acc.setblocking(False)
+        total = 0
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            try:
+                total += acc.send(b"A" * 16384)
+            except BlockingIOError:
+                time.sleep(0.01)  # as the system grows what it will hold
+                try:
+                    total += acc.send(b"A" * 16384)
+                except BlockingIOError:
+                    break
+        for x in (acc, cli, srv):
+            x.close()
+        return total
+
+    size = window() + (100 << 10)  # what the system holds for the reader, and less than a call's window more
+    plain = free_port()
+    relay = Node("od-relay", "serve", "--no-udp", "--expose=expose.test", "--expose-http=127.0.0.1:%d" % plain).start()
+    _, (a,) = space("od", relay=relay)
+    ca = a.client()
+    backend = socket.create_server(("127.0.0.1", free_port()))
+    done = threading.Event()
+
+    def serve_one():
+        c, _ = backend.accept()
+        while c.recv(4096):
+            pass
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % size + b"X" * size)
+        c.close()
+        done.set()
+
+    threading.Thread(target=serve_one, daemon=True).start()
+    name = ca.expose(backend.getsockname()[1])[0]["label"] + ".expose.test"
+    eventually("exposed", lambda: [r["status"] for e in ca.exposures() for r in e["relays"]] == [0])
+    reader = socket.socket()
+    reader.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    reader.connect(("127.0.0.1", plain))
+    reader.sendall(f"GET / HTTP/1.1\r\nHost: {name}\r\n\r\n".encode())
+    reader.shutdown(socket.SHUT_WR)
+    assert done.wait(10)
+    time.sleep(0.6)
+    a.p.kill()  # the space's only device, gone
+    a.p.wait()
+    time.sleep(0.6)
+    got = 0
+    try:
+        while data := reader.recv(1 << 16):
+            got += len(data)
+    except OSError:
+        pass
+    reader.close()
+    time.sleep(0.3)
+    assert relay.p.poll() is None, "the relay fell over"
+    assert got > size, (got, size)  # the whole answer, head and all, though its device had left
+
+
 def test_public_held_off():
     """The public cannot keep the public out: what is not TLS, what fails its handshake, and what says nothing leave
     nothing behind at the relay, and someone who has something to ask is still answered."""

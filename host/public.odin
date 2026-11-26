@@ -211,6 +211,17 @@ public_session_closed :: proc(h: ^Host, sp: ^Space, session: u32) {
 	}
 }
 
+// A space goes (the host stops): whoever of the public it serves is let go first, for nothing of it may be touched after.
+@(private)
+public_space_closed :: proc(s: ^Space) {
+	rp := &s.host.public
+	#reverse for c in rp.conns {
+		if c.sp == s {
+			public_out_close(c, reset = true)
+		}
+	}
+}
+
 // The label a name is for, if it is one of this relay's: <label>.<domain>, in any case.
 @(private)
 public_name :: proc(h: ^Host, asked: string) -> ^Relay_Label {

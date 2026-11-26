@@ -259,6 +259,7 @@ space_authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
 }
 
 space_close :: proc(s: ^Space) {
+	public_space_closed(s)
 	ports_close(s)
 	found_close(s)
 	bridges_close(s)
@@ -490,6 +491,9 @@ host_settle :: proc(h: ^Host) {
 			busy := len(s.node.sessions) > 0
 			for x in h.streams {
 				busy ||= x.space == s
+			}
+			for c in h.public.conns {
+				busy ||= c.sp == s // the public may yet be reading what its device said before it left
 			}
 			if !busy {
 				unordered_remove(&h.spaces, i)

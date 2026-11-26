@@ -133,7 +133,8 @@ test)
 	if [ "$(uname)" = Linux ]; then
 		# Names, ports and exposure again, under AddressSanitizer: what glibc forgives, it does not.
 		odin build zspd -out:build/zspd-asan -debug -sanitize:address $STRICT $TESTING
-		ZSPD=build/zspd-asan end_to_end test_names test_ports test_offers_end test_expose test_durable_object_expose test_luau_ports
+		ZSPD=build/zspd-asan end_to_end test_names test_ports test_offers_end test_expose test_durable_object_expose test_luau_ports \
+			test_public_outlives_its_device test_public_held_off test_own_ports_kept test_services_by_scope
 	fi
 	wait $web || true
 	cat build/web.log
