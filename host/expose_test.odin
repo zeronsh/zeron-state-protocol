@@ -260,3 +260,36 @@ bridges_close_lets_go_of_the_refused :: proc(t: ^testing.T) {
 	n, _ = net.recv_tcp(client, buf[:])
 	testing.expect_value(t, n, 0) // and closed
 }
+
+// What a relay says of an exposure is kept only as a relay would say it (a URL of its own, not megabytes), and only
+// while this device is linked to that relay.
+@(test)
+exposures_heard_bounded :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts)
+	defer test_space_destroy(&ts)
+	ts.space.ports = new(Ports)
+	ts.space.ports.space = &ts.space
+	defer ports_close(&ts.space)
+	p := ts.space.ports
+	append(&p.exposures, Exposure{port = 8080, label = strings.clone("app-demo")})
+	say :: proc(sp: ^Space, relay: byte, url: string) {
+		s := zsp.Session{peer_relay = true}
+		s.peer[0] = relay
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, 1)
+		zsp.write_bytes(&w, transmute([]byte)string("app-demo"))
+		append(&w, 0)
+		zsp.write_bytes(&w, transmute([]byte)url)
+		exposures_heard(sp, &s, w[:])
+	}
+	say(&ts.space, 1, strings.repeat("x", 265_000, context.temp_allocator))
+	say(&ts.space, 2, "javascript:alert(1)")
+	testing.expect_value(t, len(p.exposures[0].heard), 0)
+	for i in 1 ..= 40 {
+		say(&ts.space, byte(i), "https://app-demo.expose.test")
+	}
+	testing.expect_value(t, len(p.exposures[0].heard), 16) // MAX_HEARD
+	exposures_tell(p) // and none of those relays is linked to this device
+	testing.expect_value(t, len(p.exposures[0].heard), 0)
+}

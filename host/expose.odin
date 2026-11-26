@@ -21,6 +21,8 @@ import "../zsp"
 // devices, end to end; what is exposed is public.
 
 MAX_EXPOSURES :: 16
+MAX_URL :: 512 // bytes of what a relay says an exposure is at: https://<label>.<its domain>, and a port
+MAX_HEARD :: 16 // relays whose word on one exposure is kept
 
 Exposure :: struct {
 	port:   u16,
@@ -228,6 +230,19 @@ exposures_tell :: proc(p: ^Ports) {
 			delete_key(&p.ever_told, id)
 		}
 	}
+	// What a relay said holds while this device is linked to it: one gone says nothing now.
+	for &e in p.exposures {
+		#reverse for x, i in e.heard {
+			linked := false
+			for s in sp.node.sessions {
+				linked ||= s.ready && s.role == .Peer && s.peer_relay && s.peer == x.relay
+			}
+			if !linked {
+				delete(x.url)
+				ordered_remove(&e.heard, i)
+			}
+		}
+	}
 }
 
 // 41 Exposed, from a relay: n varint ‖ n × { label bytes ‖ status (1) ‖ url bytes }.
@@ -246,6 +261,9 @@ exposures_heard :: proc(sp: ^Space, s: ^zsp.Session, payload: []byte) {
 		if r.bad {
 			return
 		}
+		if status > 3 || len(url) > MAX_URL || url != "" && !strings.has_prefix(url, "https://") && !strings.has_prefix(url, "http://") {
+			continue // no relay's word: nothing of it is kept, nor said to clients
+		}
 		for &e in p.exposures {
 			if e.label != label {
 				continue
@@ -257,7 +275,7 @@ exposures_heard :: proc(sp: ^Space, s: ^zsp.Session, payload: []byte) {
 					x.status, x.url, found = status, strings.clone(url), true
 				}
 			}
-			if !found {
+			if !found && len(e.heard) < MAX_HEARD {
 				append(&e.heard, Exposed{s.peer, status, strings.clone(url)})
 			}
 			if status == 0 {
