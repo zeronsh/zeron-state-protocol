@@ -245,12 +245,15 @@ start :: proc "c" (full: bool) -> bool {
 		log_drop = proc(_: rawptr, segment: u64) {log_drop(f64(segment))},
 		log_truncate = proc(_: rawptr, off: u64) {log_truncate(f64(off))},
 		log_sync = proc(_: rawptr) -> bool {return log_sync()},
-		page = proc(_: rawptr, no: u32) -> ^zsp.Page {
-			return (^zsp.Page)(pages_get(&tree_pages, no, page_read))
+		// A store on a volume of its own uses its pages again, and so never numbers one past 2^32: 16 TiB of tree.
+		page = proc(_: rawptr, no: zsp.Page_No) -> ^zsp.Page {
+			assert(no <= zsp.Page_No(max(u32)))
+			return (^zsp.Page)(pages_get(&tree_pages, u32(no), page_read))
 		},
-		page_write = proc(_: rawptr, no: u32, bytes: []byte) -> bool {
-			pages_forget(&tree_pages, no)
-			return page_write(no, raw_data(bytes), len(bytes))
+		page_write = proc(_: rawptr, no: zsp.Page_No, bytes: []byte) -> bool {
+			assert(no <= zsp.Page_No(max(u32)))
+			pages_forget(&tree_pages, u32(no))
+			return page_write(u32(no), raw_data(bytes), len(bytes))
 		},
 		page_sync = proc(_: rawptr) -> bool {return page_sync()},
 		close = proc(_: rawptr) {},
