@@ -337,6 +337,48 @@ revoked_devices_stay_asleep :: proc(t: ^testing.T) {
 	}
 }
 
+// Review of the strip, round 1. What a hibernating relay kept is resumed only if it is what this node saved: not with
+// the id of none, nor another session's, nor flags it does not know.
+@(test)
+only_what_was_saved_is_resumed :: proc(t: ^testing.T) {
+	state := seeded(40)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 1, 64)
+	defer sim_destroy(&s)
+	sim_link(&s, 1, 2)
+	pass_all(&s)
+	relay := s.nodes[2]
+	at_relay := s.links[0].b
+	saved := make([dynamic]byte, context.temp_allocator)
+	testing.expect(t, session_save(at_relay, &saved))
+	sessions := len(relay.node.sessions)
+	odd :: proc(saved: []byte, id: u64, flags: u8) -> []byte {
+		r := Reader{buf = saved}
+		_ = read_varint(&r)
+		_ = read_u8(&r)
+		w := make([dynamic]byte, context.temp_allocator)
+		write_varint(&w, id)
+		append(&w, flags)
+		append(&w, ..saved[r.pos:])
+		return w[:]
+	}
+	flags := saved[1] if at_relay.id < 128 else saved[2]
+	for bad in ([][]byte{odd(saved[:], 0, flags), odd(saved[:], u64(at_relay.id), flags), odd(saved[:], 999, flags | 32), odd(saved[:], 999, flags | 128)}) {
+		revived, ok := session_load(&relay.node, bad)
+		testing.expect(t, !ok)
+		if ok {
+			session_close(revived)
+		}
+	}
+	testing.expect_value(t, len(relay.node.sessions), sessions)
+	revived, ok := session_load(&relay.node, odd(saved[:], 999, flags))
+	testing.expect(t, ok) // and so it was the id and the flags alone that were refused
+	if ok {
+		session_close(revived)
+	}
+}
+
 // Either end of a direct link may hush a relay, and both listen again when it goes.
 @(test)
 hushing_is_mutual :: proc(t: ^testing.T) {

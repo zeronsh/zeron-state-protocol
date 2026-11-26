@@ -225,3 +225,24 @@ const until = async (f) => { for (let i = 0; i < 2000 && !f(); i++) await new Pr
     console.log("ok   a relay that checkpoints once quiet keeps its connections after the checkpoint, and resumes them");
   } finally { await r.close(); }
 }
+
+// Review of the strip, round 1. What a relay kept before this one, which began with how many exposures the connection
+// had, is not resumed as though it were this one's: that connection is told to reconnect, and the others resume.
+{
+  const r = await relayWith(2);
+  try {
+    const [wsA, wsB] = r.serverSockets, [clientA] = r.clients;
+    await new Promise((go) => setTimeout(go, 300));
+    assert(kept(wsA) && kept(wsB), "both kept while quiet");
+    const state = wsB._att.state;
+    wsB._att = { ...wsB._att, state: Uint8Array.from([0, ...state.subarray(1)]) }; // no exposures, as the old relay said it
+    const closedA = wsA.closed;
+    r.doSpace = new Space(r.ctx, r.env);
+    assert.deepEqual(wsA.closed, closedA, "woken, it resumed the one it kept");
+    assert.equal(wsB.closed?.code, 1012, "and told the other, kept by another relay, to reconnect");
+    await clientA.write(1, (ch) => ch.insert(schema, "items", 1, { body: new Uint8Array(64).fill(1) }));
+    for (let i = 0; i < 200 && r.states[1].rows.length !== 1; i++) await new Promise((go) => setTimeout(go, 50)); // it reconnects in its own time
+    assert.equal(r.states[1].rows.length, 1, "which it does, and hears what is said");
+    console.log("ok   a relay resumes only connections it kept itself");
+  } finally { await r.close(); }
+}

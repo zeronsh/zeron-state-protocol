@@ -272,7 +272,7 @@ Each side first sends
 A session between peers with flag 8, a **calls session**, carries Hello, Roster, Call, Flow and Error and nothing else: it is begun over a link a relay
 carries (§13), which carries everything else already. Both ends say 8, or the session ends *denied*.
 
-The accepting host decides from the credential and the proven key whether to serve the connection (§15); until it has, later frames
+The accepting host decides from the credential and the proven key whether to serve the connection (§16); until it has, later frames
 wait. Then, between peers, whichever has the newer roster sends it (one no older than it said, or the session ends), and each verifies that the other is a member with a grant in
 force, or is a relay it chose to dial:
 

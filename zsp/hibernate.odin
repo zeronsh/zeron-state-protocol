@@ -80,6 +80,7 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 		x: Watch
 		x.id = read_varint(&r)
 		f := read_u8(&r)
+		r.bad ||= f & 128 != 0
 		x.data, x.live, x.level = f & 1 != 0, f & 2 != 0, f & 4 != 0
 		x.lo, x.hi = read_key(&r), read_key(&r)
 		x.counts, x.settled = f & 16 != 0, f & 32 != 0
@@ -104,7 +105,11 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 		append(&s.watches, x)
 	}
 	m := roster_member(&n.roster, s.peer)
-	if r.bad || (s.ready && (m == nil || !member_active(m))) {
+	taken := false // another session has its id: what was saved is not this node's
+	for x in n.sessions {
+		taken ||= x.id == s.id
+	}
+	if r.bad || s.id == 0 || taken || flags & ~u8(31) != 0 || (s.ready && (m == nil || !member_active(m))) {
 		// Nothing of it stays: nor what it asked upstream for.
 		for i := len(n.interests) - 1; i >= 0; i -= 1 {
 			if n.interests[i].session == s.id {

@@ -37,6 +37,10 @@ foreign host {
 
 MAX_PLAIN :: 60 << 10
 
+// What `save` gives begins with this. Anything else was kept by another relay than this one, and is not resumed: one that
+// carried exposures began with how many, at most 16.
+SAVED :: 0xf1
+
 Conn :: struct {
 	id:       u32,
 	open:     bool, // the handshake is done
@@ -310,6 +314,7 @@ save :: proc "c" (id: u32) -> int {
 	if !ok || !c.open || c.greet {
 		return 0
 	}
+	append(&message, SAVED)
 	append(&message, ..c.channel.send[:])
 	append(&message, ..c.channel.recv[:])
 	zsp.write_u64(&message, c.channel.send_n)
@@ -325,6 +330,9 @@ save :: proc "c" (id: u32) -> int {
 load :: proc "c" (id: u32, size: int) -> bool {
 	context = runtime.default_context()
 	r := zsp.Reader{buf = message[:size]}
+	if zsp.read_u8(&r) != SAVED || r.bad {
+		return false
+	}
 	c := new(Conn)
 	c.id = id
 	c.open = true

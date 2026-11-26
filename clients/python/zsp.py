@@ -183,17 +183,6 @@ def question(scope, where=ALL, order=(NEWEST,), offset=0, limit=50, from_end=Fal
     return out + varint(len(totals)) + b"".join(bytes([fn]) + col + varint(top) for fn, col, top in totals)
 
 
-# -- streams and services, as bytes: SPEC.md 16
-
-
-def put_text(s):
-    return put_bytes(s.encode() if isinstance(s, str) else s)
-
-
-def put_texts(items):
-    return varint(len(items)) + b"".join(map(put_text, items))
-
-
 class Fault(Exception):
     """A call failed, or was cancelled: fault is its code (SPEC.md 12)."""
 
@@ -512,12 +501,8 @@ class Client:
         self.send(CELLS, out)
         return self.seq
 
-    def put(self, *args, **more):
-        """put(scope, name, order, values) writes a row: see put_row. put(device, scope, local, remote) sends a file to a
-        device: see put_file."""
-        return (self.put_row if isinstance(args[0], int) else self.put_file)(*args, **more)
-
-    def put_row(self, scope, name, order, values, row=None, slot=1):
+    def put(self, scope, name, order, values, row=None, slot=1):
+        """Writes a row, shelved in a list at an order, with values in slots 16 onwards."""
         row = row or self.new_id(scope)
         place = (row, slot, PLACE, self.tag(scope, name) + struct.pack(">Q", order))
         self.write(place, *((row, 16 + i, VALUE, v) for i, v in enumerate(values)))
