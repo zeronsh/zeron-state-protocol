@@ -1566,11 +1566,33 @@ def test_offers_end():
     assert audit.count('"service":"offer"') == 3 and b.key in audit
 
 
+def pause(p, seconds):
+    """Stops a process for a while, as a busy machine may, and lets it go on."""
+    if os.name == "nt":
+        import ctypes
+
+        kernel, nt = ctypes.windll.kernel32, ctypes.windll.ntdll
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        nt.NtSuspendProcess.argtypes = nt.NtResumeProcess.argtypes = kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel.OpenProcess(0x0800, False, p.pid)  # PROCESS_SUSPEND_RESUME
+        assert handle, "cannot stop it"
+        nt.NtSuspendProcess(handle)
+        try:
+            time.sleep(seconds)
+        finally:
+            nt.NtResumeProcess(handle)
+            kernel.CloseHandle(handle)
+    else:
+        os.kill(p.pid, signal.SIGSTOP)
+        try:
+            time.sleep(seconds)
+        finally:
+            os.kill(p.pid, signal.SIGCONT)
+
+
 def test_forward_outlasts_a_pause():
     """A connection to another device's port, carried by a relay, outlasts the relay's being silent for a while, as a
     busy machine's may be: the link between the devices waits before it gives up, however fast the path was."""
-    if not hasattr(signal, "SIGSTOP"):
-        return  # nothing here stops a process and lets it go on
     relay, (a, b) = ports_space(2)
     ca, cb = a.client(), b.client()
     cb.until(lambda: len(cb.devices) == 2)
@@ -1584,11 +1606,7 @@ def test_forward_outlasts_a_pause():
         s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(address_of(cb, a.key)) + struct.pack(">H", port))
         assert s.recv(10)[1] == 0 and s.recv(4) == b"hi\r\n"
         time.sleep(1.5)  # quiet, with a call under way: the link asks after the other end
-        os.kill(relay.p.pid, signal.SIGSTOP)
-        try:
-            time.sleep(2)
-        finally:
-            os.kill(relay.p.pid, signal.SIGCONT)
+        pause(relay.p, 2)
         s.sendall(b"still")
         assert s.recv(5) == b"still"
 
