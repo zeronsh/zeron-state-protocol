@@ -88,9 +88,9 @@ model_host :: proc(h: ^Model_Host) -> Remote_Host {
 		},
 		cache_get = proc(data: rawptr, kind: Cached, key: u64, into: []byte) -> bool {
 			h := (^Model_Host)(data)
-			unit := u64(1) if kind == .Page else 1
+			unit := u64(1) if kind != .Log else 1
 			for first, run in h.cache[kind] {
-				if kind == .Page {
+				if kind != .Log {
 					if key >= first && (key - first) * PAGE_SIZE + u64(len(into)) <= u64(len(run)) && (key - first) * PAGE_SIZE < u64(len(run)) {
 						copy(into, run[(key - first) * PAGE_SIZE:])
 						return true

@@ -12,6 +12,19 @@ review_cell :: proc(row_lo: u64, slot: Slot, t: u64, body: []byte) -> Cell {
 	return Cell{row = {u64(1) << 48, row_lo}, slot = slot, kind = .Value, stamp = {t, row_lo + 1}, body = body}
 }
 
+// How many of a pack's pages the host keeps, among the tops or the rest.
+@(private)
+review_pack_cached :: proc(h: ^Model_Host, gen: u64) -> (n: int) {
+	for kind in ([?]Cached{.Page, .Top}) {
+		for k, b in h.cache[kind] {
+			if k >> PACK_SHIFT == gen {
+				n += len(b) / PAGE_SIZE
+			}
+		}
+	}
+	return
+}
+
 // Answers one operation under way, as it is, or as failed.
 @(private)
 review_answer :: proc(h: ^Model_Host, r: ^Remote, idx: int, ok: bool) {
@@ -360,9 +373,8 @@ review_fetched_run_kept_as_read :: proc(t: ^testing.T) {
 	store_end(&x.store, &step, false)
 	remote_ops(&x.remote)
 	review_answer(&x.host, &x.remote, 0, true)
-	probe := make([]byte, size_of(Page))
-	defer delete(probe)
-	testing.expect(t, x.remote.host.cache_get(x.remote.host.data, .Page, last, probe), "the page fetched is not kept")
+	probe: Page
+	testing.expect(t, remote_cached(&x.remote, last, &probe), "the page fetched is not kept")
 }
 
 // A live frame that comes by the lossy way is a step too: a relay that has not at hand what it reads drops it.
@@ -738,12 +750,11 @@ review_warm_wake_asks_nothing :: proc(t: ^testing.T) {
 	x.remote.want_checkpoint = true
 	remote_store_settle(t, &x)
 	first := x.remote.kept_gen << PACK_SHIFT
-	cached := len(x.host.cache[.Page][first]) / PAGE_SIZE
+	cached := review_pack_cached(&x.host, x.remote.kept_gen)
 	testing.expectf(t, cached > 2 * PAGE_RUN, "only %d pages cached", cached)
-	probe := make([]byte, PAGE_SIZE)
-	defer delete(probe)
+	probe_page: Page
 	target := first + 2 * PAGE_RUN
-	testing.expect(t, x.remote.host.cache_get(x.remote.host.data, .Page, target, probe))
+	testing.expect(t, remote_cached(&x.remote, target, &probe_page))
 
 	remote_store_close(&x)
 	remote_store_open(t, &x)
@@ -755,7 +766,7 @@ review_warm_wake_asks_nothing :: proc(t: ^testing.T) {
 		review_answer(&x.host, &x.remote, 0, true)
 	}
 	testing.expectf(t, gets == 0, "%d gets on a warm wake", gets)
-	testing.expect(t, x.remote.host.cache_get(x.remote.host.data, .Page, target, probe), "the latest pack is no longer cached whole")
+	testing.expect(t, remote_cached(&x.remote, target, &probe_page), "the latest pack is no longer cached whole")
 }
 
 // A relay woken with a watcher's counts to make again, and a change before they are: the watcher hears of it, rather
@@ -873,7 +884,7 @@ review_counts_kept_through_sleep :: proc(t: ^testing.T) {
 	}
 	for kind in Cached {
 		for k, b in relay.remote.host.cache[kind] {
-			if kind != .Page || k >> PACK_SHIFT != latest {
+			if kind == .Log || k >> PACK_SHIFT != latest {
 				delete(b)
 				delete_key(&relay.remote.host.cache[kind], k)
 			}
@@ -958,7 +969,7 @@ review_warm_wake_of_a_small_pack_asks_nothing :: proc(t: ^testing.T) {
 	}
 	x.remote.want_checkpoint = true
 	remote_store_settle(t, &x)
-	cached := len(x.host.cache[.Page][x.remote.kept_gen << PACK_SHIFT]) / PAGE_SIZE
+	cached := review_pack_cached(&x.host, x.remote.kept_gen)
 	testing.expectf(t, cached > 0 && cached <= PAGE_RUN, "a pack of %d pages", cached)
 	testing.expect_value(t, x.remote.kept_pages, u64(cached))
 
@@ -1086,4 +1097,67 @@ review_readers_read_ahead_each :: proc(t: ^testing.T) {
 	}
 	gets := x.remote.stats.log_gets - before
 	testing.expectf(t, gets <= bytes / EXTENT + 8, "%d reads of the log for %d extents of it", gets, bytes / EXTENT + 1)
+}
+
+// A host whose cache has turned over still has every tree's tops: a row is read in one round of fetching, its leaf,
+// rather than a round a level down the tree.
+@(test)
+review_cold_lookup_is_one_round :: proc(t: ^testing.T) {
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	keeps :: proc(data: rawptr, kind: Cached, key: u64, bytes: []byte) {
+		h := (^Model_Host)(data)
+		if old, ok := h.cache[kind][key]; ok {
+			delete(old)
+		}
+		h.cache[kind][key] = slice.clone(bytes)
+	}
+	x.remote.host.cache_put = keeps
+	for store_work(&x.store) {}
+	ROWS :: 30000
+	for i := u64(0); i < ROWS; i += 100 {
+		cells: [100]Cell
+		for j in u64(0) ..< 100 {
+			cells[j] = review_cell(i + j + 1, 1, 10 + i + j, {byte(j)})
+		}
+		review_commit(&x.store, cells[:])
+		free_all(context.temp_allocator)
+	}
+	x.remote.want_checkpoint = true
+	remote_store_settle(t, &x)
+	testing.expectf(t, page(&x.store, x.store.cells.root).level >= 2, "a tree of %d levels", page(&x.store, x.store.cells.root).level + 1)
+
+	// Woken, with only the tops kept.
+	remote_store_close(&x)
+	for kind in ([?]Cached{.Page, .Log}) {
+		for _, b in x.host.cache[kind] {
+			delete(b)
+		}
+		clear(&x.host.cache[kind])
+	}
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	x.remote.host.cache_put = keeps
+	rounds := 0
+	for {
+		step := store_begin(&x.store)
+		cs := row_scan(&x.store, review_cell(12345, 1, 0, nil).row)
+		for _ in row_next(&x.store, &cs) {}
+		missed := store_missed(&x.store, &step)
+		store_end(&x.store, &step, false)
+		if !missed {
+			break
+		}
+		rounds += 1
+		remote_ops(&x.remote)
+		for len(x.host.ops) > 0 {
+			review_answer(&x.host, &x.remote, 0, true)
+		}
+		remote_rest(&x.remote)
+		if rounds > 10 {
+			break
+		}
+	}
+	testing.expectf(t, rounds <= 1, "%d rounds of fetching for one row", rounds)
 }

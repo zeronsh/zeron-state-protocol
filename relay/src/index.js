@@ -189,7 +189,7 @@ export class Space extends DurableObject {
     const url = new URL(request.url);
     this.#space ??= unhex(url.pathname.slice(1));
     if (this.env.STATS === "1" && url.searchParams.has("stats")) return this.#stats();
-    if (this.env.STATS === "1" && url.searchParams.has("evict")) return this.#evict(url.searchParams.get("evict") === "cold");
+    if (this.env.STATS === "1" && url.searchParams.has("evict")) return this.#evict(url.searchParams.get("evict"));
     if (this.env.STATS === "1" && url.searchParams.has("probe")) return this.#storage.probe().then((t) => new Response(JSON.stringify(t) + "\n"));
     const wait = Number(this.env.FULL_WAIT ?? 60000);
     if (this.#full && Date.now() - this.#full < wait) return new Response(FULL + "\n", { status: 507 });
@@ -286,15 +286,16 @@ export class Space extends DurableObject {
     }
   }
 
-  // As though evicted and woken: the node starts again from its sockets and its storage, its own cache kept, or with
-  // that let go too where `cold`, so that what a read then costs can be measured. Only where STATS is set.
-  #evict(cold) {
+  // As though evicted and woken: the node starts again from its sockets and its storage, its own cache kept ("warm"),
+  // all but the trees' tops let go of ("cold": as much as a cache can have turned over), or everything ("empty"), so
+  // that what a read then costs can be measured. Only where STATS is set.
+  #evict(how) {
     if (this.#wasm) {
       this.#wasm = undefined;
       this.#epoch++;
       this.#sockets.clear();
       this.#storage.cancel();
-      if (cold) this.#storage.forget();
+      if (how === "cold" || how === "empty") this.#storage.forget(how === "empty");
       this.#begin() && this.#settle();
     }
     return new Response("evicted\n");

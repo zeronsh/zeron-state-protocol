@@ -45,9 +45,11 @@ def one_write(ca, cb, order):
 def main():
     cloud = e.Cloud().start(ACCESS_TOKEN="bench", CHECKPOINT_TAIL=str(64 << 20))
     results = []
-    for size, name in ((16 << 10, "rows of 16 KiB"), (200, "rows of 200 B")):
+    sizes = ((16 << 10, "rows of 16 KiB"), (200, "rows of 200 B"))
+    for size, name in [x for x in sizes if os.environ.get("ZSP_ROWS", "") in ("", str(x[0]))]:
         for tail in TAILS:
-            _, (a, b) = e.space("wa", "wb", relay=cloud, options=["--credential=" + cloud.token])
+            run = len(results)
+            _, (a, b) = e.space(f"wa{run}", f"wb{run}", relay=cloud, options=["--credential=" + cloud.token])
             sid = e.zspd_space(a)
             ca, cb = a.client(), b.client()
             cb.watch(1, 1, "w", limit=20, back=True)

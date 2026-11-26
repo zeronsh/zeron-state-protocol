@@ -449,6 +449,52 @@ async function cached_run_kept_longest(seed) {
   assert.equal(memory[1 << 21], 6);
 }
 
+// The trees' tops are kept apart: however much else is read and let go of, they stay, and a cache let go of as one
+// turned over lets go of everything but them.
+async function tops_outlast_the_rest(seed) {
+  const { s, host, memory } = harness(seed, { CACHE_BYTES: String(1 << 20) });
+  host.log_write(0, 0, 1);
+  for (let i = 0; i < 4 * 4096; i++) memory[i] = 7;
+  host.cache_put(2, 1 << 20, 0, 4 * 4096); // the tops of a pack
+  for (let k = 0; k < 400; k++) {
+    for (let i = 0; i < 8 * 4096; i++) memory[i] = k & 255;
+    host.cache_put(0, (2 << 20) + k * 8, 0, 8 * 4096); // far more pages than there is room for
+  }
+  assert.equal(host.cache_get(2, (1 << 20) + 3, 1 << 21, 4096), 1, "the tops were let go of to make room for pages");
+  assert.equal(host.cache_get(0, (1 << 20) + 3, 1 << 21, 4096), 0, "tops are not pages");
+  s.forget(false);
+  assert.equal(host.cache_get(2, (1 << 20) + 3, 1 << 21, 4096), 1, "a cache turned over still has its tops");
+  assert.equal(host.cache_get(0, (2 << 20) + 399 * 8, 1 << 21, 4096), 0);
+  s.forget(true);
+  assert.equal(host.cache_get(2, (1 << 20) + 3, 1 << 21, 4096), 0);
+  host.cache_put(2, 5 << 20, 0, 4096);
+  host.cache_drop(2, 5 << 20, 6 << 20);
+  assert.equal(host.cache_get(2, 5 << 20, 1 << 21, 4096), 0, "dropped with its pack");
+}
+
+// Read back a little at a time, as replay reads each place it meets, the log costs a row of SQLite read a row of it, not
+// a row a read; and what is cut and written again is read as it now is.
+async function log_read_a_row_once(seed) {
+  const { s, host, memory } = harness(seed);
+  for (let i = 0; i < 200; i++) {
+    memory.fill(i, 0, 1000);
+    assert.equal(host.log_write(i * 1000, 0, 1000), 1); // the first rows whole, the last at hand
+  }
+  const before = s.stats.rowsRead;
+  for (let off = 0; off + 100 <= 64000; off += 100) {
+    assert.equal(host.log_read(off, 1 << 21, 100), 1);
+    assert.equal(memory[1 << 21], Math.floor(off / 1000));
+  }
+  assert.ok(s.stats.rowsRead - before <= 4, `${s.stats.rowsRead - before} rows read for one row of log`);
+  host.log_cut(30000, 2 ** 64);
+  memory.fill(200, 0, 1000);
+  assert.equal(host.log_write(30000, 0, 1000), 1);
+  assert.equal(host.log_read(30500, 1 << 21, 10), 1);
+  assert.equal(memory[1 << 21], 200, "read as it was before it was cut");
+  assert.equal(host.log_read(29000, 1 << 21, 10), 1);
+  assert.equal(memory[1 << 21], 29);
+}
+
 for (let seed = first; seed < first + seeds; seed++) {
   await log_matches(seed);
   await cache_is_sound(seed);
@@ -462,5 +508,7 @@ for (let seed = first; seed < first + seeds; seed++) {
   if (seed === first) await full_is_heard_by_its_own(seed);
   if (seed % 5 === 0) await kept_here_read_as_wanted(seed);
   if (seed === first) await cached_run_kept_longest(seed);
+  if (seed === first) await tops_outlast_the_rest(seed);
+  if (seed === first) await log_read_a_row_once(seed);
 }
 console.log(`ok   relay storage held to its model over ${seeds} seeds`);

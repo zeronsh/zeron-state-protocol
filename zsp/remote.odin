@@ -62,6 +62,7 @@ Remote_Op :: struct {
 Cached :: enum u8 {
 	Page, // keyed by page number; a run of a pack's pages under the first
 	Log, // keyed by offset
+	Top, // as Page, of branches alone: kept whatever else is let go of, so that only leaves are ever fetched
 }
 
 Remote_Host :: struct {
@@ -225,6 +226,7 @@ remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_bu
 	// Pages of a pack never made durable may have been cached by nobody, but are let go of all the same; and the pack,
 	// should it have been put, is deleted, now and again a while later.
 	host.cache_drop(host.data, .Page, (r.kept_gen + 1) << PACK_SHIFT, max(u64))
+	host.cache_drop(host.data, .Top, (r.kept_gen + 1) << PACK_SHIFT, max(u64))
 	for g in r.kept_gen + 1 ..< r.next_gen {
 		append(&r.deletes, Remote_Object{g, true})
 		remote_redelete(r, {g, true})
@@ -246,7 +248,7 @@ remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_bu
 		for run in Page_No(0) ..< min(2, (r.kept_pages + PAGE_RUN - 1) / PAGE_RUN) {
 			no := r.kept_gen << PACK_SHIFT | run * PAGE_RUN
 			probe: Page
-			if !host.cache_get(host.data, .Page, no, ([^]byte)(&probe)[:size_of(Page)]) || !page_sound(&probe, no) {
+			if !remote_cached(r, no, &probe) {
 				r.want_pages[no] = {}
 			}
 		}
@@ -354,6 +356,38 @@ remote_miss :: proc(r: ^Remote) {
 
 // ---------------------------------------------------------------- pages
 
+// Whether the host keeps a page, among the tops or the rest.
+@(private)
+remote_cached :: proc(r: ^Remote, no: Page_No, into: ^Page) -> bool {
+	bytes := ([^]byte)(into)[:size_of(Page)]
+	for kind in ([?]Cached{.Page, .Top}) {
+		if r.host.cache_get(r.host.data, kind, no, bytes) && page_sound(into, no) {
+			return true
+		}
+	}
+	return false
+}
+
+// Keeps a run of a pack's pages, its branches (which come first in a pack) among the tops.
+@(private)
+remote_keep :: proc(r: ^Remote, first: Page_No, bytes: []byte) {
+	tops := 0
+	for at := 0; at + PAGE_SIZE <= len(bytes); at += PAGE_SIZE {
+		probe: Page
+		copy(([^]byte)(&probe)[:size_of(Page)], bytes[at:])
+		if probe.level == 0 {
+			break
+		}
+		tops += 1
+	}
+	if tops > 0 {
+		r.host.cache_put(r.host.data, .Top, first, bytes[:tops * PAGE_SIZE])
+	}
+	if tops * PAGE_SIZE < len(bytes) {
+		r.host.cache_put(r.host.data, .Page, first + u64(tops), bytes[tops * PAGE_SIZE:])
+	}
+}
+
 @(private)
 remote_page :: proc(data: rawptr, no: Page_No) -> ^Page {
 	r := (^Remote)(data)
@@ -369,7 +403,7 @@ remote_page :: proc(data: rawptr, no: Page_No) -> ^Page {
 		return c.pg
 	}
 	pg := new(Page)
-	if r.host.cache_get(r.host.data, .Page, no, ([^]byte)(pg)[:size_of(Page)]) && page_sound(pg, no) {
+	if remote_cached(r, no, pg) {
 		r.pages[no] = {pg, r.tick}
 		r.stats.local_hits += 1
 		return pg
@@ -627,7 +661,7 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 			sound += 1
 		}
 		if sound > 0 {
-			r.host.cache_put(r.host.data, .Page, first, bytes[:sound * PAGE_SIZE])
+			remote_keep(r, first, bytes[:sound * PAGE_SIZE])
 		} else if got == 0 && absent && s != nil && !remote_deleted(r, {op.number, true}) {
 			// A page that is named and not there: the store cannot be read. (Of a pack deleted since it was asked for,
 			// it is no longer named: whatever asked for it will ask for something else.)
@@ -1100,7 +1134,7 @@ remote_commit :: proc(r: ^Remote) {
 		}
 		if !ok || len(run) >= 512 * PAGE_SIZE {
 			if len(run) > 0 {
-				r.host.cache_put(r.host.data, .Page, at, run[:])
+				remote_keep(r, at, run[:])
 				clear(&run)
 			}
 			at = no + 1
@@ -1113,6 +1147,7 @@ remote_commit :: proc(r: ^Remote) {
 	r.accounted -= f.accounted
 	for g in r.dead[:f.dead] {
 		r.host.cache_drop(r.host.data, .Page, g << PACK_SHIFT, (g + 1) << PACK_SHIFT)
+		r.host.cache_drop(r.host.data, .Top, g << PACK_SHIFT, (g + 1) << PACK_SHIFT)
 	}
 	remove_range(&r.dead, 0, f.dead)
 	r.entry = false

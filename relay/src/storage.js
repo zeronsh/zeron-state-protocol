@@ -8,6 +8,7 @@
 const LOG_ROW = 64 << 10; // a row of the log grows, rewritten, up to this: one row written per burst, not one per write
 const PAGE = 4096;
 const CACHE_ROW = 2 << 20; // storage takes no larger value
+const LOG_ROWS_READ = 4; // rows of the log kept as read, for reads of a little of one after another
 const GET = 0, LOG = 1, HINTS = 2, PUT_PACK = 3, PUT_EXTENT = 4, DELETE = 5; // Remote_Op_Kind
 const MOST = 8; // operations on R2 under way at once
 const FULL = "this relay can keep no more of this space";
@@ -23,7 +24,8 @@ export class Storage {
   #prefix = "";
   #made = false;
   #tail; // the log's last row, if it may grow: { off, bytes, len }
-  #cached = [0, 0]; // bytes
+  #rows = []; // rows of the log lately read, latest first: { off, bytes }. What lies at an offset changes only once cut
+  #cached = [0, 0, 0]; // bytes: of pages, of the log, of tops
   #budget;
   #queue = []; // operations to start
   #running = 0;
@@ -64,6 +66,7 @@ export class Storage {
     this.#sql.exec("CREATE TABLE IF NOT EXISTS manifest (id INTEGER PRIMARY KEY, data BLOB) STRICT");
     this.#sql.exec("CREATE TABLE IF NOT EXISTS cache0 (key INTEGER PRIMARY KEY, data BLOB) STRICT");
     this.#sql.exec("CREATE TABLE IF NOT EXISTS cache1 (key INTEGER PRIMARY KEY, data BLOB) STRICT");
+    this.#sql.exec("CREATE TABLE IF NOT EXISTS cache2 (key INTEGER PRIMARY KEY, data BLOB) STRICT");
     if (!this.#env.STORE) this.#sql.exec("CREATE TABLE IF NOT EXISTS object (key TEXT PRIMARY KEY, data BLOB) WITHOUT ROWID");
   }
 
@@ -74,7 +77,7 @@ export class Storage {
     if (!this.#made) return;
     if (this.#sql.exec("SELECT name FROM sqlite_master WHERE name = 'page'").toArray().length > 0) this.#sql.exec("DROP TABLE page");
     this.#tables();
-    for (const kind of [0, 1]) {
+    for (const kind of [0, 1, 2]) {
       this.#cached[kind] = this.#sql.exec(`SELECT coalesce(sum(length(data)), 0) AS n FROM cache${kind}`).one().n;
     }
     const [row] = this.#sql.exec("SELECT off, data FROM log ORDER BY off DESC LIMIT 1").toArray();
@@ -189,6 +192,7 @@ export class Storage {
   }
 
   #put_log_row(off, bytes) {
+    this.#rows = this.#rows.filter((r) => r.off !== off);
     this.write("INSERT INTO log VALUES (?, ?) ON CONFLICT (off) DO UPDATE SET data = excluded.data", off, bytes);
   }
 
@@ -199,10 +203,17 @@ export class Storage {
       return true;
     }
     for (let got = 0; got < into.length; ) {
-      const [row] = this.#read("SELECT off, data FROM log WHERE off <= ? ORDER BY off DESC LIMIT 1", off + got);
-      const from = row && off + got - row.off;
-      if (!row || from >= row.data.byteLength) return false;
-      const part = new Uint8Array(row.data, from, Math.min(into.length - got, row.data.byteLength - from));
+      const at = off + got;
+      let row = this.#rows.find((r) => r.off <= at && at < r.off + r.bytes.length);
+      if (!row) {
+        const [r] = this.#read("SELECT off, data FROM log WHERE off <= ? ORDER BY off DESC LIMIT 1", at);
+        if (!r || at - r.off >= r.data.byteLength) return false;
+        row = { off: r.off, bytes: new Uint8Array(r.data) };
+        this.#rows.unshift(row);
+        if (this.#rows.length > LOG_ROWS_READ) this.#rows.pop();
+      }
+      const from = at - row.off;
+      const part = row.bytes.subarray(from, Math.min(row.bytes.length, from + into.length - got));
       into.set(part, got);
       got += part.length;
     }
@@ -213,6 +224,7 @@ export class Storage {
   // In an order that loses nothing it keeps, wherever it stops: what lies past the cut is written anew before the row
   // it was in is cut short or goes.
   #log_cut(lo, hi) {
+    this.#rows = [];
     const rows = this.#read("SELECT off, length(data) AS n FROM log WHERE off < ? AND off + length(data) > ?", hi, lo);
     for (const { off, n } of rows) {
       const end = off + n;
@@ -234,7 +246,7 @@ export class Storage {
   #cache_get(kind, key, into) {
     const [row] = this.#read(`SELECT key, data FROM cache${kind} WHERE key <= ? ORDER BY key DESC LIMIT 1`, key);
     if (!row) return false;
-    const at = kind === 0 ? (key - row.key) * PAGE : key - row.key;
+    const at = kind !== 1 ? (key - row.key) * PAGE : key - row.key;
     if (at + into.length > row.data.byteLength) return false;
     into.set(new Uint8Array(row.data, at, into.length));
     return true;
@@ -242,7 +254,9 @@ export class Storage {
 
   // Kept if there is room, the oldest let go to make it; never at the cost of what must be kept.
   #cache_put(kind, key, bytes) {
-    const budget = kind === 0 ? Math.floor((this.#budget * 3) / 4) : Math.floor(this.#budget / 4);
+    // Pages three quarters, the log a quarter; and the trees' tops half as much again, apart, so that what else is
+    // read never crowds them out.
+    const budget = Math.floor((this.#budget * [3, 1, 2][kind]) / 4);
     if (bytes.length > CACHE_ROW || bytes.length > budget) return;
     // What lies at a place never changes: a run already cached there at least as long holds all of this.
     const [longer] = this.#read(`SELECT 1 AS x FROM cache${kind} WHERE key = ? AND length(data) >= ?`, key, bytes.length);
@@ -321,11 +335,12 @@ export class Storage {
     this.#done = undefined; // and what the next asks for waits for it to say who hears of it
   }
 
-  // Lets go of everything cached, here and in SQLite, and of whatever was to be started: for measuring.
-  forget() {
+  // Lets go of what is cached, here and in SQLite, and of whatever was to be started: for measuring. The trees' tops
+  // too, if `all`: else what is let go of is what a cache the budget has wholly turned over would not have.
+  forget(all) {
     this.cancel();
     if (!this.#made) return;
-    for (const kind of [0, 1]) {
+    for (const kind of all ? [0, 1, 2] : [0, 1]) {
       this.#shrink(`DELETE FROM cache${kind}`);
       this.#cached[kind] = 0;
     }
