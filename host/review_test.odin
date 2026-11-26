@@ -929,3 +929,61 @@ review_interrupts_held_once :: proc(t: ^testing.T) {
 		delete(p.held)
 	}
 }
+
+// Output nobody reads stops at the window, and the process with it; read again, all of it comes, and its end.
+@(test)
+review_output_held_then_read_comes_whole :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = true))
+	a, b := world_space(&w, 1), world_space(&w, 2)
+	testing.expect(t, shares_set(b, "shell 1 commands"))
+	WRITTEN :: 8 << 20
+	Holder :: struct {
+		using handler: Call_Handler,
+		sp:      ^Space,
+		holding: bool,
+		held:    int,
+		total:   int,
+		exited:  bool,
+		ended:   bool,
+	}
+	h: Holder
+	h.data, h.sp, h.holding = &h, a, true
+	h.on_data = proc(hd: ^Call_Handler, call: u64, bytes: []byte) -> bool {
+		h := (^Holder)(hd.data)
+		if len(bytes) > 0 && bytes[0] == 1 {
+			h.total += len(bytes) - 1
+		} else if len(bytes) > 0 && bytes[0] == 3 {
+			h.exited = true
+		}
+		if h.holding {
+			h.held += len(bytes)
+			return false
+		}
+		return true
+	}
+	h.on_end = proc(hd: ^Call_Handler, call: u64) {(^Holder)(hd.data).ended = true}
+	python := "python" when ODIN_OS == .Windows else "python3"
+	script := fmt.tprintf("import sys; sys.stdout.buffer.write(b'x' * %d); sys.stdout.flush()", WRITTEN)
+	first := make([dynamic]byte, context.temp_allocator)
+	append(&first, 0)
+	zsp.write_varint(&first, 3)
+	zsp.write_bytes(&first, transmute([]byte)python)
+	zsp.write_bytes(&first, transmute([]byte)string("-c"))
+	zsp.write_bytes(&first, transmute([]byte)script)
+	zsp.write_varint(&first, 0)
+	zsp.write_bytes(&first, nil)
+	call := host_call(a, w.keys[2].device, 1, "zsp.exec", first[:], &h.handler)
+	testing.expect(t, call != 0)
+	wait := time.tick_now()
+	world_run(&w, proc(w: ^World, at: rawptr) -> bool {return time.tick_since((^time.Tick)(at)^) > time.Second}, &wait)
+	testing.expectf(t, h.total > 0 && h.total <= zsp.CALL_WINDOW && !h.exited, "%d came while unread", h.total)
+	h.holding = false
+	call_consumed(a, call, h.held)
+	testing.expect(t, world_run(&w, proc(w: ^World, d: rawptr) -> bool {return (^Holder)(d).ended}, &h, 30 * time.Second), "it never ended")
+	testing.expectf(t, h.total == WRITTEN && h.exited, "%d of %d came, exited %v", h.total, WRITTEN, h.exited)
+	call_end(a, call)
+	world_run(&w, nobody_left)
+}

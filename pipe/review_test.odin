@@ -292,3 +292,103 @@ review_streams_done_with_are_kept_in_runs :: proc(t: ^testing.T) {
 	testing.expectf(t, len(n.links[1].peer_done) <= 2, "%d kept (floor %d, retired %d)", len(n.links[1].peer_done), n.links[1].peer_floor, n.links[1].peer_retired)
 	testing.expectf(t, n.links[1].peer_retired >= 3900, "only %d retired", n.links[1].peer_retired)
 }
+
+// A link with its handshake done, both ends quiet.
+@(private)
+review_pair :: proc(t: ^testing.T, a, b: ^Link, now: Time) {
+	a_sec := zsp.Key32{0 = 1}
+	b_sec := zsp.Key32{0 = 2}
+	space := zsp.Key32{0 = 3}
+	buf: [PACKET_MAX]byte
+	testing.expect(t, link_dial(a, a_sec, zsp.x25519_public(b_sec), space, 1))
+	testing.expect(t, link_answer(b, b_sec, space, link_hello(a, buf[:])))
+	testing.expect(t, link_input(a, link_hello(b, buf[:]), now))
+	review_exchange(a, b, now)
+}
+
+// Each end sends what it has, until neither has anything.
+@(private)
+review_exchange :: proc(a, b: ^Link, now: Time) {
+	buf: [PACKET_MAX]byte
+	for {
+		moved := false
+		for p := link_output(a, buf[:], now); len(p) > 0; p = link_output(a, buf[:], now) {
+			link_input(b, p, now)
+			moved = true
+		}
+		for p := link_output(b, buf[:], now); len(p) > 0; p = link_output(b, buf[:], now) {
+			link_input(a, p, now)
+			moved = true
+		}
+		if !moved {
+			return
+		}
+	}
+}
+
+// Round 4. A stream this end opened is of the urgency it gave it, whatever the peer's header says: nor is anything left
+// of it in the classes it was scheduled in once it is let go.
+@(test)
+review_urgency_is_the_openers :: proc(t: ^testing.T) {
+	a, b: Link
+	defer link_destroy(&a)
+	defer link_destroy(&b)
+	now: Time = 1000
+	review_pair(t, &a, &b, now)
+	buf: [PACKET_MAX]byte
+	id, ok := link_open(&a, 6)
+	testing.expect(t, ok)
+	payload := make([]byte, a.mtu - HEAD - zsp.TAG - 38, context.temp_allocator)
+	testing.expect(t, link_write(&a, id, payload))
+	link_finish(&a, id)
+	pkt := link_output(&a, buf[:], now)
+	testing.expect(t, len(pkt) > 0)
+	testing.expect(t, len(a.classes[6].fresh) + len(a.classes[6].old) > 0)
+	testing.expect(t, link_input(&b, pkt, now))
+	// The peer answers with another urgency, its end, and word of all it was sent.
+	bs := stream_find(&b, id)
+	testing.expect(t, bs != nil)
+	bs.urgency = 0
+	link_finish(&b, id)
+	b.ack_due = now
+	reply := link_output(&b, buf[:], now)
+	testing.expect(t, len(reply) > 0)
+	testing.expect(t, link_input(&a, reply, now))
+	testing.expectf(t, len(a.classes[6].fresh) == 0 && len(a.classes[6].old) == 0, "a stream let go of is still scheduled (%d, %d)", len(a.classes[6].fresh), len(a.classes[6].old))
+	for c in a.classes {
+		for s in c.fresh {
+			testing.expect(t, stream_find(&a, s.id) == s, "a stream let go of is still scheduled")
+		}
+		for s in c.old {
+			testing.expect(t, stream_find(&a, s.id) == s, "a stream let go of is still scheduled")
+		}
+	}
+}
+
+// Round 4. Packets that only acknowledge are not remembered for ever: a peer that makes this end acknowledge, and
+// acknowledges that, leaves nothing growing here.
+@(test)
+review_acks_alone_are_forgotten :: proc(t: ^testing.T) {
+	a, b: Link
+	defer link_destroy(&a)
+	defer link_destroy(&b)
+	now: Time = 1000
+	review_pair(t, &a, &b, now)
+	buf: [PACKET_MAX]byte
+	for _ in 0 ..< 4 {
+		now += ACK_DELAY + 1
+		review_exchange(&a, &b, now)
+	}
+	testing.expect_value(t, a.in_flight, 0)
+	for _ in 0 ..< 2000 {
+		now += 100
+		testing.expect(t, link_datagram(&b, []byte{1}))
+		pkt := link_output(&b, buf[:], now)
+		testing.expect(t, len(pkt) > 0)
+		testing.expect(t, link_input(&a, pkt, now))
+		for ack := link_output(&a, buf[:], now); len(ack) > 0; ack = link_output(&a, buf[:], now) {
+			testing.expect(t, link_input(&b, ack, now))
+		}
+	}
+	testing.expectf(t, len(a.sent) - a.sent_head < 64, "%d remembered", len(a.sent) - a.sent_head)
+}

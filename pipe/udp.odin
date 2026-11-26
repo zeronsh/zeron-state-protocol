@@ -1070,7 +1070,18 @@ stream_deliver :: proc(l: ^Link, s: ^Stream, bytes: []byte, again := false) -> b
 		stream_consumed(l, s, 1)
 		bytes = bytes[1:]
 		if stream_headed(s) {
-			s.urgency = min(s.head[0], 7)
+			// Its urgency is its opener's to say: a header on one this end opened says nothing of it. One the peer
+			// opened, if already in line, moves to the line of its urgency.
+			if urgency := min(s.head[0], 7); !stream_mine(l, s.id) && urgency != s.urgency {
+				listed := s.list != .None
+				if listed {
+					stream_unlist(l, s)
+				}
+				s.urgency = urgency
+				if listed {
+					stream_wake(l, s)
+				}
+			}
 			r := zsp.Reader{buf = s.head[1:s.head_size]}
 			s.after = zsp.read_varint(&r)
 		}
@@ -1567,6 +1578,9 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 	p.delivered, p.delivered_at = l.delivered, l.delivered_at
 	p.idle = !link_sendable(l)
 	append(&l.sent, p)
+	if !eliciting {
+		link_settle(l) // nothing to wait for of it: forgotten at once, if nothing before it is waited for
+	}
 	if eliciting {
 		if l.in_flight == 0 {
 			l.waiting = now
@@ -1723,6 +1737,7 @@ link_expire :: proc(l: ^Link, now: Time) {
 			break
 		}
 	}
+	link_settle(l) // what was lost is waited for no more
 }
 
 @(private)
