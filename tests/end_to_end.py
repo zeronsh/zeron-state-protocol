@@ -1241,6 +1241,13 @@ def test_ports():
             while data := s.recv(4096):
                 got += data
             assert got.startswith(b"HTTP/1.1 403 "), (request, got)
+    # As an HTTP proxy, as curl -x is: the request in absolute form, written whole, and answered.
+    with socket.create_connection(proxy, 5) as s:
+        s.sendall(b"GET http://bee.zsp.internal:%d/ HTTP/1.1\r\nHost: bee.zsp.internal:%d\r\nConnection: close\r\n\r\n" % (port, port))
+        got = b""
+        while data := s.recv(4096):
+            got += data
+        assert got.startswith(b"HTTP/1.1 200 ") and got.endswith(b"bee's"), got
     # Refused as it says all it will at once (its request, then the end of it): the refusal is still read.
     def socks_to(address, port):
         s = socket.create_connection(proxy, 5)

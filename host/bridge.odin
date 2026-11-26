@@ -461,6 +461,11 @@ bridge_on_data :: proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
 		if b.done != nil {
 			b.done(b.done_data, .Connected) // before anything from the port is written
 		}
+		// What the socket said already, given with the forward, goes now: the socket may have nothing more to say until
+		// it is answered (a proxy's request, read whole before the forward was made).
+		if !b.over && len(b.held) > 0 && (b.inspect == nil || b.early > 0) {
+			bridge_send_held(b)
+		}
 		return true // the status is not for the socket
 	}
 	if b.heard_end {
