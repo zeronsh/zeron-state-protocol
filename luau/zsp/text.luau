@@ -740,6 +740,9 @@ end
 
 -- Types bytes just after an element, deleted or not ("" for the start), and says what the first is called.
 function text.after(t: Text, after: string, bytes: string, fresh: () -> string): string
+	if bytes == "" then
+		return "" -- nothing is put, and nothing named
+	end
 	begin(t, fresh)
 	local lp, lo = "", 0
 	local i = 1

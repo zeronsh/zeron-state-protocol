@@ -69,7 +69,10 @@ function mirror.map(fields: { [string]: any }): Schema
 			end
 		else
 			assert(f.encode, `{name} is neither a column nor a schema`)
-			claim(f.slot, name)
+			-- Whose what is in a slot is says so of another's slot: it has none of its own.
+			if not f.who then
+				claim(f.slot, name)
+			end
 			columns[name] = f
 		end
 		table.insert(names, name)
@@ -429,6 +432,9 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 				mark_box(k, true)
 			end
 			wheres[id] = w :: any
+			if w then
+				dead_rows[id] = nil -- it was only out of the list a while, and is back
+			end
 			emptied[id] = if w and w.kind == ENTRY and not w.present then true else nil
 			if w and (not old or old.body ~= w.body) then
 				local k = key_of(w.owner, w.field)
@@ -476,7 +482,28 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 
 	-- A value as a column holds it: a text is always one, empty or not; otherwise what is empty is nothing.
 	local function decode(c: Column, row: any): any
-		if c.text then
+		if c.who then
+			-- Whose what is in the slot is, as the client says it: whoever wrote there last, or all who have, by name.
+			local last: any = nil
+			local names: { [string]: boolean } = {}
+			for _, cell in row.slots[c.slot] or {} :: any do
+				if not last or cell.stamp > last.stamp then
+					last = cell
+				end
+				if cell.author and cell.author.subject ~= "" then
+					names[cell.author.subject] = true
+				end
+			end
+			if c.who == "all" then
+				local all = {}
+				for name in names do
+					table.insert(all, name)
+				end
+				table.sort(all)
+				return table.freeze(all)
+			end
+			return if last and last.author and last.author.subject ~= "" then last.author.subject else nil
+		elseif c.text then
 			return text.read(client:held_text(row.id, c.slot) :: any)
 		end
 		local cell = latest(row, c.slot)
@@ -1890,6 +1917,10 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		end,
 		set = set,
 		update = function(f: (draft: any) -> ())
+			-- From the state as it is now, with all that has come read: a draft of an older one would write it back.
+			assert(not held, "what is asked about is read, not written")
+			assert(not stopped, "the document is closed")
+			refresh()
 			local d = draft_map(schema, current)
 			f(d)
 			set(finish_map(d, schema))

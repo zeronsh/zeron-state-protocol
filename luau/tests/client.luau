@@ -399,6 +399,20 @@ do
 	editor.close()
 	h.run()
 	assert(shown.rows[1].writers[1] == "me")
+	-- And in a document: whose its title and its text are, by name, not what is in them.
+	local doc = zsp.mirror.open(h.client, {
+		scope = 2,
+		name = "signed",
+		schema = zsp.mirror.map({ title = zsp.string(16), by = zsp.author(16), body = zsp.text(17), writers = zsp.authors(17) }),
+	})
+	h.run()
+	doc.set({ title = "t", body = "typed" })
+	h.run()
+	local st = doc.state()
+	assert(st.title == "t" and st.body == "typed")
+	assert(st.by == "me", `the title is mine, not {tostring(st.by)}`)
+	assert(#st.writers == 1 and st.writers[1] == "me", "and the text")
+	doc.stop()
 	assert(not pcall(function()
 		h.client:write(2, function(change)
 			change.set(mine, Signed, { by = "you" })

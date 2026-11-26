@@ -1032,6 +1032,87 @@ end
 
 -- ---------------------------------------------------------------- held to it
 
+-- ---------------------------------------------------------------- cases, each once
+
+do
+	math.randomseed(0)
+	-- Sent by a node, and not yet read by the document.
+	local function unread(p: Peer, cells: string)
+		send_cells(p, rows_of(nodes[p], store(p, cells)))
+	end
+	local function pass(from: Peer, to: Peer, since: number, read: boolean)
+		for k = since + 1, #from.out do
+			if read then
+				hear(to, from.out[k])
+			else
+				unread(to, from.out[k])
+			end
+		end
+	end
+	local a, b = peer(), peer()
+	local doc = { scope = 1, name = document, schema = Board }
+	local da, db = m.open(a.client, doc), m.open(b.client, doc)
+	run(a)
+	run(b)
+	da.set({ title = "board", tasks = { { title = "first", tags = {}, steps = { { name = "one" } }, plan = {} } } })
+	run(a)
+	pass(a, b, 0, true)
+	assert(db.state().tasks[1].title == "first" and #db.state().tasks[1].steps == 1)
+
+	-- An update is drafted from what has come, read or not: what another wrote meanwhile is not written back over.
+	local since = #a.out
+	da.update(function(d)
+		d.tasks[1].title = "second"
+	end)
+	run(a)
+	pass(a, b, since, false)
+	local mine = #b.out
+	db.update(function(d)
+		d.title = "renamed"
+	end)
+	run(b)
+	pass(b, a, mine, true)
+	assert(db.state().tasks[1].title == "second", `b wrote back what it had not read: {db.state().tasks[1].title}`)
+	assert(da.state().tasks[1].title == "second" and da.state().title == "renamed", "and a has both")
+
+	-- A row put in another list, and back, was only away: what is in it is not let go of when next anyone writes.
+	local task = da.state().tasks[1].id
+	since = #a.out
+	a.client:write(1, function(change)
+		change.place(task, "elsewhere", 0)
+	end)
+	run(a)
+	pass(a, b, since, true)
+	assert(#db.state().tasks == 0, "away")
+	since = #a.out
+	a.client:write(1, function(change)
+		change.place(task, "mirror/" .. document, 0)
+	end)
+	run(a)
+	pass(a, b, since, true)
+	assert(#db.state().tasks == 1, "and back")
+	mine = #b.out
+	db.update(function(d)
+		d.title = "again"
+	end)
+	run(b)
+	pass(b, a, mine, true)
+	assert(#db.state().tasks[1].steps == 1, "b let go of what is in a row that came back")
+	assert(#da.state().tasks[1].steps == 1, "and so a has lost it")
+	da.stop()
+	db.stop()
+end
+
+-- Nothing put after an element is nothing written.
+do
+	local t = text.new()
+	local function fresh(): string
+		return "\1\2\3\4\5\6\7\8"
+	end
+	assert(text.after(t, "", "", fresh) == "", "nothing is named")
+	assert(text.close(t, string.rep("\1", 16)) == nil, "and nothing is written")
+end
+
 local failures = 0
 local SEEDS = tonumber(require("@lune/process").args[1] or "") or 60
 -- And with every shortcut off, held to the same.
