@@ -286,6 +286,8 @@ start :: proc "c" (full: bool) -> bool {
 			}
 		},
 		questions = questions(),
+		reach = relayed_reach,
+		link = relayed_input,
 	}
 	synced_at = time.tick_now()
 	started = true
@@ -350,6 +352,7 @@ stop :: proc "c" () {
 		return // of no space yet: there is nothing to stop
 	}
 	started = false
+	relayed_close()
 	links_destroy()
 	found_close()
 	for _, c in conns {
@@ -747,6 +750,7 @@ tick :: proc "c" () -> f64 {
 	}
 	dialers_run(t)
 	links_run()
+	relayed_run(time.tick_now())
 	found_run(time.tick_now())
 	ids := make([dynamic]u32, 0, len(conns), context.temp_allocator)
 	for id in conns {
@@ -758,6 +762,15 @@ tick :: proc "c" () -> f64 {
 		}
 	}
 	links_flush()
+	for r in relayed {
+		relayed_flush(r)
+	}
+	// What links had to say through relays goes out at once.
+	for id in ids {
+		if c := conns[id] or_else nil; c != nil {
+			conn_flush(c)
+		}
+	}
 	zsp.store_flush(&node.store)
 	if zsp.store_unsynced(&node.store) && sync_due == nil {
 		// At once, unless syncing would then be busy more than half the time: so one writer waits for one sync, and many
@@ -803,6 +816,9 @@ tick :: proc "c" () -> f64 {
 	}
 	if w, ok := links_deadline(); ok {
 		sooner(&wait, f64(w) / f64(time.Millisecond))
+	}
+	if due := relayed_deadline(); due != 0 {
+		sooner(&wait, f64(i64(due) - i64(now_us())) / 1000)
 	}
 	return wait
 }

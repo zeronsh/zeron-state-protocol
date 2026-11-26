@@ -190,12 +190,14 @@ Echo :: struct {
 	accepted: i32, // atomic
 	read:     i64, // atomic; bytes
 	stalled:  bool, // reads nothing: a reader that never reads
+	giving_up: bool, // a send gives up now and then, to see whether the test is over: never where what it sends counts,
+	// for on Windows a send that gives up may have sent some of what it was given, and nobody can say how much
 	stop:     bool, // atomic
 }
 
 // Echoes whatever each connection says until it says no more, then says no more itself.
 @(private)
-echo_start :: proc(e: ^Echo, stalled := false) -> bool {
+echo_start :: proc(e: ^Echo, stalled := false, giving_up := false) -> bool {
 	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
 	if err != nil {
 		return false
@@ -204,6 +206,7 @@ echo_start :: proc(e: ^Echo, stalled := false) -> bool {
 	bound, _ := net.bound_endpoint(listener)
 	e.port = bound.port
 	e.stalled = stalled
+	e.giving_up = giving_up
 	e.thread = thread.create_and_start_with_poly_data(e, proc(e: ^Echo) {
 		for !sync.atomic_load(&e.stop) {
 			client, _, err := net.accept_tcp(e.listener)
@@ -215,9 +218,11 @@ echo_start :: proc(e: ^Echo, stalled := false) -> bool {
 				return
 			}
 			sync.atomic_add(&e.accepted, 1)
-			// A reset that comes while nothing can be sent may be heard late: so a send gives up, now and then,
-			// to see whether the test is over.
-			net.set_option(client, .Send_Timeout, 200 * time.Millisecond)
+			// A reset that comes while nothing can be sent may be heard late: so, where it may, a send gives up now
+			// and then, to see whether the test is over.
+			if e.giving_up {
+				net.set_option(client, .Send_Timeout, 200 * time.Millisecond)
+			}
 			if e.stalled {
 				for !sync.atomic_load(&e.stop) {
 					time.sleep(10 * time.Millisecond)

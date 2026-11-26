@@ -336,7 +336,7 @@ forward_holds_little_for_a_reader_that_never_reads :: proc(t: ^testing.T) {
 		defer world_destroy(&w)
 		testing.expect(t, world_ready(&w, direct = udp))
 		e: Echo
-		testing.expect(t, echo_start(&e))
+		testing.expect(t, echo_start(&e, giving_up = true))
 		defer echo_stop(&e)
 		open_port = u16(e.port)
 		w.hosts[2].port_permitted = permit_open_port

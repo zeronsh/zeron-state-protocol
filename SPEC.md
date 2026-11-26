@@ -8,7 +8,7 @@ trusted with nothing. This document is enough to write a client, a relay or a fu
 [4 Cells](#4-cells) · [5 Text](#5-text) · [6 Fingerprints](#6-fingerprints) · [7 Channels](#7-channels) ·
 [8 Sessions](#8-sessions) · [9 Watching](#9-watching) · [10 Reconciling](#10-reconciling) · [11 Live](#11-live) ·
 [12 Calls](#12-calls) · [13 Relays](#13-relays) · [14 Links](#14-links) · [15 Questions](#15-questions) ·
-[16 Who handles what](#16-who-handles-what)
+[16 Streams and services](#16-streams-and-services) · [18 Who handles what](#18-who-handles-what)
 
 ## 1 Model
 
@@ -128,7 +128,7 @@ has learnt, so that nothing garbled later takes them away; and an owner signs al
 closing it no later than the one before (the first, at 0), with 32 zero bytes for its key in `history`. Nothing sealed under a void epoch is acceptable; what honest
 members sealed under it they seal again.
 
-Rights are bits: 1 Read, 2 Write, 4 Call, 8 Vouch: to be believed about for whom one writes and calls (§4, §12). Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
+Rights are bits: 1 Read, 2 Write, 4 Call, 8 Vouch: to be believed about for whom one writes and calls (§4, §12), 16 Shell and 32 Files: to use what devices share of themselves in the scope (§16). Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
 invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
 a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed; and so does taking Vouch away in a signed scope. `closed`
 says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
@@ -266,8 +266,11 @@ clear prefix and then plaintext; the node seals and opens on its client's behalf
 Each side first sends
 
 ```
-1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, 2 relay: which only confirms what the dialler knows; 4, of a local client, that it is told whose cells are) ‖ space (32) ‖ roster serial varint ‖ credential bytes
+1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, 2 relay: which only confirms what the dialler knows; 4, of a local client, that it is told whose cells are; 8 calls) ‖ space (32) ‖ roster serial varint ‖ credential bytes
 ```
+
+A session between peers with flag 8, a **calls session**, carries Hello, Roster, Call, Flow and Error and nothing else: it is begun over a link a relay
+carries (§13), which carries everything else already. Both ends say 8, or the session ends *denied*.
 
 The accepting host decides from the credential and the proven key whether to serve the connection (§15); until it has, later frames
 wait. Then, between peers, whichever has the newer roster sends it (one no older than it said, or the session ends), and each verifies that the other is a member with a grant in
@@ -384,12 +387,20 @@ writer seals a piece within about a second of beginning it; a reader drops live 
 A call is a stream of messages each way. `device` is the callee's on the way out and the caller's on arrival. For whom is at most 64 bytes: what a client says of that is disregarded, and its node says whom its host accepted it for, or nothing; the
 last node tells its own client the same if the calling device has Vouch in that scope, and otherwise the device's `subject`. Who may not vouch may not call for another: *denied*. Ids belong to whoever sent
 Call on that session. A call ends when both sides have sent End, or on Fault or Cancel. Each side may have 256 KiB of messages outstanding beyond what the
-other has credited; the first message counts. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
+other has credited, and may be credited ahead of what it has sent up to 4 MiB; the first message counts. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
+Names beginning `zsp.` are for devices' hosts themselves (§16): a client's Serve of one is passed over, and a call to one is the host's to answer.
 
 What a node committed before a call it sends on its way before it, and so does a relay: whoever is called has what the call is about, unless so much was committed at once that one of them has to
-compare afresh (§9). Both devices need the Call right in the scope, and both check. A call takes a direct session with the device if there is one, else a tunnel (§13). It
-stays on the path it began on: if that fails the call faults *lost*, and may or may not have happened. Faults: 1 denied, 2 unreachable, 3 unserved,
-4 lost, 5 overrun, 6 busy.
+compare afresh (§9). Both devices need the Call right in the scope, and both check. A call takes a direct session with the device if there is one, one that
+replicates before a calls session, else a calls session over a link through a relay both are present at (§13), begun for it. It
+stays on the session it began on: if that fails the call faults *lost*, and may or may not have happened. Faults: 1 denied, 2 unreachable, 3 unserved,
+4 lost, 5 overrun, 6 busy. A relay may call a device that dialled it by the method `zsp.public` in scope 0, and by nothing else; no grant governs such a call.
+
+**Lanes.** Over a link (§14) each call has a stream of its own, its **lane**, opened by whoever sends Call on it, which carries that call's Call and Flow
+frames and nothing else, each way. A lane's first bytes each way say how many bytes of the session's own stream (stream 0) its sender had produced
+before them, so that what was committed before a call is still had before it. Frames on a lane are taken only once the session is ready. A lane is
+finished by each side once its call is over for it; one given up (Reset) loses its call. Lanes are opened with an urgency, 0 most urgent to 7 least,
+which a host takes from the method (§16) or, passing a call on, from the lane it came by.
 
 ## 13 Relays
 
@@ -407,33 +418,65 @@ docs/relay-storage.md.)
 | kind | blob |
 |---|---|
 | 0 | stamp (16) ‖ XChaCha20-Poly1305 under derive(X25519 of the two devices, "zsp-signal"), nonce stamp ‖ 0 ‖ 0x41 ‖ 0 (6), associated data from ‖ to |
-| 1, 2 | a tunnel's Noise messages, as §7, the caller dialling |
-| 3, 4 | tunnel data, from the caller and to it: counter (8) ‖ Noise ciphertext with that counter. A counter not above the last is dropped |
-| 5, 6 | nothing. Data came, of kind 3 or 4, in a tunnel that is unknown here. An end that has it open drops it, and its calls are *lost* |
+| 7 | a link's packet (§14), as over UDP |
 
-Tunnel plaintexts are single Call and Flow frames. A relay keeps nothing for a tunnel. A new first message does not replace a live tunnel until data
-arrives under it.
+Others are passed over. Devices with no direct link reach each other by a **link through a relay**: the same link as over UDP, its packets in signals
+of kind 7, taken only from members and only through a relay the receiver dialled. Whoever has a call to make and no session for it dials; the other
+answers. Over it runs a calls session (§8). Its packets are at most 8192 bytes; it needs no probing of its path's size, and no NAT keeps it. A
+packet that comes newest yet by another relay both are present at moves the link there, and an end whose relay has gone, or whose peer has gone
+from it, sends by another: a link outlives a relay, and its calls with it. A link whose calls have been over for 30 seconds is closed.
+
+A relay keeps nothing for a link and may drop any of its packets, as a router does; it must drop them rather than hold more than 256 KiB for a
+device, beyond which they would only wait. The link sends them again and slows. Nothing else that it carries may it drop.
 
 While every other device present at a relay is a full replica with a settled direct session, a device may end its watches there (it goes on sending), and must
 watch afresh when that ceases to be so.
 
 ## 14 Links
 
-A link is an ordered byte stream and datagrams (live frames) over UDP. First byte: 0x40 punch (ignored), 0x41 first (sender's id (4, little-endian) ‖ Noise 1),
+A link is ordered byte streams and datagrams (live frames) over UDP, or through a relay (§13). First byte: 0x40 punch (ignored), 0x41 first (sender's id (4, little-endian) ‖ Noise 1),
 0x42 second (sender's id ‖ receiver's id ‖ Noise 2), 0x43 data (receiver's id ‖ counter (8, little-endian) ‖ ciphertext, the 13 bytes before it being
 associated data), 0x44 beacon. Anything lower is STUN. The source of a genuine data packet newer than any before it is thenceforth the
 peer's address; a packet seen before, or too old to tell, is dropped. A live link gives way to a new knock only when that proves itself with data.
 The payload of Noise 1 is a stamp time drawn by the dialler, and a knock no later than the last from that device is ignored: anyone may have kept an old one.
 
-A packet there is no room for goes unacknowledged. Data frames: 0 padding to the end · 1 ping · 2 ack (largest varint, run varint, then (gap, run) pairs, a zero gap, then the highest stream offset permitted) ·
-3 stream (offset varint, bytes) · 4 datagram (bytes) · 5 close. Runs count downward from the largest. Loss recovery is RFC 9002's; congestion control is
-the sender's affair. A link with nothing in flight sends nothing.
+Data frames:
+
+```
+0 Pad       to the end
+1 Ping
+2 Ack       largest varint ‖ delay varint (µs since the largest came) ‖ run varint ‖ n × { gap varint ‖ run varint } ‖ 0
+3 Stream    id varint ‖ offset varint ‖ bytes
+4 Datagram  bytes
+5 Close
+6 Fin       id varint ‖ offset varint ‖ bytes                   as Stream, and its last bytes
+7 Reset     id varint ‖ final size varint                       its sender gives it up
+8 Stop      id varint                                           its receiver wants no more of it: the sender resets it
+9 Window    id varint ‖ highest offset permitted varint
+10 Limit    highest sum of offsets permitted varint ‖ streams the peer may have opened varint
+```
+
+Runs count downward from the largest. Loss recovery is RFC 9002's, less the delay a peer says it held an acknowledgement for, up to 25 ms; congestion
+control is the sender's affair. A packet that is not wholly understood, or that there is no room for, goes unacknowledged. A link with nothing in
+flight sends nothing.
+
+Streams are numbered: 0 is open from the start, and the dialler opens 2, 4, 6 … and the other 1, 3, 5 …, each the next of its own, implicitly by its
+first frame. Each other stream's first bytes, each way, are a header: urgency (1) ‖ after varint: it is delivered no earlier than `after` bytes of
+stream 0 have been, from the same sender. Offsets count the header. A stream is over for its sender once its Fin or Reset is acknowledged, and for
+its receiver once all before its end is delivered or a Reset came; when both, it is let go of, and frames for it later are acknowledged and passed over.
+A peer may have opened 256 streams at first, and as many more as are let go of, by Limit.
+
+Flow control is per stream and for the link: what a stream may send beyond what its receiver has delivered of it, at first 256 KiB, and what all
+of them may together, at first 1 MiB, the highest offset ever sent of each counted, a Reset's final size included. A receiver raises each when half
+of it is used and may double it, to 16 MiB and 32 MiB, while raising it again within two round trips. Of the link's window 64 KiB is kept for streams
+of urgency 3 or below. A sender should serve streams most urgent first, and within an urgency give a turn of a packet to each, first to those that
+had lately nothing to send. Out-of-order data, held, is bounded by these windows.
 
 The device with the lesser key dials. Devices that share a relay swap candidate addresses, 18 bytes each (IPv6 or mapped IPv4, then port, big-endian), in signals of kind 0, and
 both send to all of the other's at once. On a local network a device broadcasts from its link socket, at start and a few times soon after, to UDP port 9083, and a device that hears it and should be dialled answers that socket with the same: 0x44 ‖ salt (8) ‖
 XChaCha20-Poly1305 under derive(space, "zsp-beacon"), nonce 0 (8) ‖ salt ‖ 0 ‖ 0x42 ‖ 0 (6), of device (32) ‖ link port (2, big-endian), no associated data.
 
-A link through a NAT is closed after 25 idle seconds, before the NAT forgets it, and dialled again when there is something to say. While a call is under
+A link over UDP through a NAT is closed after 25 idle seconds, before the NAT forgets it, and dialled again when there is something to say. While a call is under
 way on a link, an end that has said nothing on it for 15 seconds pings; and so does one whose relay says that the device has gone.
 
 ## 15 Questions
@@ -519,7 +562,52 @@ each row's key, as in a Watch, in place of its id, any key of it. The partial re
 places, data and live, and answers its client once it holds the rows. It believes nothing else that would not be an answer to what it asked. A device that will not answer faults *unserved*, and another is asked; until one
 does, and when none can be reached, the answer is of what is held. A Fetch waits for the other, if one can be reached, and for its rows to be confirmed.
 
-## 16 Who handles what
+## 16 Streams and services
+
+A device's host serves methods of its own, by names beginning `zsp.`: what it lets others do on it. Each answers first with a status, and
+then as the method says:
+
+```
+status      0 ok ‖ what the method says · or code (1) ‖ reason (UTF-8), and End:
+            1 denied · 2 not offered · 3 refused · 4 unreachable · 5 timed out · 6 not found · 7 failed · 8 changed · 9 exists · 10 malformed
+```
+
+What it lets others do is the device's to say, in the scopes it says: **shares**, of terminals and commands (shell), and of folders of files, each by
+a name and for reading or writing too (files). Nothing is shared until its owner says, and whoever would use a share needs besides, in its scope,
+Call and Shell or Files (§3). When either changes, every call no longer allowed is faulted *denied* at once, and its process killed or its file closed.
+Every opening, refusal and close is written down by the host, with who and what but none of what passed. A host does not answer its own local
+clients but by `zsp.services` and `zsp.share`, nor relays but by `zsp.public`.
+
+| method | first message | then |
+|---|---|---|
+| `zsp.services` | – | n × service, End: 1 shell ‖ flags (1: 1 terminal, 2 commands) · 2 files ‖ flags (1: 1 read, 2 write) ‖ name bytes · 3 tcp ‖ port (2) ‖ host bytes ‖ name bytes; what the caller's rights let it use |
+| `zsp.share` | – or the shares, as text | the shares as text, or the new ones taken; for local clients alone |
+| `zsp.tcp` | port (2) ‖ host bytes | a TCP connection, there or by default to its loopback: bytes each way as messages, End a half-close, Fault or Cancel a reset |
+| `zsp.exec` | flags (1) ‖ n varint ‖ n × argument bytes ‖ m varint ‖ m × environment bytes ‖ folder bytes | a process |
+| `zsp.pty` | rows (2) ‖ columns (2) ‖ TERM bytes ‖ as `zsp.exec` after its flags | a process with a terminal; no arguments, the user's shell |
+| `zsp.list` | path bytes | m × { kind (1: 1 file, 2 folder, 3 other) ‖ name bytes ‖ size varint ‖ modified (ms) varint } in messages, End |
+| `zsp.get` | path bytes ‖ offset varint ‖ identity bytes | size varint ‖ modified varint ‖ identity bytes ‖ from varint, then the file |
+| `zsp.put` | path bytes ‖ size varint ‖ modified varint ‖ identity bytes ‖ flags (1: 1 replace, 2 make the folders) | from varint, then the file the other way |
+
+Integers of two bytes are big-endian. A process's messages are tagged: to it, `0 ‖ input`, `1 ‖ signal (1)` (POSIX numbers: 1 hang up, 2 interrupt,
+3 quit, 9 kill, 15 terminate, 18 continue, 19 stop) and `2 ‖ rows (2) ‖ columns (2)`, End meaning no more input; from it, `1 ‖ output`, `2 ‖ errors`, and last
+`3 ‖ code varint ‖ signal (1)`, then End. Arguments are the program's own, never through a shell; environment entries are NAME=value over the host's,
+NAME alone removing one. A call cancelled kills the process and all it started.
+
+Paths are a share's name and then the path within it, `/` between, whatever the system; none may lead out of the share, by `..` or by a link, which is
+judged by where the file opened really is. An empty path lists the shares of files. A file is hashed in chunks of 1 MiB, each by SHA-256, and the file
+by SHA-256 of its chunks' hashes in order. Whoever has the file sends it from `from` as `1 ‖ bytes`, each chunk followed by `2 ‖ its hash (32)`, then
+`3 ‖ status (1) ‖ [the file's hash (32)]` (with it unless resumed), and End; the receiver checks each chunk as it comes, and a put ends with its
+verdict, a status (1), once the sender has ended. **Resuming**: what was received is kept with the hashes of its whole chunks; asked again, a
+transfer takes up at the end of those that are still what their hashes say, if the file is the one it was by its `identity`, an opaque value its
+holder gives for it (here, its size, time and identity on its disk); otherwise it begins again. A file received is put in place whole, with the
+sender's time, or not at all.
+
+Whoever answers reads only as much as it has credit to send, and credits only what it has written on, to a socket, a process or a disk: so a
+slow end slows the other, and nothing piles up between them. Lanes take their urgency from the method: `zsp.pty` 1; `zsp.exec`, `zsp.tcp` and
+`zsp.public` 2; others 3, but those between nodes themselves 4, and `zsp.get` and `zsp.put` 6.
+
+## 18 Who handles what
 
 | | protocol | consumer |
 |---|---|---|

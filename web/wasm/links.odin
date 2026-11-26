@@ -247,21 +247,18 @@ peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
 	}
 	p.knocks = 0
 	p.session = zsp.session_open(&node, .Peer, peer_dials(p), p.device)
-	p.session.datagram_data = p
-	p.session.datagram = proc(data: rawptr, frame: []byte) -> bool {
-		return pipe.link_datagram((^Peer)(data).link, frame)
-	}
+	session_link(p.session, p.link)
 }
 
 @(private)
 peer_wire :: proc(p: ^Peer, l: ^pipe.Link) {
 	l.data = p
 	// The packet that proves a link may already carry its first bytes.
-	l.on_stream = proc(l: ^pipe.Link, bytes: []byte) {
+	l.on_stream = proc(l: ^pipe.Link, id: u64, bytes: []byte, event: pipe.Stream_Event) {
 		p := (^Peer)(l.data)
 		peer_opened(p, l)
 		if l == p.link && p.session != nil {
-			zsp.session_input(p.session, bytes) // links_run closes it, once it has heard why
+			link_heard(p.session, l, id, bytes, event) // links_run closes it, once it has heard why
 		}
 	}
 	l.on_datagram = proc(l: ^pipe.Link, bytes: []byte) {
@@ -554,15 +551,7 @@ links_flush :: proc() {
 			continue
 		}
 		for {
-			room := pipe.link_room(p.link)
-			if room > 0 {
-				out := zsp.session_output(p.session)
-				n := min(len(out), room)
-				if n > 0 {
-					pipe.link_write(p.link, out[:n])
-					zsp.session_sent(p.session, n)
-				}
-			}
+			link_feed(p.session, p.link)
 			packet := pipe.link_output(p.link, buf[:], now)
 			if packet == nil {
 				break
