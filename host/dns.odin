@@ -49,7 +49,7 @@ dns_open :: proc(h: ^Host, at: net.Endpoint) -> bool {
 		return false
 	}
 	net.set_blocking(d.udp, false)
-	tcp, lerr := nbio.listen_tcp(at, 16)
+	tcp, lerr := nbio.listen_tcp(at, 128)
 	if lerr != nil {
 		report(.Warning, "cannot answer for names by TCP: ", fmt.tprint(lerr))
 		net.close(d.udp)

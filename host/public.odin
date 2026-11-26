@@ -77,7 +77,7 @@ public_open :: proc(h: ^Host) -> bool {
 			report(.Error, "the certificate or its key cannot be read: a chain of PEM certificates, the leaf first, and an ECDSA (P-256, P-384) or RSA key")
 			return false
 		}
-		socket, err := listen_on(at, 512)
+		socket, err := listen_on(at)
 		if err != nil {
 			report(.Error, "cannot listen for the public at ", net.endpoint_to_string(at, context.temp_allocator), ": ", fmt.tprint(err))
 			return false
@@ -86,7 +86,7 @@ public_open :: proc(h: ^Host) -> bool {
 		rp.accepting[0] = nbio.accept_poly2(socket, h, true, public_accepted)
 	}
 	if at, ok := h.expose_http.?; ok {
-		socket, err := listen_on(at, 512)
+		socket, err := listen_on(at)
 		if err != nil {
 			report(.Error, "cannot listen for the public at ", net.endpoint_to_string(at, context.temp_allocator), ": ", fmt.tprint(err))
 			return false

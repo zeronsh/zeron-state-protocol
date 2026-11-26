@@ -19,7 +19,7 @@ class Sink:
     """Serves `size` bytes to each connection, and echoes otherwise: the far end of what is measured."""
 
     def __init__(self, port, size):
-        self.sock = socket.create_server(("127.0.0.1", port))
+        self.sock = socket.create_server(("127.0.0.1", port), backlog=4096)  # else the system's SYN cookies, not zspd, are measured
         self.size = size
         threading.Thread(target=self.serve, daemon=True).start()
 

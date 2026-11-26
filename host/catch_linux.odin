@@ -27,7 +27,7 @@ Catch :: struct {
 @(private)
 catch_open :: proc(h: ^Host, at: net.Endpoint) {
 	c := &h.catch
-	socket, err := listen_on(at, 256)
+	socket, err := listen_on(at)
 	if err != nil {
 		report(.Warning, "cannot listen for devices' addresses at ", net.endpoint_to_string(at, context.temp_allocator), ": ", fmt.tprint(err))
 		return

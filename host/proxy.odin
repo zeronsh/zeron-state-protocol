@@ -36,7 +36,7 @@ Proxy_Client :: struct {
 @(private)
 proxy_open :: proc(h: ^Host, at: net.Endpoint) {
 	p := &h.proxy_server
-	socket, err := listen_on(at, 128)
+	socket, err := listen_on(at)
 	if err != nil {
 		report(.Warning, "cannot be a proxy at ", net.endpoint_to_string(at, context.temp_allocator), ": ", fmt.tprint(err))
 		return

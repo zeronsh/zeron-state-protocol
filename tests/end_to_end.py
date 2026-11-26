@@ -1112,6 +1112,12 @@ def test_ports():
     if direct:
         assert http_get(bee, port, host="bee.zsp.internal") == (200, b"bee's")
         assert http_get(bee, port) == (200, b"bee's")
+    # Applications open many connections at once: what listens for them has room for them all to wait, where the
+    # system says so (ss shows a listener's backlog as its Send-Q).
+    if sys.platform.startswith("linux") and shutil.which("ss"):
+        for at in ([f"{bee}:{port}"] if direct else []) + [f"127.0.0.1:{proxy[1]}"]:
+            line = subprocess.run(["ss", "-Hltn", "src", at], capture_output=True, text=True).stdout.split()
+            assert line and int(line[2]) >= 1024, (at, line)
     # What a device offers is among the services it lists, to whoever it offers it.
     listed = ca.call(bytes.fromhex(b.key), 1, "zsp.services")
     data = b"".join(listed["data"])
