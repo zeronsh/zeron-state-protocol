@@ -1222,6 +1222,22 @@ def test_ports():
     finally:
         ca.host = host
     assert said[0] == b"\x01" + struct.pack(">H", port) + zsp.varint(5) + "café".encode() + b"\x00", said
+    # A device is its key, not what runs into the next field; and an answer is read whole, or is not one.
+    for bad in (bytes(31), bytes(33)):
+        try:
+            ca.offer(port, 1, device=bad, host="\0")
+            assert False, "offered to a device of %d bytes" % len(bad)
+        except ValueError:
+            pass
+    for ask in (ca.nodes, ca.offers, ca.exposures):
+        ca.host = lambda method, body=b"": [b"\x00\x00"]
+        try:
+            ask()
+            assert False, "%s read more than an answer" % ask.__name__
+        except ValueError:
+            pass
+        finally:
+            ca.host = host
     # What a device offers is among the services it lists, to whoever it offers it.
     listed = ca.call(bytes.fromhex(b.key), 1, "zsp.services")
     data = b"".join(listed["data"])

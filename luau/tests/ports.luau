@@ -143,6 +143,24 @@ for _, bad in { 65616, 0, 1.5, -80 } do
 	assert(not pcall(a.expose, a, bad), `exposed {bad}`)
 	assert(not pcall(a.unexpose, a, bad), `unexposed {bad}`)
 end
+-- Nor a scope that is not one, nor a device that is not a key: not one the wire wraps round to, nor what runs into the
+-- next field.
+for _, o in { { lo = port, scope = -255 }, { lo = port, scope = 1.9 }, { lo = port, scope = 2 ^ 32 }, { lo = port, scope = 0 }, { lo = port, scope = 1, device = string.rep("x", 31), host = "\0" } } do
+	assert(not pcall(a.offer, a, o :: any), `offered in {o.scope} to {o.device}`)
+end
+-- An answer that is short, longer, or holds a count past what it holds is malformed: said so, not thrown, nor nothing.
+local codec = require("../zsp/codec")
+local host_of = b._host
+for _, said in { "", "\1", "\1\0", string.rep("\128", 150) .. "\0", "\0\0" } do
+	(b :: any)._host = function()
+		return codec.reader(said), nil
+	end
+	for _, ask in { "nodes", "offers", "exposures" } do
+		local ok, got, fault = pcall((b :: any)[ask], b)
+		assert(ok and got == nil and fault == "malformed", `{ask} of {#said} bytes: {ok} {got} {fault}`)
+	end
+end;
+(b :: any)._host = host_of
 print("ok")
 end
 

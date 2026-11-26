@@ -4,6 +4,7 @@
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { CallFault, Client } from "../src/client.ts";
+import { Malformed } from "../src/codec.ts";
 import { cleanUp, eventually, node, TMP, token, zspd, zspdConnect } from "./procs.ts";
 
 function fails(what: string, fault: string, p: Promise<unknown>): Promise<void> {
@@ -81,6 +82,17 @@ async function main(): Promise<void> {
     await fails("exposed already", "denied", ca.expose(port));
     if ((await ca.unexpose(port)).length !== 1 || (await ca.unexpose(port + 1)).length !== 0) throw new Error("taken back");
     await fails("not exposed", "denied", ca.unexpose(port));
+    // An answer is read whole, or is not one: what is left over says it was not what it was read as.
+    const request = ca.request;
+    ca.request = () => Promise.resolve(new Uint8Array([0, 0]));
+    try {
+      for (const ask of [() => ca.nodes(), () => ca.offers(), () => ca.exposures()]) {
+        const read = await ask().then(() => true, (e) => !(e instanceof Malformed));
+        if (read) throw new Error(`${ask} read more than an answer`);
+      }
+    } finally {
+      ca.request = request;
+    }
     console.log("ok   ports.ts");
   } finally {
     listener.close();

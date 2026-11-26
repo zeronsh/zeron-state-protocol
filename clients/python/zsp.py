@@ -1314,12 +1314,12 @@ class Client:
             device, name, address, flags, subject = r.take(32), r.bytes().decode(), ".".join(map(str, r.take(4))), r.u8(), r.bytes()
             out.append(dict(device=device, name=name, address=address, here=bool(flags & 1), reachable=bool(flags & 2),
                             direct=bool(flags & 4), subject=subject, ports=entries(r)))
-        return out
+        return whole(r, out)
 
     def offers(self, op=0, offer=b""):
         """What this device offers: a list of dicts, as offer() takes them."""
         r = Reader(b"".join(self.host("zsp.offers", bytes([op]) + offer)))
-        return [read_offer(r) for _ in range(r.varint())]
+        return whole(r, [read_offer(r) for _ in range(r.varint())])
 
     def offer(self, ports, scope, device=None, host="", name="", proxy=False):
         """Offers this machine's ports (a number or (lo, hi)), or another's at `host`, to whoever may call in `scope`."""
@@ -1335,7 +1335,7 @@ class Client:
             port, prefix, flags, label = struct.unpack(">H", r.take(2))[0], r.bytes().decode(), r.u8(), r.bytes().decode()
             relays = [dict(relay=r.take(32), status=r.u8(), url=r.bytes().decode()) for _ in range(r.varint())]
             out.append(dict(port=port, name=prefix, proxy=bool(flags & 1), label=label, relays=relays))
-        return out
+        return whole(r, out)
 
     def expose(self, port, name="", proxy=False):
         """Exposes a port of this machine to the public, through every relay that will, under a fresh name."""
@@ -1375,8 +1375,19 @@ def entries(r):
     return out
 
 
+def whole(r, read):
+    """What was read, if it was all there was: what is left over says the answer was not what it was read as."""
+    if not r.done():
+        raise ValueError("more than an answer")
+    return read
+
+
 def put_offer(ports, scope, device, host, name, proxy):
     lo, hi = ports if isinstance(ports, tuple) else (ports, ports)
+    if device is not None and len(device) != 32:
+        raise ValueError("a device is its 32-byte key")  # else what follows it would be read as part of it
+    if not isinstance(scope, int) or not 1 <= scope < 1 << 32:
+        raise ValueError("a scope is a whole number from 1")
     return (struct.pack(">HH", lo, hi) + varint(scope) + (device or bytes(32)) + varint(len(host.encode())) + host.encode()
             + varint(len(name.encode())) + name.encode() + bytes([1 if proxy else 0]))
 

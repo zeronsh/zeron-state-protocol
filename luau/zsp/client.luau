@@ -2394,9 +2394,27 @@ local function u16(r: codec.Reader): number
 	return hi * 256 + codec.u8(r)
 end
 
+-- A count of things each at least a byte long: no more than there are bytes left, nor NaN (a varint too long).
+local function count(r: codec.Reader): number
+	local n = codec.varint(r)
+	if n ~= n or n > r.len - r.pos then
+		error("malformed", 0)
+	end
+	return n
+end
+
+-- Reads an answer whole or not at all: nil and "malformed" for one that is short, longer, or not what it is read as.
+local function answer<T>(r: codec.Reader, read: (codec.Reader) -> T): (T?, string?)
+	local ok, v = pcall(read, r)
+	if not ok or r.pos ~= r.len then
+		return nil, "malformed"
+	end
+	return v, nil
+end
+
 local function read_ports(r: codec.Reader): { Port }
 	local out: { Port } = {}
-	for _ = 1, codec.varint(r) do
+	for _ = 1, count(r) do
 		table.insert(out, table.freeze({ port = u16(r), scope = codec.varint(r), host = codec.bytes(r), name = codec.bytes(r) }))
 	end
 	return table.freeze(out)
@@ -2409,23 +2427,25 @@ function Client.nodes(self: Client): ({ Node }?, string?)
 	if not r then
 		return nil, fault
 	end
-	local out: { Node } = {}
-	for _ = 1, codec.varint(r) do
-		local id, name = codec.take(r, 32), codec.bytes(r)
-		local a = codec.take(r, 4)
-		local flags = codec.u8(r)
-		table.insert(out, table.freeze({
-			id = id,
-			name = name,
-			address = `{string.byte(a, 1)}.{string.byte(a, 2)}.{string.byte(a, 3)}.{string.byte(a, 4)}`,
-			here = bit32.band(flags, 1) ~= 0,
-			reachable = bit32.band(flags, 2) ~= 0,
-			direct = bit32.band(flags, 4) ~= 0,
-			subject = codec.bytes(r),
-			ports = read_ports(r),
-		}))
-	end
-	return table.freeze(out), nil
+	return answer(r, function(r: codec.Reader): { Node }
+		local out: { Node } = {}
+		for _ = 1, count(r) do
+			local id, name = codec.take(r, 32), codec.bytes(r)
+			local a = codec.take(r, 4)
+			local flags = codec.u8(r)
+			table.insert(out, table.freeze({
+				id = id,
+				name = name,
+				address = `{string.byte(a, 1)}.{string.byte(a, 2)}.{string.byte(a, 3)}.{string.byte(a, 4)}`,
+				here = bit32.band(flags, 1) ~= 0,
+				reachable = bit32.band(flags, 2) ~= 0,
+				direct = bit32.band(flags, 4) ~= 0,
+				subject = codec.bytes(r),
+				ports = read_ports(r),
+			}))
+		end
+		return table.freeze(out)
+	end)
 end
 
 -- A TCP port as the wire has it, two bytes: one of 1 to 65535, or none at all (not one taken modulo 65536).
@@ -2440,6 +2460,12 @@ end
 local function put_offer(w: codec.Writer, o: Offer)
 	put_port(w, o.lo)
 	put_port(w, o.hi or o.lo)
+	if type(o.scope) ~= "number" or o.scope ~= math.floor(o.scope) or o.scope < 1 or o.scope >= 2 ^ 32 then
+		error("a scope is a whole number from 1", 3) -- not one the wire would wrap round to another
+	end
+	if o.device ~= nil and (type(o.device) ~= "string" or #o.device ~= 32) then
+		error("a device is its 32-byte key", 3) -- else what follows would be read as part of it
+	end
 	codec.put_varint(w, o.scope)
 	codec.put(w, o.device or string.rep("\0", 32))
 	codec.put_bytes(w, o.host or "")
@@ -2457,21 +2483,23 @@ function Client._offers(self: Client, op: number, o: Offer?): ({ Offer }?, strin
 	if not r then
 		return nil, fault
 	end
-	local out: { Offer } = {}
-	for _ = 1, codec.varint(r) do
-		local lo, hi, scope, device = u16(r), u16(r), codec.varint(r), codec.take(r, 32)
-		local host, name, flags = codec.bytes(r), codec.bytes(r), codec.u8(r)
-		table.insert(out, table.freeze({
-			lo = lo,
-			hi = hi,
-			scope = scope,
-			device = if device == string.rep("\0", 32) then nil else device,
-			host = if host == "" then nil else host,
-			name = if name == "" then nil else name,
-			proxy = bit32.band(flags, 1) ~= 0,
-		}))
-	end
-	return table.freeze(out), nil
+	return answer(r, function(r: codec.Reader): { Offer }
+		local out: { Offer } = {}
+		for _ = 1, count(r) do
+			local lo, hi, scope, device = u16(r), u16(r), codec.varint(r), codec.take(r, 32)
+			local host, name, flags = codec.bytes(r), codec.bytes(r), codec.u8(r)
+			table.insert(out, table.freeze({
+				lo = lo,
+				hi = hi,
+				scope = scope,
+				device = if device == string.rep("\0", 32) then nil else device,
+				host = if host == "" then nil else host,
+				name = if name == "" then nil else name,
+				proxy = bit32.band(flags, 1) ~= 0,
+			}))
+		end
+		return table.freeze(out)
+	end)
 end
 
 -- What this device offers others of its space: ports of this machine (or, with host, of another, from here), to
@@ -2495,16 +2523,18 @@ function Client._exposures(self: Client, data: string): ({ Exposure }?, string?)
 	if not r then
 		return nil, fault
 	end
-	local out: { Exposure } = {}
-	for _ = 1, codec.varint(r) do
-		local port, name, flags, label = u16(r), codec.bytes(r), codec.u8(r), codec.bytes(r)
-		local relays: { Relay_Exposure } = {}
-		for _ = 1, codec.varint(r) do
-			table.insert(relays, table.freeze({ relay = codec.take(r, 32), status = codec.u8(r), url = codec.bytes(r) }))
+	return answer(r, function(r: codec.Reader): { Exposure }
+		local out: { Exposure } = {}
+		for _ = 1, count(r) do
+			local port, name, flags, label = u16(r), codec.bytes(r), codec.u8(r), codec.bytes(r)
+			local relays: { Relay_Exposure } = {}
+			for _ = 1, count(r) do
+				table.insert(relays, table.freeze({ relay = codec.take(r, 32), status = codec.u8(r), url = codec.bytes(r) }))
+			end
+			table.insert(out, table.freeze({ port = port, name = name, proxy = bit32.band(flags, 1) ~= 0, label = label, relays = table.freeze(relays) }))
 		end
-		table.insert(out, table.freeze({ port = port, name = name, proxy = bit32.band(flags, 1) ~= 0, label = label, relays = table.freeze(relays) }))
-	end
-	return table.freeze(out), nil
+		return table.freeze(out)
+	end)
 end
 
 -- What this device exposes to the public, through relays that will: for each, where (url, when status is 0). Yields.

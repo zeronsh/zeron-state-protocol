@@ -2089,6 +2089,7 @@ export class Client {
         subject: fromUtf8.decode(codec.bytes(r)), ports: readPorts(r),
       }));
     }
+    whole(r);
     return Object.freeze(out);
   }
 
@@ -2117,6 +2118,7 @@ export class Client {
         host: host || undefined, name: name || undefined, proxy: !!(flags & 1),
       }));
     }
+    whole(r);
     return Object.freeze(out);
   }
 
@@ -2146,6 +2148,7 @@ export class Client {
       }
       out.push(Object.freeze({ port: (p[0] << 8) | p[1], name, proxy: !!(flags & 1), label, relays: Object.freeze(relays) }));
     }
+    whole(r);
     return Object.freeze(out);
   }
 
@@ -2352,6 +2355,11 @@ export interface Exposure {
   readonly proxy: boolean;
   readonly label: string;
   readonly relays: readonly RelayExposure[];
+}
+
+/** An answer is read to its last byte: what is left over says it was not what it was read as. */
+function whole(r: codec.Reader): void {
+  if (r.pos !== r.len) throw new codec.Malformed("more than an answer");
 }
 
 function readPorts(r: codec.Reader): readonly Port[] {
