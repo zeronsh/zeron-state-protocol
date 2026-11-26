@@ -201,6 +201,10 @@ system) # names and addresses as every application here has them: zspd setup, as
 	r=0
 	$PYTHON tests/system.py || r=$?
 	$SUDO build/zspd$EXE setup --undo
+	# Taken back whatever it was set up with, though --undo is told nothing of it.
+	$SUDO build/zspd$EXE setup --names=elsewhere.test --loopback=127.78.0 >/dev/null
+	$SUDO build/zspd$EXE setup --undo
+	$PYTHON tests/system.py nothing-left || r=1
 	exit $r
 	;;
 slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 && end_to_end slow_hibernation slow_expose_hibernation ;;

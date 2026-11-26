@@ -97,6 +97,41 @@ def main():
         print("     (this system does not ask about addresses the other way)")
 
 
+def nothing_left():
+    """After zspd setup --undo, told nothing of how it was set up: nothing of it is left, whatever that was."""
+    left = []
+    if sys.platform.startswith("linux"):
+        if run("ip", "link", "show", "zsp0").returncode == 0:
+            left.append("the zsp0 link")
+        if run("sudo", "-n", "nft", "list", "table", "ip", "zsp").returncode == 0:
+            left.append("the nftables table")
+        if os.path.exists("/etc/systemd/system/zsp-names.service"):
+            left.append("the unit")
+    elif sys.platform == "darwin":
+        for name in os.listdir("/etc/resolver") if os.path.isdir("/etc/resolver") else []:
+            with open(os.path.join("/etc/resolver", name), errors="replace") as f:
+                if f.read().startswith("# Made by zspd setup"):
+                    left.append("/etc/resolver/" + name)
+        if os.path.exists("/Library/LaunchDaemons/sh.zeron.zsp-names.plist"):
+            left.append("the LaunchDaemon")
+        lo0 = run("ifconfig", "lo0").stdout
+        left += [line.split()[1] for line in lo0.splitlines() if line.strip().startswith("inet 127.7") and line.split()[1].startswith(("127.77.", "127.78."))]
+    elif WINDOWS:
+        rules = run("powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-DnsClientNrptRule | Where-Object Comment -eq 'zspd setup'").stdout
+        if rules.strip():
+            left.append("the NRPT rule")
+    assert not left, left
+    print("ok   nothing left")
+
+
+if sys.argv[1:] == ["nothing-left"]:
+    try:
+        nothing_left()
+    except AssertionError as e:
+        print("FAIL nothing left:", e)
+        sys.exit(1)
+    sys.exit(0)
+
 try:
     main()
     print("ok   system")

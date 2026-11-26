@@ -137,7 +137,8 @@ write :: proc(s: ^Setup, path, text: string) -> bool {
 	if err := os.make_directory_all(filepath_dir(path)); err != nil && !os.is_dir(filepath_dir(path)) {
 		return false
 	}
-	return host.save(path, transmute([]byte)text)
+	// Readable by all, as the system's own are: what reads it need not be root.
+	return host.save(path, transmute([]byte)text) && os.chmod(path, {.Read_User, .Write_User, .Read_Group, .Read_Other}) == nil
 }
 
 @(private = "file")
@@ -259,10 +260,11 @@ when ODIN_OS == .Linux {
 			`<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
 			`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n" +
 			"<!-- Made by zspd setup; zspd setup --undo takes it away. Addresses of a zsp space's devices, here, at boot. -->\n" +
+			"<!-- zsp-aliases %d %d %d -->\n" +
 			"<plist version=\"1.0\"><dict>\n<key>Label</key><string>%s</string>\n" +
 			"<key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>%s</string></array>\n" +
 			"<key>RunAtLoad</key><true/>\n</dict></plist>\n",
-			SETUP_LABEL, aliases(s, true),
+			s.loopback[0], s.loopback[1], s.devices, SETUP_LABEL, aliases(s, true),
 		)
 		write(s, SETUP_PLIST, plist) or_return
 		step(s, "forget any earlier one", "/bin/sh", "-c", "launchctl bootout system/" + SETUP_LABEL + " 2>/dev/null; true")
@@ -274,11 +276,44 @@ when ODIN_OS == .Linux {
 	@(private = "file")
 	setup_undo :: proc(s: ^Setup) -> bool {
 		say(os.stdout, "Taking back what zspd setup did:\n")
+		// What it was set up with is found where it was written, not taken from what --undo is told.
+		if plist, err := os.read_entire_file(SETUP_PLIST, context.temp_allocator); err == nil {
+			if _, _, rest := strings.partition(string(plist), "<!-- zsp-aliases "); rest != "" {
+				said, _, _ := strings.partition(rest, " -->")
+				words := strings.fields(said, context.temp_allocator)
+				if len(words) == 3 {
+					number :: proc(w: string) -> (n: int, ok: bool) {
+						if w == "" || len(w) > 5 {
+							return
+						}
+						for c in transmute([]byte)w {
+							if c < '0' || c > '9' {
+								return
+							}
+							n = n * 10 + int(c - '0')
+						}
+						return n, true
+					}
+					a, aok := number(words[0])
+					b, bok := number(words[1])
+					n, nok := number(words[2])
+					if aok && bok && nok && a >= 0 && a <= 255 && b >= 0 && b <= 255 && n > 0 && n <= 65000 {
+						s.loopback, s.devices = {byte(a), byte(b)}, n
+					}
+				}
+			}
+		}
 		step(s, "stop making the addresses", "/bin/sh", "-c", "launchctl bootout system/" + SETUP_LABEL + " 2>/dev/null; true")
 		remove(s, SETUP_PLIST)
 		step(s, "take the addresses away", "/bin/sh", "-c", aliases(s, false))
-		remove(s, strings.concatenate({"/etc/resolver/", s.suffix}, context.temp_allocator))
-		remove(s, strings.concatenate({"/etc/resolver/", reverse_zone(s)}, context.temp_allocator))
+		if files, err := os.read_all_directory_by_path("/etc/resolver", context.temp_allocator); err == nil {
+			for f in files {
+				text, rerr := os.read_entire_file(f.fullpath, context.temp_allocator)
+				if rerr == nil && strings.has_prefix(string(text), "# Made by zspd setup") {
+					remove(s, f.fullpath)
+				}
+			}
+		}
 		return true
 	}
 
