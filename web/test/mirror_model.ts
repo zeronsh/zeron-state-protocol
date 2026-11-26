@@ -16,7 +16,7 @@ import * as text from "../src/text.ts";
 import { type Client, type Column, type Stored } from "../src/client.ts";
 import * as m from "../src/mirror.ts";
 import { board, derive, document, hostile, latest, mutate, rows, words } from "./mirror_cases.ts";
-import { drain, evaluate, hear, peer, rowsOf, run, sendCells, store, type Peer } from "./peers.ts";
+import { admit, drain, evaluate, hear, peer, rowsOf, run, sendCells, store, type Peer } from "./peers.ts";
 import { random, type Random } from "./random.ts";
 
 const SEEDS = Number(process.argv[2] ?? 40);
@@ -356,8 +356,35 @@ function cases(): void {
   pass(b, a, mine, true);
   must(B().tasks[0].steps.length === 1, "b let go of what is in a row that came back");
   must(A().tasks[0].steps.length === 1, "and so a has lost it");
+
+  // NaN, as anyone may write in a number, is what it was: a state that has it, set again, writes nothing.
+  void da.update((d) => void (d.count = NaN));
+  run(a);
+  since = a.out.length;
+  void da.set(structuredClone(A()) as m.Input<typeof Board>);
+  run(a);
+  must(a.out.length === since, "NaN as it was is written again");
   da.close();
   db.close();
+
+  // Another stretch asked for before the client is told its scopes is the stretch it is given once it is.
+  {
+    const w = peer(bytes, () => clock * 1000);
+    const dw = m.open(w.client, doc);
+    run(w);
+    void dw.set({ tasks: ["a", "b", "c"].map((title) => ({ title, tags: [], steps: [], plan: {} })) });
+    run(w);
+    const r = peer(bytes, () => clock * 1000, false);
+    let got!: m.Found<m.At<typeof Board, readonly ["tasks"]>>;
+    const asked = m.ask(r.client, doc, ["tasks"], { order: ["title"], limit: 1 }, (x) => (got = x));
+    asked.move(1, 1);
+    admit(r);
+    for (const c of w.out) hear(r, c);
+    run(r);
+    must(got.status === "ready" && got.first === 1 && got.rows.length === 1 && got.rows[0].title === "b", `the second: ${got.rows[0]?.title}`);
+    asked.stop();
+    dw.close();
+  }
 
   // Nothing put after an element is nothing written.
   const t = text.create();

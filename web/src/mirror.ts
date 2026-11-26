@@ -2060,6 +2060,10 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
     wasNamed = named;
     doc.refresh();
     const found = answers.get("found");
+    let status: Found["status"] = found ? found.status : "loading";
+    for (const a of answers.values()) {
+      if (a.status !== "ready" && status === "ready") status = a.status === "denied" || a.status === "faulty" ? a.status : "loading";
+    }
     // What the document shows there, by row id.
     const shown = new Map<string, unknown>();
     const keyOf = new Map<string, string>();
@@ -2079,25 +2083,9 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
       };
       walk(box as readonly Obj[] | undefined);
     }
+    const rows: unknown[] = [], keys: string[] = [];
     const of = p.box.of;
     const tree = p.box.kind === "tree" ? p.box : undefined;
-    // And the maps within each map given, which are there whether their rows are or not, but say what they hold: of each
-    // that answers, and of a tree's, of every node beneath it, for those are given with it.
-    if (isMap(of)) {
-      const ids: string[] = [];
-      const within = (id: string): void => {
-        mapsWithin(of, binaryOf(id), doc.derive, ids);
-        const n = tree && (shown.get(id) as Obj | undefined);
-        for (const c of n ? ((n.children as readonly Obj[] | undefined) ?? NONE) : NONE) within(c.id);
-      };
-      for (const r of found ? found.rows : NONE) within(r.id);
-      withinMaps(ids); // which may tell, before this goes on with what it then is
-    }
-    let status: Found["status"] = found ? found.status : "loading";
-    for (const a of answers.values()) {
-      if (a.status !== "ready" && status === "ready") status = a.status === "denied" || a.status === "faulty" ? a.status : "loading";
-    }
-    const rows: unknown[] = [], keys: string[] = [];
     for (const r of found ? found.rows : NONE) {
       const v = shown.get(r.id);
       if (v !== undefined) {
@@ -2150,8 +2138,22 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
     }
   };
 
+  // The maps within each that answers, which are there whether their rows are or not, but say what they hold; and, in a
+  // tree, within every node, since a node is given with all beneath it.
+  const mapsOfGiven = (): void => {
+    const p = place;
+    if (!p || !isMap(p.box.of)) return;
+    const ids: string[] = [];
+    for (const r of answers.get("found")?.rows ?? NONE) mapsWithin(p.box.of, binaryOf(r.id), doc.derive, ids);
+    if (p.box.kind === "tree") {
+      const mine = `tree ${p.trees.length - 1} `;
+      for (const [name, a] of answers) if (name.startsWith(mine)) for (const r of a.rows) mapsWithin(p.box.of, binaryOf(r.id), doc.derive, ids);
+    }
+    withinMaps(ids);
+  };
+
   let found: Asking | undefined;
-  let stretch = { offset: asking.offset, limit: asking.limit }; // as last moved to, which is asked once it can be
+  let moved: { offset: number; limit: number | undefined } | undefined; // asked for before there was anything to move
   const start = (): boolean => {
     if (place || stopped) return true;
     if (!client.scopeKey(scope)) return false;
@@ -2174,17 +2176,19 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
         table: columns,
         where: where.all(where.inList(list), where.begins(W, within), asking.where ?? where.all()),
         order: asking.order,
-        offset: stretch.offset,
-        limit: stretch.limit,
+        offset: asking.offset,
+        limit: asking.limit,
         fromEnd: asking.fromEnd,
         totals: asking.totals,
       },
       (a) => {
         answers.set("found", a);
+        mapsOfGiven();
         tell();
       },
     );
     questions.push(found);
+    if (moved) found.move(moved.offset, moved.limit);
     // The rows on the way: whether what answers is there is theirs to say.
     questions.push(
       client.ask({ scope, table: BY_WHERE, where: where.ids(p.chain.map((id) => codec.hex(id))), limit: 1000 }, (a) => {
@@ -2209,6 +2213,7 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
             (a) => {
               answers.set(`tree ${i} ${n}`, a);
               for (let k = n + 1; k * 1000 < a.total; k++) if (!pages.has(k)) page(k);
+              mapsOfGiven();
               tell();
             },
           ),
@@ -2237,8 +2242,8 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
   return Object.freeze({
     // Another stretch of what answers.
     move(offset: number, limit?: number): void {
-      stretch = { offset, limit: limit ?? stretch.limit };
-      found?.move(offset, limit);
+      if (found) found.move(offset, limit);
+      else moved = { offset, limit };
     },
     stop(): void {
       if (stopped) return;

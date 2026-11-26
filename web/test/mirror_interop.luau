@@ -158,7 +158,7 @@ local Board = m.map({
 	tasks = m.list(18, Task),
 	scores = m.record(number(16)),
 	people = m.record(Person),
-	outline = m.tree(19, m.map({ name = zsp.string(16), body = zsp.text(17), marks = m.list(18, number(16)) })),
+	outline = m.tree(19, m.map({ name = zsp.string(16), body = zsp.text(17), marks = m.list(18, number(16)), look = m.map({ color = zsp.string(16) }) })),
 	numbers = m.list(20, number(16)),
 })
 
@@ -256,9 +256,10 @@ local function mutate(d: any)
 				n.name = word()
 				n.body = (n.body or "") .. word()
 				table.insert(n.marks, math.random(100))
+				n.look.color = if math.random(4) == 1 then nil else word()
 			else
 				local into = if #all > 0 and math.random(2) == 1 then all[math.random(#all)].children else d.outline
-				table.insert(into, math.random(1, #into + 1), { name = word(), children = {}, marks = { 1, 2 } })
+				table.insert(into, math.random(1, #into + 1), { name = word(), children = {}, marks = { 1, 2 }, look = { color = word() } })
 			end
 		elseif r == 10 then
 			d.count = if math.random(4) == 1 then nil else math.random(1000)

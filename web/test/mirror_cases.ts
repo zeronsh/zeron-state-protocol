@@ -33,7 +33,7 @@ export function board(number: (slot: number) => Column<number> = c.number, steps
   const fields = { title: c.string(16), done: c.boolean(17), notes: c.text(18), tags: m.list(19, c.string(16)) };
   const Task = m.map({ ...fields, steps: m.list(20, Step), plan: m.map({ due: number(16) }) });
   const Person = m.map({ role: c.string(16), bio: c.text(17), pets: m.list(18, m.map({ name: c.string(16) })) });
-  const Outline = m.map({ name: c.string(16), body: c.text(17), marks: m.list(18, number(16)) });
+  const Outline = m.map({ name: c.string(16), body: c.text(17), marks: m.list(18, number(16)), look: m.map({ color: c.string(16) }) });
   return m.map({
     title: c.string(16),
     count: number(17),
@@ -134,9 +134,10 @@ export function mutate(d: m.Draft<Board>, rng: Random, steps = true): void {
         n.name = word();
         n.body = (n.body ?? "") + word();
         n.marks.push(R(100));
+        n.look.color = R(4) === 1 ? undefined : word();
       } else {
         const into = all.length > 0 && R(2) === 1 ? all[R(all.length) - 1].children : d.outline;
-        into.splice(RR(1, into.length + 1) - 1, 0, { name: word(), children: [], marks: [1, 2] });
+        into.splice(RR(1, into.length + 1) - 1, 0, { name: word(), children: [], marks: [1, 2], look: { color: word() } });
       }
     } else if (r === 10) {
       d.count = R(4) === 1 ? undefined : R(1000);
