@@ -227,6 +227,13 @@ remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_bu
 	if r.local_from > 0 {
 		host.log_cut(host.data, 0, r.local_from)
 	}
+	// The latest pack begins with the branches it changed, the roots of every tree among them: asked for at once, they
+	// are at hand in one read, rather than a read a level as each tree is first gone down.
+	if r.kept_gen > 0 {
+		for slot in Page_No(0) ..< 2 * PAGE_RUN {
+			r.want_pages[r.kept_gen << PACK_SHIFT | slot] = {}
+		}
+	}
 	return true
 }
 

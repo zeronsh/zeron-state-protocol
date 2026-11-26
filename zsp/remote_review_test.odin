@@ -603,3 +603,35 @@ review_waiting_is_never_for_ever :: proc(t: ^testing.T) {
 		sim_check(&s)
 	}
 }
+
+// A host opened with nothing at hand asks at once for the head of the latest pack, where every tree's root and upper
+// branches are: one read, before anything has gone down any tree.
+@(test)
+remote_opening_asks_for_the_tops :: proc(t: ^testing.T) {
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	for store_work(&x.store) {}
+	for i in u64(0) ..< 200 {
+		review_commit(&x.store, {review_cell(i + 1, 1, 10 + i, {byte(i)})})
+	}
+	x.remote.want_checkpoint = true
+	remote_store_settle(t, &x)
+	latest := x.remote.kept_gen
+	testing.expect(t, latest > 0)
+	remote_store_close(&x)
+	for kind in Cached {
+		for _, b in x.host.cache[kind] {
+			delete(b)
+		}
+		clear(&x.host.cache[kind])
+	}
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	remote_ops(&x.remote)
+	asked := false
+	for op in x.host.ops {
+		asked ||= op.kind == .Get_Pages && op.number == latest && op.off == 0
+	}
+	testing.expect(t, asked, "the tops were not asked for")
+}
