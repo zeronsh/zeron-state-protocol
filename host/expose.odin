@@ -395,6 +395,22 @@ proxy_header :: proc(from: pipe.Address, to: [4]byte, port: u16, extra: []byte) 
 	return w[:]
 }
 
+// What a device's connection through an offer marked proxy says first: PROXY v2, from the device's address here, as any
+// application here would see it, to this machine's port; with TLVs 0xE0, the device's key, and 0xE1, its name. Owned.
+port_proxy_header :: proc(sp: ^Space, caller: zsp.Key32, port: u16) -> []byte {
+	caller := caller
+	ip, _ := device_address(sp, caller)
+	extra := make([dynamic]byte, context.temp_allocator)
+	append(&extra, 0xe0, 0, 32)
+	append(&extra, ..caller[:])
+	if m := zsp.roster_member(&sp.node.roster, caller); m != nil && sp.naming.suffix != "" {
+		name := member_name_of(sp, m)
+		append(&extra, 0xe1, byte(len(name) >> 8), byte(len(name)))
+		append(&extra, name)
+	}
+	return proxy_header(pipe.address_v4(ip[0], ip[1], ip[2], ip[3], 0), {127, 0, 0, 1}, port, extra[:])
+}
+
 // zsp.expose, for a local client: 0 to list, 1 ‖ port (2) ‖ prefix bytes ‖ flags (1: 1 proxy) to expose a port, 2 ‖ port (2)
 // to take it back. Answered with n varint ‖ n × { port (2) ‖ prefix bytes ‖ flags (1) ‖ label bytes ‖ m varint ‖ m × {
 // relay (32) ‖ status (1) ‖ url bytes } }.

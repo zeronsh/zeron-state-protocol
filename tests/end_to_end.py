@@ -1055,6 +1055,20 @@ def test_ports():
         assert got == b"bye"
         s.close()
 
+    # Who connects, said first to a service that asks, through an offer marked so.
+    told = free_port()
+    asks = Service("127.0.0.1", told, says=b"who?")
+    cb.offer(told, 1, proxy=True)
+    resolve(a.dns, "bee.zsp.internal")
+    eventually("that offer is heard", lambda: any(p["port"] == told for n in ca.nodes() for p in n["ports"]))
+    assert http_get("bee.zsp.internal", told, proxy=proxy) == (200, b"who?")
+    head = asks.heads[-1]
+    here = address_of(cb, a.key)  # a, as b sees it
+    assert head.startswith(b"\r\n\r\n\x00\r\nQUIT\n\x21\x11") and head[16:20] == socket.inet_aton(here), head[:40]
+    tlv = head[28:]
+    assert tlv[:3] == b"\xe0\x00\x20" and tlv[3:35] == bytes.fromhex(a.key), tlv[:40]
+    assert tlv[35] == 0xE1 and b".id.zsp.internal" in tlv[38:38 + struct.unpack(">H", tlv[36:38])[0]]
+
     # A page elsewhere, whose own name leads here, or that would send it here, reaches nothing.
     if direct:
         assert http_get(bee, port, host="attacker.example")[0] == 403
