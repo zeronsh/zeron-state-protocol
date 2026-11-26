@@ -94,6 +94,7 @@ Session :: struct {
 	lane_data: rawptr,
 	lane_open: proc(data: rawptr, urgency: u8, after: u64) -> (id: u64, ok: bool),
 	taken:     u64, // bytes of `out` the host has taken, ever
+	lane_held: int, // bytes waiting on lanes, all of them together
 }
 
 Watch :: struct {
@@ -1980,7 +1981,9 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 		return
 	}
 	if n.keys == nil {
-		link := len(rest) > 0 && Post(rest[0]) == .Link
+		if len(rest) > MAX_SIGNAL {
+			return // larger than any signal there is
+		}
 		for to in n.sessions {
 			// What was committed before goes before: all of it, to everyone it goes to, or nothing yet.
 			if to.ready && to.peer == device && !flush_changes(to) {
@@ -1989,8 +1992,8 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 		}
 		for to in n.sessions {
 			if to.ready && to.peer == device {
-				if link && session_backlog(to) > LINK_QUEUE {
-					continue // dropped, as a router would: it is sent again, and its sender slows
+				if session_backlog(to) + len(rest) + 64 > LINK_QUEUE {
+					continue // dropped, as a router would: what matters is sent again, and its sender slows
 				}
 				cells_close(to)
 				at := frame_begin(&to.out, .Signal)

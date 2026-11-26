@@ -13,6 +13,8 @@ import "base:runtime"
 // stream once all of it is sent, and calls session_lane_closed, after which the lane is gone.
 
 MAX_LANES :: 1024 // a session's, open at once; past this, calls share the session's own stream
+MAX_LANE_FRAME :: CALL_WINDOW + 4096 // a frame on a lane: one message of a call, and what says which
+MAX_LANE_HELD :: 8 << 20 // frames cut short, across a session's lanes, waiting for the rest
 
 Lane :: struct {
 	id:      u64, // the pipe's stream
@@ -164,13 +166,29 @@ session_lane_input :: proc(s: ^Session, id: u64, urgency: u8, bytes: []byte) -> 
 		// Taken where they lie, and only what is cut short kept for later.
 		used := lane_frames(s, l, bytes)
 		if !s.closing {
-			append(&l.input, ..bytes[used:])
+			lane_keep(s, l, bytes[used:])
 		}
 		return !s.closing
 	}
-	append(&l.input, ..bytes)
+	lane_keep(s, l, bytes)
 	lane_take(s, l)
 	return !s.closing
+}
+
+// Keeps what must wait on a lane, as much as may wait: before the session is ready, no more across its lanes than
+// its own stream may hold; after, frames cut short, no more across them than MAX_LANE_HELD.
+@(private)
+lane_keep :: proc(s: ^Session, l: ^Lane, bytes: []byte) {
+	if len(bytes) == 0 {
+		return
+	}
+	most := MAX_LANE_HELD if s.ready else MAX_FRAME + 16
+	if s.lane_held + len(bytes) > most {
+		session_fail(s, .Malformed)
+		return
+	}
+	append(&l.input, ..bytes)
+	s.lane_held += len(bytes)
 }
 
 // Takes the whole frames that have come on a lane, once the session may act on them.
@@ -182,6 +200,7 @@ lane_take :: proc(s: ^Session, l: ^Lane) {
 	used := lane_frames(s, l, l.input[:])
 	if used > 0 {
 		remove_range(&l.input, 0, used)
+		s.lane_held -= used
 	}
 	if len(l.input) == 0 {
 		shrink(&l.input)
@@ -202,7 +221,7 @@ lane_frames :: proc(s: ^Session, l: ^Lane, bytes: []byte) -> (used: int) {
 			}
 			break
 		}
-		if n == 0 || n > MAX_FRAME {
+		if n == 0 || n > MAX_LANE_FRAME {
 			session_fail(s, .Malformed)
 			break
 		}
@@ -248,6 +267,9 @@ session_lane_heard :: proc(s: ^Session, id: u64, given_up: bool) {
 		lane_take(s, l)
 	}
 	l.heard = true
+	if l.calls <= 0 {
+		l.over = true // nothing goes on on it, nor can now
+	}
 	if given_up || len(l.input) > 0 {
 		// A frame cut short, or frames that will now never be whole: its calls cannot go on.
 		calls_lost(s.node, s.id, lane = id)

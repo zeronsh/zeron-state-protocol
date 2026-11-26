@@ -77,7 +77,7 @@ sim_relayed_pump :: proc(s: ^Sim) -> (busy: bool) {
 			if len(out) == 0 {
 				continue
 			}
-			n := min(len(out), 32 << 10)
+			n := min(len(out), 8192) // as large as a link's packet through a relay, at most
 			blob := make([]byte, n + 1, context.temp_allocator)
 			blob[0] = 0 if r.mine else 1
 			copy(blob[1:], out[:n])

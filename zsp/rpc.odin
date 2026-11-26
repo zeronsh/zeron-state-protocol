@@ -635,9 +635,12 @@ node_post_link :: proc(n: ^Node, relay: u32, device: Key32, packet: []byte) -> b
 	return true
 }
 
-// What a relay holds for a link's packets, beyond which it drops them: enough to keep a fast path full, little
+// What a relay holds of signals for a device, beyond which it drops them: enough to keep a fast path full, little
 // enough that what is urgent does not wait long behind it. Loss recovery, end to end, makes up the rest.
 LINK_QUEUE :: 256 << 10
+
+// A signal's blob, at most: a link's packet through a relay (8192), and what goes with it.
+MAX_SIGNAL :: 16 << 10
 
 // What is queued for a session's peer and not yet on its way: here, and in its host's pipe.
 @(private)
