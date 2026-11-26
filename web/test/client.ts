@@ -628,8 +628,24 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   assert(caller === "zoe");
   h.client.call(codec.hex(rep("e", 32)), 2, "m", "hello");
   h.run();
-  assert(h.last(CALL)!.body.slice(-8) === "\x01m\0hello", "and for whom is not for it to say");
+  assert(h.last(CALL)!.body.slice(-9) === "\x01m\0\x03hello", "and for whom is not for it to say; its urgency is 3 unless said");
   assert(h.last(SERVE));
+  // An urgency, of 0 to 7, is the call's own; a call to it carries none.
+  void h.client.request(codec.hex(rep("e", 32)), 2, "m", "hi", { urgency: 1 });
+  h.run();
+  assert(h.last(CALL)!.body.slice(-6) === "\x01m\0\x01hi", "a call says how urgent it is");
+  h.client.call(codec.hex(rep("e", 32)), 2, "m", "", { urgency: 0 });
+  h.client.call(codec.hex(rep("e", 32)), 2, "m", "", { urgency: 7 });
+  h.run();
+  const urgencies = h.self.said.filter((x) => x.kind === CALL).slice(-2).map((x) => x.body.slice(-1));
+  assert.deepEqual(urgencies, ["\0", "\x07"], "from the most urgent to the least");
+  const quiet = h.self.said.length;
+  for (const urgency of [8, -1, 1.5, NaN]) {
+    assert.throws(() => h.client.call(codec.hex(rep("e", 32)), 2, "m", "", { urgency }), RangeError);
+    await assert.rejects(h.client.request(codec.hex(rep("e", 32)), 2, "m", "", { urgency }), RangeError);
+  }
+  h.run();
+  assert.equal(h.self.said.length, quiet, "and none other is said");
 }
 
 // What a roster has made unlawful goes from the rows it was in, as they are said over again; and no more than that.

@@ -1,7 +1,6 @@
 // A device in Node: its store is a directory, and its node runs in this very thread, as everything in Node does.
 
 import { Client } from "./client.ts";
-import { NodeFolder } from "./folder-node.ts";
 import type { Device, Relay } from "./index.ts";
 import { Node, type NodeOptions, type Rights } from "./node.ts";
 import { nodeDatagrams, type UdpOptions } from "./udp-node.ts";
@@ -12,8 +11,6 @@ export * from "./index.ts";
 export { Node } from "./node.ts";
 export { NodeVolume } from "./volume-node.ts";
 export { MemoryVolume } from "./volume.ts";
-export { NodeFolder } from "./folder-node.ts";
-export { bridge } from "./net-node.ts";
 
 export interface OpenOptions extends Partial<Omit<NodeOptions, "module" | "volume" | "datagrams">> {
   /** The directory it keeps what it holds in. */
@@ -49,7 +46,7 @@ export async function open(options: OpenOptions): Promise<Device & { readonly no
     relay: async (key: string, url: string) => node.relay(key, url),
     members: async () => node.members(),
     connect: node.connect,
-    client: (host = {}) => new Client({ folder: new NodeFolder(), ...host, connect: node.connect }),
+    client: (host = {}) => new Client({ ...host, connect: node.connect }),
     close: () => node.close(),
   };
 }

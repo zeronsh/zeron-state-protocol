@@ -1,6 +1,6 @@
 // What a test page has, for test/browsers.ts to drive: devices of this origin, and the live suite.
 
-import { open, Client, columns, OpfsFolder, type Device, type State, type Transferred } from "../src/browser.ts";
+import { open, Client, columns, type Device, type State } from "../src/browser.ts";
 import type { Connect, Wire } from "../src/node.ts";
 import { live } from "./live.ts";
 
@@ -259,49 +259,6 @@ const zsp = {
       cb.close();
     }
     return lines.join("\n");
-  },
-  /** Makes a space this tab's device owns, in which it and another may use all that devices share in scope 1: its name. */
-  async governs(name: string, relay: { key: string; url: string }, other: string): Promise<string> {
-    const d = devices.get(name)!;
-    const space = await d.create();
-    await d.relay(relay.key, relay.url);
-    const all = { write: true, call: true, shell: true, files: true };
-    await d.admit(d.key, 1, all);
-    await d.admit(other, 1, all);
-    return space;
-  },
-  /**
-   * Fetches a file a device shares into the origin's private file system, cut off once and taken up again; sends it back
-   * under another name; and puts one file over another there. What came of each, and the hash of what it holds.
-   */
-  async transfers(name: string, device: string, remote: string, back: string): Promise<{ cut: string; got: Transferred; sent: Transferred; sha: string; replaced: string; names: string[] }> {
-    const c = clientOf(name);
-    const folder = new OpfsFolder("zsp-test/" + name);
-    for (let i = 0; i < 1000 && !(await c.services(device, 1).then((s) => s.length > 0, () => false)); i++) await sleep(20);
-    const stop = new AbortController();
-    const cut = await c.get(device, 1, remote, "big", { folder, signal: stop.signal, onProgress: (done) => done >= 3 << 20 && stop.abort() }).then(
-      () => "whole",
-      (e: Error) => e.message,
-    );
-    const got = await c.get(device, 1, remote, "big", { folder });
-    const f = (await folder.open("big", false))!;
-    const all = new Uint8Array((await f.info()).size);
-    await f.read(all, 0);
-    await f.close();
-    const sha = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", all)), (b) => b.toString(16).padStart(2, "0")).join("");
-    const sent = await c.put(device, 1, "big", back, { folder });
-    for (const [n, said] of [["one", "first"], ["two", "second"]]) {
-      const g = (await folder.open(n, true))!;
-      await g.write(new TextEncoder().encode(said), 0);
-      await g.close();
-    }
-    await folder.rename("one", "two");
-    const two = (await folder.open("two", false))!;
-    const replaced = new Uint8Array((await two.info()).size);
-    await two.read(replaced, 0);
-    await two.close();
-    const names = (await folder.list("")).map((e) => e.name).sort();
-    return { cut, got, sent, sha, replaced: new TextDecoder().decode(replaced), names };
   },
 };
 

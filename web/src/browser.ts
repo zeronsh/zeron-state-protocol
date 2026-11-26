@@ -2,13 +2,11 @@
 // may be read and written synchronously; tabs of one origin share it, whichever of them happens to run it (./worker.ts).
 
 import { Client } from "./client.ts";
-import { OpfsFolder } from "./folder-opfs.ts";
 import type { Device, Relay } from "./index.ts";
 import type { Connect, Member, Rights } from "./node.ts";
 import type { Command, Op, Report, Say } from "./worker.ts";
 
 export * from "./index.ts";
-export { OpfsFolder } from "./folder-opfs.ts";
 
 export interface OpenOptions {
   /** Which store: one device each, shared by the origin's tabs. "default" unless said. */
@@ -121,8 +119,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     relay: (key: string, url: string) => ask<void>("relay", key, url),
     members: () => ask<Member[]>("members"),
     connect,
-    // Files fetched are kept in the origin's private file system, apart from the store: zsp-files/<name>.
-    client: (host = {}) => new Client({ folder: new OpfsFolder("zsp-files/" + (options.name ?? "default")), ...host, connect }),
+    client: (host = {}) => new Client({ ...host, connect }),
     close: async () => worker.terminate(),
   };
 }

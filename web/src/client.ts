@@ -10,8 +10,6 @@ import * as codec from "./codec.ts";
 import { sha256 } from "./sha256.ts";
 import * as text from "./text.ts";
 import type { Connect, Wire } from "./node.ts";
-import type { Folder } from "./folder.ts";
-import * as services from "./services.ts";
 
 const HELLO = 1, ROSTER = 2, WATCH = 3, UNWATCH = 4, CELLS = 7, ACK = 8;
 const ASK = 32, UNASK = 33, ANSWER = 34, FETCH = 35;
@@ -42,12 +40,6 @@ function rowId(id: string): string {
 }
 const toBytes = (data: Uint8Array | string): Uint8Array => (typeof data === "string" ? utf8.encode(data) : data);
 
-// A TCP port as the wire has it, two bytes: one of 1 to 65535, or none at all (not one taken modulo 65536).
-function port16(port: number): Uint8Array {
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new RangeError("a port is a whole number from 1 to 65535");
-  return new Uint8Array([port >> 8, port & 255]);
-}
-
 // ---------------------------------------------------------------- what the host lends
 
 export interface Host {
@@ -65,8 +57,6 @@ export interface Host {
   defer?: (f: () => void) => void;
   /** Runs f later, and returns a way to cancel it: setTimeout by default. */
   after?: (ms: number, f: () => void) => () => void;
-  /** Where files fetched are kept, and files sent are found, unless a transfer says otherwise. */
-  folder?: Folder;
 }
 
 interface Lent {
@@ -77,7 +67,6 @@ interface Lent {
   now: () => number;
   defer: (f: () => void) => void;
   after: (ms: number, f: () => void) => () => void;
-  folder?: Folder;
 }
 
 // ---------------------------------------------------------------- columns
@@ -213,6 +202,14 @@ export interface Call {
   onfault?: (fault: Fault) => void;
   /** More may be sent: room grew, and nothing waits for it. */
   onroom?: () => void;
+}
+
+export interface CallOptions {
+  /**
+   * How urgent the call is, from 0, the most, to 7, the least: 3 unless said. It is the urgency of the stream between
+   * devices that carries it, so what is interactive, as keystrokes, goes ahead of what is bulk, as a copy (1 and 6, say).
+   */
+  urgency?: number;
 }
 
 export interface Query<T extends Table = Table> {
@@ -498,7 +495,6 @@ export class Client {
           const t = setTimeout(f, ms);
           return () => clearTimeout(t);
         }),
-      folder: host.folder,
     };
     this.#dial();
   }
@@ -2032,8 +2028,10 @@ export class Client {
   }
 
   /** Calls a method on a device, by its id. Set ondata, onend and onfault on the result before the turn is out. */
-  call(device: string, scope: number, method: string, data: Uint8Array | string = new Uint8Array()): Call {
+  call(device: string, scope: number, method: string, data: Uint8Array | string = new Uint8Array(), options: CallOptions = {}): Call {
     if (!DEVICE_ID.test(device)) throw new RangeError("a device's id is 64 hex digits");
+    const urgency = options.urgency ?? 3;
+    if (!Number.isInteger(urgency) || urgency < 0 || urgency > 7) throw new RangeError("an urgency is a whole number from 0 to 7");
     const id = ++this.#nextCall;
     const live = this.#call(id, 0, device, method);
     const first = toBytes(data);
@@ -2050,126 +2048,22 @@ export class Client {
     codec.putVarint(w, scope);
     codec.putBytes(w, utf8.encode(method));
     codec.putBytes(w, new Uint8Array()); // for whom is for the node to say
+    codec.putU8(w, urgency);
     codec.put(w, first);
     this.#frame(CALL, w);
     return live.call;
   }
 
   /** One question, one answer. Rejects with the fault, as a CallFault, if there is one. */
-  request(device: string, scope: number, method: string, data: Uint8Array | string = new Uint8Array()): Promise<Uint8Array> {
+  request(device: string, scope: number, method: string, data: Uint8Array | string = new Uint8Array(), options: CallOptions = {}): Promise<Uint8Array> {
     return new Promise((resolve, reject) => {
       const parts: Uint8Array[] = [];
-      const call = this.call(device, scope, method, data);
+      const call = this.call(device, scope, method, data, options);
       call.ondata = (d) => void parts.push(d);
       call.onend = () => resolve(concat(parts));
       call.onfault = (f) => reject(new CallFault(f));
       call.finish();
     });
-  }
-
-  // ---------------------------------------------------------------- this device's host: names, ports, exposures (§17)
-
-  /** Calls a zsp.* method of this device's own host, in the least scope this client may call in. */
-  async #hostCall(method: string, data: Uint8Array): Promise<codec.Reader> {
-    let scope: number | undefined;
-    for (const [s, { rights }] of this.#scopes) if (rights & 4 && (scope === undefined || s < scope)) scope = s;
-    const me = this.#devices[0];
-    if (scope === undefined || !me) throw new CallFault("unreachable");
-    return codec.reader(await this.request(me.id, scope, method, data));
-  }
-
-  /** Every device of the space as this one reaches it: its name, its address here, and what it offers this device. */
-  async nodes(): Promise<readonly NodeInfo[]> {
-    const r = await this.#hostCall("zsp.nodes", new Uint8Array());
-    const out: NodeInfo[] = [];
-    for (let n = codec.varint(r); n > 0; n--) {
-      const id = codec.hex(codec.take(r, 32)), name = fromUtf8.decode(codec.bytes(r)), a = codec.take(r, 4), flags = codec.u8(r);
-      out.push(Object.freeze({
-        id, name, address: Array.from(a).join("."), here: !!(flags & 1), reachable: !!(flags & 2), direct: !!(flags & 4),
-        subject: fromUtf8.decode(codec.bytes(r)), ports: readPorts(r),
-      }));
-    }
-    whole(r);
-    return Object.freeze(out);
-  }
-
-  async #offers(op: number, o?: Offer): Promise<readonly Offer[]> {
-    const w = codec.writer();
-    codec.putU8(w, op);
-    if (o) {
-      codec.put(w, port16(o.lo));
-      codec.put(w, port16(o.hi ?? o.lo));
-      if (!Number.isInteger(o.scope) || o.scope < 1) throw new RangeError("a scope is a whole number from 1");
-      codec.putVarint(w, o.scope);
-      if (o.device !== undefined && !DEVICE_ID.test(o.device)) throw new RangeError("a device's id is 64 hex digits");
-      codec.put(w, o.device !== undefined ? codec.unhex(o.device) : new Uint8Array(32)); // as devices and calls have it
-      codec.putBytes(w, utf8.encode(o.host ?? ""));
-      codec.putBytes(w, utf8.encode(o.name ?? ""));
-      codec.putU8(w, o.proxy ? 1 : 0);
-    }
-    const r = await this.#hostCall("zsp.offers", w.buf.subarray(0, w.pos));
-    const out: Offer[] = [];
-    const none = "0".repeat(64);
-    for (let n = codec.varint(r); n > 0; n--) {
-      const pair = codec.take(r, 4), scope = codec.varint(r), device = codec.hex(codec.take(r, 32));
-      const host = fromUtf8.decode(codec.bytes(r)), name = fromUtf8.decode(codec.bytes(r)), flags = codec.u8(r);
-      out.push(Object.freeze({
-        lo: (pair[0] << 8) | pair[1], hi: (pair[2] << 8) | pair[3], scope, device: device === none ? undefined : device,
-        host: host || undefined, name: name || undefined, proxy: !!(flags & 1),
-      }));
-    }
-    whole(r);
-    return Object.freeze(out);
-  }
-
-  /** What this device offers others of its space. Nothing is offered unless it is. */
-  offers(): Promise<readonly Offer[]> {
-    return this.#offers(0);
-  }
-
-  /** Offers ports of this machine (or, with host, of another, from here) to whoever may call in a scope, or one device. */
-  offer(o: Offer): Promise<readonly Offer[]> {
-    return this.#offers(1, o);
-  }
-
-  /** Takes an offer back: whoever is using it is cut off. */
-  unoffer(o: Offer): Promise<readonly Offer[]> {
-    return this.#offers(2, o);
-  }
-
-  async #exposures(data: Uint8Array): Promise<readonly Exposure[]> {
-    const r = await this.#hostCall("zsp.expose", data);
-    const out: Exposure[] = [];
-    for (let n = codec.varint(r); n > 0; n--) {
-      const p = codec.take(r, 2), name = fromUtf8.decode(codec.bytes(r)), flags = codec.u8(r), label = fromUtf8.decode(codec.bytes(r));
-      const relays: RelayExposure[] = [];
-      for (let m = codec.varint(r); m > 0; m--) {
-        relays.push(Object.freeze({ relay: codec.hex(codec.take(r, 32)), status: codec.u8(r), url: fromUtf8.decode(codec.bytes(r)) }));
-      }
-      out.push(Object.freeze({ port: (p[0] << 8) | p[1], name, proxy: !!(flags & 1), label, relays: Object.freeze(relays) }));
-    }
-    whole(r);
-    return Object.freeze(out);
-  }
-
-  /** What this device exposes to the public, and where each relay says it is (url, when status is 0). */
-  exposures(): Promise<readonly Exposure[]> {
-    return this.#exposures(new Uint8Array([0]));
-  }
-
-  /** Exposes a port of this machine to the public, under a fresh name; `proxy` says where each connection came from. */
-  expose(port: number, options: { name?: string; proxy?: boolean } = {}): Promise<readonly Exposure[]> {
-    const w = codec.writer();
-    codec.putU8(w, 1);
-    codec.put(w, port16(port));
-    codec.putBytes(w, utf8.encode(options.name ?? ""));
-    codec.putU8(w, options.proxy ? 1 : 0);
-    return this.#exposures(w.buf.subarray(0, w.pos));
-  }
-
-  /** Takes a port back from the public: whoever is using it is cut off, and its name is nobody's for ever. */
-  unexpose(port: number): Promise<readonly Exposure[]> {
-    return this.#exposures(new Uint8Array([2, ...port16(port)]));
   }
 
   /** Answers a method within a scope. The handler gets the call and its first message. Returns a way to stop. */
@@ -2237,140 +2131,9 @@ export class Client {
       call.onfault?.(FAULTS[code] ?? "cancelled");
     }
   }
-
-  // ---------------------------------------------------------------- streams and services (./services.ts)
-
-  /** What a device lets this one use in a scope, as this device's rights there allow; of this client's own, all it shares there. */
-  services(device: string, scope: number): Promise<services.Service[]> {
-    return services.services(this, device, scope);
-  }
-
-  // This client's own device, and a scope in which it may be called: its host answers its own clients, by zsp.share.
-  #own(): { device: string; scope: number } | undefined {
-    const device = this.#authors.get(0)?.id ?? this.#devices[0]?.id;
-    for (const [scope, s] of this.#scopes) if (device && s.rights & 4) return { device, scope };
-    return undefined;
-  }
-
-  /** What this client's device shares, as text, a share to a line, as host/services.odin says. */
-  shares(): Promise<string> {
-    const own = this.#own();
-    if (!own) return Promise.reject(new services.ServiceError(this.#ready ? "denied" : "unreachable", "this client may call nothing"));
-    return services.shares(this, own.device, own.scope);
-  }
-
-  /** Puts new shares in the place of this client's device's, at once: whatever they no longer allow is ended. Empty, nothing is shared. */
-  setShares(text: string): Promise<void> {
-    const own = this.#own();
-    if (!own) return Promise.reject(new services.ServiceError(this.#ready ? "denied" : "unreachable", "this client may call nothing"));
-    return services.setShares(this, own.device, own.scope, text);
-  }
-
-  /** Runs a command on a device: the program, found as the device finds programs, and its arguments, never through a shell. */
-  exec(device: string, scope: number, argv: readonly string[], options: services.ExecOptions = {}): services.Process {
-    return services.exec(this, device, scope, argv, options);
-  }
-
-  /** Runs a command to its end, with what input is given, and says what it said and how it ended. */
-  run(device: string, scope: number, argv: readonly string[], options: services.RunOptions = {}): Promise<services.Ran> {
-    return services.run(this, device, scope, argv, options);
-  }
-
-  /** Opens a terminal on a device: the user's shell there. */
-  terminal(device: string, scope: number, options: services.TerminalOptions = {}): services.Terminal {
-    return services.terminal(this, device, scope, options);
-  }
-
-  /** Has a device make a TCP connection to a port, its own or one on its network, and carry it here. */
-  connect(device: string, scope: number, port: number, host = ""): services.Stream {
-    return services.connect(this, device, scope, port, host);
-  }
-
-  /** What a folder of a device's shares holds; of the path "", the shares of files themselves. */
-  list(device: string, scope: number, path: string): Promise<services.Entry[]> {
-    return services.list(this, device, scope, path);
-  }
-
-  /** Fetches a file of a device's shares, by its path there: `share/path`. Taken up where an earlier one stopped. */
-  get(device: string, scope: number, remote: string, local: string, options: services.TransferOptions = {}): Promise<services.Transferred> {
-    return services.get(this, device, scope, remote, local, { ...options, folder: options.folder ?? this.#host.folder });
-  }
-
-  /** Sends a file to a device's shares, as a path there: `share/path`. Taken up where an earlier one stopped. */
-  put(device: string, scope: number, local: string, remote: string, options: services.PutOptions = {}): Promise<services.Transferred> {
-    return services.put(this, device, scope, local, remote, { ...options, folder: options.folder ?? this.#host.folder });
-  }
-
-  /** Fetches a folder of a device's shares, and all in it. */
-  getTree(device: string, scope: number, remote: string, local: string, options: services.TransferOptions = {}): Promise<services.TreeFile[]> {
-    return services.getTree(this, device, scope, remote, local, { ...options, folder: options.folder ?? this.#host.folder });
-  }
-
-  /** Sends a folder, and all the files in it, to a device's shares. */
-  putTree(device: string, scope: number, local: string, remote: string, options: services.PutOptions = {}): Promise<services.TreeFile[]> {
-    return services.putTree(this, device, scope, local, remote, { ...options, folder: options.folder ?? this.#host.folder });
-  }
 }
 
 /** Why a call did not end as it should have. */
-/** A port a device offers this one: where to reach it, the scope it is offered in, and what it is. */
-export interface Port {
-  readonly port: number;
-  readonly scope: number;
-  readonly host: string;
-  readonly name: string;
-}
-
-/** A device of the space as this one reaches it (SPEC §17). */
-export interface NodeInfo {
-  readonly id: string; // 64 hex digits, as `devices` and calls have it
-  readonly name: string; // <name>.<suffix>, or <id>.id.<suffix>: what any application here reaches it by
-  readonly address: string; // 127.a.b.c
-  readonly here: boolean;
-  readonly reachable: boolean;
-  readonly direct: boolean; // linked directly, rather than through a relay
-  readonly subject: string;
-  readonly ports: readonly Port[];
-}
-
-export interface Offer {
-  readonly lo: number;
-  readonly hi?: number;
-  readonly scope: number;
-  readonly device?: string;
-  readonly host?: string;
-  readonly name?: string;
-  readonly proxy?: boolean;
-}
-
-export interface RelayExposure {
-  readonly relay: string;
-  readonly status: number; // 0 exposed, 1 that relay exposes nothing, 2 the label is another's, 3 too many
-  readonly url: string;
-}
-
-export interface Exposure {
-  readonly port: number;
-  readonly name: string;
-  readonly proxy: boolean;
-  readonly label: string;
-  readonly relays: readonly RelayExposure[];
-}
-
-/** An answer is read to its last byte: what is left over says it was not what it was read as. */
-function whole(r: codec.Reader): void {
-  if (r.pos !== r.len) throw new codec.Malformed("more than an answer");
-}
-
-function readPorts(r: codec.Reader): readonly Port[] {
-  const out: Port[] = [];
-  for (let n = codec.varint(r); n > 0; n--) {
-    const p = codec.take(r, 2);
-    out.push(Object.freeze({ port: (p[0] << 8) | p[1], scope: codec.varint(r), host: fromUtf8.decode(codec.bytes(r)), name: fromUtf8.decode(codec.bytes(r)) }));
-  }
-  return Object.freeze(out);
-}
-
 export class CallFault extends Error {
   readonly fault: Fault;
 

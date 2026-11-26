@@ -3,9 +3,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import { Client } from "../src/client.ts";
 import * as codec from "../src/codec.ts";
-import * as services from "../src/services.ts";
-import { Sha256, sha256 } from "../src/sha256.ts";
+import { sha256 } from "../src/sha256.ts";
 import * as text from "../src/text.ts";
 import { random } from "./random.ts";
 
@@ -14,8 +14,8 @@ type Vectors = {
   keys: { key: string; wire: string }[];
   lists: { scope: number; list_key: string; name: string; tag: string }[];
   texts: { cells: Cell[]; text: string }[];
-  files: { size: number; chunks: string[]; file: string }[];
-  services: { message: string; bytes: string }[];
+  local_call: { id: number; device: string; scope: number; method: string; for: string; urgency: number; first: string; frame: string };
+  credit: { id: number; callee: boolean; bytes: number; frame: string };
 };
 
 const vectors = JSON.parse(readFileSync(process.argv[2], "utf8")) as Vectors;
@@ -35,84 +35,71 @@ assert.equal(codec.hex(sha256(new Uint8Array(1000).fill(97))), "41edece42d63e8d9
   }
 }
 
-// A piece at a time, however the pieces fall, as at once.
+// Frames a client says, byte for byte, length and all: a call it makes, and the credit it gives a call it answers.
 {
-  const { createHash } = await import("node:crypto");
-  const data = new Uint8Array(5000);
-  for (let i = 0; i < data.length; i++) data[i] = (i * 31 + 3) & 255;
-  for (let k = 0; k < 200; k++) {
-    const n = rng.int(0, data.length);
-    const h = new Sha256();
-    for (let at = 0; at < n; ) {
-      const step = Math.min(n - at, rng.int(0, 150));
-      h.update(data.subarray(at, at + step));
-      at += step;
-    }
-    assert.equal(codec.hex(h.digest()), createHash("sha256").update(data.subarray(0, n)).digest("hex"), `sha256 of ${n} bytes in pieces`);
-  }
-}
-
-// Files hashed in chunks of a MiB, as §16 says: fed in pieces that fall across the chunks' edges.
-for (const v of vectors.files) {
-  const data = new Uint8Array(v.size);
-  for (let i = 0; i < v.size; i++) data[i] = (i * 7 + Math.floor(i / 251)) & 255;
-  const h = new services.Hashing();
-  const chunks: string[] = [];
-  for (let at = 0; at < data.length; ) {
-    const { taken, ended } = h.feed(data.subarray(at, at + 65536 + 3));
-    at += taken;
-    if (ended || at === data.length) chunks.push(codec.hex(h.chunk()));
-  }
-  assert.deepEqual(chunks, v.chunks, `the chunks of ${v.size} bytes`);
-  assert.equal(codec.hex(h.file()), v.file, `the file of ${v.size} bytes`);
-}
-
-// What services say, byte for byte: what a client says made here, and what a device says read here. Each of them.
-{
-  const said = new Map(vectors.services.map((v) => [v.message, v.bytes]));
-  const seen = new Set<string>();
-  const of = (message: string): Uint8Array => {
-    assert.ok(said.has(message), `vectors.json says "${message}"`);
-    seen.add(message);
-    return codec.unhex(said.get(message)!);
+  const frames: Uint8Array[] = [];
+  const deferred: (() => void)[] = [];
+  const run = () => {
+    while (deferred.length > 0) deferred.shift()!();
   };
-  const made = (message: string, bytes: Uint8Array) => assert.equal(codec.hex(bytes), codec.hex(of(message)), message);
-  const hash = codec.unhex("5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8");
-  made("zsp.tcp to port 22 of 127.0.0.1", services.tcpRequest(22, "127.0.0.1"));
-  made("zsp.exec ls -l /tmp, LANG=C and without HOME, in /srv", services.execRequest(["ls", "-l", "/tmp"], { LANG: "C", HOME: null }, "/srv"));
-  made("zsp.pty 24 rows by 80, xterm-256color, the user's shell, COLORTERM=truecolor", services.ptyRequest(24, 80, "xterm-256color", { COLORTERM: "truecolor" }));
-  made("zsp.get docs/report.pdf from 3 MiB, as it was", services.getRequest("docs/report.pdf", 3 << 20, Uint8Array.of(0xaa, 0xbb, 0xcc)));
-  made(
-    "zsp.put docs/new/report.pdf of 2.5 MiB, replacing, making folders",
-    services.putRequest("docs/new/report.pdf", 2621440, 1700000000123, Uint8Array.of(1, 2, 3, 4), { replace: true, folders: true }),
-  );
-  made("zsp.list docs/sub", services.listRequest("docs/sub"));
-  made("input: ls", services.inputMessage(new TextEncoder().encode("ls\n")));
-  made("signal: interrupt", services.signalMessage("interrupt"));
-  made("resize: 50 rows by 132", services.resizeMessage(50, 132));
-  made("a chunk's hash follows its bytes", services.chunkMessage(hash));
-  made("the end of a file sent whole, with its hash", services.endMessage("ok", hash));
+  let receive!: (data: Uint8Array) => void;
+  const client = new Client({
+    connect: (r) => {
+      receive = r;
+      return {
+        send: (data) => {
+          for (let r = codec.reader(data); r.pos < r.len; ) {
+            const at = r.pos;
+            codec.bytes(r);
+            frames.push(data.slice(at, r.pos));
+          }
+        },
+        close: () => {},
+      };
+    },
+    defer: (f) => void deferred.push(f),
+  });
+  const tell = (kind: number, body: Uint8Array) => {
+    const w = codec.writer();
+    codec.putBytes(w, Uint8Array.of(kind, ...body));
+    receive(codec.written(w).slice());
+    run();
+  };
+  const kindOf = (f: Uint8Array) => {
+    const r = codec.reader(f);
+    codec.varint(r);
+    return codec.u8(r);
+  };
+  const said = (kind: number) => frames.filter((f) => kindOf(f) === kind).map((f) => codec.hex(f));
+  const call = vectors.local_call;
+  const roster = codec.writer();
+  codec.put(roster, new Uint8Array(8));
+  codec.putVarint(roster, call.scope);
+  codec.putU8(roster, 7);
+  codec.put(roster, new Uint8Array(32));
+  run();
+  tell(2, codec.written(roster).slice());
+  assert.ok(client.ready);
+  assert.equal(call.for, "", "for whom is for the node to say, and a client says nothing of it");
+  client.call(call.device, call.scope, call.method, codec.unhex(call.first), { urgency: call.urgency });
+  run();
+  assert.equal(call.id, 1);
+  assert.deepEqual(said(15), [call.frame], "a call, as a local client makes it");
 
-  assert.deepEqual(services.readEntries(of("an entry: a.txt, 1234 bytes")), [{ name: "a.txt", kind: "file", size: 1234, modified: 1700000000000 }]);
-  const listed = services.readStatus(of("zsp.services: terminals and commands, docs to read and write, port 22 as ssh"));
-  assert.equal(listed.status, "ok");
-  assert.deepEqual(services.readServices(listed.rest), [
-    { kind: "shell", terminal: true, commands: true },
-    { kind: "files", name: "docs", read: true, write: true },
-    { kind: "tcp", port: 22, host: "", name: "ssh" },
-  ]);
-  const ok = services.readStatus(of("status: ok"));
-  assert.ok(ok.status === "ok" && ok.rest.length === 0);
-  const denied = services.readStatus(of("status: denied, with a reason"));
-  assert.deepEqual([denied.status, denied.reason], ["denied", "not shared with you"]);
-  const got = services.readStatus(of("zsp.get answered: 2.5 MiB, from 1 MiB"));
-  assert.deepEqual({ ...services.readGot(got.rest), identity: codec.hex(services.readGot(got.rest).identity) }, { size: 2621440, modified: 1700000000123, identity: "aabbcc", from: 1 << 20 });
-  assert.equal(services.readFrom(services.readStatus(of("zsp.put answered: from 2 MiB")).rest), 2 << 20);
-  assert.deepEqual(services.readOutput(of("output: hi")), { kind: "output", data: new TextEncoder().encode("hi") });
-  assert.deepEqual(services.readOutput(of("errors: no")), { kind: "errors", data: new TextEncoder().encode("no") });
-  assert.deepEqual(services.readOutput(of("exited 1")), { kind: "exit", exit: { code: 1, signal: 0 } });
-  assert.deepEqual(services.readOutput(of("killed by 9")), { kind: "exit", exit: { code: 0, signal: 9 } });
-  assert.deepEqual([...said.keys()].filter((m) => !seen.has(m)), [], "every message is held to");
+  const credit = vectors.credit;
+  assert.ok(credit.callee && credit.id === 1);
+  client.serve(call.scope, "take", () => {});
+  run();
+  // A call to it, whose first message is the bytes it credits as it takes them.
+  const incoming = codec.writer();
+  codec.putVarint(incoming, credit.id);
+  codec.put(incoming, codec.unhex(call.device));
+  codec.putVarint(incoming, call.scope);
+  codec.putBytes(incoming, new TextEncoder().encode("take"));
+  codec.putBytes(incoming, new Uint8Array());
+  codec.put(incoming, new Uint8Array(credit.bytes));
+  tell(15, codec.written(incoming).slice());
+  assert.deepEqual(said(16), [credit.frame], "credit, as the callee gives it");
 }
 
 for (const v of vectors.keys) {

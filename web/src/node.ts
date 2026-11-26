@@ -90,10 +90,6 @@ export interface Rights {
   call?: boolean;
   /** To be believed about for whom it writes and calls. */
   vouch?: boolean;
-  /** To run commands and open terminals on devices that share them in the scope. */
-  shell?: boolean;
-  /** To read and write files on devices that share them in the scope. */
-  files?: boolean;
 }
 
 /** A member of the space, as its roster says. */
@@ -290,7 +286,7 @@ export class Node {
     const b = new Uint8Array(69);
     b.set(Node.#parseKey(key, 64));
     new DataView(b.buffer).setUint32(64, scope, true);
-    b[68] = 1 | (rights.write ? 2 : 0) | (rights.call ? 4 : 0) | (rights.vouch ? 8 : 0) | (rights.shell ? 16 : 0) | (rights.files ? 32 : 0);
+    b[68] = 1 | (rights.write ? 2 : 0) | (rights.call ? 4 : 0) | (rights.vouch ? 8 : 0);
     this.#govern(GOVERN.admit, b);
   }
 
@@ -356,8 +352,6 @@ export class Node {
           write: (r & 2) !== 0,
           call: (r & 4) !== 0,
           vouch: (r & 8) !== 0,
-          shell: (r & 16) !== 0,
-          files: (r & 32) !== 0,
         });
       }
       at += 4 + grants.size * 5;

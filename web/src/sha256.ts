@@ -1,5 +1,5 @@
 // FIPS 180-4, for naming lists, synchronously: WebCrypto would make every list name wait. Nothing secret passes through
-// here twice. And a piece at a time, for checking files as they pass, chunk by chunk (SPEC.md §16): WebCrypto has no way to.
+// here twice.
 
 // The first 32 bits of the fractions of the cube roots of the first 64 primes.
 const K = new Int32Array([
@@ -87,35 +87,4 @@ export function sha256(data: Uint8Array): Uint8Array {
   for (let at = 0; at < whole; at += 64) block(H, data, at);
   tail.set(data.subarray(whole), 0);
   return finish(H, n, n - whole);
-}
-
-/** SHA-256 of what is given it a piece at a time, however long: `update` as often as need be, then `digest` once. */
-export class Sha256 {
-  #h = Int32Array.from(START);
-  #pending = new Uint8Array(64); // of a block not yet whole
-  #filled = 0;
-  #length = 0;
-
-  update(data: Uint8Array): this {
-    let at = 0;
-    this.#length += data.length;
-    if (this.#filled > 0) {
-      const n = Math.min(64 - this.#filled, data.length);
-      this.#pending.set(data.subarray(0, n), this.#filled);
-      this.#filled += n;
-      at = n;
-      if (this.#filled < 64) return this;
-      block(this.#h, this.#pending, 0);
-      this.#filled = 0;
-    }
-    for (; at + 64 <= data.length; at += 64) block(this.#h, data, at);
-    this.#pending.set(data.subarray(at), 0);
-    this.#filled = data.length - at;
-    return this;
-  }
-
-  digest(): Uint8Array {
-    tail.set(this.#pending.subarray(0, this.#filled), 0);
-    return finish(this.#h, this.#length, this.#filled);
-  }
 }

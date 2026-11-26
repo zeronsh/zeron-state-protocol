@@ -4,8 +4,7 @@
 // restart, with nothing to reach. `node test/browsers.ts [names...]`
 
 import { execFileSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createServer as http } from "node:http";
 import { createServer as tcp, connect as dial } from "node:net";
 import type { AddressInfo } from "node:net";
@@ -311,37 +310,6 @@ const tests: Record<string, () => Promise<void>> = {
     expectEqual(back.key, key);
     expectEqual(back.space, s.sid);
     expectEqual((await call<string[]>(later, "titles", "br", "notes", 50)).join(), many.join());
-  },
-  // A browser's device, which owns the space, fetches a file a zspd device shares into the origin's private file system,
-  // cut off and taken up where it stopped, and sends it back; and puts one of its files over another.
-  async browser_files() {
-    const relay = await node("serve", join(TMP, "bf-relay"));
-    const p = await page();
-    await call(p, "device", "bf");
-    const dir = join(TMP, "bf-b");
-    const key = zspd("key", dir);
-    const sid = await call<string>(p, "governs", "bf", relay, key);
-    zspd("join", dir, sid, relay.key, relay.url);
-    const b = await node("run", dir);
-    await eventually("it hears who belongs", () => exists(join(dir, sid, "roster")));
-    const shared = join(TMP, "bf-shared");
-    mkdirSync(shared, { recursive: true });
-    const data = randomBytes(7 * (1 << 20) + 1234);
-    writeFileSync(join(shared, "big"), data);
-    const cb = new Client({ connect: zspdConnect(b.address), credential: token(dir) });
-    await eventually("b's client may call", () => cb.may(1, "call"));
-    await cb.setShares(`files 1 docs write ${shared}\n`);
-    type Went = { size: number; bytes: number; resumed: number; hash: string };
-    const r = await call<{ cut: string; got: Went; sent: Went; sha: string; replaced: string; names: string[] }>(p, "transfers", "bf", key.slice(0, 64), "docs/big", "docs/back");
-    expectEqual(r.cut, "failed: cancelled");
-    expectEqual(r.got.size, data.length);
-    if (!(r.got.resumed > 0 && r.got.bytes === data.length - r.got.resumed)) throw new Error(`not taken up where it stopped: ${JSON.stringify(r.got)}`);
-    expectEqual(r.sha, createHash("sha256").update(data).digest("hex"));
-    expectEqual(r.sent.hash, r.got.hash);
-    expectEqual(createHash("sha256").update(readFileSync(join(shared, "back"))).digest("hex"), r.sha);
-    expectEqual(r.replaced, "first");
-    expectEqual(r.names.join(), "big,two");
-    cb.close();
   },
 };
 
