@@ -19,10 +19,10 @@ def zspd(*args):
 
 
 class Node:
-    def __init__(self, name, mode="run", *options):
+    def __init__(self, name, mode="run", *options, machine=False):
         self.dir = os.path.join(TMP, name)
         self.name, self.mode, self.options = name, mode, list(options)
-        if mode == "run":  # nothing of this machine's own: tests run side by side, and others may have set up for names
+        if mode == "run" and not machine:  # nothing of this machine's own: tests run side by side, and others may have set up for names
             for flag, default in (("--dns", "--dns=127.0.0.1:0"), ("--catch", "--catch=127.0.0.1:0"), ("--proxy", "--no-proxy")):
                 if not any(o.startswith(flag) for o in self.options):
                     self.options.insert(0, default)

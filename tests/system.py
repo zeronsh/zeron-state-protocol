@@ -38,7 +38,7 @@ def sshd(port):
 
 def main():
     relay = Node("sys-relay", "serve", "--no-udp").start()
-    a = Node("sys-a", "run", "--no-udp")  # as zspd setup expects: every default
+    a = Node("sys-a", "run", "--no-udp", machine=True)  # as zspd setup expects: every default, the machine's own
     b = Node("sys-b", "run", "--no-udp", "--loopback=127.88.0", "--dns=127.0.0.1:%d" % free_port(), "--catch=127.0.0.1:0", "--no-proxy")
     c = Node("sys-c", "run", "--no-udp", "--loopback=127.89.0", "--dns=127.0.0.1:%d" % free_port(), "--catch=127.0.0.1:0", "--no-proxy")
     sid = zspd("create", a.dir)
