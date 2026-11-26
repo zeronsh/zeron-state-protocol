@@ -41,6 +41,7 @@ Udp :: struct {
 	asked:    time.Tick,
 	asking:   bool,
 	outside:  Maybe(pipe.Address),
+	no_gso:   bool, // the kernel cannot cut a buffer into datagrams here
 	stun:     net.Endpoint,
 	have_stun: bool,
 }
@@ -147,16 +148,7 @@ udp_listen :: proc(h: ^Host, socket: net.UDP_Socket) {
 		if op.poll.result != .Ready {
 			return
 		}
-		for _ in 0 ..< 256 {
-			n, from, err := net.recv_udp(socket, h.shared)
-			if err == .Would_Block {
-				break
-			}
-			if err != nil {
-				continue // an unreachable peer, reported late; the link will notice
-			}
-			udp_input(h, h.shared[:n], address_from(from))
-		}
+		udp_receive(h, socket)
 		udp_listen(h, socket)
 	})
 }
@@ -717,20 +709,25 @@ links_flush :: proc(h: ^Host) {
 		return
 	}
 	now := now_us()
-	buf: [pipe.PACKET_MAX]byte
+	b: Batch
 	for p in u.links {
 		if p.session == nil || p.link == nil {
 			continue
 		}
 		for {
 			link_feed(p.session, p.link)
-			packet := pipe.link_output(p.link, buf[:], now)
+			packet := pipe.link_output(p.link, b.packets[b.n][:], now)
 			if packet == nil {
 				break
 			}
-			udp_send(h, packet, p.address)
+			b.sizes[b.n] = len(packet)
+			b.n += 1
 			p.used = time.tick_now()
+			if b.n == UDP_BATCH {
+				udp_send_batch(h, &b, p.address)
+			}
 		}
+		udp_send_batch(h, &b, p.address)
 	}
 }
 
@@ -769,4 +766,14 @@ links_deadline :: proc(h: ^Host) -> (due: pipe.Time) {
 		}
 	}
 	return
+}
+
+// Packets to send to one address, together.
+UDP_BATCH :: 32
+
+@(private)
+Batch :: struct {
+	packets: [UDP_BATCH][pipe.PACKET_MAX]byte,
+	sizes:   [UDP_BATCH]int,
+	n:       int,
 }

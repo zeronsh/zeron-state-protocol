@@ -6,7 +6,6 @@ import "core:os"
 import "core:slice"
 import "core:strings"
 import "core:sync"
-import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -160,20 +159,6 @@ Usage :: struct {
 	rss: int, // the most resident, in bytes
 }
 
-@(private)
-usage :: proc() -> (u: Usage) {
-	when ODIN_OS == .Linux || ODIN_OS == .Darwin {
-		ru: posix.rusage
-		if posix.getrusage(.SELF, &ru) == .OK {
-			tv :: proc(t: posix.timeval) -> time.Duration {
-				return time.Duration(t.tv_sec) * time.Second + time.Duration(t.tv_usec) * time.Microsecond
-			}
-			u.cpu = tv(ru.ru_utime) + tv(ru.ru_stime)
-			u.rss = int(ru.ru_maxrss) * (1 if ODIN_OS == .Darwin else 1024) // bytes there, KiB here
-		}
-	}
-	return
-}
 
 @(private)
 percentile :: proc(samples: []time.Duration, p: int) -> f64 {
