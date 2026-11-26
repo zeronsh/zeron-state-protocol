@@ -356,7 +356,8 @@ end
 eventually("a port not offered", function()
 	return closed ~= nil
 end)
-check(closed == "denied", `connect: {closed}`)
+-- Denied where nothing decides what is offered; not offered where offers do (zspd's, SPEC §17), as here.
+check(closed == "not offered" or closed == "denied", `connect: {closed}`)
 
 -- ---------------------------------------------------------------- commands and terminals
 
