@@ -26,6 +26,7 @@ TEMP_PAGES :: Page_No(1) << 62 // numbers for pages not yet in any pack
 EXTENT :: #config(ZSP_EXTENT, min(SEGMENT / 4, 1 << 20)) // the log is put in object storage in pieces of this size
 #assert(SEGMENT % EXTENT == 0 && EXTENT % LOG_BLOCK == 0)
 LOG_BLOCK :: min(64 << 10, EXTENT) // a read of the log fetches at least this much
+LOCAL_KEEP :: #config(ZSP_LOCAL_KEEP, 4 << 20) // the log's latest bytes, kept by the host though in object storage: what is shown
 PAGE_RUN :: 16 // a read of a page fetches its neighbours in the pack too
 HINT_SIZE :: 48
 PACK_MAGIC :: 0x7a73_7070_6163_6b31 // "zsppack1", ending a pack
@@ -167,6 +168,7 @@ Remote :: struct {
 	tick:          u64,
 	rested:        u64, // the tick at the last rest
 	page_budget:   int,
+	local_keep:    u64, // LOCAL_KEEP, or less where the host's storage is small
 	block_budget:  int,
 
 	// Being fetched, and wanted.
@@ -195,9 +197,9 @@ Remote :: struct {
 }
 
 // Opens the remote side: what the manifest says, before store_open.
-remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_budget := 256) -> bool {
+remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_budget := 256, local_keep: u64 = LOCAL_KEEP) -> bool {
 	r.host = host
-	r.page_budget, r.block_budget = page_budget, block_budget
+	r.page_budget, r.block_budget, r.local_keep = page_budget, block_budget, local_keep
 	r.next_gen = 1
 	if bytes := host.manifest_read(host.data); bytes != nil {
 		remote_manifest_read(r, bytes) or_return
@@ -572,8 +574,12 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 			}
 			r.tick += 1
 			r.blocks[b] = {slice.clone(bytes[lo:hi]), r.tick}
-			// Not kept by the host: a row written costs more than reading it again, and what is read of the log is
-			// seldom read twice, as it is when a device catches up.
+			// Kept by the host when read here and there, as for a window: what is shown is shown again. Not when read
+			// on and on, as a device catching up reads: that is seldom read twice, and a row written costs more than
+			// reading it again.
+			if op.len <= 2 * LOG_BLOCK && hi - lo == LOG_BLOCK {
+				r.host.cache_put(r.host.data, .Log, b, bytes[lo:hi])
+			}
 		}
 	case .Get_Hints:
 		g := &r.gc
@@ -940,7 +946,7 @@ remote_commit :: proc(r: ^Remote) {
 	r.inflight = nil
 	defer delete(f.victims)
 	defer delete(f.deletes)
-	local_from := max(r.local_from, min(r.uploaded, f.header.log))
+	local_from := max(r.local_from, min(r.uploaded, f.header.log, f.header.log - min(f.header.log, r.local_keep)))
 	r.local_from, local_from = local_from, r.local_from
 	if !remote_manifest_write(r, f.header, f.packs, f.gen, f.deletes[:]) {
 		r.local_from = local_from

@@ -54,7 +54,7 @@ conns: map[u32]^Conn
 message: [dynamic]byte // handed in and out
 
 @(export)
-init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len: int, roster: [^]byte, roster_len: int, page_budget, block_budget: int) -> bool {
+init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len: int, roster: [^]byte, roster_len: int, page_budget, block_budget: int, local_keep: f64) -> bool {
 	context = runtime.default_context()
 	secret = secret_ptr^
 	h := zsp.Remote_Host {
@@ -98,7 +98,7 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len
 		},
 		now = proc(_: rawptr) -> u64 {return u64(now())},
 	}
-	zsp.remote_open(&remote, h, page_budget, block_budget) or_return
+	zsp.remote_open(&remote, h, page_budget, block_budget, u64(local_keep)) or_return
 	node.store.remote = &remote
 	disk := zsp.remote_disk(&remote)
 	node.now = u64(now())

@@ -882,3 +882,39 @@ remote_cold_replay_fetches_together :: proc(t: ^testing.T) {
 	remote_store_settle(t, &x)
 	remote_store_close(&x)
 }
+
+// The log's latest bytes stay in the host's own storage though they are in object storage too: what is shown is read
+// from there, at once. What is older is let go of there.
+@(test)
+remote_keeps_the_latest_log_at_hand :: proc(t: ^testing.T) {
+	state := seeded(12)
+	context.random_generator = rand.default_random_generator(&state)
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	KEEP :: 3 * EXTENT
+	testing.expect(t, remote_open(&x.remote, model_host(&x.host), 1024, 64, KEEP))
+	x.store.remote = &x.remote
+	testing.expect(t, store_open(&x.store, remote_disk(&x.remote)))
+	x.remote.store = &x.store
+	defer remote_store_close(&x)
+	for _ in 0 ..< 3000 {
+		cells: [2]Cell
+		for &c in cells {
+			c = random_cell(500, 1_000_000)
+			if c.kind == .Value || c.kind == .Piece {
+				c.body = make([]byte, 1500, context.temp_allocator)
+			}
+		}
+		remote_store_step(t, &x, &cells, proc(s: ^Store, data: rawptr) {store_commit(s, (^[2]Cell)(data)[:])})
+		testing.expect(t, store_sync(&x.store))
+		remote_store_turn(&x, 1 << 20)
+		free_all(context.temp_allocator)
+	}
+	x.remote.want_checkpoint = true
+	remote_store_settle(t, &x)
+	tail := store_tail(&x.store)
+	testing.expectf(t, tail > 4 * KEEP, "only %d of log", tail)
+	testing.expectf(t, x.remote.local_from > 0 && x.remote.local_from <= tail - KEEP, "the host holds the log from %d of %d", x.remote.local_from, tail)
+	recent: [1000]byte
+	testing.expect(t, memory_disk(&x.host.local).log_read(&x.host.local, tail - 2000, recent[:]))
+}
