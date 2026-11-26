@@ -58,7 +58,7 @@ text of 8,000 pieces is at most some 200 cells to fetch, check and open, in thre
 **Services are yours to build.** A call is a stream each way between two devices the roster lets call, with credit, so that a
 slow end slows the other and nothing piles up between; it takes a stream of its own over the link, direct or through a relay, at the
 urgency its caller says, and moves to another relay should its own go. Files, terminals, ports: whatever a device offers is built on that, outside
-the protocol, and in-process where the host is embedded, as [examples/forward](examples/forward/main.odin) forwards TCP in under 400
+the protocol, and in-process where the host is embedded, as [examples/forward](examples/forward/main.odin) forwards TCP in some 430
 lines ([docs/services.md](docs/services.md)).
 
 ## Measured

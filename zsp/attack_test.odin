@@ -379,6 +379,53 @@ only_what_was_saved_is_resumed :: proc(t: ^testing.T) {
 	}
 }
 
+// Review of the strip, round 2. What a partial replica kept is not resumed at another session's cost: one saved with a
+// live session's id, or that turns out not to be sound, takes away none of what the live one asked upstream for, and
+// leaves the count of watches as it was.
+@(test)
+a_load_refused_takes_nothing_away :: proc(t: ^testing.T) {
+	state := seeded(41)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 1, 1, 1, 64)
+	defer sim_destroy(&s)
+	sim_link(&s, 1, 2)
+	pass_all(&s)
+	partial := s.nodes[1]
+	live := s.links[0].a
+	saved := make([dynamic]byte, context.temp_allocator)
+	testing.expect(t, session_save(live, &saved))
+	append(&partial.node.interests, Interest{id = INTEREST | 42, session = live.id})
+	interests, next_watch := len(partial.node.interests), partial.node.next_watch
+	with :: proc(saved: []byte, id: u64, watch_then_garbage: bool) -> []byte {
+		r := Reader{buf = saved}
+		_ = read_varint(&r)
+		w := make([dynamic]byte, context.temp_allocator)
+		write_varint(&w, id)
+		append(&w, ..saved[r.pos:])
+		if watch_then_garbage {
+			write_varint(&w, 9)
+			write_u8(&w, 1 | 8)
+			write_key(&w, KEY_MIN)
+			write_key(&w, KEY_MAX)
+			write_varint(&w, INTEREST | 999_999)
+			append(&w, 1) // a watch cut short
+		}
+		return w[:]
+	}
+	for bad in ([][]byte{with(saved[:], u64(live.id), false), with(saved[:], u64(live.id), true), with(saved[:], 999, true)}) {
+		revived, ok := session_load(&partial.node, bad)
+		testing.expect(t, !ok)
+		if ok {
+			session_close(revived)
+		}
+		testing.expect_value(t, len(partial.node.interests), interests)
+		testing.expect_value(t, partial.node.next_watch, next_watch)
+	}
+	testing.expect(t, partial.node.interests[interests - 1].id == INTEREST | 42)
+	pop(&partial.node.interests)
+}
+
 // Either end of a direct link may hush a relay, and both listen again when it goes.
 @(test)
 hushing_is_mutual :: proc(t: ^testing.T) {

@@ -64,3 +64,35 @@ knocks_are_heard_once :: proc(t: ^testing.T) {
 	peer_answer(&h, old[:n], from)
 	testing.expect(t, pipe.link_answers(p.answer, new[:n]))
 }
+
+// A device that starts again, its key the same and its port another, is heard from by beacon while the one that dials
+// it still has a session on a link to the process that is gone. The dialler knocks anew, on a link beside the old one;
+// a beacon from the port the link already has changes nothing.
+@(test)
+a_device_started_again_is_dialled_again :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = true))
+	dialler := 1 if string(w.keys[1].device[:]) < string(w.keys[2].device[:]) else 2
+	other := 3 - dialler
+	h := &w.hosts[dialler]
+	p: ^Peer
+	for x in h.udp.links {
+		if x.device == w.keys[other].device && x.session != nil {
+			p = x
+		}
+	}
+	testing.expect(t, p != nil && p.answer == nil)
+	if p == nil {
+		return
+	}
+	same := zsp.beacon_seal(&world_space(&w, other).node, int(p.address.port))
+	beacon_heard(h, same, p.address)
+	testing.expect(t, p.answer == nil, "a beacon from where the link is knocks for nothing")
+	moved := p.address
+	moved.port += 1
+	again := zsp.beacon_seal(&world_space(&w, other).node, int(moved.port))
+	beacon_heard(h, again, moved)
+	testing.expect(t, p.answer != nil && p.session != nil, "it knocks anew, and keeps the session it has meanwhile")
+}

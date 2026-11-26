@@ -69,7 +69,6 @@ Join :: struct {
 	call:      u64,
 	socket:    net.TCP_Socket,
 	connected: bool,
-	closed:    bool, // the socket is, already
 	dialling:  ^nbio.Operation,
 	reading:   ^nbio.Operation,
 	writing:   ^nbio.Operation,
@@ -183,8 +182,9 @@ join_finish :: proc(j: ^Join) {
 }
 
 // Over: the call cancelled if it goes on, and the socket shut both ways, which ends whatever the system still has of
-// it: each such operation then completes, and only once none is left is anything let go of. Removing one instead would
-// leave the kernel writing into a buffer since freed, and a descriptor closed under it free to be another's.
+// it: each such operation then completes, and only once none is left is anything let go of, the socket last. Removing
+// one instead, or closing the socket under it, would leave the kernel writing into a buffer since freed, or a send it
+// takes up again going to whatever socket has since been given the same handle.
 join_close :: proc(j: ^Join) {
 	if j.over {
 		return
@@ -195,12 +195,8 @@ join_close :: proc(j: ^Join) {
 		j.call = 0
 	}
 	if j.connected {
-		when ODIN_OS == .Windows {
-			net.close(j.socket) // what is pending completes, aborted, on the completion port
-			j.closed = true
-		} else {
-			net.shutdown(j.socket, .Both) // what is pending completes: a read with nothing, a write with an error
-		}
+		net.shutdown(j.socket, .Both) // what is pending completes: a read with nothing, a write with an error
+		socket_cancel(j.socket)
 	}
 	join_free(j)
 }
@@ -210,7 +206,7 @@ join_free :: proc(j: ^Join) {
 	if !j.over || j.dialling != nil || j.reading != nil || j.writing != nil {
 		return
 	}
-	if j.connected && !j.closed {
+	if j.connected {
 		net.close(j.socket)
 	}
 	delete(j.out)

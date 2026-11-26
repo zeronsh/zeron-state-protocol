@@ -44,7 +44,7 @@ speak in it. `host_call(sp, device, scope, method, first, handler, urgency)` cal
 does not serve, or for which its `Host_Method` returns `.Unserved`, passes on to a local client that serves it, so
 in-process services and those of local clients can be mixed on one device.
 
-[examples/forward](../examples/forward/main.odin) is the whole of a TCP-forwarding service built so, in under 400 lines, comments and all:
+[examples/forward](../examples/forward/main.odin) is the whole of a TCP-forwarding service built so, in some 430 lines, comments and all:
 connections accepted on one device become calls to another, which joins each to an address it was told to allow. It
 reads a socket only into what the call has credit for, with one receive and one send in flight on each connection, and its
 test holds it to bulk both ways, many calls at once, half-closes, a reader that never reads (which holds the writer to a

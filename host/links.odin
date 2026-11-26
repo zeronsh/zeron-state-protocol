@@ -596,11 +596,15 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 		}
 		p := peer_for(s, device)
 		report(.Debug, "a beacon from ", net.endpoint_to_string(address_to(from), context.temp_allocator))
-		if p == nil || p.session != nil {
+		if p == nil {
 			return
 		}
 		at := from
 		at.port = u16(port)
+		if p.session != nil {
+			peer_restarted(p, at)
+			return
+		}
 		if p.knocks > 0 {
 			// Heard by another road, which may be the one that works; or again, our answer having been lost.
 			new := !slice.contains(p.candidates[:], at)
@@ -622,6 +626,33 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 		peer_knock(p)
 		return
 	}
+}
+
+// A beacon from a device this one has a session with, from another port than its link's. A device with a session says
+// none but when it starts, or its network changes; so it has started again, or moved, and the link here may be to a
+// process that is gone, which a quiet link would not find out for a long while, nor would the other dial, not being the
+// one to. The dialler knocks anew, on a link of its own beside the old one, which gives way to it only once it is
+// proven, as it does to a knock answered.
+@(private)
+peer_restarted :: proc(p: ^Peer, at: pipe.Address) {
+	if !peer_dials(p) || at.port == p.address.port {
+		return
+	}
+	if p.answer == nil {
+		l := new(pipe.Link)
+		if !pipe.link_dial(l, p.space.host.secret, p.device, p.space.node.space, zsp.node_stamp(&p.space.node).time) {
+			free(l)
+			return
+		}
+		p.answer = l
+		peer_wire(p, l)
+	}
+	if p.answer.state == .Open {
+		return
+	}
+	report(.Debug, "knocking again for a device heard from elsewhere: ", net.endpoint_to_string(address_to(at), context.temp_allocator))
+	buf: [pipe.PACKET]byte
+	udp_send(p.space.host, pipe.link_hello(p.answer, buf[:]), at)
 }
 
 // Announces this device to the local network. Call at start, and when the network changes. A broadcast may be

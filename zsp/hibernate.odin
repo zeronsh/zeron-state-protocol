@@ -76,6 +76,17 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 	s.seq_in = read_varint(&r)
 	s.acked_in = read_varint(&r)
 	s.cursor = n.events.next
+	m := roster_member(&n.roster, s.peer)
+	taken := false // another session has its id: what was saved is not this node's
+	for x in n.sessions {
+		taken ||= x.id == s.id
+	}
+	if r.bad || s.id == 0 || taken || flags & ~u8(31) != 0 || (s.ready && (m == nil || !member_active(m))) {
+		free(s)
+		return nil, false
+	}
+	// What a watch below adds, and nothing else, is taken back should what follows not be sound.
+	interests, next_watch := len(n.interests), n.next_watch
 	for r.pos < len(r.buf) && !r.bad {
 		x: Watch
 		x.id = read_varint(&r)
@@ -104,19 +115,13 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 		}
 		append(&s.watches, x)
 	}
-	m := roster_member(&n.roster, s.peer)
-	taken := false // another session has its id: what was saved is not this node's
-	for x in n.sessions {
-		taken ||= x.id == s.id
-	}
-	if r.bad || s.id == 0 || taken || flags & ~u8(31) != 0 || (s.ready && (m == nil || !member_active(m))) {
+	if r.bad {
 		// Nothing of it stays: nor what it asked upstream for.
-		for i := len(n.interests) - 1; i >= 0; i -= 1 {
-			if n.interests[i].session == s.id {
-				delete(n.interests[i].reports)
-				ordered_remove(&n.interests, i)
-			}
+		for i in interests ..< len(n.interests) {
+			delete(n.interests[i].reports)
 		}
+		resize(&n.interests, interests)
+		n.next_watch = next_watch
 		delete(s.watches)
 		free(s)
 		return nil, false
