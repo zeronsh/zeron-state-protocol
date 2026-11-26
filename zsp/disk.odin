@@ -12,8 +12,8 @@ Disk :: struct {
 	log_truncate: proc(data: rawptr, off: u64), // forget everything from here on
 	log_sync:   proc(data: rawptr) -> bool,
 	// Pages of PAGE_SIZE bytes. `page` returns memory valid until the next `page_sync`.
-	page:       proc(data: rawptr, no: u32) -> ^Page,
-	page_write: proc(data: rawptr, no: u32, bytes: []byte) -> bool,
+	page:       proc(data: rawptr, no: Page_No) -> ^Page,
+	page_write: proc(data: rawptr, no: Page_No, bytes: []byte) -> bool,
 	page_sync:  proc(data: rawptr) -> bool,
 	close:      proc(data: rawptr),
 }
@@ -21,7 +21,7 @@ Disk :: struct {
 // A disk in memory, which can also forget everything that was not synced.
 Memory_Disk :: struct {
 	log:         map[u64][dynamic]byte, // by segment
-	pages:       map[u32]^Page,
+	pages:       map[Page_No]^Page,
 	writes:      int,
 	bytes:       int,
 	syncs:       int,
@@ -86,10 +86,10 @@ memory_disk :: proc(m: ^Memory_Disk) -> Disk {
 			m.kept = memory_disk_end(m)
 			return !m.fail
 		},
-		page = proc(data: rawptr, no: u32) -> ^Page {
+		page = proc(data: rawptr, no: Page_No) -> ^Page {
 			return (^Memory_Disk)(data).pages[no]
 		},
-		page_write = proc(data: rawptr, no: u32, bytes: []byte) -> bool {
+		page_write = proc(data: rawptr, no: Page_No, bytes: []byte) -> bool {
 			m := (^Memory_Disk)(data)
 			pg, ok := m.pages[no]
 			if !ok {

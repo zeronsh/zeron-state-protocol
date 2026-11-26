@@ -190,15 +190,14 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			d.dirty = false
 			return true
 		},
-		page = proc(data: rawptr, no: u32) -> ^zsp.Page {
+		page = proc(data: rawptr, no: zsp.Page_No) -> ^zsp.Page {
 			d := (^File_Disk)(data)
-			at := int(no) * zsp.PAGE_SIZE
-			if at + size_of(zsp.Page) > len(d.mapped) {
+			if no >= u64(len(d.mapped) / zsp.PAGE_SIZE) {
 				return nil
 			}
-			return (^zsp.Page)(raw_data(d.mapped[at:]))
+			return (^zsp.Page)(raw_data(d.mapped[int(no) * zsp.PAGE_SIZE:]))
 		},
-		page_write = proc(data: rawptr, no: u32, bytes: []byte) -> bool {
+		page_write = proc(data: rawptr, no: zsp.Page_No, bytes: []byte) -> bool {
 			d := (^File_Disk)(data)
 			if !file_disk_make(d) {
 				return false

@@ -55,14 +55,14 @@ Header :: struct {
 	clock:      u64,
 	serial:     u64,
 	forgot:     u64,
-	shelf:      u32,
-	cells:      u32,
-	waste:      u32,
-	outbox:     u32,
-	next:       u32,
+	shelf:      Page_No,
+	cells:      Page_No,
+	waste:      Page_No,
+	outbox:     Page_No,
+	next:       Page_No,
 	sum:        u64,
 }
-MAGIC :: [8]byte{'z', 's', 'p', '-', 't', 'r', 'e', '2'}
+MAGIC :: [8]byte{'z', 's', 'p', '-', 't', 'r', 'e', '3'} // a store of another is made again from its log
 HEADER_PAGES :: 2
 
 // Where a cell's body lies. Packed into a tree value.
@@ -147,7 +147,7 @@ store_close :: proc(s: ^Store) {
 
 @(private)
 store_header :: proc(disk: Disk) -> (best: Header) {
-	for i in u32(0) ..< HEADER_PAGES {
+	for i in Page_No(0) ..< HEADER_PAGES {
 		pg := disk.page(disk.data, i)
 		if pg == nil {
 			continue
@@ -247,7 +247,7 @@ find_free :: proc(s: ^Store) {
 	for i in 0 ..< HEADER_PAGES {
 		used[i] = true
 	}
-	mark :: proc(s: ^Store, used: []bool, no: u32, level: int) {
+	mark :: proc(s: ^Store, used: []bool, no: Page_No, level: int) {
 		used[no] = true
 		if level == 0 {
 			return
@@ -264,7 +264,7 @@ find_free :: proc(s: ^Store) {
 	}
 	#reverse for u, i in used {
 		if !u {
-			append(&s.free, u32(i))
+			append(&s.free, Page_No(i))
 		}
 	}
 }
@@ -754,7 +754,7 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 	block: [512]byte
 	copy(block[:], ([^]byte)(&h)[:size_of(h)])
 	ok := s.disk.page_sync(s.disk.data)
-	ok = ok && s.disk.page_write(s.disk.data, u32(h.generation % HEADER_PAGES), block[:])
+	ok = ok && s.disk.page_write(s.disk.data, Page_No(h.generation % HEADER_PAGES), block[:])
 	ok = ok && s.disk.page_sync(s.disk.data)
 	if !ok {
 		s.failed = true

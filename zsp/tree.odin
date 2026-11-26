@@ -7,7 +7,10 @@ package zsp
 
 PAGE_SIZE :: 4096
 LEAF_CAP :: 72
-BRANCH_CAP :: 63
+BRANCH_CAP :: 56
+
+// Pages are numbered with 64 bits, and subtrees counted with 64 too: no tree runs out of either.
+Page_No :: u64
 
 Page :: struct #align (8) {
 	level:   u16, // zero for leaves
@@ -29,8 +32,8 @@ Leaf :: struct {
 Branch :: struct {
 	key:   Key, // smallest key the child may hold; the first is never consulted
 	sum:   Print,
-	count: u32,
-	child: u32,
+	count: u64,
+	child: Page_No,
 }
 
 Sum :: struct {
@@ -40,18 +43,18 @@ Sum :: struct {
 
 Pager :: struct {
 	disk:    Disk,
-	dirty:   map[u32]^Page,
-	free:    [dynamic]u32, // reusable now
-	pending: [dynamic]u32, // reusable once the checkpoint that abandoned them is durable
-	next:    u32, // first page number never used
+	dirty:   map[Page_No]^Page,
+	free:    [dynamic]Page_No, // reusable now
+	pending: [dynamic]Page_No, // reusable once the checkpoint that abandoned them is durable
+	next:    Page_No, // first page number never used
 }
 
 Tree :: struct {
-	root: u32, // zero when empty
+	root: Page_No, // zero when empty
 }
 
 @(require_results)
-page :: #force_inline proc(p: ^Pager, no: u32) -> ^Page {
+page :: #force_inline proc(p: ^Pager, no: Page_No) -> ^Page {
 	if len(p.dirty) != 0 {
 		if pg, ok := p.dirty[no]; ok {
 			return pg
@@ -61,7 +64,7 @@ page :: #force_inline proc(p: ^Pager, no: u32) -> ^Page {
 }
 
 @(private)
-page_new :: proc(p: ^Pager, level: u16) -> (no: u32, pg: ^Page) {
+page_new :: proc(p: ^Pager, level: u16) -> (no: Page_No, pg: ^Page) {
 	if len(p.free) > 0 {
 		no = pop(&p.free)
 	} else {
@@ -75,7 +78,7 @@ page_new :: proc(p: ^Pager, level: u16) -> (no: u32, pg: ^Page) {
 }
 
 @(private)
-page_drop :: proc(p: ^Pager, no: u32) {
+page_drop :: proc(p: ^Pager, no: Page_No) {
 	if pg, ok := p.dirty[no]; ok {
 		free(pg)
 		delete_key(&p.dirty, no)
@@ -87,7 +90,7 @@ page_drop :: proc(p: ^Pager, no: u32) {
 
 // A writable version of the page, which may live under a new number.
 @(private)
-page_own :: proc(p: ^Pager, no: u32) -> (u32, ^Page) {
+page_own :: proc(p: ^Pager, no: Page_No) -> (Page_No, ^Page) {
 	if pg, ok := p.dirty[no]; ok {
 		return no, pg
 	}
@@ -145,9 +148,9 @@ page_sum :: proc(pg: ^Page) -> (s: Sum) #no_bounds_check {
 }
 
 @(private)
-branch_of :: proc(key: Key, no: u32, pg: ^Page) -> Branch {
+branch_of :: proc(key: Key, no: Page_No, pg: ^Page) -> Branch {
 	s := page_sum(pg)
-	return {key, s.print, u32(s.count), no}
+	return {key, s.print, u64(s.count), no}
 }
 
 @(require_results)
@@ -190,7 +193,7 @@ tree_put :: proc(p: ^Pager, t: ^Tree, key: Key, val: Print) {
 }
 
 @(private)
-put :: proc(p: ^Pager, no: u32, key: ^Key, val: Print) -> (left: u32, split: Key, right: Branch) {
+put :: proc(p: ^Pager, no: Page_No, key: ^Key, val: Print) -> (left: Page_No, split: Key, right: Branch) {
 	pg: ^Page
 	left, pg = page_own(p, no)
 
@@ -280,7 +283,7 @@ tree_delete :: proc(p: ^Pager, t: ^Tree, key: Key) -> bool {
 }
 
 @(private)
-del :: proc(p: ^Pager, old: u32, key: ^Key) -> u32 {
+del :: proc(p: ^Pager, old: Page_No, key: ^Key) -> Page_No {
 	no, pg := page_own(p, old)
 	if pg.level == 0 {
 		i := leaf_find(pg, key)
@@ -394,7 +397,7 @@ tree_select :: proc(p: ^Pager, t: Tree, rank: int) -> (key: Key, ok: bool) {
 	return pg.leaf[rank].key, true
 }
 
-MAX_DEPTH :: 8 // 63^7 leaves
+MAX_DEPTH :: 12 // 56^11 leaves
 
 // An ordered walk. Invalidated by mutation.
 Cursor :: struct {

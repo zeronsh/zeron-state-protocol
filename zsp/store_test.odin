@@ -294,3 +294,49 @@ waste_is_reclaimed :: proc(t: ^testing.T) {
 	testing.expect_value(t, census(&s), want)
 	store_close(&s)
 }
+
+// A store written in an earlier format, whose pages cannot be read as these are, is made again from its log.
+@(test)
+older_store_is_made_again :: proc(t: ^testing.T) {
+	state := seeded(6)
+	context.random_generator = rand.default_random_generator(&state)
+	m: Memory_Disk
+	defer memory_disk_destroy(&m)
+	s: Store
+	testing.expect(t, store_open(&s, memory_disk(&m)))
+	for _ in 0 ..< 300 {
+		cells: [8]Cell
+		for &c in cells {
+			c = random_cell(400, 1_000_000)
+		}
+		store_commit(&s, cells[:])
+		if rand.int_max(20) == 0 {
+			testing.expect(t, store_checkpoint(&s))
+		}
+		free_all(context.temp_allocator)
+	}
+	testing.expect(t, store_checkpoint(&s))
+	want := census(&s)
+	store_close(&s)
+	// As the last format left it: other magic, and pages laid out otherwise.
+	for no, pg in m.pages {
+		bytes := ([^]byte)(pg)[:size_of(Page)]
+		if no < HEADER_PAGES {
+			bytes[7] = '2'
+			h := (^Header)(pg)
+			h.sum = header_sum(h)
+		} else {
+			for &b in bytes {
+				b = byte(rand.uint32())
+			}
+		}
+	}
+	testing.expect(t, store_open(&s, memory_disk(&m)))
+	testing.expect_value(t, census(&s), want)
+	check_shelf(t, &s)
+	testing.expect(t, store_checkpoint(&s))
+	store_close(&s)
+	testing.expect(t, store_open(&s, memory_disk(&m)))
+	testing.expect_value(t, census(&s), want)
+	store_close(&s)
+}

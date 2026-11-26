@@ -18,8 +18,8 @@ foreign host {
 	log_end :: proc() -> f64 ---
 	log_drop :: proc(lo, hi: f64) ---
 	log_truncate :: proc(off: f64) ---
-	page_read :: proc(no: u32, ptr: rawptr) -> bool ---
-	page_write :: proc(no: u32, ptr: [^]byte, len: int) -> bool ---
+	page_read :: proc(no: f64, ptr: rawptr) -> bool ---
+	page_write :: proc(no: f64, ptr: [^]byte, len: int) -> bool ---
 	save_roster :: proc(ptr: [^]byte, len: int) ---
 	// Answered by `verdict`, now or later.
 	authenticate :: proc(conn: u32, device: ^zsp.Key32, ptr: [^]byte, len: int) ---
@@ -42,7 +42,7 @@ Conn :: struct {
 node: zsp.Node
 secret: zsp.Key32
 conns: map[u32]^Conn
-pages: map[u32]^zsp.Page
+pages: map[zsp.Page_No]^zsp.Page
 message: [dynamic]byte // handed in and out
 
 @(export)
@@ -63,24 +63,24 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len
 		log_truncate = proc(_: rawptr, off: u64) {log_truncate(f64(off))},
 		// Storage here is synchronous, and what leaves is held back until it is durable.
 		log_sync = proc(_: rawptr) -> bool {return true},
-		page = proc(_: rawptr, no: u32) -> ^zsp.Page {
+		page = proc(_: rawptr, no: zsp.Page_No) -> ^zsp.Page {
 			if pg, ok := pages[no]; ok {
 				return pg
 			}
 			pg := new(zsp.Page)
-			if !page_read(no, pg) {
+			if !page_read(f64(no), pg) {
 				free(pg)
 				return nil
 			}
 			pages[no] = pg
 			return pg
 		},
-		page_write = proc(_: rawptr, no: u32, bytes: []byte) -> bool {
+		page_write = proc(_: rawptr, no: zsp.Page_No, bytes: []byte) -> bool {
 			if pg, ok := pages[no]; ok {
 				free(pg)
 				delete_key(&pages, no)
 			}
-			return page_write(no, raw_data(bytes), len(bytes))
+			return page_write(f64(no), raw_data(bytes), len(bytes))
 		},
 		page_sync = proc(_: rawptr) -> bool {return true},
 		close = proc(_: rawptr) {},
