@@ -579,6 +579,42 @@ def test_durable_object():
     assert not os.path.exists(os.path.join(d.dir, zspd_space(a), "roster"))
 
 
+def test_relay_full():
+    """A relay that can keep no more of a space says so and lets go, and nothing anyone has is lost or garbled."""
+    cloud = Cloud().start(ACCESS_TOKEN="sesame", STORAGE_LIMIT="1500000", FULL_WAIT="3000")
+    _, (a, b) = space("fa", "fb", relay=cloud, options=["--credential=" + cloud.token])
+    ca, cb = a.client(), b.client()
+    cb.watch(1, 1, "big")
+    cb.until(lambda: 1 in cb.windows)
+    sent = {}
+    for i in range(80):  # five megabytes, where one and a half may be kept
+        sent[i] = bytes([i]) * 65536
+        ca.put(1, "big", i, [sent[i]])
+    host, port = cloud.address.split(":")
+
+    def knock():
+        k = socket.create_connection((host, int(port)))
+        k.sendall(
+            f"GET /{zspd_space(a)} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".encode()
+        )
+        status = k.recv(200).split(b" ")[1]
+        k.close()
+        return status
+
+    eventually("the relay says it is full", lambda: knock() == b"507", timeout=30)
+    assert cloud.p.poll() is None, "and is still there"
+    # The other has some of it, all of it whole; the one who wrote has it all.
+    cb.drain(0.5)
+    got = {order: values[16] for order, _, values in cb.list(1, "big")}
+    assert 0 < len(got) < 80, len(got)
+    assert all(got[o] == sent[o] for o in got), "nothing garbled"
+    ca.drain(0.5)
+    assert len(ca.list(1, "big")) == 80, "nothing lost"
+    # And after a while it lets devices in again, from what it kept.
+    eventually("it lets devices in again", lambda: knock() == b"101", timeout=15)
+
+
 def slow_hibernation():
     cloud = Cloud().start()
     _, (a, b) = space("t", "u", relay=cloud, options=["--credential=" + cloud.token])

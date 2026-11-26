@@ -7,6 +7,10 @@ import { DurableObject } from "cloudflare:workers";
 import module from "./relay.wasm";
 
 const CHUNK = 1 << 20; // storage takes no larger value than two of these
+const FULL = "this relay can keep no more of this space";
+
+// What SQLite throws when it can keep no more; and what is thrown here for STORAGE_LIMIT, the same way.
+class Full extends Error {}
 
 const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 const unhex = (s) => Uint8Array.from(s.match(/../g) ?? [], (b) => parseInt(b, 16));
@@ -58,6 +62,8 @@ export class Space extends DurableObject {
   #space;
   #made = false; // the tables exist
   #sent = 0;
+  #full = 0; // when storage last could keep no more: for a while after, nobody is let in
+  #broken = false; // storage failed where the node was not there to be told
 
   constructor(ctx, env) {
     super(ctx, env);
@@ -68,15 +74,54 @@ export class Space extends DurableObject {
     const sockets = ctx.getWebSockets();
     for (const ws of sockets) this.#space ??= ws.deserializeAttachment()?.space;
     this.#space ??= this.#kept("space");
-    if (this.#space) console.log("woke with", sockets.length, "sockets"), this.#wake(this.#space);
+    if (this.#space) console.log("woke with", sockets.length, "sockets"), this.#begin();
+  }
+
+  // Wakes the node, unless storage can keep nothing: then everyone is told so and let go.
+  #begin() {
+    try {
+      this.#wake(this.#space);
+    } catch (e) {
+      if (!(e instanceof Full)) throw e;
+      this.#fail();
+      return false;
+    }
+    return true;
+  }
+
+  // Writes, unless storage is full: a space may be kept up to STORAGE_LIMIT bytes, if that is given, as up to the
+  // platform's own limit, past which SQLite throws.
+  #write(query, ...args) {
+    const limit = Number(this.env.STORAGE_LIMIT ?? 0);
+    if (limit > 0 && this.#sql.databaseSize > limit) throw new Full(FULL);
+    try {
+      return this.#sql.exec(query, ...args);
+    } catch (e) {
+      throw /SQLITE_FULL|is full|exceeded|quota/i.test(String(e?.message ?? e)) ? new Full(String(e?.message ?? e)) : e;
+    }
+  }
+
+  // Nothing more can be kept: what was not kept was not acknowledged, and every device still has it. Everyone here is
+  // told and let go, the node with all it held in memory is let go too, and for a while nobody is let in.
+  #fail() {
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.close(1011, FULL);
+      } catch {}
+    }
+    this.#sockets.clear();
+    this.#wasm = undefined;
+    this.#broken = false;
+    this.#full = Date.now();
+    console.log(FULL);
   }
 
   #make() {
     if (this.#made) return;
     this.#made = true;
-    this.#sql.exec("CREATE TABLE log (off INTEGER PRIMARY KEY, data BLOB) STRICT");
-    this.#sql.exec("CREATE TABLE page (no INTEGER PRIMARY KEY, data BLOB) STRICT");
-    this.#sql.exec("CREATE TABLE kept (name TEXT PRIMARY KEY, data BLOB) STRICT");
+    this.#write("CREATE TABLE log (off INTEGER PRIMARY KEY, data BLOB) STRICT");
+    this.#write("CREATE TABLE page (no INTEGER PRIMARY KEY, data BLOB) STRICT");
+    this.#write("CREATE TABLE kept (name TEXT PRIMARY KEY, data BLOB) STRICT");
     this.#keep("space", this.#space);
   }
 
@@ -88,18 +133,31 @@ export class Space extends DurableObject {
 
   #keep(name, bytes) {
     this.#make();
-    this.#sql.exec("INSERT OR REPLACE INTO kept VALUES (?, ?)", name, bytes);
+    this.#write("INSERT OR REPLACE INTO kept VALUES (?, ?)", name, bytes);
+  }
+
+  // Runs a write the node asked for, and says whether it was kept; one that fails where the node cannot be told
+  // breaks the store, which is then let go of.
+  #kept_if(f) {
+    try {
+      f();
+      return 1;
+    } catch (e) {
+      if (!(e instanceof Full)) throw e;
+      return 0;
+    }
   }
 
   #wake(space) {
     const sql = this.#sql;
     const { exports, view } = instantiate((view) => ({
-      log_write: (off, ptr, len) => {
-        this.#make();
-        for (let at = 0; at < len; at += CHUNK) {
-          sql.exec("INSERT OR REPLACE INTO log VALUES (?, ?)", off + at, view(ptr + at, Math.min(CHUNK, len - at)).slice());
-        }
-      },
+      log_write: (off, ptr, len) =>
+        this.#kept_if(() => {
+          this.#make();
+          for (let at = 0; at < len; at += CHUNK) {
+            this.#write("INSERT OR REPLACE INTO log VALUES (?, ?)", off + at, view(ptr + at, Math.min(CHUNK, len - at)).slice());
+          }
+        }),
       log_read: (off, ptr, len) => {
         if (!this.#made) return 0;
         for (let got = 0; got < len; ) {
@@ -130,14 +188,17 @@ export class Space extends DurableObject {
         view(ptr, row.data.byteLength).set(new Uint8Array(row.data));
         return 1;
       },
-      page_write: (no, ptr, len) => {
-        this.#make();
-        sql.exec("INSERT OR REPLACE INTO page VALUES (?, ?)", no, view(ptr, len).slice());
-      },
+      page_write: (no, ptr, len) =>
+        this.#kept_if(() => {
+          this.#make();
+          this.#write("INSERT OR REPLACE INTO page VALUES (?, ?)", no, view(ptr, len).slice());
+        }),
       save_roster: (ptr, len) => {
         const old = this.#kept("roster");
-        if (old) this.#keep("roster.old", old);
-        this.#keep("roster", view(ptr, len).slice());
+        if (!this.#kept_if(() => {
+          if (old) this.#keep("roster.old", old);
+          this.#keep("roster", view(ptr, len).slice());
+        })) this.#broken = true;
       },
       authenticate: (id, device, ptr, len) => this.#judge(id, hex(view(device, 32)), view(ptr, len).slice()),
       now: () => Date.now(),
@@ -151,7 +212,9 @@ export class Space extends DurableObject {
     view(ptr + 32, 32).set(unhex(this.env.RELAY_SECRET));
     view(ptr + 64, old.length).set(old);
     view(ptr + 64 + old.length, roster.length).set(roster);
-    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length)) throw new Error("storage is damaged");
+    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length)) {
+      throw exports.failed() ? new Full(FULL) : new Error("storage is damaged");
+    }
     let lost = false;
     for (const ws of this.ctx.getWebSockets()) {
       const { id, state } = ws.deserializeAttachment() ?? {};
@@ -186,7 +249,9 @@ export class Space extends DurableObject {
 
   fetch(request) {
     this.#space ??= unhex(new URL(request.url).pathname.slice(1));
-    if (!this.#wasm) this.#wake(this.#space);
+    const wait = Number(this.env.FULL_WAIT ?? 60000);
+    if (this.#full && Date.now() - this.#full < wait) return new Response(FULL + "\n", { status: 507 });
+    if (!this.#wasm && !this.#begin()) return new Response(FULL + "\n", { status: 507 });
     const { 0: client, 1: server } = new WebSocketPair();
     const id = this.#next++;
     this.ctx.acceptWebSocket(server);
@@ -197,6 +262,7 @@ export class Space extends DurableObject {
   }
 
   webSocketMessage(ws, message) {
+    if (!this.#wasm) return void ws.close(1011, FULL); // what came before it was let go
     const { id } = ws.deserializeAttachment();
     if (typeof message === "string" || !this.#put(new Uint8Array(message), (n) => this.#wasm.received(id, n))) this.#drain(id, ws), this.#drop(id, ws);
     this.#settle();
@@ -256,6 +322,7 @@ export class Space extends DurableObject {
       }
     }
     this.#wasm.rest();
+    if (this.#broken || this.#wasm.failed()) this.#fail();
   }
 }
 

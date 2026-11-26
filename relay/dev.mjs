@@ -16,7 +16,12 @@ const mf = new Miniflare({
     { type: "CompiledWasm", path: "relay.wasm", contents: readFileSync(at("relay.wasm")) },
   ],
   compatibilityDate: "2026-01-01",
-  bindings: { RELAY_SECRET: secret, ...(process.env.ACCESS_TOKEN && { ACCESS_TOKEN: process.env.ACCESS_TOKEN }) },
+  bindings: {
+    RELAY_SECRET: secret,
+    ...(process.env.ACCESS_TOKEN && { ACCESS_TOKEN: process.env.ACCESS_TOKEN }),
+    ...(process.env.STORAGE_LIMIT && { STORAGE_LIMIT: process.env.STORAGE_LIMIT }),
+    ...(process.env.FULL_WAIT && { FULL_WAIT: process.env.FULL_WAIT }),
+  },
   durableObjects: { SPACE: { className: "Space", useSQLite: true } },
   durableObjectsPersist: process.env.PERSIST ?? false,
 });

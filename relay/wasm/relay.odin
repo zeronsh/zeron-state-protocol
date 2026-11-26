@@ -12,13 +12,14 @@ foreign import host "host"
 
 @(default_calling_convention = "contextless")
 foreign host {
-	log_write :: proc(off: f64, ptr: [^]byte, len: int) ---
+	// Whether it was kept: storage may be full.
+	log_write :: proc(off: f64, ptr: [^]byte, len: int) -> bool ---
 	log_read :: proc(off: f64, ptr: [^]byte, len: int) -> bool ---
 	log_end :: proc() -> f64 ---
 	log_drop :: proc(lo, hi: f64) ---
 	log_truncate :: proc(off: f64) ---
 	page_read :: proc(no: u32, ptr: rawptr) -> bool ---
-	page_write :: proc(no: u32, ptr: [^]byte, len: int) ---
+	page_write :: proc(no: u32, ptr: [^]byte, len: int) -> bool ---
 	save_roster :: proc(ptr: [^]byte, len: int) ---
 	// Answered by `verdict`, now or later.
 	authenticate :: proc(conn: u32, device: ^zsp.Key32, ptr: [^]byte, len: int) ---
@@ -50,8 +51,7 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len
 	secret = secret_ptr^
 	disk := zsp.Disk {
 		log_write = proc(_: rawptr, off: u64, bytes: []byte) -> bool {
-			log_write(f64(off), raw_data(bytes), len(bytes))
-			return true
+			return log_write(f64(off), raw_data(bytes), len(bytes))
 		},
 		log_read = proc(_: rawptr, off: u64, into: []byte) -> bool {
 			return log_read(f64(off), raw_data(into), len(into))
@@ -80,8 +80,7 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len
 				free(pg)
 				delete_key(&pages, no)
 			}
-			page_write(no, raw_data(bytes), len(bytes))
-			return true
+			return page_write(no, raw_data(bytes), len(bytes))
 		},
 		page_sync = proc(_: rawptr) -> bool {return true},
 		close = proc(_: rawptr) {},
@@ -106,6 +105,12 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len
 	}
 	free_all(context.temp_allocator)
 	return true
+}
+
+// Whether storage has failed, as when it is full: nothing more can be kept, and what was not kept was not acknowledged.
+@(export)
+failed :: proc "c" () -> bool {
+	return node.store.failed
 }
 
 // Where the host should put bytes for the next call.
