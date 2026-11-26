@@ -51,6 +51,7 @@ Public_In :: struct {
 	tried6:  bool,
 	prelude: []byte, // owned
 	abandoned: bool, // over while dialling: the dial is left to finish, and this freed then
+	heard_end: bool, // the public said all it will before the connection was made
 }
 
 exposure_destroy :: proc(e: ^Exposure) {
@@ -75,7 +76,7 @@ exposures_load :: proc(p: ^Ports) {
 			continue
 		}
 		e, ok := exposure_parse(p.space, strings.fields(line, context.temp_allocator))
-		if !ok || len(p.exposures) >= MAX_EXPOSURES {
+		if !ok || len(p.exposures) >= MAX_EXPOSURES || own_port(p.space.host, e.port) {
 			report(.Warning, "an exposure makes no sense, and is not made: ", line)
 			continue
 		}
@@ -289,7 +290,7 @@ public_called :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, fir
 	copy(a.ip[:], address)
 	a.port = u16(address[16]) << 8 | u16(address[17])
 	peer := net.endpoint_to_string(address_to(a), context.temp_allocator)
-	if e == nil {
+	if e == nil || own_port(sp.host, e.port) {
 		audit(sp, {service = "public", detail = label, event = .Denied, peer = peer})
 		return nil, .Denied
 	}
@@ -303,7 +304,9 @@ public_called :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, fir
 		append(&c.early, ..bytes) // the connection is yet to be made: it waits, within the credit it was given
 		return false
 	}
-	c.on_end = proc(h: ^Call_Handler, call: u64) {} // whatever came is written once connected
+	c.on_end = proc(h: ^Call_Handler, call: u64) {
+		(^Public_In)(h).heard_end = true // whatever came is written once connected, and then the end of it
+	}
 	c.on_fault = proc(h: ^Call_Handler, call: u64, _: zsp.Call_Fault) {
 		public_in_drop((^Public_In)(h))
 	}
@@ -350,6 +353,9 @@ public_dial :: proc(c: ^Public_In, six: bool) {
 		c.forward.done, c.forward.done_data = public_in_bridged, c
 		call_consumed(c.sp, c.call, credit)
 		clear(&c.early)
+		if c.heard_end {
+			c.forward.handler.on_end(&c.forward.handler, c.call)
+		}
 	}, timeout = 10 * time.Second)
 }
 

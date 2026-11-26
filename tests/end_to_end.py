@@ -1494,6 +1494,59 @@ def test_expose_nowhere():
     eventually("the relay says it will not", lambda: [r["status"] for e in ca.exposures() for r in e["relays"]] == [1])
 
 
+def listening_ports(pid):
+    """The TCP ports a process listens on, as Linux says; None elsewhere."""
+    if not os.path.isdir("/proc/%d/fd" % pid):
+        return None
+    inodes = set()
+    for fd in os.listdir("/proc/%d/fd" % pid):
+        try:
+            link = os.readlink("/proc/%d/fd/%s" % (pid, fd))
+        except OSError:
+            continue
+        if link.startswith("socket:["):
+            inodes.add(link[8:-1])
+    ports = set()
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        with open(table) as f:
+            for line in f.readlines()[1:]:
+                fields = line.split()
+                if fields[3] == "0A" and fields[9] in inodes:  # listening
+                    ports.add(int(fields[1].rsplit(":", 1)[1], 16))
+    return ports
+
+
+def test_own_ports_kept():
+    """A device's own sockets are never offered nor exposed, though it offers every port and the system chose theirs:
+    else another device could reach, through this one's proxy, what only this one may."""
+    relay = Node("ok-relay", "serve", "--no-udp").start()
+    a = Node("oka", "run", "--no-udp", "--dns=127.0.0.1:0", "--proxy=127.0.0.1:0", "--catch=127.0.0.1:0")
+    b = Node("okb", "run", "--no-udp", "--dns=127.0.0.1:0", "--no-proxy", "--catch=127.0.0.1:0")
+    sid = zspd("create", a.dir)
+    url = "ws://localhost:" + relay.address.split(":")[1]
+    zspd("relay", a.dir, relay.key, url)
+    zspd("admit", a.dir, zspd("key", b.dir), "1")
+    zspd("join", b.dir, sid, relay.key, url)
+    a.start(), b.start()
+    ca, cb = a.client(), b.client()
+    cb.until(lambda: len(cb.devices) == 2)
+    web = free_port()
+    Service("127.0.0.1", web, says=b"offered")
+    ca.offer((1, 65535), 1)
+    seen = lambda: {p["port"] for n in cb.nodes() if n["device"].hex() == a.key for p in n["ports"]}
+    eventually("what listens is offered", lambda: web in seen(), timeout=15)
+    own = listening_ports(a.p.pid)
+    if own is not None:
+        assert len(own) >= 3, own  # its local API, proxy, and name server at least
+        assert not own & seen(), own & seen()
+        for port in own:
+            try:
+                ca.expose(port)
+                raise AssertionError("its own port %d was exposed" % port)
+            except PermissionError:
+                pass
+
+
 def test_public_held_off():
     """The public cannot keep the public out: what is not TLS, what fails its handshake, and what says nothing leave
     nothing behind at the relay, and someone who has something to ask is still answered."""

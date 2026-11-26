@@ -287,20 +287,23 @@ port_permitted :: proc(sp: ^Space, caller: zsp.Key32, scope: zsp.Scope, port: u1
 	return
 }
 
-// Whether this machine's port is one of the host's own, which is never offered: it would reach through this
-// device what this device reaches.
+// Whether this machine's port is one of the host's own, which is never offered nor exposed: it would reach through
+// this device what this device reaches. Asked of the sockets themselves, as bound, so that one on port 0 is known by
+// the port it was given.
 @(private, require_results)
 own_port :: proc(h: ^Host, port: u16) -> bool {
-	if bound, err := net.bound_endpoint(h.listener); err == nil && h.listen != nil && bound.port == int(port) {
-		return true
+	is :: proc(socket: net.TCP_Socket, port: u16) -> bool {
+		at, err := net.bound_endpoint(socket)
+		return err == nil && at.port == int(port)
 	}
-	if at, ok := h.proxy.?; ok && at.port == int(port) {
-		return true
-	}
-	if catch_port(h) == int(port) {
-		return true
-	}
-	return false
+	return(
+		(h.listen != nil && is(h.listener, port)) ||
+		(h.proxy_server.open && is(h.proxy_server.socket, port)) ||
+		(h.dns_server.open && is(h.dns_server.tcp, port)) ||
+		(h.public.have_tls && is(h.public.tls, port)) ||
+		(h.public.have_http && is(h.public.http, port)) ||
+		catch_port(h) == int(port)
+	)
 }
 
 // What a device is offered now, in temporary memory, ascending by port; and a hash of it.
