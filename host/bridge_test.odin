@@ -34,6 +34,7 @@ Client :: struct {
 	prefix:   string, // sent first
 	slow:     bool, // a little at a time
 	heard:    int, // atomic; bytes read
+	local:    int, // atomic; the port it connected from
 }
 
 @(private)
@@ -44,6 +45,9 @@ client_start :: proc(c: ^Client) -> ^thread.Thread {
 		if err != nil {
 			c.reset = true
 			return
+		}
+		if at, berr := net.bound_endpoint(s); berr == nil {
+			sync.atomic_store(&c.local, at.port)
 		}
 		defer net.close(s)
 		reader: ^thread.Thread
@@ -113,11 +117,33 @@ Gate :: struct {
 	to:       u16, // B's port
 	scope:    zsp.Scope,
 	op:       ^nbio.Operation,
-	status:   [dynamic]Forward_Status,
+	status:   [dynamic]Forward_Status, // every forward's, in turn
 	forwards: int,
+	each:     [dynamic]^Gate_Forward,
 	early:    []byte,
 	inspect:  proc(data: rawptr, first: []byte) -> Inspection,
 	last:     ^Forward,
+}
+
+// What happened to one forward, by the port it was accepted from.
+@(private)
+Gate_Forward :: struct {
+	gate:   ^Gate,
+	port:   int,
+	status: [dynamic]Forward_Status,
+}
+
+// What happened to the forward that carried a client's connection: whatever else may have come to the gate, as
+// another test elsewhere on this machine may knock at a port it once had.
+@(private)
+gate_status :: proc(g: ^Gate, c: ^Client) -> []Forward_Status {
+	local := sync.atomic_load(&c.local)
+	for f in g.each {
+		if f.port == local {
+			return f.status[:]
+		}
+	}
+	return nil
 }
 
 @(private)
@@ -144,13 +170,18 @@ gate_accepted :: proc(op: ^nbio.Operation, g: ^Gate) {
 		return
 	}
 	g.forwards += 1
+	f := new(Gate_Forward)
+	f.gate, f.port = g, op.accept.client_endpoint.port
+	append(&g.each, f)
 	g.last = forward(world_space(g.w, 1), g.w.keys[2].device, g.scope, g.to, "", op.accept.client, proc(data: rawptr, status: Forward_Status) {
-		g := (^Gate)(data)
+		f := (^Gate_Forward)(data)
+		g := f.gate
+		append(&f.status, status)
 		append(&g.status, status)
 		if status != .Connected {
 			g.last = nil
 		}
-	}, g, g.inspect, g.early)
+	}, f, g.inspect, g.early)
 }
 
 @(private)
@@ -160,6 +191,11 @@ gate_close :: proc(g: ^Gate) {
 	}
 	net.close(g.listener)
 	delete(g.status)
+	for f in g.each {
+		delete(f.status)
+		free(f)
+	}
+	delete(g.each)
 }
 
 @(private)
@@ -196,7 +232,8 @@ forward_reaches_a_port :: proc(t: ^testing.T) {
 		testing.expect(t, world_run(&w, proc(w: ^World, _: rawptr) -> bool {
 			return len(world_space(w, 1).bridges) + len(world_space(w, 2).bridges) + len(world_space(w, 1).calls) + len(world_space(w, 2).calls) == 0
 		}))
-		testing.expectf(t, len(g.status) == 2 && g.status[0] == .Connected && g.status[1] == .Closed, "%v", g.status[:])
+		st := gate_status(&g, &c)
+		testing.expectf(t, len(st) == 2 && st[0] == .Connected && st[1] == .Closed, "%v", st)
 		log, err := os.read_entire_file(file_in(world_space(&w, 2).dir, "audit.log"), context.temp_allocator)
 		testing.expect(t, err == nil && strings.contains(string(log), `"event":"open"`) && strings.contains(string(log), `"service":"tcp"`))
 		testing.expectf(t, strings.contains(string(log), `"in":3145728,"out":3145728`), "%s", log)
@@ -237,7 +274,9 @@ forward_refused :: proc(t: ^testing.T) {
 		th := client_start(&c)
 		testing.expect(t, world_run(&w, client_done, &c))
 		testing.expect(t, world_run(&w, proc(w: ^World, g: rawptr) -> bool {return len((^Gate)(g).status) > 0}, &g))
-		testing.expectf(t, len(g.status) == 1 && g.status[0] == k.status, "port %d scope %d: %v", k.port, k.scope, g.status[:])
+		testing.expect(t, world_run(&w, proc(w: ^World, c: rawptr) -> bool {return sync.atomic_load(&(^Client)(c).local) != 0}, &c) || c.reset)
+		st := gate_status(&g, &c)
+		testing.expectf(t, len(st) == 1 && st[0] == k.status, "port %d scope %d: %v", k.port, k.scope, st)
 		testing.expectf(t, c.reset && len(c.got) == 0, "port %d: reset %v, %d back", k.port, c.reset, len(c.got))
 		client_destroy(&c, th)
 		gate_close(&g)
@@ -271,7 +310,7 @@ forward_inspects :: proc(t: ^testing.T) {
 		testing.expect(t, gate_open(&g, &w, u16(e.port)))
 		g.early = transmute([]byte)string("early:")
 		g.inspect = proc(data: rawptr, first: []byte) -> Inspection {
-			g := (^Gate)(data)
+			g := (^Gate_Forward)(data).gate
 			if len(first) < 8 {
 				return .More
 			}
@@ -292,7 +331,8 @@ forward_inspects :: proc(t: ^testing.T) {
 		}
 		client_destroy(&c, th)
 		testing.expect(t, world_run(&w, nobody_left))
-		testing.expectf(t, len(g.status) > 0 && g.status[len(g.status) - 1] == (.Closed if pass else .Rejected), "%v", g.status[:])
+		st := gate_status(&g, &c)
+		testing.expectf(t, len(st) > 0 && st[len(st) - 1] == (.Closed if pass else .Rejected), "%v", st)
 		gate_close(&g)
 	}
 }
@@ -321,7 +361,8 @@ forward_rechecked :: proc(t: ^testing.T) {
 	testing.expect(t, c.reset)
 	client_destroy(&c, th)
 	testing.expect(t, world_run(&w, nobody_left))
-	testing.expect(t, len(g.status) == 2 && g.status[1] == .Denied)
+	st := gate_status(&g, &c)
+	testing.expectf(t, len(st) == 2 && st[1] == .Denied, "%v", st)
 	log, _ := os.read_entire_file(file_in(world_space(&w, 2).dir, "audit.log"), context.temp_allocator)
 	testing.expect(t, strings.contains(string(log), `"event":"denied"`))
 }
@@ -440,5 +481,6 @@ forward_outlives_its_relay :: proc(t: ^testing.T) {
 	testing.expectf(t, !c.reset && len(c.got) == len(c.sent) && string(c.got[:]) == string(c.sent[:]), "%d of %d came back", len(c.got), len(c.sent))
 	client_destroy(&c, th)
 	testing.expect(t, world_run(&w, nobody_left))
-	testing.expectf(t, len(g.status) == 2 && g.status[1] == .Closed, "%v", g.status[:])
+	st := gate_status(&g, &c)
+	testing.expectf(t, len(st) == 2 && st[1] == .Closed, "%v", st)
 }
