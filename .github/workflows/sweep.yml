@@ -1,0 +1,35 @@
+name: sweep
+# Structured state held to its model over many more seeds than a push can wait for, and other ones each night: any seed
+# that fails is named, and runs alone again with `lune run luau/tests/mirror_model.luau 1 [plain] <seed>`.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+jobs:
+  sweep:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: lune
+        run: |
+          mkdir -p ~/tools && cd ~/tools
+          curl -sSLo lune.zip https://github.com/lune-org/lune/releases/download/v0.11.1/lune-0.11.1-linux-x86_64.zip && unzip -qo lune.zip
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+      - name: seeds
+        run: |
+          # Each night its own seeds: 2000 with shortcuts and 500 without, in each of four shards.
+          first=$(( (${{ github.run_number }} * 4 + ${{ matrix.shard }}) * 2000 + 1000000 ))
+          echo "with shortcuts from $first, without from $first"
+          lune run luau/tests/mirror_model.luau 2000 "" $first &
+          quick=$!
+          lune run luau/tests/mirror_model.luau 500 plain $first &
+          long=$!
+          failed=
+          wait $quick || failed=1
+          wait $long || failed=1
+          [ -z "$failed" ]
