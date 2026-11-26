@@ -3,6 +3,7 @@ package zsp
 
 import "core:fmt"
 import "core:math/rand"
+import "core:slice"
 import "core:testing"
 
 // A disk that holds everything but hands over only what has been fetched, as a cache over object storage does: a page
@@ -106,17 +107,20 @@ slow_miss :: proc(d: ^Slow_Disk) {
 	}
 }
 
-// The host brings some of what was asked for, or all of it. Returns how much it brought.
+// The host brings some of what was asked for, or all of it. Returns how much it brought. (Keys are gone over in
+// order: a map's own order differs from run to run, and a seed must say everything.)
 @(private)
 slow_fetch :: proc(d: ^Slow_Disk, all := false) -> (brought: int) {
-	for no in d.want_pages {
+	pages := sorted_keys(d.want_pages)
+	for no in pages {
 		if all || rand.int_max(2) == 0 {
 			d.pages[no] = {}
 			delete_key(&d.want_pages, no)
 			brought += 1
 		}
 	}
-	for b in d.want_blocks {
+	blocks := sorted_keys(d.want_blocks)
+	for b in blocks {
 		if all || rand.int_max(2) == 0 {
 			d.blocks[b] = {}
 			delete_key(&d.want_blocks, b)
@@ -126,26 +130,30 @@ slow_fetch :: proc(d: ^Slow_Disk, all := false) -> (brought: int) {
 	return
 }
 
+@(private)
+sorted_keys :: proc(m: map[$K]$V) -> []K {
+	keys := make([]K, len(m), context.temp_allocator)
+	i := 0
+	for k in m {
+		keys[i] = k
+		i += 1
+	}
+	slice.sort(keys)
+	return keys
+}
+
 // The cache lets some of it go.
 @(private)
 slow_evict :: proc(d: ^Slow_Disk, chance: int) {
-	gone := make([dynamic]Page_No, context.temp_allocator)
-	for no in d.pages {
+	for no in sorted_keys(d.pages) {
 		if rand.int_max(chance) == 0 {
-			append(&gone, no)
+			delete_key(&d.pages, no)
 		}
 	}
-	for no in gone {
-		delete_key(&d.pages, no)
-	}
-	blocks := make([dynamic]u64, context.temp_allocator)
-	for b in d.blocks {
+	for b in sorted_keys(d.blocks) {
 		if rand.int_max(chance) == 0 {
-			append(&blocks, b)
+			delete_key(&d.blocks, b)
 		}
-	}
-	for b in blocks {
-		delete_key(&d.blocks, b)
 	}
 }
 

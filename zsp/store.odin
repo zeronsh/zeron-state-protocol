@@ -51,6 +51,7 @@ Store :: struct {
 	// Where reads may answer "not yet", the log past the checkpoint is replayed a record at a time: see lazy.odin.
 	replaying:   bool,
 	step_missed: int, // reads that missed before the step under way began
+	remote:      ^Remote, // where it is kept in object storage: see remote.odin
 	replay_at:   u64, // the next record, or where to look for it
 	replay_tail: u64, // the end of the last sound record
 	repair_at:   Key, // how far over the shelf repair_steps has gone
@@ -141,6 +142,9 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 	s.waste.root, s.outbox.root = best.waste, best.outbox
 	s.repair.root = best.repair
 	s.next = max(best.next, HEADER_PAGES)
+	if s.remote != nil {
+		s.next = TEMP_PAGES // pages are numbered for where they go only at a checkpoint
+	}
 	if store_lazy(s) {
 		// Nothing may be read here that might not be at hand: what is free is never sought, and the log is
 		// replayed by store_work, a record at a time, before anything else is done.
@@ -750,6 +754,11 @@ store_wants_checkpoint :: proc(s: ^Store) -> bool {
 
 // Writes the trees, so that the log before this point need never be replayed.
 store_checkpoint :: proc(s: ^Store) -> bool {
+	if s.remote != nil {
+		// Made a step at a time, and put in object storage whenever it is: see remote_work.
+		s.remote.want_checkpoint = true
+		return !s.failed
+	}
 	if s.replaying || (s.checkpoint == store_tail(s) && len(s.dirty) == 0 && s.serial == s.serial_kept) {
 		return true
 	}

@@ -15,8 +15,9 @@ Page_No :: u64
 Page :: struct #align (8) {
 	level:   u16, // zero for leaves
 	count:   u16,
-	_:       u32,
-	_:       u64,
+	check:   u32, // set and believed only by storage that checks what it reads back: see remote.odin
+	number:  Page_No, // the same
+
 	using _: struct #raw_union {
 		leaf:   [LEAF_CAP]Leaf,
 		branch: [BRANCH_CAP]Branch,
