@@ -1182,6 +1182,14 @@ def test_ports():
         for at in ([f"{bee}:{port}"] if direct else []) + [f"127.0.0.1:{proxy[1]}"]:
             line = subprocess.run(["ss", "-Hltn", "src", at], capture_output=True, text=True).stdout.split()
             assert line and int(line[2]) >= 1024, (at, line)
+    # Asked once, without a lease, a device's list is said once, and then the call is over: asking for a lease after
+    # makes it none of those kept up, which are so many at most, each device's and all.
+    once = []
+    for _ in range(6):
+        call = ca.open(bytes.fromhex(b.key), 1, "zsp.ports", zsp.varint(0))
+        call.send(zsp.varint(600))
+        once.append(call)
+    eventually("each is over", lambda: all(c["ended"] or c["fault"] is not None for c in once) or ca.step() and False, timeout=5)
     # What a device offers is among the services it lists, to whoever it offers it.
     listed = ca.call(bytes.fromhex(b.key), 1, "zsp.services")
     data = b"".join(listed["data"])

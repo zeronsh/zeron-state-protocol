@@ -55,6 +55,7 @@ Port_Watch :: struct {
 	said:   u64, // a hash of what was last said
 	owed:   bool, // something has changed that there was no room to say
 	ended:  bool, // this side has ended: it is freed when the other has
+	once:   bool, // asked with no lease: answered once, and never kept up, whatever it asks after
 }
 
 offer_destroy :: proc(o: ^Offer) {
@@ -422,10 +423,13 @@ ports_called :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, firs
 		return nil, .Busy
 	}
 	w := new(Port_Watch)
-	w.ports, w.call, w.device = p, call, from.device
+	w.ports, w.call, w.device, w.once = p, call, from.device, lease == 0
 	w.until = time.tick_add(time.tick_now(), time.Duration(min(lease, MAX_LEASE)) * time.Second)
 	w.on_data = proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
 		w := (^Port_Watch)(h)
+		if w.once {
+			return true // not counted among those kept up, so never one of them
+		}
 		r := zsp.Reader{buf = bytes}
 		lease := zsp.read_varint(&r)
 		if zsp.read_done(&r) {
