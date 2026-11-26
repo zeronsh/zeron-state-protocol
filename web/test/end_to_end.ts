@@ -277,7 +277,7 @@ const tests: Record<string, () => Promise<void>> = {
       const through = await proxy(relay.url);
       const owner = join(TMP, "k-owner-" + kind);
       const sid = zspd("create", owner);
-      zspd("relay", owner, relay.key, through.url);
+      zspd("relay", owner, relay.key, relay.url); // the web device alone goes through the proxy, whose connections are its
       await node("run", owner);
       const d = await open({ dir: join(TMP, "k-web-" + kind), keepalive: { idle: 500, wait: 1000 }, log: () => {} });
       zspd("admit", owner, d.key, "1");
