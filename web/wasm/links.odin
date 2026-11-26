@@ -221,7 +221,10 @@ peer_heard :: proc(p: ^Peer, l: ^pipe.Link, from: pipe.Address) {
 	p.far = !address_near(from)
 	p.used = time.tick_now()
 	if l.state == .Closed {
-		return // links_run lets it go
+		if l == p.link {
+			peer_drop(p) // told so: its session ends now, and no call is put on it meanwhile
+		}
+		return
 	}
 	peer_opened(p, l)
 }
@@ -559,6 +562,9 @@ links_flush :: proc() {
 			send_to(packet, p.address)
 			p.used = time.tick_now()
 		}
+		if p.link.state == .Closed {
+			peer_drop(p) // given up, or closed, as it sent: let go now, not when next looked at, nor a call put on it meanwhile
+		}
 	}
 }
 
@@ -586,8 +592,8 @@ links_deadline :: proc() -> (wait: time.Duration, ok: bool) {
 	for p in udp.links {
 		if p.session != nil {
 			nearer(&due, pipe.link_deadline(p.link))
-			if zsp.node_calling(&node, p.session) {
-				nearer(&due, at(p.used, CALL_ALIVE))
+			if zsp.node_calling(&node, p.session) && pipe.link_pokeable(p.link) {
+				nearer(&due, at(p.used, CALL_ALIVE)) // else its own deadline is what comes next: a poke would do nothing
 			}
 			if p.far {
 				nearer(&due, at(p.used, NAT_IDLE + time.Millisecond))

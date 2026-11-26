@@ -478,8 +478,12 @@ host_settle :: proc(h: ^Host) {
 	}
 	links_flush(h)
 	for s in h.spaces {
-		for r in s.relayed {
+		#reverse for r, i in s.relayed {
 			relayed_flush(r)
+			if r.link.state == .Closed {
+				ordered_remove(&s.relayed, i) // given up, or closed, as it sent: let go now, not when next looked at
+				relayed_drop(r)
+			}
 		}
 	}
 	// Last, so that what links had to say through relays goes out at once.

@@ -762,8 +762,12 @@ tick :: proc "c" () -> f64 {
 		}
 	}
 	links_flush()
-	for r in relayed {
+	#reverse for r, i in relayed {
 		relayed_flush(r)
+		if r.link.state == .Closed {
+			ordered_remove(&relayed, i) // given up, or closed, as it sent: let go now, not when next looked at
+			relayed_drop(r)
+		}
 	}
 	// What links had to say through relays goes out at once.
 	for id in ids {

@@ -4,6 +4,7 @@ import "core:nbio"
 import "core:sync"
 import "core:testing"
 import "core:time"
+import "../pipe"
 import "../zsp"
 
 // A device whose own way to its relay is backed up holds its link's packets back, rather than handing them on to be
@@ -94,4 +95,121 @@ relayed_held_back_waits :: proc(t: ^testing.T) {
 	testing.expectf(t, ticks < 500, "the host went round %d times in 50 ms, held back past CALL_ALIVE", ticks)
 	testing.expect(t, world_run(&w, client_done, &c, 60 * time.Second))
 	client_destroy(&c, th)
+}
+
+// Review, round 11. A link only knocked for, and never heard from over, is no way to the device: a call put on it would
+// wait on it for ever, as would every call after it. Another is dialled instead.
+@(test)
+relayed_reach_passes_over_the_unproven :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = false))
+	a := world_space(&w, 1)
+	b := w.keys[2].device
+	via, ok := relay_with(a, b)
+	testing.expect(t, ok)
+	r := new(Relayed) // as a knock from b leaves it, answered: Waiting, not mine, not proven
+	r.space, r.device, r.via = a, b, via
+	r.link = new(pipe.Link)
+	r.link.state = .Waiting
+	relayed_wire(r)
+	r.used = time.tick_now()
+	append(&a.relayed, r)
+	s := relayed_reach(a, b)
+	testing.expect(t, s != nil && s != r.session)
+}
+
+// Review, round 11. A link asking after its peer (probing, with what it sent unacknowledged) while a call on it has
+// been quiet past CALL_ALIVE: a poke would do nothing, so that deadline is not the host's to wait for, past as it is.
+// It spun until the link was given up.
+@(test)
+relayed_probing_waits :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = false))
+	e: Echo
+	testing.expect(t, echo_start(&e))
+	defer echo_stop(&e)
+	open_port = u16(e.port)
+	w.hosts[2].port_permitted = permit_open_port
+	g: Gate
+	testing.expect(t, gate_open(&g, &w, u16(e.port)))
+	defer gate_close(&g)
+	c := Client{port = g.port, send = 8 << 20, read_too = true}
+	th := client_start(&c)
+	testing.expect(t, world_run(&w, proc(w: ^World, c: rawptr) -> bool {return sync.atomic_load(&(^Client)(c).heard) > 256 << 10}, &c))
+	a := world_space(&w, 1)
+	testing.expect_value(t, len(a.relayed), 1)
+	r := a.relayed[0]
+
+	// The relay carries nothing more of theirs, for a while: what a sent waits to be acknowledged.
+	relay := world_space(&w, 0)
+	backlog := relay.node.host.backlog
+	relay.node.host.backlog = proc(_: rawptr, _: ^zsp.Session) -> int {return 1 << 30}
+	h := &w.hosts[1]
+	ticks := 0
+	until := time.tick_add(time.tick_now(), 300 * time.Millisecond)
+	for time.tick_diff(time.tick_now(), until) > 0 {
+		r.used = time.tick_add(time.tick_now(), -CALL_ALIVE - time.Millisecond) // quiet past CALL_ALIVE, all along
+		host_settle(h)
+		wait := nbio.NO_TIMEOUT
+		if due, ok := host_deadline(h); ok {
+			wait = max(time.tick_diff(time.tick_now(), due), 0)
+		}
+		left := time.tick_diff(time.tick_now(), until)
+		if wait == nbio.NO_TIMEOUT || wait > left {
+			wait = max(left, 0)
+		}
+		_ = nbio.tick(wait)
+		ticks += 1
+	}
+	relay.node.host.backlog = backlog
+	testing.expectf(t, r.link.in_flight > 0, "nothing in flight: %d", r.link.in_flight)
+	testing.expectf(t, ticks < 1000, "the host went round %d times in 300 ms, probing past CALL_ALIVE", ticks)
+	testing.expect(t, world_run(&w, client_done, &c, 60 * time.Second))
+	client_destroy(&c, th)
+}
+
+// Review, round 11. A link closed as it sends (given up, or closed) is let go of then, its session with it: not when
+// next looked at, seconds later, meanwhile a session that is ready and not closing, on which a call would be lost.
+@(test)
+closed_links_let_go_at_once :: proc(t: ^testing.T) {
+	for direct in ([]bool{false, true}) {
+		w: World
+		testing.expect(t, world_init(t, &w, udp = direct))
+		defer world_destroy(&w)
+		testing.expect(t, world_ready(&w, direct = direct))
+		e: Echo
+		testing.expect(t, echo_start(&e))
+		defer echo_stop(&e)
+		open_port = u16(e.port)
+		w.hosts[2].port_permitted = permit_open_port
+		g: Gate
+		testing.expect(t, gate_open(&g, &w, u16(e.port)))
+		defer gate_close(&g)
+		c := Client{port = g.port, send = 64 << 10, read_too = true}
+		th := client_start(&c)
+		testing.expect(t, world_run(&w, client_done, &c))
+		client_destroy(&c, th)
+		a := world_space(&w, 1)
+		session: ^zsp.Session
+		if direct {
+			for p in w.hosts[1].udp.links {
+				if p.session != nil {
+					session = p.session
+					pipe.link_close(p.link)
+				}
+			}
+		} else {
+			testing.expect_value(t, len(a.relayed), 1)
+			session = a.relayed[0].session
+			pipe.link_close(a.relayed[0].link)
+		}
+		testing.expect(t, session != nil)
+		id := session.id if session != nil else 0
+		host_settle(&w.hosts[1])
+		testing.expectf(t, zsp.node_session(&a.node, id) == nil, "direct %v: its session still there once the host has settled", direct)
+	}
 }

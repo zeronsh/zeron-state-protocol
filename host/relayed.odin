@@ -39,12 +39,11 @@ Relayed :: struct {
 @(private)
 relayed_reach :: proc(data: rawptr, device: zsp.Key32) -> ^zsp.Session {
 	sp := (^Space)(data)
-	// One heard from first: beside it there may be one newly knocked for, not yet shown to be anyone's.
-	for proven in ([]bool{true, false}) {
-		for r in sp.relayed {
-			if r.device == device && r.session != nil && !r.session.closing && r.link.state != .Closed && (r.proven || r.mine) == proven {
-				return r.session
-			}
+	// One this end dialled, or has heard from: never one only knocked for, which may be a knock played again and go
+	// nowhere, and whose calls would wait on it for ever. Without such a one, another is dialled.
+	for r in sp.relayed {
+		if r.device == device && r.session != nil && !r.session.closing && r.link.state != .Closed && (r.proven || r.mine) {
+			return r.session
 		}
 	}
 	via, ok := relay_with(sp, device)
@@ -292,7 +291,9 @@ relayed_deadline :: proc(sp: ^Space) -> (due: pipe.Time) {
 		}
 		nearer(&due, pipe.link_deadline(r.link))
 		if r.session != nil && zsp.node_calling(&sp.node, r.session) {
-			nearer(&due, at(r.used, CALL_ALIVE))
+			if pipe.link_pokeable(r.link) {
+				nearer(&due, at(r.used, CALL_ALIVE)) // else its own deadline is what comes next: a poke would do nothing
+			}
 		} else {
 			nearer(&due, at(r.used, RELAY_IDLE))
 		}
