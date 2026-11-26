@@ -1,6 +1,5 @@
 package host
 
-import "core:nbio"
 import "core:slice"
 import "../zsp"
 
@@ -105,20 +104,30 @@ may_configure :: proc(sp: ^Space, s: ^zsp.Session) -> bool {
 // given to return: nothing more is heard of the call.
 @(private)
 call_answer :: proc(sp: ^Space, call: u64, b: []byte) -> ^Call_Handler {
-	Answer :: struct {
-		sp:   ^Space,
-		call: u64,
-		b:    []byte,
-	}
-	a := new(Answer)
-	a^ = {sp, call, slice.clone(b)}
-	nbio.next_tick_poly(a, proc(_: ^nbio.Operation, a: ^Answer) {
-		call_send(a.sp, a.call, a.b)
-		call_end(a.sp, a.call)
-		delete(a.b)
-		free(a)
-	})
+	append(&sp.host.later, Later{sp, call, slice.clone(b)})
 	return &answered
+}
+
+// Something to do once whatever is under way has returned: said in host_settle, straight after the events of a tick.
+@(private)
+Later :: struct {
+	sp:   ^Space,
+	call: u64,
+	say:  []byte, // owned: said in the call, which then ends
+}
+
+@(private)
+later_run :: proc(h: ^Host) {
+	for len(h.later) > 0 {
+		todo := h.later
+		h.later = nil
+		for l in todo {
+			call_send(l.sp, l.call, l.say)
+			call_end(l.sp, l.call)
+			delete(l.say)
+		}
+		delete(todo)
+	}
 }
 
 @(private)

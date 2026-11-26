@@ -1291,6 +1291,40 @@ class Client:
                 files += 1
         return files, carried
 
+    # -- this device's host: names, ports, exposures (calls to its zsp.* methods)
+
+    def host(self, method, body=b""):
+        """Calls a zsp.* method of this device's own host, in a scope this client may call in."""
+        scope = next(s for s, (rights, _) in sorted(self.scopes.items()) if rights & 4)
+        until = time.monotonic() + 5
+        while not self.devices and time.monotonic() < until:
+            self.step()
+        answer = self.call(self.devices[0][0], scope, method, body)
+        if answer["fault"] is not None:
+            raise PermissionError(f"{method}: fault {answer['fault']}")
+        return answer["data"]
+
+    def nodes(self):
+        """Every device of the space, as this one reaches it: name, address, whether it can, and what it offers this one."""
+        r, out = Reader(b"".join(self.host("zsp.nodes"))), []
+        for _ in range(r.varint()):
+            device, name, address, flags, subject = r.take(32), r.bytes().decode(), ".".join(map(str, r.take(4))), r.u8(), r.bytes()
+            out.append(dict(device=device, name=name, address=address, here=bool(flags & 1), reachable=bool(flags & 2),
+                            direct=bool(flags & 4), subject=subject, ports=entries(r)))
+        return out
+
+    def offers(self, op=0, offer=b""):
+        """What this device offers: a list of dicts, as offer() takes them."""
+        r = Reader(b"".join(self.host("zsp.offers", bytes([op]) + offer)))
+        return [read_offer(r) for _ in range(r.varint())]
+
+    def offer(self, ports, scope, device=None, host="", name="", proxy=False):
+        """Offers this machine's ports (a number or (lo, hi)), or another's at `host`, to whoever may call in `scope`."""
+        return self.offers(1, put_offer(ports, scope, device, host, name, proxy))
+
+    def unoffer(self, ports, scope, device=None, host=""):
+        return self.offers(2, put_offer(ports, scope, device, host, "", False))
+
     def author(self, row, slot):
         """Whom the last to write there goes by, and on which device, if that is known: (device, subject)."""
         stamps = [t for (s, _, t) in self.rows.get(row, ()) if s == slot]
@@ -1310,6 +1344,27 @@ class Client:
                     values = {s: b for (s, k, _), b in cells.items() if k == VALUE}
                     out.append((struct.unpack(">Q", body[16:24])[0], row, values))
         return sorted(out)
+
+
+def entries(r):
+    """What a device is offered, as zsp.ports and zsp.nodes say it."""
+    out = []
+    for _ in range(r.varint()):
+        port = struct.unpack(">H", r.take(2))[0]
+        out.append(dict(port=port, scope=r.varint(), host=r.bytes().decode(), name=r.bytes().decode()))
+    return out
+
+
+def put_offer(ports, scope, device, host, name, proxy):
+    lo, hi = ports if isinstance(ports, tuple) else (ports, ports)
+    return (struct.pack(">HH", lo, hi) + varint(scope) + (device or bytes(32)) + varint(len(host.encode())) + host.encode()
+            + varint(len(name.encode())) + name.encode() + bytes([1 if proxy else 0]))
+
+
+def read_offer(r):
+    lo, hi = struct.unpack(">HH", r.take(4))
+    scope, device, host, name, flags = r.varint(), r.take(32), r.bytes().decode(), r.bytes().decode(), r.u8()
+    return dict(ports=(lo, hi), scope=scope, device=None if device == bytes(32) else device, host=host, name=name, proxy=bool(flags & 1))
 
 
 def stamps_of(bundle):

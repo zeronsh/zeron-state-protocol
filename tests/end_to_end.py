@@ -805,6 +805,277 @@ def slow_hibernation():
     assert "woke with 2 sockets" in cloud.p.stdout.read() + open(os.path.join(TMP, "cloud.log")).read()
 
 
+def free_port(host="127.0.0.1"):
+    with socket.socket() as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def bindable(address):
+    """Whether this machine has the address (macOS has 127.0.0.1 alone until zspd setup gives it more)."""
+    try:
+        with socket.socket() as s:
+            s.bind((address, 0))
+        return True
+    except OSError:
+        return False
+
+
+def lan_address():
+    """An address of this machine that is not loopback, if it has one: another machine, as far as an offer can tell."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))  # nothing is sent
+            a = s.getsockname()[0]
+        return None if a.startswith("127.") else a
+    except OSError:
+        return None
+
+
+def resolve(server, name, qtype=1):
+    """Asks a node for a name, as a system resolver would: the address, or the rcode if there is none."""
+    q = os.urandom(2) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    q += b"".join(bytes([len(label)]) + label.encode() for label in name.split(".")) + b"\x00" + struct.pack(">HH", qtype, 1)
+    host, port = server.rsplit(":", 1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(2)
+        s.sendto(q, (host, int(port)))
+        a = s.recv(512)
+    assert a[:2] == q[:2] and a[12 : len(q)] == q[12:], "the question comes back as asked"
+    if a[3] & 15 or struct.unpack(">H", a[6:8])[0] == 0:
+        return a[3] & 15
+    return ".".join(map(str, a[-4:]))
+
+
+class Service:
+    """A TCP service on this machine: HTTP that says who it is, or one that speaks first, as SSH does."""
+
+    def __init__(self, host, port, banner=None, says=b""):
+        import threading
+
+        self.sock = socket.create_server((host, port))
+        self.banner, self.says, self.peers = banner, says, []
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        import threading
+
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.one, args=(c,), daemon=True).start()
+
+    def one(self, c):
+        try:
+            self.talk(c)
+        except OSError:
+            pass  # reset, as some are meant to be
+
+    def talk(self, c):
+        with c:
+            self.peers.append(c)
+            if self.banner:
+                c.sendall(self.banner)  # before a word from the other side
+                while (data := c.recv(65536)) :
+                    c.sendall(data)
+                c.sendall(b"bye")  # after the other side has finished: half-closed, not closed
+                return
+            head = b""
+            while b"\r\n\r\n" not in head and (data := c.recv(4096)):
+                head += data
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(self.says), self.says))
+
+
+def http_get(address, port, host=None, origin=None, proxy=None):
+    """A GET by hand, so nothing is hidden: the status and body, or None if the connection was refused or reset."""
+    try:
+        if proxy:  # SOCKS 5, by name
+            s = socket.create_connection(proxy, 3)
+            s.sendall(b"\x05\x01\x00")
+            assert s.recv(2) == b"\x05\x00"
+            s.sendall(b"\x05\x01\x00\x03" + bytes([len(address)]) + address.encode() + struct.pack(">H", port))
+            reply = s.recv(10)
+            if len(reply) < 2 or reply[1] != 0:
+                return None
+        else:
+            s = socket.create_connection((address, port), 3)
+        with s:
+            extra = f"Origin: {origin}\r\n" if origin else ""
+            s.sendall(f"GET / HTTP/1.1\r\nHost: {host or address}:{port}\r\n{extra}\r\n".encode())
+            got = b""
+            while data := s.recv(65536):
+                got += data
+    except OSError:
+        return None
+    if not got:
+        return None
+    head, _, body = got.partition(b"\r\n\r\n")
+    return int(head.split()[1]), body
+
+
+def ports_space(n, owner_offers=False):
+    """A relay and n devices that share scope 1, each with its own addresses for the others and its own name server."""
+    relay = Node("pr-relay", "serve", "--no-udp").start()
+    devices = []
+    for i in range(n):
+        dns = "127.0.0.1:%d" % free_port()
+        d = Node("pd%d" % i, "run", "--no-udp", "--loopback=127.%d.0" % (90 + i), "--dns=" + dns, "--catch=127.0.0.1:0",
+                 "--proxy=127.0.0.1:%d" % free_port())
+        d.dns, d.base = dns, "127.%d.0" % (90 + i)
+        devices.append(d)
+    sid = zspd("create", devices[0].dir)
+    url = "ws://localhost:" + relay.address.split(":")[1]
+    zspd("relay", devices[0].dir, relay.key, url)
+    for d in devices[1:]:
+        zspd("admit", devices[0].dir, zspd("key", d.dir), "1")
+        zspd("join", d.dir, sid, relay.key, url)
+    for d in devices:
+        d.start()
+    for d in devices:
+        eventually("every device hears who belongs", lambda: os.path.exists(os.path.join(d.dir, sid, "roster")))
+    return relay, devices
+
+
+def address_of(client, device_key):
+    return next(n["address"] for n in client.nodes() if n["device"].hex() == device_key)
+
+
+def test_names():
+    """Every device has a name and an address on every other, which any resolver asking here finds; nothing else does."""
+    _, (a, b, c) = ports_space(3)
+    zspd("name", a.dir, zspd("key", b.dir), "bee")
+    ca = a.client()
+    eventually("the name reaches every device", lambda: resolve(a.dns, "bee.zsp.internal") == a.base[:-1] + "0.3")
+    assert resolve(a.dns, "BEE.Zsp.Internal") == a.base[:-1] + "0.3"
+    eventually("and itself", lambda: resolve(b.dns, "bee.zsp.internal") == "127.0.0.1")
+    nodes = {n["device"].hex(): n for n in ca.nodes()}
+    assert nodes[b.key]["name"] == "bee.zsp.internal" and nodes[a.key]["here"]
+    cid = nodes[c.key]["name"]
+    assert cid.endswith(".id.zsp.internal") and resolve(a.dns, cid) == nodes[c.key]["address"] == a.base[:-1] + "0.4"
+    assert resolve(a.dns, "bee.zsp.internal", 28) == 0  # no IPv6 address, and no error
+    assert resolve(a.dns, "nobody.zsp.internal") == 3
+    assert resolve(a.dns, "example.com") == 5
+    # Renamed, the old name is nobody's; the address stays.
+    zspd("name", a.dir, zspd("key", b.dir), "wasp")
+    eventually("the new name", lambda: resolve(a.dns, "wasp.zsp.internal") == a.base[:-1] + "0.3")
+    assert resolve(a.dns, "bee.zsp.internal") == 3
+
+
+def test_ports():
+    """Offered ports, reached by name from any application, by address or proxy: two devices on one port, a service that
+    speaks first, and nothing that is not offered, nor to anyone a web page sent."""
+    _, (a, b, c) = ports_space(3)
+    zspd("name", a.dir, zspd("key", b.dir), "bee")
+    ca, cb, cc = a.client(), b.client(), c.client()
+    ca.until(lambda: len(ca.devices) == 3)
+    port, quiet = free_port(), free_port()
+    web = Service("127.0.0.1", port, says=b"bee's")
+    shell = Service("127.0.0.1", quiet, banner=b"SSH-2.0-zsp-test\r\n")
+    direct = bindable(a.base[:-1] + "0.3")  # macOS without zspd setup: the proxy alone
+    proxy = ("127.0.0.1", int(a.options[-1].rsplit(":", 1)[1]))
+    bee = address_of(ca, b.key)
+
+    # Nothing is offered unless it is.
+    assert http_get("bee.zsp.internal", port, proxy=proxy) is None
+    if direct:
+        assert http_get(bee, port) is None
+    assert cb.offers() == []
+    cb.offer((port, port + 1), 1, name="web")
+    cb.offer(quiet, 1)
+    assert [o["ports"] for o in cb.offers()] == [(port, port + 1), (quiet, quiet)]
+    # Whoever looks the name up is kept up with what it offers: only what listens.
+    resolve(a.dns, "bee.zsp.internal")
+    eventually("the offer is heard", lambda: [p["port"] for p in next(n for n in ca.nodes() if n["device"].hex() == b.key)["ports"]] == sorted([port, quiet]))
+    assert http_get("bee.zsp.internal", port, proxy=proxy) == (200, b"bee's")
+    if direct:
+        assert http_get(bee, port, host="bee.zsp.internal") == (200, b"bee's")
+        assert http_get(bee, port) == (200, b"bee's")
+
+    # Two devices, one port: the other's is another machine's, offered from there.
+    other = lan_address()
+    if other and direct:
+        Service(other, port, says=b"see's")
+        cc.offer(port, 1, host=other)
+        resolve(a.dns, ca.nodes()[2]["name"])
+        see = address_of(ca, c.key)
+        eventually("both are heard", lambda: any(p["port"] == port for n in ca.nodes() if n["device"].hex() == c.key for p in n["ports"]))
+        assert http_get(see, port) == (200, b"see's") and http_get(bee, port) == (200, b"bee's")
+
+    # A service that speaks first, as SSH does, and ends one way at a time.
+    if direct:
+        s = socket.create_connection((bee, quiet), 3)
+        assert s.recv(64) == b"SSH-2.0-zsp-test\r\n"
+        s.sendall(b"hello")
+        assert s.recv(64) == b"hello"
+        s.shutdown(socket.SHUT_WR)
+        got = b""
+        while data := s.recv(64):
+            got += data
+        assert got == b"bye"
+        s.close()
+
+    # A page elsewhere, whose own name leads here, or that would send it here, reaches nothing.
+    if direct:
+        assert http_get(bee, port, host="attacker.example")[0] == 403
+        assert http_get(bee, port, host="bee.zsp.internal", origin="https://attacker.example")[0] == 403
+        assert http_get(bee, port, host="bee.zsp.internal", origin="http://bee.zsp.internal:%d" % port) == (200, b"bee's")
+    with open(os.path.join(b.dir, zspd_space(b), "audit.log")) as f:
+        audit = f.read()
+    assert a.key in audit and '"event":"Open"' in audit and '"event":"Change"' in audit
+
+
+def test_offers_end():
+    """Taking an offer back, or a grant, cuts off whoever was using it, then and there."""
+    _, (a, b, c) = ports_space(3)  # a owns the space, and offers; b uses it
+    ca, cb = a.client(), b.client()
+    cb.until(lambda: len(cb.devices) == 3)
+    quiet = free_port()
+    Service("127.0.0.1", quiet, banner=b"hi\r\n")
+    start = time.monotonic()
+    ca.offer(quiet, 1)
+    assert time.monotonic() - start < 0.5, "answered at once, not at the next deadline"
+    zspd("offer", c.dir, str(quiet), "1", "name=x")  # straight to the file when no node runs there: here one does
+    assert zspd("offers", c.dir) == "%d 1 name=x" % quiet
+    proxy = ("127.0.0.1", int(b.options[-1].rsplit(":", 1)[1]))
+    there = address_of(cb, a.key)
+
+    def connect():
+        s = socket.create_connection(proxy, 3)
+        s.sendall(b"\x05\x01\x00")
+        s.recv(2)
+        s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(there) + struct.pack(">H", quiet))
+        assert s.recv(10)[1] == 0 and s.recv(4) == b"hi\r\n"
+        s.settimeout(3)
+        return s
+
+    def cut(s):
+        """Whether the connection has been cut off: it says nothing more, at once. Silence is not that."""
+        try:
+            s.sendall(b"x")
+            return s.recv(1) == b""
+        except socket.timeout:
+            return False
+        except OSError:
+            return True
+
+    s = connect()
+    ca.unoffer(quiet, 1)
+    assert cut(s)
+    ca.offer(quiet, 1)
+    s = connect()
+    zspd("revoke", a.dir, zspd("key", c.dir))  # another's grant ends: nothing of this changes
+    time.sleep(0.3)
+    s.sendall(b"still")
+    assert s.recv(5) == b"still"
+    zspd("revoke", a.dir, zspd("key", b.dir))  # its own ends: cut off, whatever it would do
+    assert cut(s)
+    with open(os.path.join(a.dir, zspd_space(a), "audit.log")) as f:
+        audit = f.read()
+    assert audit.count('"service":"offer"') == 3 and b.key in audit
+
+
 def zspd_space(node):
     with open(os.path.join(node.dir, "space")) as f:
         return f.read().strip()

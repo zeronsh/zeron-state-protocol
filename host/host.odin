@@ -60,6 +60,8 @@ Host :: struct {
 	udp:          Udp,
 	dns_server:   Dns,
 	catch:        Catch,
+	proxy_server: Proxy,
+	later:        [dynamic]Later,
 	shared:       []byte, // everything is received into this
 	sync_due:     time.Tick,
 	syncing:      bool, // sync_due is set
@@ -325,6 +327,9 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 	if at, ok := h.catch_at.?; ok && !h.relay && h.names != "" {
 		catch_open(h, at) // tried once there is a space to try it for
 	}
+	if at, ok := h.proxy.?; ok && !h.relay && h.names != "" {
+		proxy_open(h, at)
+	}
 	return true
 }
 
@@ -356,6 +361,7 @@ host_destroy :: proc(h: ^Host) {
 	udp_close(h)
 	dns_close(h)
 	catch_close(h)
+	proxy_close(h)
 	for len(h.spaces) > 0 {
 		space_close(pop(&h.spaces))
 	}
@@ -364,6 +370,10 @@ host_destroy :: proc(h: ^Host) {
 	}
 	delete(h.streams)
 	delete(h.spaces)
+	for l in h.later {
+		delete(l.say)
+	}
+	delete(h.later)
 	delete(h.dialers)
 	delete(h.shared)
 	delete(h.methods)
@@ -400,6 +410,7 @@ host_settle :: proc(h: ^Host) {
 			h.stopping = true
 		}
 	}
+	later_run(h)
 	dialers_run(h, now)
 	links_run(h)
 	for s in h.spaces {

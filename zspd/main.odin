@@ -79,6 +79,7 @@ USAGE :: `zspd - Zeron State Protocol node
   --loopback=<127.a.b>   run: the first of the addresses devices are given (127.77.0)
   --dns=<addr:port>      run: answer for names here (127.77.0.1:53, or :5053 where 53 needs root)
   --catch=<addr:port>    run, Linux: where zspd setup sends connections to devices' addresses (127.0.0.1:5054)
+  --proxy=<addr:port>    run: be a SOCKS 5 and HTTP proxy to devices here (127.0.0.1:1080); --no-proxy for none
   --trust-local-users    run: let anyone on this machine reach other devices' ports, not only this user
   --verbose
 
@@ -608,6 +609,7 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	}
 	dns := ""
 	catch := "127.0.0.1:5054" when ODIN_OS == .Linux else ""
+	proxy := "127.0.0.1:1080"
 	listen := "0.0.0.0:8787" if relay else "127.0.0.1:0"
 	for a in args {
 		eq := strings.index_byte(a, '=')
@@ -666,6 +668,10 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 			dns = value
 		case "--catch":
 			catch = value
+		case "--proxy":
+			proxy = value
+		case "--no-proxy":
+			proxy = ""
 		case "--trust-local-users":
 			config.trust_local_users = true
 		case "--verbose":
@@ -690,6 +696,14 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		} else {
 			os.write_string(os.stderr, USAGE)
 			return 2
+		}
+		if proxy != "" {
+			ep, parsed := net.parse_endpoint(proxy)
+			if !parsed {
+				os.write_string(os.stderr, USAGE)
+				return 2
+			}
+			config.proxy = ep
 		}
 		if catch != "" {
 			ep, parsed := net.parse_endpoint(catch)

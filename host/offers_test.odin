@@ -1,0 +1,166 @@
+package host
+
+import "core:encoding/hex"
+import "core:strings"
+import "core:testing"
+import "../pipe"
+import "../zsp"
+
+@(private = "file")
+words :: proc(s: string) -> []string {
+	return strings.fields(s, context.temp_allocator)
+}
+
+@(test)
+offers_read_and_written :: proc(t: ^testing.T) {
+	device := strings.repeat("ab", 32, context.temp_allocator)
+	for text in ([]string{"22 1", "8000-8999 3 name=dev", cat("5432 2 device=", device, " host=10.0.0.4 name=db proxy"), "80 1 host=fd00::4"}) {
+		o, ok := offer_parse(words(text))
+		testing.expectf(t, ok, "%q is an offer", text)
+		testing.expect_value(t, offer_text(&o), text)
+		w := make([dynamic]byte, context.temp_allocator)
+		offer_put(&w, &o)
+		r := zsp.Reader{buf = w[:]}
+		back, read := offer_read(&r)
+		testing.expect(t, read && zsp.read_done(&r) && offer_text(&back) == text)
+	}
+	for text in ([]string{
+		"", "22", "0 1", "22 0", "22-21 1", "22-70000 1", "x 1", "22 x", "22 1 bogus", "22 1 device=12",
+		"22 1 host=127.0.0.1", // this machine is no host: an offer of no host is
+		"22 1 host=127.77.0.5", // nor is another device, through this one
+		"22 1 host=::1", "22 1 host=::ffff:127.0.0.1", "22 1 host=0.0.0.0", "22 1 host=nas.local",
+		"1-2000 1 host=10.0.0.4", // another machine's ports, a few at a time
+		cat("22 1 name=", strings.repeat("x", 64, context.temp_allocator)),
+	}) {
+		_, ok := offer_parse(words(text))
+		testing.expectf(t, !ok, "%q is not an offer", text)
+	}
+	bad := Offer{lo = 22, hi = 22, scope = 1, name = "a\nb"}
+	testing.expect(t, !offer_sound(&bad))
+}
+
+@(test)
+entries_round_trip :: proc(t: ^testing.T) {
+	list := []Port_Entry{{22, 1, "", "ssh"}, {5432, 7, "10.0.0.4", ""}, {65535, 1 << 30, "", ""}}
+	w := make([dynamic]byte, context.temp_allocator)
+	entries_put(&w, list)
+	back, ok := entries_read(w[:])
+	testing.expect(t, ok && len(back) == 3)
+	for e, i in back {
+		testing.expect(t, e == list[i])
+	}
+	for cut in 0 ..< len(w) {
+		_, partial := entries_read(w[:cut])
+		testing.expect(t, !partial)
+	}
+	_, zero := entries_read({1, 0, 22, 0, 0, 0}) // scope 0 is nobody's
+	testing.expect(t, !zero)
+}
+
+@(private = "file")
+offer :: proc(t: ^testing.T, ts: ^Test_Space, text: string) {
+	o, ok := offer_parse(words(text))
+	testing.expect(t, ok)
+	append(&ts.space.ports.offers, Offer{o.lo, o.hi, o.scope, o.device, strings.clone(o.host), strings.clone(o.name), o.proxy})
+}
+
+@(test)
+offers_permit :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts)
+	defer test_space_destroy(&ts)
+	sp := &ts.space
+	sp.ports = new(Ports)
+	sp.ports.space = sp
+	defer ports_close(sp)
+	b, c := ts.keys[1].device, ts.keys[2].device
+
+	// Nothing is offered unless it is.
+	ok, _ := port_permitted(sp, b, 1, 22, "")
+	testing.expect(t, !ok)
+
+	offer(t, &ts, "22 1")
+	offer(t, &ts, cat("8000-8100 1 device=", string(hex.encode(c[:], context.temp_allocator)), " proxy"))
+	offer(t, &ts, "5432 1 host=10.0.0.4")
+	ok, _ = port_permitted(sp, b, 1, 22, "")
+	testing.expect(t, ok)
+	ok, _ = port_permitted(sp, b, 1, 23, "")
+	testing.expect(t, !ok)
+	ok, _ = port_permitted(sp, b, 1, 22, "10.0.0.4") // the offer is of this machine's port, not another's
+	testing.expect(t, !ok)
+	ok, _ = port_permitted(sp, b, 1, 5432, "10.0.0.4")
+	testing.expect(t, ok)
+	ok, _ = port_permitted(sp, b, 1, 5432, "")
+	testing.expect(t, !ok)
+	// To one device, and only to it.
+	ok, _ = port_permitted(sp, b, 1, 8050, "")
+	testing.expect(t, !ok)
+	proxy: bool
+	ok, proxy = port_permitted(sp, c, 1, 8050, "")
+	testing.expect(t, ok && proxy)
+	// Nobody reaches this device through itself.
+	ok, _ = port_permitted(sp, ts.keys[0].device, 1, 22, "")
+	testing.expect(t, !ok)
+
+	// What it lists is what listens, of what is offered; never this host's own; and another machine's as offered.
+	append(&sp.ports.listening, pipe.address_v4(0, 0, 0, 0, 22), pipe.address_v4(127, 0, 0, 1, 8080), pipe.address_v4(192, 168, 1, 5, 8081))
+	append(&sp.ports.listening, pipe.address_v4(127, 77, 0, 3, 8082)) // a forward of another's, here
+	append(&sp.ports.listening, pipe.Address{ip = {15 = 1}, port = 8083}, pipe.address_v4(0, 0, 0, 0, 9999))
+	list, _ := offered_to(sp.ports, c)
+	ports := make([dynamic]u16, context.temp_allocator)
+	for e in list {
+		append(&ports, e.port)
+	}
+	testing.expectf(t, len(list) == 4 && list[0] == {22, 1, "", ""} && list[1].port == 5432 && list[1].host == "10.0.0.4" && list[2].port == 8080 && list[3].port == 8083, "%v", list)
+	list, _ = offered_to(sp.ports, b)
+	testing.expectf(t, len(list) == 2, "%v", list)
+
+	// A grant that ends ends what it allowed.
+	d := zsp.draft_from(&sp.node.roster, 1000)
+	zsp.draft_revoke(&d, c)
+	roster, signed := zsp.roster_sign(&ts.keys[0], ts.root, &d, context.temp_allocator)
+	testing.expect(t, signed && zsp.node_adopt(&sp.node, roster))
+	ok, _ = port_permitted(sp, c, 1, 8050, "")
+	testing.expect(t, !ok)
+	list, _ = offered_to(sp.ports, c)
+	testing.expect_value(t, len(list), 0)
+}
+
+@(test)
+web_pages_reach_only_their_own :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts, {"", "desk", ""})
+	defer test_space_destroy(&ts)
+	sp := &ts.space
+	desk := ts.keys[1].device
+	verdict :: proc(sp: ^Space, device: zsp.Key32, request: string) -> Inspect {
+		v, _ := http_verdict(sp, device, transmute([]byte)request)
+		return v
+	}
+	id := name_id(ts.keys[2].device)
+	other := strings.concatenate({string(id[:]), ".id.zsp.internal"}, context.temp_allocator)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal:8080\r\n\r\n"), Inspect.Pass)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nhost: DESK.zsp.internal.\r\n\r\n"), Inspect.Pass)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: 127.77.0.3:8080\r\n\r\n"), Inspect.Pass)
+	testing.expect_value(t, verdict(sp, desk, cat("POST /x HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: http://", other, ":3000\r\n\r\nbody")), Inspect.Pass)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.0\r\n\r\n"), Inspect.Pass) // no browser leaves out the name
+	// Not yet known.
+	testing.expect_value(t, verdict(sp, desk, "GE"), Inspect.More)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk"), Inspect.More)
+	// Not HTTP at all: an SSH client, TLS.
+	testing.expect_value(t, verdict(sp, desk, "SSH-2.0-OpenSSH_9.6\r\n"), Inspect.Pass)
+	testing.expect_value(t, verdict(sp, desk, "\x16\x03\x01\x02\x00"), Inspect.Pass)
+	// A page elsewhere, whose own name now leads here; another device's name; and a page of another place.
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: attacker.example:8080\r\n\r\n"), Inspect.Reject)
+	testing.expect_value(t, verdict(sp, desk, cat("GET / HTTP/1.1\r\nHost: ", other, "\r\n\r\n")), Inspect.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"), Inspect.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: https://attacker.example\r\n\r\n"), Inspect.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: null\r\n\r\n"), Inspect.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nHost: attacker.example\r\n\r\n"), Inspect.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal.attacker.example\r\n\r\n"), Inspect.Reject)
+}
+
+@(private = "file")
+cat :: proc(parts: ..string) -> string {
+	return strings.concatenate(parts, context.temp_allocator)
+}
