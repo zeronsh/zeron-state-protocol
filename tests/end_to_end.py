@@ -747,7 +747,7 @@ def test_relay_unbounded():
             break
         assert time.monotonic() < deadline, ("the relay never stops reaching R2", seen[-5:])
     # A device that comes later is sent all of it, much of it from object storage, which is read an extent at a time.
-    before = stats["storage"]["gets"]
+    before, got = stats["storage"]["gets"], stats["storage"]["got"]
     c = Node("uc", "run", "--credential=" + cloud.token, "--no-udp")
     zspd("admit", a.dir, zspd("key", c.dir), "1")
     zspd("join", c.dir, zspd_space(a), cloud.key, cloud.url)
@@ -758,7 +758,11 @@ def test_relay_unbounded():
     cc.until(lambda: len(cc.list(1, "big")) == 240, timeout=120)
     assert all(values[16] == sent[order] for order, _, values in cc.list(1, "big")), "nothing garbled"
     stats = json.loads(urllib.request.urlopen(cloud.url.replace("ws", "http", 1) + "/" + zspd_space(a) + "?stats").read())
-    assert 0 < stats["storage"]["gets"] - before <= 40, stats
+    # Nothing fetched twice: little more than the log, and its pages. And in stretches, not a block at a time (some 240
+    # gets): how long each is depends on how fast the device reads, so the bound leaves room for a slow one.
+    extents, log = stats["node"]["extents"], stats["node"]["tail"]
+    assert stats["storage"]["got"] - got <= log * 1.25, ("fetched more than once", stats)
+    assert 0 < stats["storage"]["gets"] - before <= 4 * extents, ("fetched a little at a time", stats)
 
 
 def slow_hibernation():
