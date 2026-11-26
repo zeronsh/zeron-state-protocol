@@ -104,13 +104,13 @@ def main():
         t = time.perf_counter()
         for _ in range(n):
             s = socket.create_connection((bee, port), 10)
-            s.sendall(b"e")
+            s.sendall(b"ex")  # echo, and a byte to be echoed
             s.recv(1)
             s.close()
         connect = (time.perf_counter() - t) / n
         s = socket.create_connection((bee, port), 10)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        s.sendall(b"e")
+        s.sendall(b"ex")
         s.recv(1)
         n = 2000
         t = time.perf_counter()
@@ -182,14 +182,16 @@ def idle_calls(pid, seconds):
     """System calls a process makes in so many seconds, as strace counts them; None where it cannot."""
     if not shutil.which("strace"):
         return None
-    p = subprocess.Popen(["strace", "-f", "-c", "-p", str(pid)], stderr=subprocess.PIPE, text=True)
+    sudo = [] if os.geteuid() == 0 or open("/proc/sys/kernel/yama/ptrace_scope").read().strip() == "0" else ["sudo", "-n"]
+    p = subprocess.Popen([*sudo, "strace", "-f", "-c", "-p", str(pid)], stderr=subprocess.PIPE, text=True)
     time.sleep(seconds)
-    p.send_signal(2)
+    subprocess.run([*sudo, "kill", "-INT", str(p.pid)]) if sudo else p.send_signal(2)
     err = p.communicate()[1]
     for line in err.splitlines():
         if line.strip().endswith("total"):
-            return int(line.split()[2]) if len(line.split()) > 4 else int(line.split()[1])
+            return int(line.split()[3])  # % time, seconds, µs a call, calls, [errors], total
     return 0 if "attached" in err else None
 
 
-main()
+if __name__ == "__main__":
+    main()

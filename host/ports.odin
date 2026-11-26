@@ -52,6 +52,7 @@ Remote :: struct {
 	known:     bool, // what it offers has been heard since it could be reached
 	reachable: bool,
 	unserved:  bool, // it does not offer ports at all
+	owed:      bool, // a lease is to be asked for as soon as there is room in the call
 	listeners: [dynamic]^Listener,
 	forwards:  int,
 }
@@ -122,7 +123,8 @@ ports_run :: proc(sp: ^Space, now: time.Tick) {
 		ports_reach(p, reach)
 	}
 	for r in p.remotes {
-		if r.call == 0 || time.tick_diff(r.leased, time.tick_add(now, INTEREST / 2)) > 0 {
+		// Asked again only once less than half the lease is left: time.tick_diff(now, leased) is what is left.
+		if r.call == 0 || r.owed || time.tick_diff(now, r.leased) > INTEREST / 2 {
 			continue
 		}
 		// Kept up, and wanted still: ask for as long again before it lapses.
@@ -140,7 +142,7 @@ ports_deadline :: proc(sp: ^Space) -> (due: time.Tick, ok: bool) {
 	}
 	due, ok = offers_deadline(p)
 	for r in p.remotes {
-		if r.call != 0 && time.tick_diff(r.wanted, time.tick_now()) < INTEREST {
+		if r.call != 0 && !r.owed && time.tick_diff(r.wanted, time.tick_now()) < INTEREST {
 			renew := time.tick_add(r.leased, -INTEREST / 2)
 			if !ok || renew._nsec < due._nsec {
 				due, ok = renew, true
@@ -206,6 +208,12 @@ remote_for :: proc(p: ^Ports, device: zsp.Key32, make := true) -> ^Remote {
 	}
 	r.reachable = true
 	r.on_data = remote_heard
+	r.on_room = proc(h: ^Call_Handler, call: u64) {
+		r := (^Remote)(h)
+		if r.owed && call == r.call {
+			remote_lease(r, time.tick_now())
+		}
+	}
 	r.on_end = proc(h: ^Call_Handler, call: u64) {
 		r := (^Remote)(h)
 		if call == r.call {
@@ -258,7 +266,8 @@ remote_lease :: proc(r: ^Remote, now: time.Tick) {
 	}
 	b := make([dynamic]byte, context.temp_allocator)
 	zsp.write_varint(&b, u64(INTEREST / time.Second))
-	if call_send(r.ports.space, r.call, b[:]) {
+	r.owed = !call_send(r.ports.space, r.call, b[:])
+	if !r.owed {
 		r.leased = time.tick_add(now, INTEREST)
 	}
 }
@@ -276,7 +285,7 @@ ports_wanted :: proc(sp: ^Space, device: zsp.Key32) {
 	}
 	now := time.tick_now()
 	r.wanted = now
-	if r.call == 0 || time.tick_diff(r.leased, time.tick_add(now, INTEREST / 2)) < 0 {
+	if r.call == 0 || time.tick_diff(now, r.leased) <= INTEREST / 2 {
 		remote_lease(r, now)
 	}
 }

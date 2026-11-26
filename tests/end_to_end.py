@@ -1100,6 +1100,41 @@ def test_ports():
     assert any(e["event"] == "change" and e["service"] == "offer" for e in audit), audit
 
 
+def cpu_seconds(pid):
+    """Processor time a process has used, where the system says it plainly; None elsewhere."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "time=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        minutes, _, seconds = out.rpartition(":")
+        return float(minutes or 0) * 60 + float(seconds)
+    except (OSError, ValueError):
+        return None
+
+
+def test_quiet_while_kept_up():
+    """A device kept up with what another offers, and the other keeping it up, do nothing between changes."""
+    _, (a, b, c) = ports_space(3)
+    ca, cb = a.client(), b.client()
+    ca.until(lambda: len(ca.devices) == 3)
+    port = free_port()
+    Service("127.0.0.1", port, says=b"x")
+    cb.offer(port, 1)
+    resolve(a.dns, next(n["name"] for n in ca.nodes() if n["device"].hex() == b.key))  # a lease begins
+    eventually("the offer is heard", lambda: any(p["port"] == port for n in ca.nodes() for p in n["ports"]))
+    time.sleep(0.5)
+    before = [cpu_seconds(d.p.pid) for d in (a, b)]
+    if None in before:
+        return  # where the time used cannot be had
+    time.sleep(3)
+    used = [cpu_seconds(d.p.pid) - t for d, t in zip((a, b), before)]
+    assert max(used) < 0.15, f"kept up, and yet busy: {used} s of processor in 3 s"
+
+
 def test_offers_end():
     """Taking an offer back, or a grant, cuts off whoever was using it, then and there."""
     _, (a, b, c) = ports_space(3)  # a owns the space, and offers; b uses it
