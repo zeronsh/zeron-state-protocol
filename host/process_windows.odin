@@ -743,7 +743,9 @@ process_pipe :: proc(mine, theirs: ^win.HANDLE, inbound: bool, inheritable: bool
 	n := sync.atomic_add(&process_pipes, 1)
 	name := strings.concatenate({`\\.\pipe\zsp-`, strconv.write_uint(buf[:16], u64(win.GetCurrentProcessId()), 10), "-", strconv.write_uint(buf[16:], n, 10)}, context.temp_allocator)
 	wname := win.utf8_to_wstring(name)
-	access := win.PIPE_ACCESS_INBOUND if inbound else win.PIPE_ACCESS_OUTBOUND
+	// This end of one the child reads is duplex, though nothing is read of it here: so that it may be asked whether
+	// the other has gone (process_pipe_gone), which a pipe only to be written does not allow. The child's end is to read.
+	access := win.PIPE_ACCESS_INBOUND if inbound else win.PIPE_ACCESS_DUPLEX
 	mine^ = win.CreateNamedPipeW(wname, access | win.FILE_FLAG_OVERLAPPED | win.FILE_FLAG_FIRST_PIPE_INSTANCE, win.PIPE_TYPE_BYTE | win.PIPE_READMODE_BYTE | win.PIPE_WAIT | win.PIPE_REJECT_REMOTE_CLIENTS, 1, PROCESS_READ, PROCESS_READ, 0, nil)
 	if mine^ == win.INVALID_HANDLE_VALUE {
 		mine^ = nil
