@@ -89,11 +89,11 @@ Cloudflare, with the bucket in the same region as the objects, and devices in th
 | a small write, device to relay to device | 26 to 38 ms, the round trip included; one row of SQLite written, $0.000001 |
 | 25 MB written in bulk | 2.3 to 3 s; $0.000055 a MB: a row of SQLite a burst, a put an extent, a put a checkpoint |
 | 5 MB written steadily over 15 s | 2 checkpoints, 6 puts, $0.00007 a MB (30 checkpoints and $0.00012 a MB when one was every 256 KiB) |
-| what is next written after an object hibernated | 47 to 59 ms, the round trip included: some 15 ms more than when awake |
+| what is next written after an object hibernated | 37 to 59 ms, the round trip included, some 15 ms more than when awake; after a burst of bulk, 55 to 210 ms |
 | a new device sent 25 MB | 4 to 6 s; some 40 gets, $0.00004 in all |
 | a window of 50 from an object woken from eviction | 10 to 110 ms; at most 1 get |
-| the same with its cache turned over | 0.15 to 0.4 s; 3 to 5 gets, $0.00001 at most: leaves, then the log, as the device asks |
-| the same with nothing cached at all, not even the trees' tops | 0.2 to 0.55 s; 3 to 7 gets |
+| the same with its cache turned over | 0.15 to 0.25 s; 3 gets, $0.000005: leaves, then the log, as the device asks |
+| the same with nothing cached at all, not even the trees' tops | 0.2 to 0.3 s; 3 gets |
 | a device that has everything, back | one fingerprint; nothing read from R2 |
 | R2 from an object | a get of 4 KiB 22 to 43 ms, of 1 MiB 35 to 49 ms; a put of 1 MiB 176 to 230 ms; from another continent, ten times that |
 | kept in the object | the log's last 4 MiB and the cache: some 1 to 5 MB, $0.001 a month |
