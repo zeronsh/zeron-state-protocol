@@ -8,7 +8,7 @@ trusted with nothing. This document is enough to write a client, a relay or a fu
 [4 Cells](#4-cells) · [5 Text](#5-text) · [6 Fingerprints](#6-fingerprints) · [7 Channels](#7-channels) ·
 [8 Sessions](#8-sessions) · [9 Watching](#9-watching) · [10 Reconciling](#10-reconciling) · [11 Live](#11-live) ·
 [12 Calls](#12-calls) · [13 Relays](#13-relays) · [14 Links](#14-links) · [15 Questions](#15-questions) ·
-[16 Streams and services](#16-streams-and-services) · [18 Who handles what](#18-who-handles-what)
+[16 Streams and services](#16-streams-and-services) · [17 Names, ports and exposure](#17-names-ports-and-exposure) · [18 Who handles what](#18-who-handles-what)
 
 ## 1 Model
 
@@ -132,7 +132,10 @@ Rights are bits: 1 Read, 2 Write, 4 Call, 8 Vouch: to be believed about for whom
 invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
 a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed; and so does taking Vouch away in a signed scope. `closed`
 says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
-`subject` is the consumer's name for whomever the device belongs to, opaque here. A roster is at most 2²² − 64 bytes. Members are never removed, only their grants
+`subject` is the consumer's name for whomever the device belongs to, opaque here. A roster that names any device begins `"zsp-r2"`
+in place of `"zsp-r1"`, and each member's subject is followed by its **name** bytes, empty or one DNS label: 1 to 63 of `a`–`z`, `0`–`9` and
+`-`, with no hyphen at either end. No two members share a name; a name goes with its member's last grant (§17). A roster that names nobody
+is `"zsp-r1"`, as it always was. A roster is at most 2²² − 64 bytes. Members are never removed, only their grants
 ended, so that a member's index is for ever.
 
 **Scope keys.** Each scope has a 32-byte sealing key per epoch. For each member in order, for each grant in force in order,
@@ -621,6 +624,92 @@ Whoever answers reads only as much as it has credit to send, and credits only wh
 slow end slows the other, and nothing piles up between them. Lanes take their urgency from the method: `zsp.pty` 1; `zsp.get` and `zsp.put` 6;
 those between nodes themselves 4; all others, commands and ports among them, which may be bulk or not, 3.
 
+## 17 Names, ports and exposure
+
+Every device of a space has, on every other, a name that any application can look up and an address it can connect to, and through it
+the TCP ports that device offers: as if the space were a network, with no network device made for it. None of this is in the store or
+replicated; what is on the wire is the roster's names, a few methods (§12), and two messages between a device and a relay.
+
+**Names.** A member's **id** is the first 10 bytes of its device key in RFC 4648 base32, lower case and unpadded: 16 letters that nobody can
+choose to match another's. Under a suffix of the host's (`zsp.internal` here, under ICANN's private-use `.internal`):
+
+```
+<name>.<suffix>        the member the roster gives that name
+<id>.id.<suffix>       any member with a grant in force
+```
+
+A member at index *i* of the roster's members is at 127.*a*.(*b* + ⌊(*i* + 2) / 256⌋).((*i* + 2) mod 256), from a loopback range 127.*a*.*b* of
+the host's choice (127.77.0 here): indexes are for ever, so an address never comes to mean another device however long it is remembered.
+127.*a*.*b*.1 is the host's own (its name server, here). A device's own names are 127.0.0.1. A member whose grants have all ended has
+neither name nor address. A host answers for these names and addresses, and for the reverse zone of the range, as an authoritative name
+server (RFC 1035): with a time to live of 5 seconds, a start of authority whose minimum is the same, nothing for AAAA, and nothing for any
+other name. How the machine's resolver comes to ask it is the host's affair.
+
+**Ports.** What a device **offers** is its own to say, and it says nothing unless told: ranges of ports, each to whoever may call in a scope,
+or to one device among them; of this machine, or of another as reached from it. Of this machine's, only those that are listening, and
+reached at its loopback, are listed. A device never offers its own listeners, nor anything at an address of its own loopback range: nothing
+reaches through it what it reaches. A connection to a port is a `zsp.tcp` call (§16), permitted only when an offer covers the port and the
+host named, and both devices may call in the offer's scope; when an offer is taken back, or a grant ends, every connection it no longer
+permits is cut off.
+
+```
+zsp.ports    first message: lease varint (seconds, at most 600; 0 for once)
+             each message back: entries, the whole of what the callee offers the caller; again whenever that differs,
+             until the lease ends and the callee ends the call. Another lease varint from the caller asks for as long again.
+entries      n varint ‖ n × { port (2) ‖ scope varint ‖ host bytes (empty for the callee's own machine) ‖ name bytes }
+```
+
+A device asks what another offers when it can first reach it, and keeps it up while anyone on it seems to want it: a name looked up, a
+connection made, a client asking (60 seconds, here). The callee looks again at what is listening every 2 seconds while anyone is kept up,
+and never otherwise. An offer marked so says who connects before anything else: the PROXY protocol's second version, from the caller's
+address on the callee's machine, with TLVs 0xE0, its device key, and 0xE1, its name.
+
+Whoever reaches another device's port through its address must be the user the node runs as, or the system: a host asks its system whose
+the connecting socket is, and refuses any other user's. And a connection whose first bytes are an HTTP request must name the device by
+`Host`, and if it has an `Origin`, be from one of the space's names or addresses; otherwise it is answered 403 and closed. So a web page
+elsewhere that has pointed a name of its own at one of these addresses (DNS rebinding) reaches nothing.
+
+**Exposure.** A device may expose a port of its own machine to the public, through relays that will, one port at a time, under a
+**label**:
+
+```
+label = [prefix "-"] base32(SHA-256("zsp-expose" ‖ space ‖ device ‖ prefix bytes ‖ nonce (16))[0..10])
+```
+
+the prefix being up to 20 letters, digits and hyphens of the device's choosing, and the nonce drawn afresh each time a port is exposed, so
+that a label once let go is nobody's for ever. Nobody can be given another's label: that would take a second preimage of 80 bits.
+
+```
+40 Expose    device → relay: n varint ‖ n × { prefix bytes ‖ nonce (16) }      all it exposes there, replacing what it said before
+41 Exposed   relay → device: n varint ‖ n × { label bytes ‖ status (1) ‖ url bytes }
+             status 0 exposed, at url; 1 this relay exposes nothing; 2 the label is another's; 3 too many
+zsp.public   relay → device, in scope 0: label bytes ‖ address (16) ‖ port (2), whence the connection came
+             then as zsp.tcp: the callee's first message 0, or a code ‖ reason; then the connection's bytes each way
+```
+
+A relay works each label out itself, from the space, the device's proven key and what it said, and holds it only while the device is
+connected; it is reached at `<label>.<domain>` for a domain of the relay's, by TLS that it terminates (routed by the name asked for) or by
+plain HTTP routed by `Host`, behind something else that does. A device takes `zsp.public` only from a session it dialled as a relay's, and
+only for a label it exposes; for an exposure marked so, it says first where each connection came from, by PROXY v2. Taking a port back
+cuts off whoever is using it. What is exposed is public, and the relay sees it, as any reverse proxy must that holds the certificate; what
+is offered stays between devices, end to end.
+
+**A local client** asks its own device's host, by calling its own device (§12), in any scope it may call in:
+
+```
+zsp.nodes    answered once: n varint ‖ n × { device (32) ‖ name bytes ‖ address (4) ‖ flags (1: 1 this device, 2 reachable,
+             4 linked directly) ‖ subject bytes ‖ entries, of what it offers this device }
+zsp.offers   0 | 1 ‖ offer | 2 ‖ offer            list, offer, take back; answered with n varint ‖ n × offer, as they then are
+offer        lo (2) ‖ hi (2) ‖ scope varint ‖ device (32, zero for any) ‖ host bytes ‖ name bytes ‖ flags (1: 1 PROXY v2)
+zsp.expose   0 | 1 ‖ port (2) ‖ prefix bytes ‖ flags (1: 1 PROXY v2) | 2 ‖ port (2)
+             answered with n varint ‖ n × { port (2) ‖ prefix bytes ‖ flags (1) ‖ label bytes ‖
+             m varint ‖ m × { relay (32) ‖ status (1) ‖ url bytes } }
+```
+
+Only a client its host accepted for every scope (scope 0) may change what the device offers or exposes; another is *denied*. An offer
+in a scope the device may not call in is *denied*, for it could never be taken up. A method that is not a local client's is *denied* to
+one, and these are denied to everyone else.
+
 ## 18 Who handles what
 
 | | protocol | consumer |
@@ -630,5 +719,8 @@ those between nodes themselves 4; all others, commands and ports among them, whi
 | **Permission** | Read, Write, Call, Vouch per scope, in the roster; enforced by every replica, relays included | decides whom to grant |
 | **Keys** | wraps, rotates, seals, signs | keeps the device's secret |
 | **Authentication** | carries an opaque credential, inside the channel, to the accepting host, and waits for its verdict | is the verdict: accounts, tokens, quotas, billing |
+| **Names** | carries each device's name in the signed roster; derives ids and addresses; answers for them | decides what to call devices; points the machine's resolver at the node (zspd setup) |
+| **Ports** | lists what is offered and listening, permits and cuts off by offer and grant, refuses other users and other pages | decides what to offer, and to whom |
+| **Exposure** | derives labels nobody can take, carries the public to what is exposed and nothing else, cuts off what is taken back | decides what to expose; holds the domain and its certificate |
 
 For a peer, the verdict says whether to serve the connection; what it may then do is the roster's. For a local client, the verdict *is* the grants, and for whom it is.

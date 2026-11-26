@@ -55,6 +55,12 @@ text of 8,000 pieces is at most some 200 cells to fetch, check and open, in thre
 
 **Nothing happens unless something happened.** An idle node makes no system calls. An idle link sends no packets and sets no timer.
 
+**The space is a network.** Every device has a name on every other, `desk.zsp.internal`, and an address of its own there, 127.77.0.3,
+the same for as long as the space lasts; whatever it offers is reached at it by any application, ssh or a browser, two devices on one port
+alike, with no VPN and nothing made in the kernel. Nothing is offered unless it is, nobody but its user may borrow a device's reach, and a
+page elsewhere led there by a name of its own reaches nothing. A port may be exposed to the public too, through a relay, under a name
+nobody else can be given ([SPEC §18](SPEC.md#18-names-ports-and-exposure)).
+
 ## Measured
 
 `./x bench`, on one core of a Ryzen 9 9950X and a virtual disk, a million sealed 200-byte rows:
@@ -136,6 +142,11 @@ zspd share ~/.zsp "shell 1" "files 1 docs read $HOME/Documents"   # on this one,
 zspd services ~/.zsp <this>                 # on that one, what this one offers it
 zspd exec ~/.zsp <this> -- uname -a         # a command here, from there; `terminal` for a shell
 zspd get ~/.zsp <this> docs/report.pdf ./   # a file or a folder; again, after a break, to take up from there
+zspd name ~/.zsp <that> desk                # what the space calls it: desk.zsp.internal, on every device
+sudo zspd setup                             # once, on each machine: every application finds devices by name
+zspd offer ~/.zsp 22 1                      # on desk: offer its port 22 to whoever may call in scope 1
+ssh desk.zsp.internal                       # anywhere else in the space, as if it were on the network
+zspd expose ~/.zsp 8080 name=web            # to the public, through a relay run with --expose: https://web-<id>.<its domain>
 ```
 
 ```luau
