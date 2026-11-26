@@ -161,6 +161,11 @@ function body(call, framing, length) {
     controller.close();
     call.cancel();
   };
+  // Nothing sensible came, or not all of it: the call goes too, as an error does not cancel the stream's source.
+  const fail = (controller, why) => {
+    call.cancel();
+    controller.error(new Error(why));
+  };
   const more = async () => {
     const b = await call.read();
     if (!b) return false;
@@ -172,7 +177,7 @@ function body(call, framing, length) {
       async pull(controller) {
         if (framing === "length") {
           if (left === 0) return done(controller);
-          if (!buf.length && !(await more())) return controller.error(new Error("the device ended short"));
+          if (!buf.length && !(await more())) return fail(controller, "the device ended short");
           const n = Math.min(left, buf.length);
           controller.enqueue(buf.subarray(0, n));
           buf = buf.subarray(n);
@@ -181,7 +186,7 @@ function body(call, framing, length) {
         } else if (framing === "chunked") {
           for (;;) {
             if (chunk > 0) {
-              if (!buf.length && !(await more())) return controller.error(new Error("the device ended short"));
+              if (!buf.length && !(await more())) return fail(controller, "the device ended short");
               const n = Math.min(chunk, buf.length);
               controller.enqueue(buf.subarray(0, n));
               buf = buf.subarray(n);
@@ -191,19 +196,19 @@ function body(call, framing, length) {
             }
             const eol = buf.indexOf(10);
             if (eol < 0) {
-              if (buf.length > 4096 || !(await more())) return controller.error(new Error("a chunk makes no sense"));
+              if (buf.length > 4096 || !(await more())) return fail(controller, "a chunk makes no sense");
               continue;
             }
             const line = dec.decode(buf.subarray(0, eol)).replace(/\r$/, "");
             buf = buf.subarray(eol + 1);
             if (chunk === -2) {
-              if (line !== "") return controller.error(new Error("a chunk makes no sense")); // its CRLF, and nothing else
+              if (line !== "") return fail(controller, "a chunk makes no sense"); // its CRLF, and nothing else
               chunk = 0;
               continue;
             }
             // Hex digits, then extensions if any: nothing else is a size (not "-2", not "5GARBAGE").
             const sizeText = line.split(";")[0].trim();
-            if (!/^[0-9a-fA-F]{1,15}$/.test(sizeText)) return controller.error(new Error("a chunk makes no sense"));
+            if (!/^[0-9a-fA-F]{1,15}$/.test(sizeText)) return fail(controller, "a chunk makes no sense");
             const size = parseInt(sizeText, 16);
             if (size === 0) return done(controller); // trailers, if any, go unread
             chunk = size;

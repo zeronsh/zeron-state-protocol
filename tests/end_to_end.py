@@ -1882,6 +1882,12 @@ def test_durable_object_expose():
     for path in ("/chunk-negative", "/chunk-garbage"):  # a body cut short, never one made up
         got = ask(path)
         assert b"HELLO" not in got.partition(b"\r\n\r\n")[2], (path, got)
+    with socket.create_connection((host, int(port)), 5) as kept:  # the public stays, having had what there was
+        kept.sendall(f"GET /chunk-garbage-kept HTTP/1.1\r\nHost: {odd}\r\n\r\n".encode())
+        heard = b""
+        while b"\r\n\r\n" not in heard:
+            heard += kept.recv(4096)
+        eventually("and the port's connection is let go with it", lambda: quirky.closed.get("/chunk-garbage-kept"))
     assert b"ok" in ask("/keep").partition(b"\r\n\r\n")[2]
     eventually("the port's connection is let go once its answer has come", lambda: quirky.closed.get("/keep"))
     for ip in ("1:2:3:4:5:6:7:8:9", "::ffff:192.0.2.1", "nonsense", "300.1.1.1"):
@@ -1938,6 +1944,7 @@ class Quirky:
             "/205": b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n",
             "/chunk-negative": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-2\r\n5\r\n5\r\nHELLO\r\n0\r\n\r\n",
             "/chunk-garbage": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5GARBAGE\r\nHELLO\r\n0\r\n\r\n",
+            "/chunk-garbage-kept": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nNOT A SIZE\r\n",  # and the connection kept
             "/keep": b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",  # and the connection kept, asked or not
             "/huge": b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
             b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n\x82\x7f\x00\x00\x01\x00\x00\x00\x00\x00",
@@ -1954,6 +1961,11 @@ class Quirky:
                     while time.monotonic() < deadline:
                         c.sendall(b"x")
                         time.sleep(0.05)
+                if path == "/chunk-garbage-kept":  # the request's end comes at once: cut off is when a write fails
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline:
+                        time.sleep(0.2)
+                        c.sendall(b"Z" * 16384)
                 if path == "/huge":
                     c.settimeout(30)
                     while c.recv(4096):
