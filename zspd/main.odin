@@ -64,6 +64,10 @@ USAGE :: `zspd - Zeron State Protocol node
   --partial              replicate only what local clients watch
   --credential=<text>    present this to relays
   --allow=<space,...>    serve only these spaces
+  --names=<suffix>       run: find devices as <name>.<suffix> (zsp.internal)
+  --no-names             run: give devices no names or addresses here
+  --loopback=<127.a.b>   run: the first of the addresses devices are given (127.77.0)
+  --dns=<addr:port>      run: answer for names here (127.77.0.1:53, or :5053 where 53 needs root)
   --verbose
 
   <device>               a device's key, the start of one, or whose it is, as the roster says
@@ -581,7 +585,10 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		udp_port     = 0,
 		data         = &policy,
 		authenticate = authenticate,
+		names        = "" if relay else host.NAMES,
+		loopback     = {77, 0},
 	}
+	dns := ""
 	listen := "0.0.0.0:8787" if relay else "127.0.0.1:0"
 	for a in args {
 		eq := strings.index_byte(a, '=')
@@ -619,6 +626,25 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 				copy(id[:], bytes)
 				append(&policy.spaces, id)
 			}
+		case "--names":
+			if !host.suffix_valid(value) {
+				os.write_string(os.stderr, USAGE)
+				return 2
+			}
+			config.names = value
+		case "--no-names":
+			config.names = ""
+		case "--loopback":
+			parts := strings.split(value, ".", context.temp_allocator)
+			a, aok := strconv.parse_uint(parts[1] if len(parts) == 3 else "", 10)
+			b, bok := strconv.parse_uint(parts[2] if len(parts) == 3 else "", 10)
+			if len(parts) != 3 || parts[0] != "127" || !aok || !bok || a > 255 || b > 255 {
+				os.write_string(os.stderr, USAGE)
+				return 2
+			}
+			config.loopback = {byte(a), byte(b)}
+		case "--dns":
+			dns = value
 		case "--verbose":
 		case:
 			os.write_string(os.stderr, USAGE)
@@ -631,6 +657,18 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		return 2
 	}
 	config.listen = at
+	if config.names != "" {
+		if dns == "" {
+			base := config.loopback
+			port := 5053 when ODIN_OS == .Linux || ODIN_OS == .FreeBSD else 53
+			config.dns = net.Endpoint{net.IP4_Address{127, base[0], base[1], 1}, port}
+		} else if ep, parsed := net.parse_endpoint(dns); parsed {
+			config.dns = ep
+		} else {
+			os.write_string(os.stderr, USAGE)
+			return 2
+		}
+	}
 
 	h: host.Host
 	if !host.host_init(&h, config) {

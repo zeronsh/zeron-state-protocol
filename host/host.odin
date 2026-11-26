@@ -25,6 +25,11 @@ Config :: struct {
 	udp_port:     Maybe(int), // links, on this port or any if zero
 	stun:         string, // host:port to ask for this machine's outside address
 	credential:   string, // presented to relays
+	// Every device of the first space by name and by address, on this machine: see names.odin. "" for none.
+	names:        string,
+	loopback:     [2]byte, // 127.a.b.c: a, and b's first value
+	dns:          Maybe(net.Endpoint), // where to answer for names
+	proxy:        Maybe(net.Endpoint), // SOCKS 5 and HTTP CONNECT, for applications that can use one
 	// Authentication, which is wholly the embedder's: see zsp.Host.authenticate. `data` is passed back.
 	data:         rawptr,
 	authenticate: proc(data: rawptr, s: ^zsp.Session, credential: []byte),
@@ -47,6 +52,7 @@ Host :: struct {
 	listener:     net.TCP_Socket,
 	dialers:      [dynamic]^Dialer,
 	udp:          Udp,
+	dns_server:   Dns,
 	shared:       []byte, // everything is received into this
 	sync_due:     time.Tick,
 	syncing:      bool, // sync_due is set
@@ -71,6 +77,7 @@ Space :: struct {
 	shares: [dynamic]Share, // what this device lets others do on it
 	services: [dynamic]^Service_Call, // calls to them, which a change may end
 	audit: Audit_Log,
+	naming: Naming,
 }
 
 @(private)
@@ -199,6 +206,9 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 	if !h.relay {
 		s.node.host.questions = questions(s)
 		shares_load(s)
+		if len(h.spaces) == 0 {
+			s.naming = {h.names, h.loopback}
+		}
 	}
 	append(&h.spaces, s)
 	return s
@@ -285,6 +295,9 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 		udp_open(h, port) or_return
 	}
 	host_serve_builtin(h)
+	if at, ok := h.dns.?; ok && !h.relay && h.names != "" {
+		dns_open(h, at)
+	}
 	return true
 }
 
@@ -314,6 +327,7 @@ host_destroy :: proc(h: ^Host) {
 		stream_close(h.streams[0])
 	}
 	udp_close(h)
+	dns_close(h)
 	for len(h.spaces) > 0 {
 		space_close(pop(&h.spaces))
 	}
