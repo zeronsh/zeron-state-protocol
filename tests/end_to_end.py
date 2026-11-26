@@ -731,15 +731,21 @@ def test_relay_unbounded():
     assert stats["sqlite"] < 3000000, stats
     assert stats["node"]["extents"] >= 10 and stats["node"]["checkpoints"] > 0, stats
 
-    # What the writing left to do (checkpoints, extents, what they read) is done before what follows is counted.
-    def quiet():
-        s0 = json.loads(urllib.request.urlopen(url).read())
-        time.sleep(0.5)
-        s1 = json.loads(urllib.request.urlopen(url).read())
-        stats.update(s1)
-        return s1["node"]["dirty"] == 0 and all(s0["storage"][k] == s1["storage"][k] for k in ("gets", "puts", "deletes"))
+    # What the writing left to do (extents, checkpoints, what they read) is done before what follows is counted: nothing
+    # goes to or comes from R2 for a second. (Pages may stay changed until the next checkpoint, which may be long.)
+    def r2(st):
+        return [st["storage"][k] for k in ("gets", "puts", "deletes")] + [st["node"][k] for k in ("checkpoints", "extents", "uploaded")]
 
-    eventually("the relay has done what writing left it", quiet, timeout=60)
+    seen = []
+    deadline = time.monotonic() + 60
+    while True:
+        s0 = json.loads(urllib.request.urlopen(url).read())
+        time.sleep(1)
+        stats = json.loads(urllib.request.urlopen(url).read())
+        seen.append(r2(stats))
+        if r2(s0) == r2(stats):
+            break
+        assert time.monotonic() < deadline, ("the relay never stops reaching R2", seen[-5:])
     # A device that comes later is sent all of it, much of it from object storage, which is read an extent at a time.
     before = stats["storage"]["gets"]
     c = Node("uc", "run", "--credential=" + cloud.token, "--no-udp")
