@@ -108,6 +108,9 @@ names_resolve :: proc(t: ^testing.T) {
 	testing.expect(t, ask(h, "9.0.77.127.in-addr.arpa", pipe.DNS_PTR).rcode == .Name_Error)
 	testing.expect(t, ask(h, "2.0.77.127.in-addr.arpa", pipe.DNS_PTR).rcode == .Name_Error) // this device's index is not an address
 	testing.expect(t, ask(h, "03.0.77.127.in-addr.arpa", pipe.DNS_PTR).rcode == .Name_Error)
+	for odd in ([]string{"1.2.3.4.5.77.127.in-addr.arpa", "1.2.3.0.77.127.in-addr.arpa", "a.b.c.d.e.f.g.0.77.127.in-addr.arpa"}) {
+		testing.expectf(t, ask(h, odd, pipe.DNS_PTR).rcode == .Name_Error, "%s", odd)
+	}
 	testing.expect(t, ask(h, "zsp.internal", pipe.DNS_SOA).soa)
 	testing.expect(t, ask(h, "example.com").rcode == .Refused)
 	testing.expect(t, ask(h, "internal").rcode == .Refused)
@@ -164,4 +167,30 @@ addresses_stay_in_range :: proc(t: ^testing.T) {
 	testing.expect(t, ok && ip == {127, 77, 255, 255})
 	ip, ok = member_address(&ts.space, 254 * 256 + 254)
 	testing.expectf(t, !ok, "%v", ip)
+}
+
+// A member past the space's range of addresses has its name, and no address: not 0.0.0.0, which is this machine.
+@(test)
+names_past_the_range :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts)
+	defer test_space_destroy(&ts)
+	ts.space.naming = {NAMES, {77, 255}} // room for 254
+	d := zsp.draft_from(&ts.space.node.roster, 1000)
+	last: zsp.Key32
+	for n in 0 ..< 260 {
+		k: zsp.Keyring
+		secret: zsp.Key32
+		secret[0], secret[1], secret[2] = 0xa5, byte(n), byte(n >> 8)
+		zsp.keyring_init(&k, secret)
+		zsp.draft_grant(&d, k.device, k.signer, 1, {.Write, .Call})
+		last = k.device
+		zsp.keyring_destroy(&k)
+	}
+	testing.expect(t, zsp.draft_name(&d, last, "far"))
+	roster, ok := zsp.roster_sign(&ts.keys[0], ts.root, &d, context.temp_allocator)
+	testing.expect(t, ok && zsp.node_adopt(&ts.space.node, roster))
+	a := ask(&ts.host, "far.zsp.internal")
+	_, has := a.a.?
+	testing.expectf(t, a.rcode == .No_Error && !has, "%v %v", a.rcode, a.a)
 }

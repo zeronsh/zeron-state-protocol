@@ -139,7 +139,9 @@ names_answer :: proc(h: ^Host, q: ^pipe.Dns_Query) -> (a: pipe.Dns_Answer) {
 				a.rcode = .Name_Error
 				return
 			}
-			a.a, _ = device_address(sp, m.device)
+			if ip, has := device_address(sp, m.device); has {
+				a.a = ip // and none, past the space's range: the name is, but no address here is its
+			}
 			if q.type == pipe.DNS_A || q.type == pipe.DNS_ANY {
 				ports_wanted(sp, m.device) // whoever looks it up is about to connect
 			}
@@ -156,10 +158,12 @@ names_answer :: proc(h: ^Host, q: ^pipe.Dns_Query) -> (a: pipe.Dns_Answer) {
 			parts := strings.split(rest, ".", context.temp_allocator)
 			ip := [4]byte{127, sp.naming.loopback[0], 0, 0}
 			valid := len(parts) == 2
-			for p, i in parts {
-				v, digits := strconv.parse_uint(p, 10)
-				valid &&= digits && v <= 255 && (len(p) == 1 || p[0] != '0')
-				ip[3 - i] = byte(v)
+			if valid {
+				for p, i in parts {
+					v, digits := strconv.parse_uint(p, 10)
+					valid &&= digits && v <= 255 && (len(p) == 1 || p[0] != '0')
+					ip[3 - i] = byte(v)
+				}
 			}
 			m := address_member(sp, ip) if valid else nil
 			if m == nil {
