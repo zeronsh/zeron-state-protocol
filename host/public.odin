@@ -5,6 +5,7 @@ import "core:nbio"
 import "core:net"
 import "core:os"
 import "core:strings"
+import "core:time"
 import "../pipe"
 import "../zsp"
 
@@ -16,6 +17,8 @@ import "../zsp"
 MAX_EXPOSED :: 4096 // labels at one relay
 PUBLIC_MAX :: 1024 // connections from the public at once
 PUBLIC_HEAD_MAX :: 16 << 10
+PUBLIC_OUT_MAX :: 256 << 10 // for the public, unwritten: no more is read from it until that has gone
+PUBLIC_HELLO :: 10 * time.Second // to say where to, after which it is let go
 
 @(private)
 Relay_Public :: struct {
@@ -56,9 +59,11 @@ Public_Out :: struct {
 	told_end:  bool, // and the device has been told so
 	ended_out: bool, // the device has
 	shut:      bool,
+	finishing: bool, // closed once what is in `out` is written: an alert, a refusal
 	closed:    bool,
 	polling:   ^nbio.Operation,
 	writing:   ^nbio.Operation,
+	hello:     ^nbio.Operation, // until it says where to
 }
 
 // Listens for the public, as configured. False if it cannot.
@@ -220,8 +225,20 @@ public_accepted :: proc(op: ^nbio.Operation, h: ^Host, secure: bool) {
 		return
 	}
 	if len(rp.conns) >= PUBLIC_MAX {
-		socket_abort(op.accept.client)
-		return
+		// Full: the longest waiting of those that have not said where to makes room, so that nobody can keep the
+		// public out by opening connections and saying nothing; if all have, the newcomer waits its turn elsewhere.
+		oldest: ^Public_Out
+		for x in rp.conns {
+			if x.call == 0 && !x.closed {
+				oldest = x
+				break
+			}
+		}
+		if oldest == nil {
+			socket_abort(op.accept.client)
+			return
+		}
+		public_out_close(oldest, reset = true)
 	}
 	c := new(Public_Out)
 	c.h, c.socket, c.from = h, op.accept.client, op.accept.client_endpoint
@@ -232,6 +249,9 @@ public_accepted :: proc(op: ^nbio.Operation, h: ^Host, secure: bool) {
 	}
 	c.on_data = proc(hd: ^Call_Handler, call: u64, bytes: []byte) -> bool {
 		c := (^Public_Out)(hd)
+		if c.finishing {
+			return true
+		}
 		bytes := bytes
 		if !c.connected {
 			if len(bytes) == 0 || bytes[0] != 0 {
@@ -271,13 +291,19 @@ public_accepted :: proc(op: ^nbio.Operation, h: ^Host, secure: bool) {
 	c.on_room = proc(hd: ^Call_Handler, call: u64) {
 		public_out_forward((^Public_Out)(hd))
 	}
-	append(&rp.conns, c)
+	append(&rp.conns, c) // oldest first
+	c.hello = nbio.timeout_poly(PUBLIC_HELLO, c, proc(op: ^nbio.Operation, c: ^Public_Out) {
+		c.hello = nil
+		if c.call == 0 {
+			public_out_close(c, reset = true)
+		}
+	})
 	public_out_wait(c)
 }
 
 @(private)
 public_out_wait :: proc(c: ^Public_Out) {
-	if c.polling != nil || c.closed || c.ended_in {
+	if c.polling != nil || c.closed || c.ended_in || c.finishing || len(c.out) - c.sent >= PUBLIC_OUT_MAX {
 		return
 	}
 	// Read only while what was read can be passed on: the public is held back as the device is.
@@ -323,10 +349,10 @@ public_out_read :: proc(c: ^Public_Out) {
 		if c.tls != nil {
 			plain := make([dynamic]byte, context.temp_allocator)
 			ok := pipe.tls_accept(c.tls, bytes, &plain, &c.out, public_identity, h)
+			c.finishing = !ok // its alert written, if any, and that is all
 			public_out_flush(c)
 			if !ok {
-				c.ended_in = true
-				break
+				return
 			}
 			if c.call == 0 && c.tls.state == .Open && !public_out_route(c, pipe.tls_server_name(c.tls)) {
 				return
@@ -382,10 +408,11 @@ public_out_route :: proc(c: ^Public_Out, name: string) -> bool {
 	h := c.h
 	l := public_name(h, name)
 	if l == nil {
-		if c.tls == nil {
-			net.send_tcp(c.socket, transmute([]byte)string("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		if c.tls != nil {
+			public_out_close(c, reset = true)
+		} else {
+			public_out_finish(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 		}
-		public_out_close(c, reset = c.tls != nil)
 		return false
 	}
 	first := make([dynamic]byte, context.temp_allocator)
@@ -394,6 +421,10 @@ public_out_route :: proc(c: ^Public_Out, name: string) -> bool {
 	append(&first, ..from.ip[:])
 	append(&first, byte(from.port >> 8), byte(from.port))
 	c.sp = l.space
+	if c.hello != nil {
+		nbio.remove(c.hello)
+		c.hello = nil
+	}
 	c.call = host_call(l.space, l.device, 0, "zsp.public", first[:], c)
 	if c.call == 0 {
 		public_out_refused(c)
@@ -459,6 +490,10 @@ public_out_flush :: proc(c: ^Public_Out) {
 	}
 	clear(&c.out)
 	c.sent = 0
+	if c.finishing {
+		public_out_close(c, reset = false)
+		return
+	}
 	if c.owed > 0 && c.call != 0 {
 		call_consumed(c.sp, c.call, c.owed) // written: the device may send as much again
 		c.owed = 0
@@ -478,18 +513,31 @@ public_out_refused :: proc(c: ^Public_Out) {
 	if c.closed {
 		return
 	}
-	if c.tls == nil {
-		net.send_tcp(c.socket, transmute([]byte)string("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
-		public_out_close(c, reset = false)
-	} else {
-		w := make([dynamic]byte, context.temp_allocator)
-		if c.tls.state == .Open {
-			pipe.tls_server_write(c.tls, transmute([]byte)string("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"), &w)
-			pipe.tls_server_close(c.tls, &w)
-		}
-		net.send_tcp(c.socket, w[:])
-		public_out_close(c, reset = false)
+	public_out_finish(c, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+}
+
+// Says one last thing to the public, and closes once it is written, however slowly it reads.
+@(private)
+public_out_finish :: proc(c: ^Public_Out, say: string) {
+	if c.finishing {
+		return
 	}
+	c.finishing = true
+	if c.polling != nil {
+		nbio.remove(c.polling)
+		c.polling = nil
+	}
+	if c.call != 0 {
+		call_cancel(c.sp, c.call)
+		c.call = 0
+	}
+	if c.tls == nil {
+		append(&c.out, say)
+	} else if c.tls.state == .Open {
+		pipe.tls_server_write(c.tls, transmute([]byte)say, &c.out)
+		pipe.tls_server_close(c.tls, &c.out)
+	}
+	public_out_flush(c)
 }
 
 @(private)
@@ -510,6 +558,9 @@ public_out_close :: proc(c: ^Public_Out, reset: bool) {
 	}
 	if c.writing != nil {
 		nbio.remove(c.writing)
+	}
+	if c.hello != nil {
+		nbio.remove(c.hello)
 	}
 	if c.call != 0 {
 		call_cancel(c.sp, c.call)

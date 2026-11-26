@@ -7,6 +7,7 @@ import "core:crypto/rsa"
 import "core:crypto/sha2"
 import "core:encoding/endian"
 import "core:encoding/pem"
+import "core:strings"
 import "../zsp"
 
 // A TLS 1.3 server (RFC 8446), for the public's way in to what a device exposes through a relay: so that a browser,
@@ -50,6 +51,7 @@ Tls_Server :: struct {
 	session:    [32]byte, // echoed, as middleboxes expect
 	session_len: int,
 	alert:      u8, // why it ended, if it was this end's doing
+	update_owed: bool, // the client asked for a KeyUpdate: one is sent, however many it asked for at once
 }
 
 // What a server says for a name: the identity to prove, or nil to refuse.
@@ -260,6 +262,7 @@ RETRY := [32]byte{
 tls_accept :: proc(t: ^Tls_Server, bytes: []byte, plain, w: ^[dynamic]byte, find: Tls_Find, data: rawptr) -> bool {
 	append(&t.input, ..bytes)
 	used := 0
+	defer tls_update(t, w) // once, for all this asked
 	defer {
 		copy(t.input[:], t.input[used:])
 		resize(&t.input, len(t.input) - used)
@@ -327,6 +330,17 @@ tls_accept :: proc(t: ^Tls_Server, bytes: []byte, plain, w: ^[dynamic]byte, find
 	return t.state != .Closed
 }
 
+// Answers what KeyUpdates asked for one (RFC 8446 §4.6.3): once, before anything else is sent, however many asked.
+@(private = "file")
+tls_update :: proc(t: ^Tls_Server, w: ^[dynamic]byte) {
+	if t.update_owed && t.state == .Open {
+		t.update_owed = false
+		tls_seal(&t.send, 22, {24, 0, 0, 1, 0}, w)
+		t.server_app = tls_expand(t.server_app, "traffic upd", nil)
+		tls_key(&t.send, t.server_app)
+	}
+}
+
 // Appends plaintext as records.
 tls_server_write :: proc(t: ^Tls_Server, plain: []byte, w: ^[dynamic]byte) {
 	plain := plain
@@ -381,6 +395,11 @@ tls_server_messages :: proc(t: ^Tls_Server, w: ^[dynamic]byte, find: Tls_Find, d
 		}
 		m := rest[:4 + n]
 		used += len(m)
+		// What comes before a change of keys ends its record (RFC 8446 §5.1): nothing may follow it under the old keys.
+		// A client cannot so make one record ask for a thousand.
+		if (m[0] == 1 || m[0] == 20 || m[0] == 24) && used != len(t.messages) {
+			return tls_fail(t, 10, w) // unexpected_message
+		}
 		switch t.state {
 		case .Hello, .Retried:
 			if m[0] != 1 {
@@ -405,11 +424,7 @@ tls_server_messages :: proc(t: ^Tls_Server, w: ^[dynamic]byte, find: Tls_Find, d
 			case m[0] == 24 && n == 1 && m[4] <= 1: // key_update
 				t.client_app = tls_expand(t.client_app, "traffic upd", nil)
 				tls_key(&t.recv, t.client_app)
-				if m[4] == 1 {
-					tls_seal(&t.send, 22, {24, 0, 0, 1, 0}, w)
-					t.server_app = tls_expand(t.server_app, "traffic upd", nil)
-					tls_key(&t.send, t.server_app)
-				}
+				t.update_owed ||= m[4] == 1
 			case:
 				return tls_fail(t, 10, w) // nothing else is asked of a server once open
 			}
@@ -506,7 +521,7 @@ tls_client_hello :: proc(t: ^Tls_Server, m: []byte, w: ^[dynamic]byte, find: Tls
 	if suite == 0 || !x25519 {
 		return tls_fail(t, 40, w) // handshake_failure
 	}
-	if t.state == .Retried && (name != tls_server_name(t) || suite != t.suite || share == nil) {
+	if t.state == .Retried && (!strings.equal_fold(name, tls_server_name(t)) || suite != t.suite || share == nil) {
 		return tls_fail(t, 47, w) // illegal_parameter
 	}
 	// Which name, and whether it has an identity here.

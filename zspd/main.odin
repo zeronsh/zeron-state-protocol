@@ -112,6 +112,9 @@ main :: proc() {
 }
 
 run :: proc() -> int {
+	when ODIN_OS != .Windows {
+		raise_file_limit()
+	}
 	args := os.args[1:]
 	if len(args) >= 1 && args[0] == "setup" {
 		return setup(args[1:])
