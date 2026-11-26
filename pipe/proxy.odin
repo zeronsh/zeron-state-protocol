@@ -121,9 +121,16 @@ http_proxy_request :: proc(b: []byte) -> (r: Proxy_Request, result: Proxy_Result
 		return r, .Broken // only a proxy's requests come here
 	}
 	authority := target[len("http://"):]
+	// The authority ends at the path, or at a query with none (http://host?q, which is /?q), as RFC 3986 has it.
 	path := "/"
-	if slash := strings.index_byte(authority, '/'); slash >= 0 {
-		authority, path = authority[:slash], authority[slash:]
+	if stop := strings.index_any(authority, "/?#"); stop >= 0 {
+		authority, path = authority[:stop], authority[stop:]
+		if path[0] == '#' || strings.contains(path, "#") {
+			return r, .Broken // a fragment is the client's, and never sent
+		}
+		if path[0] == '?' {
+			path = strings.concatenate({"/", path}, context.temp_allocator)
+		}
 	}
 	host, port, ok := split_host_port(authority, 80)
 	if !ok {

@@ -1374,6 +1374,17 @@ def test_ports():
             while data := s.recv(4096):
                 got += data
             assert got.startswith(b"HTTP/1.1 200 ") and got.endswith(b"got %d" % size), (size, got)
+    # Greeted as SOCKS, it is SOCKS: an HTTP request after the greeting is no request.
+    with socket.create_connection(proxy, 5) as s:
+        s.sendall(b"\x05\x01\x00")
+        assert s.recv(2) == b"\x05\x00"
+        s.sendall(b"GET http://bee.zsp.internal:%d/ HTTP/1.1\r\nHost: bee.zsp.internal:%d\r\n\r\n" % (port, port))
+        try:
+            refused = not s.recv(64).startswith(b"HTTP/")
+        except OSError:
+            refused = True
+        assert refused, "proxied as HTTP after a SOCKS greeting"
+
     def socks_to(address, port):
         s = socket.create_connection(proxy, 5)
         s.sendall(b"\x05\x01\x00")

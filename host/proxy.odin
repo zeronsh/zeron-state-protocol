@@ -164,7 +164,7 @@ proxy_client_parse :: proc(c: ^Proxy_Client) -> (result: pipe.Proxy_Result) {
 	if len(c.buf) == 0 {
 		return .More
 	}
-	if c.buf[0] == 5 {
+	if c.buf[0] == 5 || c.greeted { // greeted as SOCKS, it is SOCKS: what follows is its request, or nothing
 		if !c.greeted {
 			used: int
 			used, result = pipe.socks_greeting(c.buf[:])
