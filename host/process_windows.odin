@@ -8,6 +8,7 @@ import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import "core:time"
 import win "core:sys/windows"
 
 // A process on Windows: in a job object of its own, which ends all it starts with it, with pipes or a pseudoconsole
@@ -45,6 +46,8 @@ Process :: struct {
 	telling:  int,
 	freed:    bool,
 	console_guard: sync.Mutex, // held while the console is resized or closed, on whichever thread
+	pipe_check: ^nbio.Operation, // once it has ended: whether a read of its output waits on a pipe at its end
+	stuck:    [2]bool, // seen so once already
 }
 
 HPCON :: distinct rawptr
@@ -387,6 +390,10 @@ process_free :: proc(p: ^Process) {
 	}
 	p.freed = true
 	p.events = {}
+	if p.pipe_check != nil {
+		nbio.remove(p.pipe_check)
+		p.pipe_check = nil
+	}
 	TerminateJobObject(p.job, 128 + win.UINT(Signal.Kill))
 	// What waits on a handle is taken back before it is closed. A read or write taken back no longer touches its
 	// buffer once the cancel has returned.
@@ -605,6 +612,45 @@ process_exited :: proc(op: ^nbio.Operation) {
 	p.exit = {code = int(code)}
 	p.reaped = true
 	process_check_done(p)
+	if !p.told && !p.freed {
+		process_check_pipes(p)
+	}
+}
+
+// core:nbio on Windows may wait for ever on a read of a pipe that broke as the read was made, its end told by no
+// completion: so once the process has ended, a pipe still being read that says it is broken and empty, twice over a
+// while apart (time for any completion on its way to come), is taken to be at its end.
+@(private)
+process_check_pipes :: proc(p: ^Process) {
+	p.pipe_check = nil
+	for i in 0 ..< 2 {
+		h := p.output[i]
+		if h == nil || p.read_ops[i] == nil {
+			p.stuck[i] = false
+			continue
+		}
+		avail: win.DWORD
+		broken := !win.PeekNamedPipe(h, nil, 0, nil, &avail, nil) && win.GetLastError() == win.ERROR_BROKEN_PIPE
+		if !broken {
+			p.stuck[i] = false
+			continue
+		}
+		if !p.stuck[i] {
+			p.stuck[i] = true
+			continue
+		}
+		nbio.remove(p.read_ops[i])
+		p.read_ops[i] = nil
+		process_eof(p, i)
+		if p.freed || p.told {
+			return
+		}
+	}
+	if p.output[0] != nil || p.output[1] != nil {
+		p.pipe_check = nbio.timeout_poly(100 * time.Millisecond, p, proc(op: ^nbio.Operation, p: ^Process) {
+			process_check_pipes(p)
+		})
+	}
 }
 
 // Stops, or lets go on, everything in its job.
