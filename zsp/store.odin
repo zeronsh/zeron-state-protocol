@@ -371,11 +371,13 @@ record_at :: proc(b: []byte) -> int {
 	if len(b) <= RECORD_HEAD {
 		return 0
 	}
-	n := int(get_u32(b))
+	// Compared as it is, unsigned: where int is 32 bits, as in WebAssembly, a length of 2^31 or more is negative.
+	size := get_u32(b)
 	kind := b[RECORD_HEAD] // the first cell of a record always names its row
-	if n == 0 || n > len(b) - RECORD_HEAD || kind < u8(min(Kind)) || kind > u8(max(Kind)) {
+	if size == 0 || u64(size) > u64(len(b) - RECORD_HEAD) || kind < u8(min(Kind)) || kind > u8(max(Kind)) {
 		return 0
 	}
+	n := int(size)
 	return n if record_sum(b[RECORD_HEAD:][:n]) == get_u32(b[4:]) else 0
 }
 

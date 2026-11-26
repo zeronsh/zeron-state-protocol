@@ -1,6 +1,6 @@
 """How long a relay takes to wake, by how much log it has to replay: python3 bench/wake.py [tails in KiB...]
 
-Against a relay deployed with STATS set and CHECKPOINT_TAIL far above the largest tail (ZSP_CLOUD=https://...,
+Against a relay deployed with STATS set and QUIET_TAIL far above the largest tail, so that no checkpoint comes of waiting (ZSP_CLOUD=https://...,
 ZSP_CLOUD_TOKEN), or under workerd here. For each tail, a new space has that much written past its last checkpoint, in
 rows of 16 KiB or of 200 bytes; then the relay is woken three ways, and what a device next writes is timed to another:
 as an object evicted with its cache, as one evicted with nothing at hand, and as one that hibernated on its own."""
@@ -43,7 +43,7 @@ def one_write(ca, cb, order):
 
 
 def main():
-    cloud = e.Cloud().start(ACCESS_TOKEN="bench", CHECKPOINT_TAIL=str(64 << 20))
+    cloud = e.Cloud().start(ACCESS_TOKEN="bench", QUIET_TAIL=str(64 << 20))
     results = []
     sizes = ((16 << 10, "rows of 16 KiB"), (200, "rows of 200 B"))
     for size, name in [x for x in sizes if os.environ.get("ZSP_ROWS", "") in ("", str(x[0]))]:

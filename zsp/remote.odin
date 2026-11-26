@@ -27,6 +27,10 @@ EXTENT :: #config(ZSP_EXTENT, min(SEGMENT / 4, 1 << 20)) // the log is put in ob
 #assert(SEGMENT % EXTENT == 0 && EXTENT % LOG_BLOCK == 0)
 LOG_BLOCK :: #config(ZSP_LOG_BLOCK, min(64 << 10, EXTENT)) // a read of the log fetches at least this much
 LOCAL_KEEP :: #config(ZSP_LOCAL_KEEP, 4 << 20) // the log's latest bytes, kept by the host though in object storage: what is shown
+// Checkpoints, each a put, wait while writing goes on until the log waking would replay is CHECKPOINT_TAIL long; once
+// writing stops, there is one if it is longer than this. What hibernates wakes with little to replay, and what is
+// written on and on is put a checkpoint every few megabytes, not every few hundred kilobytes.
+QUIET_TAIL :: #config(ZSP_QUIET_TAIL, min(256 << 10, CHECKPOINT_TAIL / 4))
 LOCAL_MOST :: 64 << 20 // the most of the log the host holds, should object storage fall behind, before writing waits for it
 PAGE_RUN :: 16 // a read of a page fetches its neighbours in the pack too
 HINT_SIZE :: 48
@@ -184,6 +188,7 @@ Remote :: struct {
 	tick:          u64,
 	rested:        u64, // the tick at the last rest
 	page_budget:   int,
+	quiet_tail:    u64, // QUIET_TAIL, or as the host says
 	local_keep:    u64, // LOCAL_KEEP, or less where the host's storage is small
 	local_most:    u64, // LOCAL_MOST, or less: the most of the log the host holds before writing waits; zero, where there is no
 	// object storage to wait for, for none: the host's storage fills, and fails, as it would
@@ -218,6 +223,7 @@ Remote :: struct {
 remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_budget := 256, local_keep: u64 = LOCAL_KEEP, local_most: u64 = LOCAL_MOST) -> bool {
 	r.host = host
 	r.page_budget, r.block_budget = page_budget, block_budget
+	r.quiet_tail = QUIET_TAIL
 	remote_limits(r, local_keep, local_most)
 	r.next_gen = 1
 	if bytes := host.manifest_read(host.data); bytes != nil {
@@ -783,7 +789,11 @@ remote_work :: proc(r: ^Remote) -> (waiting: bool) {
 		return false
 	}
 	// Writing waits for the host's storage to hold less of the log: a checkpoint lets it go, once object storage has it.
+	// And where the host has little room, writing that goes on is checkpointed often enough that it need seldom wait.
 	tail := store_tail(s)
+	if r.local_most > 0 && !s.replaying && tail - s.checkpoint > max(r.quiet_tail, (r.local_most - min(r.local_most, r.local_keep)) / 2) {
+		r.want_checkpoint = true
+	}
 	if remote_full(r) && min(r.uploaded, tail - min(tail, r.local_keep)) > r.local_from {
 		r.want_checkpoint = true
 	}
@@ -803,6 +813,20 @@ remote_work :: proc(r: ^Remote) -> (waiting: bool) {
 		waiting = true
 	}
 	return
+}
+
+// Whether, should writing stop now, a checkpoint would be worth one: call when nothing has happened for a while.
+@(require_results)
+remote_quiet_due :: proc(r: ^Remote) -> bool {
+	s := r.store
+	return !s.replaying && !s.failed && r.inflight == nil && !r.want_checkpoint && store_tail(s) - s.checkpoint > r.quiet_tail
+}
+
+// Writing has stopped: a checkpoint, if one is worth it, begun by the next remote_work.
+remote_quiet :: proc(r: ^Remote) {
+	if remote_quiet_due(r) {
+		r.want_checkpoint = true
+	}
 }
 
 // Whether writing should wait: so much has changed while a checkpoint was under way that memory would run short, or

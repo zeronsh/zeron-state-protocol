@@ -105,7 +105,10 @@ def main():
 
     # A device that keeps only what its screen shows, new each time, served a window of 50 by a relay woken from
     # eviction: with its own cache, as it is, or with nothing at hand but its manifest and its log's tail.
-    for i, (which, back, how) in enumerate((("latest", True, "warm"), ("earliest", False, "warm"), ("latest", True, "cold"), ("earliest", False, "cold"))):
+    ways = [("latest", True, "warm"), ("earliest", False, "warm"), ("latest", True, "cold"), ("earliest", False, "cold")]
+    if os.environ.get("ZSP_EMPTY"):  # and with not even the trees' tops kept, where the relay keeps them apart
+        ways += [("latest", True, "empty"), ("earliest", False, "empty")]
+    for i, (which, back, how) in enumerate(ways):
         p = e.Node(f"rp{i}", "run", "--credential=" + cloud.token, "--no-udp", "--partial")
         e.zspd("admit", a.dir, e.zspd("key", p.dir), "1")
         e.zspd("join", p.dir, sid, cloud.key, cloud.url)
@@ -122,7 +125,8 @@ def main():
         s1 = stats(cloud, sid)
         d = spent(s0, s1)
         results[f"window {which} {how}"] = {"ms": took * 1e3, **d}
-        print(f"a window of the {which} 50 from a relay woken {'with its own cache' if how == 'warm' else 'with nothing at hand'}: {took * 1e3:.0f} ms")
+        said = {"warm": "with its own cache", "cold": "with its cache turned over", "empty": "with nothing at hand"}[how]
+        print(f"a window of the {which} 50 from a relay woken {said}: {took * 1e3:.0f} ms")
         line(f"window of the {which} 50, {how}", d)
         cw.sock.close()
         p.stop()

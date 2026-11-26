@@ -254,9 +254,9 @@ export class Storage {
 
   // Kept if there is room, the oldest let go to make it; never at the cost of what must be kept.
   #cache_put(kind, key, bytes) {
-    // Pages three quarters, the log a quarter; and the trees' tops half as much again, apart, so that what else is
-    // read never crowds them out.
-    const budget = Math.floor((this.#budget * [3, 1, 2][kind]) / 4);
+    // Pages half, the log a quarter, and the trees' tops a quarter, apart, so that what else is read never crowds them
+    // out.
+    const budget = Math.floor((this.#budget * [2, 1, 1][kind]) / 4);
     if (bytes.length > CACHE_ROW || bytes.length > budget) return;
     // What lies at a place never changes: a run already cached there at least as long holds all of this.
     const [longer] = this.#read(`SELECT 1 AS x FROM cache${kind} WHERE key = ? AND length(data) >= ?`, key, bytes.length);

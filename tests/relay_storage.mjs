@@ -126,26 +126,26 @@ async function cache_is_sound(seed) {
   host.log_write(0, 0, 1); // made
   const at = (kind, key, i) => ((kind * 977 + key * 131 + i * 7) ^ (key >> 3)) & 255; // what lies there
   for (let round = 0; round < 600; round++) {
-    const kind = rand(2);
+    const kind = rand(3), paged = kind !== 1;
     if (rand(3) === 0) {
-      const key = rand(5000), len = kind === 0 ? (1 + rand(20)) * 4096 : 1 + rand(30000);
-      for (let i = 0; i < len; i++) memory[i] = kind === 0 ? at(0, key + Math.floor(i / 4096), i % 4096) : at(1, key + i, 0);
+      const key = rand(5000), len = paged ? (1 + rand(20)) * 4096 : 1 + rand(30000);
+      for (let i = 0; i < len; i++) memory[i] = paged ? at(kind, key + Math.floor(i / 4096), i % 4096) : at(1, key + i, 0);
       host.cache_put(kind, key, 0, len);
     } else if (rand(10) === 0) {
       const lo = rand(5000);
       host.cache_drop(kind, lo, lo + rand(500));
     } else {
-      const key = rand(5000), len = kind === 0 ? 4048 : 1 + rand(100);
+      const key = rand(5000), len = paged ? 4048 : 1 + rand(100);
       if (host.cache_get(kind, key, 1 << 21, len)) {
         for (let i = 0; i < len; i++) {
-          const want = kind === 0 ? at(0, key, i) : at(1, key + i, 0);
+          const want = paged ? at(kind, key, i) : at(1, key + i, 0);
           assert.equal(memory[(1 << 21) + i], want, `seed ${seed} round ${round}: the cache answered wrongly for ${kind}:${key}+${i}`);
         }
       }
     }
   }
   const sum = (k) => sql.exec(`SELECT coalesce(sum(length(data)), 0) AS n FROM cache${k}`).one().n;
-  assert.ok(sum(0) <= 225000 && sum(1) <= 75000, `seed ${seed}: the cache holds ${sum(0)} + ${sum(1)}`);
+  assert.ok(sum(0) + sum(1) + sum(2) <= 300000, `seed ${seed}: the cache holds ${sum(0)} + ${sum(1)} + ${sum(2)}, past its budget`);
 }
 
 // Full: what must be kept fails when it cannot be, and what may be forgotten is quietly not kept.

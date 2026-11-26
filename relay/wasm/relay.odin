@@ -35,7 +35,6 @@ foreign host {
 	now :: proc() -> f64 ---
 }
 
-checkpoint_tail: u64 = 256 << 10 // what waking may have to replay
 MAX_PLAIN :: 60 << 10
 
 Conn :: struct {
@@ -54,12 +53,9 @@ conns: map[u32]^Conn
 message: [dynamic]byte // handed in and out
 
 @(export)
-init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len: int, roster: [^]byte, roster_len: int, page_budget, block_budget: int, local_keep, local_most, tail: f64) -> bool {
+init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len: int, roster: [^]byte, roster_len: int, page_budget, block_budget: int, local_keep, local_most, quiet_tail: f64) -> bool {
 	context = runtime.default_context()
 	secret = secret_ptr^
-	if tail > 0 {
-		checkpoint_tail = u64(tail)
-	}
 	h := zsp.Remote_Host {
 		log_write = proc(_: rawptr, off: u64, bytes: []byte) -> bool {
 			return log_write(f64(off), raw_data(bytes), len(bytes))
@@ -102,6 +98,9 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len
 		now = proc(_: rawptr) -> u64 {return u64(now())},
 	}
 	zsp.remote_open(&remote, h, page_budget, block_budget, u64(local_keep), u64(local_most)) or_return
+	if quiet_tail > 0 {
+		remote.quiet_tail = u64(quiet_tail)
+	}
 	node.store.remote = &remote
 	disk := zsp.remote_disk(&remote)
 	node.now = u64(now())
@@ -222,12 +221,23 @@ settle :: proc "c" () -> int {
 		zsp.store_sync(&node.store)
 	}
 	zsp.node_retry(&node)
-	if !node.store.replaying && zsp.store_tail(&node.store) - node.checkpoint > checkpoint_tail {
-		remote.want_checkpoint = true
-	}
 	zsp.remote_work(&remote)
 	zsp.remote_ops(&remote)
 	return 1 if node.store.more else 0
+}
+
+// Whether a checkpoint would be worth one should nothing more happen: if so, the host calls `quiet` once nothing has
+// for a while, and settles.
+@(export)
+quiet_due :: proc "c" () -> bool {
+	context = runtime.default_context()
+	return zsp.remote_quiet_due(&remote)
+}
+
+@(export)
+quiet :: proc "c" () {
+	context = runtime.default_context()
+	zsp.remote_quiet(&remote)
 }
 
 // Starts fetching what producing output wanted. Call after taking output, before resting.

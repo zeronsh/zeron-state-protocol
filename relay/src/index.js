@@ -62,6 +62,7 @@ export class Space extends DurableObject {
   #soon = false; // a settle is due at once
   #full = 0; // when storage last could keep no more: for a while after, nobody is let in
   #broken = false; // storage failed where the node was not there to be told
+  #quiet; // a timer: once nothing has happened for QUIET_MS, a checkpoint if one is worth it
   #ending = new Set(); // connections whose input failed: let go of once what they have to hear is said, if anything is
 
   constructor(ctx, env) {
@@ -150,7 +151,7 @@ export class Space extends DurableObject {
     // And writing waits for R2, should it fall behind, before this storage holds more of the log than 64 MiB, or half of
     // what may be kept here: a space R2 can keep never fills it.
     const most = limit > 0 ? Math.min(64 << 20, Math.floor(limit / 2)) : 64 << 20;
-    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length, pages, blocks, keep, most, Number(this.env.CHECKPOINT_TAIL ?? 0))) {
+    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length, pages, blocks, keep, most, Number(this.env.QUIET_TAIL ?? 0))) {
       throw exports.failed() ? new Full(FULL) : new Error("storage is damaged");
     }
     let lost = false;
@@ -279,6 +280,19 @@ export class Space extends DurableObject {
     this.#wasm.rest();
     if (this.#broken || this.#wasm.failed()) return void this.#fail();
     this.#storage.run(this.#done);
+    // Writing has perhaps stopped: if nothing more happens for a moment, the log waking would replay is made short.
+    // Until then the object stays awake, which costs that moment; it does not hibernate with much to replay.
+    clearTimeout(this.#quiet);
+    this.#quiet = undefined;
+    if (this.#wasm.quiet_due()) {
+      const epoch = this.#epoch;
+      this.#quiet = setTimeout(() => {
+        this.#quiet = undefined;
+        if (epoch !== this.#epoch || !this.#wasm) return;
+        this.#wasm.quiet();
+        this.#settle();
+      }, Number(this.env.QUIET_MS ?? 1000));
+    }
     if (more && !this.#soon) {
       // There is more it could do at once, as making a store again from a long log: after whatever else is waiting.
       this.#soon = true;

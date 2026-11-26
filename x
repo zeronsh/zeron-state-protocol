@@ -116,7 +116,7 @@ test)
 	mfail=; wait $quick || mfail=1; wait $long || mfail=1; [ -z "$mfail" ]
 	node examples/relay/test.mjs
 	node tests/relay_storage.mjs
-	node tests/relay_settle.mjs
+	node tests/relay_settle.mjs && node tests/relay_checkpoints.mjs
 	$PYTHON examples/apps/test.py
 	$PYTHON examples/organization.py
 	end_to_end

@@ -1161,3 +1161,42 @@ review_cold_lookup_is_one_round :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, rounds <= 1, "%d rounds of fetching for one row", rounds)
 }
+
+// While writing goes on, no checkpoint until the log waking would replay is CHECKPOINT_TAIL long; once it stops, one if
+// there is more than QUIET_TAIL to replay, and none for less.
+@(test)
+review_checkpoints_wait_for_quiet :: proc(t: ^testing.T) {
+	state := seeded(3)
+	context.random_generator = rand.default_random_generator(&state)
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	for store_work(&x.store) {}
+	body := make([]byte, 1000)
+	defer delete(body)
+	write :: proc(t: ^testing.T, x: ^Remote_Store, from, n: u64, body: []byte) {
+		for i in from ..< from + n {
+			review_commit(&x.store, {review_cell(i + 1, DATA, 10 + i, body)})
+			testing.expect(t, store_sync(&x.store))
+			remote_store_turn(x, 1 << 20)
+			free_all(context.temp_allocator)
+		}
+	}
+	before := x.remote.stats.checkpoints
+	n := u64(CHECKPOINT_TAIL / 2 / 1000)
+	write(t, &x, 0, n, body)
+	testing.expectf(t, x.remote.stats.checkpoints == before, "%d checkpoints while writing went on", x.remote.stats.checkpoints - before)
+	testing.expect(t, remote_quiet_due(&x.remote))
+	remote_quiet(&x.remote)
+	remote_store_settle(t, &x)
+	testing.expect_value(t, x.remote.stats.checkpoints, before + 1)
+	testing.expect(t, store_tail(&x.store) - x.store.checkpoint <= QUIET_TAIL)
+	testing.expect(t, !remote_quiet_due(&x.remote))
+	// A little, and quiet: not worth one.
+	write(t, &x, n, 2, body)
+	testing.expect(t, !remote_quiet_due(&x.remote))
+	// On and on: one at CHECKPOINT_TAIL, quiet or not.
+	write(t, &x, n + 2, u64(CHECKPOINT_TAIL / 1000) + 2, body)
+	testing.expect(t, x.remote.stats.checkpoints >= before + 2)
+}
