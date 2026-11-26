@@ -3,6 +3,7 @@ package host
 import "core:fmt"
 import "core:nbio"
 import "core:net"
+import "core:slice"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -182,4 +183,35 @@ judged_requests_go_before_the_end :: proc(t: ^testing.T) {
 		step(&w)
 	}
 	testing.expectf(t, len(callee.buf) == expected && strings.contains(string(callee.buf[:]), "WHOLE"), "%d of %d arrived", len(callee.buf), expected)
+}
+
+// The proxy, asked for a device that cannot be reached, keeps nothing of it: as one connecting to its address.
+@(test)
+proxy_keeps_nothing_of_the_unreachable :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, false))
+	w.dead[2] = true
+	host_destroy(&w.hosts[2])
+	sa := world_space(&w, 1)
+	sa.naming = {suffix = NAMES, loopback = {77, 0}}
+	testing.expect(t, world_run(&w, proc(w: ^World, _: rawptr) -> bool {
+		sa := world_space(w, 1)
+		return !slice.contains(zsp.node_reach(&sa.node), w.hosts[2].device) && remote_for(sa.ports, w.hosts[2].device, make = false) == nil
+	}))
+	proxy_open(&w.hosts[1], {net.IP4_Loopback, 0})
+	testing.expect(t, w.hosts[1].proxy_server.open)
+	at, _ := net.bound_endpoint(w.hosts[1].proxy_server.socket)
+	ip, _ := device_address(sa, w.hosts[2].device)
+	request := fmt.tprintf("CONNECT %d.%d.%d.%d:8080 HTTP/1.1\r\nHost: x\r\n\r\n", ip[0], ip[1], ip[2], ip[3])
+	client, err := net.dial_tcp(at)
+	testing.expect(t, err == nil)
+	defer net.close(client)
+	net.send_tcp(client, transmute([]byte)request)
+	start := time.tick_now()
+	for time.tick_since(start) < 300 * time.Millisecond {
+		step(&w)
+	}
+	testing.expect(t, remote_for(sa.ports, w.hosts[2].device, make = false) == nil)
 }

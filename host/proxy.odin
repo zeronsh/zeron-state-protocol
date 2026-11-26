@@ -3,6 +3,7 @@ package host
 import "core:fmt"
 import "core:nbio"
 import "core:net"
+import "core:slice"
 import "core:strings"
 import "../pipe"
 import "../zsp"
@@ -225,7 +226,7 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 	append(&early, ..r.head)
 	append(&early, ..c.buf[r.used:])
 	device := m.device
-	rem := remote_for(sp.ports, device, make = true)
+	rem := remote_for(sp.ports, device, make = slice.contains(zsp.node_reach(&sp.node), device)) // as by its address
 	if rem == nil {
 		proxy_refuse(c)
 		return
