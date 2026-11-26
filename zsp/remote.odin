@@ -126,6 +126,7 @@ Inflight :: struct {
 	gen:       u64,
 	header:    Header,
 	packs:     Page_No, // its root
+	pages:     u64, // in its pack
 	accounted: int, // of pending
 	dead:      int, // of dead
 	victims:   []u64, // segments dropped once it is durable
@@ -158,6 +159,7 @@ Remote :: struct {
 	packs:         Tree, // generation -> {live pages, pages}
 	packs_kept:    Page_No, // its root, as the manifest says
 	kept_gen:      u64, // the latest pack the manifest names; those after it, before next_gen, were never made durable
+	kept_pages:    u64, // how many pages it has
 	deletes:       [dynamic]Remote_Object, // named in the manifest until deleted
 	// What was deleted is deleted again an hour later, as is what was put and never named: a put under way when a host
 	// died may yet land, and the hour is longer than any put lives.
@@ -230,7 +232,7 @@ remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_bu
 	// The latest pack begins with the branches it changed, the roots of every tree among them: asked for at once, they
 	// are at hand in one read, rather than a read a level as each tree is first gone down. Unless the host has them.
 	if r.kept_gen > 0 {
-		for run in Page_No(0) ..< 2 {
+		for run in Page_No(0) ..< min(2, (r.kept_pages + PAGE_RUN - 1) / PAGE_RUN) {
 			no := r.kept_gen << PACK_SHIFT | run * PAGE_RUN
 			probe: Page
 			if !host.cache_get(host.data, .Page, no, ([^]byte)(&probe)[:size_of(Page)]) || !page_sound(&probe, no) {
@@ -854,7 +856,7 @@ remote_begin :: proc(r: ^Remote) {
 	gen := r.next_gen
 	// The generation is spent before anything is put under it: a put that lands late lands on nothing named.
 	r.next_gen = gen + 1
-	if !remote_manifest_write(r, r.header, r.packs_kept, r.kept_gen, r.deletes[:]) {
+	if !remote_manifest_write(r, r.header, r.packs_kept, r.kept_gen, r.kept_pages, r.deletes[:]) {
 		s.failed = true
 		return
 	}
@@ -965,6 +967,7 @@ remote_begin :: proc(r: ^Remote) {
 		gen       = gen,
 		header    = h,
 		packs     = r.packs.root,
+		pages     = u64(n),
 		accounted = r.accounted,
 		dead      = len(r.dead),
 		victims   = slice.clone(r.gone[:]),
@@ -1021,13 +1024,13 @@ remote_commit :: proc(r: ^Remote) {
 	for o in f.deletes {
 		remote_redelete(r, o)
 	}
-	if !remote_manifest_write(r, f.header, f.packs, f.gen, f.deletes[:]) {
+	if !remote_manifest_write(r, f.header, f.packs, f.gen, f.pages, f.deletes[:]) {
 		r.local_from = local_from
 		s.failed = true
 		return
 	}
 	r.header = f.header
-	r.packs_kept, r.kept_gen = f.packs, f.gen
+	r.packs_kept, r.kept_gen, r.kept_pages = f.packs, f.gen, f.pages
 	remote_header_page(r)
 	s.checkpoint = f.header.log
 	s.generation = f.header.generation
@@ -1318,7 +1321,7 @@ touch :: proc(p: ^Pager, no: Page_No, key: ^Key, level: u16, target: Page_No) ->
 // ---------------------------------------------------------------- the manifest
 
 @(private)
-remote_manifest_write :: proc(r: ^Remote, h: Header, packs: Page_No, kept_gen: u64, deletes: []Remote_Object) -> bool {
+remote_manifest_write :: proc(r: ^Remote, h: Header, packs: Page_No, kept_gen, kept_pages: u64, deletes: []Remote_Object) -> bool {
 	w := make([dynamic]byte, context.temp_allocator)
 	magic := MANIFEST_MAGIC
 	append(&w, ..magic[:])
@@ -1340,6 +1343,7 @@ remote_manifest_write :: proc(r: ^Remote, h: Header, packs: Page_No, kept_gen: u
 		write_u64(&w, d.object.number)
 		write_u64(&w, d.at)
 	}
+	write_u64(&w, kept_pages)
 	write_u64(&w, xxhash.XXH64(w[:]))
 	return r.host.manifest_write(r.host.data, w[:])
 }
@@ -1378,6 +1382,7 @@ remote_manifest_read :: proc(r: ^Remote, bytes: []byte) -> bool {
 			return false
 		}
 	}
+	r.kept_pages = read_u64(&rd)
 	remote_header_page(r)
 	return !rd.bad
 }

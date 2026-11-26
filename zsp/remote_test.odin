@@ -982,11 +982,11 @@ remote_relay_revives_sessions_cold :: proc(t: ^testing.T) {
 		remote_work(&relay.remote.remote)
 		_ = session_output(revived)
 		remote_ops(&relay.remote.remote)
-		if model_tick(&relay.remote.host, &relay.remote.remote, 1 << 20) == 0 && !revived.beyond_due && !relay.node.store.replaying {
+		if model_tick(&relay.remote.host, &relay.remote.remote, 1 << 20) == 0 && !relay.node.store.replaying {
 			break
 		}
 	}
-	testing.expect(t, !revived.beyond_due && !relay.node.failed)
+	testing.expect(t, !relay.node.failed)
 	testing.expect_value(t, relay.remote.remote.unguarded, 0)
 	counted := false
 	for w in revived.watches {

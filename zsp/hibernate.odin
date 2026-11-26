@@ -34,11 +34,19 @@ session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 				interest = it.id
 			}
 		}
-		write_u8(w, (1 if x.data else 0) | (2 if x.live else 0) | (4 if x.level else 0) | (8 if interest != 0 else 0) | (16 if x.counts else 0) | (32 if x.settled else 0))
+		write_u8(
+			w,
+			(1 if x.data else 0) | (2 if x.live else 0) | (4 if x.level else 0) | (8 if interest != 0 else 0) | (16 if x.counts else 0) | (32 if x.settled else 0) | (64 if x.counts else 0),
+		)
 		write_key(w, x.lo)
 		write_key(w, x.hi)
 		if interest != 0 {
 			write_varint(w, interest)
+		}
+		if x.counts {
+			// What the peer was last told lies beyond the window: what is to be told next is what differs from it.
+			write_varint(w, u64(x.before))
+			write_varint(w, u64(x.after))
 		}
 	}
 	return true
@@ -63,9 +71,6 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 	s.seq_in = read_varint(&r)
 	s.acked_in = read_varint(&r)
 	s.cursor = n.events.next
-	// Where storage may answer "not yet", what lies beyond each window is counted when the session is next pumped,
-	// in a step: nothing may be read here.
-	s.beyond_due = store_lazy(&n.store)
 	for r.pos < len(r.buf) && !r.bad {
 		x: Watch
 		x.id = read_varint(&r)
@@ -80,13 +85,28 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 			append(&n.interests, Interest{id = id, session = s.id, watch = w})
 			n.next_watch = max(n.next_watch, id & ~INTEREST)
 		}
-		if !store_lazy(&n.store) {
+		if f & 64 != 0 {
+			x.before, x.after = int(read_varint(&r)), int(read_varint(&r))
+		} else if x.counts {
+			// Saved by a relay that kept no counts. Where storage may answer "not yet" nothing may be read here, and
+			// counted later, a change since would be counted in as though told: better it reconnects.
+			if store_lazy(&n.store) {
+				r.bad = true
+				break
+			}
 			x.before, x.after = watch_beyond(n, &x)
 		}
 		append(&s.watches, x)
 	}
 	m := roster_member(&n.roster, s.peer)
 	if r.bad || (s.ready && (m == nil || !member_active(m))) {
+		// Nothing of it stays: nor what it asked upstream for.
+		for i := len(n.interests) - 1; i >= 0; i -= 1 {
+			if n.interests[i].session == s.id {
+				delete(n.interests[i].reports)
+				ordered_remove(&n.interests, i)
+			}
+		}
 		delete(s.watches)
 		free(s)
 		return nil, false

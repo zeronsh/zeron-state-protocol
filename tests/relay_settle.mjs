@@ -132,3 +132,59 @@ try {
   assert.equal(bSaw, false, `Peer B received unpersisted cell (wsB.sent ${sentBefore}->${wsB.sent.length}, wsA.att ${attBefore}->${wsA.attachments.length})`);
   console.log("ok   a relay that cannot keep a cell passes it on to nobody");
 } finally { rmSync(tmp, { recursive: true, force: true }); }
+
+// A device that sends a roster revoking itself to a relay with no room to keep it: the relay says nothing on the
+// strength of a roster it did not keep, and lets everyone go as full, rather than turning the device away.
+const tmp2 = mkdtempSync(join(tmpdir(), "zsp-r2-"));
+try {
+  const spaceId = execFileSync(ZSPD, ["create", tmp2], { encoding: "utf8" }).trim();
+  const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
+  const sql = new Sql(), sockets = new Set(), serverSockets = [];
+  const env = { RELAY_SECRET: relaySecret, STORAGE_LIMIT: 45_000 };
+  const ctx = { storage: { sql, sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+  const doSpace = new Space(ctx, env);
+  class BridgeWS {
+    static OPEN = 1; static CLOSED = 3;
+    constructor(url) {
+      this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
+      doSpace.fetch(new Request(url.replace(/^ws/, "http")));
+      const { server, pair } = nextPair; this._s = server; serverSockets.push(server);
+      pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
+      pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
+      queueMicrotask(() => { this.readyState = 1; this._emit("open", {}); });
+    }
+    _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
+    addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
+    send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+  }
+  const mod = await loadModule();
+  const volA = new MemoryVolume();
+  const stA = await Store.open(volA, 16 << 20);
+  stA.keep("device", readFileSync(join(tmp2, "device.key")));
+  await stA.close();
+  const nodeA = await Node.open({ volume: volA, module: mod, WebSocket: BridgeWS, log: () => {} });
+  const nodeB = await Node.open({ volume: new MemoryVolume(), module: mod, WebSocket: BridgeWS, log: () => {} });
+  execFileSync(ZSPD, ["relay", tmp2, relayPub, "ws://relay.local"]);
+  execFileSync(ZSPD, ["admit", tmp2, nodeB.key, "1"]);
+  const roster1 = readFileSync(join(tmp2, spaceId, "roster"));
+  assert(nodeA.adopt(roster1) && nodeB.adopt(roster1));
+  const schema = { body: columns.bytes(16) };
+  const clientA = new Client({ connect: nodeA.connect.bind(nodeA) });
+  await new Promise((r) => setTimeout(r, 100));
+  await clientA.write(1, (ch) => ch.insert(schema, "items", 1, { body: new Uint8Array(40_000).fill(0x11) }));
+  await new Promise((r) => setTimeout(r, 120));
+  assert(sql.databaseSize > env.STORAGE_LIMIT);
+  const rosterBefore = new Uint8Array(sql.exec("SELECT data FROM kept WHERE name = 'roster'").one().data);
+  const [, wsB] = serverSockets;
+  const sentBefore = wsB.sent.length;
+  execFileSync(ZSPD, ["revoke", tmp2, nodeB.key]);
+  assert(nodeB.adopt(readFileSync(join(tmp2, spaceId, "roster"))));
+  await new Promise((r) => setTimeout(r, 120));
+  const rosterAfter = new Uint8Array(sql.exec("SELECT data FROM kept WHERE name = 'roster'").one().data);
+  clientA.close(); await nodeA.close(); await nodeB.close();
+  assert.deepEqual(rosterAfter, rosterBefore, "the roster with no room for it was not kept");
+  assert.equal(wsB.sent.length, sentBefore, `${wsB.sent.length - sentBefore} frame(s) said on the strength of it, and closed with ${wsB.closed?.code}`);
+  assert.equal(wsB.closed?.code, 1011);
+  console.log("ok   a relay that cannot keep a roster says nothing of it");
+} finally { rmSync(tmp2, { recursive: true, force: true }); }

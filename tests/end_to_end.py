@@ -726,9 +726,20 @@ def test_relay_unbounded():
     cb.until(lambda: len(cb.list(1, "big")) == 240, timeout=120)
     got = {order: values[16] for order, _, values in cb.list(1, "big")}
     assert all(got[o] == sent[o] for o in sent), "nothing garbled"
-    stats = json.loads(urllib.request.urlopen(cloud.url.replace("ws", "http", 1) + "/" + zspd_space(a) + "?stats").read())
+    url = cloud.url.replace("ws", "http", 1) + "/" + zspd_space(a) + "?stats"
+    stats = json.loads(urllib.request.urlopen(url).read())
     assert stats["sqlite"] < 3000000, stats
     assert stats["node"]["extents"] >= 10 and stats["node"]["checkpoints"] > 0, stats
+
+    # What the writing left to do (checkpoints, extents, what they read) is done before what follows is counted.
+    def quiet():
+        s0 = json.loads(urllib.request.urlopen(url).read())
+        time.sleep(0.5)
+        s1 = json.loads(urllib.request.urlopen(url).read())
+        stats.update(s1)
+        return s1["node"]["dirty"] == 0 and all(s0["storage"][k] == s1["storage"][k] for k in ("gets", "puts", "deletes"))
+
+    eventually("the relay has done what writing left it", quiet, timeout=60)
     # A device that comes later is sent all of it, much of it from object storage, which is read an extent at a time.
     before = stats["storage"]["gets"]
     c = Node("uc", "run", "--credential=" + cloud.token, "--no-udp")

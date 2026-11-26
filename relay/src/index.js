@@ -62,6 +62,7 @@ export class Space extends DurableObject {
   #soon = false; // a settle is due at once
   #full = 0; // when storage last could keep no more: for a while after, nobody is let in
   #broken = false; // storage failed where the node was not there to be told
+  #ending = new Set(); // connections whose input failed: let go of once what they have to hear is said, if anything is
 
   constructor(ctx, env) {
     super(ctx, env);
@@ -97,6 +98,7 @@ export class Space extends DurableObject {
       } catch {}
     }
     this.#sockets.clear();
+    this.#ending.clear();
     this.#wasm = undefined;
     this.#epoch++;
     this.#storage.cancel();
@@ -204,7 +206,8 @@ export class Space extends DurableObject {
   webSocketMessage(ws, message) {
     if (!this.#wasm) return void ws.close(1011, FULL); // what came before it was let go
     const { id } = ws.deserializeAttachment();
-    if (typeof message === "string" || !this.#put(new Uint8Array(message), (n) => this.#wasm.received(id, n))) this.#drain(id, ws), this.#drop(id, ws);
+    // Its last words, if any, are said by #settle, and only once what it came to is kept: else, nothing is said at all.
+    if (typeof message === "string" || !this.#put(new Uint8Array(message), (n) => this.#wasm.received(id, n))) this.#ending.add(id);
     this.#settle();
   }
 
@@ -257,6 +260,11 @@ export class Space extends DurableObject {
           said = true;
         }
       }
+      for (const id of this.#ending) {
+        const ws = this.#sockets.get(id);
+        if (ws) this.#drop(id, ws), (said = true);
+      }
+      this.#ending.clear();
     }
     for (const [id, ws] of this.#sockets) {
       const n = this.#wasm.save(id);
