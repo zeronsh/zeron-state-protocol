@@ -1210,7 +1210,7 @@ def test_ports():
     eventually("each is over", lambda: all(c["ended"] or c["fault"] is not None for c in once) or ca.step() and False, timeout=5)
     # And so it is said to one that says all it will as it asks, as a call of one message does: answered all the same.
     asked = []
-    for _ in range(20):
+    for _ in range(12):  # of the 16 a device may ask at once
         call = ca.open(bytes.fromhex(b.key), 1, "zsp.ports", zsp.varint(0))
         call.end()
         asked.append(call)
