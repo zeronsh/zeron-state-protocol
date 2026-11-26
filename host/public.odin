@@ -18,8 +18,13 @@ MAX_EXPOSED :: 4096 // labels at one relay
 PUBLIC_MAX :: 1024 // connections from the public at once
 PUBLIC_HEAD_MAX :: 16 << 10
 PUBLIC_READS :: 16 // reads of one connection, at most, before the others have their turn
-PUBLIC_OUT_MAX :: 256 << 10 // for the public, unwritten: no more is read from it until that has gone
+// For the public, unwritten, past which no more is read from it until some has gone. What waits for it is what the
+// device sent, which its credit bounds (a call's window, 4 MiB at most), and what TLS says of its own, one KeyUpdate
+// for each read at most: so it is read on while it does not read, and a failure or a close of its is heard at once.
+// This is only for what could not otherwise be.
+PUBLIC_OUT_MAX :: 8 << 20
 PUBLIC_HELLO :: 10 * time.Second // to say where to, after which it is let go
+PUBLIC_STALL :: #config(ZSP_PUBLIC_STALL, 60_000) * time.Millisecond // to read what is written to it, or be let go
 
 @(private)
 Relay_Public :: struct {
@@ -65,6 +70,8 @@ Public_Out :: struct {
 	polling:   ^nbio.Operation,
 	writing:   ^nbio.Operation,
 	hello:     ^nbio.Operation, // until it says where to
+	stall:     ^nbio.Operation, // while a write waits on it
+	wrote_at:  time.Tick, // when a write last took anything
 }
 
 // Listens for the public, as configured. False if it cannot.
@@ -482,7 +489,11 @@ public_out_flush :: proc(c: ^Public_Out) {
 	for c.sent < len(c.out) {
 		n, err := net.send_tcp(c.socket, c.out[c.sent:])
 		c.sent += n
+		if n > 0 {
+			c.wrote_at = time.tick_now()
+		}
 		if err == .Would_Block {
+			public_out_stall(c)
 			when POLLS_MEET {
 				if c.polling != nil {
 					nbio.remove(c.polling)
@@ -518,6 +529,31 @@ public_out_flush :: proc(c: ^Public_Out) {
 	if c.shut && c.told_end {
 		public_out_close(c, reset = false)
 	}
+}
+
+// A public that takes nothing of what is written to it for PUBLIC_STALL is let go, as a reverse proxy lets go of a
+// reader that never reads: else it would hold its place, and the device's call, for ever. Timed only while a write
+// waits.
+@(private)
+public_out_stall :: proc(c: ^Public_Out) {
+	if c.stall != nil {
+		return
+	}
+	if c.wrote_at == {} {
+		c.wrote_at = time.tick_now()
+	}
+	due := PUBLIC_STALL - time.tick_since(c.wrote_at)
+	c.stall = nbio.timeout_poly(max(due, 0), c, proc(op: ^nbio.Operation, c: ^Public_Out) {
+		c.stall = nil
+		if c.closed || c.writing == nil {
+			return // written meanwhile: timed again when a write next waits
+		}
+		if time.tick_since(c.wrote_at) >= PUBLIC_STALL {
+			public_out_close(c, reset = true)
+			return
+		}
+		public_out_stall(c)
+	})
 }
 
 // The device would not have it: the public is told plainly, where it speaks HTTP.
@@ -574,6 +610,9 @@ public_out_close :: proc(c: ^Public_Out, reset: bool) {
 	}
 	if c.hello != nil {
 		nbio.remove(c.hello)
+	}
+	if c.stall != nil {
+		nbio.remove(c.stall)
 	}
 	if c.call != 0 {
 		call_cancel(c.sp, c.call)

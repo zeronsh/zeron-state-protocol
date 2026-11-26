@@ -14,6 +14,7 @@ EXE=
 # fragmented, as on busy machines where a big one at times could not be had; what does not fit waits its turn.
 STRICT="-vet -strict-style -define:ODIN_NBIO_QUEUE_SIZE=256"
 SIZED=zsp.review_little_room_whatever_quiet,zsp.review_little_room_pack_before_extent,zsp.review_little_room_small_writes_no_checkpoint # run at full size too
+TESTING="-define:ZSP_CALL_ALIVE=1000 -define:ZSP_PUBLIC_STALL=3000" # what the end-to-end tests wait on, made short
 SMALL="-define:ZSP_SEGMENT=262144 -define:ZSP_LOOSE=12 -define:ZSP_ALIKE=3 -define:ZSP_GC_HOT=4 -define:ZSP_GC_DEAD=1 -define:ZSP_EXTENT=131072 -define:ZSP_LOG_BLOCK=16384 -define:ZSP_LOCAL_KEEP=0" # so that tests roll and reclaim segments
 
 # The relay for speed, with WebAssembly's 128-bit vectors, which Workers have: what it does is mostly ChaCha20-Poly1305.
@@ -98,7 +99,7 @@ test)
 	done
 	# And what shows only at the sizes a relay runs with, where CHECKPOINT_TAIL is larger than an extent.
 	(odin test zsp -out:build/zsp-sized-test$EXE $STRICT -define:ODIN_TEST_NAMES=$SIZED >build/zsp-sized.log 2>&1 || echo zsp-sized >>build/failed; cat build/zsp-sized.log) &
-	(odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 || echo zspd >>build/failed) &
+	(odin build zspd -out:build/zspd$EXE -debug $STRICT $TESTING || echo zspd >>build/failed) &
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
 	(odin build examples/apps -out:build/apps$EXE -debug $STRICT || echo examples >>build/failed) &
 	(! stale web/src/node.wasm || web_wasm || echo web >>build/failed) &
@@ -131,7 +132,7 @@ test)
 	$PYTHON tests/services_test.py
 	if [ "$(uname)" = Linux ]; then
 		# Names, ports and exposure again, under AddressSanitizer: what glibc forgives, it does not.
-		odin build zspd -out:build/zspd-asan -debug -sanitize:address $STRICT -define:ZSP_CALL_ALIVE=1000
+		odin build zspd -out:build/zspd-asan -debug -sanitize:address $STRICT $TESTING
 		ZSPD=build/zspd-asan end_to_end test_names test_ports test_offers_end test_expose test_durable_object_expose test_luau_ports
 	fi
 	wait $web || true
@@ -194,7 +195,7 @@ bench)
 	;;
 nat) odin build zspd -out:build/zspd -debug $STRICT && sudo tests/nat.sh && sudo env NAT_B=--random-fully EXPECT_RELAY=1 tests/nat.sh ;;
 system) # names and addresses as every application here has them: zspd setup, as root, and taken back after
-	odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000
+	odin build zspd -out:build/zspd$EXE -debug $STRICT $TESTING
 	SUDO=sudo
 	[ "${OS:-}" = Windows_NT ] && SUDO= # an Administrator already, or nothing here works
 	$SUDO build/zspd$EXE setup
@@ -207,6 +208,6 @@ system) # names and addresses as every application here has them: zspd setup, as
 	$PYTHON tests/system.py nothing-left || r=1
 	exit $r
 	;;
-slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 && end_to_end slow_hibernation slow_expose_hibernation ;;
+slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT $TESTING && end_to_end slow_hibernation slow_expose_hibernation ;;
 *) sed -n 2p "$0" && exit 2 ;;
 esac

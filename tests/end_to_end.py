@@ -1451,24 +1451,32 @@ def test_expose():
     assert http_get("127.0.0.1", plain, host="nobody.expose.test")[0] == 404
     # A client that says it is done as it asks is answered all the same.
     assert public_get_closing(https, name).endswith(b"hello, public")
-    # One whose TLS fails while it is not reading has its port's connection cut off at once, not once it reads.
+    # One whose TLS fails while it is not reading has its port's connection cut off: at once, where the relay may read
+    # while it waits to write; else (Windows) once it has read nothing for PUBLIC_STALL (3 s as tests build it).
     import ssl, threading
 
     cut_at = []
     flood = socket.create_server(("127.0.0.1", free_port()))
 
-    def flood_one():
-        c, _ = flood.accept()
+    def flood_each():
+        while True:
+            try:
+                c, _ = flood.accept()
+            except OSError:
+                return
+            threading.Thread(target=flood_one, args=(c,), daemon=True).start()
+
+    def flood_one(c):
         c.recv(65536)
         try:
-            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 8388608\r\n\r\n" + b"x" * (8 << 20))
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 67108864\r\n\r\n" + b"x" * (64 << 20))  # more than any buffer holds
             while c.recv(65536):
                 pass
         except OSError:
             pass
         cut_at.append(time.monotonic())
 
-    threading.Thread(target=flood_one, daemon=True).start()
+    threading.Thread(target=flood_each, daemon=True).start()
     floods = ca.expose(flood.getsockname()[1], name="flood")[-1]["label"] + ".expose.test"
     eventually("it too", lambda: all(r["status"] == 0 for e in ca.exposures() for r in e["relays"]))
     context = ssl.create_default_context(cafile=os.path.join(CERTS, "p256.pem"))
@@ -1487,8 +1495,31 @@ def test_expose():
     raw.sendall(outward.read())
     time.sleep(1)  # the answer fills what the relay may write to it
     raw.sendall(b"\x00" * 8)  # and then not TLS at all
-    eventually("the port's connection is cut off", lambda: cut_at, timeout=5)
+    eventually("the port's connection is cut off", lambda: cut_at, timeout=10)
     raw.close()
+    # And one that asks and never reads is let go once it has read nothing for PUBLIC_STALL: it holds no place for ever.
+    stalled = []
+    huge = socket.create_server(("127.0.0.1", free_port()))
+
+    def huge_one():
+        c, _ = huge.accept()
+        c.recv(65536)
+        try:
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 67108864\r\n\r\n" + b"x" * (64 << 20))
+        except OSError:
+            stalled.append(time.monotonic())
+
+    threading.Thread(target=huge_one, daemon=True).start()
+    huges = ca.expose(huge.getsockname()[1], name="huge")[-1]["label"] + ".expose.test"
+    eventually("that one", lambda: all(r["status"] == 0 for e in ca.exposures() for r in e["relays"]))
+    asked = socket.create_connection(("127.0.0.1", plain), 5)
+    asked.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    asked.sendall(f"GET / HTTP/1.1\r\nHost: {huges}\r\n\r\n".encode())
+    start = time.monotonic()
+    eventually("a reader that never reads is let go", lambda: stalled, timeout=15)
+    assert stalled[0] - start >= 2.5, stalled[0] - start  # not before its time
+    asked.close()
+    ca.unexpose(huge.getsockname()[1])
     ca.unexpose(flood.getsockname()[1])
     # A port that resets each connection as it accepts it: the public hears nothing from it, and the device and relay
     # go on as before.
