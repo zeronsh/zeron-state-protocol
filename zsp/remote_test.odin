@@ -464,6 +464,8 @@ objects_sound :: proc(s: ^Store, h: ^Model_Host) -> bool {
 @(test)
 remote_store_matches_quick :: proc(t: ^testing.T) {
 	SEEDS :: #config(ZSP_REMOTE_SEEDS, 6)
+	all_relocated := 0
+	defer testing.expectf(t, all_relocated > 0, "nothing was ever copied on out of a pack")
 	for seed in 0 ..< SEEDS {
 		state := seeded(u64(seed) + 900)
 		context.random_generator = rand.default_random_generator(&state)
@@ -650,6 +652,7 @@ remote_store_matches_quick :: proc(t: ^testing.T) {
 		})
 		testing.expectf(t, stored <= 3 * reached + 64, "seed %d: %d pages stored for %d that live", seed, stored, reached)
 		testing.expectf(t, crashes > 0 && checkpoints > 10, "seed %d: %d crashes, %d checkpoints", seed, crashes, checkpoints)
+		all_relocated += relocated
 		remote_store_close(&x)
 	}
 }
@@ -760,4 +763,64 @@ remote_store_made_from_a_whole_log :: proc(t: ^testing.T) {
 	testing.expect_value(t, remote_census(t, &x), want)
 	testing.expect(t, !x.store.failed)
 	remote_store_close(&x)
+}
+
+// A device catching up is sent rows in order, a few at a time; the log they lie in is read ahead, further each time,
+// so that it costs a read an extent or so, not one a block.
+@(test)
+remote_catching_up_reads_ahead :: proc(t: ^testing.T) {
+	state := seeded(5)
+	context.random_generator = rand.default_random_generator(&state)
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x, 2048, 256)
+	defer remote_store_close(&x)
+	ROWS :: 300
+	big := make([]byte, 6 << 10)
+	defer delete(big)
+	for i in 0 ..< ROWS {
+		body: [24]byte
+		put_u64(body[:], 1 << 32 | 1)
+		put_u64(body[16:], u64(i))
+		row := Id{1 << 32 | u64(i), 7}
+		cells := [2]Cell{{row, PLACE, .Place, {u64(i) * 2 + 1, 1}, body[:]}, {row, DATA, .Value, {u64(i) * 2 + 2, 1}, big}}
+		remote_store_step(t, &x, &cells, proc(s: ^Store, data: rawptr) {store_commit(s, (^[2]Cell)(data)[:])})
+		testing.expect(t, store_sync(&x.store))
+		remote_store_turn(&x, 1 << 20)
+		free_all(context.temp_allocator)
+	}
+	for _ in 0 ..< 5 {
+		x.remote.want_checkpoint = true
+		remote_store_settle(t, &x)
+	}
+	for _, c in x.remote.blocks {
+		delete(c.bytes)
+	}
+	clear(&x.remote.blocks)
+	before := x.remote.stats.log_gets
+	Fill :: struct {
+		from: Key,
+		done: bool,
+	}
+	f := Fill{KEY_MIN, false}
+	for !f.done {
+		remote_store_step(t, &x, &f, proc(s: ^Store, data: rawptr) {
+			f := (^Fill)(data)
+			scan := tree_scan(s, s.shelf, f.from, KEY_MAX)
+			rows := 0
+			for leaf in tree_next(&scan) {
+				cs := row_scan(s, key_row(leaf.key))
+				for _ in row_next(s, &cs) {}
+				if rows += 1; rows == 4 {
+					f.from = key_next(leaf.key)
+					return
+				}
+			}
+			f.done = true
+		})
+		remote_rest(&x.remote)
+	}
+	bytes := ROWS * (len(big) + 100)
+	gets := x.remote.stats.log_gets - before
+	testing.expectf(t, gets <= bytes / EXTENT + 4, "%d reads of the log for %d extents of it", gets, bytes / EXTENT + 1)
 }

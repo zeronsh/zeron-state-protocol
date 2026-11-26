@@ -13,7 +13,7 @@ EXE=
 # An event loop's ring of 256 rather than 2048: the kernel finds the smaller run of memory it wants even when it is
 # fragmented, as on busy machines where a big one at times could not be had; what does not fit waits its turn.
 STRICT="-vet -strict-style -define:ODIN_NBIO_QUEUE_SIZE=256"
-SMALL="-define:ZSP_SEGMENT=262144 -define:ZSP_LOOSE=12 -define:ZSP_ALIKE=3" # so that tests roll and reclaim segments
+SMALL="-define:ZSP_SEGMENT=262144 -define:ZSP_LOOSE=12 -define:ZSP_ALIKE=3 -define:ZSP_GC_HOT=4 -define:ZSP_GC_DEAD=1 -define:ZSP_EXTENT=131072" # so that tests roll and reclaim segments
 
 wasm() {
 	odin build relay/wasm -target:js_wasm32 -o:size -out:relay/src/relay.wasm -no-entry-point $STRICT \

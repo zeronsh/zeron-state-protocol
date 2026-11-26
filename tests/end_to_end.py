@@ -729,7 +729,8 @@ def test_relay_unbounded():
     stats = json.loads(urllib.request.urlopen(cloud.url.replace("ws", "http", 1) + "/" + zspd_space(a) + "?stats").read())
     assert stats["sqlite"] < 3000000, stats
     assert stats["node"]["extents"] >= 10 and stats["node"]["checkpoints"] > 0, stats
-    # A device that comes later is sent all of it, much of it from object storage.
+    # A device that comes later is sent all of it, much of it from object storage, which is read an extent at a time.
+    before = stats["storage"]["gets"]
     c = Node("uc", "run", "--credential=" + cloud.token, "--no-udp")
     zspd("admit", a.dir, zspd("key", c.dir), "1")
     zspd("join", c.dir, zspd_space(a), cloud.key, cloud.url)
@@ -740,7 +741,7 @@ def test_relay_unbounded():
     cc.until(lambda: len(cc.list(1, "big")) == 240, timeout=120)
     assert all(values[16] == sent[order] for order, _, values in cc.list(1, "big")), "nothing garbled"
     stats = json.loads(urllib.request.urlopen(cloud.url.replace("ws", "http", 1) + "/" + zspd_space(a) + "?stats").read())
-    assert stats["node"]["gets"] > 0, stats
+    assert 0 < stats["storage"]["gets"] - before <= 40, stats
 
 
 def slow_hibernation():
@@ -801,4 +802,5 @@ def main():
     sys.exit(any(r.returncode for r in runs))
 
 
-main()
+if __name__ == "__main__":
+    main()

@@ -255,6 +255,7 @@ export class Space extends DurableObject {
         ws.serializeAttachment({ id, space: this.#space }); // too much to carry: after a sleep, it reconnects
       }
     }
+    this.#wasm.ops(); // what taking output wanted, fetched now: not when something next happens
     this.#wasm.rest();
     if (this.#broken || this.#wasm.failed()) return void this.#fail();
     this.#storage.run(this.#done);
@@ -271,8 +272,8 @@ export class Space extends DurableObject {
     if (this.#wasm) {
       const n = this.#wasm.stats();
       const d = new DataView(this.#view(this.#wasm.data(), n).slice().buffer);
-      const names = ["gets", "puts", "deletes", "got", "put", "checkpoints", "extents", "fetched_pages", "local_hits", "relocated", "dirty"];
-      out.node = Object.fromEntries(names.map((k, i) => [k, Number(d.getBigUint64(i * 8, true))]));
+      const names = ["gets", "puts", "deletes", "got", "put", "checkpoints", "extents", "fetched_pages", "local_hits", "relocated", "dirty", "log_gets"];
+      out.node = Object.fromEntries(names.map((k, i) => [k, Number(d.getBigUint64(i * 8, false))]));
       out.memory = this.#wasm.memory.buffer.byteLength;
     }
     return new Response(JSON.stringify(out) + "\n", { headers: { "content-type": "application/json" } });

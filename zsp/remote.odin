@@ -89,6 +89,7 @@ Remote_Stats :: struct {
 	checkpoints, extents:      int,
 	fetched_pages, local_hits: int,
 	relocated:                 int, // pages copied on out of packs mostly superseded
+	log_gets:                  int, // of the gets, of the log
 }
 
 Redelete :: struct {
@@ -166,6 +167,8 @@ Remote :: struct {
 	want_blocks:   map[u64]struct{},
 	getting_pages: map[u64]u32, // a run's first page -> op
 	getting_blocks: map[u64]u32, // a block -> op
+	read_to:       u64, // where the last read of the log ended
+	ahead:         u64, // how far beyond what is wanted it reads
 	ready:         [dynamic]^Remote_Op, // started by remote_ops
 
 	// The checkpoint under way, if any, and the bookkeeping that precedes one.
@@ -441,12 +444,25 @@ remote_ops :: proc(r: ^Remote) {
 			for j < len(blocks) && blocks[j] == blocks[j - 1] + LOG_BLOCK && blocks[j] / EXTENT == blocks[i] / EXTENT {
 				j += 1
 			}
+			// Reading on from where the last read ended, as a device catching up does: read further ahead each time, up
+			// to the rest of the extent; else a little.
+			first, end := blocks[i], blocks[j - 1] + LOG_BLOCK
+			r.ahead = min(max(r.ahead, LOG_BLOCK) * 2, EXTENT) if first == r.read_to else 2 * LOG_BLOCK
+			end = min(max(end, first + r.ahead), (first / EXTENT + 1) * EXTENT)
+			for b := blocks[j - 1] + LOG_BLOCK; b < end; b += LOG_BLOCK {
+				if b in r.blocks || b in r.getting_blocks {
+					end = b
+					break
+				}
+			}
+			r.read_to = end
 			op := remote_op(r, .Get_Log)
-			op.number = blocks[i] / EXTENT
-			op.off = blocks[i] % EXTENT
-			op.len = u64(j - i) * LOG_BLOCK
-			for k in i ..< j {
-				r.getting_blocks[blocks[k]] = op.id
+			r.stats.log_gets += 1
+			op.number = first / EXTENT
+			op.off = first % EXTENT
+			op.len = end - first
+			for b := first; b < end; b += LOG_BLOCK {
+				r.getting_blocks[b] = op.id
 			}
 			remote_start(r, op)
 			i = j
@@ -541,9 +557,8 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 			}
 			r.tick += 1
 			r.blocks[b] = {slice.clone(bytes[lo:hi]), r.tick}
-			if hi - lo == LOG_BLOCK {
-				r.host.cache_put(r.host.data, .Log, b, bytes[lo:hi])
-			}
+			// Not kept by the host: a row written costs more than reading it again, and what is read of the log is
+			// seldom read twice, as it is when a device catches up.
 		}
 	case .Get_Hints:
 		g := &r.gc
@@ -1070,7 +1085,9 @@ remote_upload :: proc(r: ^Remote) {
 
 GC_STEP :: 64 // pages touched in a step
 GC_LIVE :: 2 // a pack is emptied once fewer than one in this many of its pages live
-GC_HOT :: 4 // the latest packs are let be: their pages are still changing
+GC_HOT :: #config(ZSP_GC_HOT, 64) // the latest packs are let be: what is changing will empty them sooner and for nothing
+GC_DEAD :: #config(ZSP_GC_DEAD, 64) // nor one with fewer dead pages than this: emptying it costs more than keeping them
+GC_WORTH :: CHECKPOINT_DIRTY / 4 // pages copied on that are worth a checkpoint of their own; fewer wait for the next
 
 // Copies on what still lives in a pack mostly superseded, so that it is soon wholly superseded and deleted.
 @(private)
@@ -1130,9 +1147,9 @@ remote_gc_steps :: proc(r: ^Remote) -> (waiting: bool) {
 	}
 	delete(g.hints)
 	g^ = {}
-	// What was copied on goes into the next checkpoint, which is then due; and until it is durable the books are not
-	// yet what they will be, so nothing else is chosen.
-	r.want_checkpoint = true
+	// What was copied on goes into the next checkpoint, made for it if it is worth one; and until it is durable the
+	// books are not yet what they will be, so nothing else is chosen.
+	r.want_checkpoint ||= len(s.dirty) >= GC_WORTH
 	r.gc_after = r.next_gen
 	return false
 }
@@ -1143,7 +1160,7 @@ remote_gc_victim :: proc(r: ^Remote) -> (gen, total: u64, ok: bool) {
 	best := f64(1)
 	for leaf in tree_next(&scan) {
 		g, live, pages := leaf.key[4], leaf.val[0], leaf.val[1]
-		if g + GC_HOT >= r.next_gen || pages == 0 || live * GC_LIVE >= pages {
+		if g + GC_HOT >= r.next_gen || pages == 0 || live * GC_LIVE >= pages || pages - live < GC_DEAD {
 			continue
 		}
 		if ratio := f64(live) / f64(pages); ratio < best {

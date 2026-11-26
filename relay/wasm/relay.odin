@@ -227,6 +227,14 @@ settle :: proc "c" () -> int {
 	return 1 if node.store.more else 0
 }
 
+// Starts fetching what producing output wanted. Call after taking output, before resting.
+@(export)
+ops :: proc "c" () {
+	context = runtime.default_context()
+	zsp.remote_ops(&remote)
+	free_all(context.temp_allocator)
+}
+
 // An operation `start` began has finished; for a get, what it read lies in the buffer.
 @(export)
 done :: proc "c" (id: u32, ok, absent: bool, size: int) {
@@ -235,13 +243,13 @@ done :: proc "c" (id: u32, ok, absent: bool, size: int) {
 	free_all(context.temp_allocator)
 }
 
-// What it has cost so far, into the buffer: eleven numbers.
+// What it has cost so far, into the buffer: twelve numbers.
 @(export)
 stats :: proc "c" () -> int {
 	context = runtime.default_context()
 	clear(&message)
 	st := remote.stats
-	for v in ([?]u64{u64(st.gets), u64(st.puts), u64(st.deletes), st.got, st.put, u64(st.checkpoints), u64(st.extents), u64(st.fetched_pages), u64(st.local_hits), u64(st.relocated), u64(len(node.store.dirty))}) {
+	for v in ([?]u64{u64(st.gets), u64(st.puts), u64(st.deletes), st.got, st.put, u64(st.checkpoints), u64(st.extents), u64(st.fetched_pages), u64(st.local_hits), u64(st.relocated), u64(len(node.store.dirty)), u64(st.log_gets)}) {
 		zsp.write_u64(&message, v)
 	}
 	return len(message)

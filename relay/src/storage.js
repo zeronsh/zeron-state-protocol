@@ -29,7 +29,7 @@ export class Storage {
   #queue = []; // operations to start
   #running = 0;
   #failures = 0; // in a row, for backing off
-  stats = { gets: 0, puts: 0, deletes: 0, got: 0, put: 0, rowsWritten: 0, rowsRead: 0, failures: 0 };
+  stats = { gets: 0, puts: 0, deletes: 0, got: 0, put: 0, rowsWritten: 0, rowsRead: 0, failures: 0, getMs: 0, putMs: 0 };
 
   constructor(ctx, env) {
     this.#ctx = ctx;
@@ -295,6 +295,7 @@ export class Storage {
       case HINTS: {
         this.stats.gets++;
         let object;
+        const began = Date.now();
         try {
           object = await this.#bucket.get(key, { range: { offset: op.off, length: op.len } });
         } catch (e) {
@@ -303,20 +304,25 @@ export class Storage {
         }
         if (object === null) return { ok: true, absent: true };
         const bytes = new Uint8Array(await object.arrayBuffer());
+        this.stats.getMs += Date.now() - began;
         this.stats.got += bytes.length;
         return { ok: true, bytes };
       }
       case PUT_PACK:
         this.stats.puts++;
         this.stats.put += op.body.length;
+        const began = Date.now();
         await this.#bucket.put(key, op.body);
+        this.stats.putMs += Date.now() - began;
         return { ok: true };
       case PUT_EXTENT: {
         const bytes = new Uint8Array(op.len);
         if (!this.#log_read(op.off, bytes)) return { ok: false };
         this.stats.puts++;
         this.stats.put += bytes.length;
+        const began = Date.now();
         await this.#bucket.put(key, bytes);
+        this.stats.putMs += Date.now() - began;
         return { ok: true };
       }
       case DELETE: {
