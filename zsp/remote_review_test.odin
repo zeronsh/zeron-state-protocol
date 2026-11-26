@@ -496,3 +496,110 @@ review_writing_waits_for_object_storage :: proc(t: ^testing.T) {
 	sim_settle(&s)
 	sim_check(&s)
 }
+
+// A session is not saved for sleep while it holds what saving would lose: changes it has yet to be sent, a comparison
+// owed, an acknowledgement owed, or a verdict awaited. It reconnects instead.
+@(test)
+review_session_saved_only_whole :: proc(t: ^testing.T) {
+	state := seeded(31)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	s.lazy = .Remote
+	sim_init(t, &s, 2, 0, 1, 64)
+	defer sim_destroy(&s)
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	at_relay := s.links[0].b
+	saved := make([dynamic]byte, context.temp_allocator)
+	testing.expect(t, session_save(at_relay, &saved), "a session level and quiet is saved")
+	n := &s.nodes[2].node
+	cases := []string{"changes unsent", "a comparison owed", "an acknowledgement owed", "a verdict awaited"}
+	for c, i in cases {
+		cursor, recompare, seq_in, accepted := at_relay.cursor, at_relay.recompare, at_relay.seq_in, at_relay.accepted
+		switch i {
+		case 0:
+			at_relay.cursor = n.events.next - 1 if n.events.next > 0 else n.events.next + 1
+		case 1:
+			at_relay.recompare = true
+		case 2:
+			at_relay.seq_in = at_relay.acked_in + 1
+		case 3:
+			at_relay.accepted = false
+		}
+		clear(&saved)
+		testing.expectf(t, !session_save(at_relay, &saved), "saved with %s", c)
+		at_relay.cursor, at_relay.recompare, at_relay.seq_in, at_relay.accepted = cursor, recompare, seq_in, accepted
+	}
+}
+
+// A segment evacuated after the next pack's books were begun is forgotten as waste by that pack all the same, as it lets
+// it go: what a checkpoint lets go of is just what it says is gone.
+@(test)
+review_evacuated_late_still_forgotten :: proc(t: ^testing.T) {
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	for store_work(&x.store) {}
+	st := store_begin(&x.store)
+	tree_put(&x.store, &x.store.waste, {0, 0, 0, 0, 7}, {SEGMENT, 0})
+	store_end(&x.store, &st, true)
+	review_commit(&x.store, {review_cell(1, 1, 10, {1})})
+	testing.expect(t, store_sync(&x.store))
+	// The books begun, and the pack's entry made, before the segment is done with.
+	testing.expect(t, !remote_account_steps(&x.remote))
+	testing.expect(t, x.remote.entry)
+	append(&x.store.evacuated, 7)
+	x.remote.want_checkpoint = true
+	remote_store_settle(t, &x)
+	testing.expect(t, !slice.contains(x.store.evacuated[:], u64(7)), "not let go of")
+	gone := false
+	remote_store_step(t, &x, &gone, proc(s: ^Store, data: rawptr) {
+		_, there := tree_get(s, s.waste, {0, 0, 0, 0, 7})
+		(^bool)(data)^ = !there
+	})
+	testing.expect(t, gone, "let go of, and still said to be waste")
+}
+
+// However small the host's storage is said to be, writing that waits for object storage waits only until it has caught
+// up: past what is kept, a whole extent is always there to put.
+@(test)
+review_waiting_is_never_for_ever :: proc(t: ^testing.T) {
+	for c in ([][2]u64{{EXTENT / 3, EXTENT * 3 / 4}, {2 * EXTENT, EXTENT + EXTENT / 2}}) {
+		state := seeded(201)
+		context.random_generator = rand.default_random_generator(&state)
+		s: Sim
+		s.lazy = .Remote
+		sim_init(t, &s, 2, 0, 1, 64)
+		defer sim_destroy(&s)
+		relay := s.nodes[2]
+		r := &relay.remote.remote
+		relay.remote.host.fail = 0
+		remote_limits(r, c[0], c[1])
+		testing.expect(t, r.local_most >= r.local_keep + 2 * EXTENT)
+		sim_link(&s, 0, 2)
+		sim_settle(&s)
+		a := s.nodes[0]
+		big := make([]byte, 4 << 10)
+		defer delete(big)
+		for i in 0 ..< 120 {
+			s.now += 3
+			a.node.now = sim_now(&s, a)
+			body: [24]byte
+			put_u64(body[:], 1 << 32 | 5)
+			put_u64(body[8:], 5)
+			put_u64(body[16:], u64(i))
+			row := node_id(&a.node, 1)
+			_ = node_write(&a.node, {{row, PLACE, .Place, node_stamp(&a.node), body[:]}, {row, DATA, .Value, node_stamp(&a.node), big}})
+			if i % 10 == 0 {
+				sim_settle(&s)
+			}
+			free_all(context.temp_allocator)
+		}
+		sim_settle(&s)
+		testing.expectf(t, !remote_full(r), "waiting for ever: tail %d, uploaded %d, from %d, most %d", store_tail(&relay.node.store), r.uploaded, r.local_from, r.local_most)
+		sim_link(&s, 1, 2)
+		sim_settle(&s)
+		sim_check(&s)
+	}
+}

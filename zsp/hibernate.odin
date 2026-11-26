@@ -6,10 +6,15 @@ package zsp
 // Appends the session's state. False when it is in the middle of something and must not sleep.
 @(require_results)
 session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
+	n := s.node
 	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || len(s.tasks) > 0 || len(s.refused) > 0 || s.closing {
 		return false
 	}
-	n := s.node
+	// Nor anything more that is not saved: changes it has yet to be sent (as where storage answered "not yet"), a
+	// comparison owed, an acknowledgement owed, or the host's verdict on it. Better it reconnects than misses any.
+	if s.cursor != n.events.next || s.recompare || s.seq_in > s.acked_in || (s.greeted && !s.accepted) {
+		return false
+	}
 	write_varint(w, u64(s.id))
 	write_u8(
 		w,

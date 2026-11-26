@@ -1,0 +1,134 @@
+// The relay's Durable Object, run in Node with the real relay.wasm, storage.js and index.js, and two web devices: what
+// it fails to keep it passes on to nobody. A device writes past STORAGE_LIMIT; the other never sees what was refused,
+// and the writer is let go of. Needs build/zspd, relay/src/relay.wasm and web/src/node.wasm: run by ./x test.
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { registerHooks } from "node:module";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
+
+const REPO = resolve(".");
+const ZSPD = resolve("./build/zspd" + (process.platform === "win32" ? ".exe" : ""));
+
+class Sql {
+  constructor() { this.db = new DatabaseSync(":memory:"); }
+  get databaseSize() { return this.db.prepare("PRAGMA page_count").get().page_count * this.db.prepare("PRAGMA page_size").get().page_size; }
+  exec(query, ...args) {
+    const st = this.db.prepare(query);
+    let rows = [], changes = 0;
+    if (/^\s*(SELECT|PRAGMA)/i.test(query))
+      rows = st.all(...args).map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Uint8Array ? v.slice().buffer : v])));
+    else changes = st.run(...args.map((a) => (a instanceof Uint8Array ? a.slice() : a))).changes;
+    return { toArray: () => rows, one: () => rows[0], rowsRead: rows.length, rowsWritten: changes };
+  }
+}
+
+registerHooks({
+  resolve(spec, ctx, next) {
+    if (spec === "cloudflare:workers") return { url: "mock:cf", shortCircuit: true };
+    if (spec === "./relay.wasm") return { url: "mock:wasm", shortCircuit: true };
+    return next(spec, ctx);
+  },
+  load(url, ctx, next) {
+    if (url === "mock:cf") return { format: "module", shortCircuit: true, source: "export class DurableObject { constructor(c,e){ this.ctx=c; this.env=e; } }" };
+    if (url === "mock:wasm") return { format: "module", shortCircuit: true, source: `import { readFileSync } from "node:fs"; export default new WebAssembly.Module(readFileSync(${JSON.stringify(join(REPO, "relay/src/relay.wasm"))}));` };
+    return next(url, ctx);
+  },
+});
+
+globalThis.WebSocketRequestResponsePair = class { constructor(a, b) { this.request = a; this.response = b; } };
+const OrigResponse = globalThis.Response;
+globalThis.Response = class extends OrigResponse {
+  constructor(b, init) { init?.status === 101 ? (super(null, { status: 200 }), (this.webSocket = init.webSocket)) : super(b, init); }
+};
+class MockServerWS {
+  constructor(onSend, onClose) { this._onSend = onSend; this._onClose = onClose; this.sent = []; this.attachments = []; this.closed = null; }
+  send(d) { const b = new Uint8Array(d).slice(); this.sent.push(b); this._onSend(b); }
+  close(code, reason) { this.closed = { code, reason }; this._onClose(code, reason); }
+  serializeAttachment(v) { this._att = structuredClone(v); this.attachments.push(structuredClone(v)); }
+  deserializeAttachment() { return this._att; }
+}
+let nextPair;
+globalThis.WebSocketPair = class {
+  constructor() {
+    const pair = { onMsg: null, onClose: null };
+    const server = new MockServerWS((b) => pair.onMsg?.(b), (c, r) => pair.onClose?.(c, r));
+    this[0] = {}; this[1] = server; nextPair = { server, pair };
+  }
+};
+
+const { Space, publicKey } = await import(pathToFileURL(join(REPO, "relay/src/index.js")).href);
+const { Node } = await import(pathToFileURL(join(REPO, "web/src/node.ts")).href);
+const { Store } = await import(pathToFileURL(join(REPO, "web/src/store.ts")).href);
+const { Client, columns } = await import(pathToFileURL(join(REPO, "web/src/client.ts")).href);
+const { MemoryVolume } = await import(pathToFileURL(join(REPO, "web/src/volume.ts")).href);
+const { loadModule } = await import(pathToFileURL(join(REPO, "web/src/wasm.ts")).href);
+
+const tmp = mkdtempSync(join(tmpdir(), "zsp-r2-"));
+try {
+  const spaceId = execFileSync(ZSPD, ["create", tmp], { encoding: "utf8" }).trim();
+  const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
+  const sql = new Sql(), sockets = new Set(), serverSockets = [];
+  const env = { RELAY_SECRET: relaySecret, STORAGE_LIMIT: 45_000 };
+  const ctx = { storage: { sql, sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+  const doSpace = new Space(ctx, env);
+
+  class BridgeWS {
+    static OPEN = 1; static CLOSED = 3;
+    constructor(url) {
+      this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
+      doSpace.fetch(new Request(url.replace(/^ws/, "http")));
+      const { server, pair } = nextPair; this._s = server; serverSockets.push(server);
+      pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
+      pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
+      queueMicrotask(() => { this.readyState = 1; this._emit("open", {}); });
+    }
+    _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
+    addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
+    send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+  }
+
+  const mod = await loadModule();
+  const volA = new MemoryVolume();
+  const stA = await Store.open(volA, 16 << 20);
+  stA.keep("device", readFileSync(join(tmp, "device.key")));
+  await stA.close();
+  const nodeA = await Node.open({ volume: volA, module: mod, WebSocket: BridgeWS, log: () => {} });
+  const nodeB = await Node.open({ volume: new MemoryVolume(), module: mod, WebSocket: BridgeWS, log: () => {} });
+  execFileSync(ZSPD, ["relay", tmp, relayPub, "ws://relay.local"]);
+  execFileSync(ZSPD, ["admit", tmp, nodeB.key, "1"]);
+  const roster = readFileSync(join(tmp, spaceId, "roster"));
+  assert(nodeA.adopt(roster) && nodeB.adopt(roster));
+
+  const schema = { body: columns.bytes(16) };
+  const clientA = new Client({ connect: nodeA.connect.bind(nodeA) });
+  const clientB = new Client({ connect: nodeB.connect.bind(nodeB) });
+  let stateB = { rows: [] };
+  clientB.window({ scope: 1, list: "items", table: schema, size: 100, from: "start" }, (s) => (stateB = s));
+  await new Promise((r) => setTimeout(r, 120));
+
+  // Near STORAGE_LIMIT, 45 KiB, with a cell of 40 KiB; then one that does not fit.
+  await clientA.write(1, (ch) => ch.insert(schema, "items", 1, { body: new Uint8Array(40_000).fill(0x11) }));
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(stateB.rows.length, 1);
+
+  const [wsA, wsB] = serverSockets;
+  const sentBefore = wsB.sent.length, attBefore = wsA.attachments.length;
+  const logBefore = sql.exec("SELECT COALESCE(SUM(length(data)), 0) AS n FROM log").one().n;
+
+  void clientA.write(1, (ch) => ch.insert(schema, "items", 2, { body: new Uint8Array(1000).fill(0xab) }));
+  await new Promise((r) => setTimeout(r, 120));
+
+  const logAfter = sql.exec("SELECT COALESCE(SUM(length(data)), 0) AS n FROM log").one().n;
+  const bSaw = stateB.rows.some((r) => r.body?.length === 1000 && r.body[0] === 0xab);
+  clientA.close(); clientB.close(); await nodeA.close(); await nodeB.close();
+
+  assert.equal(logAfter, logBefore);
+  assert.equal(wsA.closed?.code, 1011);
+  assert.equal(bSaw, false, `Peer B received unpersisted cell (wsB.sent ${sentBefore}->${wsB.sent.length}, wsA.att ${attBefore}->${wsA.attachments.length})`);
+  console.log("ok   a relay that cannot keep a cell passes it on to nobody");
+} finally { rmSync(tmp, { recursive: true, force: true }); }

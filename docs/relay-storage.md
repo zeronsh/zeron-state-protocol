@@ -1,8 +1,9 @@
 # Where a relay keeps a space
 
 A relay on Durable Objects keeps each space in an R2 bucket, with the space's object's own SQLite as its cache. A space has no size:
-R2 has none, and what the object keeps is small whatever the space comes to. A relay without a bucket keeps a space in its object alone,
-as it always did, until that is full. `zspd serve` keeps spaces in files, as it always has.
+R2 has none, and what the object keeps is small whatever the space comes to. A relay without a bucket keeps what it would have put in R2
+in its object's SQLite too, and so a space in its object alone, as it always did, until that is full. `zspd serve` keeps spaces in files, as
+it always has.
 
 ## What is where
 
@@ -45,8 +46,10 @@ what SQLite had not synced (zsp/remote_test.odin, tests/relay_storage.mjs), and 
 
 ## When it is full
 
-Should R2 fall behind, so that the object holds more of the log than 64 MiB, or half of `STORAGE_LIMIT`, what devices write waits until R2 has
-caught up: it is acknowledged later, and nothing is turned away for want of room that R2 has. What can still fill up is the object's own
+Should R2 fall behind, so that the object holds more of the log than 64 MiB, or half of `STORAGE_LIMIT` (but never less than the 4 MiB it keeps
+at hand and two extents more, so that there is always a whole extent to put, and waiting ends), what devices write waits until R2 has caught
+up: it is acknowledged later, and nothing is turned away for want of room that R2 has. A `STORAGE_LIMIT` below some 8 MiB leaves no room for
+that, and such an object fills as one without a bucket does. What can still fill up is the object's own
 SQLite where no bucket is bound. Then the relay says so as it always did: whoever is connected is let go with `1011`, and for `FULL_WAIT`
 milliseconds (a minute) anyone who knocks is answered `507`. Nothing that was not kept was acknowledged, and every device still has it.
 

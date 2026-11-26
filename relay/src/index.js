@@ -70,6 +70,10 @@ export class Space extends DurableObject {
     // Nothing is stored until someone admitted has something to store: merely knocking leaves no trace. Until
     // then a sleeping object's sockets remember which space it is.
     this.#storage = new Storage(ctx, env);
+    this.#storage.onFull = () => {
+      this.#broken = true;
+      this.#settle();
+    };
     const sockets = ctx.getWebSockets();
     for (const ws of sockets) this.#space ??= ws.deserializeAttachment()?.space;
     this.#space ??= this.#storage.kept("space");
@@ -146,8 +150,7 @@ export class Space extends DurableObject {
     const limit = Number(this.env.STORAGE_LIMIT ?? 0), keep = limit > 0 ? Math.min(4 << 20, Math.floor(limit / 4)) : 4 << 20;
     // And writing waits for R2, should it fall behind, before this storage holds more of the log than 64 MiB, or half of
     // what may be kept here: a space R2 can keep never fills it.
-    // With no bucket bound there is nothing to wait for: storage here fills, and the relay says so.
-    const most = !this.env.STORE ? 0 : limit > 0 ? Math.min(64 << 20, Math.floor(limit / 2)) : 64 << 20;
+    const most = limit > 0 ? Math.min(64 << 20, Math.floor(limit / 2)) : 64 << 20;
     if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length, pages, blocks, keep, most)) {
       throw exports.failed() ? new Full(FULL) : new Error("storage is damaged");
     }
@@ -191,7 +194,7 @@ export class Space extends DurableObject {
     if (this.env.STATS === "1" && url.searchParams.has("probe")) return this.#storage.probe().then((t) => new Response(JSON.stringify(t) + "\n"));
     const wait = Number(this.env.FULL_WAIT ?? 60000);
     if (this.#full && Date.now() - this.#full < wait) return new Response(FULL + "\n", { status: 507 });
-    if (!this.#wasm && !this.#begin()) return new Response(FULL + "\n", { status: 507 });
+    if (!this.#wasm && (!this.#begin() || (this.#settle(), !this.#wasm))) return new Response(FULL + "\n", { status: 507 });
     const { 0: client, 1: server } = new WebSocketPair();
     const id = this.#next++;
     this.ctx.acceptWebSocket(server);
@@ -241,6 +244,8 @@ export class Space extends DurableObject {
   #settle() {
     if (!this.#wasm) return;
     const more = this.#wasm.settle();
+    // What failed to be kept is said to nobody: not passed on, and no session saved as though it had been.
+    if (this.#broken || this.#wasm.failed()) return void this.#fail();
     // One socket's end may give the others something to hear, so until nobody has anything.
     for (let said = true; said; ) {
       said = false;

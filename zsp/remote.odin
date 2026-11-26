@@ -192,6 +192,7 @@ Remote :: struct {
 	accounted:     int, // of the store's pending
 	dead:          [dynamic]u64, // packs all superseded
 	entry:         bool, // the next pack's entry is in packs
+	gone:          [dynamic]u64, // segments evacuated whose waste the next pack forgets: what it lets go of
 
 	uploads:       [dynamic]Upload, // extents being put, in order
 	upload_next:   u64, // where the next begins
@@ -202,7 +203,8 @@ Remote :: struct {
 // Opens the remote side: what the manifest says, before store_open.
 remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_budget := 256, local_keep: u64 = LOCAL_KEEP, local_most: u64 = LOCAL_MOST) -> bool {
 	r.host = host
-	r.page_budget, r.block_budget, r.local_keep, r.local_most = page_budget, block_budget, local_keep, local_most
+	r.page_budget, r.block_budget = page_budget, block_budget
+	remote_limits(r, local_keep, local_most)
 	r.next_gen = 1
 	if bytes := host.manifest_read(host.data); bytes != nil {
 		remote_manifest_read(r, bytes) or_return
@@ -226,6 +228,15 @@ remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_bu
 		host.log_cut(host.data, 0, r.local_from)
 	}
 	return true
+}
+
+// How much of the log the host keeps, and holds before writing waits. Waiting is never for ever: past what is kept,
+// there is always a whole extent to put in object storage, which lets the host let go of it.
+remote_limits :: proc(r: ^Remote, keep, most: u64) {
+	r.local_keep, r.local_most = keep, most
+	if most > 0 {
+		r.local_most = max(most, keep + 2 * EXTENT)
+	}
 }
 
 remote_close :: proc(r: ^Remote) {
@@ -258,6 +269,7 @@ remote_close :: proc(r: ^Remote) {
 	delete(r.redelete)
 	delete(r.uploads)
 	delete(r.dead)
+	delete(r.gone)
 	delete(r.gc.hints)
 	r^ = {}
 }
@@ -771,14 +783,15 @@ remote_rest :: proc(r: ^Remote) {
 @(private)
 remote_account_steps :: proc(r: ^Remote) -> (waiting: bool) {
 	s := r.store
-	for r.accounted < len(s.pending) || !r.entry {
-		accounted, dead, entry := r.accounted, len(r.dead), r.entry
+	for r.accounted < len(s.pending) || !r.entry || len(r.gone) < len(s.evacuated) {
+		accounted, dead, entry, gone := r.accounted, len(r.dead), r.entry, len(r.gone)
 		t := store_begin(s)
 		remote_account(r)
 		if store_missed(s, &t) {
 			store_end(s, &t, false)
 			r.accounted, r.entry = accounted, entry
 			resize(&r.dead, dead)
+			resize(&r.gone, gone)
 			return true
 		}
 		store_end(s, &t, true)
@@ -808,12 +821,15 @@ remote_account :: proc(r: ^Remote) {
 			tree_put(s, &r.packs, key, v)
 		}
 	}
-	if !r.entry {
-		// Segments evacuated are said to be gone in the same checkpoint as lets them go: else, until another, they
-		// would be evacuated again on waking, and found empty, and every cell sought out of them.
-		for seg in s.evacuated {
+	// Segments evacuated are said to be gone in the same checkpoint as lets them go, and that lets go of just those:
+	// else, until another, they would be evacuated again on waking, and found empty, and every cell sought out of them.
+	for seg in s.evacuated {
+		if !slice.contains(r.gone[:], seg) {
 			tree_delete(s, &s.waste, {0, 0, 0, 0, seg})
+			append(&r.gone, seg)
 		}
+	}
+	if !r.entry {
 		tree_put(s, &r.packs, {0, 0, 0, 0, r.next_gen}, {})
 		r.entry = true
 	}
@@ -940,14 +956,14 @@ remote_begin :: proc(r: ^Remote) {
 		packs     = r.packs.root,
 		accounted = r.accounted,
 		dead      = len(r.dead),
-		victims   = slice.clone(s.evacuated[:]),
+		victims   = slice.clone(r.gone[:]),
 	}
 	// What this checkpoint lets go of is named in its manifest until it is gone.
 	append(&f.deletes, ..r.deletes[:])
 	for g in r.dead {
 		append(&f.deletes, Remote_Object{number = g, pack = true})
 	}
-	for seg in s.evacuated {
+	for seg in r.gone {
 		for e := seg * SEGMENT / EXTENT; e < (seg + 1) * SEGMENT / EXTENT; e += 1 {
 			append(&f.deletes, Remote_Object{number = e})
 		}
@@ -1036,6 +1052,7 @@ remote_commit :: proc(r: ^Remote) {
 	}
 	remove_range(&r.dead, 0, f.dead)
 	r.entry = false
+	clear(&r.gone)
 	for seg in f.victims {
 		r.host.log_cut(r.host.data, seg * SEGMENT, (seg + 1) * SEGMENT)
 		r.host.cache_drop(r.host.data, .Log, seg * SEGMENT, (seg + 1) * SEGMENT)

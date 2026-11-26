@@ -35,13 +35,17 @@ export class Storage {
     this.#ctx = ctx;
     this.#env = env;
     this.#sql = ctx.storage.sql;
-    this.#bucket = env.STORE;
+    // With no bucket bound, objects are kept here too, and a space is kept here alone, as it always was, until full.
+    this.#bucket = env.STORE ?? new Here(this);
     this.#made = this.#sql.exec("SELECT name FROM sqlite_master WHERE name = 'kept'").toArray().length > 0;
     const limit = Number(env.STORAGE_LIMIT ?? 0);
     const budget = Number(env.CACHE_BYTES ?? 64 << 20);
     // The cache never crowds out what must be kept: no more than a quarter of what may be kept at all.
-    this.#budget = limit > 0 ? Math.min(budget, Math.floor(limit / 4)) : budget;
+    this.#budget = !env.STORE ? 0 : limit > 0 ? Math.min(budget, Math.floor(limit / 4)) : budget;
   }
+
+  // Told when what an operation needed could not be kept here: the node then fails, and the relay says it is full.
+  onFull;
 
   get made() {
     return this.#made;
@@ -63,6 +67,7 @@ export class Storage {
     this.#sql.exec("CREATE TABLE IF NOT EXISTS manifest (id INTEGER PRIMARY KEY, data BLOB) STRICT");
     this.#sql.exec("CREATE TABLE IF NOT EXISTS cache0 (key INTEGER PRIMARY KEY, data BLOB) STRICT");
     this.#sql.exec("CREATE TABLE IF NOT EXISTS cache1 (key INTEGER PRIMARY KEY, data BLOB) STRICT");
+    if (!this.#env.STORE) this.#sql.exec("CREATE TABLE IF NOT EXISTS object (key TEXT PRIMARY KEY, data BLOB) WITHOUT ROWID");
   }
 
   // A space kept wholly in SQLite, as before: its pages are of a format no longer read, and go; its log stays, the
@@ -99,6 +104,14 @@ export class Storage {
     const cursor = this.#sql.exec(query, ...args);
     cursor.toArray();
     this.stats.rowsWritten += cursor.rowsWritten;
+  }
+
+  // For objects kept here.
+  select(query, ...args) {
+    return this.#read(query, ...args);
+  }
+  drop(query, ...args) {
+    this.#shrink(query, ...args);
   }
 
   #read(query, ...args) {
@@ -268,14 +281,20 @@ export class Storage {
   }
 
   #start() {
-    while (this.#queue.length > 0 && this.#running < MOST) {
+    while (this.#done && this.#queue.length > 0 && this.#running < MOST) {
       const op = this.#queue.shift();
       const done = this.#done;
       this.#running++;
       const finished = this.#do(op).then(
         (r) => r,
-        (e) => (console.log("R2", e?.message ?? e), { ok: false }),
+        (e) => (e instanceof Full ? { ok: false, full: true } : (console.log("R2", e?.message ?? e), { ok: false })),
       ).then(async (r) => {
+        if (r.full) {
+          // Kept here, and no room: nothing will make room, so it is said at once.
+          this.#running--;
+          this.onFull?.();
+          return;
+        }
         if (!r.ok) {
           // Failing again and again: back off, up to a minute, before the node hears and asks again.
           this.stats.failures++;
@@ -297,6 +316,7 @@ export class Storage {
   // What a node that has been let go of asked for and was not yet started is not: nothing it did not finish is done.
   cancel() {
     this.#queue = [];
+    this.#done = undefined; // and what the next asks for waits for it to say who hears of it
   }
 
   // Lets go of everything cached, here and in SQLite, and of whatever was to be started: for measuring.
@@ -337,7 +357,6 @@ export class Storage {
   }
 
   async #do(op) {
-    if (!this.#bucket) return { ok: false }; // no R2 bound: nothing leaves, and the space is kept here until full
     // Nothing starts before what was written before it is durable: a pack before the manifest that spends its
     // generation, an extent before the log it holds, a delete before the manifest that no longer names it.
     await this.#ctx.storage.sync();
@@ -385,6 +404,39 @@ export class Storage {
       }
     }
     return { ok: false };
+  }
+}
+
+// Objects kept in the object's own SQLite, where no bucket is bound: as R2 would keep them, in parts of 1 MiB.
+const PART = 1 << 20;
+class Here {
+  #s;
+  constructor(storage) {
+    this.#s = storage;
+  }
+  #key = (key, part) => `${key}#${String(part).padStart(6, "0")}`;
+  async get(key, { range }) {
+    const rows = this.#s.select("SELECT key, data FROM object WHERE key >= ? AND key < ? ORDER BY key", key + "#", key + "$");
+    if (rows.length === 0) return null;
+    const size = rows.reduce((n, r) => n + r.data.byteLength, 0);
+    const out = new Uint8Array(Math.max(0, Math.min(range.length, size - range.offset)));
+    for (let at = 0; at < out.length; ) {
+      const off = range.offset + at, part = new Uint8Array(rows[Math.floor(off / PART)].data);
+      const n = Math.min(out.length - at, part.length - (off % PART));
+      out.set(part.subarray(off % PART, off % PART + n), at);
+      at += n;
+    }
+    return { arrayBuffer: async () => out.buffer };
+  }
+  async put(key, body) {
+    const bytes = new Uint8Array(body);
+    this.#s.drop("DELETE FROM object WHERE key >= ? AND key < ?", key + "#", key + "$");
+    for (let at = 0, part = 0; at < bytes.length || part === 0; at += PART, part++) {
+      this.#s.write("INSERT INTO object VALUES (?, ?)", this.#key(key, part), bytes.subarray(at, Math.min(bytes.length, at + PART)));
+    }
+  }
+  async delete(keys) {
+    for (const key of keys) this.#s.drop("DELETE FROM object WHERE key >= ? AND key < ?", key + "#", key + "$");
   }
 }
 

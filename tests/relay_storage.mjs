@@ -260,6 +260,79 @@ async function nodes_hear_their_own(seed) {
   assert.ok(!held.objects.has(Buffer.from(space).toString("hex") + "/p/9"), "what the first had not started never was");
 }
 
+// A node let go of while one of its operations is under way, and the next asking for one before it has said who
+// hears of what it asks: the first's finishing does not start the next's on the first's account.
+async function the_next_waits_to_say(seed) {
+  const sql = new Sql(), held = new Held(), waits = [];
+  const ctx = { storage: { sql, sync: async () => {} }, waitUntil: (p) => waits.push(p) };
+  const s = new Storage(ctx, { STORE: held });
+  const space = new Uint8Array(32).fill(seed & 255);
+  s.open(space);
+  const memory = new Uint8Array(64);
+  const host = s.imports((ptr, len) => memory.subarray(ptr, ptr + len), space);
+  host.log_write(0, 0, 1);
+  const heard = [[], []];
+  host.start(1, 3, 1, 0, 0, 0, 16);
+  s.run((op) => heard[0].push(op.id));
+  await new Promise((go) => setTimeout(go, 1));
+  s.cancel(); // let go of, its put under way
+  host.start(7, 5, 0, 0, 0, 0, 16); // the next asks, as it opens, before saying who hears
+  await held.answer();
+  await new Promise((go) => setTimeout(go, 1));
+  s.run((op) => heard[1].push(op.id));
+  while (s.busy) {
+    await new Promise((go) => setTimeout(go, 1));
+    await held.answer();
+  }
+  await Promise.all(waits);
+  assert.deepEqual(heard, [[1], [7]], `heard ${JSON.stringify(heard)}`);
+}
+
+// With no bucket bound, objects are kept in the object's own SQLite, as R2 would keep them; and where there is no room
+// for one, the node is told it is full, at once, rather than asked to try again for ever.
+async function kept_here_without_a_bucket(seed) {
+  const rand = random(seed * 31 + 5);
+  for (const limit of [0, 1 << 20]) {
+    const sql = new Sql(), waits = [];
+    const ctx = { storage: { sql, sync: async () => {} }, waitUntil: (p) => waits.push(p) };
+    const s = new Storage(ctx, limit ? { STORAGE_LIMIT: String(limit) } : {});
+    let full = 0;
+    s.onFull = () => full++;
+    const space = new Uint8Array(32).fill(seed & 255);
+    s.open(space);
+    const memory = new Uint8Array(4 << 20);
+    const host = s.imports((ptr, len) => memory.subarray(ptr, ptr + len), space);
+    host.log_write(0, 0, 1);
+    const ask = (id, kind, number, off, len, size) =>
+      new Promise((done) => {
+        host.start(id, kind, number, off, len, 0, size);
+        s.run((op, ok, absent, bytes) => done({ ok, absent, bytes }));
+        if (limit && full) done({ full: true });
+      });
+    const size = (2 << 20) + 12345;
+    for (let i = 0; i < size; i++) memory[i] = (i * 7 + (i >> 11)) & 255;
+    const put = await Promise.race([ask(1, 3, 9, 0, 0, size), new Promise((go) => setTimeout(() => go({ full: true }), 200))]);
+    if (limit) {
+      assert.ok(full === 1 && !put.ok, `no room for it: told ${full} times`);
+      continue;
+    }
+    assert.ok(put.ok);
+    for (let k = 0; k < 20; k++) {
+      const off = rand(size + 100), len = 1 + rand(1 << 21);
+      const got = await ask(10 + k, 0, 9, off, len, 0);
+      assert.ok(got.ok && !got.absent);
+      const want = Math.max(0, Math.min(len, size - off));
+      assert.equal(got.bytes.length, want, `a read of ${len} at ${off}`);
+      for (let i = 0; i < want; i += 997) assert.equal(got.bytes[i], ((off + i) * 7 + ((off + i) >> 11)) & 255);
+    }
+    memory.set(new Uint8Array(new BigUint64Array([9n, 1n]).buffer), 0); // Remote_Object{number = 9, pack = true}
+    assert.ok((await ask(40, 5, 0, 0, 0, 16)).ok);
+    const gone = await ask(41, 0, 9, 0, 10, 0);
+    assert.ok(gone.ok && gone.absent, "deleted");
+    await Promise.all(waits);
+  }
+}
+
 // Full: what failed to be kept is not read back from memory as though it had been; what lessens what is kept is done
 // whatever the limit; and a store too full to keep its first write still has its tables.
 async function full_leaves_nothing_behind(seed) {
@@ -311,6 +384,8 @@ for (let seed = first; seed < first + seeds; seed++) {
   if (seed % 10 === 0) await r2_finishes(seed);
   if (seed === first) await cancelled_is_not_started(seed);
   if (seed === first) await nodes_hear_their_own(seed);
+  if (seed === first) await the_next_waits_to_say(seed);
+  if (seed % 5 === 0) await kept_here_without_a_bucket(seed);
   if (seed % 5 === 0) await full_leaves_nothing_behind(seed);
 }
 console.log(`ok   relay storage held to its model over ${seeds} seeds`);
