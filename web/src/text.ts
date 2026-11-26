@@ -542,14 +542,22 @@ export function apply(t: Text, kind: number, stamp: string, body: Uint8Array): R
     if (body.length < 8) return "same";
     return applyPiece(t, codec.binary(body, 0, 8), stamp, body.subarray(8));
   } else if (kind === 5) {
+    // Its entries, in order, up to the first that does not say all it should: the rest is nothing, the same for everyone.
+    if (body.length < 4) return "same";
     const r = codec.reader(body);
     const n = codec.u32(r);
     r.pos = 4 + n * 16;
     let out: Result = "same";
     while (r.pos < r.len) {
-      const inner = codec.takeBinary(r, 16);
-      const id = codec.takeBinary(r, 8);
-      const ops = codec.bytes(r);
+      let inner: string, id: string, ops: Uint8Array;
+      try {
+        inner = codec.takeBinary(r, 16);
+        id = codec.takeBinary(r, 8);
+        ops = codec.bytes(r);
+      } catch (e) {
+        if (e instanceof codec.Malformed) break;
+        throw e;
+      }
       if (inner > t.base) {
         const result = applyPiece(t, id, inner, ops);
         if (result === "rebuild") return "rebuild";

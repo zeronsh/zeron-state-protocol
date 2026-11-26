@@ -228,6 +228,47 @@ export function putBytes(w: Writer, data: Uint8Array): void {
   put(w, data);
 }
 
+// Where a UTF-16 index of what bytes read as falls in them: the reading being a TextDecoder's, which keeps a leading byte
+// order mark, and gives U+FFFD for each stretch that is not UTF-8 (the WHATWG decoder, step by step). An index within
+// two UTF-16 units of one character is no place to be.
+export function utf8Offset(bytes: Uint8Array, index: number): number {
+  if (!(index >= 0)) throw new RangeError("no such position");
+  let units = 0, needed = 0, seen = 0, lower = 0x80, upper = 0xbf;
+  const emit = (end: number, n: number): number | undefined => {
+    units += n;
+    if (units === index) return end;
+    if (units > index) throw new RangeError("that is inside a character");
+    return undefined;
+  };
+  if (index === 0) return 0;
+  for (let i = 0; i < bytes.length; ) {
+    const b = bytes[i];
+    let done: number | undefined;
+    if (needed === 0) {
+      if (b <= 0x7f) done = emit(i + 1, 1);
+      else if (b >= 0xc2 && b <= 0xdf) needed = 1;
+      else if (b >= 0xe0 && b <= 0xef) (needed = 2), b === 0xe0 && (lower = 0xa0), b === 0xed && (upper = 0x9f);
+      else if (b >= 0xf0 && b <= 0xf4) (needed = 3), b === 0xf0 && (lower = 0x90), b === 0xf4 && (upper = 0x8f);
+      else done = emit(i + 1, 1);
+      i++;
+    } else if (b < lower || b > upper) {
+      // What was begun is one U+FFFD, and this byte begins afresh.
+      (needed = 0), (seen = 0), (lower = 0x80), (upper = 0xbf);
+      done = emit(i, 1);
+    } else {
+      (lower = 0x80), (upper = 0xbf);
+      i++;
+      if (++seen === needed) {
+        done = emit(i, needed === 3 ? 2 : 1);
+        (needed = 0), (seen = 0);
+      }
+    }
+    if (done !== undefined) return done;
+  }
+  if (needed !== 0 && emit(bytes.length, 1) !== undefined) return bytes.length;
+  throw new RangeError("no such position");
+}
+
 // How many bytes a string takes in UTF-8, a lone surrogate being U+FFFD as TextEncoder makes it.
 export function utf8Length(s: string): number {
   let n = s.length;

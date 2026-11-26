@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import * as codec from "../src/codec.ts";
 import { Client, columns as c, type Answer, type State } from "../src/client.ts";
+import * as text from "../src/text.ts";
 import { where } from "../src/ask.ts";
 
 const HELLO = 1, ROSTER = 2, WATCH = 3, CELLS = 7, ACK = 8, SYNCED = 10;
@@ -28,6 +29,7 @@ function harness() {
     deferred: [] as (() => void)[],
     later: [] as (() => void)[],
     closes: 0,
+    connects: 0,
   };
   const run = () => {
     while (self.deferred.length > 0) self.deferred.shift()!();
@@ -42,6 +44,7 @@ function harness() {
       return () => {};
     },
     connect: (receive, closed) => {
+      self.connects++;
       self.receive = receive;
       self.closed = closed;
       return {
@@ -173,8 +176,132 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   h.greet();
   h.self.receive(b(rep("\x80", 310) + "\0"));
   assert(h.self.closes === 1);
+  // And it is as lost as any pipe: dialled again, and all is as it was.
+  assert(!h.client.ready);
+  h.laters();
+  h.run();
+  assert.equal(h.self.connects, 2, "dialled again");
+  h.greet();
+  assert(h.client.ready);
   const call = h.client.call(codec.hex(rep("d", 32)), 1, "m", "");
   assert.throws(() => call.send(new Uint8Array(262145)), "a message too big for any window is refused at once");
+}
+
+// What anyone may write cannot break what everyone reads: a value that does not read is no value, and a bundle cut short
+// is what its entries before the cut say.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const Doc = { meta: c.json<{ n: number }>(16), title: c.string(18), body: c.text(17) };
+  let seen!: State<typeof Doc>;
+  const shown = () => seen;
+  h.client.window({ scope: 1, list: "a", table: Doc }, (x) => (seen = x));
+  h.run();
+  const cell = (row: string, kind: number, slot: number, n: number, body: string) => {
+    const w = codec.writer();
+    codec.putBinary(w, ch(kind) + row + ch(slot) + rep("\0", 15) + ch(n));
+    codec.putBytes(w, b(body));
+    return s(codec.written(w));
+  };
+  const one = "\0\0\0\x01" + rep("1", 12), two = "\0\0\0\x01" + rep("2", 12);
+  const place = (row: string) => cell(row, 2, 1, 1, h.client.tag(1, "a") + codec.u64(1));
+  // Two entries, each typing a letter, the second cut short.
+  const entry = (k: number, letter: string) => rep("\0", 15) + ch(k) + codec.u64(k) + ch(5) + "\x01\0\0\x01" + letter;
+  const bundle = "\0\0\0\x01" + rep("\0", 15) + ch(1) + entry(4, "a") + entry(5, "b").slice(0, 20);
+  h.tell(CELLS, "\0" + place(one) + cell(one, 3, 16, 2, "{not json") + cell(one, 3, 18, 3, "ok") + cell(one, 5, 17, 9, bundle));
+  h.tell(CELLS, "\0" + place(two) + cell(two, 3, 16, 2, "") + cell(two, 3, 18, 3, "also"));
+  assert.equal(shown().rows.length, 2);
+  const [first, second] = shown().rows;
+  assert.equal(first.meta, undefined);
+  assert.equal(first.title, "ok");
+  assert.equal(first.body, "a");
+  assert.equal(second.meta, undefined);
+  assert.equal(second.title, "also");
+}
+
+// Positions in a text are where they are shown, whatever its bytes: one that is not UTF-8 shows as one character.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  h.run();
+  const one = "\0\0\0\x01" + rep("1", 12);
+  const cell = (kind: number, slot: number, n: number, body: string) => {
+    const w = codec.writer();
+    codec.putBinary(w, ch(kind) + one + ch(slot) + rep("\0", 15) + ch(n));
+    codec.putBytes(w, b(body));
+    return s(codec.written(w));
+  };
+  h.tell(CELLS, "\0" + cell(2, 1, 1, h.client.tag(1, "a") + codec.u64(1)) + cell(3, 17, 2, "\xffabc"));
+  const editor = h.client.text(codec.hex(one), Note.body);
+  assert.equal(editor.read(), "\ufffdabc");
+  editor.delete(1, 1);
+  assert.equal(editor.read(), "\ufffdbc");
+  editor.insert(1, "x");
+  assert.equal(editor.read(), "\ufffdxbc");
+  editor.close();
+}
+
+// A change that throws is as if it had never been: nothing of it is shown, held or said.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "kept", body: "typed" })));
+  h.run();
+  h.tell(ACK, "\x01");
+  const said = h.self.said.length;
+  const rows = Client.internals(h.client).rows.size;
+  assert.throws(
+    () =>
+      h.client.write(1, (change) => {
+        change.set(id, Note, { title: "gone" }); // over what was there, which it would kill
+        change.insert(Note, "a", 2, { title: "never" });
+        change.edit(id, Note.body.slot, (t, fresh) => text.insert(t, 0, "x", fresh));
+        change.delete(id);
+        throw new Error("changed my mind");
+      }),
+    /changed my mind/,
+  );
+  h.run();
+  assert.equal(h.self.said.length, said, "nothing was said");
+  assert.equal(Client.internals(h.client).rows.size, rows, "nothing new is held");
+  // The row as it is held: not deleted, its title what it was, its text what it was.
+  const row = h.client.held(id)!;
+  assert(!row.dead, "the deletion stands");
+  const titles = [...row.slots.get(16)!.values()].map((cell) => new TextDecoder().decode(cell.body));
+  assert.deepEqual(titles, ["kept"], "what the new title killed is not back");
+  assert.equal(text.read(h.client.heldText(id, Note.body.slot)!), "typed");
+}
+
+// A client that is closed is not connected, says so, and what it was calling is lost.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const told: boolean[] = [];
+  h.client.on("status", (up) => told.push(up));
+  const call = h.client.call(codec.hex(rep("d", 32)), 1, "m", "x");
+  let fault = "";
+  call.onfault = (f) => (fault = f);
+  let rejected = "";
+  void h.client.request(codec.hex(rep("d", 32)), 1, "m", "y").catch((e) => (rejected = e.fault));
+  h.run();
+  h.client.close();
+  h.run();
+  await tick();
+  assert(!h.client.ready, "it is not connected");
+  assert.deepEqual(told, [true, false], "and says so");
+  assert.equal(fault, "lost");
+  assert.equal(rejected, "lost");
+  h.laters();
+  h.run();
+  assert.equal(h.self.connects, 1, "and does not dial again");
 }
 
 // What is sent for an answer waits for it, and what another answer shows outlives the one that stops.

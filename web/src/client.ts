@@ -409,19 +409,12 @@ function placeKey(c: Cell, id: string): string {
   return codec.binary(c.body, 0, 24) + id;
 }
 
-// The offset in bytes of UTF-16 index `index` of a string.
-function byteIndex(s: string, index: number): number {
-  if (index < 0 || index > s.length) throw new RangeError("no such position");
-  const c = s.charCodeAt(index - 1);
-  if (index > 0 && index < s.length && c >= 0xd800 && c < 0xdc00) throw new RangeError("that is inside a character");
-  return codec.utf8Length(index === s.length ? s : s.slice(0, index));
-}
-
 // ---------------------------------------------------------------- the client
 
 export class Client {
   #host: Lent;
   #wire?: Wire;
+  #hangUp: () => void = () => {};
   #ready = false;
   #closed = false;
   #failures = 0;
@@ -494,6 +487,11 @@ export class Client {
       return;
     }
     this.#wire = wire;
+    // A pipe let go of from this end is as lost as one that broke: nothing says so but this.
+    this.#hangUp = () => {
+      wire.close();
+      closed();
+    };
     const w = codec.writer();
     codec.putU8(w, 1);
     codec.putU8(w, 4); // telling who wrote what
@@ -537,7 +535,7 @@ export class Client {
   close(): void {
     this.#closed = true;
     this.#flush();
-    this.#wire?.close();
+    this.#hangUp();
     for (const a of [...this.#asked.values()]) this.#fetched(a);
   }
 
@@ -598,7 +596,7 @@ export class Client {
         if (p - at > 5) {
           // no frame is so long
           this.#input = new Uint8Array(0);
-          this.#wire?.close();
+          this.#hangUp();
           return;
         }
         n += (b & 127) * scale;
@@ -617,7 +615,7 @@ export class Client {
         if (!(e instanceof codec.Malformed)) throw e;
         // Nonsense from the pipe ends the pipe and nothing else.
         this.#input = new Uint8Array(0);
-        this.#wire?.close();
+        this.#hangUp();
         return;
       }
     }
@@ -1139,7 +1137,13 @@ export class Client {
         if (slot) {
           for (const cell of slot.values()) {
             if (cell.kind !== VALUE) continue;
-            const value = c.decode(cell.body);
+            // What cannot be read is no value: anyone may write anything in a slot.
+            let value: unknown;
+            try {
+              value = c.decode(cell.body);
+            } catch {
+              value = undefined;
+            }
             if (value !== undefined) made[name] = value;
           }
         }
@@ -1666,8 +1670,8 @@ export class Client {
       }
       if (closed) finish();
     });
-    // Where a UTF-16 index of what is shown falls in its bytes.
-    const at = (t: text.Text, index: number) => byteIndex(text.read(t), index);
+    // Where a UTF-16 index of what is shown falls in its bytes, whatever they are.
+    const at = (t: text.Text, index: number) => codec.utf8Offset(text.content(t), index);
     return Object.freeze({
       read: () => text.read(this.#text(row, slot)),
       insert: (index: number, s: string) =>
@@ -1680,9 +1684,8 @@ export class Client {
         }),
       delete: (index: number, count: number) =>
         edit((t) => {
-          const shown = text.read(t);
-          const from = byteIndex(shown, index);
-          text.erase(t, from, byteIndex(shown, index + count) - from, fresh);
+          const from = at(t, index);
+          text.erase(t, from, at(t, index + count) - from, fresh);
         }),
       commit: () => this.#seal(row, slot),
       close: () => {
@@ -1789,12 +1792,40 @@ export class Client {
     const cells: Written[] = [];
     const fresh = new Set<string>(); // rows made here
     const rows = new Set<string>();
+    // How each row was before this touched it, so that a change that throws leaves nothing behind.
+    const before = new Map<string, { existed: boolean; slots: Map<number, Map<string, Cell>>; dead: boolean; texts: Set<number> }>();
+    const touch = (id: string, slot: number): Stored => {
+      let was = before.get(id);
+      const existed = this.#rows.get(id);
+      const row = existed ?? this.#row(id);
+      if (!was) {
+        const slots = new Map<number, Map<string, Cell>>();
+        for (const [k, cells] of row.slots) slots.set(k, new Map(cells));
+        before.set(id, (was = { existed: existed !== undefined, slots, dead: row.dead, texts: new Set() }));
+      }
+      was.texts.add(slot);
+      return row;
+    };
+    const undo = () => {
+      for (const [id, was] of before) {
+        const row = this.#rows.get(id);
+        if (!row) continue;
+        row.slots = was.slots;
+        row.dead = was.dead;
+        // What was made of the slots' texts is made again from their cells, when wanted. (An editor's own typing that
+        // was open is sealed before anything here is written over it, and stands.)
+        for (const slot of was.texts) if (!row.texts.get(slot)?.open) row.texts.delete(slot), row.lives.delete(slot);
+        row.views.clear();
+        if (!was.existed && row.pages === 0 && row.held.size === 0 && !this.#isPending(id)) this.#rows.delete(id);
+      }
+    };
     const put = (row: string, slot: number, kind: number, body: Uint8Array) => {
       if (body.length > MAX_OPEN) throw new RangeError("a value may be 1 MiB at most, less 192 bytes");
+      const stored = touch(row, slot);
       const stamp = this.#stamp();
       rows.add(row);
       cells.push({ row, slot, kind, stamp, body });
-      this.#accept(this.#row(row), slot, kind, stamp, body, this.#mine(scope));
+      this.#accept(stored, slot, kind, stamp, body, this.#mine(scope));
     };
     const set = (bin: string, schema: Table, values: Record<string, unknown>) => {
       for (const name in values) {
@@ -1817,10 +1848,10 @@ export class Client {
       if (bin.length !== 16) throw new Error("a row's id is 32 hex digits");
       return bin;
     };
-    // Done here, so that what is refused throws here.
+    // Done here, so that what is refused throws here; and should it throw, as if it had never been.
     let resolve!: () => void;
     const result = new Promise<void>((done) => (resolve = done));
-    {
+    try {
       f({
         insert: (schema, list, order, values) => {
           // As late as anything heard of: later, then, than any right that is known to have ended.
@@ -1838,8 +1869,9 @@ export class Client {
         edit: (id, slot, f) => {
           if (!Number.isInteger(slot) || slot < 16 || slot > 255) throw new RangeError("data slots are 16 to 255");
           const bin = idOf(id);
-          const row = this.#row(bin);
-          if (row.texts.get(slot)?.open) this.#seal(row, slot); // what an editor has open goes first
+          const open = this.#rows.get(bin);
+          if (open?.texts.get(slot)?.open) this.#seal(open, slot); // what an editor has open goes first, and stands
+          const row = touch(bin, slot);
           const t = this.#text(row, slot);
           f(t, () => codec.binary(this.#host.random(8)));
           const stamp = this.#stamp();
@@ -1853,9 +1885,12 @@ export class Client {
           }
         },
       });
-      if (cells.length > 0) this.#sendCells(cells, resolve);
-      else this.#host.defer(resolve);
+    } catch (e) {
+      undo();
+      throw e;
     }
+    if (cells.length > 0) this.#sendCells(cells, resolve);
+    else this.#host.defer(resolve);
     const placing = new Set<Stored>();
     for (const id of rows) {
       const row = this.#rows.get(id);
