@@ -935,11 +935,12 @@ review_interrupts_held_once :: proc(t: ^testing.T) {
 review_output_held_then_read_comes_whole :: proc(t: ^testing.T) {
 	for direct in ([]bool{true, false}) {
 		review_output_held(t, direct)
+		review_output_held(t, direct, both = true)
 	}
 }
 
 @(private)
-review_output_held :: proc(t: ^testing.T, direct: bool) {
+review_output_held :: proc(t: ^testing.T, direct: bool, both := false) {
 	w: World
 	testing.expect(t, world_init(t, &w, udp = direct))
 	defer world_destroy(&w)
@@ -953,6 +954,8 @@ review_output_held :: proc(t: ^testing.T, direct: bool) {
 		holding: bool,
 		held:    int,
 		total:   int,
+		errors:  int,
+		faulted: bool,
 		exited:  bool,
 		ended:   bool,
 	}
@@ -962,6 +965,8 @@ review_output_held :: proc(t: ^testing.T, direct: bool) {
 		h := (^Holder)(hd.data)
 		if len(bytes) > 0 && bytes[0] == 1 {
 			h.total += len(bytes) - 1
+		} else if len(bytes) > 0 && bytes[0] == 2 {
+			h.errors += len(bytes) - 1
 		} else if len(bytes) > 0 && bytes[0] == 3 {
 			h.exited = true
 		}
@@ -972,8 +977,16 @@ review_output_held :: proc(t: ^testing.T, direct: bool) {
 		return true
 	}
 	h.on_end = proc(hd: ^Call_Handler, call: u64) {(^Holder)(hd.data).ended = true}
+	h.on_fault = proc(hd: ^Call_Handler, call: u64, fault: zsp.Call_Fault) {
+		h := (^Holder)(hd.data)
+		h.faulted, h.ended = true, true
+	}
 	python := "python" when ODIN_OS == .Windows else "python3"
 	script := fmt.tprintf("import sys; sys.stdout.buffer.write(b'x' * %d); sys.stdout.flush()", WRITTEN)
+	if both {
+		// Its errors too, a piece of each in turn: so that both are being read at once, where that is how reading goes.
+		script = fmt.tprintf("import sys\nfor _ in range(%d):\n sys.stdout.buffer.write(b'x' * 65536); sys.stdout.flush(); sys.stderr.buffer.write(b'e' * 65536); sys.stderr.flush()", WRITTEN / 65536)
+	}
 	first := make([dynamic]byte, context.temp_allocator)
 	append(&first, 0)
 	zsp.write_varint(&first, 3)
@@ -986,11 +999,11 @@ review_output_held :: proc(t: ^testing.T, direct: bool) {
 	testing.expect(t, call != 0)
 	wait := time.tick_now()
 	world_run(&w, proc(w: ^World, at: rawptr) -> bool {return time.tick_since((^time.Tick)(at)^) > time.Second}, &wait)
-	testing.expectf(t, h.total > 0 && h.total <= zsp.CALL_WINDOW && !h.exited, "%d came while unread", h.total)
+	testing.expectf(t, h.total + h.errors > 0 && h.held <= zsp.CALL_WINDOW && !h.exited, "%d came while unread", h.held)
 	h.holding = false
 	call_consumed(a, call, h.held)
 	testing.expect(t, world_run(&w, proc(w: ^World, d: rawptr) -> bool {return (^Holder)(d).ended}, &h, 30 * time.Second), "it never ended")
-	testing.expectf(t, h.total == WRITTEN && h.exited, "%d of %d came, exited %v", h.total, WRITTEN, h.exited)
+	testing.expectf(t, h.total == WRITTEN && (!both || h.errors == WRITTEN) && h.exited && !h.faulted, "%d and %d of %d came, exited %v, faulted %v", h.total, h.errors, WRITTEN, h.exited, h.faulted)
 	call_end(a, call)
 	world_run(&w, nobody_left)
 }
