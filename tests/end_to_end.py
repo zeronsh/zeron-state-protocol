@@ -858,7 +858,7 @@ class Service:
         import threading
 
         self.sock = socket.create_server((host, port))
-        self.banner, self.says, self.peers = banner, says, []
+        self.banner, self.says, self.peers, self.heads = banner, says, [], []
         threading.Thread(target=self.serve, daemon=True).start()
 
     def serve(self):
@@ -887,8 +887,9 @@ class Service:
                 c.sendall(b"bye")  # after the other side has finished: half-closed, not closed
                 return
             head = b""
-            while b"\r\n\r\n" not in head and (data := c.recv(4096)):
+            while b"\r\n\r\n" not in head.removeprefix(b"\r\n\r\n\x00\r\nQUIT\n") and (data := c.recv(4096)):
                 head += data
+            self.heads.append(head)
             c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(self.says), self.says))
 
 
@@ -1078,6 +1079,137 @@ def test_offers_end():
     with open(os.path.join(a.dir, zspd_space(a), "audit.log")) as f:
         audit = f.read()
     assert audit.count('"service":"offer"') == 3 and b.key in audit
+
+
+CERTS = os.path.join(ROOT, "tests", "certs")
+
+
+def public_get(port, name, path="/", alpn=None):
+    """A GET over TLS as the public makes it, checking the certificate as browsers do: status, body, protocol."""
+    import ssl
+
+    context = ssl.create_default_context(cafile=os.path.join(CERTS, "p256.pem"))
+    if alpn:
+        context.set_alpn_protocols(alpn)
+    with socket.create_connection(("127.0.0.1", port), 5) as raw, context.wrap_socket(raw, server_hostname=name) as s:
+        s.sendall(f"GET {path} HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n".encode())
+        got = b""
+        while data := s.recv(65536):
+            got += data
+        head, _, body = got.partition(b"\r\n\r\n")
+        return int(head.split()[1]), body, s.selected_alpn_protocol()
+
+
+def test_expose():
+    """A port exposed to the public through a relay, at a name of its own, by TLS and by plain HTTP; with where each
+    connection came from if asked; at the pace of the slower side; and no more once taken back."""
+    https, plain = free_port(), free_port()
+    relay = Node("ex-relay", "serve", "--no-udp", "--expose=expose.test", "--https=127.0.0.1:%d" % https, "--expose-http=127.0.0.1:%d" % plain,
+                 "--tls-cert=" + os.path.join(CERTS, "p256.pem"), "--tls-key=" + os.path.join(CERTS, "p256.key")).start()
+    _, (a, b) = space("ex", "ey", relay=relay)
+    ca, cb = a.client(), b.client()
+    port, told, big = free_port(), free_port(), free_port()
+    web = Service("127.0.0.1", port, says=b"hello, public")
+    proxied = Service("127.0.0.1", told, says=b"who?")
+    data = os.urandom(8 << 20)
+    Service("127.0.0.1", big, says=data)
+
+    # Nothing is exposed unless it is: no name leads anywhere.
+    assert ca.exposures() == []
+    try:
+        public_get(https, "anything.expose.test")
+        raise AssertionError("an unexposed name answered")
+    except OSError:
+        pass
+    exposed = ca.expose(port, name="web")
+    label = exposed[0]["label"]
+    assert label.startswith("web-") and len(label) == 20, label
+    eventually("the relay says where", lambda: [r["url"] for e in ca.exposures() for r in e["relays"]] == ["https://%s.expose.test:%d" % (label, https)])
+    name = label + ".expose.test"
+    assert public_get(https, name, alpn=["h2", "http/1.1"]) == (200, b"hello, public", "http/1.1")
+    assert public_get(https, name.upper()) [:2] == (200, b"hello, public")
+    assert http_get("127.0.0.1", plain, host=name) == (200, b"hello, public")
+    assert http_get("127.0.0.1", plain, host="nobody.expose.test")[0] == 404
+
+    # Where each came from, if asked, before anything else.
+    ca.expose(told, proxy=True)
+    eventually("both are exposed", lambda: all(r["status"] == 0 for e in ca.exposures() for r in e["relays"]) and len(ca.exposures()) == 2)
+    other = next(e["label"] for e in ca.exposures() if e["port"] == told)
+    assert public_get(https, other + ".expose.test")[:2] == (200, b"who?")
+    head = proxied.heads[-1]
+    assert head.startswith(b"\r\n\r\n\x00\r\nQUIT\n\x21\x11\x00\x0c\x7f\x00\x00\x01\x7f\x00\x00\x01"), head[:28]  # from 127.0.0.1, to 127.0.0.1
+    assert struct.unpack(">H", head[26:28])[0] == told and head[28:].startswith(b"GET / HTTP/1.1")
+    assert not any(h.startswith(b"\r\n\r\n\x00") for h in web.heads if hasattr(web, "heads"))
+
+    # As fast as the slower side takes it, and no faster: the relay keeps only what is in flight.
+    ca.expose(big)
+    eventually("the big one too", lambda: len(ca.exposures()) == 3 and all(r["status"] == 0 for e in ca.exposures() for r in e["relays"]))
+    third = next(e["label"] for e in ca.exposures() if e["port"] == big) + ".expose.test"
+    import ssl
+
+    context = ssl.create_default_context(cafile=os.path.join(CERTS, "p256.pem"))
+    slow = context.wrap_socket(socket.create_connection(("127.0.0.1", https), 5), server_hostname=third)
+    slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 16)
+    slow.sendall(f"GET / HTTP/1.1\r\nHost: {third}\r\n\r\n".encode())
+    got = slow.recv(1 << 16)
+    time.sleep(1)  # reading nothing, while the device would send 8 MB
+    rss = memory_of(relay.p.pid)
+    while len(got) < len(data):
+        got += slow.recv(1 << 16)
+        if len(got) < 1 << 20:
+            time.sleep(0.001)
+    assert got.endswith(data[-1000:])
+    if rss:
+        assert rss < 24 << 20, f"the relay held {rss >> 20} MB for a reader that did not read"
+        print(f"     a reader that did not read: the relay at {rss >> 20} MB")
+    slow.close()
+
+    # A device is not a relay: neither its own client nor another device may come as the public.
+    for caller, device in ((ca, ca.devices[0][0]), (cb, a.key and bytes.fromhex(a.key))):
+        r = caller.call(device, 1, "zsp.public", varint_bytes(label.encode()) + bytes(18))
+        assert r["fault"] == 1, r
+
+    # Taken back, a live connection is cut off and the name is nobody's.
+    live = context.wrap_socket(socket.create_connection(("127.0.0.1", https), 5), server_hostname=third)
+    live.sendall(f"GET / HTTP/1.1\r\nHost: {third}\r\n\r\n".encode())
+    live.recv(1024)
+    ca.unexpose(big)
+    live.settimeout(5)
+    try:
+        while live.recv(1 << 16):
+            pass
+    except OSError:
+        pass  # reset, or ended short: either way, not the 8 MB
+    try:
+        public_get(https, third)
+        raise AssertionError("a name taken back still answers")
+    except OSError:
+        pass
+    with open(os.path.join(a.dir, zspd_space(a), "audit.log")) as f:
+        audit = f.read()
+    assert '"service":"public"' in audit and '"peer":"127.0.0.1:' in audit and '"detail":"-%d"' % big in audit
+
+
+def test_expose_nowhere():
+    """A relay that exposes nothing says so; the device exposes nothing there."""
+    _, (a,) = space("en")
+    ca = a.client()
+    port = free_port()
+    ca.expose(port)
+    eventually("the relay says it will not", lambda: [r["status"] for e in ca.exposures() for r in e["relays"]] == [1])
+
+
+def varint_bytes(b):
+    return zsp.varint(len(b)) + b
+
+
+def memory_of(pid):
+    """A process's resident memory, where the system says it plainly."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            return next(int(line.split()[1]) * 1024 for line in f if line.startswith("VmRSS:"))
+    except OSError:
+        return None
 
 
 def zspd_space(node):

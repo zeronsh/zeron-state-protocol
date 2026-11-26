@@ -1328,6 +1328,22 @@ class Client:
     def unoffer(self, ports, scope, device=None, host=""):
         return self.offers(2, put_offer(ports, scope, device, host, "", False))
 
+    def exposures(self, op=b"\x00"):
+        """What this device exposes to the public: port, name, label, and where each relay says it is (url, or why not)."""
+        r, out = Reader(b"".join(self.host("zsp.expose", op))), []
+        for _ in range(r.varint()):
+            port, prefix, flags, label = struct.unpack(">H", r.take(2))[0], r.bytes().decode(), r.u8(), r.bytes().decode()
+            relays = [dict(relay=r.take(32), status=r.u8(), url=r.bytes().decode()) for _ in range(r.varint())]
+            out.append(dict(port=port, name=prefix, proxy=bool(flags & 1), label=label, relays=relays))
+        return out
+
+    def expose(self, port, name="", proxy=False):
+        """Exposes a port of this machine to the public, through every relay that will, under a fresh name."""
+        return self.exposures(b"\x01" + struct.pack(">H", port) + varint(len(name)) + name.encode() + bytes([1 if proxy else 0]))
+
+    def unexpose(self, port):
+        return self.exposures(b"\x02" + struct.pack(">H", port))
+
     def author(self, row, slot):
         """Whom the last to write there goes by, and on which device, if that is known: (device, subject)."""
         stamps = [t for (s, _, t) in self.rows.get(row, ()) if s == slot]
