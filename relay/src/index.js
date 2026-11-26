@@ -7,7 +7,7 @@
 import { DurableObject } from "cloudflare:workers";
 import module from "./relay.wasm";
 import { Storage, Full, hex } from "./storage.js";
-import { Call, Label, labelOf, serve } from "./public.js";
+import { Call, ipBytes, Label, labelOf, serve } from "./public.js";
 
 export { Label };
 
@@ -226,14 +226,8 @@ export class Space extends DurableObject {
 
   // A zsp.public call to the device that exposes a label, for the public at an address; null if nobody does.
   #open(label, ip) {
-    const address = new Uint8Array(18);
-    const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(ip);
-    if (v4) address.set([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, ...v4.slice(1).map(Number)]);
-    else if (ip.includes(":")) {
-      const halves = ip.split("::"), head = halves[0] ? halves[0].split(":") : [], tail = halves[1] ? halves[1].split(":") : [];
-      const words = [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail];
-      words.forEach((w, i) => address.set([parseInt(w, 16) >> 8, parseInt(w, 16) & 255], i * 2));
-    }
+    const address = new Uint8Array(18); // and the port, which the platform does not say
+    address.set(ipBytes(ip));
     const name = enc.encode(label);
     const first = new Uint8Array([...varint(name.length), ...name, ...address]);
     const id = this.#put(first, (n) => this.#wasm.public_open(n));

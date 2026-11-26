@@ -11,6 +11,7 @@ const dec = new TextDecoder();
 const HOP = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te", "trailer", "proxy-authorization", "proxy-authenticate", "host", "content-length"]);
 const HEAD_MAX = 64 << 10;
 const WS_QUEUE = 1 << 20; // a WebSocket's messages may wait this much for room, and no more: the platform says nothing of its own
+const WS_MESSAGE_MAX = 1 << 20; // a message from the device, as the platform takes no larger
 
 const cat = (...parts) => {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -153,6 +154,11 @@ function findHeadEnd(b) {
 // The body of a response, as a stream that pulls from the device only as it is read.
 function body(call, framing, length) {
   let left = length, chunk = 0, buf = new Uint8Array(0);
+  // The whole of it has come: the call goes too, whether or not the port, asked to close, does.
+  const done = (controller) => {
+    controller.close();
+    call.cancel();
+  };
   const more = async () => {
     const b = await call.read();
     if (!b) return false;
@@ -163,13 +169,13 @@ function body(call, framing, length) {
     {
       async pull(controller) {
         if (framing === "length") {
-          if (left === 0) return controller.close();
+          if (left === 0) return done(controller);
           if (!buf.length && !(await more())) return controller.error(new Error("the device ended short"));
           const n = Math.min(left, buf.length);
           controller.enqueue(buf.subarray(0, n));
           buf = buf.subarray(n);
           left -= n;
-          if (left === 0) controller.close();
+          if (left === 0) done(controller);
         } else if (framing === "chunked") {
           for (;;) {
             if (chunk > 0) {
@@ -194,7 +200,7 @@ function body(call, framing, length) {
             }
             const size = parseInt(line.split(";")[0], 16);
             if (Number.isNaN(size)) return controller.error(new Error("a chunk makes no sense"));
-            if (size === 0) return controller.close(); // trailers, if any, go unread
+            if (size === 0) return done(controller); // trailers, if any, go unread
             chunk = size;
           }
         } else {
@@ -256,19 +262,26 @@ export async function serve(request, label, open) {
       if (length === null && !(await call.write(enc.encode("0\r\n\r\n")))) throw new Error("lost");
     }
     call.end();
-    const head = await readHead(call);
-    if (!head) {
+    let head = await readHead(call);
+    while (head && head.status >= 100 && head.status < 200 && head.status !== 101) head = await readHead(call); // interim: 100 Continue, 103
+    const nonsense = () => {
       call.cancel();
       return new Response("what is exposed here said nothing sensible\n", { status: 502 });
-    }
+    };
+    if (!head || !(head.status >= 200 && head.status <= 599)) return nonsense(); // 101 too: nobody asked it to switch
     const headers = new Headers();
-    let framingOut = "close", left = 0;
+    let framingOut = "close", left = 0, said = null;
     for (const [name, value] of head.headers) {
       const lower = name.toLowerCase();
       if (lower === "transfer-encoding" && value.toLowerCase().includes("chunked")) framingOut = "chunked";
-      else if (lower === "content-length" && framingOut !== "chunked") (framingOut = "length"), (left = Number(value));
+      else if (lower === "content-length") {
+        // Digits, and the same each time it is said: else nobody can say where the answer ends.
+        if (!/^\d{1,15}$/.test(value) || (said !== null && said !== Number(value))) return nonsense();
+        said = Number(value);
+      }
       if (!HOP.has(lower)) headers.append(name, value);
     }
+    if (framingOut !== "chunked" && said !== null) (framingOut = "length"), (left = said);
     const empty = request.method === "HEAD" || head.status === 204 || head.status === 304 || head.status < 200;
     if (empty) call.cancel();
     return new Response(empty ? null : body(call, framingOut, left), { status: head.status, statusText: head.reason, headers });
@@ -285,7 +298,8 @@ async function socket(request, url, call) {
   const protocol = request.headers.get("sec-websocket-protocol");
   if (protocol) extra += `Sec-WebSocket-Protocol: ${protocol}\r\n`;
   if (!(await call.write(enc.encode(requestHead(request, url, extra))))) throw new Error("lost");
-  const head = await readHead(call);
+  let head = await readHead(call);
+  while (head && head.status >= 100 && head.status < 200 && head.status !== 101) head = await readHead(call);
   if (!head || head.status !== 101) {
     call.cancel();
     return new Response("what is exposed here would not take a WebSocket\n", { status: 502 });
@@ -317,6 +331,16 @@ async function socket(request, url, call) {
       buf = cat(buf, b);
       for (;;) {
         const f = wsTake(buf);
+        const held = parts.reduce((n, p) => n + p.length, 0);
+        if (f?.bad || (!f && buf.length > WS_MESSAGE_MAX + 14) || (f && held + f.payload.length > WS_MESSAGE_MAX)) {
+          // Larger than the platform would carry: said so, and over, rather than held without end.
+          closed = true;
+          try {
+            server.close(1009, "too large a message");
+          } catch {}
+          call.cancel();
+          return;
+        }
         if (!f) break;
         buf = buf.subarray(f.used);
         if (f.opcode === 9) say(10, f.payload); // ping: pong
@@ -367,6 +391,7 @@ function wsTake(b) {
     (n = (b[2] << 8) | b[3]), (at = 4);
   } else if (n === 127) {
     if (b.length < 10) return null;
+    if (b[2] | b[3] | b[4] | b[5]) return { bad: true }; // 4 GiB or more: nothing that size is carried
     (n = b[6] * 2 ** 24 + ((b[7] << 16) | (b[8] << 8) | b[9])), (at = 10);
   }
   const masked = b[1] & 128;
@@ -376,6 +401,39 @@ function wsTake(b) {
   let payload = b.subarray(at, at + n);
   if (mask) payload = payload.map((x, i) => x ^ mask[i & 3]);
   return { fin: !!(b[0] & 128), opcode: b[0] & 15, payload, used: at + n };
+}
+
+/**
+ * An address as the platform says it (cf-connecting-ip), as 16 bytes: IPv4 mapped into IPv6. All zeros, nobody's, if
+ * it is not an address.
+ */
+export function ipBytes(ip) {
+  const out = new Uint8Array(16);
+  const v4 = (text) => {
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
+    const b = m && m.slice(1).map(Number);
+    return b && b.every((x) => x <= 255) ? b : null;
+  };
+  const four = v4(ip);
+  if (four) {
+    out.set([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, ...four]);
+    return out;
+  }
+  if (!/^[0-9a-fA-F:.]+$/.test(ip) || ip.split("::").length > 2) return new Uint8Array(16);
+  let text = ip, tail4 = null;
+  const last = text.lastIndexOf(":");
+  if (text.includes(".")) {
+    tail4 = v4(text.slice(last + 1));
+    if (!tail4) return new Uint8Array(16);
+    text = text.slice(0, last + 1) + "0:0"; // two words, filled in below
+  }
+  const [h, t] = text.includes("::") ? text.split("::") : [text, null];
+  const head = h ? h.split(":") : [], tail = t ? t.split(":") : [];
+  const words = t === null ? head : [...head, ...Array(Math.max(0, 8 - head.length - tail.length)).fill("0"), ...tail];
+  if (words.length !== 8 || (t !== null && head.length + tail.length > 7) || !words.every((w) => /^[0-9a-fA-F]{1,4}$/.test(w))) return new Uint8Array(16);
+  words.forEach((w, i) => out.set([parseInt(w, 16) >> 8, parseInt(w, 16) & 255], i * 2));
+  if (tail4) out.set(tail4, 12);
+  return out;
 }
 
 /** The label a host names, if it is under the domain the public reaches devices at. */

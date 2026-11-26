@@ -1537,8 +1537,110 @@ def test_durable_object_expose():
         assert opcode == 1 and payload == message.upper(), (opcode, payload[:20])
     s.close()
 
+    # What a port says that is odd, or wrong: interim answers are passed over, an answer whose length cannot be told is
+    # refused at once, an answer is over when its length has come though the port keeps its connection, and a message
+    # larger than the platform carries ends the WebSocket. Whatever the platform says the public's address is.
+    quirky = Quirky(free_port())
+    ca.expose(quirky.port, name="odd")
+    eventually("that too", lambda: len([r for e in ca.exposures() for r in e["relays"] if r["status"] == 0]) == 3)
+    odd = next(e["label"] for e in ca.exposures() if e["port"] == quirky.port) + ".expose.test"
+
+    def ask(path, extra=""):
+        with socket.create_connection((host, int(port)), 5) as s:
+            s.settimeout(5)
+            s.sendall(f"GET {path} HTTP/1.1\r\nHost: {odd}\r\n{extra}Connection: close\r\n\r\n".encode())
+            got = b""
+            while data := s.recv(65536):  # until the answer is whole, as framed: workerd keeps the connection
+                got += data
+                head, sep, rest = got.partition(b"\r\n\r\n")
+                lower = head.lower()
+                if sep and b"transfer-encoding: chunked" in lower and rest.endswith(b"0\r\n\r\n"):
+                    break
+                if sep and b"content-length:" in lower and len(rest) >= int(lower.split(b"content-length:")[1].split(b"\r\n")[0]):
+                    break
+            return got
+
+    for path in ("/100", "/103"):
+        got = ask(path)
+        assert got.startswith(b"HTTP/1.1 200 ") and b"ok" in got.partition(b"\r\n\r\n")[2], (path, got)
+    for path in ("/bad-length", "/two-lengths", "/101"):
+        assert ask(path).startswith(b"HTTP/1.1 502 "), path
+    assert b"ok" in ask("/keep").partition(b"\r\n\r\n")[2]
+    eventually("the port's connection is let go once its answer has come", lambda: quirky.closed.get("/keep"))
+    for ip in ("1:2:3:4:5:6:7:8:9", "::ffff:192.0.2.1", "nonsense", "300.1.1.1"):
+        assert ask("/", f"cf-connecting-ip: {ip}\r\n").startswith(b"HTTP/1.1 200 "), ip
+    s = socket.create_connection((host, int(port)), 5)
+    s.sendall(f"GET /huge HTTP/1.1\r\nHost: {odd}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+              "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".encode())
+    got = b""
+    while b"\r\n\r\n" not in got:
+        got += s.recv(4096)
+    head, _, buf = got.partition(b"\r\n\r\n")
+    assert b" 101 " in head.split(b"\r\n")[0], head
+    s.settimeout(5)
+    while len(buf) < 2 or len(buf) < ws_frame_size(buf):
+        data = s.recv(65536)
+        assert data, "closed without saying why"
+        buf += data
+    opcode, payload = ws_payload(buf[: ws_frame_size(buf)])
+    assert opcode == 8 and payload[:2] == struct.pack(">H", 1009), (opcode, payload)
+    s.close()
+
     ca.unexpose(web)
     eventually("taken back", lambda: http_get(host, int(port), host=labels[web] + ".expose.test")[0] in (404, 502))
+
+
+class Quirky:
+    """A port that answers oddly, or wrongly, by path; and says when each connection was closed by the other side."""
+
+    def __init__(self, port):
+        import threading
+
+        self.port, self.closed = port, {}
+        self.sock = socket.create_server(("127.0.0.1", port))
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        import threading
+
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.one, args=(c,), daemon=True).start()
+
+    def one(self, c):
+        ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        answers = {
+            "/100": b"HTTP/1.1 100 Continue\r\n\r\n" + ok,
+            "/103": b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n" + ok,
+            "/bad-length": b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nhello",
+            "/two-lengths": b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 5\r\n\r\nhello",
+            "/101": b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n",
+            "/keep": b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",  # and the connection kept, asked or not
+            "/huge": b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n\x82\x7f\x00\x00\x01\x00\x00\x00\x00\x00",
+        }
+        try:
+            with c:
+                head = b""
+                while b"\r\n\r\n" not in head and (data := c.recv(4096)):
+                    head += data
+                path = head.split(b" ")[1].decode() if head.count(b" ") >= 2 else "/"
+                c.sendall(answers.get(path, ok))
+                if path == "/keep":  # as a port that minds no end, nor Connection: close: let go only when it is cut off
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline:
+                        c.sendall(b"x")
+                        time.sleep(0.05)
+                if path == "/huge":
+                    c.settimeout(30)
+                    while c.recv(4096):
+                        pass
+                    self.closed[path] = True
+        except OSError:
+            self.closed[path] = True
 
 
 def test_expose_nowhere():
