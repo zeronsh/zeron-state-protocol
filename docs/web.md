@@ -51,7 +51,10 @@ store needs: the origin private file system, through handles each of which holds
 device. Each has a worker; whichever holds the store's lock (Web Locks) runs the node, and the others carry their tabs' pipes to it
 over a BroadcastChannel of their own. When the tab running it goes, its lock goes with it; the next worker in line opens the store
 and says so, every pipe carried to the one before breaks, and every client dials again, as it does whenever a pipe breaks, losing
-nothing: what was not acknowledged is sent again, and what was watched is watched again.
+nothing: what was not acknowledged is sent again, and what was watched is watched again. Should storage fail, the node stops
+rather than go on with what may be lost, every tab is told, and what was asked of it and not done is said to have failed; a worker
+whose node stopped, or could not start, gets in line for the store again when its tab next wants the device, and so the device runs
+again once it can.
 
 **Files open in their own time in a browser, but the store writes when it writes.** So segments of the log are opened two ahead of
 need. Should writing outrun that, what is written to a segment not yet open is held in memory; should it have to be durable before

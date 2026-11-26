@@ -197,11 +197,14 @@ const tests: Record<string, () => Promise<void>> = {
     await follower.quota(1);
     for (let i = 0; i < 4; i++) await call(follower, "putLarge", "lf", "big", 900 << 10);
     await eventually("both tabs are told", async () => (await call<string[]>(leader, "failures")).length > 0 && (await call<string[]>(follower, "failures")).length > 0);
-    await follower.quota();
+    // The follower's worker, next in line, has the store at once, and its storage is as full: it stops too, and says so.
+    await eventually("the follower's worker tries, and stops", async () => (await call<string[]>(follower, "failures")).length > 1);
+    await follower.quota(); // room again
     await leader.close(); // its worker has let go already; this tab may stay or go
     pages.splice(pages.indexOf(leader), 1);
-    // The follower's worker has the store now: it says what is so, and what it writes is durable.
-    await eventually("the follower runs it", async () => (await call<string>(follower, "memberOrError", "lf")) === "true");
+    // Wanted again, the follower's worker tries again, and has the store: it says what is so, and what it writes is durable.
+    const member = () => Promise.race([call<string>(follower, "memberOrError", "lf"), new Promise<string>((done) => setTimeout(() => done("no answer"), 2000))]);
+    await eventually("the follower runs it", async () => (await member()) === "true");
     await call(follower, "put", "lf", "notes", ["two"]);
     expectEqual((await call<string[]>(follower, "titles", "lf", "notes", 2)).join(), "one,two");
   },

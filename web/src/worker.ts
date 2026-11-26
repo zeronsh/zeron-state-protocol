@@ -55,10 +55,23 @@ self.onmessage = async (e: MessageEvent<Command>) => {
   else if ("ask" in c) self.postMessage({ answer: c.ask, ...(await ask(c.op, c.args)) } satisfies Report);
 };
 
+let options: Options;
+let contending = false; // in line for the store, or running it
+
 function open(o: Options): void {
+  options = o;
   channel = new BroadcastChannel("zsp:" + o.name);
   channel.onmessage = (e: MessageEvent<Shout>) => heard(e.data);
-  // Whoever holds this runs the node, for as long as its tab lives.
+  contend();
+}
+
+// Gets in line for the store. Whoever holds its lock runs the node, for as long as its tab lives; one whose node stopped,
+// or never started, gets in line again when it is next wanted, by its tab asking or dialling, and tries again then: so a
+// store whose storage failed is run again once it can be, and one that cannot be is not tried over and over meanwhile.
+function contend(): void {
+  if (contending) return;
+  contending = true;
+  const o = options;
   void navigator.locks.request("zsp:" + o.name, async () => {
     let failed: Promise<Error>;
     try {
@@ -68,6 +81,7 @@ function open(o: Options): void {
       failed = new Promise((done) => (node.onFailure = done));
       device = node;
     } catch (error) {
+      contending = false;
       fail(error instanceof Error ? error.message : String(error));
       return;
     }
@@ -80,6 +94,7 @@ function open(o: Options): void {
     // worker may have the store, and try.
     const error = await failed;
     device = undefined;
+    contending = false;
     fail(error.message);
   });
 }
@@ -106,6 +121,7 @@ function breakCarried(): void {
 
 async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: string }> {
   if (device) return answer(op, args);
+  contend();
   const id = crypto.randomUUID();
   return new Promise((done) => {
     waiting.set(id, done);
@@ -201,6 +217,7 @@ function connect(port: MessagePort): void {
     port.onmessage = (e: MessageEvent<Say>) => (wire ? onSay(wire, e.data) : undefined);
     return;
   }
+  contend();
   // The leader may not be listening on the pipe's own channel until it says so: until then what the tab says waits here.
   const name = channel.name + ":" + crypto.randomUUID();
   const far = new BroadcastChannel(name);
