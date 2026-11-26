@@ -110,6 +110,9 @@ export class Space extends DurableObject {
   // Nothing more can be kept: what was not kept was not acknowledged, and every device still has it. Everyone here is
   // told and let go, the node with all it held in memory is let go too, and for a while nobody is let in.
   #fail() {
+    // The public's calls go with the node: whoever waits on one hears it is over, not nothing until the platform gives up.
+    for (const c of this.#calls.values()) c.flow(3, new Uint8Array());
+    this.#calls.clear();
     for (const ws of this.ctx.getWebSockets()) {
       try {
         ws.close(1011, FULL);
