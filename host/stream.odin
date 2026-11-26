@@ -1,6 +1,7 @@
 package host
 
 import "core:encoding/hex"
+import "core:fmt"
 import "core:nbio"
 import "core:net"
 import "core:strings"
@@ -448,6 +449,7 @@ Dialer :: struct {
 	url:      pipe.Url,
 	stream:   ^Stream,
 	failures: int,
+	admitted: bool, // the session on this connection is ready
 	due:      time.Tick, // when to try again
 	state:    enum {
 		Waiting,
@@ -559,8 +561,10 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 				dialer_resolved(d)
 			}
 		case .Up:
-			if d.stream.session != nil && d.stream.session.ready {
+			if d.stream.session != nil && d.stream.session.ready && !d.admitted {
 				d.failures = 0 // admitted, not merely answered
+				d.admitted = true
+				report(.Debug, "admitted by the relay at ", d.source)
 			}
 			if d.dropped {
 				d.stream.dead = true
@@ -606,6 +610,7 @@ dialer_resolve :: proc(d: ^Dialer) {
 @(private)
 dialer_resolved :: proc(d: ^Dialer) {
 	if !d.found {
+		report(.Debug, "cannot find the relay at ", d.source)
 		dialer_failed(d)
 		return
 	}
@@ -613,9 +618,12 @@ dialer_resolved :: proc(d: ^Dialer) {
 	d.dialling = nbio.dial_poly(d.endpoint, d, proc(op: ^nbio.Operation, d: ^Dialer) {
 		d.dialling = nil
 		if op.dial.err != nil {
+			report(.Debug, "cannot reach the relay at ", d.source, ": ", fmt.tprint(op.dial.err))
 			dialer_failed(d)
 			return
 		}
+		report(.Debug, "connected to the relay at ", d.source)
+		d.admitted = false
 		s := stream_new(d.host, op.dial.socket)
 		s.dialer = d
 		d.stream = s
@@ -633,13 +641,16 @@ dialer_resolved :: proc(d: ^Dialer) {
 @(private)
 dialer_failed :: proc(d: ^Dialer) {
 	wait := 200 * time.Millisecond << uint(min(d.failures, 8))
+	wait += wait * time.Duration(time.tick_now()._nsec % 64) / 128
 	d.failures += 1
 	d.state = .Waiting
-	d.due = time.tick_add(time.tick_now(), wait + wait * time.Duration(time.tick_now()._nsec % 64) / 128)
+	d.due = time.tick_add(time.tick_now(), wait)
+	report(.Debug, "the relay at ", d.source, " again in ", fmt.tprint(wait))
 }
 
 @(private)
 dialer_lost :: proc(d: ^Dialer) {
+	report(.Debug, "no longer connected to the relay at ", d.source)
 	d.stream = nil
 	dialer_failed(d)
 }

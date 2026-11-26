@@ -9,6 +9,7 @@ package main
 import "base:runtime"
 import "core:crypto"
 import "core:encoding/hex"
+import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
@@ -93,7 +94,15 @@ run :: proc() -> int {
 	// Standard output is for answers.
 	context.logger = {
 		lowest_level = .Debug if verbose else .Info,
-		procedure    = proc(_: rawptr, _: runtime.Logger_Level, text: string, _: runtime.Logger_Options, _ := #caller_location) {
+		procedure    = proc(_: rawptr, level: runtime.Logger_Level, text: string, _: runtime.Logger_Options, _ := #caller_location) {
+			if level == .Debug {
+				// When, to the millisecond, so that what several nodes say can be read as one story.
+				now := time.now()
+				h, m, sec := time.clock_from_time(now)
+				ms := time.to_unix_nanoseconds(now) / 1_000_000 % 1000
+				say(os.stderr, fmt.tprintf("%02d:%02d:%02d.%03d ", h, m, sec, ms), text, "\n")
+				return
+			}
 			say(os.stderr, text, "\n")
 		},
 	}
