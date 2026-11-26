@@ -86,6 +86,66 @@ const zsp = {
     w.stop();
     return state ? state.rows.map((r) => r.title ?? "") : [];
   },
+  /** What a device costs here: each figure the median of many. Its owner admits it, by `admit`, between the two halves. */
+  async benchOpen(name: string): Promise<{ key: string; opened: number }> {
+    const t = performance.now();
+    const d = await open({ name });
+    devices.set(name, d);
+    return { key: d.key, opened: performance.now() - t };
+  },
+  async benchRun(name: string, rows: number): Promise<Record<string, number>> {
+    const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+    const M = { author: columns.string(16), body: columns.text(17), stars: columns.number(18) };
+    const c = clientOf(name);
+    for (let i = 0; i < 2000 && !c.may(1, "write"); i++) await sleep(5);
+    const writes: number[] = [];
+    for (let i = 0; i < 100; i++) {
+      const t = performance.now();
+      await c.write(1, (ch) => ch.insert(M, "chat", i, { author: "wing", stars: i }));
+      writes.push(performance.now() - t);
+    }
+    let t = performance.now();
+    const all: Promise<void>[] = [];
+    for (let i = 0; i < rows; i += 1000)
+      all.push(c.write(1, (ch) => {
+        for (let k = i; k < i + 1000 && k < rows; k++) ch.insert(M, "big", k, { author: "author " + (k % 100), stars: k, body: "the quick brown fox " + k });
+      }));
+    await Promise.all(all);
+    const bulk = performance.now() - t;
+    const pages: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      const fresh = new Client({ connect: devices.get(name)!.connect });
+      while (!fresh.ready) await sleep(0);
+      t = performance.now();
+      await new Promise<void>((done) => {
+        const w = fresh.window({ scope: 1, list: "big", table: M, size: 50 }, (st) => {
+          if (st.status === "ready" && st.rows.length === 50) (pages.push(performance.now() - t), w.stop(), done());
+        });
+      });
+      fresh.close();
+    }
+    let id = "";
+    await c.write(1, (ch) => (id = ch.insert(M, "tokens", 1, {})));
+    const reader = new Client({ connect: devices.get(name)!.connect });
+    let shown = "";
+    reader.window({ scope: 1, list: "tokens", table: M }, (st) => (shown = st.rows[0]?.body ?? ""));
+    for (let i = 0; i < 2000 && !reader.ready; i++) await sleep(1);
+    await sleep(100);
+    const editor = c.text(id, M.body);
+    const tokens: number[] = [];
+    let said = "";
+    const turn = () => new Promise<void>((done) => { const ch = new MessageChannel(); ch.port1.onmessage = () => done(); ch.port2.postMessage(0); });
+    for (let i = 0; i < 200; i++) {
+      said += `token${i} `;
+      t = performance.now();
+      editor.append(`token${i} `);
+      while (shown !== said) await turn();
+      tokens.push(performance.now() - t);
+    }
+    editor.close();
+    reader.close();
+    return { write: median(writes), bulk, page: median(pages), token: median(tokens) };
+  },
   /** Runs the live suite with a and b as said. */
   async live(a: Side, b: Side): Promise<string> {
     const lines: string[] = [];

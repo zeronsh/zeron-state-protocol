@@ -116,7 +116,8 @@ export const columns = Object.freeze({
         new DataView(b.buffer).setFloat64(0, v);
         return b;
       },
-      (b) => (b.length === 8 ? new DataView(b.buffer, b.byteOffset, 8).getFloat64(0) : NaN),
+      // As Luau reads it: eight bytes or more, the first eight; fewer, nothing.
+      (b) => (b.length >= 8 ? new DataView(b.buffer, b.byteOffset, 8).getFloat64(0) : (undefined as unknown as number)),
     ),
   boolean: (slot: number): Column<boolean> => column(slot, "boolean", (v: boolean) => Uint8Array.of(v ? 1 : 0), (b) => b.length === 1 && b[0] === 1),
   /** Another row, by its id. */
@@ -1135,7 +1136,13 @@ export class Client {
         made[name] = text.read(this.#text(row, c.slot));
       } else {
         const slot = row.slots.get(c.slot);
-        if (slot) for (const cell of slot.values()) if (cell.kind === VALUE) made[name] = c.decode(cell.body);
+        if (slot) {
+          for (const cell of slot.values()) {
+            if (cell.kind !== VALUE) continue;
+            const value = c.decode(cell.body);
+            if (value !== undefined) made[name] = value;
+          }
+        }
       }
     }
     Object.freeze(made);

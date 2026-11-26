@@ -9,6 +9,7 @@ import { Client } from "../src/client.ts";
 import type { Connect, Wire } from "../src/node.ts";
 import { open } from "../src/nodejs.ts";
 import { live } from "./live.ts";
+import { mirrorSuite } from "./mirror.ts";
 import { cloud, eventually, exists, expectEqual, node, procs, proxy, TMP, token, zspd, zspdConnect } from "./procs.ts";
 
 // Pipes that can be broken, as a crash of the pipe breaks them.
@@ -195,6 +196,13 @@ const tests: Record<string, () => Promise<void>> = {
     const relay = await node("serve", join(TMP, "w-relay"));
     const s = await space("w", relay, ["web", "web"]);
     await live(s);
+    await s.close();
+  },
+  // Structured state, by two web devices through a relay: test/mirror.ts, as luau/tests/mirror.luau is run on zspd's.
+  async mirror() {
+    const relay = await node("serve", join(TMP, "m-relay"));
+    const s = await space("m", relay, ["web", "web"]);
+    await mirrorSuite(s);
     await s.close();
   },
 };

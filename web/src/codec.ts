@@ -67,10 +67,21 @@ export function binaryFromHex(s: string): string {
   return binary(unhex(s));
 }
 
+// The value of each hex digit by its char code, and 255 for what is none.
+const NIBBLE = (() => {
+  const t = new Uint8Array(128).fill(255);
+  for (let i = 0; i < 16; i++) t["0123456789abcdef".charCodeAt(i)] = t["0123456789ABCDEF".charCodeAt(i)] = i;
+  return t;
+})();
+
 export function unhex(s: string): Uint8Array {
-  if (s.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(s)) throw new Malformed("not hex");
+  if (s.length % 2 !== 0) throw new Malformed("not hex");
   const out = new Uint8Array(s.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.slice(i * 2, i * 2 + 2), 16);
+  for (let i = 0; i < out.length; i++) {
+    const hi = NIBBLE[s.charCodeAt(2 * i)] ?? 255, lo = NIBBLE[s.charCodeAt(2 * i + 1)] ?? 255;
+    if ((hi | lo) > 15) throw new Malformed("not hex");
+    out[i] = (hi << 4) | lo;
+  }
   return out;
 }
 

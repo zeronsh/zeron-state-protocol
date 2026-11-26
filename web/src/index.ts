@@ -7,6 +7,8 @@ import type { Connect, Member, Rights } from "./node.ts";
 export { Client, CallFault, columns } from "./client.ts";
 export type { Answer, Asking, AuthorsColumn, Call, Change, Column, Device as Who, Editor, Entry, Event, Fault, Host, Is, Query, Row, State, Status, Stored, Table, TextColumn, Values, Window } from "./client.ts";
 export { where } from "./ask.ts";
+export * as mirror from "./mirror.ts";
+export type { Doc, Draft, Fields, Input, ListSchema, MapSchema, Mirror, Of, RecordSchema, Schema, TreeSchema } from "./mirror.ts";
 export type { Match, Question, Total, Where } from "./ask.ts";
 export { spaceUrl } from "./node.ts";
 export type { Connect, Member, Rights, Wire } from "./node.ts";

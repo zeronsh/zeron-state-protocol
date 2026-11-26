@@ -49,13 +49,15 @@ web_test() {
 	node test/node.ts
 	node test/vectors.ts ../vectors/vectors.json
 	node test/ask.ts
-	for t in text store end_to_end browsers; do
+	for t in text mirror_model mirror_interop store end_to_end browsers; do
 		args=
 		[ $t = store ] && args=../build/node-small.wasm
 		(node test/$t.ts $args >../build/web-$t.log 2>&1 || echo web-$t >>../build/failed) &
 	done
 	wait
-	cat ../build/web-text.log ../build/web-store.log ../build/web-end_to_end.log ../build/web-browsers.log
+	for t in text mirror_model mirror_interop store end_to_end browsers; do
+		cat ../build/web-$t.log
+	done
 }
 
 case "${1:-test}" in
@@ -121,7 +123,14 @@ sim) # as many worlds as you have patience for: ./x sim 10000 [first]
 		-define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 -define:ZSP_FIND_RUN=64 -define:ZSP_FIND_HOT=0
 	;;
 bench)
-	if [ "${2:-}" = mirror ]; then # what structured state costs a client: ./x bench mirror [rows]
+	if [ "${2:-}" = web ]; then # what a web device costs, in Node and in a browser: ./x bench web [rows]
+		[ -f build/zspd$EXE ] || odin build zspd -out:build/zspd$EXE -debug $STRICT
+		! stale web/src/node.wasm || web_wasm
+		web_deps
+		node web/build.ts
+		node --expose-gc web/test/bench.ts ${3:-100000}
+		node web/test/browsers.ts bench
+	elif [ "${2:-}" = mirror ]; then # what structured state costs a client: ./x bench mirror [rows]
 		lune run luau/tests/mirror_bench.luau ${3:-2000}
 	elif [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]
 		odin build bench/find -out:build/bench-find$EXE -o:speed $STRICT
