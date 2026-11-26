@@ -3,6 +3,7 @@
 // devices through a relay of zspd's and through the Durable Object. `node test/end_to_end.ts [names...]`
 
 import { spawn } from "node:child_process";
+import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { Client, columns } from "../src/client.ts";
@@ -273,14 +274,27 @@ const tests: Record<string, () => Promise<void>> = {
 async function main(): Promise<void> {
   const names = process.argv.slice(2).length > 0 ? process.argv.slice(2) : Object.keys(tests);
   if (names.length > 1) {
-    // Side by side, each in a process of its own, as tests/end_to_end.py runs.
-    const runs = names.map((name) => {
-      const p = spawn(process.execPath, [process.argv[1], name], { stdio: ["ignore", "pipe", "pipe"] });
-      let out = "";
-      p.stdout.on("data", (d) => (out += d));
-      p.stderr.on("data", (d) => (out += d));
-      return new Promise<[string, number]>((done) => p.on("exit", (code) => done([out, code ?? 1])));
-    });
+    // Side by side, each in a process of its own, as tests/end_to_end.py runs; but no more at once than half the machine
+    // has cores for, since some say how fast things are, and a machine with more to do than it can is not fast.
+    const room = Math.max(2, Math.floor(availableParallelism() / 2));
+    const run = (name: string) =>
+      new Promise<[string, number]>((done) => {
+        const p = spawn(process.execPath, [process.argv[1], name], { stdio: ["ignore", "pipe", "pipe"] });
+        let out = "";
+        p.stdout.on("data", (d) => (out += d));
+        p.stderr.on("data", (d) => (out += d));
+        p.on("exit", (code) => done([out, code ?? 1]));
+      });
+    const results: Promise<[string, number]>[] = [];
+    const running = new Set<Promise<unknown>>();
+    for (const name of names) {
+      while (running.size >= room) await Promise.race(running);
+      const r = run(name);
+      results.push(r);
+      const held: Promise<boolean> = r.then(() => running.delete(held));
+      running.add(held);
+    }
+    const runs = results;
     let failed = false;
     for (const [out, code] of await Promise.all(runs)) {
       process.stdout.write(out);
