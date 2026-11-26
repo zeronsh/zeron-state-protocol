@@ -2,17 +2,21 @@
 // times, each of whose documents is at every step what a reading of its rows from nothing says it is; that come to the
 // same; and in which each change reads back as what was set. The same as luau/tests/mirror_model.luau.
 //
+// And what is asked about, without opening anything, is what the document shows there of what a node finds.
+//
 // node web/test/mirror_model.ts [seeds] [quick|plain|both] [first]: with the shortcuts, with every one of them off, or, as
 // unless said, both side by side. Each seed is gone over from the same start, so that any one can be gone back to alone.
+// Cases that are gone over once come first, in either.
 
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { where as q, type Where } from "../src/ask.ts";
 import * as codec from "../src/codec.ts";
 import * as text from "../src/text.ts";
 import { type Client, type Column, type Stored } from "../src/client.ts";
 import * as m from "../src/mirror.ts";
-import { board, derive, document, hostile, latest, mutate, rows } from "./mirror_cases.ts";
-import { hear, peer, run, type Peer } from "./peers.ts";
+import { board, derive, document, hostile, latest, mutate, rows, words } from "./mirror_cases.ts";
+import { drain, evaluate, hear, peer, rowsOf, run, sendCells, store, type Peer } from "./peers.ts";
 import { random, type Random } from "./random.ts";
 
 const SEEDS = Number(process.argv[2] ?? 40);
@@ -271,6 +275,7 @@ class Failed extends Error {}
 
 const Board = board();
 let hostileClock = 0;
+let asks = 0, given = 0; // questions asked of what is in a document, and rows given in answer
 
 // Both, side by side, each in a process of its own.
 async function both(): Promise<void> {
@@ -292,8 +297,77 @@ async function both(): Promise<void> {
   console.log("ok");
 }
 
+// ---------------------------------------------------------------- cases, each once
+
+function must(ok: unknown, what: string): asserts ok {
+  if (!ok) throw new Failed(what);
+}
+
+function cases(): void {
+  rng = random(0);
+  clock = 1800000000;
+  // Sent by a node, and not yet read by the document.
+  const unread = (p: Peer, cells: Uint8Array) => sendCells(p, rowsOf(p, store(p, cells)));
+  const pass = (from: Peer, to: Peer, since: number, read: boolean) => {
+    for (let k = since; k < from.out.length; k++) {
+      if (read) hear(to, from.out[k]);
+      else unread(to, from.out[k]);
+    }
+  };
+  const a = peer(bytes, () => clock * 1000), b = peer(bytes, () => clock * 1000);
+  const doc = { scope: 1, name: document, schema: Board };
+  const da = m.open(a.client, doc), db = m.open(b.client, doc);
+  // As each is when asked, which what was asked before says nothing of.
+  const A = (): m.Doc<typeof Board> => da.state, B = (): m.Doc<typeof Board> => db.state;
+  run(a);
+  run(b);
+  void da.set({ title: "board", tasks: [{ title: "first", tags: [], steps: [{ name: "one" }], plan: {} }] });
+  run(a);
+  pass(a, b, 0, true);
+  must(B().tasks[0]?.title === "first" && B().tasks[0].steps.length === 1, "b has what a set");
+
+  // An update is drafted from what has come, read or not: what another wrote meanwhile is not written back over.
+  let since = a.out.length;
+  void da.update((d) => void (d.tasks[0].title = "second"));
+  run(a);
+  pass(a, b, since, false);
+  let mine = b.out.length;
+  void db.update((d) => void (d.title = "renamed"));
+  run(b);
+  pass(b, a, mine, true);
+  must(B().tasks[0].title === "second", `b wrote back what it had not read: ${B().tasks[0].title}`);
+  must(A().tasks[0].title === "second" && A().title === "renamed", "and a has both");
+
+  // A row put in another list, and back, was only away: what is in it is not let go of when next anyone writes.
+  const task = A().tasks[0].id;
+  since = a.out.length;
+  void a.client.write(1, (change) => change.place(task, "elsewhere", 0));
+  run(a);
+  pass(a, b, since, true);
+  must(B().tasks.length === 0, "away");
+  since = a.out.length;
+  void a.client.write(1, (change) => change.place(task, "mirror/" + document, 0));
+  run(a);
+  pass(a, b, since, true);
+  must(B().tasks.length === 1, "and back");
+  mine = b.out.length;
+  void db.update((d) => void (d.title = "again"));
+  run(b);
+  pass(b, a, mine, true);
+  must(B().tasks[0].steps.length === 1, "b let go of what is in a row that came back");
+  must(A().tasks[0].steps.length === 1, "and so a has lost it");
+  da.close();
+  db.close();
+
+  // Nothing put after an element is nothing written.
+  const t = text.create();
+  must(text.after(t, "", new Uint8Array(0), () => "\x01\x02\x03\x04\x05\x06\x07\x08") === "", "nothing is named");
+  must(text.close(t, "\x01".repeat(16)) === null, "and nothing is written");
+}
+
 function quick(): void {
   const began = performance.now();
+  cases();
   for (let seed = FIRST; seed < FIRST + SEEDS; seed++) {
     rng = random(seed);
     clock = 1800000000;
@@ -313,6 +387,104 @@ function quick(): void {
         throw new Failed(`seed ${seed}, client ${i + 1}, ${what}: ${differ(docs[i].state, want, "")}\n  mirror ${ids(docs[i].state.tasks)}\n  model  ${ids(want.tasks)}`);
       }
     };
+    // What is asked about is what the document shows there that answers, as a node orders it; given without its own
+    // lists, records and trees of rows.
+    const checkAsk = (i: number, what: string, asker?: Peer) => {
+      const want = model(peers[i].client, Board);
+      const by = asker ?? peers[i];
+      const root = derive("");
+      const word = () => words[R(words.length) - 1];
+      let path: string[] = ["tasks"], cond: Where | undefined, kind: "list" | "record" | "tree" = "list";
+      let byTitle = R(2) === 1;
+      const some = (t: Any): string | undefined => {
+        const ks = Object.keys(t ?? {});
+        return ks.length > 0 ? ks[R(ks.length) - 1] : undefined;
+      };
+      const r = R(6);
+      if (r === 1) {
+        const c = R(3);
+        if (c === 1) cond = q.is("done", R(2) === 1);
+        else if (c === 2) cond = q.is("title", word());
+      } else if (r === 2) {
+        const lo = RR(0, 60), hi = RR(40, 100);
+        [path, kind, byTitle] = [["scores"], "record", false];
+        cond = q.between("value", lo, hi);
+      } else if (r === 3) {
+        const w = word();
+        [path, kind] = [["people"], "record"];
+        cond = q.is("role", w);
+      } else if (r === 4) {
+        const w = word();
+        [path, kind] = [["outline"], "tree"];
+        if (R(2) === 1) cond = q.is("name", w);
+      } else if (r === 5) {
+        path = ["people", some(want.people) ?? word(), "pets"];
+      } else {
+        const t = want.tasks[R(Math.max(1, want.tasks.length)) - 1];
+        path = ["tasks", t ? t.id : "01".repeat(16), "steps"];
+        if (R(2) === 1) cond = q.is("name", word());
+      }
+      // What the model says.
+      let box: Any = want;
+      let s: m.MapSchema = Board;
+      for (let k = 0; box !== undefined && k < path.length; k += 2) {
+        const b = s.boxes[s.at.get(path[k])!]!;
+        box = box[path[k]];
+        if (k === path.length - 1) break;
+        const key = path[k + 1];
+        if (b.kind === "record") box = box?.[key];
+        else box = ((box ?? []) as Any[]).find((x) => x.id === key);
+        s = (b as m.ListSchema<m.MapSchema>).of;
+      }
+      const strip = (v: unknown): unknown => {
+        if (typeof v !== "object" || v === null) return v;
+        const out: Record<string, unknown> = {};
+        for (const [f, x] of Object.entries(v)) {
+          if (f === "children") out.children = (x as unknown[]).map(strip);
+          else if (f !== "steps" && f !== "pets") out[f] = x;
+        }
+        return out;
+      };
+      const members: { id: string; key?: string; v: unknown }[] = [];
+      if (kind === "record") {
+        for (const [key, v] of Object.entries(box ?? {})) members.push({ id: hex(derive(root, name(path[path.length - 1]), name(key))), key, v });
+      } else {
+        const walk = (level: Any[] | undefined) => {
+          for (const n of level ?? []) {
+            members.push({ id: n.id, v: n });
+            walk(n.children);
+          }
+        };
+        walk(box);
+      }
+      const last = path[path.length - 1];
+      const orderBy = last === "tasks" ? "title" : last === "people" ? "role" : "name";
+      let got: Any;
+      const asking = { where: cond, order: byTitle ? [orderBy] : undefined, limit: 1000 };
+      const asked = m.ask(by.client, { scope: 1, name: document, schema: Board }, path as unknown as m.Path<typeof Board>, asking, (a) => (got = a));
+      run(by);
+      // Which rows answer is the node's to say, by the bytes in them, as it orders them; that they are what the document
+      // shows, and are given as it shows them, the mirror's.
+      const first = Math.min(...by.asked.keys());
+      const byId = new Map(members.map((x) => [x.id, x]));
+      const expected = evaluate(by, by.asked.get(first)!)[0].flatMap((rid) => byId.get(hex(rid)) ?? []);
+      const fail = (why: string) => {
+        throw new Failed(
+          `seed ${seed}, client ${i + 1}, ${what}, asking about ${path.join("/")} (${byTitle ? orderBy : "newest"}): ${why}` +
+            `\n  want ${expected.map((x) => show(strip(x.v))).join(" ")}\n  got  ${got.rows.map(show).join(" ")}`,
+        );
+      };
+      if (got.status !== "ready") fail(`it is ${got.status}`);
+      if (got.rows.length !== expected.length) fail(`${got.rows.length} rows, not ${expected.length}`);
+      expected.forEach((x, j) => {
+        if (!equal(got.rows[j], strip(x.v))) fail(`row ${j + 1} differs: ${differ(got.rows[j], strip(x.v), "") ?? "?"}`);
+        if (kind === "record" && got.keys[j] !== x.key) fail(`key ${j + 1} is ${got.keys[j]}, not ${x.key}`);
+      });
+      asks++;
+      given += got.rows.length;
+      asked.stop();
+      run(by);
+    };
     for (let step = 1; step <= 30; step++) {
       clock += (rng.int(0, 2 ** 30) / 2 ** 30) * 3;
       // Some write; each change reads back as what was set.
@@ -329,11 +501,15 @@ function quick(): void {
           mutate(d, rng);
           draft = plain(d);
         });
-        run(peers[i]);
+        // As written, before the node sends anything back: what comes back with it (others' writing, in rows this one put
+        // in the list) is news, and is held to the model below.
+        drain(peers[i]);
         if (!equal(docs[i].state, draft, false)) {
           throw new Failed(`seed ${seed} step ${step}, client ${i + 1}: what was set is not what is read: ${differ(draft, docs[i].state, "")}\n  set  ${show(draft)}\n  read ${show(docs[i].state)}`);
         }
+        run(peers[i]);
         check(i, `step ${step}, after writing`);
+        if (R(3) === 1) checkAsk(i, `step ${step}, after writing`);
         for (let k = before; k < peers[i].out.length; k++) log.push(peers[i].out[k]);
       }
       if (seed % 3 === 0 && R(3) === 1) log.push(hostile(peers[0].client, rng, clock, ++hostileClock));
@@ -352,6 +528,7 @@ function quick(): void {
       rng.shuffle(order);
       for (const k of order) hear(peers[i], log[k]);
       check(i, "at the end");
+      checkAsk(i, "at the end");
     }
     // Each writes once more, which lets go of what nothing shows; and once that is everywhere, nothing is kept that is not
     // shown, but keys that were let go of, which hold nothing.
@@ -395,6 +572,13 @@ function quick(): void {
         }
       }
     }
+    // One that has heard it all and opened nothing: it holds only what it asks about, and finds the same.
+    {
+      const reader = peer(bytes, () => clock * 1000);
+      for (const cells of log) hear(reader, cells);
+      for (const p of peers) for (const cells of p.out) hear(reader, cells);
+      for (let k = 0; k < 6; k++) checkAsk(0, "by one that opened nothing", reader);
+    }
     for (let i = 1; i < n; i++) {
       if (!equal(docs[i].state, docs[0].state)) throw new Failed(`seed ${seed}: clients 1 and ${i + 1} differ: ${differ(docs[0].state, docs[i].state, "")}`);
     }
@@ -409,7 +593,9 @@ function quick(): void {
     };
     walk(docs[0].state.outline);
   }
-  console.log(`${SEEDS} seeds from ${FIRST}${MODE === "plain" ? ", every shortcut off" : ", with the shortcuts"}: ${((performance.now() - began) / 1000).toFixed(2)} s`);
+  const how = MODE === "plain" ? ", every shortcut off" : ", with the shortcuts";
+  const took = ((performance.now() - began) / 1000).toFixed(2);
+  console.log(`${SEEDS} seeds from ${FIRST}${how}, ${asks} questions asked, ${given} rows given: ${took} s`);
   console.log("ok");
 }
 

@@ -10,10 +10,11 @@
 // A port of luau/zsp/mirror.luau, which says the same in the same order; what one does, the other does, and each reads
 // what the other writes. Row ids are hex where an application sees them, and binary strings within, as the client's are.
 
+import { where, type Total, type Where as Condition } from "./ask.ts";
 import * as codec from "./codec.ts";
 import { sha256 } from "./sha256.ts";
 import * as text from "./text.ts";
-import type { AuthorsColumn, Cell, Change, Client, Column, Stored, Table, TextColumn } from "./client.ts";
+import type { Answer, Asking, AuthorsColumn, Cell, Change, Client, Column, Stored, Table, TextColumn } from "./client.ts";
 
 const WHERE = 255; // the slot that says what a row is in
 const W = "\0where";
@@ -103,7 +104,8 @@ function raw(slot: number): Column<Uint8Array> {
 
 /**
  * Named columns, and whatever is nested under other names. Each column has a slot of its own, from 16 to 254, as has
- * each list and tree, which keeps its order there.
+ * each list and tree, which keeps its order there; but one that says whose what is in a slot is (columns.author and
+ * columns.authors), which names another's.
  */
 export function map<F extends Fields>(fields: F): MapSchema<F> {
   const slots = new Set<number>();
@@ -126,7 +128,8 @@ export function map<F extends Fields>(fields: F): MapSchema<F> {
       columns.push(undefined);
     } else {
       if (typeof f?.encode !== "function") throw new Error(`${name} is neither a column nor a schema`);
-      claim(f.slot, name);
+      // Whose what is in a slot is says so of another's slot: it has none of its own.
+      if (!f.who) claim(f.slot, name);
       columns.push(f);
       boxes.push(undefined);
       if (!f.who) {
@@ -520,6 +523,26 @@ type Items = Extract<BoxState, { kind: "items" }>;
  * whatever did not change the very same object as before.
  */
 export function open<S extends MapSchema<any>>(client: Client, options: { scope: number; name: string; schema: S }, observer?: (state: Doc<S>) => void): Mirror<S> {
+  return opened(client, options, observer, false).mirror;
+}
+
+// An open document, and for ask, what it reads with: read again what has changed among the rows held; the ids that are the
+// same for everyone; a row to read again; the state as last read. One opened for ask (heldOnly) is read over whatever rows
+// the client holds, not over the whole document: what is not held is not known, rather than gone. It is read, not written.
+interface Opened<S extends MapSchema<any>> {
+  mirror: Mirror<S>;
+  refresh: () => void;
+  derive: (parts: string) => string;
+  mark: (id: string) => void;
+  current: () => Obj;
+}
+
+function opened<S extends MapSchema<any>>(
+  client: Client,
+  options: { scope: number; name: string; schema: S },
+  observer: ((state: Doc<S>) => void) | undefined,
+  heldOnly: boolean,
+): Opened<S> {
   const { scope, schema } = options;
   if (schema?.kind !== "map") throw new Error("a document is a map");
   const list = "mirror/" + options.name;
@@ -711,8 +734,10 @@ export function open<S extends MapSchema<any>>(client: Client, options: { scope:
         if (t && t.kind === "tree" && moved(id, t.slot)) markBox(k, true);
       }
       // What was in a row that is gone is gone with it, wherever it is; and a row that is here is not gone, whatever was
-      // seen of it, as when it was let go of from memory while it was elsewhere, and is back.
-      if (old && !w && (!row || row.dead)) deadRows.add(id); // deleted, and perhaps let go of from memory already
+      // seen of it, as when it was let go of from memory while it was elsewhere, and is back. Where only some rows are
+      // held, one that is not held is not known to be gone.
+      const gone = heldOnly ? row !== undefined && row.dead : !row || row.dead;
+      if (old && !w && gone) deadRows.add(id); // deleted, and perhaps let go of from memory already
       else if (row && !row.dead) deadRows.delete(id);
       // What is in a row that comes or goes is there or not with it.
       if ((old === undefined) !== (w === undefined)) {
@@ -1264,13 +1289,13 @@ export function open<S extends MapSchema<any>>(client: Client, options: { scope:
     if (observer && was !== current) observer(current as Doc<S>);
   };
 
-  const watching = client.window({ scope, list, table: WINDOW, size: 0, from: "start", bare: true }, () => refresh());
+  const watching = heldOnly ? undefined : client.window({ scope, list, table: WINDOW, size: 0, from: "start", bare: true }, () => refresh());
   const unfollow = client.follow((id) => {
     if (stopped) return;
     const bin = binaryOf(id);
     if (ours(bin, id)) dirtyRows.add(bin);
   });
-  for (const e of watching.entries()) dirtyRows.add(e.row.id);
+  for (const e of watching?.entries() ?? NONE) dirtyRows.add(e.row.id);
   refresh();
 
   // ------------------------------------------------ writing
@@ -1284,6 +1309,7 @@ export function open<S extends MapSchema<any>>(client: Client, options: { scope:
   };
 
   const set = (state: Input<S>): Promise<void> => {
+    if (heldOnly) throw new Error("what is asked about is read, not written");
     if (stopped) throw new Error("the document is closed");
     if (!client.may(scope, "write")) throw new Error("this client may not write there, or does not know yet that it may");
     refresh();
@@ -1752,7 +1778,7 @@ export function open<S extends MapSchema<any>>(client: Client, options: { scope:
     }
   };
 
-  return Object.freeze({
+  const mirror: Mirror<S> = Object.freeze({
     get state(): Doc<S> {
       return current as Doc<S>;
     },
@@ -1761,7 +1787,10 @@ export function open<S extends MapSchema<any>>(client: Client, options: { scope:
     },
     set,
     update(f: (draft: Draft<S>) => void): Promise<void> {
-      refresh(); // a draft of the state as it is, not as it was last told
+      // From the state as it is now, with all that has come read: a draft of an older one would write it back.
+      if (heldOnly) throw new Error("what is asked about is read, not written");
+      if (stopped) throw new Error("the document is closed");
+      refresh();
       const drafts = new Drafts();
       const d = drafts.map(schema, current, undefined);
       f(d as unknown as Draft<S>);
@@ -1771,7 +1800,446 @@ export function open<S extends MapSchema<any>>(client: Client, options: { scope:
       if (stopped) return;
       stopped = true;
       unfollow();
-      watching.stop();
+      watching?.stop();
+    },
+  });
+  return { mirror, refresh, derive, mark: (id) => void dirtyRows.add(id), current: () => current };
+}
+
+// ---------------------------------------------------------------- asking
+
+/**
+ * The path of a list, record or tree in a document: names of fields; a record's key, or an item's or node's id, after the
+ * name of what holds it. As ["tasks"], ["people", "ann", "pets"], ["tasks", id, "steps"].
+ */
+export type Path<S extends MapSchema<any>> = S extends MapSchema<infer F> ? PathIn<F> : never;
+type PathIn<F> = {
+  [K in keyof F & string]: F[K] extends MapSchema<infer G>
+    ? readonly [K, ...PathIn<G>]
+    : F[K] extends { readonly kind: "list" | "record" | "tree"; readonly of: MapSchema<infer G> }
+      ? readonly [K] | readonly [K, string, ...PathIn<G>]
+      : F[K] extends RecordSchema<any>
+        ? readonly [K]
+        : never; // a list of values is in one row: it is read, not asked about
+}[keyof F & string];
+
+/** What is at a path: the list, record or tree. */
+export type At<S extends MapSchema<any>, P> = S extends MapSchema<infer F> ? BoxAt<F, P> : never;
+type BoxAt<F, P> = P extends readonly [infer K extends keyof F, ...infer R]
+  ? R extends readonly []
+    ? F[K]
+    : F[K] extends MapSchema<infer G>
+      ? BoxAt<G, R>
+      : R extends readonly [string, ...infer R2]
+        ? F[K] extends { readonly of: MapSchema<infer G> }
+          ? BoxAt<G, R2>
+          : never
+        : never
+  : never;
+
+// Fields of rows of their own, which are asked about by their paths rather than given with what holds them.
+type OfRows<F> = { [K in keyof F]: F[K] extends RecordSchema<any> | TreeSchema<any> | ListSchema<MapSchema<any>> ? K : never }[keyof F];
+type GivenField<X> = X extends MapSchema<infer G> ? GivenMap<G> : FieldDoc<X>;
+type GivenMap<F> = Flat<
+  { readonly id: string } & { readonly [K in Exclude<Always<F>, OfRows<F>>]: GivenField<F[K]> } & {
+    readonly [K in Exclude<keyof F, Always<F>>]?: FieldDoc<F[K]>;
+  }
+>;
+type GivenNode<N> = N extends MapSchema<infer F> ? Flat<GivenMap<F> & { readonly children: readonly GivenNode<N>[] }> : never;
+
+/**
+ * What is given of each row that answers: its map, with what is in its own row and in its maps, and a node's children;
+ * not its own lists, records and trees of rows. A record of values gives its values.
+ */
+export type Given<B> =
+  B extends ListSchema<infer O>
+    ? O extends MapSchema<infer F>
+      ? GivenMap<F>
+      : never
+    : B extends RecordSchema<infer O>
+      ? O extends MapSchema<infer F>
+        ? GivenMap<F>
+        : ValueOf<O>
+      : B extends TreeSchema<infer N>
+        ? GivenNode<N>
+        : never;
+
+/** What is asked of what is at a path. */
+export interface Asked {
+  /** Conditions on the columns of what is asked about, by their names, or `value` in a record of values: `where`. */
+  readonly where?: Condition;
+  /** As a question's: "newest" unless said; a column's name, after a minus for the greatest first; "best", "oldest". */
+  readonly order?: readonly string[];
+  readonly offset?: number;
+  /** 50 unless said. */
+  readonly limit?: number;
+  readonly fromEnd?: boolean;
+  readonly totals?: { readonly [name: string]: Total };
+}
+
+/** What a node finds, as the document shows it. */
+export interface Found<B = Schema> {
+  /** What answers, in the order asked for: each as the document shows it. */
+  readonly rows: readonly Given<B>[];
+  /** Of a record: whose each row is, by its key. */
+  readonly keys: B extends RecordSchema<any> ? readonly string[] : undefined;
+  readonly status: Answer["status"];
+  /** What a node counts, given or not, */
+  readonly total: number;
+  /** and how many of those come before these. */
+  readonly first: number;
+  readonly totals: Answer["totals"];
+}
+
+// What is at a path, and how it is reached.
+interface Place {
+  owner: string; // the row that holds it
+  field: string;
+  box: ListSchema | RecordSchema | TreeSchema;
+  chain: string[]; // the rows on the way to it, the document's first
+  trees: { owner: string; field: string }[]; // trees on the way, or it, all of whose nodes are needed to know which are there
+}
+
+const ID = /^[0-9a-f]{32}$/;
+
+function placeOf(schema: MapSchema, path: readonly string[], derive: (parts: string) => string): Place {
+  if (!Array.isArray(path) || path.length === 0) throw new Error("a path names what is asked about");
+  let s = schema;
+  let owner = derive("");
+  const chain = [owner], trees: Place["trees"] = [];
+  for (let i = 0; ; ) {
+    const name = path[i];
+    const at = typeof name === "string" ? s.at.get(name) : undefined;
+    const b = at !== undefined ? s.boxes[at] : undefined;
+    if (at === undefined || !b) throw new Error(`there is no ${String(name)} to ask about`);
+    const field = s.keys[at];
+    if (b.kind === "map") {
+      if (i === path.length - 1) throw new Error("a map is not asked about, but what is in it");
+      owner = derive(owner + "\0" + field);
+      chain.push(owner);
+      s = b;
+      i++;
+    } else if (i === path.length - 1) {
+      if (b.kind === "list" && !isMap(b.of)) throw new Error("a list of values is in one row: it is read, not asked about");
+      if (b.kind === "tree") trees.push({ owner, field });
+      return { owner, field, box: b, chain, trees };
+    } else {
+      if (!isMap(b.of)) throw new Error(`what is in ${name} holds nothing`);
+      const k = path[i + 1];
+      if (typeof k !== "string") throw new Error(`${name} is followed by a key or an id`);
+      // An item or a node by its id, in hex, as the document has it.
+      if (b.kind !== "record" && !ID.test(k)) throw new Error(`${k} is no id of what is in ${name}`);
+      const id = b.kind === "record" ? derive(owner + "\0" + field + "\0" + keyBytes(k)) : binaryOf(k);
+      if (b.kind === "tree") trees.push({ owner, field });
+      chain.push(id);
+      owner = id;
+      s = b.of;
+      i += 2;
+    }
+  }
+}
+
+// What a path comes to in a state: the list, record or tree, if it is there.
+function atPath(schema: MapSchema, state: Obj, path: readonly string[]): unknown {
+  const find = (level: readonly Obj[] | undefined, id: string): Obj | undefined => {
+    for (const n of level ?? NONE) {
+      if (n.id === id) return n;
+      const inside = n.children ? find(n.children, id) : undefined;
+      if (inside) return inside;
+    }
+    return undefined;
+  };
+  let s = schema;
+  let v: any = state;
+  let i = 0;
+  while (v !== undefined && i < path.length) {
+    const name = path[i];
+    const b = s.boxes[s.at.get(name)!]!;
+    v = v[name];
+    if (b.kind === "map") {
+      s = b;
+      i++;
+    } else if (i === path.length - 1) {
+      return v;
+    } else {
+      const k = path[i + 1];
+      v = v === undefined ? undefined : b.kind === "record" ? own(v, k) : find(v, k);
+      s = b.of as MapSchema;
+      i += 2;
+    }
+  }
+  return v;
+}
+
+const BYTES_COLUMN: Column<Uint8Array> = Object.freeze({ slot: WHERE, text: false, is: "bytes", encode: same, decode: same });
+const BY_WHERE: Table = Object.freeze({ [W]: BYTES_COLUMN });
+
+// Whether what is under a name is of rows of its own, which are asked about by their path rather than given with what holds them.
+function ofRows(b: Schema): boolean {
+  return b.kind === "record" || b.kind === "tree" || (b.kind === "list" && isMap(b.of));
+}
+
+// The ids of the maps within a map, and within those, made from its id.
+function mapsWithin(s: MapSchema, id: string, derive: (parts: string) => string, into: string[]): void {
+  for (let i = 0; i < s.names.length; i++) {
+    const b = s.boxes[i];
+    if (b && b.kind === "map") {
+      const inner = derive(id + "\0" + s.keys[i]);
+      into.push(inner);
+      mapsWithin(b, inner, derive, into);
+    }
+  }
+}
+
+const KIND_OF = { list: ITEM, record: ENTRY, tree: NODE } as const;
+const LOADING: Found<any> = Object.freeze({ rows: NONE, keys: undefined, status: "loading", total: 0, first: 0, totals: Object.freeze({}) });
+
+/**
+ * What is in a list, record or tree of a document, as a node finds it: the rows that answer, as the maps (or values) the
+ * document shows, in the order asked for, and kept up as they change. Nothing needs to be open, nor is anything more held
+ * than the rows on the way and those that answer, and for a tree all its nodes. A list's items are found by what their
+ * rows say they are in; whether they are, the rows on the way say, as they do when the document is open: what a node
+ * finds that the document would not show (rows written by one who minds nothing, or in what was deleted and not yet let
+ * go of) is not given, though a node counts it in `total` and `totals`. For a record, `keys` says whose each is.
+ *
+ * The observer hears at once, and again whenever what is given, or what is counted, changes. Returns ways to look at
+ * another stretch of it, and to stop.
+ */
+export function ask<S extends MapSchema<any>, const P extends Path<S>>(
+  client: Client,
+  options: { scope: number; name: string; schema: S },
+  path: P,
+  asking: Asked,
+  observer: (found: Found<At<S, P>>) => void,
+): Asking {
+  const { scope, schema } = options;
+  if (schema?.kind !== "map") throw new Error("a document is a map");
+  const steps: readonly string[] = path;
+  const kind = placeOf(schema, steps, () => ZERO).box.kind; // or an error, here rather than later
+  const list = "mirror/" + options.name;
+  const doc = opened(client, options, undefined, true);
+  const say = observer as (found: Found<any>) => void;
+  let stopped = false;
+  // What is given of a map: what is in its own row and its maps, its children if it is a node; not its lists, records and
+  // trees of rows. The same object for the same map.
+  const given = new WeakMap<Obj, Obj>();
+  const give = (s: MapSchema, v: Obj, tree: TreeSchema | undefined): Obj => {
+    let out = given.get(v);
+    if (out) return out;
+    const made: Record<string, unknown> = {};
+    for (const k of Object.keys(v)) {
+      const at = s.at.get(k);
+      const b = at !== undefined ? s.boxes[at] : undefined;
+      if (k === "children" && tree) made.children = Object.freeze((v.children as readonly Obj[]).map((n) => give(tree.of, n, tree)));
+      else if (b && b.kind === "map") made[k] = give(b, v[k], undefined);
+      else if (!(b && ofRows(b))) made[k] = v[k];
+    }
+    out = Object.freeze(made);
+    given.set(v, out);
+    return out;
+  };
+  const questions: Asking[] = []; // what is asked, to be stopped
+  const answers = new Map<string, Answer<any>>(); // the latest of each: what answers, the rows on the way, all of a tree's nodes, the maps within
+  let place: Place | undefined;
+  let last: Found<any> = kind === "record" ? Object.freeze({ ...LOADING, keys: NOBODY }) : LOADING;
+  let wasNamed = new Set<string>();
+
+  const tell = (): void => {
+    if (stopped || !place) return;
+    const p = place;
+    // What the answers name is read again, come or gone: a row held already is not necessarily sent again.
+    const named = new Set<string>();
+    for (const a of answers.values()) {
+      for (const r of a.rows) {
+        const id = binaryOf(r.id);
+        named.add(id);
+        doc.mark(id);
+      }
+    }
+    for (const id of wasNamed) if (!named.has(id)) doc.mark(id);
+    wasNamed = named;
+    doc.refresh();
+    const found = answers.get("found");
+    let status: Found["status"] = found ? found.status : "loading";
+    for (const a of answers.values()) {
+      if (a.status !== "ready" && status === "ready") status = a.status === "denied" || a.status === "faulty" ? a.status : "loading";
+    }
+    // What the document shows there, by row id.
+    const shown = new Map<string, unknown>();
+    const keyOf = new Map<string, string>();
+    const box = atPath(schema, doc.current(), steps);
+    if (p.box.kind === "record") {
+      for (const k of Object.keys((box as Obj | undefined) ?? {})) {
+        const id = codec.hex(doc.derive(p.owner + "\0" + p.field + "\0" + keyBytes(k)));
+        shown.set(id, (box as Obj)[k]);
+        keyOf.set(id, k);
+      }
+    } else {
+      const walk = (level: readonly Obj[] | undefined): void => {
+        for (const n of level ?? NONE) {
+          shown.set(n.id, n);
+          if (n.children) walk(n.children);
+        }
+      };
+      walk(box as readonly Obj[] | undefined);
+    }
+    const rows: unknown[] = [], keys: string[] = [];
+    const of = p.box.of;
+    const tree = p.box.kind === "tree" ? p.box : undefined;
+    for (const r of found ? found.rows : NONE) {
+      const v = shown.get(r.id);
+      if (v !== undefined) {
+        rows.push(isMap(of) ? give(of, v as Obj, tree) : v);
+        const k = keyOf.get(r.id);
+        if (k !== undefined) keys.push(k);
+      }
+    }
+    const answer: Found<any> = Object.freeze({
+      rows: Object.freeze(rows),
+      keys: p.box.kind === "record" ? Object.freeze(keys) : undefined,
+      status,
+      total: found ? found.total : 0,
+      first: found ? found.first : 0,
+      totals: found ? found.totals : LOADING.totals,
+    });
+    if (
+      last.status === answer.status &&
+      last.total === answer.total &&
+      last.first === answer.first &&
+      (last.totals === answer.totals || (Object.keys(last.totals).length === 0 && Object.keys(answer.totals).length === 0)) &&
+      sameList(last.rows, answer.rows) &&
+      (last.keys === answer.keys || sameList(last.keys, answer.keys!))
+    ) {
+      return;
+    }
+    last = answer;
+    say(answer);
+  };
+
+  // Rows asked for by id, a thousand to a question, asked again only when they change.
+  let byId: Asking[] = [];
+  let byIdOf = "";
+  const withinMaps = (ids: string[]): void => {
+    ids.sort();
+    const now = ids.join("");
+    if (now === byIdOf) return;
+    byIdOf = now;
+    for (const q of byId) q.stop();
+    byId = [];
+    for (const k of [...answers.keys()]) if (k.startsWith("maps ")) answers.delete(k);
+    for (let n = 0; n * 1000 < ids.length; n++) {
+      const part = ids.slice(n * 1000, (n + 1) * 1000).map((id) => codec.hex(id));
+      byId.push(
+        client.ask({ scope, table: BY_WHERE, where: where.ids(part), limit: 1000 }, (a) => {
+          answers.set(`maps ${n}`, a);
+          tell();
+        }),
+      );
+    }
+  };
+
+  let found: Asking | undefined;
+  const start = (): boolean => {
+    if (place || stopped) return true;
+    if (!client.scopeKey(scope)) return false;
+    const p = placeOf(schema, steps, doc.derive);
+    place = p;
+    const b = p.box;
+    const columns: Record<string, Column<any>> = { [W]: BYTES_COLUMN };
+    if (isMap(b.of)) {
+      for (let i = 0; i < b.of.names.length; i++) {
+        const c = b.of.columns[i];
+        if (c) columns[b.of.names[i]] = c;
+      }
+    } else {
+      columns.value = b.of;
+    }
+    const within = whereEncode(p.owner, p.field, KIND_OF[b.kind], b.kind === "record" ? "\x01" : "");
+    found = client.ask(
+      {
+        scope,
+        table: columns,
+        where: where.all(where.inList(list), where.begins(W, within), asking.where ?? where.all()),
+        order: asking.order,
+        offset: asking.offset,
+        limit: asking.limit,
+        fromEnd: asking.fromEnd,
+        totals: asking.totals,
+      },
+      (a) => {
+        answers.set("found", a);
+        // And the maps within each that answers, which are there whether their rows are or not, but say what they hold.
+        if (isMap(b.of)) {
+          const ids: string[] = [];
+          for (const r of a.rows) mapsWithin(b.of, binaryOf(r.id), doc.derive, ids);
+          withinMaps(ids);
+        }
+        tell();
+      },
+    );
+    questions.push(found);
+    // The rows on the way: whether what answers is there is theirs to say.
+    questions.push(
+      client.ask({ scope, table: BY_WHERE, where: where.ids(p.chain.map((id) => codec.hex(id))), limit: 1000 }, (a) => {
+        answers.set("chain", a);
+        tell();
+      }),
+    );
+    // Every node of a tree on the way: which are there, and where, is known only from all of them.
+    p.trees.forEach((t, i) => {
+      const pages = new Set<number>();
+      const page = (n: number): void => {
+        pages.add(n);
+        questions.push(
+          client.ask(
+            {
+              scope,
+              table: BY_WHERE,
+              where: where.all(where.inList(list), where.begins(W, whereEncode(t.owner, t.field, NODE))),
+              offset: n * 1000,
+              limit: 1000,
+            },
+            (a) => {
+              answers.set(`tree ${i} ${n}`, a);
+              for (let k = n + 1; k * 1000 < a.total; k++) if (!pages.has(k)) page(k);
+              tell();
+            },
+          ),
+        );
+      };
+      page(0);
+    });
+    return true;
+  };
+
+  // Ids are made with the scope's key: what is on the way is known once that is.
+  say(last);
+  let unwait: (() => void) | undefined;
+  if (!start()) {
+    let started = false;
+    const off = client.on("status", () => {
+      if (started || !start()) return;
+      started = true;
+      unwait?.();
+      unwait = undefined;
+    });
+    if (!started) unwait = off;
+    else off();
+  }
+
+  return Object.freeze({
+    // Another stretch of what answers.
+    move(offset: number, limit?: number): void {
+      found?.move(offset, limit);
+    },
+    stop(): void {
+      if (stopped) return;
+      stopped = true;
+      unwait?.();
+      unwait = undefined;
+      for (const q of questions) q.stop();
+      for (const q of byId) q.stop();
+      doc.mirror.close();
     },
   });
 }

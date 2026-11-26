@@ -7,6 +7,7 @@ import { Client, columns as c, type Answer, type State } from "../src/client.ts"
 import * as text from "../src/text.ts";
 import * as ask from "../src/ask.ts";
 import { where } from "../src/ask.ts";
+import * as m from "../src/mirror.ts";
 
 const HELLO = 1, ROSTER = 2, WATCH = 3, CELLS = 7, ACK = 8, SYNCED = 10;
 const ASK = 32, UNASK = 33, ANSWER = 34, FETCH = 35, CALL = 15, SERVE = 14, AUTHOR = 17;
@@ -503,6 +504,20 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   editor.close();
   h.run();
   assert(shown().rows[0].writers[0] === "me");
+  // And in a document: whose its title and its text are, by name, not what is in them.
+  const doc = m.open(h.client, {
+    scope: 2,
+    name: "signed",
+    schema: m.map({ title: c.string(16), by: c.author(16), body: c.text(17), writers: c.authors(17) }),
+  });
+  h.run();
+  void doc.set({ title: "t", body: "typed" });
+  h.run();
+  const st = doc.state;
+  assert(st.title === "t" && st.body === "typed");
+  assert(st.by === "me", `the title is mine, not ${st.by}`);
+  assert(st.writers.length === 1 && st.writers[0] === "me", "and the text");
+  doc.close();
   assert.throws(() => h.client.write(2, (change) => change.set(mine, Signed, { by: "you" })));
 
   const row = "\0\0\0\x02" + rep("r", 12);

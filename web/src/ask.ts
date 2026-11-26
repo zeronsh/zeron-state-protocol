@@ -8,7 +8,7 @@ import * as codec from "./codec.ts";
 const BYTES = 1, FOLD = 2, NUMBER = 3, BOOL = 4, ID = 5, WORDS = 6, CREATED = 7, MODIFIED = 8, ORDER = 9, AUTHOR = 10;
 const SUM = 1, MIN = 2, MAX = 3, COUNT = 4, FACET = 5;
 
-export type Is = "string" | "text" | "number" | "boolean" | "id" | "author";
+export type Is = "string" | "text" | "number" | "boolean" | "id" | "author" | "bytes";
 export type Columns = { readonly [name: string]: { readonly slot: number; readonly is: Is } };
 
 export type Value = number | boolean | string | Uint8Array;
@@ -132,7 +132,7 @@ export const where = Object.freeze({ all, any, none, is, among, exactly, between
 
 type Writing = { w: codec.Writer; columns: Columns; tag: (list: string) => string; scopeTag: Tag };
 
-const KINDS: { readonly [is: string]: number } = { string: FOLD, text: FOLD, number: NUMBER, boolean: BOOL, id: ID, row: ID };
+const KINDS: { readonly [is: string]: number } = { string: FOLD, text: FOLD, number: NUMBER, boolean: BOOL, id: ID, row: ID, bytes: BYTES };
 
 // A column, by its name in the table, "@created" and "@modified", or name.path into JSON, with what is wanted of it after
 // a colon, as in meta.size:number, where no value says: its slot, path, and what it is.
@@ -268,7 +268,8 @@ function putWhere(x: Writing, c: Where): void {
     case "begins":
     case "contains": {
       codec.putU8(w, c.op === "begins" ? 6 : 7);
-      const col = column(x, c.column, c.text, FOLD);
+      // A column of bytes is compared byte for byte; any other as text, without case or marks.
+      const col = column(x, c.column, c.text, find(x, c.column).is === "bytes" ? BYTES : FOLD);
       putText(x, c.text, col.ids);
       break;
     }

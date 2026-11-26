@@ -3,6 +3,8 @@
 
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { where } from "../src/ask.ts";
+import * as codec from "../src/codec.ts";
 import { columns as c, type Client } from "../src/client.ts";
 import * as m from "../src/mirror.ts";
 import { random } from "./random.ts";
@@ -99,6 +101,44 @@ export async function mirrorSuite({ a: ca, b: cb, say = console.log }: Sides): P
   check(mine.title === "Launch" && mine.tasks.length === 3 && mine.tasks[0].tags[1] === "now" && mine.outline[0].children[1].name === "risks", show(mine));
   check(mine.tasks[0].id && mine.outline[0].id, "what is made has an id");
   await level("the other has it");
+
+  // Asked about, without opening anything: a node finds what answers, and what the document shows of it is given.
+  {
+    const doc = { scope: 1, name: "board", schema: Board };
+    let open!: m.Found<m.At<typeof Board, readonly ["tasks"]>>;
+    let people!: m.Found<m.At<typeof Board, readonly ["people"]>>;
+    let outline!: m.Found<m.At<typeof Board, readonly ["outline"]>>;
+    const asked = m.ask(cb, doc, ["tasks"], { where: where.is("done", false), order: ["title"] }, (x) => (open = x));
+    const askedPeople = m.ask(cb, doc, ["people"], { where: where.is("role", "lead") }, (x) => (people = x));
+    const askedOutline = m.ask(cb, doc, ["outline"], { where: where.begins("name", "ri") }, (x) => (outline = x));
+    const ready = (found: { status: string; rows: readonly unknown[] }, rows: number) => found.status === "ready" && found.rows.length === rows;
+    await eventually("they are answered", () => ready(open, 2) && ready(people, 1) && ready(outline, 1));
+    check(open.rows[0].title === "ship it" && open.rows[1].title === "test it", show(open.rows));
+    check(open.rows[0].id === mine.tasks[2].id && open.rows[1].tags && open.rows[0].tags.length === 1, show(open.rows));
+    check(people.keys[0] === "ann" && people.rows[0].bio === "writes", show(people));
+    check(outline.rows[0].name === "risks" && outline.rows[0].children.length === 0, show(outline.rows));
+
+    // A row that says it is a task, with a marker that is nowhere: a node finds it, the document does not show it.
+    const Forged = { "\0where": c.bytes(255), title: c.string(16), done: c.boolean(17) };
+    const forged = codec.bytesOf(codec.binaryFromHex(mine.id) + "\x05tasks\x01" + "\x07".repeat(12));
+    void ca.write(1, (change) => change.insert(Forged, "mirror/board", 0, { "\0where": forged, title: "forged", done: false }));
+    await eventually("the node counts it", () => open.total === 3);
+    check(open.rows.length === 2, "but it is not given: " + show(open.rows));
+
+    // Kept up: what no longer answers goes, what comes to answer comes.
+    void a.update((d) => {
+      d.tasks[2].done = true;
+      d.people.ann.role = "writer";
+    });
+    await eventually("it is kept up", () => open.rows.length === 1 && open.rows[0].title === "test it" && people.rows.length === 0);
+    asked.stop();
+    askedPeople.stop();
+    askedOutline.stop();
+    void a.update((d) => {
+      d.tasks[2].done = false;
+      d.people.ann.role = "lead";
+    });
+  }
   check(early === b.state, "and the one opened early is told");
   check(b.state.scores.bob === 5 && b.state.people.ann.bio === "writes" && b.state.meta.owner === "ann", show(b.state));
 

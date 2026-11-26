@@ -1,8 +1,12 @@
 // Holds ask.ts to ask.luau: seeded questions of every kind of condition, order and total are written by both, and must
 // come out the same byte for byte. node web/test/ask.ts [questions] [seed]
+//
+// The Luau is luau/zsp's, or main's if luau/zsp's does not know columns of bytes yet.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,6 +27,7 @@ const tables: { [name: string]: Columns } = {
     liked: { slot: 19, is: "boolean" },
     album: { slot: 20, is: "id" },
     who: { slot: 21, is: "author" },
+    raw: { slot: 22, is: "bytes" },
     meta: { slot: 255, is: "string" },
   },
   album: { title: { slot: 16, is: "string" }, year: { slot: 17, is: "number" }, owner: { slot: 18, is: "id" }, info: { slot: 30, is: "text" } },
@@ -47,7 +52,7 @@ type C =
   | ["referred", number, string, C, V, V, string];
 type Q = { scope: number; table: string; where?: C; order?: string[]; offset?: number; limit?: number; fromEnd?: boolean; totals?: { [name: string]: Total } };
 
-type Kind = "text" | "number" | "boolean" | "id" | "author";
+type Kind = "text" | "number" | "boolean" | "id" | "author" | "bytes";
 // Columns of each table by what their values are: names, and names into JSON.
 const COLUMNS: { [table: string]: { [kind in Kind]: string[] } } = {
   track: {
@@ -56,8 +61,9 @@ const COLUMNS: { [table: string]: { [kind in Kind]: string[] } } = {
     boolean: ["liked", "meta.flag:boolean"],
     id: ["album", "meta.ref:id", "meta.ref:row"],
     author: ["who"],
+    bytes: ["raw", "meta.r:bytes"],
   },
-  album: { text: ["title", "info"], number: ["year", "info.x:number", "@created"], boolean: ["info.b:boolean"], id: ["owner"], author: [] },
+  album: { text: ["title", "info"], number: ["year", "info.x:number", "@created"], boolean: ["info.b:boolean"], id: ["owner"], author: [], bytes: [] },
 };
 const REFS: { [table: string]: string[] } = { track: ["album", "meta.ref:id"], album: ["owner"] };
 
@@ -87,7 +93,7 @@ function valueFor(kind: Kind): V {
   return text();
 }
 
-function column(table: string, kinds: readonly Kind[] = ["text", "number", "boolean", "id", "author"]): [string, Kind] {
+function column(table: string, kinds: readonly Kind[] = ["text", "number", "boolean", "id", "author", "bytes"]): [string, Kind] {
   for (;;) {
     const kind = pick(kinds);
     const names = COLUMNS[table][kind];
@@ -101,10 +107,10 @@ function condition(table: string, depth: number): C {
     const [c, kind] = column(table);
     return [pick(["is", "exactly"] as const), c, valueFor(kind)];
   } else if (op === 3) {
-    const [c, kind] = column(table, ["number", "text", "id"]);
+    const [c, kind] = column(table, ["number", "text", "id", "bytes"]);
     return [pick(["over", "under"] as const), c, valueFor(kind)];
   } else if (op === 4) {
-    const [c, kind] = column(table, ["number", "text", "id"]);
+    const [c, kind] = column(table, ["number", "text", "id", "bytes"]);
     const none: V = { nil: 1 };
     const lo = r.int(1, 4) === 1 ? none : valueFor(kind);
     const hi = lo !== none && r.int(1, 4) === 1 ? none : valueFor(kind);
@@ -113,7 +119,8 @@ function condition(table: string, depth: number): C {
     const [c, kind] = column(table);
     return ["among", c, Array.from({ length: r.int(0, 4) }, () => valueFor(kind))];
   } else if (op === 6) {
-    const [c] = column(table, ["text", "author"]);
+    // Of text, or of bytes, which is compared byte for byte.
+    const [c] = column(table, ["text", "author", "bytes"]);
     return [pick(["begins", "contains"] as const), c, text()];
   } else if (op === 7) {
     return ["has", column(table)[0]];
@@ -262,12 +269,33 @@ function tsWrite(q: Q): string {
 
 // ---------------------------------------------------------------- side by side
 
+// What web/test/ask.luau says of the questions: of luau/zsp's ask.luau, or of main's, put as it is here in a place of its own.
+function luau(input: string): string[] {
+  const root = join(here, "../..");
+  let script = join(here, "ask.luau");
+  let dir: string | undefined;
+  if (!readFileSync(join(root, "luau/zsp/ask.luau"), "utf8").includes("bytes = BYTES")) {
+    dir = mkdtempSync(join(tmpdir(), "zsp-ask-"));
+    mkdirSync(join(dir, "web/test"), { recursive: true });
+    mkdirSync(join(dir, "luau/zsp"), { recursive: true });
+    script = join(dir, "web/test/ask.luau");
+    writeFileSync(script, readFileSync(join(here, "ask.luau")));
+    const names = execFileSync("git", ["-C", root, "ls-tree", "--name-only", "origin/main", "luau/zsp/"], { encoding: "utf8" }).trim().split("\n");
+    for (const name of names) writeFileSync(join(dir, name), execFileSync("git", ["-C", root, "show", `origin/main:${name}`]));
+  }
+  try {
+    return execFileSync("lune", ["run", script], { input, maxBuffer: 1 << 30 }).toString().replace(/\n$/, "").split("\n");
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 const questions = [...FAULTY, ...Array.from({ length: COUNT }, question)];
 const began = performance.now();
 const ours = questions.map(tsWrite);
 const wrote = performance.now();
 const input = JSON.stringify({ tables, questions });
-const theirs = execFileSync("lune", ["run", join(here, "ask.luau")], { input, maxBuffer: 1 << 30 }).toString().replace(/\n$/, "").split("\n");
+const theirs = luau(input);
 assert.equal(theirs.length, questions.length);
 let faulty = 0;
 for (const [i, line] of ours.entries()) {

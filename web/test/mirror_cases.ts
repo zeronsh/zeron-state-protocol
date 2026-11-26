@@ -26,16 +26,19 @@ export function latest(row: Stored, slot: number): Cell | undefined {
 
 // ---------------------------------------------------------------- changes of every kind
 
-// A board, with numbers as said: as the client has them, unless one that reads only what is eight bytes is wanted.
-export function board(number: (slot: number) => Column<number> = c.number) {
-  const Task = m.map({ title: c.string(16), done: c.boolean(17), notes: c.text(18), tags: m.list(19, c.string(16)) });
+// A board, with numbers as said: as the client has them, unless one that reads only what is eight bytes is wanted. Its
+// tasks have steps and a plan, as luau/tests/mirror_model.luau's do, unless said: web/test/mirror_interop.luau's do not.
+export function board(number: (slot: number) => Column<number> = c.number, steps = true) {
+  const Step = m.map({ name: c.string(16) });
+  const fields = { title: c.string(16), done: c.boolean(17), notes: c.text(18), tags: m.list(19, c.string(16)) };
+  const Task = m.map({ ...fields, steps: m.list(20, Step), plan: m.map({ due: number(16) }) });
   const Person = m.map({ role: c.string(16), bio: c.text(17), pets: m.list(18, m.map({ name: c.string(16) })) });
   const Outline = m.map({ name: c.string(16), body: c.text(17), marks: m.list(18, number(16)) });
   return m.map({
     title: c.string(16),
     count: number(17),
     meta: m.map({ owner: c.string(16), size: number(17), more: m.map({ deep: c.boolean(16) }) }),
-    tasks: m.list(18, Task),
+    tasks: m.list(18, steps ? Task : (m.map(fields) as unknown as typeof Task)),
     scores: m.record(number(16)),
     people: m.record(Person),
     outline: m.tree(19, Outline),
@@ -44,17 +47,19 @@ export function board(number: (slot: number) => Column<number> = c.number) {
 }
 export type Board = ReturnType<typeof board>;
 type Node = m.Draft<Board>["outline"][number];
+type Task = m.Draft<Board>["tasks"][number];
 
 export const words = ["alpha", "beta", "gamma", "delta", "eps", "zeta"];
 
-export function mutate(d: m.Draft<Board>, rng: Random): void {
+export function mutate(d: m.Draft<Board>, rng: Random, steps = true): void {
   const R = (n: number) => rng.int(1, n); // as Luau's math.random(n)
   const RR = (lo: number, hi: number) => rng.int(lo, hi);
   const word = () => words[R(words.length) - 1];
   for (let times = RR(1, 5); times > 0; times--) {
     const r = R(16);
     if (r === 1) {
-      d.tasks.splice(RR(1, d.tasks.length + 1) - 1, 0, { title: word(), done: R(2) === 1, tags: [word()] });
+      const t = { title: word(), done: R(2) === 1, tags: [word()] };
+      d.tasks.splice(RR(1, d.tasks.length + 1) - 1, 0, steps ? { ...t, steps: [{ name: word() }], plan: { due: R(9) } } : (t as Task));
     } else if (r === 2 && d.tasks.length > 0) {
       d.tasks.splice(R(d.tasks.length) - 1, 1);
     } else if (r === 3 && d.tasks.length > 1) {
@@ -68,6 +73,17 @@ export function mutate(d: m.Draft<Board>, rng: Random): void {
       t.notes = n.slice(0, at) + word() + n.slice(at + RR(0, 2));
       t.tags.splice(RR(1, t.tags.length + 1) - 1, 0, word());
       if (t.tags.length > 2 && R(2) === 1) t.tags.shift();
+      if (!steps) continue;
+      t.plan.due = R(4) === 1 ? undefined : R(9);
+      if (R(2) === 1) {
+        t.steps.splice(RR(1, t.steps.length + 1) - 1, 0, { name: word() });
+      } else if (t.steps.length > 0) {
+        const [x] = t.steps.splice(R(t.steps.length) - 1, 1);
+        if (R(2) === 1) {
+          x.name = word();
+          t.steps.splice(RR(1, t.steps.length + 1) - 1, 0, x);
+        }
+      }
     } else if (r === 5) {
       const k = word();
       if (R(3) === 1) delete d.scores[k];
@@ -139,7 +155,7 @@ export function mutate(d: m.Draft<Board>, rng: Random): void {
     } else if (r === 16) {
       // A whole new list, some of it the old.
       const keep = d.tasks.filter(() => R(2) === 1);
-      keep.push({ title: word(), tags: [] });
+      keep.push(steps ? { title: word(), tags: [], steps: [], plan: {} } : ({ title: word(), tags: [] } as unknown as Task));
       d.tasks = keep;
     }
   }

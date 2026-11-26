@@ -1,9 +1,11 @@
-// Structured state at its edges: before a client knows its scope, texts not given, and values changed in place.
+// Structured state at its edges: before a client knows its scope, texts not given, and values changed in place; and what
+// is asked about, at its edges too.
 
 import assert from "node:assert/strict";
+import { where } from "../src/ask.ts";
 import { Client, columns as c } from "../src/client.ts";
 import * as m from "../src/mirror.ts";
-import { hear, peer, run, type Peer } from "./peers.ts";
+import { admit, hear, peer, run, type Peer } from "./peers.ts";
 
 let clock = 1800000000000;
 const random = (n: number) => crypto.getRandomValues(new Uint8Array(n));
@@ -74,6 +76,123 @@ const share = (...peers: Peer[]) => {
   share(a, b);
   assert.deepEqual(db.state.meta, { count: 2, tags: ["x", "y"] });
   assert.deepEqual([...db.state.raw!], [9, 2, 3]);
+}
+
+// ---------------------------------------------------------------- asking
+
+const Item = m.map({ n: c.number(16), label: c.string(17), more: m.map({ note: c.string(16) }), parts: m.list(18, m.map({ x: c.number(16) })) });
+const Shelf = m.map({ a: m.list(16, Item), A: m.list(17, Item), keys: m.record(c.number(16)), tree: m.tree(18, m.map({ name: c.string(16) })) });
+
+// What is in a list is found by the bytes its rows say they are in, byte for byte: "a" is not "A", whatever case is to text.
+{
+  const p = peer(random, now);
+  const d = m.open(p.client, { scope: 1, name: "shelf", schema: Shelf });
+  void d.set({ a: [{ n: 1 }, { n: 2 }], A: [{ n: 3 }, { n: 4 }, { n: 5 }] });
+  run(p);
+  share(p);
+  let got!: m.Found<m.At<typeof Shelf, readonly ["a"]>>;
+  const asked = m.ask(p.client, { scope: 1, name: "shelf", schema: Shelf }, ["a"], { order: ["n"] }, (x) => (got = x));
+  run(p);
+  assert.equal(got.status, "ready");
+  assert.deepEqual(
+    got.rows.map((r) => r.n),
+    [1, 2],
+  );
+  assert.equal(got.total, 2, "what is in A is counted as in a");
+  asked.stop();
+  d.close();
+}
+
+// Asked before its client knows the scope: loading at once, and answered once it does. What is given is frozen, the same
+// object while nothing in it changes, with its maps and without its lists of rows; and it can be moved along, and stopped.
+{
+  const p = peer(random, now, false);
+  const doc = { scope: 1, name: "early", schema: Shelf };
+  const heard: m.Found<m.At<typeof Shelf, readonly ["a"]>>[] = [];
+  const asked = m.ask(p.client, doc, ["a"], { order: ["n"], limit: 2 }, (x) => void heard.push(x));
+  assert.equal(heard.length, 1);
+  assert.equal(heard[0].status, "loading");
+  assert(Object.isFrozen(heard[0]) && Object.isFrozen(heard[0].rows));
+  run(p);
+  assert.equal(heard.length, 1, "nothing to tell while nothing is known");
+  admit(p);
+  const d = m.open(p.client, doc);
+  void d.set({ a: [{ n: 1, label: "one", more: { note: "first" }, parts: [{ x: 1 }] }, { n: 2 }, { n: 3 }] });
+  run(p);
+  share(p);
+  let last = heard[heard.length - 1];
+  assert.equal(last.status, "ready");
+  assert.equal(last.total, 3);
+  assert.deepEqual(
+    last.rows.map((r) => r.n),
+    [1, 2],
+  );
+  const one = last.rows[0];
+  assert(Object.isFrozen(one) && Object.isFrozen(one.more));
+  assert.equal(one.id, d.state.a[0].id);
+  assert.equal(one.more.note, "first", "its maps are given with it");
+  assert(!("parts" in one), "its lists of rows are not");
+  // Another row changes: what did not is the very same.
+  void d.update((x) => void (x.a[1].label = "two"));
+  run(p);
+  share(p);
+  last = heard[heard.length - 1];
+  assert.equal(last.rows[1].label, "two");
+  assert.equal(last.rows[0], one, "what did not change is the very same");
+  asked.move(2, 2);
+  run(p);
+  last = heard[heard.length - 1];
+  assert.equal(last.first, 2);
+  assert.deepEqual(
+    last.rows.map((r) => r.n),
+    [3],
+  );
+  const told = heard.length;
+  asked.stop();
+  void d.update((x) => void x.a.push({ n: 4, more: {}, parts: [] }));
+  run(p);
+  share(p);
+  assert.equal(heard.length, told, "told after it was stopped");
+  assert.equal(p.asked.size, 0, "and all it asked is stopped");
+  d.close();
+}
+
+// Records, of values and of maps, and trees, at any depth; and whose each is. A path says where, or it is no path.
+{
+  const p = peer(random, now);
+  const doc = { scope: 1, name: "deep", schema: Shelf };
+  const d = m.open(p.client, doc);
+  void d.set({ keys: { x: 3, y: 1, z: 2 }, tree: [{ name: "top", children: [{ name: "low" }] }], a: [{ n: 1, parts: [{ x: 5 }, { x: 6 }] }] });
+  run(p);
+  share(p);
+  let keys!: m.Found<m.At<typeof Shelf, readonly ["keys"]>>;
+  let tree!: m.Found<m.At<typeof Shelf, readonly ["tree"]>>;
+  let parts!: m.Found<m.At<typeof Shelf, readonly ["a", string, "parts"]>>;
+  const asked = [
+    m.ask(p.client, doc, ["keys"], { where: where.over("value", 1), order: ["value"] }, (x) => (keys = x)),
+    m.ask(p.client, doc, ["tree"], { where: where.is("name", "low") }, (x) => (tree = x)),
+    m.ask(p.client, doc, ["a", d.state.a[0].id, "parts"], { order: ["-x"] }, (x) => (parts = x)),
+  ];
+  run(p);
+  assert.deepEqual([...keys.rows], [2, 3]);
+  assert.deepEqual([...keys.keys], ["z", "x"]);
+  assert.equal(tree.rows.length, 1);
+  assert.equal(tree.rows[0].name, "low");
+  assert.deepEqual([...tree.rows[0].children], []);
+  assert.deepEqual(
+    parts.rows.map((r) => r.x),
+    [6, 5],
+  );
+  for (const q of asked) q.stop();
+  const bad = (path: readonly string[], why: RegExp) => assert.throws(() => m.ask(p.client, doc, path as m.Path<typeof Shelf>, {}, () => {}), why);
+  bad([], /names what is asked about/);
+  bad(["nothing"], /no nothing/);
+  bad(["a", "not an id", "parts"], /no id/);
+  bad(["keys", "x", "y"], /holds nothing/);
+  const Values = m.map({ v: m.list(16, c.number(16)), inner: m.map({ x: c.string(16) }) });
+  assert.throws(() => m.ask(p.client, { scope: 1, name: "v", schema: Values }, ["v"] as never, {}, () => {}), /read, not asked about/);
+  assert.throws(() => m.ask(p.client, { scope: 1, name: "v", schema: Values }, ["inner"] as never, {}, () => {}), /a map is not asked about/);
+  d.close();
 }
 
 console.log("ok");

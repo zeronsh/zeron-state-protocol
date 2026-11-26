@@ -35,7 +35,9 @@ const answer = await client.request(deviceId, 1, "run", data);
 What a column holds is typed: `Row<typeof Message>` is `{ id, order, author?: string, body: string, stars?: number }`. Ids are hex.
 Positions in a text count UTF-16 code units, as a string's indices do, and never fall inside a character. A write's promise
 resolves once the write is durable on this device. Structured state is `mirror`, as in [mirror.md](mirror.md): documents are plain,
-frozen objects and arrays, and `update` hands out a draft that copies only what it changes.
+frozen objects and arrays, and `update` hands out a draft that copies only what it changes. What is in one is asked about, without
+opening it, as a question is: `m.ask(client, { scope, name, schema }, ["tasks", id, "steps"], { where, order, limit }, (found) =>
+render(found.rows))`, typed by the schema and the path, which names items and nodes by their ids in hex.
 
 ## How it is put together
 
@@ -86,7 +88,7 @@ builds `web/dist` (zsp.js, worker.js and node.wasm, side by side: each finds the
 |---|---|
 | `test/client.ts` | the client to `luau/tests/client.luau`: what it says and makes of what it is told, by a node made of nothing |
 | `test/vectors.ts`, `text.ts`, `ask.ts` | to `vectors.json`; text to `text.luau` step by step over random edits; questions to `ask.luau` byte for byte |
-| `test/mirror_model.ts` | structured state to its model, as `luau/tests/mirror_model.luau` |
+| `test/mirror_model.ts` | structured state to its model, and what is asked about to what a node finds, as `luau/tests/mirror_model.luau` |
 | `test/store.ts` | what is said to be durable, through crashes at any moment, small segments, and files that open late |
 | `test/node.ts` | a device on its own |
 | `test/end_to_end.ts` | `test/live.ts`, which is `luau/tests/live.luau`, over every way devices meet: the client of zspd; web devices with zspd devices through zspd's relay and the Durable Object; two web devices; a space a web device governs; keepalive; direct links, and beacons with no relay |

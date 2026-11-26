@@ -70,7 +70,7 @@ interface Lent {
 // ---------------------------------------------------------------- columns
 
 /** What a column can be asked about as. */
-export type Is = "string" | "number" | "boolean" | "id" | "text" | "author";
+export type Is = "string" | "number" | "boolean" | "id" | "text" | "author" | "bytes";
 
 /** A column of a table: a data slot, and how what is in it is written and read. */
 export interface Column<T = unknown> {
@@ -112,8 +112,8 @@ const unwritable = (): never => {
 export const columns = Object.freeze({
   /** Text, as UTF-8. */
   string: (slot: number): Column<string> => column(slot, "string", (v: string) => utf8.encode(v), (b) => fromUtf8.decode(b)),
-  /** Bytes as they are. */
-  bytes: (slot: number): Column<Uint8Array> => column<Uint8Array>(slot, "string", (v) => v, (b) => b.slice()),
+  /** Bytes as they are, and asked about byte for byte. */
+  bytes: (slot: number): Column<Uint8Array> => column<Uint8Array>(slot, "bytes", (v) => v, (b) => b.slice()),
   number: (slot: number): Column<number> =>
     column(
       slot,
