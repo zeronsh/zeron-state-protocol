@@ -788,16 +788,16 @@ def zspd_space(node):
         return f.read().strip()
 
 
-def one(name):
+def one(name, tests, file):
     start = time.monotonic()
     try:
-        globals()[name]()
+        tests[name]()
         print(f"ok   {name} {time.monotonic() - start:.2f}s")
         return 0
     except BaseException as e:
         import traceback
 
-        where = [f.lineno for f in traceback.extract_tb(e.__traceback__) if f.filename == __file__]
+        where = [f.lineno for f in traceback.extract_tb(e.__traceback__) if f.filename == file]
         print(f"FAIL {name}: {type(e).__name__} {e} at {where}\nlogs in {TMP}")
         for log in sorted(f for f in os.listdir(TMP) if f.endswith(".log")):
             with open(os.path.join(TMP, log), errors="replace") as f:
@@ -809,15 +809,16 @@ def one(name):
             p.wait()
 
 
-def main():
-    names = sys.argv[1:] or [n for n in globals() if n.startswith("test_")]
+def main(tests=globals(), file=__file__):
+    """Runs the tests named, or all of them: each in a process of its own, side by side. Others' tests use it too."""
+    names = sys.argv[1:] or [n for n in tests if n.startswith("test_")]
     if len(names) == 1:
-        code = one(names[0])
+        code = one(names[0], tests, file)
         if code == 0:
             shutil.rmtree(TMP, ignore_errors=True)
         sys.exit(code)
     os.rmdir(TMP)
-    runs = [subprocess.Popen([sys.executable, __file__, n], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for n in names]
+    runs = [subprocess.Popen([sys.executable, file, n], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for n in names]
     for r in runs:
         sys.stdout.write(r.communicate()[0])
     sys.exit(any(r.returncode for r in runs))

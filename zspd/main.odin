@@ -24,8 +24,10 @@ USAGE :: `zspd - Zeron State Protocol node
   zspd create <dir>                          make a space, owned by this device
   zspd key <dir>                             print what an admin needs to admit this device
   zspd scope <dir> [signed]                  add a scope to the space
-  zspd admit <dir> <key> <scope> [read|vouch] grant a device a scope: to read, write and call; only to read; or to say
-                                             for whom, too, and be believed
+  zspd admit <dir> <key> <scope> [read|vouch|shell|files ...]
+                                             grant a device a scope: to read, write and call; only to read; or to say
+                                             for whom, too, and be believed; or to use the terminals and commands, or
+                                             the files, that devices share there
   zspd revoke <dir> <key> [scope]            end a device's grants
   zspd subject <dir> <key> <text>            say whose a device is: an account, a name, as you know them
   zspd members <dir>                         list devices: key, rights in each scope, whose it is
@@ -96,12 +98,16 @@ run :: proc() -> int {
 			copy(device[:], key)
 			copy(signer[:], key[32:])
 			rights := zsp.Rights{.Read, .Write, .Call}
-			if len(args) > 2 {
-				switch args[2] {
+			for word in args[2:] {
+				switch word {
 				case "read":
-					rights = {.Read}
+					rights -= {.Write, .Call}
 				case "vouch":
 					rights += {.Vouch}
+				case "shell":
+					rights += {.Shell}
+				case "files":
+					rights += {.Files}
 				case:
 					return false
 				}
@@ -271,7 +277,7 @@ members :: proc(dir: string) -> bool {
 			if g.until != 0 {
 				continue
 			}
-			say(os.stdout, " ", strconv.write_uint(buf[:], u64(g.scope), 10), ":", "r" if .Read in g.rights else "", "w" if .Write in g.rights else "", "c" if .Call in g.rights else "", "v" if .Vouch in g.rights else "")
+			say(os.stdout, " ", strconv.write_uint(buf[:], u64(g.scope), 10), ":", "r" if .Read in g.rights else "", "w" if .Write in g.rights else "", "c" if .Call in g.rights else "", "v" if .Vouch in g.rights else "", "s" if .Shell in g.rights else "", "f" if .Files in g.rights else "")
 		}
 		say(os.stdout, " owner" if m.owner else " admin" if m.admin else "", "\t", string(m.subject), "\n")
 	}

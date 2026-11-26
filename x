@@ -111,6 +111,7 @@ test)
 	$PYTHON examples/apps/test.py
 	$PYTHON examples/organization.py
 	end_to_end
+	$PYTHON tests/services_test.py
 	wait $web || true
 	cat build/web.log
 	[ ! -f build/failed ]
