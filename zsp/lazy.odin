@@ -96,11 +96,12 @@ store_end :: proc(s: ^Store, t: ^Step, keep: bool) {
 	p := &s.pager
 	p.step = false
 	if keep {
+		// Given up, and never written: gone. (Not to be used again either: where reads may answer "not yet", pages are
+		// numbered afresh, and the numbers would only pile up.)
 		for no in p.retired {
 			if pg, ok := p.dirty[no]; ok {
 				free(pg)
 				delete_key(&p.dirty, no)
-				append(&p.free, no)
 			}
 		}
 		clear(&p.retired)
@@ -396,6 +397,9 @@ evac_victim :: proc(s: ^Store) -> (seg: u64, ok: bool) {
 		if slice.contains(s.dropped[:], leaf.key[4]) {
 			continue
 		}
+		if s.remote != nil && (leaf.key[4] + 1) * SEGMENT > s.remote.uploaded {
+			continue // not yet wholly in object storage, where it is let go of from
+		}
 		if leaf.val[0] >= SEGMENT / 2 && leaf.key[4] != store_tail(s) / SEGMENT && leaf.val[0] > worst {
 			worst, seg, ok = leaf.val[0], leaf.key[4], true
 		}
@@ -617,9 +621,10 @@ replay_steps :: proc(s: ^Store) -> (waiting: bool) {
 				break scan
 			}
 			if s.remote != nil && (len(s.dirty) > CHECKPOINT_HARD || (len(s.dirty) > CHECKPOINT_DIRTY && s.remote.inflight == nil)) {
-				// As much as a checkpoint should hold: the rest after one is under way, which remote_work begins.
+				// As much as a checkpoint should hold: the rest after one, which remote_work begins at once, or, with one
+				// under way, once that is durable, which is heard of.
 				s.replay_at = at
-				s.more = true
+				s.more = s.remote.inflight == nil
 				return true
 			}
 			t := store_begin(s)

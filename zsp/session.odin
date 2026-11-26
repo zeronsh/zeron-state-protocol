@@ -1727,7 +1727,10 @@ session_datagram :: proc(s: ^Session, bytes: []byte) {
 	if s.ready && len(frame) > 0 && Message(frame[0]) == .Live && read_done(&r) {
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		live := Reader{buf = frame[1:]}
+		// A step, where storage may answer "not yet": one that reads what is not at hand is dropped, as any live frame may be.
+		t := store_begin(&s.node.store)
 		on_live(s, &live)
+		store_end(&s.node.store, &t, !store_missed(&s.node.store, &t))
 	}
 }
 

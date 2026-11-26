@@ -45,9 +45,10 @@ what SQLite had not synced (zsp/remote_test.odin, tests/relay_storage.mjs), and 
 
 ## When it is full
 
-What can still fill up is the object's own SQLite: when R2 is down, or no bucket is bound, the log stays there. Then the relay says so as it
-always did: whoever is connected is let go with `1011`, and for `FULL_WAIT` milliseconds (a minute) anyone who knocks is answered `507`.
-Nothing that was not kept was acknowledged, and every device still has it.
+Should R2 fall behind, so that the object holds more of the log than 64 MiB, or half of `STORAGE_LIMIT`, what devices write waits until R2 has
+caught up: it is acknowledged later, and nothing is turned away for want of room that R2 has. What can still fill up is the object's own
+SQLite where no bucket is bound. Then the relay says so as it always did: whoever is connected is let go with `1011`, and for `FULL_WAIT`
+milliseconds (a minute) anyone who knocks is answered `507`. Nothing that was not kept was acknowledged, and every device still has it.
 
 ## Setting one up
 

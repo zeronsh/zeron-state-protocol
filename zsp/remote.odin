@@ -27,6 +27,7 @@ EXTENT :: #config(ZSP_EXTENT, min(SEGMENT / 4, 1 << 20)) // the log is put in ob
 #assert(SEGMENT % EXTENT == 0 && EXTENT % LOG_BLOCK == 0)
 LOG_BLOCK :: min(64 << 10, EXTENT) // a read of the log fetches at least this much
 LOCAL_KEEP :: #config(ZSP_LOCAL_KEEP, 4 << 20) // the log's latest bytes, kept by the host though in object storage: what is shown
+LOCAL_MOST :: 64 << 20 // the most of the log the host holds, should object storage fall behind, before writing waits for it
 PAGE_RUN :: 16 // a read of a page fetches its neighbours in the pack too
 HINT_SIZE :: 48
 PACK_MAGIC :: 0x7a73_7070_6163_6b31 // "zsppack1", ending a pack
@@ -169,6 +170,8 @@ Remote :: struct {
 	rested:        u64, // the tick at the last rest
 	page_budget:   int,
 	local_keep:    u64, // LOCAL_KEEP, or less where the host's storage is small
+	local_most:    u64, // LOCAL_MOST, or less: the most of the log the host holds before writing waits; zero, where there is no
+	// object storage to wait for, for none: the host's storage fills, and fails, as it would
 	block_budget:  int,
 
 	// Being fetched, and wanted.
@@ -197,9 +200,9 @@ Remote :: struct {
 }
 
 // Opens the remote side: what the manifest says, before store_open.
-remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_budget := 256, local_keep: u64 = LOCAL_KEEP) -> bool {
+remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_budget := 256, local_keep: u64 = LOCAL_KEEP, local_most: u64 = LOCAL_MOST) -> bool {
 	r.host = host
-	r.page_budget, r.block_budget, r.local_keep = page_budget, block_budget, local_keep
+	r.page_budget, r.block_budget, r.local_keep, r.local_most = page_budget, block_budget, local_keep, local_most
 	r.next_gen = 1
 	if bytes := host.manifest_read(host.data); bytes != nil {
 		remote_manifest_read(r, bytes) or_return
@@ -211,9 +214,16 @@ remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_bu
 		append(&r.deletes, Remote_Object{g, true})
 		remote_redelete(r, {g, true})
 	}
-	// What was being deleted is deleted.
+	// What was being deleted is deleted, and again later, should a put that was under way land after.
+	for d in r.deletes {
+		remote_redelete(r, d)
+	}
 	if len(r.deletes) > 0 {
 		remote_delete(r, r.deletes[:])
+	}
+	// What the host kept of the log before where it now begins, as when it died before letting go of it, goes.
+	if r.local_from > 0 {
+		host.log_cut(host.data, 0, r.local_from)
 	}
 	return true
 }
@@ -549,9 +559,19 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 		}
 		r.stats.fetched_pages += got
 		r.stats.got += u64(len(bytes))
-		if got > 0 {
-			r.host.cache_put(r.host.data, .Page, first, bytes[:got * PAGE_SIZE])
-		} else if absent && s != nil && !remote_deleted(r, {op.number, true}) {
+		// Kept by the host as read: the pages from the first on that are sound, whether or not some were at hand.
+		sound := 0
+		for at := 0; at + PAGE_SIZE <= len(bytes); at += PAGE_SIZE {
+			probe: Page
+			copy(([^]byte)(&probe)[:size_of(Page)], bytes[at:])
+			if !page_sound(&probe, first + u64(at / PAGE_SIZE)) {
+				break
+			}
+			sound += 1
+		}
+		if sound > 0 {
+			r.host.cache_put(r.host.data, .Page, first, bytes[:sound * PAGE_SIZE])
+		} else if got == 0 && absent && s != nil && !remote_deleted(r, {op.number, true}) {
 			// A page that is named and not there: the store cannot be read. (Of a pack deleted since it was asked for,
 			// it is no longer named: whatever asked for it will ask for something else.)
 			s.failed = true
@@ -671,6 +691,11 @@ remote_work :: proc(r: ^Remote) -> (waiting: bool) {
 		}
 		return false
 	}
+	// Writing waits for the host's storage to hold less of the log: a checkpoint lets it go, once object storage has it.
+	tail := store_tail(s)
+	if remote_full(r) && min(r.uploaded, tail - min(tail, r.local_keep)) > r.local_from {
+		r.want_checkpoint = true
+	}
 	if r.inflight == nil && (r.want_checkpoint || store_wants_checkpoint(s) || len(r.dead) > 0) {
 		if !store_sync(s) {
 			return false
@@ -689,10 +714,16 @@ remote_work :: proc(r: ^Remote) -> (waiting: bool) {
 	return
 }
 
-// Whether writing should wait: so much has changed while a checkpoint was under way that memory would run short.
+// Whether writing should wait: so much has changed while a checkpoint was under way that memory would run short, or
+// object storage has fallen so far behind that the host's own storage would fill. It goes on once that is put right,
+// which is heard of: never by failing for want of room that object storage has.
 @(require_results)
 remote_full :: proc(r: ^Remote) -> bool {
-	return r != nil && len(r.store.dirty) > CHECKPOINT_HARD
+	if r == nil {
+		return false
+	}
+	s := r.store
+	return len(s.dirty) > CHECKPOINT_HARD || (r.local_most > 0 && !s.replaying && store_tail(s) - min(store_tail(s), r.local_from) > r.local_most)
 }
 
 // Lets go of what is least lately used, past the budget. Call between bursts, never within a step. What was used
@@ -778,6 +809,11 @@ remote_account :: proc(r: ^Remote) {
 		}
 	}
 	if !r.entry {
+		// Segments evacuated are said to be gone in the same checkpoint as lets them go: else, until another, they
+		// would be evacuated again on waking, and found empty, and every cell sought out of them.
+		for seg in s.evacuated {
+			tree_delete(s, &s.waste, {0, 0, 0, 0, seg})
+		}
 		tree_put(s, &r.packs, {0, 0, 0, 0, r.next_gen}, {})
 		r.entry = true
 	}
@@ -948,6 +984,16 @@ remote_commit :: proc(r: ^Remote) {
 	defer delete(f.deletes)
 	local_from := max(r.local_from, min(r.uploaded, f.header.log, f.header.log - min(f.header.log, r.local_keep)))
 	r.local_from, local_from = local_from, r.local_from
+	// What it lets go of, with whatever came to be deleted while it was being put, is named in its manifest until gone,
+	// and to be deleted again later: named there too, before the manifest is written, should the host die just after.
+	for o in r.deletes {
+		if !slice.contains(f.deletes[:], o) {
+			append(&f.deletes, o)
+		}
+	}
+	for o in f.deletes {
+		remote_redelete(r, o)
+	}
 	if !remote_manifest_write(r, f.header, f.packs, f.gen, f.deletes[:]) {
 		r.local_from = local_from
 		s.failed = true
@@ -993,7 +1039,6 @@ remote_commit :: proc(r: ^Remote) {
 	for seg in f.victims {
 		r.host.log_cut(r.host.data, seg * SEGMENT, (seg + 1) * SEGMENT)
 		r.host.cache_drop(r.host.data, .Log, seg * SEGMENT, (seg + 1) * SEGMENT)
-		append(&s.dropped, seg) // and its waste forgotten in a step: see store_work
 		for b := seg * SEGMENT; b < (seg + 1) * SEGMENT; b += LOG_BLOCK {
 			if c, have := r.blocks[b]; have {
 				delete(c.bytes)
@@ -1014,9 +1059,6 @@ remote_commit :: proc(r: ^Remote) {
 	// Deleted now, and again a while later, should a put that was under way land after.
 	clear(&r.deletes)
 	append(&r.deletes, ..f.deletes[:])
-	for o in f.deletes {
-		remote_redelete(r, o)
-	}
 	if len(r.deletes) > 0 {
 		remote_delete(r, r.deletes[:])
 	}
@@ -1162,6 +1204,7 @@ remote_gc_steps :: proc(r: ^Remote) -> (waiting: bool) {
 		}
 		slot := g.slot
 		t := store_begin(s)
+		moved := 0
 		for i in slot ..< min(slot + GC_STEP, n) {
 			h := g.hints[i * HINT_SIZE:]
 			key: Key
@@ -1170,7 +1213,7 @@ remote_gc_steps :: proc(r: ^Remote) -> (waiting: bool) {
 			}
 			roots := [?]^Tree{&s.shelf, &s.cells, &s.waste, &s.outbox, &s.repair, &r.packs}
 			if int(h[0]) < len(roots) {
-				remote_touch(s, roots[h[0]], key, u16(h[1]), g.gen << PACK_SHIFT | Page_No(i))
+				moved += int(remote_touch(s, roots[h[0]], key, u16(h[1]), g.gen << PACK_SHIFT | Page_No(i)))
 			}
 		}
 		if store_missed(s, &t) {
@@ -1178,6 +1221,7 @@ remote_gc_steps :: proc(r: ^Remote) -> (waiting: bool) {
 			return true
 		}
 		store_end(s, &t, true)
+		r.stats.relocated += moved
 		g.slot = min(slot + GC_STEP, n)
 	}
 	delete(g.hints)
@@ -1207,16 +1251,17 @@ remote_gc_victim :: proc(r: ^Remote) -> (gen, total: u64, ok: bool) {
 
 // Copies on the page at a level on the way to a key, if it is the one named: it and the way to it change.
 @(private)
-remote_touch :: proc(s: ^Store, t: ^Tree, key: Key, level: u16, target: Page_No) {
+remote_touch :: proc(s: ^Store, t: ^Tree, key: Key, level: u16, target: Page_No) -> (found: bool) {
 	key := key
 	if t.root == 0 {
 		return
 	}
-	no, found := touch(s, t.root, &key, level, target)
+	no: Page_No
+	no, found = touch(s, t.root, &key, level, target)
 	if found {
 		t.root = no
-		s.remote.stats.relocated += 1
 	}
+	return
 }
 
 @(private)

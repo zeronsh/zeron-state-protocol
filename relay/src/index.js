@@ -144,7 +144,11 @@ export class Space extends DurableObject {
     const pages = Number(this.env.PAGES_KEPT ?? 2048), blocks = Number(this.env.BLOCKS_KEPT ?? 64);
     // The log's latest bytes stay here though in R2, for what is shown: 4 MiB, or a quarter of what may be kept here.
     const limit = Number(this.env.STORAGE_LIMIT ?? 0), keep = limit > 0 ? Math.min(4 << 20, Math.floor(limit / 4)) : 4 << 20;
-    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length, pages, blocks, keep)) {
+    // And writing waits for R2, should it fall behind, before this storage holds more of the log than 64 MiB, or half of
+    // what may be kept here: a space R2 can keep never fills it.
+    // With no bucket bound there is nothing to wait for: storage here fills, and the relay says so.
+    const most = !this.env.STORE ? 0 : limit > 0 ? Math.min(64 << 20, Math.floor(limit / 2)) : 64 << 20;
+    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length, pages, blocks, keep, most)) {
       throw exports.failed() ? new Full(FULL) : new Error("storage is damaged");
     }
     let lost = false;

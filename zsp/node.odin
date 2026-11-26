@@ -87,6 +87,11 @@ Report :: struct {
 }
 
 node_init :: proc(n: ^Node, disk: Disk, space: Key32, keys: ^Keyring, full: bool, ring := 256) -> bool {
+	// Storage that may answer "not yet" is a relay's: what a node does on behalf of its clients, and what a partial
+	// replica does to stay so, is not undone a step at a time.
+	if disk.missed != nil && (keys != nil || !full) {
+		return false
+	}
 	n.space = space
 	n.keys = keys
 	n.full = full
