@@ -341,8 +341,7 @@ async function socket(request, url, call) {
     closed = true;
     // A status only if it is one a Close frame may carry: else none, as for one that said none (1005) or vanished (1006).
     const code = e.code;
-    const sayable = code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006 || code >= 3000 && code <= 4999;
-    say(8, sayable ? cat(new Uint8Array([code >> 8, code & 255]), enc.encode(e.reason ?? "")) : new Uint8Array(0));
+    say(8, sayable(code) ? cat(new Uint8Array([code >> 8, code & 255]), enc.encode(e.reason ?? "")) : new Uint8Array(0));
     chain.then(() => call.end());
   });
   (async () => {
@@ -368,10 +367,19 @@ async function socket(request, url, call) {
         if (f.opcode === 9) say(10, f.payload); // ping: pong
         else if (f.opcode === 8) {
           closed = true;
+          // Its status and reason if the public may be told them; else that it is over, plainly. Closed, either way.
           const code = f.payload.length >= 2 ? (f.payload[0] << 8) | f.payload[1] : 1000;
+          let reason = "";
           try {
-            server.close(code === 1005 || code === 1006 ? 1000 : code, dec.decode(f.payload.subarray(2)));
+            reason = new TextDecoder("utf-8", { fatal: true }).decode(f.payload.subarray(2));
           } catch {}
+          try {
+            server.close(sayable(code) ? code : 1000, reason);
+          } catch {
+            try {
+              server.close(1000);
+            } catch {}
+          }
           call.end();
           return;
         } else if (f.opcode === 0 || f.opcode === 1 || f.opcode === 2) {
@@ -417,6 +425,11 @@ function wsFrame(opcode, payload) {
 }
 
 // A frame as a server says it, if all of it is here.
+/** Whether a Close frame may carry a status (RFC 6455 §7.4): not 1004 to 1006, nor 1015, nor what is no status at all. */
+function sayable(code) {
+  return (code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006) || (code >= 3000 && code <= 4999);
+}
+
 function wsTake(b) {
   if (b.length < 2) return null;
   let n = b[1] & 127, at = 2;
@@ -431,6 +444,7 @@ function wsTake(b) {
   const masked = b[1] & 128;
   const mask = masked ? b.subarray(at, at + 4) : null;
   if (masked) at += 4;
+  if ((b[0] & 8) && (n > 125 || !(b[0] & 128))) return { bad: true }; // a control frame is short and whole
   if (b.length < at + n) return null;
   let payload = b.subarray(at, at + n);
   if (mask) payload = payload.map((x, i) => x ^ mask[i & 3]);

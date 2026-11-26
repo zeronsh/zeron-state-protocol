@@ -23,6 +23,9 @@ class Socket {
   }
   send() {}
   close(code, reason) {
+    // As the platform has it: a status a Close frame may not carry, or a reason of more than 123 bytes, is refused.
+    const ok = code === undefined || (code >= 1000 && code <= 1014 && ![1004, 1005, 1006].includes(code)) || (code >= 3000 && code <= 4999);
+    if (!ok || new TextEncoder().encode(reason ?? "").length > 123) throw new RangeError("not a close");
     this.closedWith = { code, reason };
   }
 }
@@ -42,6 +45,7 @@ globalThis.Response = class extends RealResponse {
 };
 
 const enc = new TextEncoder();
+const cat = (...parts) => new Uint8Array(Buffer.concat(parts));
 const later = (ms) => new Promise((done) => setTimeout(done, ms));
 let failed = false;
 const check = (what, ok, detail = "") => {
@@ -141,6 +145,17 @@ for (const code of [1005, 1006, undefined]) {
   server.emit("close", { code: 1000, reason: "and more than that" });
   await later(20);
   check("a close past what is held", p.said.includes(3) && !p.said.includes(1), JSON.stringify(p.said));
+}
+
+// The port closes with what the public may not be told: the public is told it is over all the same, not left open.
+for (const [code, reason] of [[1004, ""], [1015, ""], [2000, ""], [999, ""], [5000, ""], [1000, "x".repeat(124)], [3000, "\xff"]]) {
+  const p = pipe();
+  const [call, server] = await switched(p);
+  const body = cat(new Uint8Array([code >> 8, code & 255]), typeof reason === "string" && reason !== "\xff" ? enc.encode(reason) : new Uint8Array([0xff]));
+  const head = body.length < 126 ? new Uint8Array([0x88, body.length]) : new Uint8Array([0x88, 126, body.length >> 8, body.length & 255]);
+  call.flow(0, cat(head, body));
+  await later(20);
+  check(`a port's close with ${code} and ${reason.length} bytes`, server.closedWith !== null, JSON.stringify(p.said));
 }
 
 if (failed) process.exit(1);
