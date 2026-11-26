@@ -201,3 +201,27 @@ const until = async (f) => { for (let i = 0; i < 2000 && !f(); i++) await new Pr
     console.log("ok   a relay evicted while keeping was due keeps its connections once quiet");
   } finally { await r.close(); }
 }
+
+// With PR #5's checkpoint once writing stops: the burst is over, the checkpoint taken when quiet, and only then are
+// the connections kept, as they are after it; an object woken from that resumes both, and goes on.
+{
+  const r = await relayWith(2, { STATS: "1", QUIET_MS: "150", QUIET_TAIL: "1" });
+  try {
+    const [wsA, wsB] = r.serverSockets, [clientA] = r.clients;
+    const checkpoints = async () => JSON.parse(await (await r.doSpace.fetch(new Request(`http://relay.local/${r.spaceId}?stats`))).text()).node.checkpoints;
+    const before = await checkpoints();
+    const writes = [];
+    for (let i = 1; i <= 40; i++) writes.push(clientA.write(1, (ch) => ch.insert(schema, "items", i, { body: new Uint8Array(4000).fill(i) })));
+    await Promise.all(writes);
+    assert(await until(() => r.states[1].rows.length === 40));
+    await new Promise((go) => setTimeout(go, 800));
+    assert((await checkpoints()) > before, "a checkpoint once writing stopped");
+    assert(kept(wsA) && kept(wsB), "and both kept after it");
+    const closed = [wsA.closed, wsB.closed];
+    r.doSpace = new Space(r.ctx, r.env);
+    assert.deepEqual([wsA.closed, wsB.closed], closed, "woken, it resumed both");
+    await clientA.write(1, (ch) => ch.insert(schema, "items", 41, { body: new Uint8Array(64).fill(7) }));
+    assert(await until(() => r.states[1].rows.length === 41), "and what is said after waking reaches the other");
+    console.log("ok   a relay that checkpoints once quiet keeps its connections after the checkpoint, and resumes them");
+  } finally { await r.close(); }
+}

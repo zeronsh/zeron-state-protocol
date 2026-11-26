@@ -304,6 +304,7 @@ export class Space extends DurableObject {
       this.#quiet = setTimeout(() => {
         this.#quiet = undefined;
         if (epoch !== this.#epoch || !this.#wasm) return;
+        this.#unkeep(); // an event like any other: what was kept is let go of before anything is done
         this.#wasm.quiet();
         this.#settle();
       }, Number(this.env.QUIET_MS ?? 1000));
