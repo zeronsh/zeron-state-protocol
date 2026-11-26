@@ -349,3 +349,26 @@ files_hash_as_vectors_say :: proc(t: ^testing.T) {
 		testing.expectf(t, strings.contains(string(text), strings.concatenate({`"file": "`, string(hexed), `"`}, context.temp_allocator)), "size %d", size)
 	}
 }
+
+// A share's path is all of its line after the words before it, whatever those words are, and whatever spaces it holds.
+@(test)
+shares_parsed :: proc(t: ^testing.T) {
+	shares: [dynamic]Share
+	defer {
+		shares_free(&shares)
+		delete(shares)
+	}
+	ok := shares_parse("files 1 readonly read /srv/read me\n  files   2  write-it  write   /a b  \nshell 3 terminal\nshell 4\n# a remark\nnonsense here\nfiles 0 x read /p", &shares)
+	testing.expect(t, !ok) // the last two make no sense, and are passed over
+	testing.expect_value(t, len(shares), 4)
+	testing.expect(t, shares[0].name == "readonly" && !shares[0].write && shares[0].path == "/srv/read me")
+	testing.expect(t, shares[1].name == "write-it" && shares[1].write && shares[1].scope == 2 && shares[1].path == "/a b")
+	testing.expect(t, shares[2].kind == .Shell && shares[2].terminal && !shares[2].commands && shares[2].scope == 3)
+	testing.expect(t, shares[3].terminal && shares[3].commands)
+	again: [dynamic]Share
+	defer {
+		shares_free(&again)
+		delete(again)
+	}
+	testing.expect(t, shares_parse(shares_text(shares[:]), &again) && len(again) == 4 && again[0].path == "/srv/read me")
+}

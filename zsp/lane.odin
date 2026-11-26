@@ -28,13 +28,12 @@ Lane :: struct {
 	heard:   bool, // the other end has ended its side
 }
 
-// How urgent a call is, by its method: what someone is typing into first, what is copied in bulk last.
+// How urgent a call is, by its method: what someone is typing into first, what is copied in bulk last. What may be
+// either, a command or a port, is in the middle with everything else, where what has lately said little goes first.
 method_urgency :: proc(method: string) -> u8 {
 	switch method {
 	case "zsp.pty":
 		return 1
-	case "zsp.exec", "zsp.tcp", "zsp.public":
-		return 2
 	case "zsp.get", "zsp.put":
 		return 6
 	case "":

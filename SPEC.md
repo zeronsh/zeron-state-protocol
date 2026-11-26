@@ -604,8 +604,8 @@ holder gives for it (here, its size, time and identity on its disk); otherwise i
 sender's time, or not at all.
 
 Whoever answers reads only as much as it has credit to send, and credits only what it has written on, to a socket, a process or a disk: so a
-slow end slows the other, and nothing piles up between them. Lanes take their urgency from the method: `zsp.pty` 1; `zsp.exec`, `zsp.tcp` and
-`zsp.public` 2; others 3, but those between nodes themselves 4, and `zsp.get` and `zsp.put` 6.
+slow end slows the other, and nothing piles up between them. Lanes take their urgency from the method: `zsp.pty` 1; `zsp.get` and `zsp.put` 6;
+those between nodes themselves 4; all others, commands and ports among them, which may be bulk or not, 3.
 
 ## 18 Who handles what
 

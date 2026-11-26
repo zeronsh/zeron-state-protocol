@@ -99,9 +99,8 @@ shares_parse :: proc(text: string, into: ^[dynamic]Share) -> (ok: bool) {
 			s.kind = .Files
 			s.name = strings.clone(fields[2])
 			s.write = fields[3] == "write"
-			// The rest of the line, spaces and all.
-			at := strings.index(line, fields[3]) + len(fields[3])
-			s.path = strings.clone(strings.trim_space(line[at:]))
+			// The rest of the line after the fourth word, spaces and all.
+			s.path = strings.clone(strings.trim_space(after_words(line, 4)))
 			sane = share_name_valid(s.name)
 		case:
 			sane = false
@@ -365,4 +364,19 @@ Port_Offer :: struct {
 	port: u16,
 	host: string,
 	name: string,
+}
+
+// What is left of a line after its first n words.
+@(private)
+after_words :: proc(line: string, n: int) -> string {
+	rest := line
+	for _ in 0 ..< n {
+		rest = strings.trim_left_space(rest)
+		end := strings.index_any(rest, " \t")
+		if end < 0 {
+			return ""
+		}
+		rest = rest[end:]
+	}
+	return rest
 }

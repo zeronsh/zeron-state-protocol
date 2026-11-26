@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web]|nat|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -83,7 +83,12 @@ test)
 	# Side by side, since none needs another; each says what it has to say at its end.
 	rm -f build/failed
 	for p in zsp pipe find host; do
-		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL -define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 -define:ZSP_FIND_RUN=64 -define:ZSP_FIND_HOT=0 >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &
+		# Host tests each run whole hosts, each with an event loop of its own. On Windows core:nbio has those loops share
+		# one completion port, and hands what one finds of another's to it, which may have let that go meanwhile: so
+		# there they run one at a time, as zspd's one loop always does.
+		one=
+		[ $p = host ] && [ -n "$EXE" ] && one=-define:ODIN_TEST_THREADS=1
+		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL $one -define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 -define:ZSP_FIND_RUN=64 -define:ZSP_FIND_HOT=0 >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &
 	done
 	(odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 || echo zspd >>build/failed) &
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
@@ -135,7 +140,10 @@ sim) # as many worlds as you have patience for: ./x sim 10000 [first]
 		-define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 -define:ZSP_FIND_RUN=64 -define:ZSP_FIND_HOT=0
 	;;
 bench)
-	if [ "${2:-}" = web ]; then # what a web device costs, in Node and in a browser: ./x bench web [rows]
+	if [ "${2:-}" = streams ]; then # what streams cost and give, over UDP and a relay: ./x bench streams [bytes]
+		odin build host -build-mode:test -o:speed -out:build/bench-streams$EXE $STRICT -define:ZSP_BENCH=true -define:ZSP_BENCH_BYTES=${3:-268435456} -define:ODIN_TEST_NAMES=host.bench_streams
+		build/bench-streams$EXE 2>&1 | grep -v "^\[INFO"
+	elif [ "${2:-}" = web ]; then # what a web device costs, in Node and in a browser: ./x bench web [rows]
 		[ -f build/zspd$EXE ] || odin build zspd -out:build/zspd$EXE -debug $STRICT
 		! stale web/src/node.wasm || web_wasm
 		web_deps
