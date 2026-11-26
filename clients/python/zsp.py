@@ -1386,7 +1386,7 @@ def put_offer(ports, scope, device, host, name, proxy):
     lo, hi = ports if isinstance(ports, tuple) else (ports, ports)
     if device is not None and len(device) != 32:
         raise ValueError("a device is its 32-byte key")  # else what follows it would be read as part of it
-    if not isinstance(scope, int) or not 1 <= scope < 1 << 32:
+    if not isinstance(scope, int) or isinstance(scope, bool) or not 1 <= scope < 1 << 32:
         raise ValueError("a scope is a whole number from 1")
     return (struct.pack(">HH", lo, hi) + varint(scope) + (device or bytes(32)) + varint(len(host.encode())) + host.encode()
             + varint(len(name.encode())) + name.encode() + bytes([1 if proxy else 0]))

@@ -285,6 +285,9 @@ exposures_heard_bounded :: proc(t: ^testing.T) {
 	}
 	say(&ts.space, 1, strings.repeat("x", 265_000, context.temp_allocator))
 	say(&ts.space, 2, "javascript:alert(1)")
+	say(&ts.space, 3, "https://\xff\xfe")
+	say(&ts.space, 4, "https://evil.test\n[INFO] another line")
+	say(&ts.space, 5, "https://a.test/ b")
 	testing.expect_value(t, len(p.exposures[0].heard), 0)
 	for i in 1 ..= 40 {
 		say(&ts.space, byte(i), "https://app-demo.expose.test")

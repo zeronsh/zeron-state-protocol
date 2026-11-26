@@ -159,6 +159,23 @@ for _, said in { "", "\1", "\1\0", string.rep("\128", 150) .. "\0", "\0\0" } do
 		local ok, got, fault = pcall((b :: any)[ask], b)
 		assert(ok and got == nil and fault == "malformed", `{ask} of {#said} bytes: {ok} {got} {fault}`)
 	end
+end
+-- Nor a scope that is no scope: none, nor what a varint too long makes of one.
+local long = string.rep("\128", 150) .. "\0"
+for ask, said in {
+	nodes = "\1" .. string.rep("\0", 32) .. "\0" .. "\0\0\0\0" .. "\0" .. "\0" .. "\1" .. "\0\80" .. long .. "\0\0",
+	offers = "\1" .. "\0\80\0\80" .. long .. string.rep("\0", 32) .. "\0\0\0",
+} do
+	for _, scope in { long, "\0" } do
+		local reply = string.gsub(said, long, function()
+			return scope
+		end);
+		(b :: any)._host = function()
+			return codec.reader(reply), nil
+		end
+		local ok, got, fault = pcall((b :: any)[ask], b)
+		assert(ok and got == nil and fault == "malformed", `{ask} with a scope of {#scope} bytes: {ok} {got} {fault}`)
+	end
 end;
 (b :: any)._host = host_of
 print("ok")

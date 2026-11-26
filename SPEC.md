@@ -722,7 +722,7 @@ after its last exposure changes nothing, and is not answered. A relay works each
 key and what it said, and holds it only while the device is connected; it is reached at `<label>.<domain>` for a domain of the relay's, by TLS that it terminates (routed by the name asked for) or by
 plain HTTP routed by `Host`, behind something else that does. A device takes `zsp.public` only from a session it dialled as a relay's, and
 only for a label it exposes; it keeps what a relay says in 41 Exposed only while linked to that relay, for at most 16 relays an
-exposure, and only a status of 0 to 3 with a url that is empty or `http://` or `https://` and at most 512 bytes; for an exposure marked so, it says first where each connection came from, by PROXY v2. Taking a port back
+exposure, and only a status of 0 to 3 with a url that is empty or `http://` or `https://`, at most 512 bytes of UTF-8 with no space or control in it; for an exposure marked so, it says first where each connection came from, by PROXY v2. Taking a port back
 cuts off whoever is using it. What is exposed is public, and the relay sees it, as any reverse proxy must that holds the certificate; what
 is offered stays between devices, end to end.
 

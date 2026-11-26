@@ -8,6 +8,8 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "core:unicode"
+import "core:unicode/utf8"
 import "../pipe"
 import "../zsp"
 
@@ -261,7 +263,7 @@ exposures_heard :: proc(sp: ^Space, s: ^zsp.Session, payload: []byte) {
 		if r.bad {
 			return
 		}
-		if status > 3 || len(url) > MAX_URL || url != "" && !strings.has_prefix(url, "https://") && !strings.has_prefix(url, "http://") {
+		if status > 3 || !url_sound(url) {
 			continue // no relay's word: nothing of it is kept, nor said to clients
 		}
 		for &e in p.exposures {
@@ -283,6 +285,24 @@ exposures_heard :: proc(sp: ^Space, s: ^zsp.Session, payload: []byte) {
 			}
 		}
 	}
+}
+
+// A URL as a relay would say one: empty, or http(s), short, of UTF-8 and no space or control (it is logged, and said to
+// clients, who read it as text).
+@(private)
+url_sound :: proc(url: string) -> bool {
+	if url == "" {
+		return true
+	}
+	if len(url) > MAX_URL || !strings.has_prefix(url, "https://") && !strings.has_prefix(url, "http://") || !utf8.valid_string(url) {
+		return false
+	}
+	for r in url {
+		if unicode.is_space(r) || unicode.is_control(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // zsp.public, from a relay this device dialled: label bytes ‖ address (16) ‖ port (2), where the connection came from.

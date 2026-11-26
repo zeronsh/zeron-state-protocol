@@ -2403,6 +2403,15 @@ local function count(r: codec.Reader): number
 	return n
 end
 
+-- A scope as the wire has it: a whole number from 1, below 2^32 (not NaN or infinity, from a varint too long).
+local function scope_of(r: codec.Reader): number
+	local s = codec.varint(r)
+	if s ~= s or s < 1 or s >= 2 ^ 32 then
+		error("malformed", 0)
+	end
+	return s
+end
+
 -- Reads an answer whole or not at all: nil and "malformed" for one that is short, longer, or not what it is read as.
 local function answer<T>(r: codec.Reader, read: (codec.Reader) -> T): (T?, string?)
 	local ok, v = pcall(read, r)
@@ -2415,7 +2424,7 @@ end
 local function read_ports(r: codec.Reader): { Port }
 	local out: { Port } = {}
 	for _ = 1, count(r) do
-		table.insert(out, table.freeze({ port = u16(r), scope = codec.varint(r), host = codec.bytes(r), name = codec.bytes(r) }))
+		table.insert(out, table.freeze({ port = u16(r), scope = scope_of(r), host = codec.bytes(r), name = codec.bytes(r) }))
 	end
 	return table.freeze(out)
 end
@@ -2486,7 +2495,7 @@ function Client._offers(self: Client, op: number, o: Offer?): ({ Offer }?, strin
 	return answer(r, function(r: codec.Reader): { Offer }
 		local out: { Offer } = {}
 		for _ = 1, count(r) do
-			local lo, hi, scope, device = u16(r), u16(r), codec.varint(r), codec.take(r, 32)
+			local lo, hi, scope, device = u16(r), u16(r), scope_of(r), codec.take(r, 32)
 			local host, name, flags = codec.bytes(r), codec.bytes(r), codec.u8(r)
 			table.insert(out, table.freeze({
 				lo = lo,

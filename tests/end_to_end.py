@@ -1250,6 +1250,11 @@ def test_ports():
             assert False, "offered to a device of %d bytes" % len(bad)
         except ValueError:
             pass
+    try:
+        ca.offer(port, True)
+        assert False, "offered in scope True"
+    except ValueError:
+        pass
     for ask in (ca.nodes, ca.offers, ca.exposures):
         ca.host = lambda method, body=b"": [b"\x00\x00"]
         try:
