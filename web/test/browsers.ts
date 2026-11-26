@@ -205,6 +205,28 @@ const tests: Record<string, () => Promise<void>> = {
     await call(p, "create", "pc");
     expectEqual(await call<string>(p, "sendView", "pc"), "intact");
   },
+  // What was asked of a node whose storage failed, and was told to the asker as failed, is not done after all by the next.
+  async browser_failed_asks() {
+    const leader = await page();
+    await call(leader, "device", "fa");
+    await call(leader, "create", "fa"); // the device owns its space: it may add scopes
+    const follower = await page();
+    await call(follower, "device", "fa");
+    await call(follower, "put", "fa", "notes", ["one"]);
+    await follower.quota(1);
+    for (let i = 0; i < 4; i++) await call(follower, "putLarge", "fa", "big", 900 << 10);
+    await call(follower, "scopeLater", "fa"); // asked as the node stops
+    await eventually("the follower is told", async () => (await call<string[]>(follower, "failures")).length > 0);
+    await eventually("and what it asked is answered", async () => (await call<string[]>(follower, "asked")).length > 0);
+    await follower.quota();
+    await leader.close();
+    pages.splice(pages.indexOf(leader), 1);
+    await eventually("the follower runs it", async () => (await call<string>(follower, "memberOrError", "fa")) === "true");
+    const said = (await call<string[]>(follower, "asked"))[0];
+    const next = await call<string>(follower, "scopeOrError", "fa");
+    // Either it was done, and said so, or it was not done at all.
+    expectEqual(next, said.startsWith("error") ? "2" : "3");
+  },
   // Whichever tab joins, makes or adopts a space, every tab's device says it is of it.
   async browser_space_told() {
     const one = await page();

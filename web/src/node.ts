@@ -154,6 +154,7 @@ export class Node {
   #deliveries: [Conn & { kind: "client" }, Uint8Array][] = [];
   #ticking = false;
   #stopped = false;
+  #closing?: Promise<void>;
   #failure?: Error;
   #waiting: (() => void)[] = [];
   /** Told once if the node stops of itself: storage has failed, and nothing more can be made durable. */
@@ -429,6 +430,7 @@ export class Node {
   /** Stops at once, as a machine does that loses its power: nothing more is written, synced or said. For tests. */
   abandon(): void {
     this.#stopped = true;
+    this.#closing = Promise.resolve(); // nothing more is done, closing included
     clearTimeout(this.#timer);
     clearTimeout(this.#draining);
     for (const [, c] of this.#conns) if (c.kind === "socket") (c.ws.onclose = c.ws.onerror = c.ws.onmessage = null), c.ws.close();
@@ -437,8 +439,11 @@ export class Node {
   }
 
   /** Stops the node, makes what it was given durable, and closes the store. */
-  async close(): Promise<void> {
-    if (this.#stopped) return;
+  close(): Promise<void> {
+    return (this.#closing ??= this.#close());
+  }
+
+  async #close(): Promise<void> {
     this.#stopped = true;
     clearTimeout(this.#timer);
     clearTimeout(this.#draining);
@@ -698,10 +703,11 @@ export class Node {
     setTimeout(() => this.#tick(), 0);
   }
 
+  // Said once its files are let go of, so that whoever is told may open them.
   #fail(error: Error): void {
     if (this.#failure) return;
     this.#failure = error;
-    void this.close();
-    this.onFailure?.(error);
+    const tell = () => this.onFailure?.(error);
+    this.close().then(tell, tell);
   }
 }

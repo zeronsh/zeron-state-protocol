@@ -76,7 +76,11 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
 // with them everything sealed under them, so the change is refused, the node stops, and nothing more is said durable.
 {
   let failing = false;
+  const order: string[] = [];
   class Failing extends MemoryVolume {
+    close() {
+      order.push("files let go of");
+    }
     override async open(name: string, create: boolean): Promise<File | undefined> {
       const f = await super.open(name, create);
       if (!f || !/^(keys|roster)\./.test(name)) return f;
@@ -92,7 +96,7 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   volume.openNow = undefined; // through open, which is watched
   const node = await Node.open({ volume, module, log: () => {} });
   let failure: Error | undefined;
-  node.onFailure = (e) => (failure = e);
+  node.onFailure = (e) => ((failure = e), order.push("told"));
   node.create();
   const client = new Client({ connect: node.connect });
   while (!client.may(1, "write")) await new Promise((done) => setTimeout(done, 1));
@@ -102,10 +106,31 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   void client.write(1, (change) => change.insert({}, "x", 1, {})).then(() => (durable = true));
   await new Promise((done) => setTimeout(done, 300));
   assert(failure, "it says that it has stopped");
+  assert.deepEqual(order, ["files let go of", "told"], "it said so before its files were let go of, which whoever is told may want");
   assert(!durable, "and says nothing more is durable");
   assert.throws(() => node.member, /storage/, "and answers nothing it would make up");
   assert.throws(() => node.members());
   client.close();
+}
+
+// Closed twice, it is closed once, and the second waits for the first: for what is being opened to be, and its files to be
+// let go of.
+{
+  const volume = new MemoryVolume({ slow: true });
+  const settling = setInterval(() => volume.settle(), 1);
+  const node = await Node.open({ volume, module, log: () => {} });
+  clearInterval(settling);
+  node.create(); // which writes, and so opens segments ahead, in the volume's own time
+  const first = node.close();
+  let second = false;
+  void node.close().then(() => (second = true));
+  await new Promise((done) => setTimeout(done, 50));
+  assert(!second, "the second close was done before the first");
+  const letting = setInterval(() => volume.settle(), 1);
+  await first;
+  clearInterval(letting);
+  await new Promise((done) => setTimeout(done, 0));
+  assert(second);
 }
 
 // A relay that cannot even be dialled, as a ws:// one from an https:// page cannot, is tried again soon, as any is.

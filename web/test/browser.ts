@@ -6,6 +6,7 @@ import { live } from "./live.ts";
 
 const devices = new Map<string, Device>();
 const failures: string[] = []; // what this tab was told of nodes that stopped
+const asked: string[] = []; // what came of what was asked and not waited for
 
 // Pipes that can be broken, as a crash of the pipe breaks them.
 const pipes = new Set<{ wire: Wire; closed: () => void }>();
@@ -104,6 +105,20 @@ const zsp = {
   },
   async adopt(name: string, roster: number[]): Promise<boolean> {
     return devices.get(name)!.adopt(Uint8Array.from(roster));
+  },
+  /** Adds a scope: its number, or what went wrong. */
+  async scopeOrError(name: string): Promise<string> {
+    return devices.get(name)!.scope().then(String, (e: Error) => "error: " + e.message);
+  },
+  /** Asks for a scope and does not wait: what came of it is kept, to be had by `asked`. */
+  async scopeLater(name: string): Promise<void> {
+    void devices.get(name)!.scope().then(
+      (n) => asked.push(String(n)),
+      (e: Error) => asked.push("error: " + e.message),
+    );
+  },
+  async asked(): Promise<string[]> {
+    return asked;
   },
   async create(name: string): Promise<string> {
     return devices.get(name)!.create();

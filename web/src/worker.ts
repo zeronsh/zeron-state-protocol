@@ -164,6 +164,10 @@ function shout(id: string, s: Shout): void {
 
 function heard(s: Shout): void {
   if ("failed" in s) {
+    // Whatever was asked of the node that stopped, and not answered, was not done, and the tab is told it failed: it is
+    // not to be done by the next, either.
+    for (const [id, done] of waiting) unheard.delete(id), done({ error: s.failed });
+    waiting.clear();
     self.postMessage({ failed: s.failed } satisfies Report);
   } else if ("space" in s) {
     self.postMessage({ space: s.space } satisfies Report);
