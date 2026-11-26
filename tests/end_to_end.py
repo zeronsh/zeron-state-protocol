@@ -910,7 +910,7 @@ def http_get(address, port, host=None, origin=None, proxy=None):
     """A GET by hand, so nothing is hidden: the status and body, or None if the connection was refused or reset."""
     try:
         if proxy:  # SOCKS 5, by name
-            s = socket.create_connection(proxy, 3)
+            s = socket.create_connection(proxy, 10)
             s.sendall(b"\x05\x01\x00")
             assert s.recv(2) == b"\x05\x00"
             s.sendall(b"\x05\x01\x00\x03" + bytes([len(address)]) + address.encode() + struct.pack(">H", port))
@@ -918,7 +918,7 @@ def http_get(address, port, host=None, origin=None, proxy=None):
             if len(reply) < 2 or reply[1] != 0:
                 return None
         else:
-            s = socket.create_connection((address, port), 3)
+            s = socket.create_connection((address, port), 10)  # a slow machine's first connection makes a tunnel
         with s:
             extra = f"Origin: {origin}\r\n" if origin else ""
             s.sendall(f"GET / HTTP/1.1\r\nHost: {host or address}:{port}\r\nConnection: close\r\n{extra}\r\n".encode())
