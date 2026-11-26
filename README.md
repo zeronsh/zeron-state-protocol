@@ -123,6 +123,19 @@ many, and where runs differed, both:
 | memory, holding 100,000 rows and a page | 30 to 36 MB of the node's, 15 MB of the client's |
 | `./x test` | 2.5 s longer than without any of it: 55 s |
 
+`./x bench ports`, names, ports and exposure, real processes on the same 8 cores, both devices and the relay on one machine:
+
+| | |
+|---|---|
+| an idle node, names, offers and proxy on | 188 to 230 system calls in 20 s, its relay's pings; 0.6 MB private |
+| a name, asked of a node | 17 to 25 µs, a round trip by UDP, Python asking |
+| a connection to another device's port, through a relay | made and answered in 0.3 to 0.4 ms; then 72 to 81 µs a round trip |
+| the same, through a direct link | made and answered in 0.34 ms; then 42 µs a round trip |
+| 200 MB through a relay; through a direct link | 113 to 142 MB/s; 218 MB/s |
+| 500 idle forwarded connections | 1.1 KB each, both ends together |
+| 100 MB exposed to the public, by TLS through zspd's relay | 292 MB/s, one core for the relay's TLS |
+| a relay, after exposing it | 1.3 MB private |
+
 ## Using it
 
 ```sh
