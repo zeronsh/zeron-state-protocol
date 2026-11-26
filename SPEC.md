@@ -134,7 +134,7 @@ a member has at most one in force per scope. Taking Write away ends the grant an
 says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
 `subject` is the consumer's name for whomever the device belongs to, opaque here. A roster that names any device begins `"zsp-r2"`
 in place of `"zsp-r1"`, and each member's subject is followed by its **name** bytes, empty or one DNS label: 1 to 63 of `a`–`z`, `0`–`9` and
-`-`, with no hyphen at either end. No two members share a name; a name goes with its member's last grant (§17). A roster that names nobody
+`-`, with no hyphen at either end, and not `id`, which is the zone of names nobody chooses (§17). No two members share a name; a name goes with its member's last grant (§17). A roster that names nobody
 is `"zsp-r1"`, as it always was. A roster is at most 2²² − 64 bytes. Members are never removed, only their grants
 ended, so that a member's index is for ever.
 

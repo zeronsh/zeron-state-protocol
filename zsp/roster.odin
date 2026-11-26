@@ -350,7 +350,8 @@ roster_version :: proc(magic: []byte) -> (named, known: bool) {
 // hyphen at either end. So it means the same to every application that looks it up, and no two can be confused.
 @(require_results)
 name_valid :: proc(name: string) -> bool {
-	if len(name) == 0 || len(name) > 63 || name[0] == '-' || name[len(name) - 1] == '-' {
+	// "id" is not anybody's: <id>.id.<suffix> are the names nobody chooses (§17).
+	if len(name) == 0 || len(name) > 63 || name[0] == '-' || name[len(name) - 1] == '-' || name == "id" {
 		return false
 	}
 	for c in transmute([]byte)name {

@@ -248,7 +248,7 @@ roster_names :: proc(t: ^testing.T) {
 	testing.expect(t, draft_name(&d, b.device, "desk-top"))
 	testing.expect(t, draft_name(&d, c.device, "laptop"))
 	testing.expect(t, !draft_name(&d, a.device, "laptop")) // another's, while it is in force
-	for bad in ([]string{"", "Laptop", "-x", "x-", "a.b", "a b", "\x00", "0123456789012345678901234567890123456789012345678901234567890123"}) {
+	for bad in ([]string{"", "id", "Laptop", "-x", "x-", "a.b", "a b", "\x00", "0123456789012345678901234567890123456789012345678901234567890123"}) {
 		testing.expectf(t, !draft_name(&d, a.device, bad) || bad == "", "%q is not a name", bad)
 	}
 	named, ok := roster_sign(&a, root, &d, context.temp_allocator)
