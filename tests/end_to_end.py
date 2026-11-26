@@ -822,6 +822,24 @@ def slow_hibernation():
     assert "woke with 2 sockets" in cloud.p.stdout.read() + open(os.path.join(TMP, "cloud.log")).read()
 
 
+def slow_expose_hibernation():
+    """What a device exposes through the relay on Durable Objects is still reached once the object has slept."""
+    cloud = Cloud().start(EXPOSE_DOMAIN="expose.test")
+    _, (a,) = space("xh", relay=cloud)
+    ca = a.client()
+    web = free_port()
+    Service("127.0.0.1", web, says=b"still here")
+    ca.expose(web)
+    eventually("the relay says where", lambda: [r["status"] for e in ca.exposures() for r in e["relays"]] == [0])
+    label = ca.exposures()[0]["label"]
+    host, port = cloud.address.split(":")
+    assert http_get(host, int(port), host=label + ".expose.test") == (200, b"still here")
+    time.sleep(15)  # the object is evicted; its sockets are not, and the device has no reason to say it again
+    assert http_get(host, int(port), host=label + ".expose.test") == (200, b"still here")
+    cloud.p.terminate()
+    assert "woke with 1 sockets" in cloud.p.stdout.read() + open(os.path.join(TMP, "cloud.log")).read()
+
+
 def free_port(host="127.0.0.1"):
     with socket.socket() as s:
         s.bind((host, 0))

@@ -194,6 +194,6 @@ system) # names and addresses as every application here has them: zspd setup, as
 	$SUDO build/zspd$EXE setup --undo
 	exit $r
 	;;
-slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 && end_to_end slow_hibernation ;;
+slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 && end_to_end slow_hibernation slow_expose_hibernation ;;
 *) sed -n 2p "$0" && exit 2 ;;
 esac

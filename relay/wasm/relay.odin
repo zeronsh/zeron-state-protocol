@@ -503,6 +503,18 @@ save :: proc "c" (id: u32) -> int {
 	if !ok || !c.open || c.greet {
 		return 0
 	}
+	// What it exposes, which it has no reason to say again when this wakes.
+	count := 0
+	for l in labels {
+		count += 1 if l.conn == id else 0
+	}
+	zsp.write_varint(&message, u64(count))
+	for &l in labels {
+		if l.conn == id {
+			zsp.write_bytes(&message, transmute([]byte)l.label)
+			append(&message, ..l.device[:])
+		}
+	}
 	append(&message, ..c.channel.send[:])
 	append(&message, ..c.channel.recv[:])
 	zsp.write_u64(&message, c.channel.send_n)
@@ -518,6 +530,14 @@ save :: proc "c" (id: u32) -> int {
 load :: proc "c" (id: u32, size: int) -> bool {
 	context = runtime.default_context()
 	r := zsp.Reader{buf = message[:size]}
+	exposed := make([dynamic]Label, context.temp_allocator)
+	count := min(zsp.read_varint(&r), 16) // read once: a range's bound is looked at again each time round
+	for _ in 0 ..< count {
+		label := string(zsp.read_bytes(&r))
+		device: zsp.Key32
+		copy(device[:], zsp.read_take(&r, 32))
+		append(&exposed, Label{label, id, device})
+	}
 	c := new(Conn)
 	c.id = id
 	c.open = true
@@ -534,6 +554,9 @@ load :: proc "c" (id: u32, size: int) -> bool {
 	}
 	c.channel.peer = c.session.peer
 	conns[id] = c
+	for l in exposed {
+		append(&labels, Label{zsp_clone(l.label), id, l.device})
+	}
 	return true
 }
 
