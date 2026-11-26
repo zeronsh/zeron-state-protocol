@@ -90,6 +90,10 @@ export interface Rights {
   call?: boolean;
   /** To be believed about for whom it writes and calls. */
   vouch?: boolean;
+  /** To run commands and open terminals on devices that share them in the scope. */
+  shell?: boolean;
+  /** To read and write files on devices that share them in the scope. */
+  files?: boolean;
 }
 
 /** A member of the space, as its roster says. */
@@ -286,7 +290,7 @@ export class Node {
     const b = new Uint8Array(69);
     b.set(Node.#parseKey(key, 64));
     new DataView(b.buffer).setUint32(64, scope, true);
-    b[68] = 1 | (rights.write ? 2 : 0) | (rights.call ? 4 : 0) | (rights.vouch ? 8 : 0);
+    b[68] = 1 | (rights.write ? 2 : 0) | (rights.call ? 4 : 0) | (rights.vouch ? 8 : 0) | (rights.shell ? 16 : 0) | (rights.files ? 32 : 0);
     this.#govern(GOVERN.admit, b);
   }
 
@@ -347,7 +351,14 @@ export class Node {
       const grants = new Map<number, Required<Rights> & { read: boolean }>();
       for (let k = v.getUint32(at, true), p = at + 4; k > 0; k--, p += 5) {
         const r = b[p + 4];
-        grants.set(v.getUint32(p, true), { read: (r & 1) !== 0, write: (r & 2) !== 0, call: (r & 4) !== 0, vouch: (r & 8) !== 0 });
+        grants.set(v.getUint32(p, true), {
+          read: (r & 1) !== 0,
+          write: (r & 2) !== 0,
+          call: (r & 4) !== 0,
+          vouch: (r & 8) !== 0,
+          shell: (r & 16) !== 0,
+          files: (r & 32) !== 0,
+        });
       }
       at += 4 + grants.size * 5;
       out.push(Object.freeze({ key, id: key.slice(0, 64), owner: (flags & 1) !== 0, admin: (flags & 2) !== 0, active: (flags & 4) !== 0, subject, grants }));

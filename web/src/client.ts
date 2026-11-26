@@ -10,6 +10,8 @@ import * as codec from "./codec.ts";
 import { sha256 } from "./sha256.ts";
 import * as text from "./text.ts";
 import type { Connect, Wire } from "./node.ts";
+import type { Folder } from "./folder.ts";
+import * as services from "./services.ts";
 
 const HELLO = 1, ROSTER = 2, WATCH = 3, UNWATCH = 4, CELLS = 7, ACK = 8;
 const ASK = 32, UNASK = 33, ANSWER = 34, FETCH = 35;
@@ -18,6 +20,8 @@ const GRAVE = 1, PLACE = 2, VALUE = 3, PIECE = 4, BUNDLE = 5;
 const W_DATA = 1, W_LIVE = 2, W_BACK = 4, W_ADOPT = 8, W_COUNTS = 32;
 const F_DATA = 0, F_END = 1, F_FAULT = 2, F_CANCEL = 3, F_CREDIT = 4;
 const CALL_WINDOW = 262144;
+const WINDOW_MOST = 16 * CALL_WINDOW; // what the protocol lets a receiver credit ahead
+const WINDOW_QUICK = 250; // ms: a window used up within this grows
 const MAX_OPEN = 1048576 - 192;
 const ZERO16 = "\0".repeat(16);
 const ZERO24 = "\0".repeat(24);
@@ -55,6 +59,8 @@ export interface Host {
   defer?: (f: () => void) => void;
   /** Runs f later, and returns a way to cancel it: setTimeout by default. */
   after?: (ms: number, f: () => void) => () => void;
+  /** Where files fetched are kept, and files sent are found, unless a transfer says otherwise. */
+  folder?: Folder;
 }
 
 interface Lent {
@@ -65,6 +71,7 @@ interface Lent {
   now: () => number;
   defer: (f: () => void) => void;
   after: (ms: number, f: () => void) => () => void;
+  folder?: Folder;
 }
 
 // ---------------------------------------------------------------- columns
@@ -182,13 +189,24 @@ export interface Call {
   readonly method: string;
   /** Of one that is answered: whom whoever calls goes by. */
   readonly subject?: string;
+  /** Bytes that may be sent now and go at once, beyond what waits already: what the other side has room for. */
+  readonly room: number;
+  /** Sends a message, at once if the other side has room for it, and otherwise when it has. */
   send(data: Uint8Array | string): void;
   /** No more will be sent. */
   finish(): void;
   cancel(): void;
-  ondata?: (data: Uint8Array) => void;
+  /** Says that bytes kept from ondata are done with: the other side may send as many more. */
+  consumed(n: number): void;
+  /**
+   * A message. It is done with when this returns, unless this returns false: then it is kept from the other side's credit
+   * until consumed says so, and a reader that is slow so slows whoever sends, with nothing piling up between them.
+   */
+  ondata?: (data: Uint8Array) => boolean | void;
   onend?: () => void;
   onfault?: (fault: Fault) => void;
+  /** More may be sent: room grew, and nothing waits for it. */
+  onroom?: () => void;
 }
 
 export interface Query<T extends Table = Table> {
@@ -338,6 +356,10 @@ interface LiveCall {
   theirsEnded: boolean;
   credit: number;
   queue: Uint8Array[]; // awaiting credit
+  queued: number; // bytes of it
+  window: number; // what the other side may have outstanding with us
+  used: number; // of it, consumed since the window last grew
+  since: number; // when it last grew, or was used up
 }
 
 interface Written {
@@ -470,6 +492,7 @@ export class Client {
           const t = setTimeout(f, ms);
           return () => clearTimeout(t);
         }),
+      folder: host.folder,
     };
     this.#dial();
   }
@@ -1922,11 +1945,15 @@ export class Client {
       device,
       method,
       subject,
+      get room() {
+        return over() ? 0 : Math.max(0, live.credit - live.queued);
+      },
       send: (data) => {
         const bytes = toBytes(data);
         if (bytes.length > CALL_WINDOW) throw new RangeError("a message may be 256 KiB at most");
         if (!over() && !live.finishing) {
           live.queue.push(bytes);
+          live.queued += bytes.length;
           this.#drain(id, live);
         }
       },
@@ -1942,10 +1969,45 @@ export class Client {
           this.#flow(id, side, F_CANCEL);
         }
       },
+      consumed: (n) => {
+        if (!over()) this.#consumed(id, live, n);
+      },
     };
-    const live: LiveCall = { call, side, finishing: false, mineEnded: false, theirsEnded: false, credit: CALL_WINDOW, queue: [] };
+    const live: LiveCall = {
+      call,
+      side,
+      finishing: false,
+      mineEnded: false,
+      theirsEnded: false,
+      credit: CALL_WINDOW,
+      queue: [],
+      queued: 0,
+      window: CALL_WINDOW,
+      used: 0,
+      since: this.#host.now(),
+    };
     set.set(id, live);
     return live;
+  }
+
+  // Credits what was taken: the other side may send as much more. A reader that keeps up gets a longer window, as the host
+  // gives one (host/calls.odin), so that a long path is kept full; one that does not keep up never gets one.
+  #consumed(id: number, live: LiveCall, n: number): void {
+    if (n <= 0 || live.theirsEnded) return;
+    let credit = n;
+    live.used += n;
+    if (live.used >= live.window) {
+      const now = this.#host.now();
+      if (now - live.since < WINDOW_QUICK && live.window < WINDOW_MOST) {
+        credit += live.window;
+        live.window *= 2;
+      }
+      live.used = 0;
+      live.since = now;
+    }
+    const w = codec.writer();
+    codec.putVarint(w, credit);
+    this.#flow(id, live.side, F_CREDIT, codec.written(w));
   }
 
   // Sends what the other side has room for, and then, if there is no more, says so.
@@ -1953,6 +2015,7 @@ export class Client {
     while (live.queue.length > 0 && live.credit >= live.queue[0].length) {
       const data = live.queue.shift()!;
       live.credit -= data.length;
+      live.queued -= data.length;
       this.#flow(id, live.side, F_DATA, data);
     }
     if (live.finishing && live.queue.length === 0 && !live.mineEnded) {
@@ -1991,7 +2054,7 @@ export class Client {
     return new Promise((resolve, reject) => {
       const parts: Uint8Array[] = [];
       const call = this.call(device, scope, method, data);
-      call.ondata = (d) => parts.push(d);
+      call.ondata = (d) => void parts.push(d);
       call.onend = () => resolve(concat(parts));
       call.onfault = (f) => reject(new CallFault(f));
       call.finish();
@@ -2033,9 +2096,7 @@ export class Client {
     }
     const data = codec.rest(r).slice();
     const live = this.#call(id, 1, device, method, subject);
-    const w = codec.writer();
-    codec.putVarint(w, data.length);
-    this.#flow(id, 1, F_CREDIT, codec.written(w));
+    this.#consumed(id, live, data.length); // the first message is always taken
     handler(live.call, data);
   }
 
@@ -2050,13 +2111,11 @@ export class Client {
     const call = live.call;
     if (kind === F_DATA) {
       const data = codec.rest(r).slice();
-      const w = codec.writer();
-      codec.putVarint(w, data.length);
-      this.#flow(id, live.side, F_CREDIT, codec.written(w));
-      call.ondata?.(data);
+      if (call.ondata?.(data) !== false && set.get(id) === live) this.#consumed(id, live, data.length);
     } else if (kind === F_CREDIT) {
       live.credit += codec.varint(r);
       this.#drain(id, live);
+      if (live.queue.length === 0 && set.get(id) === live) call.onroom?.();
     } else if (kind === F_END) {
       live.theirsEnded = true;
       if (live.mineEnded) set.delete(id);
@@ -2066,6 +2125,79 @@ export class Client {
       const code = kind === F_FAULT && r.pos < r.len ? codec.u8(r) : 0;
       call.onfault?.(FAULTS[code] ?? "cancelled");
     }
+  }
+
+  // ---------------------------------------------------------------- streams and services (./services.ts)
+
+  /** What a device lets this one use in a scope, as this device's rights there allow; of this client's own, all it shares there. */
+  services(device: string, scope: number): Promise<services.Service[]> {
+    return services.services(this, device, scope);
+  }
+
+  // This client's own device, and a scope in which it may be called: its host answers its own clients, by zsp.share.
+  #own(): { device: string; scope: number } | undefined {
+    const device = this.#authors.get(0)?.id ?? this.#devices[0]?.id;
+    for (const [scope, s] of this.#scopes) if (device && s.rights & 4) return { device, scope };
+    return undefined;
+  }
+
+  /** What this client's device shares, as text, a share to a line, as host/services.odin says. */
+  shares(): Promise<string> {
+    const own = this.#own();
+    if (!own) return Promise.reject(new services.ServiceError(this.#ready ? "denied" : "unreachable", "this client may call nothing"));
+    return services.shares(this, own.device, own.scope);
+  }
+
+  /** Puts new shares in the place of this client's device's, at once: whatever they no longer allow is ended. Empty, nothing is shared. */
+  setShares(text: string): Promise<void> {
+    const own = this.#own();
+    if (!own) return Promise.reject(new services.ServiceError(this.#ready ? "denied" : "unreachable", "this client may call nothing"));
+    return services.setShares(this, own.device, own.scope, text);
+  }
+
+  /** Runs a command on a device: the program, found as the device finds programs, and its arguments, never through a shell. */
+  exec(device: string, scope: number, argv: readonly string[], options: services.ExecOptions = {}): services.Process {
+    return services.exec(this, device, scope, argv, options);
+  }
+
+  /** Runs a command to its end, with what input is given, and says what it said and how it ended. */
+  run(device: string, scope: number, argv: readonly string[], options: services.RunOptions = {}): Promise<services.Ran> {
+    return services.run(this, device, scope, argv, options);
+  }
+
+  /** Opens a terminal on a device: the user's shell there. */
+  terminal(device: string, scope: number, options: services.TerminalOptions = {}): services.Terminal {
+    return services.terminal(this, device, scope, options);
+  }
+
+  /** Has a device make a TCP connection to a port, its own or one on its network, and carry it here. */
+  connect(device: string, scope: number, port: number, host = ""): services.Stream {
+    return services.connect(this, device, scope, port, host);
+  }
+
+  /** What a folder of a device's shares holds; of the path "", the shares of files themselves. */
+  list(device: string, scope: number, path: string): Promise<services.Entry[]> {
+    return services.list(this, device, scope, path);
+  }
+
+  /** Fetches a file of a device's shares, by its path there: `share/path`. Taken up where an earlier one stopped. */
+  get(device: string, scope: number, remote: string, local: string, options: services.TransferOptions = {}): Promise<services.Transferred> {
+    return services.get(this, device, scope, remote, local, { ...options, folder: options.folder ?? this.#host.folder });
+  }
+
+  /** Sends a file to a device's shares, as a path there: `share/path`. Taken up where an earlier one stopped. */
+  put(device: string, scope: number, local: string, remote: string, options: services.PutOptions = {}): Promise<services.Transferred> {
+    return services.put(this, device, scope, local, remote, { ...options, folder: options.folder ?? this.#host.folder });
+  }
+
+  /** Fetches a folder of a device's shares, and all in it. */
+  getTree(device: string, scope: number, remote: string, local: string, options: services.TransferOptions = {}): Promise<services.TreeFile[]> {
+    return services.getTree(this, device, scope, remote, local, { ...options, folder: options.folder ?? this.#host.folder });
+  }
+
+  /** Sends a folder, and all the files in it, to a device's shares. */
+  putTree(device: string, scope: number, local: string, remote: string, options: services.PutOptions = {}): Promise<services.TreeFile[]> {
+    return services.putTree(this, device, scope, local, remote, { ...options, folder: options.folder ?? this.#host.folder });
   }
 }
 

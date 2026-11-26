@@ -1,5 +1,5 @@
 // FIPS 180-4, for naming lists, synchronously: WebCrypto would make every list name wait. Nothing secret passes through
-// here twice.
+// here twice. And a piece at a time, for checking files as they pass, chunk by chunk (SPEC.md §16): WebCrypto has no way to.
 
 // The first 32 bits of the fractions of the cube roots of the first 64 primes.
 const K = new Int32Array([
@@ -11,12 +11,15 @@ const K = new Int32Array([
   0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ]);
 
+// The first 32 bits of the fractions of the square roots of the first 8 primes.
+const START = new Int32Array([0x6a09e667, 0xbb67ae85 | 0, 0x3c6ef372, 0xa54ff53a | 0, 0x510e527f, 0x9b05688c | 0, 0x1f83d9ab, 0x5be0cd19]);
+
 const W = new Int32Array(64);
 const H = new Int32Array(8);
 const tail = new Uint8Array(128);
 
-// One 64-byte block of data, from `at`, into H.
-function block(data: Uint8Array, at: number): void {
+// One 64-byte block of data, from `at`, into the state H.
+function block(H: Int32Array, data: Uint8Array, at: number): void {
   for (let i = 0; i < 16; i++, at += 4) W[i] = (data[at] << 24) | (data[at + 1] << 16) | (data[at + 2] << 8) | data[at + 3];
   for (let i = 16; i < 64; i++) {
     const a = W[i - 15];
@@ -48,22 +51,10 @@ function block(data: Uint8Array, at: number): void {
   H[7] += h;
 }
 
-export function sha256(data: Uint8Array): Uint8Array {
-  H[0] = 0x6a09e667;
-  H[1] = 0xbb67ae85 | 0;
-  H[2] = 0x3c6ef372;
-  H[3] = 0xa54ff53a | 0;
-  H[4] = 0x510e527f;
-  H[5] = 0x9b05688c | 0;
-  H[6] = 0x1f83d9ab;
-  H[7] = 0x5be0cd19;
-  const n = data.length;
-  const whole = n - (n % 64);
-  for (let at = 0; at < whole; at += 64) block(data, at);
-  // What is left, a one bit, zeros, and the length in bits: one block or two.
-  const left = n - whole;
-  tail.fill(0);
-  tail.set(data.subarray(whole), 0);
+// What is left of n bytes in all, `left` of them, from tail: a one bit, zeros, and the length in bits; one block or two.
+// Then the state, as bytes.
+function finish(H: Int32Array, n: number, left: number): Uint8Array {
+  tail.fill(0, left);
   tail[left] = 0x80;
   const end = left < 56 ? 64 : 128;
   const hi = Math.floor(n / 0x20000000);
@@ -76,8 +67,8 @@ export function sha256(data: Uint8Array): Uint8Array {
   tail[end - 3] = lo >>> 16;
   tail[end - 2] = lo >>> 8;
   tail[end - 1] = lo;
-  block(tail, 0);
-  if (end === 128) block(tail, 64);
+  block(H, tail, 0);
+  if (end === 128) block(H, tail, 64);
   const out = new Uint8Array(32);
   for (let i = 0; i < 8; i++) {
     const v = H[i];
@@ -87,4 +78,44 @@ export function sha256(data: Uint8Array): Uint8Array {
     out[i * 4 + 3] = v;
   }
   return out;
+}
+
+export function sha256(data: Uint8Array): Uint8Array {
+  H.set(START);
+  const n = data.length;
+  const whole = n - (n % 64);
+  for (let at = 0; at < whole; at += 64) block(H, data, at);
+  tail.set(data.subarray(whole), 0);
+  return finish(H, n, n - whole);
+}
+
+/** SHA-256 of what is given it a piece at a time, however long: `update` as often as need be, then `digest` once. */
+export class Sha256 {
+  #h = Int32Array.from(START);
+  #pending = new Uint8Array(64); // of a block not yet whole
+  #filled = 0;
+  #length = 0;
+
+  update(data: Uint8Array): this {
+    let at = 0;
+    this.#length += data.length;
+    if (this.#filled > 0) {
+      const n = Math.min(64 - this.#filled, data.length);
+      this.#pending.set(data.subarray(0, n), this.#filled);
+      this.#filled += n;
+      at = n;
+      if (this.#filled < 64) return this;
+      block(this.#h, this.#pending, 0);
+      this.#filled = 0;
+    }
+    for (; at + 64 <= data.length; at += 64) block(this.#h, data, at);
+    this.#pending.set(data.subarray(at), 0);
+    this.#filled = data.length - at;
+    return this;
+  }
+
+  digest(): Uint8Array {
+    tail.set(this.#pending.subarray(0, this.#filled), 0);
+    return finish(this.#h, this.#length, this.#filled);
+  }
 }
