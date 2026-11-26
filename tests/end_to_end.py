@@ -1009,6 +1009,21 @@ def ports_space(n, owner_offers=False):
     return relay, devices
 
 
+def test_cli_long_answer():
+    """What a node answers its own CLI is had whole, however long: zspd nodes, when what others offer is more than one
+    call's credit at once."""
+    _, devices = ports_space(6)
+    for i, d in enumerate(devices):
+        d.client().offer((1000, 2023), 1, host="10.0.0.1", name="svc-%d-" % i + "a" * 50)
+    ca = devices[0].client()
+    # As much of it as each says at once (60 KiB), from each of the five others: more than 256 KiB in all.
+    heard = lambda: [len(n["ports"]) for n in ca.nodes() if not n["here"]]
+    eventually("all of it heard", lambda: len(heard()) == 5 and min(heard()) > 700, 20)
+    assert sum(len(p["host"]) + len(p["name"]) + 5 for n in ca.nodes() for p in n["ports"]) > 256 << 10
+    said = zspd("nodes", devices[0].dir)
+    assert all(n["name"] in said for n in ca.nodes()) and said.count("svc-") > 3500, said[:500]
+
+
 def address_of(client, device_key):
     return next(n["address"] for n in client.nodes() if n["device"].hex() == device_key)
 

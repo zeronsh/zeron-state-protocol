@@ -817,6 +817,15 @@ local_token :: proc(dir: string) -> string {
 
 // Calls a zsp.* method of this device's own host, as a local client of the node running here. The messages that
 // come back, or a fault; not ok if no node is running here.
+// An answer's messages, which together are it.
+joined :: proc(data: [][]byte) -> []byte {
+	all := make([dynamic]byte, context.temp_allocator)
+	for d in data {
+		append(&all, ..d)
+	}
+	return all[:]
+}
+
 local_call :: proc(dir, method: string, body: []byte) -> (data: [dynamic][]byte, fault: int, ok: bool) {
 	data = make([dynamic][]byte, context.temp_allocator)
 	address, aerr := os.read_entire_file(in_dir(dir, "address"), context.temp_allocator)
@@ -920,7 +929,15 @@ local_call :: proc(dir, method: string, body: []byte) -> (data: [dynamic][]byte,
 				}
 				switch kind {
 				case .Data:
+					// Taken: as much again may come, for an answer longer than a call's credit comes as credit does.
 					append(&data, slice.clone(f.buf[f.pos:], context.temp_allocator))
+					credit := make([dynamic]byte, context.temp_allocator)
+					cat := zsp.frame_begin(&credit, .Flow)
+					zsp.write_varint(&credit, 2)
+					append(&credit, byte(zsp.Flow.Credit))
+					zsp.write_varint(&credit, u64(len(f.buf) - f.pos))
+					zsp.frame_end(&credit, cat)
+					send(socket, credit[:])
 				case .End:
 					return data, 0, true
 				case .Fault:
@@ -937,11 +954,11 @@ FAULTS := [?]string{"cancelled", "denied", "unreachable", "unserved", "lost", "o
 // What the node running here knows of each device.
 nodes :: proc(dir: string) -> bool {
 	data, fault, ok := local_call(dir, "zsp.nodes", nil)
-	if !ok || fault != 0 || len(data) != 1 {
+	if !ok || fault != 0 || len(data) == 0 {
 		say(os.stderr, "no node is running here\n" if !ok else FAULTS[min(fault, len(FAULTS) - 1)], "\n" if ok else "")
 		return false
 	}
-	r := zsp.Reader{buf = data[0]}
+	r := zsp.Reader{buf = joined(data[:])}
 	n := zsp.read_varint(&r)
 	for _ in 0 ..< n {
 		device := zsp.read_take(&r, 32)
@@ -993,11 +1010,11 @@ offer :: proc(dir: string, args: []string, remove: bool) -> bool {
 	}
 	data, fault, running := local_call(dir, "zsp.offers", body[:])
 	if running {
-		if fault != 0 || len(data) != 1 {
+		if fault != 0 || len(data) == 0 {
 			say(os.stderr, "the node running here refused: ", FAULTS[min(fault, len(FAULTS) - 1)], " (no such offer, or too many)\n" if fault == 1 else "\n")
 			return false
 		}
-		r := zsp.Reader{buf = data[0]}
+		r := zsp.Reader{buf = joined(data[:])}
 		n := zsp.read_varint(&r)
 		for _ in 0 ..< n {
 			x := host.offer_read(&r) or_return
@@ -1101,11 +1118,11 @@ expose :: proc(dir: string, args: []string, remove: bool) -> bool {
 		say(os.stderr, "no node is running here: run it, then expose; what is exposed is said to relays as they are reached\n")
 		return false
 	}
-	if fault != 0 || len(data) != 1 {
+	if fault != 0 || len(data) == 0 {
 		say(os.stderr, "the node running here refused: ", FAULTS[min(fault, len(FAULTS) - 1)], " (exposed already, not exposed, or too many)\n" if fault == 1 else "\n")
 		return false
 	}
-	r := zsp.Reader{buf = data[0]}
+	r := zsp.Reader{buf = joined(data[:])}
 	n := zsp.read_varint(&r)
 	for _ in 0 ..< n {
 		pb := zsp.read_take(&r, 2)
