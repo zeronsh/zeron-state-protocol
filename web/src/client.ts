@@ -2061,6 +2061,105 @@ export class Client {
     });
   }
 
+  // ---------------------------------------------------------------- this device's host: names, ports, exposures (§18)
+
+  /** Calls a zsp.* method of this device's own host, in the least scope this client may call in. */
+  async #hostCall(method: string, data: Uint8Array): Promise<codec.Reader> {
+    let scope: number | undefined;
+    for (const [s, { rights }] of this.#scopes) if (rights & 4 && (scope === undefined || s < scope)) scope = s;
+    const me = this.#devices[0];
+    if (scope === undefined || !me) throw new CallFault("unreachable");
+    return codec.reader(await this.request(me.id, scope, method, data));
+  }
+
+  /** Every device of the space as this one reaches it: its name, its address here, and what it offers this device. */
+  async nodes(): Promise<readonly NodeInfo[]> {
+    const r = await this.#hostCall("zsp.nodes", new Uint8Array());
+    const out: NodeInfo[] = [];
+    for (let n = codec.varint(r); n > 0; n--) {
+      const id = codec.takeBinary(r, 32), name = fromUtf8.decode(codec.bytes(r)), a = codec.take(r, 4), flags = codec.u8(r);
+      out.push(Object.freeze({
+        id, name, address: Array.from(a).join("."), here: !!(flags & 1), reachable: !!(flags & 2), direct: !!(flags & 4),
+        subject: fromUtf8.decode(codec.bytes(r)), ports: readPorts(r),
+      }));
+    }
+    return Object.freeze(out);
+  }
+
+  async #offers(op: number, o?: Offer): Promise<readonly Offer[]> {
+    const w = codec.writer();
+    codec.putU8(w, op);
+    if (o) {
+      const hi = o.hi ?? o.lo;
+      codec.put(w, new Uint8Array([o.lo >> 8, o.lo & 255, hi >> 8, hi & 255]));
+      codec.putVarint(w, o.scope);
+      codec.put(w, o.device ? codec.bytesOf(o.device) : new Uint8Array(32));
+      codec.putBytes(w, utf8.encode(o.host ?? ""));
+      codec.putBytes(w, utf8.encode(o.name ?? ""));
+      codec.putU8(w, o.proxy ? 1 : 0);
+    }
+    const r = await this.#hostCall("zsp.offers", w.buf.subarray(0, w.pos));
+    const out: Offer[] = [];
+    const none = "\0".repeat(32);
+    for (let n = codec.varint(r); n > 0; n--) {
+      const pair = codec.take(r, 4), scope = codec.varint(r), device = codec.takeBinary(r, 32);
+      const host = fromUtf8.decode(codec.bytes(r)), name = fromUtf8.decode(codec.bytes(r)), flags = codec.u8(r);
+      out.push(Object.freeze({
+        lo: (pair[0] << 8) | pair[1], hi: (pair[2] << 8) | pair[3], scope, device: device === none ? undefined : device,
+        host: host || undefined, name: name || undefined, proxy: !!(flags & 1),
+      }));
+    }
+    return Object.freeze(out);
+  }
+
+  /** What this device offers others of its space. Nothing is offered unless it is. */
+  offers(): Promise<readonly Offer[]> {
+    return this.#offers(0);
+  }
+
+  /** Offers ports of this machine (or, with host, of another, from here) to whoever may call in a scope, or one device. */
+  offer(o: Offer): Promise<readonly Offer[]> {
+    return this.#offers(1, o);
+  }
+
+  /** Takes an offer back: whoever is using it is cut off. */
+  unoffer(o: Offer): Promise<readonly Offer[]> {
+    return this.#offers(2, o);
+  }
+
+  async #exposures(data: Uint8Array): Promise<readonly Exposure[]> {
+    const r = await this.#hostCall("zsp.expose", data);
+    const out: Exposure[] = [];
+    for (let n = codec.varint(r); n > 0; n--) {
+      const p = codec.take(r, 2), name = fromUtf8.decode(codec.bytes(r)), flags = codec.u8(r), label = fromUtf8.decode(codec.bytes(r));
+      const relays: RelayExposure[] = [];
+      for (let m = codec.varint(r); m > 0; m--) {
+        relays.push(Object.freeze({ relay: codec.takeBinary(r, 32), status: codec.u8(r), url: fromUtf8.decode(codec.bytes(r)) }));
+      }
+      out.push(Object.freeze({ port: (p[0] << 8) | p[1], name, proxy: !!(flags & 1), label, relays: Object.freeze(relays) }));
+    }
+    return Object.freeze(out);
+  }
+
+  /** What this device exposes to the public, and where each relay says it is (url, when status is 0). */
+  exposures(): Promise<readonly Exposure[]> {
+    return this.#exposures(new Uint8Array([0]));
+  }
+
+  /** Exposes a port of this machine to the public, under a fresh name; `proxy` says where each connection came from. */
+  expose(port: number, options: { name?: string; proxy?: boolean } = {}): Promise<readonly Exposure[]> {
+    const w = codec.writer();
+    codec.put(w, new Uint8Array([1, port >> 8, port & 255]));
+    codec.putBytes(w, utf8.encode(options.name ?? ""));
+    codec.putU8(w, options.proxy ? 1 : 0);
+    return this.#exposures(w.buf.subarray(0, w.pos));
+  }
+
+  /** Takes a port back from the public: whoever is using it is cut off, and its name is nobody's for ever. */
+  unexpose(port: number): Promise<readonly Exposure[]> {
+    return this.#exposures(new Uint8Array([2, port >> 8, port & 255]));
+  }
+
   /** Answers a method within a scope. The handler gets the call and its first message. Returns a way to stop. */
   serve(scope: number, method: string, handler: (call: Call, data: Uint8Array) => void): () => void {
     const key = `${scope}/${method}`;
@@ -2202,6 +2301,59 @@ export class Client {
 }
 
 /** Why a call did not end as it should have. */
+/** A port a device offers this one: where to reach it, the scope it is offered in, and what it is. */
+export interface Port {
+  readonly port: number;
+  readonly scope: number;
+  readonly host: string;
+  readonly name: string;
+}
+
+/** A device of the space as this one reaches it (SPEC §18). */
+export interface NodeInfo {
+  readonly id: string;
+  readonly name: string; // <name>.<suffix>, or <id>.id.<suffix>: what any application here reaches it by
+  readonly address: string; // 127.a.b.c
+  readonly here: boolean;
+  readonly reachable: boolean;
+  readonly direct: boolean; // linked directly, rather than through a relay
+  readonly subject: string;
+  readonly ports: readonly Port[];
+}
+
+export interface Offer {
+  readonly lo: number;
+  readonly hi?: number;
+  readonly scope: number;
+  readonly device?: string;
+  readonly host?: string;
+  readonly name?: string;
+  readonly proxy?: boolean;
+}
+
+export interface RelayExposure {
+  readonly relay: string;
+  readonly status: number; // 0 exposed, 1 that relay exposes nothing, 2 the label is another's, 3 too many
+  readonly url: string;
+}
+
+export interface Exposure {
+  readonly port: number;
+  readonly name: string;
+  readonly proxy: boolean;
+  readonly label: string;
+  readonly relays: readonly RelayExposure[];
+}
+
+function readPorts(r: codec.Reader): readonly Port[] {
+  const out: Port[] = [];
+  for (let n = codec.varint(r); n > 0; n--) {
+    const p = codec.take(r, 2);
+    out.push(Object.freeze({ port: (p[0] << 8) | p[1], scope: codec.varint(r), host: fromUtf8.decode(codec.bytes(r)), name: fromUtf8.decode(codec.bytes(r)) }));
+  }
+  return Object.freeze(out);
+}
+
 export class CallFault extends Error {
   readonly fault: Fault;
 

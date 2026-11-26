@@ -63,6 +63,7 @@ web_test() {
 	node test/package.ts
 	node test/udp.ts
 	node test/find_memory.ts
+	node test/ports.ts
 	for t in text mirror_model mirror_interop store end_to_end services browsers; do
 		args=
 		[ $t = store ] && args=../build/node-small.wasm
