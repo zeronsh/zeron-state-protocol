@@ -1091,7 +1091,9 @@ function Client._view(self: Client, row: Stored, schema: Table, key: string): Ro
 			if slot then
 				for _, cell in slot do
 					if cell.kind == VALUE then
-						made[name] = c.decode(cell.body)
+						-- What cannot be read as the column's kind is no value, rather than the end of everything shown.
+						local fine, v = pcall(c.decode, cell.body)
+						made[name] = if fine then v else nil
 					end
 				end
 			end
@@ -1953,9 +1955,32 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	local cells: { Written } = {}
 	local fresh: { [string]: boolean } = {} -- rows made here
 	local rows: { [string]: boolean } = {}
+	-- Each row as it was before this change touched it, to be put back if the change is not made after all: false for
+	-- one this change made.
+	local saved: { [string]: any } = {}
+	local function keep(id: string, slot: number)
+		local was = saved[id]
+		if was == nil then
+			local row = self.rows[id]
+			if row then
+				local slots = {}
+				for k, cs in row.slots do
+					slots[k] = table.clone(cs)
+				end
+				was = { dead = row.dead, slots = slots, touched = {} }
+			else
+				was = false
+			end
+			saved[id] = was
+		end
+		if was then
+			was.touched[slot] = true
+		end
+	end
 	local function put(row: string, slot: number, kind: number, body: string)
 		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 192 bytes")
 		local stamp = self:_stamp()
+		keep(row, slot)
 		rows[row] = true
 		table.insert(cells, { row = row, slot = slot, kind = kind, stamp = stamp, body = body })
 		self:_accept(self:_row(row), slot, kind, stamp, body, self:_mine(scope))
@@ -1974,7 +1999,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	local function place(id: string, list: string, order: number, slot: number?)
 		put(id, slot or 1, PLACE, self:_tag(scope, list) .. codec.u64(order))
 	end
-	f({
+	local change: Change = {
 		insert = function(schema, list, order, values)
 			-- As late as anything heard of: later, then, than any right that is known to have ended.
 			local ms = math.floor(self.host.now() * 1000)
@@ -1998,6 +2023,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			if row.texts[slot] and row.texts[slot].open ~= "" then
 				self:_seal(row, slot) -- what an editor has open goes first
 			end
+			keep(id, slot)
 			local t = self:_text(row, slot)
 			f(t, function(): string
 				return self.host.random(8)
@@ -2012,7 +2038,26 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 				unview(row)
 			end
 		end,
-	})
+	}
+	local ok, why = pcall(f, change)
+	if not ok then
+		-- All or nothing: whatever was done here is undone, and nothing is said.
+		for id, was in saved do
+			local row = self.rows[id]
+			if not was then
+				self.rows[id] = nil
+			elseif row then
+				row.dead = was.dead
+				row.slots = was.slots
+				for slot in was.touched do
+					row.texts[slot] = nil -- read again from its cells when next wanted
+					row.lives[slot] = nil
+				end
+				unview(row)
+			end
+		end
+		error(why, 0)
+	end
 	if #cells > 0 then
 		self:_send_cells(cells, done)
 	elseif done then

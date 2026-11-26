@@ -522,4 +522,82 @@ do
 	assert(found.rows[1].title == "kept" and found.rows[1].body == "new", "it is as it was before from then on")
 end
 
+-- A change is all or nothing: one that fails partway leaves nothing of itself, here or anywhere.
+do
+	local h = harness()
+	h.greet()
+	local shown: any
+	h.client:window({ scope = 1, list = "a", table = Note }, function(st)
+		shown = st
+	end)
+	h.run()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 1, { title = "kept", body = "hello" })
+	end)
+	h.run()
+	assert(#shown.rows == 1 and shown.rows[1].body == "hello")
+	local said = #h.self.said
+	local ok, why = pcall(function()
+		h.client:write(1, function(change)
+			change.set(id, Note, { title = "changed" })
+			change.edit(id, 17, function(t, fresh)
+				zsp.Text.insert(t, 0, "oh, ", fresh)
+			end)
+			change.delete(id)
+			change.insert(Note, "a", 2, { title = "new" })
+			error("not after all")
+		end)
+	end)
+	assert(not ok and string.find(tostring(why), "not after all", 1, true), "what went wrong is said")
+	h.run()
+	assert(#shown.rows == 1, `{#shown.rows} rows, not the one there was`)
+	assert(shown.rows[1].title == "kept" and shown.rows[1].body == "hello", "it is as it was")
+	for k = said + 1, #h.self.said do
+		assert(h.self.said[k].kind ~= CELLS, "and nothing of it was sent")
+	end
+	-- And what is written after is written as if it never was.
+	h.client:write(1, function(change)
+		change.edit(id, 17, function(t, fresh)
+			zsp.Text.insert(t, 5, "!", fresh)
+		end)
+	end)
+	h.run()
+	assert(shown.rows[1].body == "hello!", shown.rows[1].body)
+
+	-- A value that cannot be read as its column's kind is no value, and all else is shown as ever.
+	local Strict = { title = zsp.string(16), body = zsp.text(17), n = zsp.custom(18, function(v: any): string
+		return tostring(v)
+	end, function(s: string): any
+		return assert(tonumber(s), "not a number")
+	end) }
+	local strict: any
+	h.client:window({ scope = 1, list = "a", table = Strict }, function(st)
+		strict = st
+	end)
+	h.client:write(1, function(change)
+		change.set(id, { raw = zsp.string(18) }, { raw = "twelve" })
+	end)
+	h.run()
+	assert(strict.rows[1].n == nil and strict.rows[1].title == "kept", "what is not a number is nothing")
+	assert(shown.rows[1].title == "kept", "and the rest goes on")
+
+	-- A bundle whose piece runs past its end: what does not fit is not read, and nothing else is the worse for it.
+	local w = codec.writer()
+	codec.put(w, "\0\0\0\0") -- no pieces before
+	codec.put(w, string.rep("\254", 15) .. "\9") -- a piece's stamp, later than anything,
+	codec.put(w, string.rep("\7", 8)) -- its name,
+	codec.put_varint(w, 100) -- and a hundred bytes of it, of which there are three
+	codec.put(w, "abc")
+	local body = codec.string(w)
+	local c = codec.writer()
+	codec.put_u8(c, 5)
+	codec.put(c, id)
+	codec.put_u8(c, 17)
+	codec.put(c, string.rep("\254", 14) .. "\1\1")
+	codec.put_bytes(c, body)
+	h.tell(CELLS, "\0" .. codec.string(c))
+	assert(shown.rows[1].body == "hello!", "the text is as it was")
+end
+
 print("ok")

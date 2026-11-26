@@ -531,14 +531,24 @@ function text.apply(t: Text, kind: number, stamp: string, body: string): Result
 		end
 		return apply_piece(t, string.sub(body, 1, 8), stamp, string.sub(body, 9))
 	elseif kind == 5 then
+		if #body < 4 then
+			return "same"
+		end
 		local r = codec.reader(body)
 		local n: number = string.unpack(">I4", body) :: any
 		r.pos = 4 + n * 16
 		local out: Result = "same"
 		while r.pos < r.len do
+			-- Each piece as far as the bundle holds one whole: what follows one that runs past its end is not read.
+			if r.pos + 24 > r.len then
+				break
+			end
 			local inner = codec.take(r, 16)
 			local id = codec.take(r, 8)
-			local ops = codec.bytes(r)
+			local fine, ops = pcall(codec.bytes, r)
+			if not fine then
+				break
+			end
 			if inner > t.base then
 				local result = apply_piece(t, id, inner, ops)
 				if result == "rebuild" then
