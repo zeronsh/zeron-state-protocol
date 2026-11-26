@@ -1,5 +1,6 @@
 package host
 
+import "base:runtime"
 import "core:fmt"
 import "core:net"
 import "core:os"
@@ -175,6 +176,8 @@ bench_streams :: proc(t: ^testing.T) {
 	when !BENCH {
 		return
 	}
+	// With what zspd allocates with, not the test runner's tracking allocator, which costs what zspd does not.
+	context.allocator = runtime.heap_allocator()
 	fmt.eprintln("\n  path      what                                  result")
 	for udp in ([]bool{true, false}) {
 		w: World

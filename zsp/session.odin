@@ -388,7 +388,8 @@ session_sent :: proc(s: ^Session, n: int) {
 		if cap(s.out) > 4096 {
 			shrink(&s.out)
 		}
-	} else if s.sent > OUT_HIGH {
+	} else if s.sent > OUT_HIGH && s.sent >= len(s.out) - s.sent {
+		// As a lane's are, once what is sent is at least what is left.
 		resize(&s.out, copy(s.out[:], s.out[s.sent:]))
 		s.sent = 0
 	}

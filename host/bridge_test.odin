@@ -128,9 +128,10 @@ Gate :: struct {
 // What happened to one forward, by the port it was accepted from.
 @(private)
 Gate_Forward :: struct {
-	gate:   ^Gate,
-	port:   int,
-	status: [dynamic]Forward_Status,
+	gate:    ^Gate,
+	port:    int,
+	status:  [dynamic]Forward_Status,
+	forward: ^Forward, // until it is over
 }
 
 // What happened to the forward that carried a client's connection: whatever else may have come to the gate, as
@@ -185,8 +186,10 @@ gate_accepted :: proc(op: ^nbio.Operation, g: ^Gate) {
 		append(&g.status, status)
 		if status != .Connected {
 			g.last = nil
+			f.forward = nil
 		}
 	}, f, g.inspect, g.early)
+	f.forward = g.last // nil if it was over before it returned
 }
 
 @(private)
@@ -195,6 +198,12 @@ gate_close :: proc(g: ^Gate) {
 		nbio.remove(g.op)
 	}
 	net.close(g.listener)
+	// Forwards still going are ended first, as they tell what they come to.
+	for f in g.each {
+		if f.forward != nil {
+			forward_close(f.forward)
+		}
+	}
 	delete(g.status)
 	for f in g.each {
 		delete(f.status)

@@ -106,7 +106,9 @@ session_lane_sent :: proc(s: ^Session, l: ^Lane, n: int) {
 		if cap(l.out) > 4096 {
 			shrink(&l.out)
 		}
-	} else if l.sent > OUT_HIGH {
+	} else if l.sent > OUT_HIGH && l.sent >= len(l.out) - l.sent {
+		// Moved down only once what is sent is at least what is left, so that each byte is moved once at most: a
+		// lane may hold a whole call window, far more than a link takes at once.
 		resize(&l.out, copy(l.out[:], l.out[l.sent:]))
 		l.sent = 0
 	}
