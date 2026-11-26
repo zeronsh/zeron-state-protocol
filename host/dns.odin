@@ -40,7 +40,7 @@ Dns_Asker :: struct {
 dns_open :: proc(h: ^Host, at: net.Endpoint) -> bool {
 	d := &h.dns_server
 	err: net.Create_Socket_Error
-	if d.udp, err = nbio.create_udp_socket(.IP4); err != nil {
+	if d.udp, err = nbio.create_udp_socket(net.family_from_endpoint(at)); err != nil {
 		return false
 	}
 	if berr := net.bind(d.udp, at); berr != nil {

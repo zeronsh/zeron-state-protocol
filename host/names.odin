@@ -63,8 +63,8 @@ device_address :: proc(sp: ^Space, device: zsp.Key32) -> (ip: [4]byte, ok: bool)
 @(private, require_results)
 member_address :: proc(sp: ^Space, index: int) -> (ip: [4]byte, ok: bool) {
 	v := index + 2
-	if v > 0xffff {
-		return
+	if int(sp.naming.loopback[1]) + v >> 8 > 255 {
+		return // past 127.a.255.255: a space that large has no address for it here
 	}
 	return {127, sp.naming.loopback[0], sp.naming.loopback[1] + byte(v >> 8), byte(v)}, true
 }

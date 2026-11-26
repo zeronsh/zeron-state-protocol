@@ -37,6 +37,13 @@ catch_open :: proc(h: ^Host, at: net.Endpoint) {
 	catch_try(h)
 }
 
+// Where to connect to find out whether connections to the devices' addresses come here: the last but one address of
+// those caught, 127.a.b.2–127.a.255.255, which no device has but in a space of tens of thousands.
+@(private)
+catch_probe :: proc(base: [2]byte) -> net.Endpoint {
+	return {net.IP4_Address{127, base[0], 255, 254}, 9}
+}
+
 // Finds out whether connections to the devices' addresses come here.
 @(private)
 catch_try :: proc(h: ^Host) {
@@ -45,7 +52,7 @@ catch_try :: proc(h: ^Host) {
 		return
 	}
 	base := h.spaces[0].naming.loopback
-	c.probe = {net.IP4_Address{127, base[0], base[1] + 255, 254}, 9}
+	c.probe = catch_probe(base)
 	c.trying = nbio.dial_poly(c.probe, h, proc(op: ^nbio.Operation, h: ^Host) {
 		h.catch.trying = nil
 		if op.dial.err != nil {

@@ -889,7 +889,9 @@ def resolve(server, name, qtype=1):
     q = os.urandom(2) + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
     q += b"".join(bytes([len(label)]) + label.encode() for label in name.split(".")) + b"\x00" + struct.pack(">HH", qtype, 1)
     host, port = server.rsplit(":", 1)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    six = host.startswith("[")
+    host = host.strip("[]")
+    with socket.socket(socket.AF_INET6 if six else socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.settimeout(2)
         s.sendto(q, (host, int(port)))
         a = s.recv(512)
@@ -1048,6 +1050,24 @@ def test_names():
     zspd("name", a.dir, zspd("key", b.dir), "wasp")
     eventually("the new name", lambda: resolve(a.dns, "wasp.zsp.internal") == a.base[:-1] + "0.3")
     assert resolve(a.dns, "bee.zsp.internal") == 3
+
+
+def test_names_over_ipv6():
+    """A name server on an IPv6 address answers there, and zspd setup sends names to it as such."""
+    try:
+        with socket.socket(socket.AF_INET6) as probe:
+            probe.bind(("::1", 0))
+            port = probe.getsockname()[1]
+    except OSError:
+        return  # no IPv6 here
+    dns = "[::1]:%d" % port
+    _, (a,) = space("n6", options=("--dns=" + dns, "--catch=127.0.0.1:0", "--no-proxy"))
+    ca = a.client()
+    me = next(n for n in ca.nodes() if n["here"])
+    eventually("it answers by IPv6", lambda: resolve(dns, me["name"]) == "127.0.0.1")
+    if sys.platform.startswith("linux"):
+        script = subprocess.run([BIN, "setup", "--dry-run", "--dns=" + dns], capture_output=True, text=True).stdout
+        assert "resolvectl dns zsp0 %s " % dns in script, script
 
 
 def test_ports():

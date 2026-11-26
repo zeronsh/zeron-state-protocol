@@ -149,3 +149,19 @@ ids_are_base32 :: proc(t: ^testing.T) {
 cat :: proc(a, b: string) -> string {
 	return strings.concatenate({a, b}, context.temp_allocator)
 }
+
+// Every address a device is given is within the space's range, 127.a.b.2 to 127.a.255.255, whatever b is: past the
+// end there is none, not one that wraps round to another's.
+@(test)
+addresses_stay_in_range :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts)
+	defer test_space_destroy(&ts)
+	ts.space.naming = {NAMES, {77, 1}}
+	ip, ok := member_address(&ts.space, 0)
+	testing.expect(t, ok && ip == {127, 77, 1, 2})
+	ip, ok = member_address(&ts.space, 254 * 256 + 253)
+	testing.expect(t, ok && ip == {127, 77, 255, 255})
+	ip, ok = member_address(&ts.space, 254 * 256 + 254)
+	testing.expectf(t, !ok, "%v", ip)
+}

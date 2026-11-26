@@ -173,10 +173,10 @@ when ODIN_OS == .Linux {
 		base := s.loopback
 		start = fmt.tprintf(
 			"ip link add zsp0 type dummy 2>/dev/null; ip link set zsp0 up && ip addr replace %s/128 dev zsp0 nodad && " +
-			"resolvectl dns zsp0 %s:%d && resolvectl domain zsp0 '~%s' '~%s' && resolvectl default-route zsp0 false && " +
+			"resolvectl dns zsp0 %s && resolvectl domain zsp0 '~%s' '~%s' && resolvectl default-route zsp0 false && " +
 			"{{ nft delete table ip zsp 2>/dev/null; nft 'add table ip zsp; add chain ip zsp output {{ type nat hook output priority -100; policy accept; }}; " +
 			"add rule ip zsp output ip daddr 127.%d.%d.2-127.%d.255.255 meta l4proto tcp redirect to :%d'; }}",
-			ula, ip(s.dns.address), s.dns.port, s.suffix, reverse_zone(s), base[0], base[1], base[0], s.catch_at.port,
+			ula, net.endpoint_to_string(s.dns, context.temp_allocator), s.suffix, reverse_zone(s), base[0], base[1], base[0], s.catch_at.port,
 		)
 		stop = "nft delete table ip zsp 2>/dev/null; ip link del zsp0 2>/dev/null; true"
 		return
