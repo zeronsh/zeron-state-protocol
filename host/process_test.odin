@@ -538,12 +538,25 @@ process_has_a_terminal :: proc(t: ^testing.T) {
 		argv := []string{"cmd"}
 		enter := "\r"
 		size := "mode con"
-		term := "echo %TERM%"
+		term := "set TERM"
 	} else {
 		argv := []string{"sh"}
 		enter := "\n"
 		size := "stty size"
-		term := "echo $TERM"
+		term := "env | grep ^TERM="
+	}
+	// Whatever kind of terminal this host's own is (as under a shell, which says), the one made is of the kind given.
+	when ODIN_OS == .Windows {
+		was, had := os.lookup_env("TERM", context.temp_allocator)
+		os.set_env("TERM", "dumb")
+		defer if had {
+			os.set_env("TERM", was)
+		} else {
+			os.unset_env("TERM")
+		}
+	} else {
+		before := process_test_env("TERM", "dumb")
+		defer process_test_env("TERM", before)
 	}
 	r: Ran
 	defer ran_destroy(&r)
@@ -568,10 +581,11 @@ process_has_a_terminal :: proc(t: ^testing.T) {
 	clear(&r.out)
 	testing.expect(t, ran_send(&r, strings.concatenate({term, enter}, context.temp_allocator)))
 	if !testing.expect(t, ran_until(&r, proc(r: ^Ran) -> bool {
-		return strings.contains(process_test_screen(r), "xterm-zsp")
+		return strings.contains(process_test_screen(r), "TERM=xterm-zsp")
 	}), "not of the kind it was given") {
 		return
 	}
+	testing.expectf(t, !strings.contains(process_test_screen(&r), "TERM=dumb"), "of this host's kind too: %q", process_test_screen(&r))
 	testing.expect(t, ran_send(&r, strings.concatenate({"exit 3", enter}, context.temp_allocator)))
 	if !testing.expect(t, ran_until(&r, ran_exited)) {
 		return

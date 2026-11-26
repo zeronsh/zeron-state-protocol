@@ -716,8 +716,9 @@ process_environment :: proc(spec: Process_Spec) -> [^]cstring {
 	list := make([dynamic]cstring, context.temp_allocator)
 	for i := 0; posix.environ[i] != nil; i += 1 {
 		entry := string(posix.environ[i])
-		if process_env_names(spec, process_env_name(entry)) {
-			continue
+		name := process_env_name(entry)
+		if process_env_names(spec, name) || (spec.pty && name == "TERM") {
+			continue // the spec's to say, or the terminal's own kind
 		}
 		append(&list, posix.environ[i])
 	}

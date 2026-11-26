@@ -1,6 +1,7 @@
 #+build !windows
 package host
 
+import "core:c/libc"
 import "core:nbio"
 import "core:strconv"
 import "core:strings"
@@ -51,4 +52,36 @@ process_takes_signals_as_they_come :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, string(r.err[:]), "")
 	testing.expect_value(t, r.exit, Exit{})
+}
+
+// Sets, or with nil unsets, a variable of the environment processes are started with: libc's, as process_environment
+// reads it. Returns what it was.
+@(private)
+process_test_env :: proc(name: string, value: Maybe(string)) -> (was: Maybe(string)) {
+	n := strings.clone_to_cstring(name, context.temp_allocator)
+	if old := libc.getenv(n); old != nil {
+		was = strings.clone(string(old), context.temp_allocator)
+	}
+	if v, ok := value.?; ok {
+		posix.setenv(n, strings.clone_to_cstring(v, context.temp_allocator), true)
+	} else {
+		posix.unsetenv(n)
+	}
+	return
+}
+
+// A terminal is of the kind it is given, whatever this host's own is: the host's TERM is not passed on beside it,
+// where whoever reads the first would take the host's.
+@(test)
+process_terminal_kind_alone :: proc(t: ^testing.T) {
+	before := process_test_env("TERM", "dumb")
+	defer process_test_env("TERM", before)
+	env := process_environment({pty = true, term = "xterm-zsp"})
+	terms := make([dynamic]string, context.temp_allocator)
+	for i := 0; env[i] != nil; i += 1 {
+		if strings.has_prefix(string(env[i]), "TERM=") {
+			append(&terms, string(env[i]))
+		}
+	}
+	testing.expectf(t, len(terms) == 1 && terms[0] == "TERM=xterm-zsp", "%v", terms[:])
 }

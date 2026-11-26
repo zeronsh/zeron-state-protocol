@@ -151,6 +151,9 @@ signals_catch :: proc(which: Signal_Set) {
 	posix.sigemptyset(&set)
 	for s in which {
 		posix.sigaddset(&set, posix.Signal(s))
+		// A handler that never runs, every thread blocking it: a signal whose action is to be ignored, as a resized
+		// window's is, may be discarded as it comes rather than kept for sigwait, as macOS does.
+		posix.signal(posix.Signal(s), proc "c" (_: posix.Signal) {})
 	}
 	posix.pthread_sigmask(.BLOCK, &set, nil)
 	waiting := new(posix.sigset_t)

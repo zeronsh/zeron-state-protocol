@@ -285,9 +285,14 @@ def test_terminal():
         type(b"stty size\r")
         until(rb"30 90")
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 100, 0, 0))
-        time.sleep(0.3)
-        type(b"stty size\r")
-        until(rb"40 100")
+        # Asked until it says so, for the new size goes there beside what is typed, not before it.
+        for _ in range(20):
+            time.sleep(0.25)
+            type(b"stty size\r")
+            until(rb"\d+ \d+\r\n")
+            if b"40 100" in seen:
+                break
+        assert b"40 100" in seen, seen[-300:]
         # Ctrl-C is a key there, and ends what runs there rather than this.
         type(b"sleep 30\r")
         time.sleep(0.5)

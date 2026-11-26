@@ -693,7 +693,9 @@ process_environment :: proc(spec: Process_Spec) -> rawptr {
 				n += 1
 			}
 			entry, _ := win.utf16_to_utf8(at[:n], context.temp_allocator)
-			if !process_env_names(spec, process_env_name(entry)) {
+			name := process_env_name(entry)
+			// What the spec says instead, or for a terminal, its own kind instead of the host's.
+			if !process_env_names(spec, name) && !(spec.pty && strings.equal_fold(name, "TERM")) {
 				append(&list, entry)
 			}
 			at = at[n + 1:]
