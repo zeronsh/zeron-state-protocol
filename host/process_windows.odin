@@ -347,7 +347,8 @@ process_signal :: proc(p: ^Process, s: Signal) {
 	case .Interrupt:
 		if p.console != nil {
 			// Ctrl-C, typed: the console makes it CTRL_C_EVENT for whatever is attached. Ahead of what waits.
-			if p.input != nil {
+			// One ahead of what waits is all that more of them would do: so one is held, however many are asked for.
+			if p.input != nil && (len(p.held) == 0 || p.held[0] != 0x03) {
 				inject_at(&p.held, 0, 0x03)
 				process_flush(p)
 			}

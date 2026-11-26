@@ -488,5 +488,58 @@ def test_connect():
     assert not [s for s in ca.services(device, 1) if s["kind"] == "tcp"]
 
 
+def test_put_takes_no_early_verdict():
+    """A put is done only when all of it has gone and the receiver says so after: an Ok before then is no success."""
+    path = os.path.join(TMP, "ev-big.bin")
+    with open(path, "wb") as f:
+        f.write(b"A" * (512 * 1024))
+    t = zsp.Transfer(True, path, "docs/big.bin")
+    t.first_put(True, True)
+    t.on_data(b"\x00\x00")  # taken, from the start
+    t.on_data(b"\x00")  # and done, though nothing has gone
+    assert t.finished and t.status != zsp.OK, (t.status, t.bytes)
+    t.f.close()
+
+
+def test_tree_not_without_end():
+    """A device whose every folder holds another is fetched from only so deep, and nothing it names leads elsewhere."""
+
+    class Lying(zsp.Client):
+        def __init__(self, name):
+            self.calls, self.name = 0, name
+
+        def list_files(self, device, scope, path, timeout=10):
+            self.calls += 1
+            return [(zsp.FOLDER, self.name, 0, 0)]
+
+    for name in ("a", "c:x"):
+        c = Lying(name)
+        out = os.path.join(TMP, "tw-" + str(len(name)))
+        try:
+            c.get_tree(b"\x00" * 32, 1, "share", out)
+            raise AssertionError("it went on for ever")
+        except zsp.Refused as e:
+            assert e.status == zsp.MALFORMED and c.calls <= 65, (name, e.status, c.calls)
+
+
+def test_resume_from_a_cut_record():
+    """A record of a fetch's progress cut short since it was read is not taken up from."""
+    local = os.path.join(TMP, "cr-f.bin")
+    chunk0 = b"X" * zsp.CHUNK
+    with open(local + zsp.PART, "wb") as f:
+        f.write(chunk0)
+    with open(local + zsp.PART + ".meta", "wb") as f:
+        f.write(zsp.put_bytes(b"id1") + hashlib.sha256(chunk0).digest())
+    t = zsp.Transfer(False, local, "docs/f.bin")
+    t.first_get()
+    assert t.start == zsp.CHUNK
+    with open(local + zsp.PART + ".meta", "wb") as f:
+        f.write(zsp.put_bytes(b"id1"))  # cut short, since
+    assert not t.open_part(b"id1", zsp.CHUNK)
+    for f in (t.f, t.meta):
+        if f:
+            f.close()
+
+
 if __name__ == "__main__":
     end_to_end.main(globals(), __file__)

@@ -53,6 +53,7 @@ web_test() {
 	node test/vectors.ts ../vectors/vectors.json
 	node test/streams.ts
 	node test/tree_names.ts
+	node test/put_verdict.ts
 	node test/ask.ts
 	node test/utf8.ts
 	node test/store_cases.ts

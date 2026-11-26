@@ -831,3 +831,101 @@ review_resume_from_a_cut_record :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, !ok, "taken up from a record that does not say how")
 }
+
+// Round 3. A put is done only when all of it has gone and the receiver says so after: a verdict of Ok before then, from
+// a receiver that means harm or is wrong, is no success.
+@(test)
+review_put_takes_no_early_verdict :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = true))
+	a, b := world_space(&w, 1), world_space(&w, 2)
+	host_serve(b.host, "zsp.put", proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: []byte) -> (^Call_Handler, zsp.Call_Fault) {
+		ok_from := [2]byte{u8(Status.Ok), 0}
+		call_send(sp, call, ok_from[:])
+		verdict := [1]byte{u8(Status.Ok)}
+		call_send(sp, call, verdict[:])
+		call_end(sp, call)
+		return refused_handler(), .Cancelled
+	})
+	os.make_directory(in_world(&w, "mine"))
+	payload := make([]byte, 512 << 10, context.temp_allocator)
+	local := strings.clone(in_world(&w, "mine", "big.bin"))
+	defer delete(local)
+	_ = os.write_entire_file(local, payload)
+	o: Outcomes
+	defer outcomes_destroy(&o)
+	testing.expect(t, host_put(a, w.keys[2].device, 1, local, "docs/big.bin", true, outcome, &o) != 0)
+	testing.expect(t, outcomes_wait(&w, &o, 1))
+	testing.expectf(t, o.results[0].status != .Ok, "a verdict before the file had gone was taken: %d of %d bytes", o.results[0].bytes, len(payload))
+}
+
+// Round 3. Input held for a process whose own input closes as it is given more is let go of and credited, there too.
+@(test)
+review_held_input_let_go_when_its_input_closes :: proc(t: ^testing.T) {
+	when ODIN_OS == .Windows {
+		return
+	}
+	w: World
+	testing.expect(t, world_init(t, &w))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = true))
+	a, b := world_space(&w, 1), world_space(&w, 2)
+	testing.expect(t, shares_set(b, "shell 1 commands"))
+	first := make([dynamic]byte, context.temp_allocator)
+	append(&first, 0)
+	zsp.write_varint(&first, 3)
+	zsp.write_bytes(&first, transmute([]byte)string("sh"))
+	zsp.write_bytes(&first, transmute([]byte)string("-c"))
+	zsp.write_bytes(&first, transmute([]byte)string("exec <&-; printf closed; sleep 30"))
+	zsp.write_varint(&first, 0)
+	zsp.write_bytes(&first, nil)
+	recv: Review_Recv
+	review_recv_init(&recv)
+	defer review_recv_destroy(&recv)
+	call := host_call(a, w.keys[2].device, 1, "zsp.exec", first[:], &recv.handler)
+	testing.expect(t, world_run(&w, proc(w: ^World, d: rawptr) -> bool {
+		for m in (^Review_Recv)(d).msgs {
+			if len(m) > 1 && m[0] == 1 && strings.contains(string(m[1:]), "closed") {
+				return true
+			}
+		}
+		return false
+	}, &recv))
+	e: ^Exec
+	for c in b.calls {
+		if c.handler != nil && c.handler.on_data == exec_on_data {
+			e = (^Exec)(c.handler.data)
+		}
+	}
+	if !testing.expect(t, e != nil) {
+		return
+	}
+	// Held, as though it had waited for room; then room is said, and giving it finds the input closed.
+	append(&e.held, ..make([]byte, 1024, context.temp_allocator))
+	testing.expect(t, !process_input_closed(e.p))
+	e.p.events.on_room(e.p.events.data)
+	testing.expect(t, process_input_closed(e.p))
+	testing.expectf(t, len(e.held) == 0, "%d held, and not credited", len(e.held))
+	call_cancel(a, call)
+	world_run(&w, nobody_left)
+}
+
+// Round 3. Ctrl-C after Ctrl-C to a terminal that takes no input holds one, not one for each: one ahead of what waits is
+// all any of them would do.
+@(test)
+review_interrupts_held_once :: proc(t: ^testing.T) {
+	when ODIN_OS == .Windows {
+		p: Process
+		p.console = auto_cast uintptr(1) // a terminal, as far as anyone asks
+		p.input = auto_cast uintptr(1)
+		writing: nbio.Operation
+		p.write_op = &writing // a write under way, that does not end
+		for _ in 0 ..< 1000 {
+			process_signal(&p, .Interrupt)
+		}
+		testing.expectf(t, len(p.held) == 1, "%d held", len(p.held))
+		delete(p.held)
+	}
+}

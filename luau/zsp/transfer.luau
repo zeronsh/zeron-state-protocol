@@ -161,6 +161,7 @@ type State = {
 	at: number,
 	from: number,
 	sent_to: number, -- a send: the end of the last chunk whose hash was sent
+	said: string, -- a send: what this end said of the file at its end
 	hashing: Hashing,
 	pending: string, -- the hash of the chunk just ended, awaiting the sender's
 	awaiting: boolean,
@@ -207,6 +208,7 @@ local function new_state(put: boolean, files: Files?, defer: (() -> ()) -> ()): 
 		at = 0,
 		from = 0,
 		sent_to = 0,
+		said = "ok",
 		hashing = hashing(),
 		pending = "",
 		awaiting = false,
@@ -371,8 +373,13 @@ function on_data(self: State, message: string)
 		return
 	end
 	if self.put then
-		-- The verdict, once all is sent.
+		-- The verdict, once all is sent: an ok before then, or after this end said the file changed, is no success.
 		local status = services.status(message)
+		if status == "ok" and not self.sent_all then
+			status = "malformed"
+		elseif status == "ok" and self.said ~= "ok" then
+			status = self.said
+		end
 		finish(self, status, "")
 		return
 	end
@@ -651,6 +658,7 @@ function pump(self: State)
 				end
 			end
 			self.hash = if self.f then self.hashing.file.final() else self.hash
+			self.said = status
 			call.send(services.done(status, self.hash))
 			self.sent_all = true
 			call.finish()

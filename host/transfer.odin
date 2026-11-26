@@ -45,6 +45,7 @@ Transfer :: struct {
 	pending:  [32]byte,
 	awaiting: bool,
 	identity: []byte, // owned: the file being sent, as it was when begun
+	said:     Status, // what this end said of the file at its end, sending it
 	begun:    bool, // the status came
 	sent_all: bool,
 	result:   Transfer_Result,
@@ -168,8 +169,14 @@ transfer_on_data :: proc(t: ^Transfer, bytes: []byte) -> bool {
 		return true
 	}
 	if t.put {
-		// The verdict, once all is sent.
-		transfer_finish(t, Status(bytes[0]), "")
+		// The verdict, once all is sent: an Ok before then, or after this end said the file changed, is no success.
+		status := Status(bytes[0])
+		if status == .Ok && !t.sent_all {
+			status = .Malformed
+		} else if status == .Ok && t.said != .Ok {
+			status = t.said
+		}
+		transfer_finish(t, status, "")
 		return true
 	}
 	payload := bytes[1:]
@@ -318,7 +325,8 @@ transfer_pump :: proc(t: ^Transfer) {
 			identity, _, ok := file_identity(t.f)
 			same := ok && string(identity) == string(t.identity)
 			w: [34]byte
-			w[0], w[1] = 3, u8(Status.Ok if same else Status.Changed)
+			t.said = .Ok if same else .Changed
+			w[0], w[1] = 3, u8(t.said)
 			sha2.final(&t.hashing.file, t.result.hash[:])
 			copy(w[2:], t.result.hash[:])
 			if !t.port.send(t.port.data, w[:2 + (32 if same else 0)]) {

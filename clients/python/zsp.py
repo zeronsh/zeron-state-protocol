@@ -251,6 +251,7 @@ def hash_message(chunk):
     return bytes([CHUNK_HASH]) + chunk
 
 
+MAX_DEPTH = 64  # how deep a folder is fetched, at most
 TRAIL = (1 + 32) + (2 + 32)  # what follows a file's last bytes: the last chunk's hash, then the end and the file's hash
 
 
@@ -589,7 +590,7 @@ class Transfer:
         self.put, self.local, self.remote = put, local, remote
         self.call = self.f = self.meta = None
         self.size = self.modified = self.at = self.start = 0
-        self.hashing, self.pending, self.identity = Hashing(), b"", b""
+        self.hashing, self.pending, self.identity, self.said = Hashing(), b"", b"", OK
         self.awaiting = self.begun = self.sent_all = self.finished = False
         self.status, self.reason, self.bytes, self.resumed, self.hash = OK, "", 0, 0, b""
 
@@ -648,7 +649,7 @@ class Transfer:
                 if start % CHUNK or start > self.size:
                     return self.finish(MALFORMED)
                 # What the other end has, it has checked; its hashes, here, are read again, for the file's.
-                self.start, self.at = start, 0
+                self.start, self.at, self.resumed = start, 0, start
                 while self.at < start:
                     n = min(FILE_READ, start - self.at, CHUNK - self.hashing.filled)
                     self.f.seek(self.at)
@@ -666,7 +667,13 @@ class Transfer:
                 return self.finish(FAILED, "cannot write the file")
             return
         if self.put:
-            return self.finish(message[0])  # the verdict, once all is sent
+            # The verdict, once all is sent: an Ok before then, or after this end said the file changed, is no success.
+            status = message[0]
+            if status == OK and not self.sent_all:
+                status = MALFORMED
+            elif status == OK and self.said != OK:
+                status = self.said
+            return self.finish(status)
         kind, payload = message[0], memoryview(message)[1:]
         if kind == CHUNK_BYTES:
             if self.awaiting or self.at + len(payload) > self.size:
@@ -716,6 +723,8 @@ class Transfer:
                 r = Reader(kept)
                 r.bytes()
                 chunks = start // CHUNK
+                if len(kept) < r.pos + chunks * 32:
+                    return False  # cut short since it was read: nothing to take up from
                 for i in range(chunks):
                     self.hashing.file.update(kept[r.pos + i * 32 : r.pos + i * 32 + 32])
                 self.meta.truncate(r.pos + chunks * 32)
@@ -761,6 +770,7 @@ class Transfer:
                 except OSError:
                     same = False
                 self.hash = self.hashing.file.digest()
+                self.said = OK if same else CHANGED
                 self.call.send(done_message(OK, self.hash) if same else done_message(CHANGED))
                 self.sent_all = True
                 self.call.end()
@@ -1246,17 +1256,20 @@ class Client:
         c.end()
         return dict(size=t.size, bytes=t.bytes, resumed=t.resumed, hash=t.hash)
 
-    def get_tree(self, device, scope, remote, local, timeout=30):
+    def get_tree(self, device, scope, remote, local, timeout=30, depth=0):
         """Fetches a folder and all in it, walking it by zsp.list; each file as get fetches it. Says how many files
-        came, and how many bytes."""
+        came, and how many bytes. No deeper than MAX_DEPTH folders: a device whose every folder holds another is not
+        followed for ever."""
         os.makedirs(local, exist_ok=True)
         files = carried = 0
         for kind, name, _, _ in self.list_files(device, scope, remote, timeout):
-            if name in ("", ".", "..") or any(c in name for c in "/\\\0") or (os.sep != "/" and ":" in name):
+            if name in ("", ".", "..") or any(c in name for c in "/\\:\0"):
                 raise Refused(MALFORMED, "a name that would lead elsewhere: " + name)
+            if depth >= MAX_DEPTH:
+                raise Refused(MALFORMED, "folders deeper than " + str(MAX_DEPTH))
             there, here = remote.rstrip("/") + "/" + name, os.path.join(local, name)
             if kind == FOLDER:
-                more, also = self.get_tree(device, scope, there, here, timeout)
+                more, also = self.get_tree(device, scope, there, here, timeout, depth + 1)
                 files, carried = files + more, carried + also
             elif kind == FILE:
                 carried += self.get(device, scope, there, here, timeout=timeout)["bytes"]

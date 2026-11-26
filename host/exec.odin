@@ -215,6 +215,10 @@ exec_input_room :: proc(data: rawptr) {
 		n := process_input(e.p, e.held[:])
 		remove_range(&e.held, 0, n)
 		call_consumed(e.sp, e.call, n)
+		if process_input_closed(e.p) {
+			exec_input_drop(e) // closed as it was given this: what is left never will be taken
+			return
+		}
 	}
 	if len(e.held) == 0 && e.ending {
 		process_end_input(e.p)

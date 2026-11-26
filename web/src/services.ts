@@ -1206,6 +1206,7 @@ class Send extends Transfer {
   #ready = false; // the file's hash has what the other side had already
   #pumping = false;
   #sentAll = false;
+  #said: "ok" | "changed" = "ok"; // what this end said of the file at its end
   #hash?: Uint8Array; // the file's, once all is sent
   #closed = false;
 
@@ -1257,6 +1258,8 @@ class Send extends Transfer {
     const s = readStatus(d);
     if (!this.#sentAll) this.call.finish();
     if (s.status !== "ok" || !this.#sentAll) return this.finish(new ServiceError(s.status === "ok" ? "malformed" : s.status, s.reason));
+    // Nor is an ok taken for a file this end said had changed as it went.
+    if (this.#said !== "ok") return this.finish(new ServiceError(this.#said));
     return this.finish(this.result(this.#hash!));
   }
 
@@ -1292,7 +1295,8 @@ class Send extends Transfer {
           const now = await this.#f.info();
           if (this.finished) return;
           this.#hash = this.hashing.file();
-          this.call.send(endMessage(equal(now.identity, this.#info.identity) ? "ok" : "changed", this.#hash));
+          this.#said = equal(now.identity, this.#info.identity) ? "ok" : "changed";
+          this.call.send(endMessage(this.#said, this.#hash));
           this.#sentAll = true;
           this.call.finish();
           return;

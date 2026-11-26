@@ -815,6 +815,16 @@ do
 	assert(result.status == "ok" and result.resumed == 2 * CHUNK and result.bytes == 12345)
 	assert(buffer.readstring(got.data :: buffer, 2 * CHUNK, 12345) == buffer.readstring(file, 2 * CHUNK, 12345))
 
+	-- An ok before all of it has gone, from a device that means harm or is wrong, is no success.
+	t = h.client:put(DEVICE, 1, file, "docs/new/report.pdf")
+	h.run()
+	r = h.last("zsp.put")
+	h.reply(r, services.status_of("ok", services.number_of(0)))
+	h.reply(r, services.status_of("ok"))
+	h.finish(r)
+	h.run()
+	assert((t.result :: transfer.Result).status ~= "ok", "an early verdict was taken")
+
 	-- What the other end will not have.
 	t = h.client:put(DEVICE, 1, file, "docs/new/report.pdf")
 	h.run()
