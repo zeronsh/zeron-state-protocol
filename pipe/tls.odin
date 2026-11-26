@@ -1,7 +1,6 @@
 package pipe
 
 import "core:crypto"
-import "core:crypto/chacha20poly1305"
 import "core:crypto/sha2"
 import "core:encoding/endian"
 import "../zsp"
@@ -337,10 +336,8 @@ tls_seal :: proc(k: ^Tls_Key, type: byte, plain: []byte, w: ^[dynamic]byte) {
 	append(w, type)
 	resize(w, at + 5 + n)
 	iv := tls_nonce(k)
-	ctx: chacha20poly1305.Context = ---
-	chacha20poly1305.init(&ctx, k.key[:])
 	body := w[at + 5:][:len(plain) + 1]
-	chacha20poly1305.seal(&ctx, body, w[at + 5 + len(body):], iv[:], w[at:][:5], body)
+	zsp.chacha_seal(k.key[:], iv[:], body, w[at + 5 + len(body):], w[at:][:5], body)
 }
 
 @(private)
@@ -350,9 +347,7 @@ tls_open :: proc(k: ^Tls_Key, sealed, ad: []byte) -> (plain: []byte, ok: bool) {
 		return
 	}
 	iv := tls_nonce(k)
-	ctx: chacha20poly1305.Context = ---
-	chacha20poly1305.init(&ctx, k.key[:])
-	ok = chacha20poly1305.open(&ctx, sealed[:n], iv[:], ad, sealed[:n], sealed[n:])
+	ok = zsp.chacha_open(k.key[:], iv[:], sealed[:n], ad, sealed[:n], sealed[n:])
 	return sealed[:n], ok
 }
 

@@ -1,6 +1,5 @@
 package zsp
 
-import "core:crypto/chacha20poly1305"
 import "core:crypto/ed25519"
 import "core:slice"
 
@@ -39,10 +38,8 @@ append_sealed :: proc(w: ^[dynamic]byte, key: Key32, n: u64, secret: Key32) {
 	key, secret := key, secret
 	iv: [12]byte
 	put_u64(iv[4:], n)
-	ctx: chacha20poly1305.Context
-	chacha20poly1305.init(&ctx, key[:])
 	out: [48]byte
-	chacha20poly1305.seal(&ctx, out[:32], out[32:], iv[:], nil, secret[:])
+	chacha_seal(key[:], iv[:], out[:32], out[32:], nil, secret[:])
 	append(w, ..out[:])
 }
 
@@ -51,9 +48,7 @@ open_key :: proc(key: Key32, n: u64, sealed: []byte) -> (out: Key32, ok: bool) {
 	key := key
 	iv: [12]byte
 	put_u64(iv[4:], n)
-	ctx: chacha20poly1305.Context
-	chacha20poly1305.init(&ctx, key[:])
-	ok = chacha20poly1305.open(&ctx, out[:], iv[:], nil, sealed[:32], sealed[32:])
+	ok = chacha_open(key[:], iv[:], out[:], nil, sealed[:32], sealed[32:])
 	return
 }
 
@@ -102,9 +97,7 @@ aead_append :: proc(w: ^[dynamic]byte, key: Key32, iv: ^[24]byte, bind, plain: [
 	key := key
 	at := len(w)
 	resize(w, at + len(plain) + TAG)
-	ctx: chacha20poly1305.Context = ---
-	chacha20poly1305.init_xchacha(&ctx, key[:])
-	chacha20poly1305.seal(&ctx, w[at:][:len(plain)], w[at + len(plain):], iv[:], bind, plain)
+	chacha_seal(key[:], iv[:], w[at:][:len(plain)], w[at + len(plain):], bind, plain)
 }
 
 @(private)
@@ -116,9 +109,7 @@ aead_open :: proc(w: ^[dynamic]byte, key: Key32, iv: ^[24]byte, bind, sealed: []
 	}
 	at := len(w)
 	resize(w, at + n)
-	ctx: chacha20poly1305.Context = ---
-	chacha20poly1305.init_xchacha(&ctx, key[:])
-	if !chacha20poly1305.open(&ctx, w[at:], iv[:], bind, sealed[:n], sealed[n:]) {
+	if !chacha_open(key[:], iv[:], w[at:], bind, sealed[:n], sealed[n:]) {
 		resize(w, at)
 		return false
 	}

@@ -1,7 +1,6 @@
 package zsp
 
 import "core:crypto"
-import "core:crypto/chacha20poly1305"
 import "core:crypto/x25519"
 import "core:encoding/endian"
 
@@ -79,9 +78,7 @@ handshake_hkdf :: proc(h: ^Handshake, input: []byte) -> (a, b: Key32) {
 handshake_seal :: proc(h: ^Handshake, out: []byte, plain: []byte) {
 	iv := channel_nonce(h.n)
 	h.n += 1
-	ctx: chacha20poly1305.Context = ---
-	chacha20poly1305.init(&ctx, h.key[:])
-	chacha20poly1305.seal(&ctx, out[:len(plain)], out[len(plain):], iv[:], h.hash[:], plain)
+	chacha_seal(h.key[:], iv[:], out[:len(plain)], out[len(plain):], h.hash[:], plain)
 	handshake_mix_hash(h, out)
 }
 
@@ -89,9 +86,7 @@ handshake_seal :: proc(h: ^Handshake, out: []byte, plain: []byte) {
 handshake_open :: proc(h: ^Handshake, out: []byte, sealed: []byte) -> bool {
 	iv := channel_nonce(h.n)
 	h.n += 1
-	ctx: chacha20poly1305.Context = ---
-	chacha20poly1305.init(&ctx, h.key[:])
-	chacha20poly1305.open(&ctx, out, iv[:], h.hash[:], sealed[:len(out)], sealed[len(out):]) or_return
+	chacha_open(h.key[:], iv[:], out, h.hash[:], sealed[:len(out)], sealed[len(out):]) or_return
 	handshake_mix_hash(h, sealed)
 	return true
 }
@@ -195,18 +190,14 @@ channel_seal_at :: proc(c: ^Channel, w: ^[dynamic]byte, n: u64, plain, ad: []byt
 	at := len(w)
 	resize(w, at + len(plain) + TAG)
 	iv := channel_nonce(n)
-	ctx: chacha20poly1305.Context = ---
-	chacha20poly1305.init(&ctx, c.send[:])
-	chacha20poly1305.seal(&ctx, w[at:][:len(plain)], w[at + len(plain):], iv[:], ad, plain)
+	chacha_seal(c.send[:], iv[:], w[at:][:len(plain)], w[at + len(plain):], ad, plain)
 }
 
 // Seals all but the last TAG bytes of `buf` where they lie, and puts the tag after them.
 channel_seal_in_place :: proc(c: ^Channel, n: u64, buf, ad: []byte) {
 	body := buf[:len(buf) - TAG]
 	iv := channel_nonce(n)
-	ctx: chacha20poly1305.Context = ---
-	chacha20poly1305.init(&ctx, c.send[:])
-	chacha20poly1305.seal(&ctx, body, buf[len(body):], iv[:], ad, body)
+	chacha_seal(c.send[:], iv[:], body, buf[len(body):], ad, body)
 }
 
 // Opens the next message in order, in place.
@@ -224,8 +215,6 @@ channel_open_at :: proc(c: ^Channel, n: u64, sealed, ad: []byte) -> (plain: []by
 		return
 	}
 	iv := channel_nonce(n)
-	ctx: chacha20poly1305.Context = ---
-	chacha20poly1305.init(&ctx, c.recv[:])
-	chacha20poly1305.open(&ctx, sealed[:size], iv[:], ad, sealed[:size], sealed[size:]) or_return
+	chacha_open(c.recv[:], iv[:], sealed[:size], ad, sealed[:size], sealed[size:]) or_return
 	return sealed[:size], true
 }
