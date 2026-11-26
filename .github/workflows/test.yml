@@ -1,5 +1,8 @@
 name: test
 on: [push, pull_request]
+concurrency: # a branch's newer run takes the place of its older ones; every run of main is seen through
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 jobs:
   test:
     strategy:

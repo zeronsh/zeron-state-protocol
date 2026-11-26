@@ -2,7 +2,8 @@
 
 Local-first state, live across devices, through a relay that can read none of it, or no relay at all.
 
-The protocol is [SPEC.md](SPEC.md). This is the reference implementation, in Odin, with a query client in Luau.
+The protocol is [SPEC.md](SPEC.md). This is the reference implementation, in Odin, with a query client in Luau, and the same node in a
+browser, with a client in TypeScript.
 
 ```
 zsp/       the protocol: store, merge, windows, reconciliation, text, keys, calls. No I/O, threads or clocks
@@ -12,9 +13,10 @@ host/      files, sockets, one thread, one event loop
 zspd/      a device's node, or a self-hosted relay: one consumer of the above
 relay/     the same relay as a Cloudflare Durable Object: zsp/ compiled to wasm, and plumbing
 luau/zsp/  the query client
+web/       a device in a browser or Node: zsp/ and find/ compiled to wasm, and a client in TypeScript
 clients/   a whole client in the Python standard library, to show how little one needs
 vectors/   what two implementations must agree on
-docs/      how to lay out who sees what, and structured state; examples/ has it running
+docs/      how to lay out who sees what, structured state, and the web; examples/ has it running
 ```
 
 ## The idea
@@ -38,6 +40,10 @@ device somebody has, or by the host of one that serves many, if you let it vouch
 differs is written; what others write comes back with whatever did not change the very same table. Lists keep their order as text does,
 so nothing interleaves and nothing runs out of room. It is rows and texts underneath, so it costs the protocol nothing, and a document
 too big to hold can be asked about, as any rows can, at any depth ([docs/mirror.md](docs/mirror.md)).
+
+**A browser tab is a device.** It has its own key, its own encrypted store and its own node, the very same Odin, and meets the others
+at a relay, or links to them directly from Node. Its client speaks to it as every client speaks to its node, and is held to the same
+tests ([docs/web.md](docs/web.md)).
 
 **The log is the database.** A sealed cell is appended once. The bytes on disk are the bytes on the wire are the bytes on the relay.
 
@@ -91,6 +97,23 @@ text of 8,000 pieces is at most some 200 cells to fetch, check and open, in thre
 | a text in 8,000 pieces, opened and put together: unmerged, and as it is kept | 8 ms; 2 ms |
 | one word more in a text that is being written, of 200 words or 100,000 | 0.015 to 0.03 ms |
 
+`./x bench web`, a web device, on 8 cores of an EPYC 9455 under a virtual disk, Node 24 and headless Chrome 151; each figure the median of
+many, and where runs differed, both:
+
+| | |
+|---|---|
+| what a browser loads | zsp.js 30 KB gzipped, its worker 7 KB, the node 415 KB |
+| opening a device made from nothing | 4 ms in Node; 48 to 50 ms in a browser: worker, node and store |
+| opening it again, holding 100,000 rows | 27 ms |
+| one small durable write | 1.5 ms on disk in Node, 0.7 to 0.8 ms in a browser's file system; 84 µs in memory |
+| 100,000 rows, a thousand to a write | 4.3 s on disk; in a browser, 21,000 to 25,000 rows a second |
+| a page of 50 rows of 100,000, to a client that holds none | 0.6 to 1.1 ms; in a browser, of 20,000, 1.2 to 2.6 ms |
+| a question of 100,000 rows: the first 50 of 1,000, by a number | 2.5 ms |
+| a streamed token, client to client of one device | 20 to 40 µs; in a browser, tab to worker to tab, 0.1 ms |
+| a streamed token, web device to relay to web device's screen | 0.1 ms in Node; in a browser, by the live suite's 10th token, 4 to 5 ms |
+| memory, holding 100,000 rows and a page | 30 to 36 MB of the node's, 15 MB of the client's |
+| `./x test` | 2.5 s longer than without any of it: 55 s |
+
 ## Using it
 
 ```sh
@@ -138,6 +161,19 @@ client:serve(1, "run", function(call, data) ... end)
 local answer = client:request(device, 1, "run", data)
 ```
 
+In a browser or Node, the device is the node, and the client is the Luau one, in TypeScript ([docs/web.md](docs/web.md)):
+
+```ts
+import { open, columns as c } from "zsp";
+
+const device = await open({ name: "chat" });     // in Node: open({ dir })
+await device.join(space, { key: relayKey, url: "wss://relay.example" }); // or device.create(), and govern it
+const client = device.client();
+const window = client.window({ scope: 1, list: "chat/42", table: Message }, (state) => render(state.rows));
+await client.write(1, (change) => change.insert(Message, "chat/42", Date.now(), { author: "model" })); // durable here
+client.text(id, Message.body).append(token);
+```
+
 On Cloudflare, authentication is a function:
 
 ```js
@@ -158,7 +194,8 @@ and what each application on a machine may do. Its examples are in [examples/](e
 ## Working on it
 
 `./x check` type-checks every platform, `./x test` runs everything, `./x sim 10000` runs ten thousand seeded networks that fragment, partition, crash, lose
-unsynced disk, disagree on the time, have rights given and taken away, and conflict, `./x nat` punches through real NATs in network namespaces, `./x slow` watches a Durable Object sleep. Needs `odin` (dev-2026-11), `wasm-ld`, `lune`, `luau-analyze`, `node`, `python3`.
+unsynced disk, disagree on the time, have rights given and taken away, and conflict, `./x nat` punches through real NATs in network namespaces, `./x slow` watches a Durable Object sleep, `./x web` builds what a browser loads. Needs `odin` (dev-2026-11), `wasm-ld`, `lune`, `luau-analyze`, `node` (24), `python3`, and
+Chrome for the browser tests.
 
 ## License
 

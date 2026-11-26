@@ -190,3 +190,4 @@ for (const [name, volume] of [
 }
 
 rmSync(TMP, { recursive: true, force: true });
+process.exit(0); // what is left open, such as a socket closing, is not waited for
