@@ -571,7 +571,7 @@ def test_durable_object():
     cb.serve(1, "add", lambda device, body: body + b"!")
     cb.drain(0.1)
     ca.until(lambda: len(ca.devices) == 2)
-    ca.send(zsp.CALL, zsp.varint(9) + ca.devices[1][0] + zsp.varint(1) + zsp.varint(3) + b"add\0hi")
+    ca.send(zsp.CALL, zsp.varint(9) + ca.devices[1][0] + zsp.varint(1) + zsp.varint(3) + b"add\0" + bytes([zsp.URGENCY]) + b"hi")
     ca.calls[9] = {"data": [], "ended": False, "fault": None}
     cb.drain(1)
     ca.until(lambda: ca.calls[9]["data"] == [b"hi!"])
