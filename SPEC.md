@@ -730,7 +730,8 @@ zsp.expose   0 | 1 ‖ port (2) ‖ prefix bytes ‖ flags (1: 1 PROXY v2) | 2 �
 ```
 
 Only a client its host accepted for every scope (scope 0) may change what the device offers or exposes; another is *denied*. An offer
-in a scope the device may not call in is *denied*, for it could never be taken up. A method that is not a local client's is *denied* to
+in a scope the device may not call in is *denied*, for it could never be taken up, and so is one whose name is not one word: at most 63
+bytes of UTF-8 with no space or control character in it. A method that is not a local client's is *denied* to
 one, and these are denied to everyone else.
 
 ## 18 Who handles what

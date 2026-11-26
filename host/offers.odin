@@ -7,6 +7,8 @@ import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "core:unicode"
+import "core:unicode/utf8"
 import "../pipe"
 import "../zsp"
 
@@ -88,7 +90,7 @@ offer_parse :: proc(words: []string) -> (o: Offer, ok: bool) {
 			o.proxy = true
 		case key == "device" && eq != "":
 			b, err := hex.decode(transmute([]byte)value, context.temp_allocator)
-			if !err || len(b) < 32 {
+			if !err || len(b) != 32 {
 				return
 			}
 			copy(o.device[:], b)
@@ -110,8 +112,12 @@ offer_sound :: proc(o: ^Offer) -> bool {
 	if o.lo == 0 || o.lo > o.hi || o.scope == 0 || len(o.name) > 63 {
 		return false
 	}
-	for c in transmute([]byte)o.name {
-		if c < ' ' || c == 0x7f {
+	// One word, as a device keeps it in its offers file: no space of any kind, nor what is not UTF-8 or is a control.
+	if !utf8.valid_string(o.name) {
+		return false
+	}
+	for r in o.name {
+		if unicode.is_space(r) || unicode.is_control(r) {
 			return false
 		}
 	}

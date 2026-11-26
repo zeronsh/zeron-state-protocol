@@ -38,6 +38,24 @@ offers_read_and_written :: proc(t: ^testing.T) {
 	}
 	bad := Offer{lo = 22, hi = 22, scope = 1, name = "a\nb"}
 	testing.expect(t, !offer_sound(&bad))
+	testing.expect(t, !ok_parse(cat("22 1 device=", device, "abab"))) // a key is 32 bytes, not the first 32 of more
+	// A name is one word, as the offers file keeps it: else what is offered is not what is read back, as a name that
+	// says `host=` would make an offer of this machine one of another.
+	for name in ([]string{"app host=10.20.30.40 proxy", "my web app", "a\u00a0b", "a\u2003b", "a\u0085b", "\xff", "a\x7fb"}) {
+		o := Offer{lo = 22, hi = 22, scope = 1, name = name}
+		testing.expectf(t, !offer_sound(&o), "%q is a name", name)
+	}
+	for name in ([]string{"café", "web-1", "a=b", "#1"}) {
+		o := Offer{lo = 22, hi = 22, scope = 1, name = name}
+		back, ok := offer_parse(words(offer_text(&o)))
+		testing.expectf(t, offer_sound(&o) && ok && back.name == name && back.host == "" && !back.proxy, "%q", name)
+	}
+}
+
+@(private = "file")
+ok_parse :: proc(text: string) -> bool {
+	_, ok := offer_parse(words(text))
+	return ok
 }
 
 @(test)
