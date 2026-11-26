@@ -13,6 +13,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:time"
@@ -39,6 +40,15 @@ USAGE :: `zspd - Zeron State Protocol node
   zspd relay <dir> <key> <url>               name a relay for the space's devices to meet at
   zspd join <dir> <space> <relay-key> <url>  become a device of a space that has admitted this one
   zspd peer <dir> <roster-file>              join from a roster file instead of a relay
+  zspd nodes <dir>                           list devices as the node running here reaches them: name, address,
+                                             whether it can, and what each offers this one
+  zspd offer <dir> <port[-port]> <scope> [device=<key>] [host=<address>] [name=<name>] [proxy]
+                                             offer this machine's ports (or another's, from here) to the devices
+                                             that may call in the scope, or to one of them; only those listening
+                                             are listed. Nothing is offered unless it is offered
+  zspd unoffer <dir> <port[-port]> <scope> [device=<key>] [host=<address>]
+                                             take an offer back: whoever is using it is cut off
+  zspd offers <dir>                          list what this device offers
   zspd run <dir> [options]                   run a device's node
   zspd serve <dir> [options]                 run a relay
 
@@ -68,6 +78,8 @@ USAGE :: `zspd - Zeron State Protocol node
   --no-names             run: give devices no names or addresses here
   --loopback=<127.a.b>   run: the first of the addresses devices are given (127.77.0)
   --dns=<addr:port>      run: answer for names here (127.77.0.1:53, or :5053 where 53 needs root)
+  --catch=<addr:port>    run, Linux: where zspd setup sends connections to devices' addresses (127.0.0.1:5054)
+  --trust-local-users    run: let anyone on this machine reach other devices' ports, not only this user
   --verbose
 
   <device>               a device's key, the start of one, or whose it is, as the roster says
@@ -229,6 +241,12 @@ run :: proc() -> int {
 		ok = len(rest) == 3 && join(dir, rest[0], rest[1], rest[2])
 	case "peer":
 		ok = len(rest) == 1 && join_from_roster(dir, rest[0])
+	case "nodes":
+		ok = nodes(dir)
+	case "offer", "unoffer":
+		ok = offer(dir, rest, args[0] == "unoffer")
+	case "offers":
+		ok = offer(dir, nil, false)
 	case "run", "serve":
 		return serve(dir, rest, args[0] == "serve")
 	case "share":
@@ -589,6 +607,7 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		loopback     = {77, 0},
 	}
 	dns := ""
+	catch := "127.0.0.1:5054" when ODIN_OS == .Linux else ""
 	listen := "0.0.0.0:8787" if relay else "127.0.0.1:0"
 	for a in args {
 		eq := strings.index_byte(a, '=')
@@ -645,6 +664,10 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 			config.loopback = {byte(a), byte(b)}
 		case "--dns":
 			dns = value
+		case "--catch":
+			catch = value
+		case "--trust-local-users":
+			config.trust_local_users = true
 		case "--verbose":
 		case:
 			os.write_string(os.stderr, USAGE)
@@ -667,6 +690,14 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		} else {
 			os.write_string(os.stderr, USAGE)
 			return 2
+		}
+		if catch != "" {
+			ep, parsed := net.parse_endpoint(catch)
+			if !parsed {
+				os.write_string(os.stderr, USAGE)
+				return 2
+			}
+			config.catch_at = ep
 		}
 	}
 
@@ -719,4 +750,228 @@ local_token :: proc(dir: string) -> string {
 	token := strings.clone(to_hex(b[:]))
 	host.save(path, transmute([]byte)token)
 	return token
+}
+
+// Calls a zsp.* method of this device's own host, as a local client of the node running here. The messages that
+// come back, or a fault; not ok if no node is running here.
+local_call :: proc(dir, method: string, body: []byte) -> (data: [dynamic][]byte, fault: int, ok: bool) {
+	data = make([dynamic][]byte, context.temp_allocator)
+	address, aerr := os.read_entire_file(in_dir(dir, "address"), context.temp_allocator)
+	token, terr := os.read_entire_file(in_dir(dir, "token"), context.temp_allocator)
+	endpoint, parsed := net.parse_endpoint(string(address))
+	secret, have := host.device_secret(dir)
+	if aerr != nil || terr != nil || !parsed || !have {
+		return
+	}
+	device := zsp.x25519_public(secret)
+	socket, err := net.dial_tcp(endpoint)
+	if err != nil {
+		return
+	}
+	defer net.close(socket)
+	net.set_option(socket, .Receive_Timeout, 5 * time.Second)
+	request := pipe.ws_request(string(address), "/")
+	net.send_tcp(socket, transmute([]byte)request)
+	send :: proc(socket: net.TCP_Socket, frames: []byte) {
+		message := make([dynamic]byte, context.temp_allocator)
+		pipe.ws_put(&message, .Binary, frames, true)
+		net.send_tcp(socket, message[:])
+	}
+	frames := make([dynamic]byte, context.temp_allocator)
+	at := zsp.frame_begin(&frames, .Hello)
+	append(&frames, zsp.VERSION, 0)
+	resize(&frames, len(frames) + 32)
+	zsp.write_varint(&frames, 0)
+	zsp.write_bytes(&frames, token)
+	zsp.frame_end(&frames, at)
+	send(socket, frames[:])
+	buf: [16 << 10]byte
+	got := make([dynamic]byte, context.temp_allocator)
+	stream := make([dynamic]byte, context.temp_allocator)
+	used, read := 0, 0
+	called := false
+	for {
+		n, rerr := net.recv_tcp(socket, buf[:])
+		if n <= 0 || rerr != nil {
+			return data, fault, fault != 0
+		}
+		append(&got, ..buf[:n])
+		if used == 0 {
+			head := pipe.http_head(got[:]) or_continue
+			used = head.size
+		}
+		for {
+			op, payload, size, _, result := pipe.ws_take(got[used:])
+			if result != .Message {
+				break
+			}
+			used += size
+			if op == .Binary {
+				append(&stream, ..payload)
+			}
+		}
+		r := zsp.Reader{buf = stream[read:]}
+		for {
+			before := r.pos
+			frame := zsp.read_bytes(&r)
+			if r.bad || len(frame) == 0 {
+				read += before
+				break
+			}
+			f := zsp.Reader{buf = frame[1:]}
+			#partial switch zsp.Message(frame[0]) {
+			case .Roster:
+				if called || len(frame) < 9 {
+					continue
+				}
+				// What this client may do: it calls in the first scope it may call in.
+				_ = zsp.read_take(&f, 8)
+				for !f.bad && f.pos < len(f.buf) {
+					scope := zsp.read_varint(&f)
+					rights := zsp.read_u8(&f)
+					_ = zsp.read_take(&f, 32)
+					if f.bad || rights & 4 == 0 || called {
+						continue
+					}
+					called = true
+					out := make([dynamic]byte, context.temp_allocator)
+					at = zsp.frame_begin(&out, .Call)
+					zsp.write_varint(&out, 1)
+					append(&out, ..device[:])
+					zsp.write_varint(&out, scope)
+					zsp.write_bytes(&out, transmute([]byte)method)
+					zsp.write_bytes(&out, nil)
+					append(&out, ..body)
+					zsp.frame_end(&out, at)
+					at = zsp.frame_begin(&out, .Flow)
+					zsp.write_varint(&out, 2)
+					append(&out, byte(zsp.Flow.End))
+					zsp.frame_end(&out, at)
+					send(socket, out[:])
+				}
+			case .Flow:
+				tag := zsp.read_varint(&f)
+				kind := zsp.Flow(zsp.read_u8(&f))
+				if f.bad || tag != 1 << 1 | 1 {
+					continue
+				}
+				switch kind {
+				case .Data:
+					append(&data, slice.clone(f.buf[f.pos:], context.temp_allocator))
+				case .End:
+					return data, 0, true
+				case .Fault:
+					return data, int(f.buf[f.pos]) if f.pos < len(f.buf) else 4, true
+				case .Cancel, .Credit:
+				}
+			}
+		}
+	}
+}
+
+FAULTS := [?]string{"cancelled", "denied", "unreachable", "unserved", "lost", "overrun", "busy"}
+
+// What the node running here knows of each device.
+nodes :: proc(dir: string) -> bool {
+	data, fault, ok := local_call(dir, "zsp.nodes", nil)
+	if !ok || fault != 0 || len(data) != 1 {
+		say(os.stderr, "no node is running here\n" if !ok else FAULTS[min(fault, len(FAULTS) - 1)], "\n" if ok else "")
+		return false
+	}
+	r := zsp.Reader{buf = data[0]}
+	n := zsp.read_varint(&r)
+	for _ in 0 ..< n {
+		device := zsp.read_take(&r, 32)
+		name := string(zsp.read_bytes(&r))
+		ip := zsp.read_take(&r, 4)
+		flags := zsp.read_u8(&r)
+		subject := string(zsp.read_bytes(&r))
+		count := zsp.read_varint(&r)
+		ports := make([dynamic]string, context.temp_allocator)
+		for _ in 0 ..< count {
+			p := zsp.read_take(&r, 2)
+			_ = zsp.read_varint(&r)
+			target := string(zsp.read_bytes(&r))
+			label := string(zsp.read_bytes(&r))
+			if r.bad {
+				break
+			}
+			buf: [8]byte
+			text := strconv.write_uint(buf[:], u64(p[0]) << 8 | u64(p[1]), 10)
+			text = strings.concatenate({text, "(" if label != "" || target != "" else "", label, "@" if target != "" else "", target, ")" if label != "" || target != "" else ""}, context.temp_allocator)
+			append(&ports, text)
+		}
+		if r.bad {
+			return false
+		}
+		state := "this device" if flags & 1 != 0 else "direct" if flags & 4 != 0 else "reachable" if flags & 2 != 0 else "away"
+		say(os.stdout, name if name != "" else to_hex(device), "\t", fmt.tprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]), "\t", state, "\t", strings.join(ports[:], ",", context.temp_allocator), "\t", subject, "\n")
+	}
+	return true
+}
+
+// Offers, takes back, or lists what this device offers: through the node running here, or in its file if none is.
+offer :: proc(dir: string, args: []string, remove: bool) -> bool {
+	o: host.Offer
+	op := byte(0)
+	if args != nil {
+		parsed: bool
+		o, parsed = host.offer_parse(args)
+		if !parsed {
+			say(os.stderr, "an offer is <port>[-<port>] <scope> [device=<key>] [host=<address>] [name=<name>] [proxy];\na host is an address of another machine, and of it no more than 1024 ports at once\n")
+			return false
+		}
+		op = 2 if remove else 1
+	}
+	body := make([dynamic]byte, context.temp_allocator)
+	append(&body, op)
+	if op != 0 {
+		host.offer_put(&body, &o)
+	}
+	data, fault, running := local_call(dir, "zsp.offers", body[:])
+	if running {
+		if fault != 0 || len(data) != 1 {
+			say(os.stderr, "the node running here refused: ", FAULTS[min(fault, len(FAULTS) - 1)], " (no such offer, or too many)\n" if fault == 1 else "\n")
+			return false
+		}
+		r := zsp.Reader{buf = data[0]}
+		n := zsp.read_varint(&r)
+		for _ in 0 ..< n {
+			x := host.offer_read(&r) or_return
+			if op == 0 {
+				say(os.stdout, host.offer_text(&x), "\n")
+			}
+		}
+		return true
+	}
+	// Nobody is running: the file is the offers, and is read at the next start.
+	_, name := read_space(dir) or_return
+	path := in_dir(in_dir(dir, name), "offers")
+	data_file, _ := os.read_entire_file(path, context.temp_allocator)
+	lines := make([dynamic]string, context.temp_allocator)
+	found := false
+	text := string(data_file)
+	for whole in strings.split_lines_iterator(&text) {
+		line := strings.trim_space(whole)
+		x, ok := host.offer_parse(strings.fields(line, context.temp_allocator))
+		same := ok && op != 0 && x.lo == o.lo && x.hi == o.hi && x.scope == o.scope && x.device == o.device && x.host == o.host
+		found ||= same
+		if op == 0 && ok {
+			say(os.stdout, line, "\n")
+		}
+		if line != "" && !same {
+			append(&lines, line)
+		}
+	}
+	switch {
+	case op == 0:
+		return true
+	case remove && !found:
+		say(os.stderr, "no such offer\n")
+		return false
+	case !remove:
+		append(&lines, host.offer_text(&o))
+	}
+	append(&lines, "")
+	return host.save(path, transmute([]byte)strings.join(lines[:], "\n", context.temp_allocator))
 }

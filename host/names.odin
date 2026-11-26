@@ -157,6 +157,9 @@ names_answer :: proc(h: ^Host, q: ^pipe.Dns_Query) -> (a: pipe.Dns_Answer) {
 				return
 			}
 			a.a, _ = device_address(sp, m.device)
+			if q.type == pipe.DNS_A || q.type == pipe.DNS_ANY {
+				ports_wanted(sp, m.device) // whoever looks it up is about to connect
+			}
 			return
 		}
 		// The addresses, the other way.

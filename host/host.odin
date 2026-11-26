@@ -30,6 +30,12 @@ Config :: struct {
 	loopback:     [2]byte, // 127.a.b.c: a, and b's first value
 	dns:          Maybe(net.Endpoint), // where to answer for names
 	proxy:        Maybe(net.Endpoint), // SOCKS 5 and HTTP CONNECT, for applications that can use one
+	catch_at:     Maybe(net.Endpoint), // Linux: where zspd setup has connections to devices' addresses sent
+	// Lets anyone on this machine use other devices' ports, not only this user: for a machine whose users are one,
+	// where who connects cannot be told.
+	trust_local_users: bool,
+	// Whether a local client may change what this device offers and exposes; nil: one accepted for every scope may.
+	may_configure: proc(data: rawptr, s: ^zsp.Session) -> bool,
 	// Authentication, which is wholly the embedder's: see zsp.Host.authenticate. `data` is passed back.
 	data:         rawptr,
 	authenticate: proc(data: rawptr, s: ^zsp.Session, credential: []byte),
@@ -53,6 +59,7 @@ Host :: struct {
 	dialers:      [dynamic]^Dialer,
 	udp:          Udp,
 	dns_server:   Dns,
+	catch:        Catch,
 	shared:       []byte, // everything is received into this
 	sync_due:     time.Tick,
 	syncing:      bool, // sync_due is set
@@ -78,6 +85,7 @@ Space :: struct {
 	services: [dynamic]^Service_Call, // calls to them, which a change may end
 	audit: Audit_Log,
 	naming: Naming,
+	ports:  ^Ports, // other devices' and this one's
 }
 
 @(private)
@@ -191,6 +199,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 			// Rights may have gone: whatever they allowed ends.
 			services_recheck(s)
 			forwards_recheck(s)
+			ports_roster(s)
 		},
 		signal       = links_signalled,
 		presence     = proc(data: rawptr, online: []zsp.Key32) {
@@ -209,6 +218,8 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		if len(h.spaces) == 0 {
 			s.naming = {h.names, h.loopback}
 		}
+		ports_open(s)
+		catch_try(h)
 	}
 	append(&h.spaces, s)
 	return s
@@ -228,6 +239,7 @@ space_authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
 }
 
 space_close :: proc(s: ^Space) {
+	ports_close(s)
 	found_close(s)
 	bridges_close(s)
 	calls_close(s)
@@ -295,8 +307,23 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 		udp_open(h, port) or_return
 	}
 	host_serve_builtin(h)
+	if !h.relay {
+		// What this device offers, unless whoever embeds it decides that otherwise.
+		if h.port_permitted == nil {
+			h.port_permitted = port_permitted
+			h.proxy_prelude = proc(sp: ^Space, from: Caller, port: u16, target: string) -> []byte {
+				return port_proxy_header(sp, from.device, port)
+			}
+		}
+		host_serve(h, "zsp.ports", ports_called)
+		host_serve(h, "zsp.nodes", nodes_called)
+		host_serve(h, "zsp.offers", offers_called)
+	}
 	if at, ok := h.dns.?; ok && !h.relay && h.names != "" {
 		dns_open(h, at)
+	}
+	if at, ok := h.catch_at.?; ok && !h.relay && h.names != "" {
+		catch_open(h, at) // tried once there is a space to try it for
 	}
 	return true
 }
@@ -328,6 +355,7 @@ host_destroy :: proc(h: ^Host) {
 	}
 	udp_close(h)
 	dns_close(h)
+	catch_close(h)
 	for len(h.spaces) > 0 {
 		space_close(pop(&h.spaces))
 	}
@@ -378,6 +406,7 @@ host_settle :: proc(h: ^Host) {
 		s.node.now = ms
 		found_run(s, now)
 		relayed_run(s, now)
+		ports_run(s, now)
 	}
 	links_flush(h)
 	for s in h.spaces {
@@ -429,6 +458,9 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 	}
 	for s in h.spaces {
 		if t, set := found_deadline(s, time.tick_now()); set {
+			earliest(&due, &ok, t)
+		}
+		if t, set := ports_deadline(s); set {
 			earliest(&due, &ok, t)
 		}
 	}
