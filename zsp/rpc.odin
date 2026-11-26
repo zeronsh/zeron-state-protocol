@@ -628,7 +628,7 @@ rpc_roster_changed :: proc(n: ^Node) {
 // is no such session, or it has so much to send already that the packet would only wait: as though lost.
 node_post_link :: proc(n: ^Node, relay: u32, device: Key32, packet: []byte) -> bool {
 	s := node_session(n, relay)
-	if s == nil || !s.ready || !s.peer_relay || s.closing || session_backlog(s) > LINK_QUEUE {
+	if s == nil || !s.ready || !s.peer_relay || s.closing || session_backlog_beyond(s, len(packet), LINK_QUEUE) {
 		return false
 	}
 	post(s, device, .Link, packet)
@@ -641,6 +641,19 @@ LINK_QUEUE :: 256 << 10
 
 // A signal's blob, at most: a link's packet through a relay (8192), and what goes with it.
 MAX_SIGNAL :: 16 << 10
+
+// Whether a session would have more than `most` queued for its peer, with `more` besides, once what its host's pipe
+// takes at once has gone.
+@(private)
+session_backlog_beyond :: proc(s: ^Session, more, most: int) -> bool {
+	if session_backlog(s) + more <= most {
+		return false
+	}
+	if n := s.node; n.host.flush != nil {
+		n.host.flush(n.host.data, s)
+	}
+	return session_backlog(s) + more > most
+}
 
 // What is queued for a session's peer and not yet on its way: here, and in its host's pipe.
 @(private)

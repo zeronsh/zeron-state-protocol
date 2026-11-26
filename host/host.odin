@@ -191,6 +191,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		reach        = relayed_reach,
 		link         = relayed_input,
 		backlog      = stream_backlog,
+		flush        = stream_push_for,
 	}
 	if !h.relay {
 		s.node.host.questions = questions(s)

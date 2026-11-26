@@ -345,31 +345,7 @@ stream_flush :: proc(s: ^Stream) {
 		return
 	}
 	for s.send_op == nil {
-		if s.session != nil && !s.closing {
-			for len(s.out) - s.sent < OUT_HIGH {
-				out := zsp.session_output(s.session)
-				if len(out) == 0 {
-					break
-				}
-				n := min(len(out), MAX_PLAIN)
-				if s.role == .Open {
-					stream_put(s, .Binary, out[:n])
-				} else if s.tls == nil {
-					client := s.dialer != nil
-					at := pipe.ws_begin(&s.out, .Binary, n + zsp.TAG, client)
-					zsp.channel_seal(&s.channel, &s.out, out[:n])
-					pipe.ws_end(&s.out, at, client)
-				} else {
-					sealed := make([dynamic]byte, 0, n + zsp.TAG, context.temp_allocator)
-					zsp.channel_seal(&s.channel, &sealed, out[:n])
-					stream_put(s, .Binary, sealed[:])
-				}
-				zsp.session_sent(s.session, n)
-			}
-			if s.session.closing && len(zsp.session_output(s.session)) == 0 {
-				s.closing = true // all has been said, the reason last
-			}
-		}
+		stream_fill(s, true)
 		if len(s.out) == s.sent {
 			break
 		}
@@ -380,6 +356,53 @@ stream_flush :: proc(s: ^Stream) {
 	}
 	if s.closing && s.send_op == nil && len(s.out) == s.sent {
 		stream_close(s)
+	}
+}
+
+// The same, now, in the midst of the session's own work or another's: so only what is queued already goes, nothing is
+// closed, and what fails is found by the next flush, which closes it.
+@(private)
+stream_push :: proc(s: ^Stream) {
+	for !s.dead && s.send_op == nil {
+		stream_fill(s, false)
+		if len(s.out) == s.sent {
+			return
+		}
+		if !stream_flush_bytes(s) {
+			s.dead = true
+		}
+	}
+}
+
+// Seals what the session has to say into what goes to the socket, OUT_HIGH of it at most; with `more`, what it has
+// yet to make too.
+@(private)
+stream_fill :: proc(s: ^Stream, more: bool) {
+	if s.session == nil || s.closing {
+		return
+	}
+	for len(s.out) - s.sent < OUT_HIGH {
+		out := zsp.session_output(s.session) if more else zsp.session_queued(s.session)
+		if len(out) == 0 {
+			break
+		}
+		n := min(len(out), MAX_PLAIN)
+		if s.role == .Open {
+			stream_put(s, .Binary, out[:n])
+		} else if s.tls == nil {
+			client := s.dialer != nil
+			at := pipe.ws_begin(&s.out, .Binary, n + zsp.TAG, client)
+			zsp.channel_seal(&s.channel, &s.out, out[:n])
+			pipe.ws_end(&s.out, at, client)
+		} else {
+			sealed := make([dynamic]byte, 0, n + zsp.TAG, context.temp_allocator)
+			zsp.channel_seal(&s.channel, &sealed, out[:n])
+			stream_put(s, .Binary, sealed[:])
+		}
+		zsp.session_sent(s.session, n)
+	}
+	if more && s.session.closing && len(zsp.session_output(s.session)) == 0 {
+		s.closing = true // all has been said, the reason last
 	}
 }
 

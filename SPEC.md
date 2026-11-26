@@ -427,7 +427,8 @@ packet that comes newest yet by another relay both are present at moves the link
 from it, sends by another: a link outlives a relay, and its calls with it. A link whose calls have been over for 30 seconds is closed.
 
 A relay keeps nothing for a link and may drop any of its packets, as a router does; it must drop them rather than hold more than 256 KiB for a
-device, beyond which they would only wait. The link sends them again and slows. Nothing else that it carries may it drop.
+device, beyond which they would only wait. What it holds is what its connection to the device would not yet take, so packets that came
+together, as a window's worth does, are not dropped for that alone. The link sends them again and slows. Nothing else that it carries may it drop.
 
 While every other device present at a relay is a full replica with a settled direct session, a device may end its watches there (it goes on sending), and must
 watch afresh when that ceases to be so.

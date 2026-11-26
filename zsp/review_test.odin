@@ -90,3 +90,48 @@ review_relay_signals_are_bounded :: proc(t: ^testing.T) {
 		testing.expectf(t, session_backlog(to_b) <= LINK_QUEUE, "kind %v: the relay holds %d for b", kind, session_backlog(to_b))
 	}
 }
+
+// A burst of a link's packets that comes all in one read is forwarded whole when the pipe onward takes it at once: a
+// relay drops only what would wait, not what came together.
+@(test)
+review_relay_burst_is_forwarded :: proc(t: ^testing.T) {
+	state := seeded(104)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
+	defer sim_destroy(&s)
+	a, b, relay := s.nodes[0], s.nodes[1], s.nodes[2]
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	to_a, to_b: ^Session
+	for sess in relay.node.sessions {
+		if sess.peer == a.keys.device {
+			to_a = sess
+		} else if sess.peer == b.keys.device {
+			to_b = sess
+		}
+	}
+	@(static) forwarded: int
+	forwarded = 0
+	relay.node.host.flush = proc(data: rawptr, s: ^Session) {
+		// A pipe that takes everything at once, as loopback does.
+		out := session_queued(s)
+		forwarded += len(out)
+		session_sent(s, len(out))
+	}
+	defer relay.node.host.flush = nil
+	packet := make([]byte, 8000, context.temp_allocator)
+	w := make([dynamic]byte, context.temp_allocator)
+	COUNT :: 64 // half a MiB, twice what a relay holds for anyone
+	for _ in 0 ..< COUNT {
+		at := frame_begin(&w, .Signal)
+		append(&w, ..b.keys.device[:])
+		write_u8(&w, u8(Post.Link))
+		append(&w, ..packet)
+		frame_end(&w, at)
+	}
+	testing.expect(t, session_input(to_a, w[:]))
+	forwarded += len(session_queued(to_b))
+	testing.expectf(t, forwarded >= COUNT * len(packet), "forwarded %d of %d", forwarded, COUNT * len(packet))
+}

@@ -294,3 +294,15 @@ stream_backlog :: proc(data: rawptr, s: ^zsp.Session) -> int {
 	}
 	return 0
 }
+
+// What a session has to say, into its pipe now, as far as the socket takes it at once (see zsp.Host.flush).
+@(private)
+stream_push_for :: proc(data: rawptr, s: ^zsp.Session) {
+	h := (^Space)(data).host
+	for st in h.streams {
+		if st.session == s {
+			stream_push(st)
+			return
+		}
+	}
+}

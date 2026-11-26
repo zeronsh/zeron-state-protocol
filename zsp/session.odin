@@ -373,6 +373,11 @@ session_output :: proc(s: ^Session) -> []byte {
 	return s.out[s.sent:]
 }
 
+// What is queued for the peer already, without making more: for a host to send in the midst of the session's work.
+session_queued :: proc(s: ^Session) -> []byte {
+	return s.out[s.sent:]
+}
+
 session_sent :: proc(s: ^Session, n: int) {
 	s.sent += n
 	s.taken += u64(n)
@@ -1992,7 +1997,7 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 		}
 		for to in n.sessions {
 			if to.ready && to.peer == device {
-				if session_backlog(to) + len(rest) + 64 > LINK_QUEUE {
+				if session_backlog_beyond(to, len(rest) + 64, LINK_QUEUE) {
 					continue // dropped, as a router would: what matters is sent again, and its sender slows
 				}
 				cells_close(to)

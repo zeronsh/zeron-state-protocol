@@ -57,6 +57,9 @@ Host :: struct {
 	link:         proc(data: rawptr, relay: u32, from: Key32, packet: []byte),
 	// How many bytes the host's pipe holds for a session, not yet sent: on a relay, so as to drop rather than queue.
 	backlog:      proc(data: rawptr, s: ^Session) -> int,
+	// Puts what a session has to say into the host's pipe now, as far as the pipe takes it at once: so that a backlog
+	// is judged by what could not go, not by what came all in one turn. It ends nothing, whatever it finds.
+	flush:        proc(data: rawptr, s: ^Session),
 }
 
 // Whoever answers questions about what is here, if anyone does: see package find. Open sessions ask them.
