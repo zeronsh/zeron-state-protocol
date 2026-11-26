@@ -2,6 +2,7 @@ package host
 
 import "core:mem"
 import "core:nbio"
+import "core:net"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -149,4 +150,54 @@ public_closed_with_its_space :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
+}
+
+// What is written to a public that reads slowly goes from what is kept as it is written, not only once all of it is:
+// else what this end adds while it waits (TLS's KeyUpdates) would pile up for ever behind what has gone.
+@(test)
+public_out_kept_written_goes :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	listener, lerr := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, lerr == nil)
+	defer net.close(listener)
+	at, _ := net.bound_endpoint(listener)
+	reader, derr := net.dial_tcp(at)
+	testing.expect(t, derr == nil)
+	defer net.close(reader)
+	socket, _, aerr := net.accept_tcp(listener)
+	testing.expect(t, aerr == nil)
+	net.set_blocking(socket, false)
+	h: Host
+	c := new(Public_Out)
+	c.h, c.socket = &h, socket
+	defer {
+		if c.writing != nil {
+			nbio.remove(c.writing)
+		}
+		if c.stall != nil {
+			nbio.remove(c.stall)
+		}
+		net.close(socket)
+		delete(c.out)
+		free(c)
+	}
+	block := make([]byte, 1 << 20, context.temp_allocator)
+	added := 0
+	for _ in 0 ..< 32 {
+		append(&c.out, ..block)
+		added += len(block)
+		if c.writing != nil {
+			nbio.remove(c.writing)
+			c.writing = nil
+		}
+		public_out_flush(c)
+		// The reader takes some, as a slow one does.
+		buf: [256 << 10]byte
+		net.set_option(reader, .Receive_Timeout, 50 * time.Millisecond)
+		net.recv_tcp(reader, buf[:])
+	}
+	// Of what is kept, what has been written is never more than a little.
+	testing.expectf(t, c.sent < 64 << 10, "kept %d already written (of %d kept, %d added)", c.sent, len(c.out), added)
+	testing.expect(t, len(c.out) < added) // and some has been written
 }

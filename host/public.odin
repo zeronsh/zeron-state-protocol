@@ -18,11 +18,10 @@ MAX_EXPOSED :: 4096 // labels at one relay
 PUBLIC_MAX :: 1024 // connections from the public at once
 PUBLIC_HEAD_MAX :: 16 << 10
 PUBLIC_READS :: 16 // reads of one connection, at most, before the others have their turn
-// For the public, unwritten, past which no more is read from it until some has gone. What waits for it is what the
-// device sent, which its credit bounds (a call's window, 4 MiB at most), and what TLS says of its own, one KeyUpdate
-// for each read at most: so it is read on while it does not read, and a failure or a close of its is heard at once.
-// This is only for what could not otherwise be.
-PUBLIC_OUT_MAX :: 8 << 20
+// For the public, unwritten, past which no more is read from it until some has gone: what it makes this end say (TLS's
+// KeyUpdates) is so bounded, as what the device sends is by its credit. A public that reads nothing is let go at
+// PUBLIC_STALL, failed or not.
+PUBLIC_OUT_MAX :: 256 << 10
 PUBLIC_HELLO :: 10 * time.Second // to say where to, after which it is let go
 PUBLIC_STALL :: #config(ZSP_PUBLIC_STALL, 60_000) * time.Millisecond // to read what is written to it, or be let go
 
@@ -71,7 +70,8 @@ Public_Out :: struct {
 	writing:   ^nbio.Operation,
 	hello:     ^nbio.Operation, // until it says where to
 	stall:     ^nbio.Operation, // while a write waits on it
-	wrote_at:  time.Tick, // when a write last took anything
+	wrote_at:  time.Tick, // when a write last took anything, or began to wait
+	linger:    ^nbio.Operation, // once this end has said all, for the public to say so too
 }
 
 // Listens for the public, as configured. False if it cannot.
@@ -234,7 +234,7 @@ public_accepted :: proc(op: ^nbio.Operation, h: ^Host, secure: bool) {
 		// public out by opening connections and saying nothing; if all have, the newcomer waits its turn elsewhere.
 		oldest: ^Public_Out
 		for x in rp.conns {
-			if x.call == 0 && !x.closed {
+			if (x.call == 0 || x.shut) && !x.closed { // silent, or done but for the public's own end
 				oldest = x
 				break
 			}
@@ -493,6 +493,10 @@ public_out_flush :: proc(c: ^Public_Out) {
 			c.wrote_at = time.tick_now()
 		}
 		if err == .Would_Block {
+			if c.sent >= 64 << 10 {
+				remove_range(&c.out, 0, c.sent) // what is written goes, not only once all is
+				c.sent = 0
+			}
 			public_out_stall(c)
 			when POLLS_MEET {
 				if c.polling != nil {
@@ -514,6 +518,14 @@ public_out_flush :: proc(c: ^Public_Out) {
 	}
 	clear(&c.out)
 	c.sent = 0
+	c.wrote_at = {} // nothing waits: a write that next waits is timed from then, not from before
+	if c.stall != nil {
+		nbio.remove(c.stall)
+		c.stall = nil
+	}
+	if cap(c.out) > 256 << 10 {
+		shrink(&c.out)
+	}
 	if c.finishing {
 		public_out_close(c, reset = false)
 		return
@@ -525,6 +537,13 @@ public_out_flush :: proc(c: ^Public_Out) {
 	if c.ended_out && !c.shut {
 		c.shut = true
 		net.shutdown(c.socket, .Send) // the device has said all: the public may yet go on
+		if !c.told_end {
+			// But not for ever: one that has heard all and says nothing of its own end is let go at PUBLIC_STALL.
+			c.linger = nbio.timeout_poly(PUBLIC_STALL, c, proc(op: ^nbio.Operation, c: ^Public_Out) {
+				c.linger = nil
+				public_out_close(c, reset = false)
+			})
+		}
 	}
 	if c.shut && c.told_end {
 		public_out_close(c, reset = false)
@@ -613,6 +632,9 @@ public_out_close :: proc(c: ^Public_Out, reset: bool) {
 	}
 	if c.stall != nil {
 		nbio.remove(c.stall)
+	}
+	if c.linger != nil {
+		nbio.remove(c.linger)
 	}
 	if c.call != 0 {
 		call_cancel(c.sp, c.call)

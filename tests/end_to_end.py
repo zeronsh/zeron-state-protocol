@@ -1572,6 +1572,22 @@ def test_expose():
     asked.close()
     ca.unexpose(huge.getsockname()[1])
     ca.unexpose(flood.getsockname()[1])
+    # One that has heard all, the relay's end too, and never says its own end, is let go at PUBLIC_STALL (3 s here).
+    half = socket.create_connection(("127.0.0.1", plain), 5)
+    half.sendall(f"GET / HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n".encode())
+    heard = b""
+    while chunk := half.recv(4096):
+        heard += chunk
+    assert heard.endswith(b"hello, public"), heard
+    time.sleep(4.5)
+    try:
+        half.sendall(b"x")
+        time.sleep(0.3)
+        half.sendall(b"x")
+        raise AssertionError("the relay still holds a connection that never ended")
+    except OSError:
+        pass
+    half.close()
     # A port that resets each connection as it accepts it: the public hears nothing from it, and the device and relay
     # go on as before.
     resets = socket.create_server(("127.0.0.1", free_port()))
