@@ -210,8 +210,8 @@ def test_put_resumed():
 
 
 def test_connect():
-    """zspd offers no ports: which may be reached, for whom, is a policy it does not have yet (Config.port_permitted),
-    and without one every port is denied. So an echo there is asked for, and is refused, and nothing is read here."""
+    """zspd offers no port unless it is offered (zspd offer, SPEC §17): so an echo there that nobody offered is asked
+    for, and is refused as not offered, and nothing is read here."""
     echo = socket.socket()
     echo.bind(("127.0.0.1", 0))
     echo.listen()
@@ -220,7 +220,7 @@ def test_connect():
     threading.Thread(target=lambda: accepted.append(echo.accept()), daemon=True).start()
     a, b = shared("cn", "shell 1")
     code, out, err = cli("connect", a.dir, "cn-b", str(port), input=b"hello\n")
-    assert code == 1 and out == b"" and b"denied" in err, (code, out, err)
+    assert code == 1 and out == b"" and (b"not offered" in err or b"denied" in err), (code, out, err)
     time.sleep(0.2)
     assert not accepted
     code, _, _ = cli("connect", a.dir, "cn-b", "70000")
