@@ -1432,6 +1432,45 @@ def test_expose():
     assert http_get("127.0.0.1", plain, host="nobody.expose.test")[0] == 404
     # A client that says it is done as it asks is answered all the same.
     assert public_get_closing(https, name).endswith(b"hello, public")
+    # One whose TLS fails while it is not reading has its port's connection cut off at once, not once it reads.
+    import ssl, threading
+
+    cut_at = []
+    flood = socket.create_server(("127.0.0.1", free_port()))
+
+    def flood_one():
+        c, _ = flood.accept()
+        c.recv(65536)
+        try:
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 8388608\r\n\r\n" + b"x" * (8 << 20))
+            while c.recv(65536):
+                pass
+        except OSError:
+            pass
+        cut_at.append(time.monotonic())
+
+    threading.Thread(target=flood_one, daemon=True).start()
+    floods = ca.expose(flood.getsockname()[1], name="flood")[-1]["label"] + ".expose.test"
+    eventually("it too", lambda: all(r["status"] == 0 for e in ca.exposures() for r in e["relays"]))
+    context = ssl.create_default_context(cafile=os.path.join(CERTS, "p256.pem"))
+    inward, outward = ssl.MemoryBIO(), ssl.MemoryBIO()
+    tls = context.wrap_bio(inward, outward, server_hostname=floods)
+    raw = socket.create_connection(("127.0.0.1", https), 5)
+    raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    while True:
+        try:
+            tls.do_handshake()
+            break
+        except ssl.SSLWantReadError:
+            raw.sendall(outward.read())
+            inward.write(raw.recv(65536))
+    tls.write(f"GET / HTTP/1.1\r\nHost: {floods}\r\n\r\n".encode())
+    raw.sendall(outward.read())
+    time.sleep(1)  # the answer fills what the relay may write to it
+    raw.sendall(b"\x00" * 8)  # and then not TLS at all
+    eventually("the port's connection is cut off", lambda: cut_at, timeout=5)
+    raw.close()
+    ca.unexpose(flood.getsockname()[1])
     # A port that resets each connection as it accepts it: the public hears nothing from it, and the device and relay
     # go on as before.
     resets = socket.create_server(("127.0.0.1", free_port()))

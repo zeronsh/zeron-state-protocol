@@ -350,6 +350,10 @@ public_out_read :: proc(c: ^Public_Out) {
 			plain := make([dynamic]byte, context.temp_allocator)
 			ok := pipe.tls_accept(c.tls, bytes, &plain, &c.out, public_identity, h)
 			c.finishing = !ok // its alert written, if any, and that is all
+			if !ok && c.call != 0 {
+				call_cancel(c.sp, c.call) // and the device hears so now, not once the public has read the alert
+				c.call = 0
+			}
 			public_out_flush(c)
 			if !ok {
 				return
