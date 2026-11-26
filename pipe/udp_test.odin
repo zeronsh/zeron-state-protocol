@@ -367,6 +367,90 @@ link_outlasts_a_pause :: proc(t: ^testing.T) {
 	testing.expect(t, strings.has_suffix(string(n.got[1][:]), "\x04\x05\x06"))
 }
 
+// A link a relay carries, whose packets are larger than a datagram's, outlasts a pause with much in flight and then
+// sends all of it: its window, cut down while it waited and after, still holds one of its packets.
+@(test)
+link_relayed_recovers_from_a_pause :: proc(t: ^testing.T) {
+	space, sa, sb: zsp.Key32
+	sa[0], sb[0] = 1, 2
+	a, b: Link
+	defer link_destroy(&a)
+	defer link_destroy(&b)
+	testing.expect(t, link_dial(&a, sa, zsp.x25519_public(sb), space, 1))
+	first: [FIRST_SIZE]byte
+	testing.expect(t, link_answer(&b, sb, space, link_hello(&a, first[:])))
+	second: [SECOND_SIZE]byte
+	testing.expect(t, link_input(&a, link_hello(&b, second[:]), 1000))
+	RELAY :: 8192
+	a.mtu, b.mtu = RELAY, RELAY // as host/relayed.odin has them
+	a.path_probes, b.path_probes = MAX_PATH_PROBES, MAX_PATH_PROBES
+	got := 0
+	b.data = &got
+	b.on_stream = proc(l: ^Link, id: u64, bytes: []byte, event: Stream_Event) {
+		if event == .Data {
+			(^int)(l.data)^ += len(bytes)
+		}
+	}
+	now: Time = 2000
+	buf: [RELAY]byte
+	// Each way, half a millisecond, until neither has anything to say; or one way dropped.
+	both :: proc(a, b: ^Link, now: ^Time, buf: []byte) {
+		for _ in 0 ..< 200 {
+			said := false
+			for p := link_output(a, buf, now^); p != nil; p = link_output(a, buf, now^) {
+				said = true
+				link_input(b, p, now^ + 500)
+			}
+			now^ += 500
+			for p := link_output(b, buf, now^); p != nil; p = link_output(b, buf, now^) {
+				said = true
+				link_input(a, p, now^ + 500)
+			}
+			now^ += 500
+			if !said {
+				return
+			}
+		}
+	}
+	for _ in 0 ..< 20 {
+		link_write(&a, 0, {1, 2, 3, 4})
+		both(&a, &b, &now, buf[:])
+		if d := link_deadline(&b); d > now {
+			now = d
+			both(&a, &b, &now, buf[:])
+		}
+	}
+	want := got + 32 << 10
+	link_write(&a, 0, make([]byte, 32 << 10, context.temp_allocator))
+	paused := now
+	for now - paused < 1500 * MS {
+		for link_output(&a, buf[:], now) != nil {
+		}
+		d := link_deadline(&a)
+		if d == 0 || d - paused >= 1500 * MS {
+			break
+		}
+		now = max(now + 1000, d)
+	}
+	testing.expect(t, a.state == .Open)
+	if d := link_deadline(&a); d != 0 {
+		now = max(now, d)
+	}
+	both(&a, &b, &now, buf[:])
+	for _ in 0 ..< 40 {
+		next := link_deadline(&a)
+		if d := link_deadline(&b); d != 0 && (next == 0 || d < next) {
+			next = d
+		}
+		if next == 0 {
+			break
+		}
+		now = max(now, next)
+		both(&a, &b, &now, buf[:])
+	}
+	testing.expectf(t, got == want, "%d of %d bytes, window %v, ceiling %v", got, want, a.window, a.ceiling)
+}
+
 // Nobody is there any more, and it is found out, however often there is more to say to them, and however slow the path was.
 @(test)
 link_to_nobody_is_closed :: proc(t: ^testing.T) {

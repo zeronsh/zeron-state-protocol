@@ -28,7 +28,6 @@ import "../zsp"
 PACKET :: 1200 // until a probe proves more
 PACKET_MAX :: 1452
 HEAD :: 13 // type, receiver, counter
-MIN_WINDOW :: 2 * PACKET
 MAX_EARLY :: 2048 // pieces held out of order, across the streams of a link, however small
 STREAM_WINDOW :: 256 << 10 // what a stream may send beyond what has been delivered, at first
 STREAM_WINDOW_MAX :: 16 << 20
@@ -500,6 +499,11 @@ link_poke :: proc(l: ^Link) {
 	if l.in_flight == 0 {
 		l.want_probe = true
 	}
+}
+
+// Whether link_poke would do anything: an open link with nothing in flight, whose silence a probe would ask after.
+link_pokeable :: proc(l: ^Link) -> bool {
+	return l.state == .Open && l.in_flight == 0
 }
 
 link_close :: proc(l: ^Link) {
@@ -1469,7 +1473,7 @@ link_model :: proc(l: ^Link, now: Time) {
 	if l.delivered >= l.round_ends {
 		heavy := l.round_lost * 8 > l.round_sent // more than an eighth
 		if heavy {
-			l.ceiling = max(min(l.window, l.ceiling) * 0.7, 4 * PACKET)
+			l.ceiling = max(min(l.window, l.ceiling) * 0.7, 4 * link_floor(l))
 		} else if l.ceiling < 1e12 {
 			l.ceiling *= 1.25
 		}
@@ -1500,7 +1504,7 @@ link_model :: proc(l: ^Link, now: Time) {
 	if l.starting {
 		target = max(target, l.window)
 	}
-	l.window = max(min(target, l.ceiling), f64(4 * PACKET))
+	l.window = max(min(target, l.ceiling), 4 * link_floor(l))
 }
 
 // ---------------------------------------------------------------- sending
@@ -1529,7 +1533,9 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 	eliciting := false
 	p: Sent
 	p.chunk = l.chunk_base + u64(len(l.chunks) - l.chunk_head)
-	room := l.in_flight + limit < int(l.window) || l.want_probe
+	// One packet at least, with nothing in flight, whatever the window: else a window smaller than a packet sends nothing,
+	// and nothing ever comes to open it.
+	room := l.in_flight == 0 || l.in_flight + limit < int(l.window) || l.want_probe
 	acking := l.ack_due != 0 && (now >= l.ack_due || link_sendable(l))
 	if acking {
 		link_put_ack(l, &w, now)
@@ -1739,12 +1745,18 @@ link_expire :: proc(l: ^Link, now: Time) {
 				l.round_lost -= int(size) // a timeout is no measure of congestion
 			}
 			if l.probes > 2 {
-				l.window = MIN_WINDOW
+				l.window = 2 * link_floor(l)
 			}
 			break
 		}
 	}
 	link_settle(l) // what was lost is waited for no more
+}
+
+// A packet of this link's, as large as its path takes: what its window is never let fall below a few of.
+@(private)
+link_floor :: proc(l: ^Link) -> f64 {
+	return f64(max(l.mtu, PACKET))
 }
 
 @(private)
