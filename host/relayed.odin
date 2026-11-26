@@ -150,11 +150,16 @@ relayed_input :: proc(data: rawptr, relay: u32, from: zsp.Key32, packet: []byte)
 	if !ok {
 		return
 	}
-	for r in sp.relayed {
+	for r, i in sp.relayed {
 		if r.device != from || r.link.local != id {
 			continue
 		}
 		if pipe.link_input(r.link, packet, now_us()) {
+			if r.link.state == .Closed {
+				ordered_remove(&sp.relayed, i) // told so: its session ends now, and no call is put on it meanwhile
+				relayed_drop(r)
+				return
+			}
 			// Newest yet, and genuine: answer by the relay it came through.
 			r.via = relay
 			r.used = time.tick_now()

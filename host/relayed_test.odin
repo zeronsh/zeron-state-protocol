@@ -213,3 +213,43 @@ closed_links_let_go_at_once :: proc(t: ^testing.T) {
 		testing.expectf(t, zsp.node_session(&a.node, id) == nil, "direct %v: its session still there once the host has settled", direct)
 	}
 }
+
+// Review, round 12. Told by the other end that a link a relay carries is closed, a device lets it go then, its session
+// with it: not when it next settles, meanwhile a session ready and not closing, on which a call would be lost.
+@(test)
+relayed_closed_by_the_peer_let_go_at_once :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = false))
+	e: Echo
+	testing.expect(t, echo_start(&e))
+	defer echo_stop(&e)
+	open_port = u16(e.port)
+	w.hosts[2].port_permitted = permit_open_port
+	g: Gate
+	testing.expect(t, gate_open(&g, &w, u16(e.port)))
+	defer gate_close(&g)
+	c := Client{port = g.port, send = 4096, read_too = true}
+	th := client_start(&c)
+	testing.expect(t, world_run(&w, client_done, &c))
+	client_destroy(&c, th)
+	a, b := world_space(&w, 1), world_space(&w, 2)
+	testing.expect(t, len(a.relayed) == 1 && len(b.relayed) == 1)
+	if len(a.relayed) != 1 || len(b.relayed) != 1 {
+		return
+	}
+	id := a.relayed[0].session.id
+	pipe.link_close(b.relayed[0].link) // as RELAY_IDLE does
+	host_settle(&w.hosts[2])
+	// The relay and b go on; a only takes in what comes, and settles nothing.
+	heard := false
+	for until := time.tick_add(time.tick_now(), 5 * time.Second); !heard && time.tick_diff(time.tick_now(), until) > 0; {
+		host_settle(&w.hosts[0])
+		host_settle(&w.hosts[2])
+		_ = nbio.tick(time.Millisecond)
+		heard = len(a.relayed) == 0 || a.relayed[0].link.state == .Closed
+	}
+	testing.expect(t, heard)
+	testing.expectf(t, zsp.node_session(&a.node, id) == nil && len(a.relayed) == 0, "its session still there, told it was closed")
+}
