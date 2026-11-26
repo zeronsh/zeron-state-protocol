@@ -717,7 +717,7 @@ zsp.public   relay → device, in scope 0: label bytes ‖ address (16) ‖ port
 
 A 40 Expose is all a device exposes at that relay, on whichever of its connections it is said: a device that comes back on another
 connection, while the relay has yet to find its last one gone, keeps its labels, and the last one's going takes nothing of them. A call
-to a device goes by its newest session. A relay takes a 40 Expose whole or not at all: one with more exposures than it allows (16, here), a prefix that is not one, or anything
+to a device goes by its newest session: the one opened last, whatever has closed since. A relay takes a 40 Expose whole or not at all: one with more exposures than it allows (16, here), a prefix that is not one, or anything
 after its last exposure changes nothing, and is not answered. A relay works each label out itself, from the space, the device's proven
 key and what it said, and holds it only while the device is connected; it is reached at `<label>.<domain>` for a domain of the relay's, by TLS that it terminates (routed by the name asked for) or by
 plain HTTP routed by `Host`, behind something else that does. A device takes `zsp.public` only from a session it dialled as a relay's, and

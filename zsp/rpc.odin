@@ -241,18 +241,28 @@ on_call :: proc(s: ^Session, r: ^Reader, lane: ^Lane = nil) {
 	}
 }
 
+// A direct session to a device, and of those one that replicates rather than one only for calls; and of those the
+// newest, by id (ids only grow, and are kept through sleep), not by place in the list, which closing reorders: a
+// device that has come back on another is reached there, not on one that may be gone and not yet known to be.
+@(private)
+call_session :: proc(n: ^Node, device: Key32) -> (direct: ^Session) {
+	for p in n.sessions {
+		if !p.ready || p.closing || p.role == .Open || p.peer != device || p.peer_relay {
+			continue
+		}
+		calls, was := p.role == .Calls, direct != nil && direct.role == .Calls
+		if direct == nil || was && !calls || was == calls && p.id > direct.id {
+			direct = p
+		}
+	}
+	return
+}
+
 // Sends a call on its way to another device.
 @(private)
 call_out :: proc(n: ^Node, c: ^Call, device: Key32, method: string, who, body: []byte) -> Maybe(Call_Fault) {
 	to := &c.ends[CALLEE]
-	// A direct session, and of those one that replicates rather than one only for calls; and of those the newest, for a
-	// device that has come back on another is reached there, not on one that may be gone and not yet known to be.
-	direct: ^Session
-	for p in n.sessions {
-		if p.ready && !p.closing && p.role != .Open && p.peer == device && !p.peer_relay && (direct == nil || direct.role == .Calls || p.role != .Calls) {
-			direct = p
-		}
-	}
+	direct := call_session(n, device)
 	if direct == nil && n.host.reach != nil {
 		// None yet: the host begins one for calls, through a relay; what is said waits until it is open.
 		direct = n.host.reach(n.host.data, device)
