@@ -98,6 +98,15 @@ Redelete :: struct {
 }
 
 @(private)
+Upload :: struct {
+	op:       u32, // zero for nothing to put: a segment that ended before
+	from, to: u64,
+	done:     bool,
+}
+
+UPLOADS :: 4 // extents put at once
+
+@(private)
 Cached_Page :: struct {
 	pg:   ^Page,
 	used: u64,
@@ -179,8 +188,8 @@ Remote :: struct {
 	dead:          [dynamic]u64, // packs all superseded
 	entry:         bool, // the next pack's entry is in packs
 
-	uploading:     u32, // the op putting an extent
-	upload_to:     u64, // where uploaded will be once it is done
+	uploads:       [dynamic]Upload, // extents being put, in order
+	upload_next:   u64, // where the next begins
 	gc:            Pack_GC,
 	gc_after:      u64, // no pack is chosen to be emptied until the one after this is durable
 }
@@ -235,6 +244,7 @@ remote_close :: proc(r: ^Remote) {
 	delete(r.ready)
 	delete(r.deletes)
 	delete(r.redelete)
+	delete(r.uploads)
 	delete(r.dead)
 	delete(r.gc.hints)
 	r^ = {}
@@ -590,13 +600,22 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 			}
 		}
 	case .Put_Extent:
-		if r.uploading == id {
-			r.uploading = 0
-			if ok {
-				r.uploaded = r.upload_to
-				r.stats.extents += 1
+		for &u in r.uploads {
+			if u.op != id {
+				continue
 			}
+			if !ok {
+				// Again, in its turn: what is uploaded must be all that comes before.
+				again := remote_op(r, .Put_Extent)
+				again.number, again.off, again.len = op.number, op.off, op.len
+				u.op = again.id
+				remote_start(r, again)
+				return
+			}
+			u.done = true
+			r.stats.extents += 1
 		}
+		remote_uploaded(r)
 	case .Delete:
 		if !ok {
 			remote_delete(r, op.objects)
@@ -1037,48 +1056,53 @@ remote_redeletes :: proc(r: ^Remote) {
 
 // ---------------------------------------------------------------- the log, to object storage
 
-// Puts the next extent of the log in object storage, if it is whole and durable.
+// Puts the next extents of the log in object storage, those that are whole and durable, a few at once.
 @(private)
 remote_upload :: proc(r: ^Remote) {
 	s := r.store
-	for r.uploading == 0 {
-		e := r.uploaded
-		seg := e / SEGMENT
-		seg_end := (seg + 1) * SEGMENT
-		ext_end := min((e / EXTENT + 1) * EXTENT, seg_end)
-		if s.synced >= ext_end {
-			// Whole, unless the segment ended before it: then as much of it as there is.
-			n := log_size(remote_disk(r), e, ext_end - e) if s.synced >= seg_end else ext_end - e
-			if n == 0 {
-				r.uploaded = seg_end if s.synced >= seg_end else ext_end
-				continue
-			}
-			op := remote_op(r, .Put_Extent)
-			op.number = e / EXTENT
-			op.off, op.len = e, n
-			r.uploading = op.id
-			r.upload_to = ext_end if n == ext_end - e else seg_end
-			r.stats.put += n
-			remote_start(r, op)
-			return
-		}
-		if s.synced >= seg_end {
-			// The segment ended before this extent began.
-			n := log_size(remote_disk(r), e, seg_end - e)
-			if n == 0 {
-				r.uploaded = seg_end
-				continue
-			}
-			op := remote_op(r, .Put_Extent)
-			op.number = e / EXTENT
-			op.off, op.len = e, n
-			r.uploading = op.id
-			r.upload_to = seg_end
-			r.stats.put += n
-			remote_start(r, op)
-		}
-		return
+	if len(r.uploads) == 0 {
+		r.upload_next = r.uploaded
 	}
+	for len(r.uploads) < UPLOADS {
+		e := r.upload_next
+		seg_end := (e / SEGMENT + 1) * SEGMENT
+		ext_end := min((e / EXTENT + 1) * EXTENT, seg_end)
+		n: u64
+		to: u64
+		switch {
+		case s.synced >= seg_end:
+			// The segment is done with: as much of the extent as there is, which may be nothing.
+			n = log_size(remote_disk(r), e, ext_end - e)
+			to = ext_end if n == ext_end - e else seg_end
+		case s.synced >= ext_end:
+			n, to = ext_end - e, ext_end
+		case:
+			return // not yet whole
+		}
+		u := Upload{from = e, to = to, done = n == 0}
+		if n > 0 {
+			op := remote_op(r, .Put_Extent)
+			op.number = e / EXTENT
+			op.off, op.len = e, n
+			u.op = op.id
+			r.stats.put += n
+			remote_start(r, op)
+		}
+		append(&r.uploads, u)
+		r.upload_next = to
+		remote_uploaded(r)
+	}
+}
+
+// What is uploaded is all that comes before the first extent still being put.
+@(private)
+remote_uploaded :: proc(r: ^Remote) {
+	i := 0
+	for i < len(r.uploads) && r.uploads[i].done {
+		r.uploaded = r.uploads[i].to
+		i += 1
+	}
+	remove_range(&r.uploads, 0, i)
 }
 
 // ---------------------------------------------------------------- emptying packs

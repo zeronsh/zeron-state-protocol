@@ -313,9 +313,9 @@ remote_store_settle :: proc(t: ^testing.T, x: ^Remote_Store) {
 	for round := 0; remote_store_turn(x, 1 << 20); round += 1 {
 		if round > 100_000 {
 			r := &x.remote
-			testing.expectf(t, false, "stuck: ops %d zombies %d inflight %v gc %v/%v slot %v asked %v wantp %d wantb %d gettingp %d gettingb %d replaying %v evac %v dirty %d pending %d acc %d uploading %d uploaded %d synced %d tail %d dropped %v evacuated %v",
+			testing.expectf(t, false, "stuck: ops %d zombies %d inflight %v gc %v/%v slot %v asked %v wantp %d wantb %d gettingp %d gettingb %d replaying %v evac %v dirty %d pending %d acc %d uploads %d uploaded %d synced %d tail %d dropped %v evacuated %v",
 				len(x.host.ops), len(x.host.zombies), r.inflight != nil, r.gc.active, r.gc.gen, r.gc.slot, r.gc.asked, len(r.want_pages), len(r.want_blocks), len(r.getting_pages), len(r.getting_blocks),
-				x.store.replaying, x.store.evac, len(x.store.dirty), len(x.store.pending), r.accounted, r.uploading, r.uploaded, x.store.synced, store_tail(&x.store), x.store.dropped[:], x.store.evacuated[:])
+				x.store.replaying, x.store.evac, len(x.store.dirty), len(x.store.pending), r.accounted, len(r.uploads), r.uploaded, x.store.synced, store_tail(&x.store), x.store.dropped[:], x.store.evacuated[:])
 			testing.fail_now(t, "never settles")
 		}
 	}
@@ -823,4 +823,57 @@ remote_catching_up_reads_ahead :: proc(t: ^testing.T) {
 	bytes := ROWS * (len(big) + 100)
 	gets := x.remote.stats.log_gets - before
 	testing.expectf(t, gets <= bytes / EXTENT + 4, "%d reads of the log for %d extents of it", gets, bytes / EXTENT + 1)
+}
+
+// A host woken with nothing at hand replays the log past the checkpoint in a few rounds of fetching, not one a record:
+// the records after one that missed are replayed too, to find what else is missing, and undone.
+@(test)
+remote_cold_replay_fetches_together :: proc(t: ^testing.T) {
+	state := seeded(8)
+	context.random_generator = rand.default_random_generator(&state)
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x, 4096, 64)
+	commit :: proc(t: ^testing.T, x: ^Remote_Store) {
+		cells: [4]Cell
+		for &c in cells {
+			c = random_cell(20_000, 1_000_000)
+		}
+		remote_store_step(t, x, &cells, proc(s: ^Store, data: rawptr) {store_commit(s, (^[4]Cell)(data)[:])})
+		testing.expect(t, store_sync(&x.store))
+		free_all(context.temp_allocator)
+	}
+	for i in 0 ..< 6000 {
+		commit(t, &x)
+		if i % 8 == 0 {
+			remote_store_turn(&x, 1 << 20)
+		}
+	}
+	x.remote.want_checkpoint = true
+	remote_store_settle(t, &x)
+	// A tail the checkpoint does not cover, touching rows all over.
+	for _ in 0 ..< 120 {
+		commit(t, &x)
+	}
+	model_crash(&x.host)
+	for kind in Cached {
+		for _, b in x.host.cache[kind] {
+			delete(b)
+		}
+		clear(&x.host.cache[kind])
+	}
+	remote_store_close(&x)
+	remote_store_open(t, &x, 4096, 64)
+	rounds := 0
+	for x.store.replaying {
+		store_work(&x.store)
+		remote_ops(&x.remote)
+		if model_tick(&x.host, &x.remote, 1 << 20) > 0 {
+			rounds += 1
+		}
+		testing.expect(t, rounds < 1000)
+	}
+	testing.expectf(t, rounds <= 12, "replayed in %d rounds of fetching", rounds)
+	remote_store_settle(t, &x)
+	remote_store_close(&x)
 }

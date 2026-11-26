@@ -556,6 +556,8 @@ repair_steps :: proc(s: ^Store) -> (waiting: bool) {
 	return false
 }
 
+REPLAY_AHEAD :: 256 // records replayed past one that missed, to find what else is missing
+
 // Replays the log past the checkpoint, a record at a time, each record a step, as replay does all at once. The log
 // there is always at hand: the host keeps what lies past the checkpoint in its own storage. Returns whether a record
 // waits for something that is not.
@@ -584,6 +586,11 @@ replay_steps :: proc(s: ^Store) -> (waiting: bool) {
 			s.failed = true
 			return false
 		}
+		// Once a record reads what is not at hand, those after it are replayed too, though they are to be undone with it:
+		// what they read and miss is fetched at the same time, rather than a round trip at a time.
+		missed: Step
+		missed_at: u64
+		ahead := 0
 		pos := 0
 		scan: for pos < size {
 			n := record_at(part[pos:])
@@ -601,6 +608,14 @@ replay_steps :: proc(s: ^Store) -> (waiting: bool) {
 				continue
 			}
 			at := s.replay_at + u64(pos)
+			if missed.active {
+				replay_record(s, at, part[pos + RECORD_HEAD:][:n])
+				pos += RECORD_HEAD + n
+				if ahead += 1; ahead < REPLAY_AHEAD {
+					continue
+				}
+				break scan
+			}
 			if s.remote != nil && (len(s.dirty) > CHECKPOINT_HARD || (len(s.dirty) > CHECKPOINT_DIRTY && s.remote.inflight == nil)) {
 				// As much as a checkpoint should hold: the rest after one is under way, which remote_work begins.
 				s.replay_at = at
@@ -610,13 +625,18 @@ replay_steps :: proc(s: ^Store) -> (waiting: bool) {
 			t := store_begin(s)
 			replay_record(s, at, part[pos + RECORD_HEAD:][:n])
 			if store_missed(s, &t) {
-				store_end(s, &t, false)
-				s.replay_at = at
-				return true
+				missed, missed_at = t, at
+				pos += RECORD_HEAD + n
+				continue
 			}
 			store_end(s, &t, true)
 			pos += RECORD_HEAD + n
 			s.replay_tail = at + u64(RECORD_HEAD + n)
+		}
+		if missed.active {
+			store_end(s, &missed, false)
+			s.replay_at = missed_at
+			return true
 		}
 		s.replay_at += u64(pos)
 		if pos == limit {
