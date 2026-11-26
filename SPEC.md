@@ -8,7 +8,7 @@ trusted with nothing. This document is enough to write a client, a relay or a fu
 [4 Cells](#4-cells) · [5 Text](#5-text) · [6 Fingerprints](#6-fingerprints) · [7 Channels](#7-channels) ·
 [8 Sessions](#8-sessions) · [9 Watching](#9-watching) · [10 Reconciling](#10-reconciling) · [11 Live](#11-live) ·
 [12 Calls](#12-calls) · [13 Relays](#13-relays) · [14 Links](#14-links) · [15 Questions](#15-questions) ·
-[16 Streams and services](#16-streams-and-services) · [17 Names, ports and exposure](#17-names-ports-and-exposure) · [18 Who handles what](#18-who-handles-what)
+[16 Who handles what](#16-who-handles-what)
 
 ## 1 Model
 
@@ -128,14 +128,11 @@ has learnt, so that nothing garbled later takes them away; and an owner signs al
 closing it no later than the one before (the first, at 0), with 32 zero bytes for its key in `history`. Nothing sealed under a void epoch is acceptable; what honest
 members sealed under it they seal again.
 
-Rights are bits: 1 Read, 2 Write, 4 Call, 8 Vouch: to be believed about for whom one writes and calls (§4, §12), 16 Shell and 32 Files: to use what devices share of themselves in the scope (§16). Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
+Rights are bits: 1 Read, 2 Write, 4 Call, 8 Vouch: to be believed about for whom one writes and calls (§4, §12); a grant with any other is invalid. Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
 invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
 a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed; and so does taking Vouch away in a signed scope. `closed`
 says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
-`subject` is the consumer's name for whomever the device belongs to, opaque here. A roster that names any device begins `"zsp-r2"`
-in place of `"zsp-r1"`, and each member's subject is followed by its **name** bytes, empty or one DNS label: 1 to 63 of `a`–`z`, `0`–`9` and
-`-`, with no hyphen at either end, and not `id`, which is the zone of names nobody chooses (§17). No two members share a name; a name goes with its member's last grant (§17). A roster that names nobody
-is `"zsp-r1"`, as it always was. A roster is at most 2²² − 64 bytes. Members are never removed, only their grants
+`subject` is the consumer's name for whomever the device belongs to, opaque here. A roster that does not begin `"zsp-r1"` is none. A roster is at most 2²² − 64 bytes. Members are never removed, only their grants
 ended, so that a member's index is for ever.
 
 **Scope keys.** Each scope has a 32-byte sealing key per epoch. For each member in order, for each grant in force in order,
@@ -389,7 +386,8 @@ slow to arrive, or whose pipe was full, sees the rest as it is typed.
 
 ```
 14 Serve   scope varint ‖ 1 or 0 ‖ method bytes                             a local client offers a method, or ceases to
-15 Call    id varint ‖ device (32) ‖ scope varint ‖ method bytes ‖ for whom bytes ‖ first message
+15 Call    id varint ‖ device (32) ‖ scope varint ‖ method bytes ‖ for whom bytes ‖ [urgency (1)] ‖ first message
+                                                                            urgency from a local client only, 0 to 7
 16 Flow    id varint × 2 + (1 if sent by the callee) ‖ kind (1) ‖ payload
            0 Data (message) · 1 End · 2 Fault (code (1)) · 3 Cancel · 4 Credit (varint bytes)
 12 Presence   to a local client: n × { device (32), subject bytes }, this device first, then all it can reach
@@ -399,19 +397,26 @@ A call is a stream of messages each way. `device` is the callee's on the way out
 last node tells its own client the same if the calling device has Vouch in that scope, and otherwise the device's `subject`. Who may not vouch may not call for another: *denied*. Ids belong to whoever sent
 Call on that session. A call ends when both sides have sent End, or on Fault or Cancel. Each side may have 256 KiB of messages outstanding beyond what the
 other has credited, and may be credited ahead of what it has sent up to 4 MiB; the first message counts. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
-Names beginning `zsp.` are for devices' hosts themselves (§16): a client's Serve of one is passed over, and a call to one is the host's to answer.
+What answers a call at a device is the device's affair: a local client that serves the method, or the host itself in its stead; to the caller
+they are alike.
 
 What a node committed before a call it sends on its way before it, and so does a relay: whoever is called has what the call is about, unless so much was committed at once that one of them has to
 compare afresh (§9). Both devices need the Call right in the scope, and both check. A call takes a direct session with the device if there is one, one that
 replicates before a calls session, else a calls session over a link through a relay both are present at (§13), begun for it. It
 stays on the session it began on: if that fails the call faults *lost*, and may or may not have happened. Faults: 1 denied, 2 unreachable, 3 unserved,
-4 lost, 5 overrun, 6 busy. A relay may call a device that dialled it by the method `zsp.public` in scope 0, and by nothing else; no grant governs such a call.
+4 lost, 5 overrun, 6 busy.
 
 **Lanes.** Over a link (§14) each call has a stream of its own, its **lane**, opened by whoever sends Call on it, which carries that call's Call and Flow
 frames and nothing else, each way. A lane's first bytes each way say how many bytes of the session's own stream (stream 0) its sender had produced
 before them, so that what was committed before a call is still had before it. Frames on a lane are taken only once the session is ready. A lane is
-finished by each side once its call is over for it; one given up (Reset) loses its call. Lanes are opened with an urgency, 0 most urgent to 7 least,
-which a host takes from the method (§16) or, passing a call on, from the lane it came by.
+finished by each side once its call is over for it; one given up (Reset) loses its call. Lanes are opened with an urgency, 0 most urgent to 7 least:
+what a local client said in its Call, or a host for a call of its own, and 4 for the nodes' own (§15). The link serves the most urgent first (§14):
+what someone types into wants 1, a bulk copy 6, and what may be either 3, where what has lately said little goes first. An urgency above 7 is malformed.
+
+**Building on calls.** Whatever a device offers others beyond the store (files, commands, terminals, its ports) is a method, each use of it a
+call. Whoever answers reads only as much as it has credit to send, and credits only what it has written on, to a socket, a process or a disk:
+so a slow end slows the other, and nothing piles up between them. End is a half-close; Fault or Cancel, a reset. The roster says only who may
+call in a scope: what each caller may then do, by its device and for whom it calls, is the service's to say, and to refuse with *denied*.
 
 ## 13 Relays
 
@@ -575,179 +580,7 @@ each row's key, as in a Watch, in place of its id, any key of it. The partial re
 places, data and live, and answers its client once it holds the rows. It believes nothing else that would not be an answer to what it asked. A device that will not answer faults *unserved*, and another is asked; until one
 does, and when none can be reached, the answer is of what is held. A Fetch waits for the other, if one can be reached, and for its rows to be confirmed.
 
-## 16 Streams and services
-
-A device's host serves methods of its own, by names beginning `zsp.`: what it lets others do on it. Each answers first with a status, and
-then as the method says:
-
-```
-status      0 ok ‖ what the method says · or code (1) ‖ reason (UTF-8), and End:
-            1 denied · 2 not offered · 3 refused · 4 unreachable · 5 timed out · 6 not found · 7 failed · 8 changed · 9 exists · 10 malformed
-```
-
-What it lets others do is the device's to say, in the scopes it says: **shares**, of terminals and commands (shell), and of folders of files, each by
-a name and for reading or writing too (files). Nothing is shared until its owner says, and whoever would use a share needs besides, in its scope,
-Call and Shell or Files (§3). When either changes, every call no longer allowed is faulted *denied* at once, and its process killed or its file closed;
-a share of files moved to another folder is another share.
-Every opening, refusal and close is written down by the host, with who and what but none of what passed. A host does not answer its own local
-clients but by `zsp.services` and `zsp.share`, nor relays but by `zsp.public`.
-
-| method | first message | then |
-|---|---|---|
-| `zsp.services` | – | n × service, End: 1 shell ‖ flags (1: 1 terminal, 2 commands) · 2 files ‖ flags (1: 1 read, 2 write) ‖ name bytes · 3 tcp ‖ port (2) ‖ host bytes ‖ name bytes; what the caller's rights let it use |
-| `zsp.share` | – or the shares, as text | the shares as text, or the new ones taken; for local clients alone, granted every scope (scope 0, Write and Call) |
-| `zsp.tcp` | port (2) ‖ host bytes | a TCP connection, there or by default to its loopback: bytes each way as messages, End a half-close, Fault or Cancel a reset |
-| `zsp.exec` | flags (1) ‖ n varint ‖ n × argument bytes ‖ m varint ‖ m × environment bytes ‖ folder bytes | a process |
-| `zsp.pty` | rows (2) ‖ columns (2) ‖ TERM bytes ‖ as `zsp.exec` after its flags | a process with a terminal; no arguments, the user's shell |
-| `zsp.list` | path bytes | m × { kind (1: 1 file, 2 folder, 3 other) ‖ name bytes ‖ size varint ‖ modified (ms) varint } in messages, End |
-| `zsp.get` | path bytes ‖ offset varint ‖ identity bytes | size varint ‖ modified varint ‖ identity bytes ‖ from varint, then the file |
-| `zsp.put` | path bytes ‖ size varint ‖ modified varint ‖ identity bytes ‖ flags (1: 1 replace, 2 make the folders) | from varint, then the file the other way |
-
-Integers of two bytes are big-endian. A process's messages are tagged: to it, `0 ‖ input`, `1 ‖ signal (1)` (POSIX numbers: 1 hang up, 2 interrupt,
-3 quit, 9 kill, 15 terminate, 18 continue, 19 stop) and `2 ‖ rows (2) ‖ columns (2)`, End meaning no more input; from it, `1 ‖ output`, `2 ‖ errors`, and last
-`3 ‖ code varint ‖ signal (1)`, then End. Arguments are the program's own, never through a shell; environment entries are NAME=value over the host's,
-NAME alone removing one. A call cancelled kills the process and all it started.
-
-Paths are a share's name and then the path within it, `/` between, whatever the system; none may lead out of the share, by `..` or by a link, which is
-judged by where the file opened really is. A file is put only in a folder reached from the share without any link, and the folders made on the way
-likewise, so a link in a share is never written through. No name in a path is `.` or `..`, holds `\`, `:` or NUL, ends in `.` or a space (on some
-systems another's name), or ends in `.zsp-part` or `.zsp-part.meta` (a receiver's own, below). A put names a file, not the share or a folder. An
-empty path lists the shares of files. A file is hashed in chunks of 1 MiB, each by SHA-256, and the file
-by SHA-256 of its chunks' hashes in order. Whoever has the file sends it from `from` as `1 ‖ bytes`, each chunk followed by `2 ‖ its hash (32)`, then
-`3 ‖ status (1) ‖ [the file's hash (32)]`, and End: with the hash in every *ok* of a put, and of a get unless resumed, and not taken without it. A
-sender whose file is no longer the one it was by its identity ends with *changed*. Credit for what follows the last bytes is kept back from them. the receiver checks each chunk as it comes, and a put ends with its
-verdict, a status (1), once the sender has ended. **Resuming**: what was received is kept with the hashes of its whole chunks; asked again, a
-transfer takes up at the end of those that are still what their hashes say, if the file is the one it was by its `identity`, an opaque value its
-holder gives for it (here, its size, time and identity on its disk); otherwise it begins again. A file received is put in place whole, with the
-sender's time, or not at all.
-
-Whoever answers reads only as much as it has credit to send, and credits only what it has written on, to a socket, a process or a disk: so a
-slow end slows the other, and nothing piles up between them. Lanes take their urgency from the method: `zsp.pty` 1; `zsp.get` and `zsp.put` 6;
-those between nodes themselves 4; all others, commands and ports among them, which may be bulk or not, 3.
-
-## 17 Names, ports and exposure
-
-Every device of a space has, on every other, a name that any application can look up and an address it can connect to, and through it
-the TCP ports that device offers: as if the space were a network, with no network device made for it. None of this is in the store or
-replicated; what is on the wire is the roster's names, a few methods (§12), and two messages between a device and a relay.
-
-**Names.** A member's **id** is the first 10 bytes of its device key in RFC 4648 base32, lower case and unpadded: 16 letters that nobody can
-choose to match another's. Under a suffix of the host's (`zsp.internal` here, under ICANN's private-use `.internal`):
-
-```
-<name>.<suffix>        the member the roster gives that name
-<id>.id.<suffix>       any member with a grant in force
-```
-
-A member at index *i* of the roster's members is at 127.*a*.(*b* + ⌊(*i* + 2) / 256⌋).((*i* + 2) mod 256), from a loopback range 127.*a*.*b* of
-the host's choice (127.77.0 here): indexes are for ever, so an address never comes to mean another device however long it is remembered.
-127.*a*.*b*.1 is the host's own (its name server, here). A device's own names are 127.0.0.1. A member whose grants have all ended has
-neither name nor address. A host answers for these names and addresses, and for the reverse zone of the range, as an authoritative name
-server (RFC 1035): with a time to live of 5 seconds, a start of authority whose minimum is the same, nothing for AAAA, and nothing for any
-other name. How the machine's resolver comes to ask it is the host's affair.
-
-**Ports.** What a device **offers** is its own to say, and it says nothing unless told: ranges of ports, each to whoever may call in a scope,
-or to one device among them; of this machine, or of another as reached from it. Of this machine's, only those that are listening, and
-reached at its loopback, are listed. A device never offers its own listeners, nor anything at an address of its own loopback range: nothing
-reaches through it what it reaches. A connection to a port is a `zsp.tcp` call (§16), permitted only when an offer covers the port and the
-host named, and both devices may call in the offer's scope; when an offer is taken back, or a grant ends, every connection it no longer
-permits is cut off.
-
-```
-zsp.ports    first message: lease varint (seconds, at most 600; 0 for once)
-             each message back: entries, the whole of what the callee offers the caller; again whenever that differs,
-             until the lease ends and the callee ends the call. Another lease varint from the caller asks for as long again.
-             Asked once, the entries are said once even if the caller has already ended its side; a caller that ends its
-             side of a lease ends the lease. A callee may keep only so many leases at once, of all and of each caller,
-             and so many asked once apart from them (256 of all, 4 leases and 16 asked once of each, here): past that, *busy*.
-entries      n varint ‖ n × { port (2) ‖ scope varint ‖ host bytes (empty for the callee's own machine) ‖ name bytes }
-```
-
-Entries are at most 60 KiB (and 10 bytes more for n), each of a port that is not 0, a host that is empty or an address, and a name of
-one word (as an offer's, below). What is not so is not believed: the call is cancelled, and nothing of it kept.
-
-A port is reached by a zsp.tcp call in the scope it is offered in, and in no other: the callee lets a call through only if an offer in
-the call's scope covers the port, the caller and the target. A device connecting to a port it has not yet heard the other offer asks
-in the first scope both share.
-
-A device asks what another offers when anyone on it seems to want it, and keeps it up while that lasts: a name looked up, a connection
-made, a client asking (60 seconds, here); and no sooner, so that a quiet space costs nothing however many devices come and go. The callee looks again at what is listening every 2 seconds while anyone is kept up,
-and never otherwise. An offer marked so says who connects before anything else: the PROXY protocol's second version, from the caller's
-address on the callee's machine, with TLVs 0xE0, its device key, and 0xE1, its name.
-
-Whoever reaches another device's port through its address must be the user the node runs as, or the system: a host asks its system whose
-the connecting socket is, and refuses any other user's. And a connection whose first bytes are an HTTP request, through the address or
-the proxy alike, must name the device by `Host`, and if it has an `Origin`, be from one of the space's names or addresses; otherwise it is
-answered 403 and closed. So a web page elsewhere that has pointed a name of its own at one of these addresses (DNS rebinding) reaches
-nothing. What a browser sends begins with a request line, `method SP target SP HTTP/d.d`, the method any token in any case, so:
-
-- empty lines before it are skipped, and a line may end in LF alone, as the most lenient server would read it;
-- bytes that cannot begin such a line pass at once, and are not HTTP, unless they begin with one of HTTP's own methods (GET, HEAD, POST,
-  PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH, in any case), or with a token and a space (or tab) and a first line that names
-  `HTTP/`: a server would read either as a request however it went on, and those are refused. That line is waited for to its end,
-  over 2 KiB at most. Bytes that can begin such a line are held until they cannot, or the head is whole;
-- except that a browser writes its request's head at once, and what comes by loopback at once is read at once: so what comes first on a
-  connection, if it is the whole of the first read, a token of at most 64 bytes, and nothing before or after it, is no browser's and
-  passes. What comes with a proxy's request is never taken so;
-- the head must have exactly one `Host`, at most one `Origin`, and no folded or malformed header lines; a `Host` (and a target in absolute
-  form) is a name or address, then `:` and digits if anything, naming the device; an `Origin` is `http` or `https`, `://`, a name or
-  address of the space, then `:` and digits if anything, and nothing else (so not `null`);
-- every request of a connection is looked at, one after another, each as long as its head and its `Content-Length` say; a page's
-  request that passes (an image's GET, which says no `Origin`) does not open the way for its next. Where a request's end is not to
-  be found (a body in chunks, an upgrade, CONNECT), what follows it passes, its own request judged; two `Content-Length`s, or one
-  that is not digits, are refused. A refused request ends its connection with the 403, and answers to requests sent with it, still
-  to come, are lost with it (browsers do not send requests ahead of answers).
-
-**Exposure.** A device may expose a port of its own machine to the public, through relays that will, one port at a time, under a
-**label**:
-
-```
-label = [prefix "-"] base32(SHA-256("zsp-expose" ‖ space ‖ device ‖ prefix bytes ‖ nonce (16))[0..10])
-```
-
-the prefix being up to 20 letters, digits and hyphens of the device's choosing, and the nonce drawn afresh each time a port is exposed, so
-that a label once let go is nobody's for ever. Nobody can be given another's label: that would take a second preimage of 80 bits.
-
-```
-40 Expose    device → relay: n varint ‖ n × { prefix bytes ‖ nonce (16) }      all it exposes there, replacing what it said before
-41 Exposed   relay → device: n varint ‖ n × { label bytes ‖ status (1) ‖ url bytes }
-             status 0 exposed, at url; 1 this relay exposes nothing; 2 the label is another's; 3 too many
-zsp.public   relay → device, in scope 0: label bytes ‖ address (16) ‖ port (2), whence the connection came
-             then as zsp.tcp: the callee's first message 0, or a code ‖ reason; then the connection's bytes each way
-```
-
-A device says 40 Expose on every session it opens to a relay, though it exposes nothing, and again whenever what it exposes changes. A 40 Expose is all a device exposes at that relay, on whichever of its connections it is said: a device that comes back on another
-connection, while the relay has yet to find its last one gone, keeps its labels, and the last one's going takes nothing of them; what comes late on the last, once it has a newer one, changes nothing. A call
-to a device goes by its newest session: the one opened last, whatever has closed since. A relay takes a 40 Expose whole or not at all: one with more exposures than it allows (16, here), a prefix that is not one, or anything
-after its last exposure changes nothing, and is not answered. A relay works each label out itself, from the space, the device's proven
-key and what it said, and holds it only while the device is connected; it is reached at `<label>.<domain>` for a domain of the relay's, by TLS that it terminates (routed by the name asked for) or by
-plain HTTP routed by `Host`, behind something else that does. A device takes `zsp.public` only from a session it dialled as a relay's, and
-only for a label it exposes; it keeps what a relay says in 41 Exposed only while linked to that relay, for at most 16 relays an
-exposure, and only a status of 0 to 3 with a url that is empty or `http://` or `https://`, at most 512 bytes of UTF-8 with no space or control in it; for an exposure marked so, it says first where each connection came from, by PROXY v2. Taking a port back
-cuts off whoever is using it. What is exposed is public, and the relay sees it, as any reverse proxy must that holds the certificate; what
-is offered stays between devices, end to end.
-
-**A local client** asks its own device's host, by calling its own device (§12), in any scope it may call in:
-
-```
-zsp.nodes    answered once: n varint ‖ n × { device (32) ‖ name bytes ‖ address (4) ‖ flags (1: 1 this device, 2 reachable,
-             4 linked directly) ‖ subject bytes ‖ entries, of what it offers this device }
-zsp.offers   0 | 1 ‖ offer | 2 ‖ offer            list, offer, take back; answered with n varint ‖ n × offer, as they then are
-offer        lo (2) ‖ hi (2) ‖ scope varint ‖ device (32, zero for any) ‖ host bytes ‖ name bytes ‖ flags (1: 1 PROXY v2)
-zsp.expose   0 | 1 ‖ port (2) ‖ prefix bytes ‖ flags (1: 1 PROXY v2) | 2 ‖ port (2)
-             answered with n varint ‖ n × { port (2) ‖ prefix bytes ‖ flags (1) ‖ label bytes ‖
-             m varint ‖ m × { relay (32) ‖ status (1) ‖ url bytes } }
-```
-
-An answer to a local client may be longer than the call's credit: it then comes in as many messages as credit allows, and is all of
-them together, until End.
-
-Only a client its host accepted for every scope (scope 0) may change what the device offers or exposes; another is *denied*. An offer
-in a scope the device may not call in is *denied*, for it could never be taken up, and so is one whose name is not one word: at most 63
-bytes of UTF-8 with no space or control character in it. A method that is not a local client's is *denied* to
-one, and these are denied to everyone else.
-
-## 18 Who handles what
+## 16 Who handles what
 
 | | protocol | consumer |
 |---|---|---|
@@ -756,8 +589,6 @@ one, and these are denied to everyone else.
 | **Permission** | Read, Write, Call, Vouch per scope, in the roster; enforced by every replica, relays included | decides whom to grant |
 | **Keys** | wraps, rotates, seals, signs | keeps the device's secret |
 | **Authentication** | carries an opaque credential, inside the channel, to the accepting host, and waits for its verdict | is the verdict: accounts, tokens, quotas, billing |
-| **Names** | carries each device's name in the signed roster; derives ids and addresses; answers for them | decides what to call devices; points the machine's resolver at the node (zspd setup) |
-| **Ports** | lists what is offered and listening, permits and cuts off by offer and grant, refuses other users and other pages | decides what to offer, and to whom |
-| **Exposure** | derives labels nobody can take, carries the public to what is exposed and nothing else, cuts off what is taken back | decides what to expose; holds the domain and its certificate |
+| **Services** | carries calls: a stream of messages each way, with credit, each on a lane of its own at the urgency its caller says, between devices that may call in the scope | builds what it offers on them (files, commands, terminals, ports, names) and decides who may use which |
 
 For a peer, the verdict says whether to serve the connection; what it may then do is the roster's. For a local client, the verdict *is* the grants, and for whom it is.

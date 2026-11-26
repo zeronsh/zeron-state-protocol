@@ -419,7 +419,3 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 	}
 	return
 }
-
-crypto_random :: proc(into: []byte) {
-	crypto.rand_bytes(into)
-}

@@ -59,7 +59,7 @@ def main(dir):
         max_.drain(0.2)
         zoe.next_call += 1
         zoe.calls[zoe.next_call] = {"data": [], "ended": False, "fault": None}
-        zoe.send(zsp.CALL, zsp.varint(zoe.next_call) + zoe.authors[0][0] + zsp.varint(3) + zsp.put_bytes(b"whoami") + zsp.put_bytes(b"the president"))
+        zoe.send(zsp.CALL, zsp.varint(zoe.next_call) + zoe.authors[0][0] + zsp.varint(3) + zsp.put_bytes(b"whoami") + zsp.put_bytes(b"the president") + bytes([zsp.URGENCY]))
         max_.until(lambda: max_.caller is not None)
         zoe.until(lambda: zoe.calls[zoe.next_call]["data"])
         assert zoe.calls[zoe.next_call]["data"] == [b"zoe"]

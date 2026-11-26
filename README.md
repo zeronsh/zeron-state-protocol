@@ -9,14 +9,14 @@ browser, with a client in TypeScript.
 zsp/       the protocol: store, merge, windows, reconciliation, text, keys, calls. No I/O, threads or clocks
 find/      answering questions about it: an index made when first asked, kept encrypted, and never replicated
 pipe/      carrying it: UDP links, WebSocket, TLS, STUN. No I/O either
-host/      files, sockets, one thread, one event loop
+host/      files, sockets, one thread, one event loop; a node to embed, and services in-process
 zspd/      a device's node, or a self-hosted relay: one consumer of the above
 relay/     the same relay as a Cloudflare Durable Object: zsp/ compiled to wasm, and plumbing; spaces kept in R2
 luau/zsp/  the query client
 web/       a device in a browser or Node: zsp/ and find/ compiled to wasm, and a client in TypeScript
 clients/   a whole client in the Python standard library, to show how little one needs
 vectors/   what two implementations must agree on
-docs/      how to lay out who sees what, structured state, and the web; examples/ has it running
+docs/      how to lay out who sees what, structured state, services, and the web; examples/ has it running
 ```
 
 ## The idea
@@ -55,11 +55,11 @@ text of 8,000 pieces is at most some 200 cells to fetch, check and open, in thre
 
 **Nothing happens unless something happened.** An idle node makes no system calls. An idle link sends no packets and sets no timer.
 
-**The space is a network.** Every device has a name on every other, `desk.zsp.internal`, and an address of its own there, 127.77.0.3,
-the same for as long as the space lasts; whatever it offers is reached at it by any application, ssh or a browser, two devices on one port
-alike, with no VPN and nothing made in the kernel. Nothing is offered unless it is, nobody but its user may borrow a device's reach, and a
-page elsewhere led there by a name of its own reaches nothing. A port may be exposed to the public too, through a relay, under a name
-nobody else can be given ([SPEC §17](SPEC.md#17-names-ports-and-exposure)).
+**Services are yours to build.** A call is a stream each way between two devices the roster lets call, with credit, so that a
+slow end slows the other and nothing piles up between; it takes a stream of its own over the link, direct or through a relay, at the
+urgency its caller says, and moves to another relay should its own go. Files, terminals, ports: whatever a device offers is built on that, outside
+the protocol, and in-process where the host is embedded, as [examples/forward](examples/forward/main.odin) forwards TCP in some 300
+lines ([docs/services.md](docs/services.md)).
 
 ## Measured
 
@@ -123,19 +123,6 @@ many, and where runs differed, both:
 | memory, holding 100,000 rows and a page | 30 to 36 MB of the node's, 15 MB of the client's |
 | `./x test` | 2.5 s longer than without any of it: 55 s |
 
-`./x bench ports`, names, ports and exposure, real processes on the same 8 cores, both devices and the relay on one machine:
-
-| | |
-|---|---|
-| an idle node, names, offers and proxy on | 188 to 230 system calls in 20 s, its relay's pings; 0.6 MB private |
-| a name, asked of a node | 17 to 25 µs, a round trip by UDP, Python asking |
-| a connection to another device's port, through a relay | made and answered in 0.3 to 0.4 ms; then 72 to 81 µs a round trip |
-| the same, through a direct link | made and answered in 0.34 ms; then 42 µs a round trip |
-| 200 MB through a relay; through a direct link | 113 to 142 MB/s; 218 MB/s |
-| 500 idle forwarded connections | 1.1 KB each, both ends together |
-| 100 MB exposed to the public, by TLS through zspd's relay | 292 MB/s, one core for the relay's TLS |
-| a relay, after exposing it | 1.3 MB private |
-
 ## Using it
 
 ```sh
@@ -149,17 +136,6 @@ zspd key ~/.zsp                             # on another device,
 zspd admit ~/.zsp <that> 1                  # on this one, at once, running or not,
 zspd join ~/.zsp <space> <relay key> ws://host:8787 && zspd run ~/.zsp     # and there
 zspd admin ~/.zsp <that>                    # let it admit others; `off` to take that back
-
-zspd admit ~/.zsp <that> 1 shell files      # let it use what devices share in scope 1
-zspd share ~/.zsp "shell 1" "files 1 docs read $HOME/Documents"   # on this one, what it shares
-zspd services ~/.zsp <this>                 # on that one, what this one offers it
-zspd exec ~/.zsp <this> -- uname -a         # a command here, from there; `terminal` for a shell
-zspd get ~/.zsp <this> docs/report.pdf ./   # a file or a folder; again, after a break, to take up from there
-zspd name ~/.zsp <that> desk                # what the space calls it: desk.zsp.internal, on every device
-sudo zspd setup                             # once, on each machine: every application finds devices by name
-zspd offer ~/.zsp 22 1                      # on desk: offer its port 22 to whoever may call in scope 1
-ssh desk.zsp.internal                       # anywhere else in the space, as if it were on the network
-zspd expose ~/.zsp 8080 name=web            # to the public, through a relay run with --expose: https://web-<id>.<its domain>
 ```
 
 ```luau
@@ -192,11 +168,7 @@ text.append(token) -- seen everywhere at once; durable a piece at a time
 
 client:serve(1, "run", function(call, data) ... end)
 local answer = client:request(device, 1, "run", data)
-
-local offered = client:services(device, 1) -- what a device shares with you: terminals, commands, files, ports
-local got = client:get(device, 1, "docs/report.pdf", "report.pdf").wait() -- taken up where it broke off; checked
-local code, signal, out, err = client:run(device, 1, { "git", "status" }, { folder = "/srv/app" })
-local shell = client:terminal(device, 1, { rows = 24, columns = 80 }) -- write, resize, on_output, on_exit
+local copy = client:call(device, 1, "copy", first, { urgency = 6 }) -- a stream each way, behind what is urgent
 ```
 
 In a browser or Node, the device is the node, and the client is the Luau one, in TypeScript ([docs/web.md](docs/web.md)):
@@ -224,7 +196,8 @@ export default relay({ authenticate: async ({ space, device, credential, env }) 
 will be; `GET /` then answers with the key devices pin: fetch it once, with something that checks certificates, as a browser or curl does. What
 it keeps where, and what that costs: [docs/relay-storage.md](docs/relay-storage.md).
 
-Embedding in Odin is the same question asked of `host.Config.authenticate`, or of `zsp.Host.authenticate` if you bring your own I/O.
+Embedding in Odin is the same question asked of `host.Config.authenticate`, or of `zsp.Host.authenticate` if you bring your own I/O; and
+an embedding host serves calls in-process, by `host.host_serve` and `host.host_call` ([docs/services.md](docs/services.md)).
 
 ## Users, teams and organizations
 

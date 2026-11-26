@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams|aead|ports]|nat|system|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams|aead]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -14,7 +14,7 @@ EXE=
 # fragmented, as on busy machines where a big one at times could not be had; what does not fit waits its turn.
 STRICT="-vet -strict-style -define:ODIN_NBIO_QUEUE_SIZE=256"
 SIZED=zsp.review_little_room_whatever_quiet,zsp.review_little_room_pack_before_extent,zsp.review_little_room_small_writes_no_checkpoint # run at full size too
-TESTING="-define:ZSP_CALL_ALIVE=1000 -define:ZSP_PUBLIC_STALL=3000" # what the end-to-end tests wait on, made short
+TESTING="-define:ZSP_CALL_ALIVE=1000" # what the end-to-end tests wait on, made short
 SMALL="-define:ZSP_SEGMENT=262144 -define:ZSP_LOOSE=12 -define:ZSP_ALIKE=3 -define:ZSP_GC_HOT=4 -define:ZSP_GC_DEAD=1 -define:ZSP_EXTENT=131072 -define:ZSP_LOG_BLOCK=16384 -define:ZSP_LOCAL_KEEP=0" # so that tests roll and reclaim segments
 
 # The relay for speed, with WebAssembly's 128-bit vectors, which Workers have: what it does is mostly ChaCha20-Poly1305.
@@ -55,8 +55,6 @@ web_test() {
 	node test/node.ts
 	node test/vectors.ts ../vectors/vectors.json
 	node test/streams.ts
-	node test/tree_names.ts
-	node test/put_verdict.ts
 	node test/ask.ts
 	node test/utf8.ts
 	node test/store_cases.ts
@@ -64,14 +62,13 @@ web_test() {
 	node test/package.ts
 	node test/udp.ts
 	node test/find_memory.ts
-	node test/ports.ts
-	for t in text mirror_model mirror_interop store end_to_end services browsers; do
+	for t in text mirror_model mirror_interop store end_to_end browsers; do
 		args=
 		[ $t = store ] && args=../build/node-small.wasm
 		(node test/$t.ts $args >../build/web-$t.log 2>&1 || echo web-$t >>../build/failed) &
 	done
 	wait
-	for t in text mirror_model mirror_interop store end_to_end services browsers; do
+	for t in text mirror_model mirror_interop store end_to_end browsers; do
 		cat ../build/web-$t.log
 	done
 }
@@ -79,7 +76,7 @@ web_test() {
 case "${1:-test}" in
 check) # every platform, no code generated
 	for t in linux_amd64 linux_arm64 darwin_arm64 windows_amd64 freebsd_amd64; do
-		odin check zspd -target:$t $STRICT && echo "ok   $t"
+		odin check zspd -target:$t $STRICT && odin check examples/forward -target:$t $STRICT && echo "ok   $t"
 	done
 	odin check relay/wasm -target:js_wasm32 -no-entry-point $STRICT && echo "ok   js_wasm32"
 	odin check web/wasm -target:js_wasm32 -no-entry-point $STRICT && echo "ok   js_wasm32 web"
@@ -102,6 +99,7 @@ test)
 	(odin build zspd -out:build/zspd$EXE -debug $STRICT $TESTING || echo zspd >>build/failed) &
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
 	(odin build examples/apps -out:build/apps$EXE -debug $STRICT || echo examples >>build/failed) &
+	(odin build examples/forward -out:build/forward$EXE -debug $STRICT || echo examples >>build/failed) &
 	(! stale web/src/node.wasm || web_wasm || echo web >>build/failed) &
 	(! stale build/node-small.wasm || web_small || echo web >>build/failed) &
 	web_deps
@@ -115,7 +113,6 @@ test)
 	node tests/vectors.mjs vectors/vectors.json
 	lune run luau/tests/vectors.luau vectors/vectors.json
 	lune run luau/tests/client.luau
-	lune run luau/tests/services.luau
 	# Structured state held to a model, with its shortcuts and without: side by side, as each is a minute or so.
 	lune run luau/tests/mirror_model.luau 300 & quick=$!
 	lune run luau/tests/mirror_model.luau 300 plain & long=$!
@@ -125,18 +122,14 @@ test)
 	node tests/relay_settle.mjs && node tests/relay_checkpoints.mjs
 	node tests/relay_keep.mjs
 	node bench/aead_wasm/run.mjs simd check # zsp's ChaCha20-Poly1305 held to core's in WebAssembly, as the relay runs it
-	node relay/test/public.mjs
-	node relay/test/expose_do.mjs
 	$PYTHON examples/apps/test.py
+	$PYTHON examples/forward/test.py
 	$PYTHON examples/organization.py
 	end_to_end
-	$PYTHON tests/cli_test.py
-	$PYTHON tests/services_test.py
 	if [ "$(uname)" = Linux ]; then
-		# Names, ports and exposure again, under AddressSanitizer: what glibc forgives, it does not.
+		# Calls and links again, under AddressSanitizer: what glibc forgives, it does not.
 		odin build zspd -out:build/zspd-asan -debug -sanitize:address $STRICT $TESTING
-		ZSPD=build/zspd-asan end_to_end test_names test_ports test_offers_end test_expose test_durable_object_expose test_luau_ports \
-			test_public_outlives_its_device test_public_held_off test_own_ports_kept test_services_by_scope
+		ZSPD=build/zspd-asan end_to_end test_calls test_direct_links test_sync_through_relay test_call_outlasts_a_pause
 	fi
 	wait $web || true
 	cat build/web.log
@@ -172,9 +165,6 @@ bench)
 		node web/build.ts
 		node --expose-gc web/test/bench.ts ${3:-100000}
 		node web/test/browsers.ts bench
-	elif [ "${2:-}" = ports ]; then # what names, ports and exposure cost: ./x bench ports
-		odin build zspd -out:build/zspd$EXE -o:speed $STRICT
-		$PYTHON tests/measure_ports.py
 	elif [ "${2:-}" = mirror ]; then # what structured state costs a client: ./x bench mirror [rows]
 		lune run luau/tests/mirror_bench.luau ${3:-2000}
 	elif [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]
@@ -197,20 +187,6 @@ bench)
 	fi
 	;;
 nat) odin build zspd -out:build/zspd -debug $STRICT && sudo tests/nat.sh && sudo env NAT_B=--random-fully EXPECT_RELAY=1 tests/nat.sh ;;
-system) # names and addresses as every application here has them: zspd setup, as root, and taken back after
-	odin build zspd -out:build/zspd$EXE -debug $STRICT $TESTING
-	SUDO=sudo
-	[ "${OS:-}" = Windows_NT ] && SUDO= # an Administrator already, or nothing here works
-	$SUDO build/zspd$EXE setup
-	r=0
-	$PYTHON tests/system.py || r=$?
-	$SUDO build/zspd$EXE setup --undo
-	# Taken back whatever it was set up with, though --undo is told nothing of it.
-	$SUDO build/zspd$EXE setup --names=elsewhere.test --loopback=127.78.0 >/dev/null
-	$SUDO build/zspd$EXE setup --undo
-	$PYTHON tests/system.py nothing-left || r=1
-	exit $r
-	;;
-slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT $TESTING && end_to_end slow_hibernation slow_expose_hibernation ;;
+slow) wasm && odin build zspd -out:build/zspd$EXE -debug $STRICT $TESTING && end_to_end slow_hibernation ;;
 *) sed -n 2p "$0" && exit 2 ;;
 esac
