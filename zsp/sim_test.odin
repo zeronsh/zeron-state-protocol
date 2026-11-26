@@ -37,6 +37,33 @@ Sim_Storage :: enum u8 {
 Sim_Link :: struct {
 	a, b:   ^Session, // a dialled
 	an, bn: int,
+	lanes:  ^Sim_Lanes, // when the pipe carries many streams
+}
+
+// A pipe of many streams, as a link is: each lane's bytes arrive in order, in any order with the others', but
+// never before as much of the session's own stream as its first bytes said.
+@(private)
+Sim_Lanes :: struct {
+	ends:    [2]Sim_Lane_End,
+	moved:   [2]u64, // of the sessions' own streams, delivered each way
+	flight:  [2][dynamic]Sim_Chunk, // each way
+	opened:  int, // lanes, ever
+}
+
+@(private)
+Sim_Lane_End :: struct {
+	lanes: ^Sim_Lanes,
+	side:  int,
+	next:  u64,
+}
+
+@(private)
+Sim_Chunk :: struct {
+	id:      u64,
+	urgency: u8,
+	after:   u64,
+	bytes:   []byte, // owned
+	end:     bool,
 }
 
 @(private)
@@ -52,6 +79,7 @@ Sim :: struct {
 	ring:   int,
 	bytes:  int,
 	lazy:   Sim_Storage, // what relays keep things in
+	lanes:  bool, // links between devices carry many streams
 }
 
 @(private)
@@ -253,15 +281,74 @@ sim_link :: proc(s: ^Sim, a, b: int) {
 		}
 	}
 	x, y := s.nodes[a], s.nodes[b]
-	append(
-		&s.links,
-		Sim_Link {
-			session_open(&x.node, .Peer, true, x25519_public(y.secret), relay = y.relay),
-			session_open(&y.node, .Peer, false, x25519_public(x.secret)),
-			a,
-			b,
-		},
-	)
+	l := Sim_Link {
+		session_open(&x.node, .Peer, true, x25519_public(y.secret), relay = y.relay),
+		session_open(&y.node, .Peer, false, x25519_public(x.secret)),
+		a,
+		b,
+		nil,
+	}
+	if s.lanes && !x.relay && !y.relay {
+		l.lanes = new(Sim_Lanes)
+		for &e, i in l.lanes.ends {
+			e = {l.lanes, i, u64(2 if i == 0 else 1)}
+			session := l.a if i == 0 else l.b
+			session.lane_data = &e
+			session.lane_open = proc(data: rawptr, urgency: u8, after: u64) -> (id: u64, ok: bool) {
+				e := (^Sim_Lane_End)(data)
+				id = e.next
+				e.next += 2
+				e.lanes.opened += 1
+				return id, true
+			}
+		}
+	}
+	append(&s.links, l)
+}
+
+// Moves some of what lanes have to say one way, and delivers some of what is on its way, in any order the pipe
+// allows. Returns whether anything moved.
+@(private)
+sim_lanes :: proc(s: ^Sim, l: ^Sim_Lanes, from, to: ^Session, way: int) -> (busy: bool) {
+	lanes := session_lanes(from)
+	for i := 0; i < len(lanes); i += 1 {
+		lane := lanes[i]
+		if out := session_lane_output(from, lane); len(out) > 0 {
+			n := len(out) if rand.int_max(2) == 0 else 1 + rand.int_max(len(out))
+			append(&l.flight[way], Sim_Chunk{lane.id, lane.urgency, lane.after, slice.clone(out[:n]), false})
+			session_lane_sent(from, lane, n)
+			busy = true
+		}
+		if session_lane_done(from, lane) {
+			append(&l.flight[way], Sim_Chunk{id = lane.id, after = lane.after, end = true})
+			session_lane_closed(from, lane)
+			lanes = session_lanes(from)
+			i -= 1
+			busy = true
+		}
+	}
+	flight := &l.flight[way]
+	for _ in 0 ..< len(flight) {
+		// Any chunk that is first of its lane, and whose lane may be delivered.
+		i := rand.int_max(len(flight))
+		c := flight[i]
+		first := true
+		for j in 0 ..< i {
+			first &&= flight[j].id != c.id
+		}
+		if !first || l.moved[way] < c.after {
+			continue
+		}
+		ordered_remove(flight, i)
+		if c.end {
+			session_lane_heard(to, c.id, false)
+		} else {
+			testing.expectf(s.t, session_lane_input(to, c.id, c.urgency, c.bytes), "lane input failed: %v", to.fault)
+			delete(c.bytes)
+		}
+		busy = true
+	}
+	return
 }
 
 @(private)
@@ -270,14 +357,27 @@ sim_cut :: proc(s: ^Sim, i: int) {
 	unordered_remove(&s.links, i)
 	session_close(l.a)
 	session_close(l.b)
+	if l.lanes != nil {
+		for f in l.lanes.flight {
+			for c in f {
+				delete(c.bytes)
+			}
+			delete(f)
+		}
+		free(l.lanes)
+	}
 }
 
 // Moves some bytes one way. Returns whether there were any.
 @(private)
-sim_pass :: proc(s: ^Sim, from, to: ^Session) -> bool {
+sim_pass :: proc(s: ^Sim, from, to: ^Session, lanes: ^Sim_Lanes = nil, way := 0) -> bool {
 	out := session_output(from)
+	busy := false
+	if lanes != nil {
+		busy = sim_lanes(s, lanes, from, to, way)
+	}
 	if len(out) == 0 {
-		return false
+		return busy
 	}
 	n := 1 + rand.int_max(len(out))
 	if rand.int_max(3) > 0 {
@@ -288,6 +388,9 @@ sim_pass :: proc(s: ^Sim, from, to: ^Session) -> bool {
 	copy(copied, out)
 	session_sent(from, n)
 	s.bytes += n
+	if lanes != nil {
+		lanes.moved[way] += u64(n)
+	}
 	ok := session_input(to, copied)
 	testing.expectf(s.t, ok, "session failed: %v", to.fault)
 	return true
@@ -316,8 +419,8 @@ sim_settle :: proc(s: ^Sim) {
 			}
 		}
 		for l in s.links {
-			busy |= sim_pass(s, l.a, l.b)
-			busy |= sim_pass(s, l.b, l.a)
+			busy |= sim_pass(s, l.a, l.b, l.lanes, 0)
+			busy |= sim_pass(s, l.b, l.a, l.lanes, 1)
 		}
 		for x in s.nodes {
 			if x.remote != nil {
@@ -639,9 +742,9 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 			if len(s.links) > 0 {
 				l := rand.choice(s.links[:])
 				if rand.int_max(2) == 0 {
-					sim_pass(s, l.a, l.b)
+					sim_pass(s, l.a, l.b, l.lanes, 0)
 				} else {
-					sim_pass(s, l.b, l.a)
+					sim_pass(s, l.b, l.a, l.lanes, 1)
 				}
 			}
 		}
@@ -678,6 +781,7 @@ sim_worlds :: proc(t: ^testing.T, lazy: Sim_Storage) {
 		s: Sim
 		s.lazy = lazy
 		sim_init(t, &s, full = 3, partial = 1, relays = 1 + seed % 2, ring = 8 if seed % 3 == 0 else 256)
+		s.lanes = seed % 5 == 2
 		defer sim_destroy(&s)
 		sim_chaos(&s, 800)
 		// Heal, through the relays alone, or with them hushed.

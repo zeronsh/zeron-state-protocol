@@ -110,10 +110,12 @@ caller_flow :: proc(c: ^Caller, id: u64, side: int, kind: Flow, body: string) {
 calls_between_devices :: proc(t: ^testing.T) {
 	state := seeded(21)
 	context.random_generator = rand.default_random_generator(&state)
-	// Once over a direct link, once with only a relay between.
-	for relayed in ([]bool{false, true}) {
+	// Over a direct link, then one that carries each call on a stream of its own, then with only a relay between.
+	for mode in 0 ..< 3 {
+		relayed := mode == 2
 		s: Sim
 		sim_init(t, &s, full = 2, partial = 1, relays = 1, ring = 64)
+		s.lanes = mode == 1
 		defer sim_destroy(&s)
 		a, b := s.nodes[0], s.nodes[1]
 		if relayed {
@@ -196,6 +198,12 @@ calls_between_devices :: proc(t: ^testing.T) {
 		}
 		testing.expect_value(t, len(ca.data), 10 * 100_001)
 
+		if s.lanes {
+			// Each call went on a lane of its own, and every lane of a call that is over is gone, both ways.
+			l := s.links[0]
+			testing.expectf(t, l.lanes.opened >= 5, "%d lanes", l.lanes.opened)
+			testing.expect_value(t, len(session_lanes(l.a)) + len(session_lanes(l.b)), 2) // call 7 goes on
+		}
 		// The path fails: both sides are told, and told it is in doubt.
 		n := len(ca.faults)
 		for len(s.links) > 0 {
@@ -330,14 +338,16 @@ tunnels_are_begun_again :: proc(t: ^testing.T) {
 // Who is called has, by then, what the caller wrote before calling.
 @(test)
 calls_come_after_what_they_are_about :: proc(t: ^testing.T) {
-	for relayed in 0 ..< 2 {
-		state := seeded(u64(24 + relayed))
+	for mode in 0 ..< 3 {
+		relayed := mode == 1
+		state := seeded(u64(24 + mode))
 		context.random_generator = rand.default_random_generator(&state)
 		s: Sim
 		sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
+		s.lanes = mode == 2 // each call on a stream of its own, which may overtake what was said before it
 		defer sim_destroy(&s)
 		a, b := s.nodes[0], s.nodes[1]
-		if relayed == 1 {
+		if relayed {
 			sim_link(&s, 0, 2)
 			sim_link(&s, 1, 2)
 		} else {
@@ -363,8 +373,8 @@ calls_come_after_what_they_are_about :: proc(t: ^testing.T) {
 			caller_call(&ca, u64(2 + i), b.keys.device, 1, "echo", "look")
 			for len(cb.calls) == calls {
 				for l in s.links {
-					sim_pass(&s, l.a, l.b)
-					sim_pass(&s, l.b, l.a)
+					sim_pass(&s, l.a, l.b, l.lanes, 0)
+					sim_pass(&s, l.b, l.a, l.lanes, 1)
 				}
 				caller_read(&cb)
 				caller_read(&ca)

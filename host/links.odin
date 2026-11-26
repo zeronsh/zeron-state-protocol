@@ -335,9 +335,79 @@ peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
 	}
 	p.knocks = 0
 	p.session = zsp.session_open(&p.space.node, .Peer, peer_dials(p), p.device)
-	p.session.datagram_data = p
-	p.session.datagram = proc(data: rawptr, frame: []byte) -> bool {
-		return pipe.link_datagram((^Peer)(data).link, frame)
+	session_link(p.session, p.link)
+}
+
+// Lets a session over a link send each call on a stream of its own.
+@(private)
+session_link :: proc(session: ^zsp.Session, l: ^pipe.Link) {
+	session.datagram_data = l
+	session.datagram = proc(data: rawptr, frame: []byte) -> bool {
+		return pipe.link_datagram((^pipe.Link)(data), frame)
+	}
+	session.lane_data = l
+	session.lane_open = proc(data: rawptr, urgency: u8, after: u64) -> (id: u64, ok: bool) {
+		return pipe.link_open((^pipe.Link)(data), urgency, after)
+	}
+}
+
+// What came on a link's streams: the session's own, or a call's.
+@(private)
+link_heard :: proc(session: ^zsp.Session, l: ^pipe.Link, id: u64, bytes: []byte, event: pipe.Stream_Event) {
+	if id == 0 {
+		if event == .Data {
+			zsp.session_input(session, bytes) // its owner closes it, once it has heard why
+		}
+		return
+	}
+	switch event {
+	case .Data:
+		zsp.session_lane_input(session, id, pipe.link_urgency(l, id), bytes)
+	case .Fin:
+		zsp.session_lane_heard(session, id, false)
+	case .Reset:
+		zsp.session_lane_heard(session, id, true)
+	case .Stopped:
+		zsp.session_lane_stopped(session, id)
+	}
+}
+
+// Hands a link what a session has to say, on its own stream and its calls', as far as the link has room.
+@(private)
+link_feed :: proc(session: ^zsp.Session, l: ^pipe.Link) {
+	if room := pipe.link_room(l, 0); room > 0 {
+		out := zsp.session_output(session)
+		if n := min(len(out), room); n > 0 {
+			pipe.link_write(l, 0, out[:n])
+			zsp.session_sent(session, n)
+		}
+	}
+	lanes := zsp.session_lanes(session)
+	for i := 0; i < len(lanes); i += 1 {
+		lane := lanes[i]
+		if !pipe.link_has(l, lane.id) {
+			// The link has let it go, so both ends are done with it.
+			lane.heard = true
+			zsp.session_lane_closed(session, lane)
+			lanes = zsp.session_lanes(session)
+			i -= 1
+			continue
+		}
+		out := zsp.session_lane_output(session, lane)
+		if len(out) > 0 {
+			pipe.link_after(l, lane.id, lane.after)
+			if n := min(len(out), pipe.link_room(l, lane.id)); n > 0 {
+				pipe.link_write(l, lane.id, out[:n])
+				zsp.session_lane_sent(session, lane, n)
+			}
+		}
+		if zsp.session_lane_done(session, lane) {
+			pipe.link_after(l, lane.id, lane.after)
+			pipe.link_finish(l, lane.id)
+			zsp.session_lane_closed(session, lane)
+			lanes = zsp.session_lanes(session)
+			i -= 1
+		}
 	}
 }
 
@@ -345,11 +415,11 @@ peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
 peer_wire :: proc(p: ^Peer, l: ^pipe.Link) {
 	l.data = p
 	// The packet that proves a link may already carry its first bytes.
-	l.on_stream = proc(l: ^pipe.Link, bytes: []byte) {
+	l.on_stream = proc(l: ^pipe.Link, id: u64, bytes: []byte, event: pipe.Stream_Event) {
 		p := (^Peer)(l.data)
 		peer_opened(p, l)
 		if l == p.link && p.session != nil {
-			zsp.session_input(p.session, bytes) // links_run closes it, once it has heard why
+			link_heard(p.session, l, id, bytes, event)
 		}
 	}
 	l.on_datagram = proc(l: ^pipe.Link, bytes: []byte) {
@@ -653,15 +723,7 @@ links_flush :: proc(h: ^Host) {
 			continue
 		}
 		for {
-			room := pipe.link_room(p.link)
-			if room > 0 {
-				out := zsp.session_output(p.session)
-				n := min(len(out), room)
-				if n > 0 {
-					pipe.link_write(p.link, out[:n])
-					zsp.session_sent(p.session, n)
-				}
-			}
+			link_feed(p.session, p.link)
 			packet := pipe.link_output(p.link, buf[:], now)
 			if packet == nil {
 				break

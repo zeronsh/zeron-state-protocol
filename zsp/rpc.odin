@@ -49,6 +49,7 @@ SELF :: max(u32) // the session of an end that is this node itself
 End :: struct {
 	session: u32,
 	tunnel:  u32, // within that session, if not zero
+	lane:    u64, // within that session, if not zero
 	id:      u64,
 	ended:   bool, // has sent its last message
 	granted: int, // how much more it may send
@@ -56,9 +57,10 @@ End :: struct {
 
 @(private)
 Call :: struct {
-	ends:  [2]End,
-	scope: Scope,
-	own:   bool, // between the nodes themselves
+	ends:    [2]End,
+	scope:   Scope,
+	own:     bool, // between the nodes themselves
+	urgency: u8, // of the lanes it takes
 }
 
 @(private)
@@ -132,7 +134,7 @@ on_serve :: proc(s: ^Session, r: ^Reader) {
 
 // id, device, scope, method, for whom, first message
 @(private)
-on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
+on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil, lane: ^Lane = nil) {
 	n := s.node
 	id := read_varint(r)
 	device := read_key32(r)
@@ -144,10 +146,14 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 		r.bad = true
 		return
 	}
-	from := End{session = s.id, tunnel = tunnel.id if tunnel != nil else 0, id = id, granted = CALL_WINDOW}
+	from := End{session = s.id, tunnel = tunnel.id if tunnel != nil else 0, lane = lane.id if lane != nil else 0, id = id, granted = CALL_WINDOW}
+	if lane != nil {
+		lane.calls += 1
+	}
 	refuse :: proc(n: ^Node, from: End, f: Call_Fault) {
 		to := from
 		call_flow(n, &to, CALLEE, .Fault, {u8(f)})
+		end_release(n, from)
 	}
 	for c in n.calls {
 		if c.ends[CALLER].session == from.session && c.ends[CALLER].tunnel == from.tunnel && c.ends[CALLER].id == id {
@@ -182,7 +188,7 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 	}
 	from.granted -= len(body)
 	n.next_call += 1
-	c := Call{scope = scope, own = own}
+	c := Call{scope = scope, own = own, urgency = lane.urgency if lane != nil else method_urgency(method)}
 	c.ends[CALLER] = from
 	to := &c.ends[CALLEE]
 	to.id = n.next_call
@@ -228,13 +234,26 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 @(private)
 call_out :: proc(n: ^Node, c: ^Call, device: Key32, method: string, who, body: []byte) -> Maybe(Call_Fault) {
 	to := &c.ends[CALLEE]
+	// A direct session, and of those one that replicates rather than one only for calls.
+	direct: ^Session
 	for p in n.sessions {
-		if p.ready && p.role == .Peer && p.peer == device && !p.peer_relay {
-			to.session = p.id
-			append(&n.calls, c^)
-			call_put(&p.out, p, to.id, device, c.scope, method, who, body)
-			return nil
+		if p.ready && p.role != .Open && p.peer == device && !p.peer_relay && (direct == nil || direct.role == .Calls) {
+			direct = p
 		}
+	}
+	if p := direct; p != nil {
+		to.session = p.id
+		flush_changes(p) // it may be about them
+		cells_close(p)
+		w := &p.out
+		if l := lane_open(p, c.urgency); l != nil {
+			to.lane = l.id
+			l.calls += 1
+			w = lane_out(p, l)
+		}
+		append(&n.calls, c^)
+		call_put(w, nil, to.id, device, c.scope, method, who, body)
+		return nil
 	}
 	t := tunnel_to(n, device)
 	if t == nil {
@@ -262,7 +281,7 @@ node_call :: proc(n: ^Node, device: Key32, scope: Scope, body: []byte) -> u64 {
 		return 0
 	}
 	n.next_call += 2
-	c := Call{scope = scope, own = true}
+	c := Call{scope = scope, own = true, urgency = method_urgency("")}
 	c.ends[CALLER] = {session = SELF, id = n.next_call - 1, granted = CALL_WINDOW - len(body)}
 	c.ends[CALLEE] = {id = n.next_call, granted = CALL_WINDOW}
 	if _, failed := call_out(n, &c, device, "", nil, body).?; failed {
@@ -397,6 +416,7 @@ flow_pass :: proc(n: ^Node, i: int, side: int, kind: Flow, payload: []byte) {
 		if from.granted < 0 || len(payload) > CALL_WINDOW {
 			call_flow(n, from, 1 - side, .Fault, {u8(Call_Fault.Overrun)})
 			call_flow(n, to, side, .Fault, {u8(Call_Fault.Overrun)})
+			call_over(n, c)
 			unordered_remove(&n.calls, i)
 			return
 		}
@@ -413,6 +433,7 @@ flow_pass :: proc(n: ^Node, i: int, side: int, kind: Flow, payload: []byte) {
 	}
 	call_flow(n, to, side, kind, payload)
 	if over {
+		call_over(n, c)
 		unordered_remove(&n.calls, i)
 	}
 }
@@ -438,6 +459,12 @@ call_flow :: proc(n: ^Node, to: ^End, speaker: int, kind: Flow, payload: []byte)
 		append(w, ..payload)
 		frame_end(w, at)
 	}
+	if to.lane != 0 {
+		if l := lane_find(s, to.lane); l != nil && !l.ended {
+			put(lane_out(s, l), to.id, speaker, kind, payload)
+		}
+		return
+	}
 	if to.tunnel == 0 {
 		cells_close(s)
 		put(&s.out, to.id, speaker, kind, payload)
@@ -455,13 +482,37 @@ call_flow :: proc(n: ^Node, to: ^End, speaker: int, kind: Flow, payload: []byte)
 
 // A path has failed: every call on it is lost.
 @(private)
-calls_lost :: proc(n: ^Node, session: u32, tunnel: u32 = 0) {
+calls_lost :: proc(n: ^Node, session: u32, tunnel: u32 = 0, lane: u64 = 0) {
 	#reverse for &c, i in n.calls {
 		for &e, side in c.ends {
-			if e.session == session && (tunnel == 0 || e.tunnel == tunnel) {
+			if e.session == session && (tunnel == 0 || e.tunnel == tunnel) && (lane == 0 || e.lane == lane) {
 				call_flow(n, &c.ends[1 - side], side, .Fault, {u8(Call_Fault.Lost)})
+				call_over(n, &c)
 				unordered_remove(&n.calls, i)
 				break
+			}
+		}
+	}
+}
+
+// A call is over: the lanes its ends took are ended once what is on them has been sent.
+@(private)
+call_over :: proc(n: ^Node, c: ^Call) {
+	for e in c.ends {
+		end_release(n, e)
+	}
+}
+
+@(private)
+end_release :: proc(n: ^Node, e: End) {
+	if e.lane == 0 {
+		return
+	}
+	if s := node_session(n, e.session); s != nil {
+		if l := lane_find(s, e.lane); l != nil {
+			l.calls -= 1
+			if l.calls <= 0 {
+				l.over = true
 			}
 		}
 	}
@@ -511,6 +562,7 @@ rpc_roster_changed :: proc(n: ^Node) {
 			for &e, side in c.ends {
 				call_flow(n, &e, 1 - side, .Fault, {u8(Call_Fault.Denied)})
 			}
+			call_over(n, &c)
 			unordered_remove(&n.calls, i)
 		}
 	}

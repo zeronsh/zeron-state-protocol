@@ -22,6 +22,7 @@ MAX_STALLED :: 4 * MAX_FRAME // input held while storage fetches what a frame ne
 Role :: enum u8 {
 	Peer, // sealed cells over an authenticated channel
 	Open, // plain cells over a trusted pipe
+	Calls, // a peer's, over a link through a relay, for calls and nothing else: the relay carries everything else
 }
 
 Fault :: enum u8 {
@@ -88,6 +89,11 @@ Session :: struct {
 	// Where live frames go when the pipe has a faster, lossier way to carry them.
 	datagram_data: rawptr,
 	datagram:  proc(data: rawptr, frame: []byte) -> bool,
+	// Where the pipe carries many streams, a call's own (see lane.odin).
+	lanes:     [dynamic]^Lane,
+	lane_data: rawptr,
+	lane_open: proc(data: rawptr, urgency: u8, after: u64) -> (id: u64, ok: bool),
+	taken:     u64, // bytes of `out` the host has taken, ever
 }
 
 Watch :: struct {
@@ -124,7 +130,8 @@ Hello_Flags :: bit_field u8 {
 	full:  bool | 1,
 	relay: bool | 1,
 	authors: bool | 1, // a local client's, which wants to be told who wrote what
-	_:     u8   | 5,
+	calls: bool | 1, // for calls only, over a link through a relay
+	_:     u8   | 4,
 }
 
 Task :: struct {
@@ -234,6 +241,7 @@ session_close :: proc(s: ^Session) {
 		}
 	}
 	rpc_session_closed(n, s)
+	lanes_destroy(s)
 	if q := &n.host.questions; s.role == .Open && q.ended != nil {
 		q.ended(q.data, s)
 	}
@@ -347,6 +355,10 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 	if len(s.input) == 0 && cap(s.input) > 4096 {
 		shrink(&s.input)
 	}
+	s.busy = false
+	if s.ready && len(s.lanes) > 0 {
+		lanes_take(s) // what waited on lanes for the session to be ready
+	}
 	return !s.closing
 }
 
@@ -362,6 +374,7 @@ session_output :: proc(s: ^Session) -> []byte {
 
 session_sent :: proc(s: ^Session, n: int) {
 	s.sent += n
+	s.taken += u64(n)
 	if s.sent == len(s.out) {
 		s.sent = 0
 		clear(&s.out)
@@ -386,6 +399,9 @@ session_frame :: proc(s: ^Session, frame: []byte) -> Fault {
 		// Nothing is accepted before both sides agree on membership; a peer that is merely early
 		// is told by the roster already on its way.
 		return .Denied
+	}
+	if s.role == .Calls && type != .Hello && type != .Roster && type != .Call && type != .Flow && type != .Error {
+		return .Malformed // it carries calls, and nothing else
 	}
 	#partial switch type {
 	case .Hello:
@@ -443,7 +459,7 @@ send_hello :: proc(s: ^Session) {
 	n := s.node
 	at := frame_begin(&s.out, .Hello)
 	write_u8(&s.out, VERSION)
-	write_u8(&s.out, u8(Hello_Flags{full = n.full, relay = n.keys == nil}))
+	write_u8(&s.out, u8(Hello_Flags{full = n.full && s.role != .Calls, relay = n.keys == nil, calls = s.role == .Calls}))
 	append(&s.out, ..n.space[:])
 	write_varint(&s.out, n.roster.serial)
 	write_bytes(&s.out, s.credential)
@@ -469,7 +485,10 @@ on_hello :: proc(s: ^Session, r: ^Reader) -> Fault {
 		return .Malformed
 	}
 	s.greeted = true
-	if s.role == .Peer && space != n.space {
+	if s.role != .Open && space != n.space {
+		return .Denied
+	}
+	if flags.calls != (s.role == .Calls) {
 		return .Denied
 	}
 	s.peer_full = flags.full
@@ -478,11 +497,11 @@ on_hello :: proc(s: ^Session, r: ^Reader) -> Fault {
 		return .Denied
 	}
 	switch {
-	case s.initiator && s.role == .Peer:
+	case s.initiator && s.role != .Open:
 		session_accept(s) // the dialler chose whom to dial
 	case n.host.authenticate != nil:
 		n.host.authenticate(n.host.data, s, credential)
-	case s.role == .Peer:
+	case s.role != .Open:
 		session_accept(s)
 	case:
 		return .Denied
@@ -585,7 +604,7 @@ on_roster :: proc(s: ^Session, r: ^Reader) -> Fault {
 session_authorize :: proc(s: ^Session) {
 	n := s.node
 	before := slice.clone(s.grants[:], context.temp_allocator)
-	if s.role == .Peer {
+	if s.role != .Open {
 		clear(&s.grants)
 		m := roster_member(&n.roster, s.peer)
 		switch {
@@ -604,6 +623,10 @@ session_authorize :: proc(s: ^Session) {
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, denied = true})
 			on_unwatch(s, w.id)
 		}
+	}
+	if s.role == .Calls {
+		s.ready = true
+		return
 	}
 	if s.role == .Open {
 		s.ready = true

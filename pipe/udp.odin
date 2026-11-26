@@ -190,6 +190,7 @@ Stream :: struct {
 	fin_lost:    bool, // to be said again
 	reset:       enum u8 {None, Due, Sent, Acked},
 	headed:      bool, // its first bytes, the header, are written
+	head_after:  Maybe(u64), // what the header is to say of stream 0
 
 	// Receiving.
 	in_next:     u64, // delivered, header included
@@ -358,10 +359,10 @@ packet_receiver :: proc(packet: []byte) -> (id: u32, ok: bool) {
 
 // ---------------------------------------------------------------- streams, for whoever uses the link
 
-// Opens a stream, to be delivered after all that has yet been written to stream 0. Fails while the peer
-// lets no more be opened.
+// Opens a stream, to be delivered after `after` bytes of stream 0, or by default all that has yet been
+// written to it. Fails while the peer lets no more be opened.
 @(require_results)
-link_open :: proc(l: ^Link, urgency: u8) -> (id: u64, ok: bool) {
+link_open :: proc(l: ^Link, urgency: u8, after: Maybe(u64) = nil) -> (id: u64, ok: bool) {
 	if l.state == .Closed || l.closing || l.opened >= l.may_open {
 		return
 	}
@@ -369,8 +370,24 @@ link_open :: proc(l: ^Link, urgency: u8) -> (id: u64, ok: bool) {
 	id = l.opened * 2 + (0 if l.dialler else 1) - (0 if l.dialler else 2)
 	s := stream_new(l, id)
 	s.urgency = min(urgency, 7)
+	s.head_after = after
 	stream_head(l, s)
 	return id, true
+}
+
+// Says how much of stream 0 must be delivered before what this end sends on a stream the peer opened: by
+// default, all that has been written to it by the time this end first writes to the stream.
+link_after :: proc(l: ^Link, id: u64, after: u64) {
+	if s := stream_find(l, id); s != nil && !s.headed {
+		s.head_after = after
+	}
+}
+
+// How urgent a stream is, as its opener said.
+@(require_results)
+link_urgency :: proc(l: ^Link, id: u64) -> u8 {
+	s := stream_find(l, id)
+	return s.urgency if s != nil else 3
 }
 
 // How many more bytes are worth handing a stream now: what the peer permits, of what the link is willing to
@@ -553,7 +570,7 @@ stream_head :: proc(l: ^Link, s: ^Stream) {
 	head: [MAX_HEADER]byte
 	head[0] = s.urgency
 	n := 1
-	v := stream_end(zero)
+	v := s.head_after.? or_else stream_end(zero)
 	for v >= 0x80 {
 		head[n] = byte(v) | 0x80
 		v >>= 7

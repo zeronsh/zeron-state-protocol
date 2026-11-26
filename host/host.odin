@@ -180,7 +180,7 @@ space_authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
 	switch {
 	case h.authenticate != nil:
 		h.authenticate(h.data, s, credential)
-	case s.role == .Peer:
+	case s.role != .Open:
 		zsp.session_accept(s)
 	case:
 		zsp.session_refuse(s)
