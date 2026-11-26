@@ -24,8 +24,10 @@ USAGE :: `zspd - Zeron State Protocol node
   zspd create <dir>                          make a space, owned by this device
   zspd key <dir>                             print what an admin needs to admit this device
   zspd scope <dir> [signed]                  add a scope to the space
-  zspd admit <dir> <key> <scope> [read|vouch] grant a device a scope: to read, write and call; only to read; or to say
-                                             for whom, too, and be believed
+  zspd admit <dir> <key> <scope> [read|vouch|shell|files ...]
+                                             grant a device a scope: to read, write and call; only to read; to say
+                                             for whom, too, and be believed; to use what devices share of terminals
+                                             and commands, or of files
   zspd revoke <dir> <key> [scope]            end a device's grants
   zspd subject <dir> <key> <text>            say whose a device is: an account, a name, as you know them
   zspd members <dir>                         list devices: key, rights in each scope, whose it is
@@ -37,6 +39,21 @@ USAGE :: `zspd - Zeron State Protocol node
   zspd run <dir> [options]                   run a device's node
   zspd serve <dir> [options]                 run a relay
 
+  zspd share <dir> [line ...]                say what this device shares, or share instead, a line each:
+                                             "shell <scope> [terminal] [commands]",
+                                             "files <scope> <name> read|write <path>"; "" for nothing
+  zspd services <dir> <device>               what a device offers this one
+  zspd connect <dir> <device> <port> [host]  join stdin and stdout to a TCP port there, or one it reaches (as an ssh
+                                             ProxyCommand, say)
+  zspd exec <dir> <device> [--] <argv...>    run a command there: its stdin, stdout and stderr are these, its exit
+                                             code this one's (128 and the signal, if one ended it; 255 if it could
+                                             not run), and signals sent here go there
+  zspd terminal <dir> <device>               a terminal there, the user's shell, in this one
+  zspd ls <dir> <device> [path]              list a folder there; with no path, the shares of files
+  zspd get <dir> <device> <remote> [local]   fetch a file or a folder; again, after a break, it takes up where it
+                                             stopped
+  zspd put <dir> <device> <local> <remote>   send a file or a folder
+
   --listen=<addr:port>   serve WebSockets here (run: 127.0.0.1:0, serve: 0.0.0.0:8787)
   --udp=<port>           use this port for direct links
   --no-udp               make no direct links
@@ -45,6 +62,15 @@ USAGE :: `zspd - Zeron State Protocol node
   --credential=<text>    present this to relays
   --allow=<space,...>    serve only these spaces
   --verbose
+
+  <device>               a device's key, the start of one, or whose it is, as the roster says
+  <path>, <remote>       a share's name, then the path within it, '/' between
+  <remote>, <local>      where what is sent or fetched goes: there; or, ending in '/', a share alone, or for a file a
+                         folder that is there already, into it, under its own name
+  --scope=N              call in this scope (1)
+  --cwd=<dir>            exec: begin there, not at home
+  --env=NAME[=value]     exec: set this, or with no value unset it
+  --replace              put: over what is there
 `
 
 main :: proc() {
@@ -59,6 +85,9 @@ run :: proc() -> int {
 	}
 	verbose := false
 	for a in args {
+		if a == "--" {
+			break // what follows is a command's, not this one's
+		}
 		verbose ||= a == "--verbose"
 	}
 	// Standard output is for answers.
@@ -96,12 +125,16 @@ run :: proc() -> int {
 			copy(device[:], key)
 			copy(signer[:], key[32:])
 			rights := zsp.Rights{.Read, .Write, .Call}
-			if len(args) > 2 {
-				switch args[2] {
+			for word in args[2:] {
+				switch word {
 				case "read":
-					rights = {.Read}
+					rights -= {.Write, .Call}
 				case "vouch":
 					rights += {.Vouch}
+				case "shell":
+					rights += {.Shell}
+				case "files":
+					rights += {.Files}
 				case:
 					return false
 				}
@@ -161,6 +194,22 @@ run :: proc() -> int {
 		ok = len(rest) == 1 && join_from_roster(dir, rest[0])
 	case "run", "serve":
 		return serve(dir, rest, args[0] == "serve")
+	case "share":
+		return share(dir, rest)
+	case "services":
+		return services(dir, rest)
+	case "connect":
+		return connect(dir, rest)
+	case "exec":
+		return exec(dir, rest)
+	case "terminal":
+		return terminal(dir, rest)
+	case "ls":
+		return ls(dir, rest)
+	case "get":
+		return get(dir, rest)
+	case "put":
+		return put(dir, rest)
 	case:
 		os.write_string(os.stderr, USAGE)
 		return 2
@@ -271,7 +320,7 @@ members :: proc(dir: string) -> bool {
 			if g.until != 0 {
 				continue
 			}
-			say(os.stdout, " ", strconv.write_uint(buf[:], u64(g.scope), 10), ":", "r" if .Read in g.rights else "", "w" if .Write in g.rights else "", "c" if .Call in g.rights else "", "v" if .Vouch in g.rights else "")
+			say(os.stdout, " ", strconv.write_uint(buf[:], u64(g.scope), 10), ":", "r" if .Read in g.rights else "", "w" if .Write in g.rights else "", "c" if .Call in g.rights else "", "v" if .Vouch in g.rights else "", "s" if .Shell in g.rights else "", "f" if .Files in g.rights else "")
 		}
 		say(os.stdout, " owner" if m.owner else " admin" if m.admin else "", "\t", string(m.subject), "\n")
 	}

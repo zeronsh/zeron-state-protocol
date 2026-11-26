@@ -130,6 +130,12 @@ zspd key ~/.zsp                             # on another device,
 zspd admit ~/.zsp <that> 1                  # on this one, at once, running or not,
 zspd join ~/.zsp <space> <relay key> ws://host:8787 && zspd run ~/.zsp     # and there
 zspd admin ~/.zsp <that>                    # let it admit others; `off` to take that back
+
+zspd admit ~/.zsp <that> 1 shell files      # let it use what devices share in scope 1
+zspd share ~/.zsp "shell 1" "files 1 docs read $HOME/Documents"   # on this one, what it shares
+zspd services ~/.zsp <this>                 # on that one, what this one offers it
+zspd exec ~/.zsp <this> -- uname -a         # a command here, from there; `terminal` for a shell
+zspd get ~/.zsp <this> docs/report.pdf ./   # a file or a folder; again, after a break, to take up from there
 ```
 
 ```luau

@@ -788,10 +788,10 @@ def zspd_space(node):
         return f.read().strip()
 
 
-def one(name):
+def one(name, tests=None):
     start = time.monotonic()
     try:
-        globals()[name]()
+        (tests or globals())[name]()
         print(f"ok   {name} {time.monotonic() - start:.2f}s")
         return 0
     except BaseException as e:
@@ -809,15 +809,17 @@ def one(name):
             p.wait()
 
 
-def main():
-    names = sys.argv[1:] or [n for n in globals() if n.startswith("test_")]
+def main(tests=None, file=__file__):
+    """Every test of a file side by side, each in a process of its own; or the one named."""
+    tests = tests or globals()
+    names = sys.argv[1:] or [n for n in tests if n.startswith("test_")]
     if len(names) == 1:
-        code = one(names[0])
+        code = one(names[0], tests)
         if code == 0:
             shutil.rmtree(TMP, ignore_errors=True)
         sys.exit(code)
     os.rmdir(TMP)
-    runs = [subprocess.Popen([sys.executable, __file__, n], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for n in names]
+    runs = [subprocess.Popen([sys.executable, file, n], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for n in names]
     for r in runs:
         sys.stdout.write(r.communicate()[0])
     sys.exit(any(r.returncode for r in runs))
