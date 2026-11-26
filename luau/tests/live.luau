@@ -197,7 +197,7 @@ for i = 1, 100 do
 			task.wait()
 		end
 		started = os.clock() - clock
-		assert(started < 0.1, "tokens are seen at once")
+		assert(started < 0.1, string.format("tokens are seen at once, not %.1f ms after", started * 1000))
 	end
 	if i % 10 == 0 then
 		task.wait(0.005)
