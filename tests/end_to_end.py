@@ -1128,6 +1128,10 @@ def test_services_by_scope():
     assert b"\x03" + struct.pack(">H", web) in one and b"local" in one, one
     assert b"secret" not in one and struct.pack(">H", 9999) not in one, one
     assert b"secret" in listed(int(two))
+    # A port offered in both, under a name in each: listed in each, as offered there.
+    ca.offer(web, int(two), name="other")
+    assert b"local" in listed(1) and b"other" not in listed(1)
+    assert b"other" in listed(int(two)) and b"\x03" + struct.pack(">H", web) in listed(int(two)), listed(int(two))
 
 
 def test_ports():

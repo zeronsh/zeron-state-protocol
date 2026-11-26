@@ -308,7 +308,7 @@ own_port :: proc(h: ^Host, port: u16) -> bool {
 
 // What a device is offered now, in temporary memory, ascending by port; and a hash of it.
 @(private)
-offered_to :: proc(p: ^Ports, device: zsp.Key32) -> (list: []Port_Entry, said: u64) {
+offered_to :: proc(p: ^Ports, device: zsp.Key32, scope: zsp.Scope = 0) -> (list: []Port_Entry, said: u64) {
 	sp := p.space
 	out := make([dynamic]Port_Entry, context.temp_allocator)
 	taken := make(map[u16]bool, context.temp_allocator)
@@ -322,7 +322,7 @@ offered_to :: proc(p: ^Ports, device: zsp.Key32) -> (list: []Port_Entry, said: u
 		append(out, e)
 	}
 	for &o in p.offers {
-		if o.device != {} && o.device != device {
+		if (o.device != {} && o.device != device) || (scope != 0 && o.scope != scope) { // in one scope, if asked
 			continue
 		}
 		if .Call not_in zsp.device_rights(&sp.node, device, o.scope) || .Call not_in zsp.device_rights(&sp.node, sp.host.device, o.scope) {

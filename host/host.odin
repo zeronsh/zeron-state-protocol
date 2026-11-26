@@ -346,14 +346,12 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 				if p := sp.ports; len(p.watchers) == 0 || time.tick_diff(p.scanned, time.tick_now()) >= SCAN_EVERY {
 					ports_scan(p)
 				}
-				list, _ := offered_to(sp.ports, from.device)
-				out := make([dynamic]Port_Offer, 0, len(list), context.temp_allocator)
-				for e in list {
-					if e.scope == scope { // what is offered in the scope asked of, and nothing of another
-						append(&out, Port_Offer{e.port, e.host, e.name})
-					}
+				list, _ := offered_to(sp.ports, from.device, scope) // what is offered in the scope asked of, and nothing else
+				out := make([]Port_Offer, len(list), context.temp_allocator)
+				for e, i in list {
+					out[i] = {e.port, e.host, e.name}
 				}
-				return out[:]
+				return out
 			}
 		}
 		host_serve(h, "zsp.public", public_called)
