@@ -411,10 +411,10 @@ public_in_free :: proc(c: ^Public_In) {
 }
 
 // The PROXY protocol's second version: where a connection came from, and where to, before anything of it; with what
-// else the target should know, as type ‖ length ‖ value. Owned.
-proxy_header :: proc(from: pipe.Address, to: [4]byte, port: u16, extra: []byte) -> []byte {
+// else the target should know, as type ‖ length ‖ value. In `allocator`'s memory.
+proxy_header :: proc(from: pipe.Address, to: [4]byte, port: u16, extra: []byte, allocator := context.allocator) -> []byte {
 	from, to := from, to
-	w := make([dynamic]byte)
+	w := make([dynamic]byte, allocator)
 	append(&w, "\r\n\r\n\x00\r\nQUIT\n")
 	if pipe.address_is_v4(from) {
 		append(&w, 0x21, 0x11, 0, 0) // a connection, of TCP over IPv4
@@ -434,7 +434,8 @@ proxy_header :: proc(from: pipe.Address, to: [4]byte, port: u16, extra: []byte) 
 }
 
 // What a device's connection through an offer marked proxy says first: PROXY v2, from the device's address here, as any
-// application here would see it, to this machine's port; with TLVs 0xE0, the device's key, and 0xE1, its name. Owned.
+// application here would see it, to this machine's port; with TLVs 0xE0, the device's key, and 0xE1, its name. In
+// temporary memory.
 port_proxy_header :: proc(sp: ^Space, caller: zsp.Key32, port: u16) -> []byte {
 	caller := caller
 	ip, _ := device_address(sp, caller)
@@ -446,7 +447,7 @@ port_proxy_header :: proc(sp: ^Space, caller: zsp.Key32, port: u16) -> []byte {
 		append(&extra, 0xe1, byte(len(name) >> 8), byte(len(name)))
 		append(&extra, name)
 	}
-	return proxy_header(pipe.address_v4(ip[0], ip[1], ip[2], ip[3], 0), {127, 0, 0, 1}, port, extra[:])
+	return proxy_header(pipe.address_v4(ip[0], ip[1], ip[2], ip[3], 0), {127, 0, 0, 1}, port, extra[:], context.temp_allocator)
 }
 
 // zsp.expose, for a local client: 0 to list, 1 ‖ port (2) ‖ prefix bytes ‖ flags (1: 1 proxy) to expose a port, 2 ‖ port (2)

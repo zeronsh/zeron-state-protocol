@@ -1,5 +1,6 @@
 package host
 
+import "core:mem"
 import "core:nbio"
 import "core:strings"
 import "core:testing"
@@ -88,4 +89,23 @@ expose_frame_whole_or_not_at_all :: proc(t: ^testing.T) {
 	append(&trailing, 0)
 	public_exposed(&ts.space, &s, trailing[:])
 	testing.expect(t, len(ts.host.public.labels) == 1 && ts.host.public.labels[0].label == held)
+}
+
+// What a device's connection through an offer marked proxy says first is in temporary memory, as the host's
+// proxy_prelude is to give it: whoever asks copies it, and nothing of it is left behind.
+@(test)
+proxy_prelude_is_temporary :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts, {"", "desk", ""})
+	defer test_space_destroy(&ts)
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	header: []byte
+	{
+		context.allocator = mem.tracking_allocator(&track)
+		header = port_proxy_header(&ts.space, ts.keys[1].device, 8080)
+	}
+	testing.expect(t, len(header) > 16 && string(header[:12]) == "\r\n\r\n\x00\r\nQUIT\n")
+	testing.expect_value(t, len(track.allocation_map), 0)
 }
