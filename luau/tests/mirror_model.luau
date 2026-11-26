@@ -27,7 +27,8 @@ local store: (Peer, string) -> { [string]: boolean }
 local parse_question: (string) -> any
 
 local clock = 1800000000
-local function peer(): Peer
+-- One told its scopes at once; or, `later`, when the function it is given back is called.
+local function peer(later: boolean?): (Peer, () -> ())
 	local self: Peer = { client = nil, receive = function() end, deferred = {}, out = {}, asked = {}, said = {}, entered = {} }
 	self.client = zsp.connect({
 		credential = "x",
@@ -81,13 +82,18 @@ local function peer(): Peer
 			}
 		end,
 	})
-	local w = codec.writer()
-	codec.put_u8(w, ROSTER)
-	codec.put(w, string.rep("\0", 8) .. "\1\7" .. KEY)
-	local framed = codec.writer()
-	codec.put_bytes(framed, codec.string(w))
-	self.receive(codec.string(framed))
-	return self
+	local function greet()
+		local w = codec.writer()
+		codec.put_u8(w, ROSTER)
+		codec.put(w, string.rep("\0", 8) .. "\1\7" .. KEY)
+		local framed = codec.writer()
+		codec.put_bytes(framed, codec.string(w))
+		self.receive(codec.string(framed))
+	end
+	if not later then
+		greet()
+	end
+	return self, greet
 end
 
 local answer: (Peer) -> boolean
@@ -729,7 +735,7 @@ local function equal(a: any, b: any, ids: boolean?): boolean
 		b = nil
 	end
 	if type(a) ~= "table" or type(b) ~= "table" then
-		return a == b
+		return a == b or (a ~= a and b ~= b) -- NaN, which a writer may put in a number column, is itself
 	end
 	for k, v in a do
 		if (ids ~= false or k ~= "id") and not equal(v, b[k], ids) then
@@ -805,7 +811,7 @@ local Board = m.map({
 	tasks = m.list(18, Task),
 	scores = m.record(zsp.number(16)),
 	people = m.record(Person),
-	outline = m.tree(19, m.map({ name = zsp.string(16), body = zsp.text(17), marks = m.list(18, zsp.number(16)) })),
+	outline = m.tree(19, m.map({ name = zsp.string(16), body = zsp.text(17), marks = m.list(18, zsp.number(16)), look = m.map({ color = zsp.string(16) }) })),
 	numbers = m.list(20, zsp.number(16)),
 })
 
@@ -903,9 +909,10 @@ local function mutate(d: any)
 				n.name = word()
 				n.body = (n.body or "") .. word()
 				table.insert(n.marks, math.random(100))
+				n.look.color = if math.random(4) == 1 then nil else word()
 			else
 				local into = if #all > 0 and math.random(2) == 1 then all[math.random(#all)].children else d.outline
-				table.insert(into, math.random(1, #into + 1), { name = word(), children = {}, marks = { 1, 2 } })
+				table.insert(into, math.random(1, #into + 1), { name = word(), children = {}, marks = { 1, 2 }, look = { color = word() } })
 			end
 		elseif r == 10 then
 			d.count = if math.random(4) == 1 then nil else math.random(1000)
@@ -1121,8 +1128,41 @@ do
 	pass(a, b, since, true)
 	assert(da.state().tasks[1].notes == ", and more", `a has {da.state().tasks[1].notes}`)
 	assert(db.state().tasks[1].notes == ", and more", `b has {db.state().tasks[1].notes}`)
+
+	-- NaN, as anyone may write in a number, is what it was: a state that has it, set again, writes nothing.
+	da.update(function(d)
+		d.count = 0 / 0
+	end)
+	run(a)
+	since = #a.out
+	da.set(table.clone(da.state()))
+	run(a)
+	assert(#a.out == since, "NaN as it was is written again")
 	da.stop()
 	db.stop()
+end
+
+-- Another stretch asked for before the client is told its scopes is the stretch it is given once it is.
+do
+	local w, _ = peer()
+	local dw = m.open(w.client, { scope = 1, name = document, schema = Board })
+	run(w)
+	dw.set({ tasks = { { title = "a", tags = {}, steps = {}, plan = {} }, { title = "b", tags = {}, steps = {}, plan = {} }, { title = "c", tags = {}, steps = {}, plan = {} } } })
+	run(w)
+	local r, greet = peer(true)
+	local got: any = nil
+	local asked = m.ask(r.client, { scope = 1, name = document, schema = Board }, { "tasks" }, { order = { "title" }, limit = 1 }, function(a)
+		got = a
+	end)
+	asked.move(1, 1)
+	greet()
+	for _, c in w.out do
+		hear(r, c)
+	end
+	run(r)
+	assert(got.status == "ready" and got.first == 1 and #got.rows == 1 and got.rows[1].title == "b", `the second: {got.rows[1] and got.rows[1].title}`)
+	asked.stop()
+	dw.stop()
 end
 
 -- Nothing put after an element is nothing written.

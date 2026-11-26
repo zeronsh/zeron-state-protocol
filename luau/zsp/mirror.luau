@@ -37,6 +37,11 @@ local function same(v: any): any
 	return v
 end
 
+-- Whether two values are one: as the very same, and so NaN with NaN, which a writer may put in any number column.
+local function alike(a: any, b: any): boolean
+	return rawequal(a, b) or (a ~= a and b ~= b)
+end
+
 local WHERE_COLUMN: Column = table.freeze({ slot = WHERE, text = false, is = "string", encode = same, decode = same, who = nil })
 local WINDOW = table.freeze({ [W] = WHERE_COLUMN }) -- one shape, so that all who open a document share its window
 
@@ -571,7 +576,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			parts[i] = v
 			if not changed then
 				local pv = was[name]
-				changed = not rawequal(if pv == nil then NIL else pv, v)
+				changed = not alike(if pv == nil then NIL else pv, v)
 			end
 		end
 		if not changed then
@@ -615,7 +620,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			return false
 		end
 		for i, v in b do
-			if not rawequal(a[i], v) then
+			if not alike(a[i], v) then
 				return false
 			end
 		end
@@ -1205,7 +1210,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					return
 				end
 				local values: { [string]: any } = {}
-				if new ~= old or made then
+				if not alike(new, old) or made then
 					if new == nil then
 						values.e = ""
 					else
@@ -1265,7 +1270,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 								end
 							end)
 						end
-					elseif nv ~= ov or made then
+					elseif not alike(nv, ov) or made then
 						if nv ~= nil then
 							values[name] = nv
 						elseif ov ~= nil or (made and old ~= nil) then
@@ -1459,10 +1464,10 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					old = (old or {}) :: any
 					local frames: { Frame } = st.frames or {}
 					local a, z = 0, 0
-					while a < #old and a < #new and old[a + 1] == new[a + 1] do
+					while a < #old and a < #new and alike(old[a + 1], new[a + 1]) do
 						a += 1
 					end
-					while z < #old - a and z < #new - a and old[#old - z] == new[#new - z] do
+					while z < #old - a and z < #new - a and alike(old[#old - z], new[#new - z]) do
 						z += 1
 					end
 					change.edit(owner, b.slot, function(t, fresh)
@@ -2225,7 +2230,31 @@ function mirror.ask(
 			table.insert(by_id, q)
 		end
 	end
+	-- The maps within each that answers, which are there whether their rows are or not, but say what they hold; and, in a
+	-- tree, within every node, since a node is given with all beneath it.
+	local function maps_of_given()
+		local p = place
+		if not p or not p.box.of.kind then
+			return
+		end
+		local ids: { string } = {}
+		for _, r in if answers.found then answers.found.rows else {} do
+			maps_within(p.box.of, r.id, doc._derive, ids)
+		end
+		if p.box.kind == "tree" then
+			local mine = `tree {#p.trees} `
+			for name, a in answers do
+				if string.sub(name, 1, #mine) == mine then
+					for _, r in a.rows do
+						maps_within(p.box.of, r.id, doc._derive, ids)
+					end
+				end
+			end
+		end
+		within_maps(ids)
+	end
 	local found_handle: any = nil
+	local moved: { offset: number, limit: number? }? = nil -- asked for before there was anything to move
 	local function start(): boolean
 		if place or stopped then
 			return true
@@ -2257,17 +2286,13 @@ function mirror.ask(
 			totals = asking.totals,
 		}, function(a: any)
 			answers.found = a
-			-- And the maps within each that answers, which are there whether their rows are or not, but say what they hold.
-			if b.of.kind then
-				local ids: { string } = {}
-				for _, r in a.rows do
-					maps_within(b.of, r.id, doc._derive, ids)
-				end
-				within_maps(ids)
-			end
+			maps_of_given()
 			tell()
 		end)
 		table.insert(questions, found_handle)
+		if moved then
+			found_handle.move(moved.offset, moved.limit)
+		end
 		-- The rows on the way: whether what answers is there is theirs to say.
 		local on_the_way: any = client:ask({ scope = scope, table = { ["\0where"] = BYTES_COLUMN }, where = where.ids(p.chain), limit = 1000 }, function(a: any)
 			answers.chain = a
@@ -2294,6 +2319,7 @@ function mirror.ask(
 							page(k)
 						end
 					end
+					maps_of_given()
 					tell()
 				end)
 				table.insert(questions, q)
@@ -2321,6 +2347,8 @@ function mirror.ask(
 		move = function(offset: number, limit: number?)
 			if found_handle then
 				found_handle.move(offset, limit)
+			else
+				moved = { offset = offset, limit = limit }
 			end
 		end,
 		stop = function()

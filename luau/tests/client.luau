@@ -565,6 +565,28 @@ do
 	h.run()
 	assert(shown.rows[1].body == "hello!", shown.rows[1].body)
 
+	-- What an editor typed and had not yet sealed is its own: a change that fails after touching that text does not take
+	-- it back, here or anywhere.
+	local editor = h.client:text(id, Note.body)
+	editor.insert(6, "typed")
+	local before = #h.self.said
+	assert(not pcall(function()
+		h.client:write(1, function(change)
+			change.set(id, Note, { body = "written over" })
+			error("not after all")
+		end)
+	end))
+	h.run()
+	assert(shown.rows[1].body == "hello!typed", `the typing is kept: {shown.rows[1].body}`)
+	local sent = false
+	for k = before + 1, #h.self.said do
+		sent = sent or h.self.said[k].kind == CELLS
+	end
+	assert(sent, "and sent, as typing is")
+	editor.close()
+	h.run()
+	assert(shown.rows[1].body == "hello!typed", shown.rows[1].body)
+
 	-- A value that cannot be read as its column's kind is no value, and all else is shown as ever.
 	local Strict = { title = zsp.string(16), body = zsp.text(17), n = zsp.custom(18, function(v: any): string
 		return tostring(v)
@@ -597,7 +619,7 @@ do
 	codec.put(c, string.rep("\254", 14) .. "\1\1")
 	codec.put_bytes(c, body)
 	h.tell(CELLS, "\0" .. codec.string(c))
-	assert(shown.rows[1].body == "hello!", "the text is as it was")
+	assert(shown.rows[1].body == "hello!typed", "the text is as it was")
 end
 
 -- Before the scope is known every map's id is nothing: two maps are not taken for one another meanwhile.

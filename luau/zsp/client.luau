@@ -1979,6 +1979,11 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	end
 	local function put(row: string, slot: number, kind: number, body: string)
 		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 192 bytes")
+		-- What an editor has open in the slot is its own writing, sent whatever becomes of this change: first, then.
+		local held = self.rows[row]
+		if held and held.texts[slot] and held.texts[slot].open ~= "" then
+			self:_seal(held, slot)
+		end
 		local stamp = self:_stamp()
 		keep(row, slot)
 		rows[row] = true
