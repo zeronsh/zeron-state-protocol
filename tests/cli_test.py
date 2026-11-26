@@ -98,7 +98,11 @@ def test_files():
     os.makedirs(drop)
     secret = os.path.join(TMP, "fl-secret")
     folder(secret, {"key": b"not for anyone"})
-    os.symlink(os.path.join(secret, "key"), os.path.join(docs, "away"))
+    try:
+        os.symlink(os.path.join(secret, "key"), os.path.join(docs, "away"))
+        linked = True
+    except OSError:  # as Windows may refuse whoever may not make links
+        linked = False
     a, b = shared("fl", f"files 1 docs read {docs}", f"files 1 drop write {drop}")
     here = os.path.join(TMP, "fl-here")
     os.makedirs(here)
@@ -106,7 +110,7 @@ def test_files():
     # Listed: the shares, a folder, a file.
     assert re.findall(r"(\S+)\n", ok("ls", a.dir, "fl-b")) == ["docs/", "drop/"]
     listing = ok("ls", a.dir, "fl-b", "docs")
-    assert [l.split()[-1] for l in listing.splitlines()] == ["away", "big.bin", "tree/"], listing
+    assert [l.split()[-1] for l in listing.splitlines()] == ["away"] * linked + ["big.bin", "tree/"], listing
     assert re.search(rf"^\s+{len(big)}\s+\d{{4}}-\d\d-\d\d \d\d:\d\d  big.bin$", listing, re.M), listing
     assert ok("ls", a.dir, "fl-b", "docs/big.bin").split()[-1] == "big.bin"
 
@@ -121,7 +125,7 @@ def test_files():
     assert again.count("here already") == 3 and "bytes" not in again, again
     # A share is a folder like any other: all of it comes but the link that leads out of it, which is said.
     code, out, err = cli("get", a.dir, "fl-b", "docs", os.path.join(here, "all"))
-    assert code == 1 and err.decode().endswith("away: denied\n"), (out, err)
+    assert (code == 1 and err.decode().endswith("away: denied\n")) if linked else code == 0, (out, err)
     assert set(tree(os.path.join(here, "all"))) == {"big.bin", "tree/a.txt", "tree/sub/b.bin", "tree/sub/empty"}
 
     # Sent: a file, a folder; again, which sends nothing; over what is there only when told to.
@@ -145,7 +149,7 @@ def test_files():
     for args, said in (
         (("ls", a.dir, "fl-b", "docs/.."), b"denied"),
         (("get", a.dir, "fl-b", "docs/../fl-secret/key", here + "/"), b"denied"),
-        (("get", a.dir, "fl-b", "docs/away", here + "/"), b"denied"),
+        *([(("get", a.dir, "fl-b", "docs/away", here + "/"), b"denied")] if linked else []),
         (("put", a.dir, "fl-b", os.path.join(mine, "one.txt"), "docs/"), b"denied"),
         (("ls", a.dir, "fl-b", "secret"), b"not offered"),
         (("get", a.dir, "fl-b", "docs/nothing", here + "/"), b"not found"),
@@ -223,6 +227,21 @@ def test_exec():
     work = os.path.join(TMP, "ex-work")
     os.makedirs(work)
     a, b = shared("ex", "shell 1")
+    if os.name == "nt":
+        # Without a POSIX shell, the same said by Python; signals are POSIX's, and Windows has none of them to send.
+        py = [sys.executable, "-c"]
+        assert cli("exec", a.dir, "ex-b", "--", *py, "exit(7)")[0] == 7
+        code, out, err = cli("exec", a.dir, "ex-b", "--", *py, "import sys; print('out'); print('err', file=sys.stderr); print('more')")
+        assert (code, out.replace(b"\r", b""), err.replace(b"\r", b"")) == (0, b"out\nmore\n", b"err\n"), (code, out, err)
+        data = os.urandom(5 * MiB)
+        code, out, err = cli("exec", a.dir, "ex-b", "--", *py, "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())", input=data)
+        assert code == 0 and out == data, (code, len(out), err)
+        code, out, err = cli("exec", a.dir, "ex-b", f"--cwd={work}", "--env=ZSP_SAID=yes", "--", *py, "import os; print(os.getcwd()); print(os.environ['ZSP_SAID'])")
+        assert [os.path.realpath(x) if i == 0 else x for i, x in enumerate(out.decode().split())] == [os.path.realpath(work), "yes"], (out, err)
+        zspd("share", b.dir, "shell 1 terminal")
+        code, out, err = cli("exec", a.dir, "ex-b", "--", *py, "pass")
+        assert code == 255 and b"denied" in err, (code, err)
+        return
     # Its exit code is this one's; its output and errors stay apart.
     code, out, err = cli("exec", a.dir, "ex-b", "--", "sh", "-c", "exit 7")
     assert code == 7, (code, out, err)
@@ -249,6 +268,8 @@ def test_exec():
 
 
 def test_terminal():
+    if os.name == "nt":
+        return  # a terminal here is a POSIX one, driven as one; Windows's are tested by the host's own (process_test)
     import fcntl, pty, select, struct, termios
 
     a, b = shared("tm", "shell 1")
