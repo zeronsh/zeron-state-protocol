@@ -89,7 +89,9 @@ relayed_held_back_waits :: proc(t: ^testing.T) {
 		ticks += 1
 	}
 	a.node.host.backlog = backlog
-	testing.expectf(t, ticks < 50, "the host went round %d times in 50 ms, held back past CALL_ALIVE", ticks)
+	// Spinning, it went round some ten thousand times; waiting, it wakes for what the transfer still brings, more often
+	// on Windows, where it went round 70 times.
+	testing.expectf(t, ticks < 500, "the host went round %d times in 50 ms, held back past CALL_ALIVE", ticks)
 	testing.expect(t, world_run(&w, client_done, &c, 60 * time.Second))
 	client_destroy(&c, th)
 }
