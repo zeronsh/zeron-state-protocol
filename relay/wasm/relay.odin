@@ -265,9 +265,11 @@ exposed :: proc(s: ^zsp.Session, payload: []byte) {
 	n := zsp.read_varint(&r)
 	// What it no longer exposes is let go, and what is new is claimed: what it says again is left as it is, for a release
 	// and a claim of the same label could reach the label's own object either way round.
+	// All the device exposes here, on whichever connection said it: one it has come back on while the last is not yet
+	// known to be gone says what it exposes for both, and the last one's going takes nothing of it.
 	before := make([dynamic]string, context.temp_allocator)
 	#reverse for l, i in labels {
-		if l.conn == id {
+		if l.device == s.peer {
 			append(&before, l.label)
 			unordered_remove(&labels, i)
 		}

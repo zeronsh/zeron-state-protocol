@@ -245,10 +245,11 @@ on_call :: proc(s: ^Session, r: ^Reader, lane: ^Lane = nil) {
 @(private)
 call_out :: proc(n: ^Node, c: ^Call, device: Key32, method: string, who, body: []byte) -> Maybe(Call_Fault) {
 	to := &c.ends[CALLEE]
-	// A direct session, and of those one that replicates rather than one only for calls.
+	// A direct session, and of those one that replicates rather than one only for calls; and of those the newest, for a
+	// device that has come back on another is reached there, not on one that may be gone and not yet known to be.
 	direct: ^Session
 	for p in n.sessions {
-		if p.ready && p.role != .Open && p.peer == device && !p.peer_relay && (direct == nil || direct.role == .Calls) {
+		if p.ready && !p.closing && p.role != .Open && p.peer == device && !p.peer_relay && (direct == nil || direct.role == .Calls || p.role != .Calls) {
 			direct = p
 		}
 	}

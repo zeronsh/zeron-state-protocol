@@ -235,21 +235,27 @@ export class Space extends DurableObject {
     const first = new Uint8Array([...varint(name.length), ...name, ...address]);
     const id = this.#put(first, (n) => this.#wasm.public_open(n));
     if (!id) return null;
+    // The node it was made with, and no later one: a call's number is that node's, and another's may be the same.
+    const epoch = this.#epoch;
+    const live = () => epoch === this.#epoch && this.#wasm !== undefined;
     const pipe = {
-      room: (call) => this.#wasm.public_room(call),
+      room: (call) => (live() ? this.#wasm.public_room(call) : 0),
       send: (call, bytes) => {
+        if (!live()) return false;
         const ok = this.#put(bytes, (n) => this.#wasm.public_send(call, n));
         this.#settle();
         return ok;
       },
       say: (call, kind, credit = 0) => {
-        this.#wasm?.public_say(call, kind, credit);
-        if (kind === 3 || this.#calls.get(call)?.done) this.#calls.delete(call);
+        if (!live()) return;
+        this.#wasm.public_say(call, kind, credit);
+        if (this.#calls.get(call) === made && (kind === 3 || made.done)) this.#calls.delete(call);
         if (this.#wasm) this.#settle();
       },
       credit: (call, n) => pipe.say(call, 4, n),
     };
     const call = new Call(pipe, id);
+    const made = call;
     this.#calls.set(id, call);
     this.#settle(); // the call goes to the device at once
     return call;
@@ -259,15 +265,17 @@ export class Space extends DurableObject {
     const url = new URL(request.url);
     this.#space ??= unhex(url.pathname.slice(1));
     const label = request.headers.get("x-zsp-label");
+    const wait = Number(this.env.FULL_WAIT ?? 60000);
     if (label) {
-      // The public, for what a device exposes: it was sent here by the label's own object.
+      // The public, for what a device exposes: it was sent here by the label's own object. Not while the space is
+      // full, as devices are not: the node is not woken to fail again, and the while is not begun again.
+      if (this.#full && Date.now() - this.#full < wait) return new Response(FULL + "\n", { status: 507 });
       if (!this.#wasm && (!this.#begin() || (this.#settle(), !this.#wasm))) return new Response(FULL + "\n", { status: 507 });
       return serve(request, label, (label, ip) => this.#open(label, ip));
     }
     if (this.env.STATS === "1" && url.searchParams.has("stats")) return this.#stats();
     if (this.env.STATS === "1" && url.searchParams.has("evict")) return this.#evict(url.searchParams.get("evict"));
     if (this.env.STATS === "1" && url.searchParams.has("probe")) return this.#storage.probe().then((t) => new Response(JSON.stringify(t) + "\n"));
-    const wait = Number(this.env.FULL_WAIT ?? 60000);
     if (this.#full && Date.now() - this.#full < wait) return new Response(FULL + "\n", { status: 507 });
     if (!this.#wasm && (!this.#begin() || (this.#settle(), !this.#wasm))) return new Response(FULL + "\n", { status: 507 });
     const { 0: client, 1: server } = new WebSocketPair();

@@ -293,3 +293,47 @@ exposures_heard_bounded :: proc(t: ^testing.T) {
 	exposures_tell(p) // and none of those relays is linked to this device
 	testing.expect_value(t, len(p.exposures[0].heard), 0)
 }
+
+// A device back on a new session, while the relay still has its last, exposes what it exposes: its own label is not
+// taken from it, and the last session's going takes nothing of it.
+@(test)
+public_exposed_by_a_device_come_back :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts)
+	defer test_space_destroy(&ts)
+	ts.host.expose = "expose.test"
+	ts.host.public.have_http = true
+	ts.host.expose_http = net.Endpoint{net.IP4_Loopback, 8080}
+	defer {
+		for l in ts.host.public.labels {
+			delete(l.label)
+		}
+		delete(ts.host.public.labels)
+	}
+	frame := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&frame, 1)
+	zsp.write_bytes(&frame, transmute([]byte)string("app"))
+	append(&frame, ..make([]byte, zsp.EXPOSE_NONCE, context.temp_allocator))
+	status_of :: proc(s: ^zsp.Session) -> u8 {
+		r := zsp.Reader{buf = s.out[:]}
+		body := zsp.read_take(&r, int(zsp.read_varint(&r)))
+		b := zsp.Reader{buf = body[1:]}
+		_ = zsp.read_varint(&b)
+		_ = zsp.read_bytes(&b)
+		return zsp.read_u8(&b)
+	}
+	last, now: zsp.Session
+	last.id, last.peer, last.node = 10, ts.keys[1].device, &ts.space.node
+	now.id, now.peer, now.node = 11, ts.keys[1].device, &ts.space.node
+	defer delete(last.out)
+	defer delete(now.out)
+	public_exposed(&ts.space, &last, frame[:])
+	testing.expect_value(t, status_of(&last), 0)
+	public_exposed(&ts.space, &now, frame[:])
+	testing.expect_value(t, status_of(&now), 0) // its own, not taken
+	public_session_closed(&ts.host, &ts.space, last.id)
+	testing.expect_value(t, len(ts.host.public.labels), 1)
+	if len(ts.host.public.labels) == 1 {
+		testing.expect_value(t, ts.host.public.labels[0].session, now.id)
+	}
+}

@@ -156,8 +156,10 @@ public_exposed :: proc(sp: ^Space, s: ^zsp.Session, payload: []byte) {
 	}
 	r := zsp.Reader{buf = payload}
 	n := zsp.read_varint(&r)
+	// All the device exposes here, on whichever session said it: one it has come back on while the last is not yet known
+	// to be gone says what it exposes for both, and the last one's going takes nothing of it.
 	#reverse for l, i in rp.labels {
-		if l.space == sp && l.session == s.id {
+		if l.space == sp && l.device == s.peer {
 			delete(l.label)
 			unordered_remove(&rp.labels, i)
 		}
