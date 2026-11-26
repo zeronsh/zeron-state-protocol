@@ -22,7 +22,7 @@ def stats(cloud, space):
 
 def spent(a, b):
     s0, s1 = a["storage"], b["storage"]
-    d = {k: s1[k] - s0[k] for k in ("gets", "puts", "deletes", "got", "put", "rowsWritten", "rowsRead", "getMs", "putMs")}
+    d = {k: s1[k] - s0[k] for k in ("gets", "puts", "deletes", "got", "put", "rowsWritten", "rowsRead")}
     d["dollars"] = d["puts"] * CLASS_A + d["gets"] * CLASS_B + d["rowsWritten"] * ROW_WRITTEN
     n0, n1 = a.get("node") or {}, b.get("node") or {}
     d["node"] = {k: n1[k] - n0.get(k, 0) for k in n1 if k != "dirty"}
@@ -99,34 +99,37 @@ def main():
     print(f"a new device has all {mb:.0f} MB in {took:.1f} s: {mb / took:.1f} MB/s")
     line("catching up", d)
 
-    # A window of the latest 50, on a relay that has slept.
-    time.sleep(20 if cloud.p is None else 12)
-    s0 = stats(cloud, sid)
-    cw = b.client()
-    t = time.monotonic()
-    cw.watch(7, 1, "bench", limit=50)
-    cw.until(lambda: 7 in cw.windows and len(cw.list(1, "bench")) >= 50, timeout=60)
-    took = time.monotonic() - t
-    s1 = stats(cloud, sid)
-    d = spent(s0, s1)
-    results["window"] = {"ms": took * 1e3, **d}
-    print(f"a window of 50 after sleeping: {took * 1e3:.0f} ms")
-    line("window of 50", d)
+    # A device that keeps only what its screen shows, served a window of the latest 50 by a relay woken with nothing
+    # at hand but its manifest and its log's tail; then one far back.
+    p = e.Node("rp", "run", "--credential=" + cloud.token, "--no-udp", "--partial")
+    e.zspd("admit", a.dir, e.zspd("key", p.dir), "1")
+    e.zspd("join", p.dir, sid, cloud.key, cloud.url)
+    p.start()
+    e.eventually("it hears who belongs", lambda: os.path.exists(os.path.join(p.dir, sid, "roster")), 60)
+    for which, back, window in (("latest", True, 7), ("earliest", False, 8)):
+        urllib.request.urlopen(urllib.request.Request(cloud.url.replace("ws", "http", 1) + "/" + sid + "?evict", headers={"User-Agent": "zsp-bench"})).read()
+        s0 = stats(cloud, sid)
+        cw = p.client()
+        t = time.monotonic()
+        cw.watch(window, 1, "bench", limit=50, back=back)
+        cw.until(lambda: window in cw.windows and len(cw.list(1, "bench")) >= 50, timeout=60)
+        took = time.monotonic() - t
+        s1 = stats(cloud, sid)
+        d = spent(s0, s1)
+        results[f"window {which}"] = {"ms": took * 1e3, **d}
+        print(f"a window of the {which} 50 from a relay woken cold: {took * 1e3:.0f} ms")
+        line(f"window of the {which} 50", d)
+        cw.sock.close()
 
-    # A device that has it all already, back: one fingerprint.
+    # A device that has it all already, back: one fingerprint, and what that costs the relay.
     s0 = stats(cloud, sid)
     c.stop()
-    t = time.monotonic()
     c.start()
-    cc = c.client()
-    cc.watch(1, 1, "bench")
-    cc.until(lambda: 1 in cc.windows, timeout=60)
-    took = time.monotonic() - t
+    time.sleep(3)
     s1 = stats(cloud, sid)
     d = spent(s0, s1)
-    results["reconnect"] = {"ms": took * 1e3, **d}
-    print(f"a device that has everything, back and level: {took * 1e3:.0f} ms")
-    line("reconnecting level", d)
+    results["reconnect"] = d
+    line("a device back, level", d)
 
     s = stats(cloud, sid)
     st = s["storage"]
@@ -134,7 +137,7 @@ def main():
     gets, puts = max(st["gets"], 1), max(st["puts"], 1)
     print(
         f"at rest: the object's own storage {s['sqlite'] / 1e6:.2f} MB (${s['sqlite'] / 1e9 * DO_GB_MONTH:.5f}/month), "
-        f"wasm memory {s['memory'] / 1e6:.1f} MB; R2 get {st['getMs'] / gets:.1f} ms, put {st['putMs'] / puts:.1f} ms on average"
+        f"wasm memory {s['memory'] / 1e6:.1f} MB"
     )
     print(json.dumps(results, indent=1))
 
