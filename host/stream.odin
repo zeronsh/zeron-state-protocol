@@ -618,7 +618,9 @@ dialer_resolved :: proc(d: ^Dialer) {
 	d.dialling = nbio.dial_poly(d.endpoint, d, proc(op: ^nbio.Operation, d: ^Dialer) {
 		d.dialling = nil
 		if op.dial.err != nil {
-			report(.Debug, "cannot reach the relay at ", d.source, ": ", fmt.tprint(op.dial.err))
+			if debugging() {
+				report(.Debug, "cannot reach the relay at ", d.source, ": ", fmt.tprint(op.dial.err))
+			}
 			dialer_failed(d)
 			return
 		}
@@ -645,7 +647,9 @@ dialer_failed :: proc(d: ^Dialer) {
 	d.failures += 1
 	d.state = .Waiting
 	d.due = time.tick_add(time.tick_now(), wait)
-	report(.Debug, "the relay at ", d.source, " again in ", fmt.tprint(wait))
+	if debugging() {
+		report(.Debug, "the relay at ", d.source, " again in ", fmt.tprint(wait))
+	}
 }
 
 @(private)

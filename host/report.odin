@@ -12,3 +12,10 @@ report :: proc(level: runtime.Logger_Level, parts: ..string, loc := #caller_loca
 		l.procedure(l.data, level, strings.concatenate(parts, context.temp_allocator), l.options, loc)
 	}
 }
+
+// Whether what is said at debug level is heard: so that nothing is put into words for nobody.
+@(private)
+debugging :: proc() -> bool {
+	l := context.logger
+	return l.procedure != nil && l.lowest_level <= .Debug
+}

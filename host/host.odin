@@ -177,7 +177,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 				save(file_in(s.dir, "roster.old"), old)
 			}
 			save(file_in(s.dir, "roster"), bytes)
-			if serial, ok := zsp.roster_claims(bytes, s.node.space); ok {
+			if serial, ok := zsp.roster_claims(bytes, s.node.space); ok && debugging() {
 				report(.Debug, "roster ", fmt.tprintf("%x", serial), " taken and kept")
 			}
 			dialers_refresh(s.host)
