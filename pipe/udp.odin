@@ -1,5 +1,5 @@
 /*
-Package pipe carries sessions between machines: an encrypted reliable stream over UDP, WebSocket
+Package pipe carries sessions between machines: an encrypted reliable transport over UDP, WebSocket
 framing, and enough TLS to reach a WebSocket on port 443. Like package zsp it performs no I/O; time
 and bytes are arguments, so every protocol here runs under simulation.
 */
@@ -9,9 +9,19 @@ import "core:crypto"
 import "core:encoding/endian"
 import "../zsp"
 
-// A link is one ordered reliable byte stream plus unreliable datagrams, between two devices that
-// know each other's keys. Loss recovery follows RFC 9002. Congestion control models the path, after
-// BBR: it keeps about one bandwidth-delay product in flight, and loss alone does not frighten it.
+// A link carries many ordered reliable byte streams, each independent of the others as in QUIC, plus
+// unreliable datagrams, between two devices that know each other's keys. A packet lost from one stream
+// holds up that stream alone: the others are delivered as they come.
+//
+// Loss recovery follows RFC 9002. Congestion control models the path, after BBR: it keeps about one
+// bandwidth-delay product in flight, and loss alone does not frighten it. Flow control is per stream and
+// per link, and each window grows while it is what limits the other side. Streams are served by urgency,
+// and within an urgency by deficit round robin in which a stream that has lately had nothing to send goes
+// first (after fq_codel): keystrokes overtake a bulk transfer without anyone having to say which is which.
+//
+// Stream 0 is open from the start. Each other stream's first bytes, each way, say how urgent it is and how
+// much of stream 0 its sender had written before it, and it is delivered no earlier than that much of
+// stream 0 has been: whatever was said before a stream began is heard before it.
 //
 // An idle link sends nothing, ever. It has no timers unless data is in flight.
 
@@ -19,13 +29,22 @@ PACKET :: 1200 // until a probe proves more
 PACKET_MAX :: 1452
 HEAD :: 13 // type, receiver, counter
 MIN_WINDOW :: 2 * PACKET
-MAX_EARLY :: 2048 // pieces held out of order, however small
-RECV_WINDOW :: 1 << 20
-SEND_BUFFER :: 1 << 20
+MAX_EARLY :: 2048 // pieces held out of order, across the streams of a link, however small
+STREAM_WINDOW :: 256 << 10 // what a stream may send beyond what has been delivered, at first
+STREAM_WINDOW_MAX :: 16 << 20
+LINK_WINDOW :: 1 << 20 // and the streams of a link together
+LINK_WINDOW_MAX :: 32 << 20
+SEND_BUFFER :: 16 << 20 // at most, written and unacknowledged: twice the congestion window, short of this
+STREAMS :: 256 // that the peer may have open at once
+URGENT :: 3 // an urgency this or lower is interactive: bulk never keeps it waiting for the link's window
+RESERVE :: 64 << 10 // of the link's window, which bulk may not take
+QUANTUM :: PACKET
 ACK_DELAY :: 5 * MS
+MAX_ACK_DELAY :: 25 * MS // that a peer's word is believed about
 MAX_PROBES :: 6
 PROBE_MOST :: 2_000 * MS // between them, unless the path is slower than that
 MAX_PATH_PROBES :: 3
+MAX_HEADER :: 11 // urgency, then a varint
 
 // First bytes. STUN's are below 0x40.
 Type :: enum u8 {
@@ -42,10 +61,15 @@ SECOND_SIZE :: 1 + 4 + 4 + zsp.HANDSHAKE_2
 Frame :: enum u8 {
 	Pad      = 0,
 	Ping     = 1,
-	Ack      = 2, // largest, first run, gap/run pairs, highest stream offset permitted
-	Stream   = 3, // offset, bytes
+	Ack      = 2, // largest, delay, first run, gap/run pairs, a zero gap
+	Stream   = 3, // id, offset, bytes
 	Datagram = 4, // bytes
 	Close    = 5,
+	Fin      = 6, // id, offset, bytes: the last of the stream
+	Reset    = 7, // id, final size: its sender has given up on it
+	Stop     = 8, // id: the receiver wants no more of it
+	Window   = 9, // id, the highest offset permitted
+	Limit    = 10, // the highest sum of offsets permitted, the most streams the peer may have opened
 }
 
 Time :: distinct i64 // microseconds; zero is never
@@ -59,6 +83,14 @@ Link_State :: enum {
 	Closed,
 }
 
+// What happened to a stream, as told to whoever receives it.
+Stream_Event :: enum u8 {
+	Data, // bytes, in order
+	Fin, // there will be no more
+	Reset, // its sender gave up on it: there will be no more, and some may never have come
+	Stopped, // its receiver wants no more of what this end sends: that side is given up
+}
+
 Link :: struct {
 	state:       Link_State,
 	channel:     zsp.Channel,
@@ -67,21 +99,41 @@ Link :: struct {
 	second:      [zsp.HANDSHAKE_2]byte,
 	local:       u32, // how the peer addresses this link
 	remote:      u32,
+	dialler:     bool,
 	mtu:         int,
 	path_probes: int,
+	now:         Time, // as of the last input or output
+
+	// Streams, by id; stream 0 first, always. The dialler opens even ids, the other odd ones.
+	streams:     [dynamic]^Stream,
+	opened:      u64, // streams this end has opened
+	may_open:    u64, // how many it may have opened, by the peer's word
+	peer_floor:  u64, // every stream the peer opened, counted from 1, up to this is done with
+	peer_done:   [dynamic]u64, // and these beyond it, ascending
+	peer_opened: u64, // the most it has opened
+	peer_may:    u64, // how many it may have opened, as last told
+	limit_due:   bool,
+	due:         [dynamic]^Stream, // with something to say about themselves
+	classes:     [8]Class,
+	held:        int, // bytes written and not yet acknowledged, all streams together
+
+	// Flow control of the link as a whole.
+	out_total:   u64, // the sum, over streams, of the highest offset sent
+	out_max:     u64, // the peer's permission
+	in_total:    u64, // the sum of the highest offsets received
+	in_given:    u64, // the sum of offsets delivered
+	in_max:      u64, // our permission, as last told
+	in_window:   u64,
+	in_moved:    Time, // when it was last moved
 
 	// Sending.
-	out:         [dynamic]byte, // unacknowledged and unsent stream bytes, after some that are done with
-	out_head:    int, // how many
-	out_base:    u64, // stream offset of out[out_head]
-	out_next:    u64, // first offset never sent
-	out_limit:   u64, // the peer's permission
-	lost:        [dynamic]Range, // to send again
-	done:        [dynamic]Range, // acknowledged beyond out_base
 	datagrams:   [dynamic][]byte, // owned
 	sent:        [dynamic]Sent, // consecutive packet numbers from sent_base, after some done with
 	sent_head:   int,
 	sent_base:   u64,
+	chunks:      [dynamic]Chunk, // of what packets carried, numbered on from chunk_base, after some done with
+	chunk_head:  int,
+	chunk_base:  u64,
 	in_flight:   int,
 	largest_acked: u64,
 	acked_any:   bool,
@@ -110,20 +162,66 @@ Link :: struct {
 	// Receiving.
 	seen:        [dynamic]Range, // packet numbers, newest last
 	seen_floor:  u64, // below this, every packet is as good as seen
+	largest_at:  Time, // when the newest of them came
 	ack_due:     Time,
 	ack_count:   int,
-	in_next:     u64,
-	in_limit:    u64,
-	early:       [dynamic]Early, // ascending by offset
+	early:       int, // pieces held, all streams together
+	release:     bool, // stream 0 has moved on: what waited for it may not need to
 
 	// Where bytes go.
 	data:        rawptr,
-	on_stream:   proc(l: ^Link, bytes: []byte),
+	on_stream:   proc(l: ^Link, id: u64, bytes: []byte, event: Stream_Event),
 	on_datagram: proc(l: ^Link, bytes: []byte),
+}
+
+Stream :: struct {
+	id:          u64,
+	urgency:     u8,
+
+	// Sending.
+	out:         [dynamic]byte, // written and not yet acknowledged, after some that are done with
+	out_head:    int, // how many
+	out_base:    u64, // the offset of out[out_head]
+	out_next:    u64, // the first offset never sent
+	out_limit:   u64, // the peer's permission
+	lost:        [dynamic]Range, // to send again
+	done:        [dynamic]Range, // acknowledged beyond out_base
+	fin:         enum u8 {None, Wanted, Sent, Acked},
+	fin_lost:    bool, // to be said again
+	reset:       enum u8 {None, Due, Sent, Acked},
+	headed:      bool, // its first bytes, the header, are written
+
+	// Receiving.
+	in_next:     u64, // delivered, header included
+	in_high:     u64, // the highest offset received
+	in_limit:    u64, // our permission, as last told
+	in_window:   u64,
+	in_moved:    Time,
+	in_end:      u64, // when ended
+	ended:       bool, // its final size is known
+	told:        bool, // its end, Fin or Reset, has been told
+	stopped:     bool, // what comes is unwanted, and dropped
+	stop_due:    bool,
+	window_due:  bool,
+	listed_due:  bool, // in Link.due
+	pieces:      [dynamic]Early, // ascending by offset
+	head:        [MAX_HEADER]byte,
+	head_size:   int,
+	after:       u64, // of stream 0, to be delivered first
+	ready:       bool, // its header has come, and that much of stream 0
+
+	// Its turn.
+	list:        enum u8 {None, New, Old},
+	deficit:     int,
 }
 
 Range :: struct {
 	lo, hi: u64,
+}
+
+@(private)
+Class :: struct {
+	fresh, old: [dynamic]^Stream,
 }
 
 @(private)
@@ -134,13 +232,22 @@ Sent :: struct {
 	idle:   bool, // sent with nothing queued behind it, so no measure of the path's rate
 	delivered: u64, // at the time of sending
 	delivered_at: Time,
-	stream: Range,
+	chunk:  u64, // the first of its chunks
+	chunks: u16,
+}
+
+// Something a packet carried that must come again if the packet does not arrive.
+@(private)
+Chunk :: struct {
+	id:     u64,
+	lo, hi: u64,
+	kind:   enum u8 {Data, Fin, Reset, Stop, Window, Limit},
 }
 
 @(private)
 Early :: struct {
 	offset: u64,
-	bytes:  []byte, // owned
+	bytes:  [dynamic]byte,
 }
 
 @(private)
@@ -152,15 +259,20 @@ link_init :: proc(l: ^Link) {
 	l.window = 10 * PACKET
 	l.starting = true
 	l.ceiling = 1e12
-	l.out_limit = RECV_WINDOW
-	l.in_limit = RECV_WINDOW
+	l.out_max = LINK_WINDOW
+	l.in_max = LINK_WINDOW
+	l.in_window = LINK_WINDOW
+	l.may_open = STREAMS
+	l.peer_may = STREAMS
 	l.srtt = 200_000
 	l.rttvar = 100_000
 	l.rtt_min = 1e12
+	stream_new(l, 0)
 }
 
 link_dial :: proc(l: ^Link, secret, peer, space: zsp.Key32, now: u64 = 1) -> bool {
 	link_init(l)
+	l.dialler = true
 	l.first = zsp.handshake_start(&l.handshake, secret, peer, space, nil, now) or_return
 	l.channel.peer = peer
 	return true
@@ -171,11 +283,15 @@ link_answer :: proc(l: ^Link, secret, space: zsp.Key32, packet: []byte) -> bool 
 	if len(packet) != FIRST_SIZE || Type(packet[0]) != .First {
 		return false
 	}
+	second, channel, ok := zsp.handshake_answer(secret, space, packet[5:])
+	if !ok {
+		return false
+	}
 	link_init(l)
 	l.state = .Waiting
 	l.remote = endian.unchecked_get_u32le(packet[1:])
 	copy(l.first[:], packet[5:])
-	l.second, l.channel = zsp.handshake_answer(secret, space, packet[5:]) or_return
+	l.second, l.channel = second, channel
 	return true
 }
 
@@ -186,19 +302,23 @@ link_answers :: proc(l: ^Link, packet: []byte) -> bool {
 }
 
 link_destroy :: proc(l: ^Link) {
-	delete(l.out)
-	delete(l.lost)
-	delete(l.done)
+	for s in l.streams {
+		stream_free(l, s)
+	}
+	delete(l.streams)
+	delete(l.peer_done)
+	delete(l.due)
+	for &c in l.classes {
+		delete(c.fresh)
+		delete(c.old)
+	}
 	for d in l.datagrams {
 		delete(d)
 	}
 	delete(l.datagrams)
 	delete(l.sent)
+	delete(l.chunks)
 	delete(l.seen)
-	for e in l.early {
-		delete(e.bytes)
-	}
-	delete(l.early)
 	crypto.zero_explicit(l, size_of(Link))
 }
 
@@ -236,33 +356,94 @@ packet_receiver :: proc(packet: []byte) -> (id: u32, ok: bool) {
 	return
 }
 
-// How many more stream bytes are worth handing over now.
+// ---------------------------------------------------------------- streams, for whoever uses the link
+
+// Opens a stream, to be delivered after all that has yet been written to stream 0. Fails while the peer
+// lets no more be opened.
 @(require_results)
-link_room :: proc(l: ^Link) -> int {
-	if l.state != .Open || l.closing {
+link_open :: proc(l: ^Link, urgency: u8) -> (id: u64, ok: bool) {
+	if l.state == .Closed || l.closing || l.opened >= l.may_open {
+		return
+	}
+	l.opened += 1
+	id = l.opened * 2 + (0 if l.dialler else 1) - (0 if l.dialler else 2)
+	s := stream_new(l, id)
+	s.urgency = min(urgency, 7)
+	stream_head(l, s)
+	return id, true
+}
+
+// How many more bytes are worth handing a stream now: what the peer permits, of what the link is willing to
+// hold. An interactive stream always has some, however much bulk is queued.
+@(require_results)
+link_room :: proc(l: ^Link, id: u64 = 0) -> int {
+	s := stream_find(l, id)
+	if s == nil || l.state != .Open || l.closing || s.fin != .None || s.reset != .None {
 		return 0
 	}
 	// Two windows' worth keeps the pipe full and what is already promised short.
-	return clamp(int(l.window) * 2, 16 << 10, SEND_BUFFER) - link_held(l)
+	total := clamp(int(l.window) * 2, 16 << 10, SEND_BUFFER)
+	permitted := int(min(s.out_limit - min(s.out_limit, stream_end(s)), 1 << 30))
+	held := int(stream_end(s) - s.out_base)
+	room := min(total - l.held, permitted)
+	if s.urgency <= URGENT || s.id == 0 {
+		room = max(room, min(16 << 10 - held, permitted))
+	}
+	return max(room, 0)
 }
 
-@(private)
-link_held :: proc(l: ^Link) -> int {
-	return len(l.out) - l.out_head
+// Hands a stream bytes to send, as many as link_room says there is room for, or more.
+link_write :: proc(l: ^Link, id: u64, bytes: []byte) -> bool {
+	s := stream_find(l, id)
+	if s == nil || s.fin != .None || s.reset != .None || l.state == .Closed {
+		return false
+	}
+	if len(bytes) == 0 {
+		return true
+	}
+	stream_head(l, s)
+	append(&s.out, ..bytes)
+	l.held += len(bytes)
+	stream_wake(l, s)
+	return true
 }
 
-@(private)
-link_sent :: proc(l: ^Link) -> []Sent {
-	return l.sent[l.sent_head:]
+// There will be no more to send on a stream.
+link_finish :: proc(l: ^Link, id: u64) {
+	s := stream_find(l, id)
+	if s == nil || id == 0 || s.fin != .None || s.reset != .None {
+		return
+	}
+	stream_head(l, s)
+	s.fin = .Wanted
+	stream_wake(l, s)
 }
 
-@(private)
-link_next :: proc(l: ^Link) -> u64 {
-	return l.sent_base + u64(len(l.sent) - l.sent_head)
+// Gives up on sending a stream: what is unsent is never sent, and the peer hears so.
+link_reset :: proc(l: ^Link, id: u64) {
+	s := stream_find(l, id)
+	if s == nil || id == 0 || s.reset != .None || s.fin == .Acked {
+		return
+	}
+	stream_give_up(l, s)
 }
 
-link_write :: proc(l: ^Link, bytes: []byte) {
-	append(&l.out, ..bytes)
+// Wants no more of a stream: what comes is dropped, and the peer is asked to stop.
+link_stop :: proc(l: ^Link, id: u64) {
+	s := stream_find(l, id)
+	if s == nil || id == 0 || s.stopped || s.told {
+		return
+	}
+	s.stopped = true
+	s.stop_due = true
+	stream_drop_pieces(l, s)
+	stream_due(l, s)
+}
+
+// Whether a stream is still open, either way.
+@(require_results)
+link_has :: proc(l: ^Link, id: u64) -> bool {
+	return stream_find(l, id) != nil
 }
 
 link_datagram :: proc(l: ^Link, bytes: []byte) -> bool {
@@ -275,10 +456,18 @@ link_datagram :: proc(l: ^Link, bytes: []byte) -> bool {
 	return true
 }
 
-// Whether all that was written has arrived.
+// Whether all that was written has arrived, and every stream's end been heard.
 @(require_results)
 link_quiet :: proc(l: ^Link) -> bool {
-	return link_held(l) == 0
+	if l.held > 0 || len(l.due) > 0 {
+		return false
+	}
+	for s in l.streams {
+		if s.fin == .Wanted || s.fin == .Sent || s.reset == .Due || s.reset == .Sent {
+			return false
+		}
+	}
+	return true
 }
 
 // Says something that must be answered, so that a link to nobody is found out.
@@ -292,12 +481,265 @@ link_close :: proc(l: ^Link) {
 	l.closing = true
 }
 
+// ---------------------------------------------------------------- stream state
+
+@(private)
+stream_new :: proc(l: ^Link, id: u64) -> ^Stream {
+	s := new(Stream)
+	s.id = id
+	s.urgency = 3
+	s.out_limit = STREAM_WINDOW
+	s.in_limit = STREAM_WINDOW
+	s.in_window = STREAM_WINDOW
+	s.ready = id == 0
+	s.headed = id == 0
+	at := len(l.streams)
+	for at > 0 && l.streams[at - 1].id > id {
+		at -= 1
+	}
+	inject_at(&l.streams, at, s)
+	return s
+}
+
+@(private)
+stream_free :: proc(l: ^Link, s: ^Stream) {
+	stream_drop_pieces(l, s)
+	delete(s.out)
+	delete(s.lost)
+	delete(s.done)
+	delete(s.pieces)
+	free(s)
+}
+
+@(private)
+stream_find :: proc(l: ^Link, id: u64) -> ^Stream {
+	lo, hi := 0, len(l.streams)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if l.streams[mid].id < id {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return l.streams[lo] if lo < len(l.streams) && l.streams[lo].id == id else nil
+}
+
+@(private)
+stream_mine :: proc(l: ^Link, id: u64) -> bool {
+	return id != 0 && (id % 2 == 0) == l.dialler
+}
+
+// Counting from 1, the how-manyth stream its opener opened.
+@(private)
+stream_number :: proc(id: u64) -> u64 {
+	return id / 2 if id % 2 == 0 else (id + 1) / 2
+}
+
+// The end of what has been written.
+@(private)
+stream_end :: proc(s: ^Stream) -> u64 {
+	return s.out_base + u64(len(s.out) - s.out_head)
+}
+
+// Writes the header that begins a stream each way, before anything else written to it.
+@(private)
+stream_head :: proc(l: ^Link, s: ^Stream) {
+	if s.headed {
+		return
+	}
+	s.headed = true
+	zero := l.streams[0]
+	head: [MAX_HEADER]byte
+	head[0] = s.urgency
+	n := 1
+	v := stream_end(zero)
+	for v >= 0x80 {
+		head[n] = byte(v) | 0x80
+		v >>= 7
+		n += 1
+	}
+	head[n] = byte(v)
+	n += 1
+	append(&s.out, ..head[:n])
+	l.held += n
+}
+
+@(private)
+stream_give_up :: proc(l: ^Link, s: ^Stream) {
+	l.held -= int(stream_end(s) - s.out_base)
+	clear(&s.out)
+	shrink(&s.out)
+	clear(&s.lost)
+	clear(&s.done)
+	s.out_head = 0
+	s.out_base = s.out_next // the final size: all that was ever sent
+	s.fin = .None
+	s.fin_lost = false
+	s.reset = .Due
+	stream_due(l, s)
+}
+
+@(private)
+stream_drop_pieces :: proc(l: ^Link, s: ^Stream) {
+	for e in s.pieces {
+		delete(e.bytes)
+	}
+	l.early -= len(s.pieces)
+	clear(&s.pieces)
+	shrink(&s.pieces)
+}
+
+// Notes that a stream has a frame about itself to send: a reset, a stop or a window.
+@(private)
+stream_due :: proc(l: ^Link, s: ^Stream) {
+	if !s.listed_due {
+		s.listed_due = true
+		append(&l.due, s)
+	}
+}
+
+// Puts a stream that may have something to send in line for its turn.
+@(private)
+stream_wake :: proc(l: ^Link, s: ^Stream) {
+	if s.list != .None || s.reset != .None {
+		return
+	}
+	s.list = .New
+	s.deficit = QUANTUM
+	append(&l.classes[s.urgency].fresh, s)
+}
+
+@(private)
+stream_unlist :: proc(l: ^Link, s: ^Stream) {
+	c := &l.classes[s.urgency]
+	list := &c.fresh if s.list == .New else &c.old
+	for x, i in list {
+		if x == s {
+			ordered_remove(list, i)
+			break
+		}
+	}
+	s.list = .None
+}
+
+// How far a stream may send new bytes: what was written, what the peer permits of it and of the link.
+@(private)
+stream_allowed :: proc(l: ^Link, s: ^Stream) -> u64 {
+	link := l.out_max
+	if s.urgency > URGENT && s.id != 0 {
+		link = link - RESERVE if link > RESERVE else 0
+	}
+	credit := link - l.out_total if link > l.out_total else 0
+	return min(stream_end(s), s.out_limit, s.out_next + credit)
+}
+
+@(private)
+stream_sendable :: proc(l: ^Link, s: ^Stream) -> bool {
+	if s.reset != .None {
+		return false
+	}
+	stream_prune_lost(s)
+	if len(s.lost) > 0 || s.out_next < stream_allowed(l, s) {
+		return true
+	}
+	// The end, once all before it is on its way.
+	return (s.fin == .Wanted && s.out_next == stream_end(s)) || s.fin_lost
+}
+
+// Drops what a later copy already delivered from what is to be sent again.
+@(private)
+stream_prune_lost :: proc(s: ^Stream) {
+	for len(s.lost) > 0 {
+		r := &s.lost[0]
+		r.lo = max(r.lo, s.out_base)
+		for d in s.done {
+			if d.lo <= r.lo && r.lo < d.hi {
+				r.lo = d.hi
+			}
+		}
+		if r.lo < r.hi {
+			return
+		}
+		ordered_remove(&s.lost, 0)
+	}
+}
+
+// Up to n bytes to send: what was lost first, then what was never sent.
+@(private)
+stream_take :: proc(l: ^Link, s: ^Stream, n: int) -> (r: Range, fin: bool) {
+	stream_prune_lost(s)
+	if len(s.lost) > 0 {
+		r = s.lost[0]
+		if r.hi - r.lo > u64(n) {
+			r.hi = r.lo + u64(n)
+			s.lost[0].lo = r.hi
+		} else {
+			ordered_remove(&s.lost, 0)
+		}
+	} else if allowed := stream_allowed(l, s); s.out_next < allowed {
+		r = {s.out_next, min(allowed, s.out_next + u64(n))}
+		l.out_total += r.hi - r.lo
+		s.out_next = r.hi
+	} else {
+		r = {s.out_next, s.out_next}
+	}
+	if s.fin != .None && r.hi == stream_end(s) && s.out_next == stream_end(s) && (s.fin == .Wanted || s.fin_lost) {
+		fin = true
+		s.fin = .Sent
+		s.fin_lost = false
+	}
+	return
+}
+
+// The stream is done with, both ways: let it go, and let the peer open another in its place.
+@(private)
+stream_finished :: proc(s: ^Stream) -> bool {
+	if s.id == 0 {
+		return false
+	}
+	sent := s.reset == .Acked || (s.fin == .Acked && s.out_base == s.out_next && len(s.out) == s.out_head)
+	return sent && s.told
+}
+
+@(private)
+link_sweep :: proc(l: ^Link) {
+	#reverse for s, i in l.streams {
+		if !stream_finished(s) || s.listed_due {
+			continue
+		}
+		if s.list != .None {
+			stream_unlist(l, s)
+		}
+		if !stream_mine(l, s.id) {
+			n := stream_number(s.id)
+			at := len(l.peer_done)
+			for at > 0 && l.peer_done[at - 1] > n {
+				at -= 1
+			}
+			inject_at(&l.peer_done, at, n)
+			for len(l.peer_done) > 0 && l.peer_done[0] == l.peer_floor + 1 {
+				l.peer_floor += 1
+				ordered_remove(&l.peer_done, 0)
+			}
+			if l.peer_floor + STREAMS >= l.peer_may + STREAMS / 4 {
+				l.limit_due = true
+			}
+		}
+		ordered_remove(&l.streams, i)
+		stream_free(l, s)
+	}
+}
+
+// ---------------------------------------------------------------- receiving
+
 // Processes one packet, decrypting it in place. True when it was genuine and the newest yet: only then is
 // its sender's address the one to answer, for anyone can send an old packet again from anywhere.
 link_input :: proc(l: ^Link, packet: []byte, now: Time) -> bool {
 	if l.state == .Closed || len(packet) < 1 {
 		return false
 	}
+	l.now = now
 	#partial switch Type(packet[0]) {
 	case .Second:
 		if l.state != .Dialling || len(packet) != SECOND_SIZE {
@@ -324,10 +766,15 @@ link_input :: proc(l: ^Link, packet: []byte, now: Time) -> bool {
 		newest := len(l.seen) == 0 || number >= l.seen[len(l.seen) - 1].hi
 		gap := len(l.seen) > 0 && number != l.seen[len(l.seen) - 1].hi
 		eliciting, kept := link_frames(l, plain, now)
+		link_release(l)
+		defer link_sweep(l)
 		if !kept {
 			return newest // as though it were lost: it will come again
 		}
 		range_add(&l.seen, number)
+		if newest {
+			l.largest_at = now
+		}
 		if len(l.seen) > 32 {
 			ordered_remove(&l.seen, 0)
 			l.seen_floor = l.seen[0].lo
@@ -349,30 +796,63 @@ link_input :: proc(l: ^Link, packet: []byte, now: Time) -> bool {
 @(private)
 link_frames :: proc(l: ^Link, plain: []byte, now: Time) -> (eliciting: bool, kept := true) {
 	r := zsp.Reader{buf = plain}
-	for r.pos < len(r.buf) && !r.bad {
-		switch Frame(zsp.read_u8(&r)) {
+	for r.pos < len(r.buf) && !r.bad && l.state != .Closed {
+		frame := Frame(zsp.read_u8(&r))
+		eliciting ||= frame != .Ack && frame != .Pad
+		switch frame {
 		case .Pad:
 			r.pos = len(r.buf)
 		case .Ping:
-			eliciting = true
 		case .Ack:
 			link_acked(l, &r, now)
-		case .Stream:
+		case .Stream, .Fin:
+			id := zsp.read_varint(&r)
 			offset := zsp.read_varint(&r)
 			bytes := zsp.read_bytes(&r)
 			if !r.bad {
-				kept &&= link_stream(l, offset, bytes)
+				kept &&= link_stream(l, id, offset, bytes, frame == .Fin)
 			}
-			eliciting = true
 		case .Datagram:
 			bytes := zsp.read_bytes(&r)
 			if !r.bad && l.on_datagram != nil {
 				l.on_datagram(l, bytes)
 			}
-			eliciting = true
 		case .Close:
 			l.state = .Closed
 			return
+		case .Reset:
+			id := zsp.read_varint(&r)
+			size := zsp.read_varint(&r)
+			if !r.bad {
+				kept &&= link_reset_heard(l, id, size)
+			}
+		case .Stop:
+			id := zsp.read_varint(&r)
+			if s := stream_find(l, id); !r.bad && s != nil && s.reset == .None && s.fin != .Acked && id != 0 {
+				stream_give_up(l, s)
+				if l.on_stream != nil {
+					l.on_stream(l, id, nil, .Stopped)
+				}
+			}
+		case .Window:
+			id := zsp.read_varint(&r)
+			limit := zsp.read_varint(&r)
+			if s := stream_find(l, id); !r.bad && s != nil && limit > s.out_limit {
+				s.out_limit = limit
+				stream_wake(l, s)
+			}
+		case .Limit:
+			most := zsp.read_varint(&r)
+			streams := zsp.read_varint(&r)
+			if !r.bad {
+				l.may_open = max(l.may_open, streams)
+				if most > l.out_max {
+					l.out_max = most
+					for s in l.streams {
+						stream_wake(l, s)
+					}
+				}
+			}
 		case:
 			return
 		}
@@ -380,37 +860,91 @@ link_frames :: proc(l: ^Link, plain: []byte, now: Time) -> (eliciting: bool, kep
 	return
 }
 
+// The stream a frame is about, opening it if the peer may and has not already been done with it. Nil, and
+// fine, for one that is over; nil, and not fine, for one that may not be.
 @(private)
-link_stream :: proc(l: ^Link, offset: u64, bytes: []byte) -> bool {
-	offset, bytes := offset, bytes
-	if offset > l.in_limit || offset + u64(len(bytes)) > l.in_limit {
-		return false // beyond what was permitted
+stream_heard :: proc(l: ^Link, id: u64) -> (s: ^Stream, ok: bool) {
+	if s = stream_find(l, id); s != nil {
+		return s, true
 	}
-	if offset <= l.in_next {
-		skip := min(l.in_next - offset, u64(len(bytes)))
-		link_deliver(l, bytes[skip:])
-		for len(l.early) > 0 && l.early[0].offset <= l.in_next {
-			e := l.early[0]
-			ordered_remove(&l.early, 0)
-			skip = min(l.in_next - e.offset, u64(len(e.bytes)))
-			link_deliver(l, e.bytes[skip:])
-			delete(e.bytes)
+	if stream_mine(l, id) {
+		return nil, stream_number(id) <= l.opened // over, or never was
+	}
+	n := stream_number(id)
+	if n <= l.peer_floor {
+		return nil, true
+	}
+	for x in l.peer_done {
+		if x == n {
+			return nil, true
 		}
-		return true
 	}
-	// Kept without overlap, so that what is held never exceeds what was permitted; and all of it is, or the
-	// packet goes unacknowledged, for what is acknowledged does not come again.
-	for len(bytes) > 0 {
-		if len(l.early) >= MAX_EARLY {
+	if n > l.peer_may {
+		return nil, false // more than it was let open
+	}
+	l.peer_opened = max(l.peer_opened, n)
+	return stream_new(l, id), true
+}
+
+@(private)
+link_stream :: proc(l: ^Link, id: u64, offset: u64, bytes: []byte, fin: bool) -> bool {
+	s, ok := stream_heard(l, id)
+	if s == nil {
+		return ok
+	}
+	end := offset + u64(len(bytes))
+	if end < offset || end > s.in_limit || (s.ended && (end > s.in_end || (fin && end != s.in_end))) || (fin && end < s.in_high) {
+		return false // beyond what was permitted, or what it said before
+	}
+	if end > s.in_high {
+		if l.in_total + (end - s.in_high) > l.in_max {
 			return false
 		}
-		at := len(l.early)
-		for at > 0 && l.early[at - 1].offset > offset {
+		l.in_total += end - s.in_high
+		s.in_high = end
+	}
+	if fin {
+		s.ended, s.in_end = true, end
+	}
+	if s.told {
+		return true // it has said all it will
+	}
+	if s.stopped {
+		stream_consumed(l, s, max(s.in_next, end) - s.in_next)
+		stream_check_end(l, s)
+		return true
+	}
+	if offset <= s.in_next && len(s.pieces) == 0 {
+		skip := min(s.in_next - offset, u64(len(bytes)))
+		if !stream_deliver(l, s, bytes[skip:]) {
+			return false
+		}
+	} else if !stream_hold(l, s, offset, bytes) {
+		return false
+	}
+	stream_drain(l, s)
+	return true
+}
+
+// Keeps what came out of order, without overlap, so that what is held never exceeds what was permitted; and all
+// of it is, or the packet goes unacknowledged, for what is acknowledged does not come again. Pieces that touch are
+// joined, so that there are about as many as there are gaps, however small the packets.
+@(private)
+stream_hold :: proc(l: ^Link, s: ^Stream, offset: u64, bytes: []byte) -> bool {
+	offset, bytes := offset, bytes
+	if offset < s.in_next {
+		skip := min(s.in_next - offset, u64(len(bytes)))
+		offset += skip
+		bytes = bytes[skip:]
+	}
+	for len(bytes) > 0 {
+		at := len(s.pieces)
+		for at > 0 && s.pieces[at - 1].offset > offset {
 			at -= 1
 		}
-		if at > 0 {
-			e := &l.early[at - 1]
-			if end := e.offset + u64(len(e.bytes)); end > offset {
+		before := &s.pieces[at - 1] if at > 0 else nil
+		if before != nil {
+			if end := before.offset + u64(len(before.bytes)); end > offset {
 				skip := min(end - offset, u64(len(bytes)))
 				offset += skip
 				bytes = bytes[skip:]
@@ -418,33 +952,187 @@ link_stream :: proc(l: ^Link, offset: u64, bytes: []byte) -> bool {
 			}
 		}
 		n := u64(len(bytes))
-		if at < len(l.early) {
-			n = min(n, l.early[at].offset - offset)
+		if at < len(s.pieces) {
+			n = min(n, s.pieces[at].offset - offset)
 		}
-		copied := make([]byte, n)
-		copy(copied, bytes)
-		inject_at(&l.early, at, Early{offset, copied})
+		after := &s.pieces[at] if at < len(s.pieces) && s.pieces[at].offset == offset + n else nil
+		switch {
+		case before != nil && before.offset + u64(len(before.bytes)) == offset:
+			append(&before.bytes, ..bytes[:n])
+			if after != nil {
+				append(&before.bytes, ..after.bytes[:])
+				delete(after.bytes)
+				ordered_remove(&s.pieces, at)
+				l.early -= 1
+			}
+		case after != nil:
+			joined := make([dynamic]byte, 0, int(n) + len(after.bytes))
+			append(&joined, ..bytes[:n])
+			append(&joined, ..after.bytes[:])
+			delete(after.bytes)
+			after^ = {offset, joined}
+		case:
+			if l.early >= (MAX_EARLY if s.urgency <= URGENT || s.id == 0 else MAX_EARLY * 3 / 4) {
+				return false
+			}
+			copied := make([dynamic]byte, 0, n)
+			append(&copied, ..bytes[:n])
+			inject_at(&s.pieces, at, Early{offset, copied})
+			l.early += 1
+		}
 		offset += n
 		bytes = bytes[n:]
 	}
 	return true
 }
 
+// Delivers what is held that has become next, for as long as the stream may be delivered.
 @(private)
-link_deliver :: proc(l: ^Link, bytes: []byte) {
-	if len(bytes) == 0 {
-		return
+stream_drain :: proc(l: ^Link, s: ^Stream) {
+	for len(s.pieces) > 0 && s.pieces[0].offset <= s.in_next && (s.ready || !stream_headed(s)) && !s.told {
+		e := s.pieces[0]
+		ordered_remove(&s.pieces, 0)
+		l.early -= 1
+		skip := min(s.in_next - e.offset, u64(len(e.bytes)))
+		stream_deliver(l, s, e.bytes[skip:]) // what must wait goes back, in the place this left
+		delete(e.bytes)
 	}
-	l.in_next += u64(len(bytes))
-	l.in_limit = l.in_next + RECV_WINDOW
+	stream_check_end(l, s)
+}
+
+// Whether the header that begins a stream has all come.
+@(private)
+stream_headed :: proc(s: ^Stream) -> bool {
+	return s.id == 0 || (s.head_size > 1 && (s.head[s.head_size - 1] < 0x80 || s.head_size == MAX_HEADER))
+}
+
+// Bytes that come next in a stream: its header, then for whoever reads it once stream 0 has caught up. False if
+// what must wait could not be kept.
+@(private)
+stream_deliver :: proc(l: ^Link, s: ^Stream, bytes: []byte) -> bool {
+	bytes := bytes
+	for len(bytes) > 0 && !stream_headed(s) {
+		s.head[s.head_size] = bytes[0]
+		s.head_size += 1
+		stream_consumed(l, s, 1)
+		bytes = bytes[1:]
+		if stream_headed(s) {
+			s.urgency = min(s.head[0], 7)
+			r := zsp.Reader{buf = s.head[1:s.head_size]}
+			s.after = zsp.read_varint(&r)
+		}
+	}
+	if len(bytes) == 0 {
+		return true
+	}
+	if !stream_check_ready(l, s) {
+		return stream_hold(l, s, s.in_next, bytes)
+	}
+	stream_consumed(l, s, u64(len(bytes)))
 	if l.on_stream != nil {
-		l.on_stream(l, bytes)
+		l.on_stream(l, s.id, bytes, .Data)
+	}
+	if s.id == 0 {
+		l.release = true // streams waiting for this much of stream 0 may go on
+	}
+	return true
+}
+
+// Delivers what waited for stream 0 and need wait no longer.
+@(private)
+link_release :: proc(l: ^Link) {
+	for l.release {
+		l.release = false
+		for i := 0; i < len(l.streams); i += 1 {
+			x := l.streams[i]
+			if x.id != 0 && !x.ready && len(x.pieces) > 0 && stream_check_ready(l, x) {
+				stream_drain(l, x)
+			}
+		}
 	}
 }
 
 @(private)
+stream_check_ready :: proc(l: ^Link, s: ^Stream) -> bool {
+	if !s.ready && stream_headed(s) && l.streams[0].in_next >= s.after {
+		s.ready = true
+	}
+	return s.ready
+}
+
+// Bytes have been delivered, or dropped: the peer may send as many more, and the windows grow while they are
+// what holds it back.
+@(private)
+stream_consumed :: proc(l: ^Link, s: ^Stream, n: u64) {
+	if n == 0 {
+		return
+	}
+	s.in_next += n
+	l.in_given += n
+	if s.in_limit - s.in_next < s.in_window / 2 && !s.ended {
+		if s.in_moved != 0 && l.now - s.in_moved < Time(2 * l.srtt) && s.in_window < STREAM_WINDOW_MAX {
+			s.in_window *= 2
+		}
+		s.in_moved = l.now
+		s.in_limit = s.in_next + s.in_window
+		s.window_due = true
+		stream_due(l, s)
+	}
+	if l.in_max - l.in_given < l.in_window / 2 {
+		if l.in_moved != 0 && l.now - l.in_moved < Time(2 * l.srtt) && l.in_window < LINK_WINDOW_MAX {
+			l.in_window *= 2
+		}
+		l.in_moved = l.now
+		l.in_max = l.in_given + l.in_window
+		l.limit_due = true
+	}
+}
+
+// Tells of a stream's end once all before it is delivered.
+@(private)
+stream_check_end :: proc(l: ^Link, s: ^Stream) {
+	if s.ended && !s.told && s.in_next == s.in_end {
+		s.told = true
+		if !s.stopped && l.on_stream != nil {
+			l.on_stream(l, s.id, nil, .Fin)
+		}
+	}
+}
+
+@(private)
+link_reset_heard :: proc(l: ^Link, id: u64, size: u64) -> bool {
+	s, ok := stream_heard(l, id)
+	if s == nil || id == 0 {
+		return ok && id != 0
+	}
+	if size < s.in_high || size > s.in_limit || (s.ended && size != s.in_end) {
+		return false
+	}
+	if l.in_total + (size - s.in_high) > l.in_max {
+		return false
+	}
+	l.in_total += size - s.in_high
+	s.in_high = size
+	s.ended, s.in_end = true, size
+	if s.told {
+		return true
+	}
+	s.told = true
+	stream_drop_pieces(l, s)
+	// What never came is as good as delivered, for the windows' sake.
+	stream_consumed(l, s, size - s.in_next)
+	if !s.stopped && l.on_stream != nil {
+		l.on_stream(l, id, nil, .Reset)
+	}
+	return true
+}
+
+// ---------------------------------------------------------------- acknowledgements
+
+@(private)
 link_acked :: proc(l: ^Link, r: ^zsp.Reader, now: Time) {
 	largest := zsp.read_varint(r)
+	delay := Time(zsp.read_varint(r))
 	if largest >= link_next(l) {
 		r.bad = true // nothing so numbered was ever sent
 		return
@@ -452,7 +1140,7 @@ link_acked :: proc(l: ^Link, r: ^zsp.Reader, now: Time) {
 	hi := largest + 1
 	newest: Time
 	any := false
-	for i := 0;; i += 1 {
+	for {
 		run := zsp.read_varint(r)
 		if r.bad || run > hi {
 			r.bad = true
@@ -469,12 +1157,12 @@ link_acked :: proc(l: ^Link, r: ^zsp.Reader, now: Time) {
 			}
 			l.in_flight -= int(p.size)
 			if p.probe {
-				l.mtu = PACKET_MAX
+				l.mtu = max(l.mtu, PACKET_MAX)
 			} else {
 				link_measure(l, p, now)
 			}
-			if p.stream.lo < p.stream.hi {
-				range_insert(&l.done, p.stream)
+			for c in link_chunks(l, p) {
+				chunk_acked(l, c)
 			}
 			p^ = {}
 		}
@@ -488,45 +1176,37 @@ link_acked :: proc(l: ^Link, r: ^zsp.Reader, now: Time) {
 		}
 		hi -= run + gap
 	}
-	l.out_limit = max(l.out_limit, zsp.read_varint(r))
 	if !any {
 		return
 	}
 	l.probes, l.waiting = 0, now
 	if newest != 0 {
 		rtt := max(f64(now - newest), 1)
+		// Remeasure the empty path now and then, lest a route change go unnoticed.
+		if rtt <= l.rtt_min || now - l.rtt_min_at > 10_000 * MS {
+			l.rtt_min, l.rtt_min_at = rtt, now
+		}
+		// Less what the peer says it sat on, as RFC 9002 has it, but never below the least ever seen.
+		if held := f64(min(delay, MAX_ACK_DELAY)); rtt - held >= l.rtt_min {
+			rtt -= held
+		}
 		if !l.acked_any {
 			l.srtt, l.rttvar = rtt, rtt / 2
 		} else {
 			l.rttvar = 0.75 * l.rttvar + 0.25 * abs(l.srtt - rtt)
 			l.srtt = 0.875 * l.srtt + 0.125 * rtt
 		}
-		// Remeasure the empty path now and then, lest a route change go unnoticed.
-		if rtt <= l.rtt_min || now - l.rtt_min_at > 10_000 * MS {
-			l.rtt_min, l.rtt_min_at = rtt, now
-		}
 	}
 	l.acked_any = true
 	l.largest_acked = max(l.largest_acked, largest)
 	link_detect_loss(l, now)
 	link_model(l, now)
+	link_settle(l)
+}
 
-	// Advance past what is wholly acknowledged, moving memory only once half of it is done with.
-	if len(l.done) > 0 && l.done[0].lo <= l.out_base {
-		l.out_head += int(l.done[0].hi - l.out_base)
-		l.out_base = l.done[0].hi
-		ordered_remove(&l.done, 0)
-		if l.out_head == len(l.out) {
-			clear(&l.out)
-			l.out_head = 0
-			if cap(l.out) > 64 << 10 {
-				shrink(&l.out)
-			}
-		} else if l.out_head > 4096 && l.out_head * 2 > len(l.out) {
-			remove_range(&l.out, 0, l.out_head)
-			l.out_head = 0
-		}
-	}
+// Lets go of the records of packets that are settled.
+@(private)
+link_settle :: proc(l: ^Link) {
 	for l.sent_head < len(l.sent) && l.sent[l.sent_head].time == 0 {
 		l.sent_head += 1
 		l.sent_base += 1
@@ -535,6 +1215,127 @@ link_acked :: proc(l: ^Link, r: ^zsp.Reader, now: Time) {
 		remove_range(&l.sent, 0, l.sent_head)
 		l.sent_head = 0
 	}
+	// Chunks are kept for the oldest packet unsettled, and those after.
+	keep := l.chunk_base + u64(len(l.chunks) - l.chunk_head)
+	for p in link_sent(l) {
+		if p.time != 0 && p.chunks > 0 {
+			keep = p.chunk
+			break
+		}
+	}
+	l.chunk_head += int(keep - l.chunk_base)
+	l.chunk_base = keep
+	if l.chunk_head * 2 > len(l.chunks) {
+		remove_range(&l.chunks, 0, l.chunk_head)
+		l.chunk_head = 0
+	}
+}
+
+@(private)
+link_chunks :: proc(l: ^Link, p: ^Sent) -> []Chunk {
+	if p.chunks == 0 || p.chunk < l.chunk_base {
+		return nil
+	}
+	at := l.chunk_head + int(p.chunk - l.chunk_base)
+	return l.chunks[at:][:p.chunks]
+}
+
+@(private)
+chunk_acked :: proc(l: ^Link, c: Chunk) {
+	if c.kind == .Limit {
+		return
+	}
+	s := stream_find(l, c.id)
+	if s == nil {
+		return
+	}
+	switch c.kind {
+	case .Data, .Fin:
+		if s.reset != .None {
+			return
+		}
+		if c.lo < c.hi {
+			range_insert(&s.done, {c.lo, c.hi})
+		}
+		if c.kind == .Fin {
+			s.fin = .Acked
+			s.fin_lost = false
+		}
+		// Advance past what is wholly acknowledged, moving memory only once half of it is done with.
+		if len(s.done) > 0 && s.done[0].lo <= s.out_base {
+			n := int(s.done[0].hi - s.out_base)
+			s.out_head += n
+			l.held -= n
+			s.out_base = s.done[0].hi
+			ordered_remove(&s.done, 0)
+			if s.out_head == len(s.out) {
+				clear(&s.out)
+				s.out_head = 0
+				if cap(s.out) > 64 << 10 {
+					shrink(&s.out)
+				}
+			} else if s.out_head > 4096 && s.out_head * 2 > len(s.out) {
+				remove_range(&s.out, 0, s.out_head)
+				s.out_head = 0
+			}
+		}
+	case .Reset:
+		if s.reset == .Sent {
+			s.reset = .Acked
+		}
+	case .Stop, .Window, .Limit:
+	}
+}
+
+@(private)
+chunk_lost :: proc(l: ^Link, c: Chunk) {
+	if c.kind == .Limit {
+		l.limit_due = true
+		return
+	}
+	s := stream_find(l, c.id)
+	if s == nil {
+		return
+	}
+	switch c.kind {
+	case .Data, .Fin:
+		if s.reset != .None {
+			return
+		}
+		if c.lo < c.hi {
+			append(&s.lost, Range{c.lo, c.hi})
+		}
+		if c.kind == .Fin && s.fin == .Sent {
+			s.fin_lost = true
+		}
+		stream_wake(l, s)
+	case .Reset:
+		if s.reset == .Sent {
+			s.reset = .Due
+			stream_due(l, s)
+		}
+	case .Stop:
+		if !s.told {
+			s.stop_due = true
+			stream_due(l, s)
+		}
+	case .Window:
+		if !s.ended {
+			s.window_due = true
+			stream_due(l, s)
+		}
+	case .Limit:
+	}
+}
+
+@(private)
+link_sent :: proc(l: ^Link) -> []Sent {
+	return l.sent[l.sent_head:]
+}
+
+@(private)
+link_next :: proc(l: ^Link) -> u64 {
+	return l.sent_base + u64(len(l.sent) - l.sent_head)
 }
 
 @(private)
@@ -559,8 +1360,8 @@ link_patience :: proc(l: ^Link) -> Time {
 @(private)
 link_lose :: proc(l: ^Link, p: ^Sent) {
 	l.in_flight -= int(p.size)
-	if p.stream.lo < p.stream.hi {
-		append(&l.lost, p.stream)
+	for c in link_chunks(l, p) {
+		chunk_lost(l, c)
 	}
 	if !p.probe {
 		l.round_lost += int(p.size)
@@ -624,12 +1425,16 @@ link_model :: proc(l: ^Link, now: Time) {
 	l.window = max(min(target, l.ceiling), f64(4 * PACKET))
 }
 
-// The next packet to send, or nil. Call until nil after input, writes, or a deadline.
+// ---------------------------------------------------------------- sending
+
+// The next packet to send, or nil. Call until nil after input, writes, or a deadline. A packet is as large as
+// the path allows, and no larger than `into`.
 @(require_results)
 link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 	if l.state != .Open {
 		return nil
 	}
+	l.now = now
 	if l.closing {
 		l.state = .Closed
 		into[HEAD] = byte(Frame.Close)
@@ -640,15 +1445,21 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 		return nil
 	}
 
-	limit := l.mtu - zsp.TAG
+	limit := min(l.mtu, len(into)) - zsp.TAG
 	w := zsp_writer(into[:limit])
 	w.pos = HEAD
 	eliciting := false
 	p: Sent
-	if l.ack_due != 0 && (now >= l.ack_due || link_sendable(l)) {
-		link_put_ack(l, &w)
-	}
+	p.chunk = l.chunk_base + u64(len(l.chunks) - l.chunk_head)
 	room := l.in_flight + limit < int(l.window) || l.want_probe
+	acking := l.ack_due != 0 && (now >= l.ack_due || link_sendable(l))
+	if acking {
+		link_put_ack(l, &w, now)
+	}
+	// What streams have to say of themselves is small, and rides along with acknowledgements.
+	if room || acking {
+		eliciting ||= link_put_control(l, &w, &p)
+	}
 	if room && len(l.datagrams) > 0 {
 		d := l.datagrams[0]
 		if w.pos + 4 + len(d) <= limit {
@@ -661,16 +1472,7 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 		}
 	}
 	if room {
-		if space := limit - w.pos - 14; space > 0 {
-			p.stream = link_take(l, space)
-		}
-		if p.stream.lo < p.stream.hi {
-			put(&w, byte(Frame.Stream))
-			put_varint(&w, p.stream.lo)
-			put_varint(&w, p.stream.hi - p.stream.lo)
-			put_bytes(&w, l.out[l.out_head:][p.stream.lo - l.out_base:p.stream.hi - l.out_base])
-			eliciting = true
-		}
+		eliciting ||= link_put_streams(l, &w, &p)
 	}
 	if !eliciting && l.want_probe {
 		put(&w, byte(Frame.Ping))
@@ -713,42 +1515,117 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 }
 
 @(private)
-link_sendable :: proc(l: ^Link) -> bool {
-	return len(l.datagrams) > 0 || len(l.lost) > 0 || l.out_next < min(l.out_base + u64(link_held(l)), l.out_limit)
+link_chunk :: proc(l: ^Link, p: ^Sent, c: Chunk) {
+	append(&l.chunks, c)
+	p.chunks += 1
+}
+
+// Resets, stops, windows and the link's limits that are due. True if any was said.
+@(private)
+link_put_control :: proc(l: ^Link, w: ^Writer, p: ^Sent) -> (said: bool) {
+	if l.limit_due && len(w.buf) - w.pos >= 21 && p.chunks < max(u16) {
+		l.limit_due = false
+		l.peer_may = l.peer_floor + STREAMS
+		put(w, byte(Frame.Limit))
+		put_varint(w, l.in_max)
+		put_varint(w, l.peer_may)
+		link_chunk(l, p, {kind = .Limit})
+		said = true
+	}
+	for len(l.due) > 0 && len(w.buf) - w.pos >= 64 && p.chunks < max(u16) - 3 {
+		s := l.due[0]
+		ordered_remove(&l.due, 0)
+		s.listed_due = false
+		if s.reset == .Due {
+			s.reset = .Sent
+			put(w, byte(Frame.Reset))
+			put_varint(w, s.id)
+			put_varint(w, s.out_next)
+			link_chunk(l, p, {id = s.id, kind = .Reset})
+			said = true
+		}
+		if s.stop_due {
+			s.stop_due = false
+			put(w, byte(Frame.Stop))
+			put_varint(w, s.id)
+			link_chunk(l, p, {id = s.id, kind = .Stop})
+			said = true
+		}
+		if s.window_due {
+			s.window_due = false
+			put(w, byte(Frame.Window))
+			put_varint(w, s.id)
+			put_varint(w, s.in_limit)
+			link_chunk(l, p, {id = s.id, kind = .Window})
+			said = true
+		}
+	}
+	return
+}
+
+// Fills the rest of a packet from streams, the most urgent first, and within an urgency those that have lately
+// had nothing to say before those that never stop. True if anything was.
+@(private)
+link_put_streams :: proc(l: ^Link, w: ^Writer, p: ^Sent) -> (said: bool) {
+	for &c in l.classes {
+		for len(c.fresh) + len(c.old) > 0 {
+			space := len(w.buf) - w.pos - 32 // frame type, id, offset, length
+			if space <= 0 || p.chunks >= max(u16) {
+				return
+			}
+			fresh := len(c.fresh) > 0
+			s := c.fresh[0] if fresh else c.old[0]
+			if !stream_sendable(l, s) {
+				ordered_remove(&c.fresh if fresh else &c.old, 0)
+				s.list = .None
+				continue
+			}
+			if s.deficit <= 0 {
+				// Its turn is over: to the back of the line, with another.
+				ordered_remove(&c.fresh if fresh else &c.old, 0)
+				s.deficit += QUANTUM
+				s.list = .Old
+				append(&c.old, s)
+				continue
+			}
+			r, fin := stream_take(l, s, min(space, max(s.deficit, 64)))
+			if r.lo == r.hi && !fin {
+				// Nothing it may send after all.
+				ordered_remove(&c.fresh if fresh else &c.old, 0)
+				s.list = .None
+				continue
+			}
+			put(w, byte(Frame.Fin if fin else Frame.Stream))
+			put_varint(w, s.id)
+			put_varint(w, r.lo)
+			put_varint(w, r.hi - r.lo)
+			put_bytes(w, s.out[s.out_head:][r.lo - s.out_base:r.hi - s.out_base])
+			link_chunk(l, p, {id = s.id, lo = r.lo, hi = r.hi, kind = .Fin if fin else .Data})
+			s.deficit -= int(r.hi - r.lo) + 8
+			said = true
+		}
+	}
+	return
 }
 
 @(private)
-link_take :: proc(l: ^Link, n: int) -> (r: Range) {
-	for len(l.lost) > 0 {
-		r = l.lost[0]
-		if r.lo < l.out_base {
-			r.lo = l.out_base
-		}
-		// Skip what a later copy already delivered.
-		for d in l.done {
-			if d.lo <= r.lo && r.lo < d.hi {
-				r.lo = d.hi
+link_sendable :: proc(l: ^Link) -> bool {
+	if len(l.datagrams) > 0 || len(l.due) > 0 || l.limit_due {
+		return true
+	}
+	for &c in l.classes {
+		for s in c.fresh {
+			if stream_sendable(l, s) {
+				return true
 			}
 		}
-		if r.lo >= r.hi {
-			ordered_remove(&l.lost, 0)
-			continue
+		for s in c.old {
+			if stream_sendable(l, s) {
+				return true
+			}
 		}
-		if r.hi - r.lo > u64(n) {
-			r.hi = r.lo + u64(n)
-			l.lost[0].lo = r.hi
-		} else {
-			ordered_remove(&l.lost, 0)
-		}
-		return
 	}
-	end := min(l.out_base + u64(link_held(l)), l.out_limit)
-	if l.out_next < end {
-		r = {l.out_next, min(end, l.out_next + u64(n))}
-		l.out_next = r.hi
-		return
-	}
-	return {}
+	return false
 }
 
 @(private)
@@ -769,14 +1646,11 @@ link_expire :: proc(l: ^Link, now: Time) {
 	}
 	l.waiting = now
 	l.want_probe = true
-	// Send the oldest unacknowledged bytes again.
+	// Send the oldest unacknowledged again.
 	for &p in link_sent(l) {
 		if p.time != 0 {
-			if p.stream.lo < p.stream.hi {
-				inject_at(&l.lost, 0, p.stream)
-			}
-			l.in_flight -= int(p.size)
-			p = {}
+			link_lose(l, &p)
+			l.round_lost -= int(p.size) // a timeout is no measure of congestion
 			if l.probes > 2 {
 				l.window = MIN_WINDOW
 			}
@@ -817,12 +1691,13 @@ link_deadline :: proc(l: ^Link) -> (t: Time) {
 }
 
 @(private)
-link_put_ack :: proc(l: ^Link, w: ^Writer) {
+link_put_ack :: proc(l: ^Link, w: ^Writer, now: Time) {
 	l.ack_due = 0
 	l.ack_count = 0
 	put(w, byte(Frame.Ack))
 	n := len(l.seen)
 	put_varint(w, l.seen[n - 1].hi - 1)
+	put_varint(w, u64(max(now - l.largest_at, 0)))
 	for i := n - 1;; i -= 1 {
 		put_varint(w, l.seen[i].hi - l.seen[i].lo)
 		if i == 0 || w.pos > 400 {
@@ -831,7 +1706,6 @@ link_put_ack :: proc(l: ^Link, w: ^Writer) {
 		}
 		put_varint(w, l.seen[i].lo - l.seen[i - 1].hi)
 	}
-	put_varint(w, l.in_limit)
 }
 
 @(private)

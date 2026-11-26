@@ -92,15 +92,17 @@ parsers_survive_noise :: proc(t: ^testing.T) {
 		l: Link
 		link_init(&l)
 		l.state = .Open
-		l.in_limit = 1 << 20
+		zero := l.streams[0]
 		for i in 0 ..< 20 {
-			append(&l.sent, Sent{time = Time(i + 1), size = 100, stream = {u64(i) * 50, u64(i) * 50 + 50}})
+			append(&l.chunks, Chunk{id = 0, lo = u64(i) * 50, hi = u64(i) * 50 + 50, kind = .Data})
+			append(&l.sent, Sent{time = Time(i + 1), size = 100, chunk = u64(i), chunks = 1})
 			l.in_flight += 100
 		}
-		resize(&l.out, 1000)
-		l.out_next = 1000
+		resize(&zero.out, 1000)
+		zero.out_next = 1000
+		l.held, l.out_total = 1000, 1000
 		if len(b) > 0 {
-			b[0] = 2 + b[0] % 3
+			b[0] = 2 + b[0] % 9
 		}
 		link_frames(&l, b, 1000)
 		buf: [PACKET_MAX]byte
