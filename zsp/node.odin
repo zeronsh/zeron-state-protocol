@@ -525,6 +525,9 @@ node_may_write :: proc(n: ^Node, scope: Scope) -> bool {
 @(private)
 node_commit :: proc(n: ^Node, cells: []Cell, from: ^Session) -> int {
 	accepted := store_commit(&n.store, cells, from.id if from != nil else 0)
+	if len(n.typing) > 0 {
+		typing_committed(n, cells)
+	}
 	if accepted > 0 && !n.full && (from == nil || from.role == .Open) {
 		for c in cells {
 			tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})

@@ -164,21 +164,26 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
 }
 
 // One client of a device that begins to look while another of its clients is typing sees what was typed before it
-// looked, and the rest as it is typed: not once the piece is sealed, a second after it began.
+// looked, and the rest as it is typed: not once the piece is sealed, a second after it began; though it is sent more
+// first than its pipe takes at once of live text.
 {
   const node = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
   node.create();
   const writer = new Client({ connect: node.connect }), reader = new Client({ connect: node.connect });
   while (!writer.may(1, "write") || !reader.may(1, "read")) await new Promise((done) => setTimeout(done, 1));
-  const Note = { body: columns.text(17) };
+  const Note = { body: columns.text(17), more: columns.string(18) };
   let id = "";
-  await writer.write(1, (change) => (id = change.insert(Note, "late", 1, {})));
+  // Behind more than a pipe takes at once of live text: the reader is sent all of these first.
+  await writer.write(1, (change) => {
+    for (let i = 0; i < 40; i++) change.insert(Note, "late", i, { more: "x".repeat(512) });
+  });
+  await writer.write(1, (change) => (id = change.insert(Note, "late", 100, {})));
   const editor = writer.text(id, Note.body);
   editor.append("typed before it looked");
   await new Promise((done) => setTimeout(done, 200));
   let shown: string | undefined;
   const looked = Date.now();
-  const w = reader.window({ scope: 1, list: "late", table: Note }, (state) => (shown = state.rows[0]?.body));
+  const w = reader.window({ scope: 1, list: "late", table: Note, size: 100 }, (state) => (shown = state.rows.find((r) => r.id === id)?.body));
   while (shown !== "typed before it looked" && Date.now() - looked < 5000) await new Promise((done) => setTimeout(done, 1));
   assert(Date.now() - looked < 500, `shown ${Date.now() - looked} ms after looking: once sealed, not live`);
   editor.close();

@@ -374,11 +374,13 @@ Live frames go only to watches with **live** that cover the row. A node forwards
 forwards each device's to the others, so a frame nobody will see is never sent. A node does not forward between peers unless it is a relay. A
 writer seals a piece within about a second of beginning it; a reader drops live text unconfirmed for ten. Since frames from the middle of a
 piece are of no use to a reader that missed its start, a node that is not a relay keeps each open piece it sees from its start,
-until it is sealed or ten seconds pass without more (at most 16 KiB of each, and 64 pieces): its own clients' typing, and what
-peers send it. What it keeps follows the row: a session is sent it from offset 0 right after being sent the row, whether because a
-new live watch, or a client's answer, brought the row, or because it already held the row as its live watch arrived. Its own
-clients' typing goes to peers under a fresh stamp; what peers sent goes only to its own clients. So whoever begins to look, or whose
-watch is slow to arrive, sees the rest as it is typed.
+as far as it goes on unbroken: its own clients' typing, and, piece by piece whatever road it came by, what peers send it. It
+forgets one when the piece is sealed, a value is written over its slot, its row is deleted, or ten seconds pass without more (at
+most 16 KiB of each, and 64 pieces). A session is sent what it watches of them, or what is in a row its client is shown, whole
+from offset 0: once it has been sent the rows it was owed, as when a new live watch, a client's answer, or a row it did not hold
+brings it the row; and once its pipe has room, as after a frame it was due was dropped for want of it. Its own clients' typing
+goes to peers under a fresh stamp; what peers sent goes only to its own clients. So whoever begins to look, or whose watch is
+slow to arrive, or whose pipe was full, sees the rest as it is typed.
 
 ## 12 Calls
 

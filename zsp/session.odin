@@ -67,6 +67,7 @@ Session :: struct {
 	busy:      bool, // within session_input
 	stalled:   bool, // a frame in input read what storage did not yet have: see lazy.odin
 	recompare: bool, // session_recompare is owed, where storage may answer "not yet"
+	typing_due: bool, // what is being typed where it watches is to be given it, once its tasks are done and its pipe has room
 	counts_due: bool, // changes have been sent since what lies beyond its windows was last counted
 	out:       [dynamic]byte,
 	sent:      int,
@@ -144,7 +145,6 @@ Task :: struct {
 		Cell, // one cell
 		Fill, // every row in a range
 		Synced,
-		Typing, // what this node's clients are typing where it now watches
 	},
 	settled: bool,
 	restart: bool,
@@ -246,7 +246,7 @@ session_close :: proc(s: ^Session) {
 		}
 	}
 	#reverse for &x, i in n.typing {
-		if x.session == s.id {
+		if x.mine && x.session == s.id {
 			delete(x.ops)
 			unordered_remove(&n.typing, i)
 		}
@@ -821,9 +821,7 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 	w := Watch{id = id, lo = lo, hi = hi, data = flags.data, live = flags.live, counts = flags.counts}
 	append(&s.watches, w)
 	// What is being typed there goes once whatever this watch has the session sent goes: after this watch's tasks.
-	defer if w.live && len(n.typing) > 0 {
-		append(&s.tasks, Task{kind = .Typing})
-	}
+	s.typing_due ||= w.live && len(n.typing) > 0
 
 	// Data interests spread outward from clients, and live ones through relays.
 	settled := true
@@ -1571,8 +1569,11 @@ emit_row :: proc(s: ^Session, row: Id) {
 		c := row_next(&s.node.store, &scan) or_break
 		emit_cell(s, &c)
 	}
-	if len(s.node.typing) > 0 {
-		typing_give(s, row) // now that it holds the row, what is being typed in it, where it watches
+	for x in s.node.typing {
+		if x.row == row {
+			s.typing_due = true // now that it holds the row, what is being typed in it, where it watches
+			break
+		}
 	}
 }
 
@@ -1598,9 +1599,6 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 		}
 		row = c.row
 		if s.role == .Open {
-			if c.kind == .Piece && len(c.body) >= 8 {
-				typing_end(n, s.id, c.row, c.slot, get_u64(c.body)) // sealed: readers have it whole now
-			}
 			scope := row_scope(c.row)
 			as, may := session_as(s, scope)
 			if !may || .Write not_in session_rights(s, scope) || !node_may_write(n, scope) || !cell_seal(n.keys, &n.roster, &c, 0, as) {
@@ -1736,9 +1734,9 @@ live_bind :: proc(l: ^Live) -> (b: [33]byte) {
 }
 
 @(private)
-send_live :: proc(s: ^Session, l: ^Live) {
-	if len(s.out) - s.sent > OUT_LIVE {
-		return // the piece itself will follow; a slow pipe is not helped by more
+send_live :: proc(s: ^Session, l: ^Live, whole := false) -> bool {
+	if !whole && len(s.out) - s.sent > OUT_LIVE {
+		return false // the piece itself will follow; a slow pipe is not helped by more
 	}
 	cells_close(s)
 	start := len(s.out)
@@ -1753,6 +1751,7 @@ send_live :: proc(s: ^Session, l: ^Live) {
 	if s.datagram != nil && s.datagram(s.datagram_data, s.out[start:]) {
 		resize(&s.out, start)
 	}
+	return true
 }
 
 // A live frame that came by the lossy way.
@@ -1834,10 +1833,11 @@ on_live :: proc(s: ^Session, r: ^Reader) {
 		if to == s || !to.ready || !(live_watched(to, &places) || session_shows(to, l.row)) {
 			continue
 		}
+		// What a full pipe cannot take now it is given whole once it can, as far as this node keeps it.
 		if to.role == .Open {
-			send_live(to, &open)
+			to.typing_due ||= !send_live(to, &open)
 		} else if s.role == .Open || n.keys == nil {
-			send_live(to, &sealed)
+			to.typing_due ||= !send_live(to, &sealed)
 		}
 	}
 }
@@ -1925,7 +1925,7 @@ session_show :: proc(s: ^Session, row: Id) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	emit_row(s, row)
 	cells_close(s)
-	typing_give(s, row, true)
+	s.typing_due ||= len(s.node.typing) > 0
 }
 
 @(private)
@@ -1988,7 +1988,8 @@ Typing :: struct {
 	last:    u64, // when it was last typed in
 }
 
-// Keeps what was typed, from the start of its piece: as long as it goes on from where the piece had got to.
+// Keeps what was typed, from the start of its piece, as far as it goes on unbroken: a client's in the order it typed it,
+// one piece at a time in each place; what peers send, piece by piece, by whichever road and in whatever order it comes.
 @(private)
 typing_keep :: proc(n: ^Node, s: ^Session, l: ^Live, mine: bool) {
 	#reverse for &x, i in n.typing {
@@ -1999,13 +2000,13 @@ typing_keep :: proc(n: ^Node, s: ^Session, l: ^Live, mine: bool) {
 	}
 	at := -1
 	for x, i in n.typing {
-		if x.session == s.id && x.row == l.row && x.slot == l.slot {
+		if x.mine == mine && x.row == l.row && x.slot == l.slot && (x.session == s.id if mine else x.piece == l.piece) {
 			at = i
 			break
 		}
 	}
 	if at >= 0 && n.typing[at].piece != l.piece {
-		clear(&n.typing[at].ops) // another piece in the same place: the last was sealed
+		clear(&n.typing[at].ops) // the client's next piece in the same place: the last was sealed
 		n.typing[at].piece = l.piece
 	}
 	if at < 0 {
@@ -2027,34 +2028,59 @@ typing_keep :: proc(n: ^Node, s: ^Session, l: ^Live, mine: bool) {
 	}
 	x := &n.typing[at]
 	have := u64(len(x.ops))
-	if l.offset > have || l.offset + u64(len(l.body)) > TYPING_BYTES {
+	if l.offset + u64(len(l.body)) > TYPING_BYTES || (mine && l.offset > have) {
 		delete(x.ops)
-		unordered_remove(&n.typing, at) // what is kept would not be the piece from its start, or would be too long
+		unordered_remove(&n.typing, at) // what is kept would be too long, or not the piece from its start
 		return
 	}
-	if l.offset + u64(len(l.body)) > have {
+	if l.offset <= have && l.offset + u64(len(l.body)) > have {
 		append(&x.ops, ..l.body[have - l.offset:])
 	}
-	x.last = n.now
+	x.last = n.now // and what goes on from beyond the end, as a peer's frame may, waits for what comes between
 }
 
-// The piece is sealed: whoever reads it now reads it whole.
-@(private)
-typing_end :: proc(n: ^Node, session: u32, row: Id, slot: Slot, piece: u64) {
-	for &x, i in n.typing {
-		if x.session == session && x.row == row && x.slot == slot && x.piece == piece {
-			delete(x.ops)
-			unordered_remove(&n.typing, i)
-			return
+// What is written puts an end to what was being typed there: a piece sealed is read whole from now on, a value written over
+// the text, or the row gone, leaves nothing of it to show. By whichever road it is written, client or peer.
+typing_committed :: proc(n: ^Node, cells: []Cell) {
+	for c in cells {
+		#partial switch c.kind {
+		case .Grave, .Value:
+			#reverse for &x, i in n.typing {
+				if x.row == c.row && (c.kind == .Grave || x.slot == c.slot) {
+					delete(x.ops)
+					unordered_remove(&n.typing, i)
+				}
+			}
+		case .Piece:
+			kept := false
+			for x in n.typing {
+				kept ||= x.row == c.row && x.slot == c.slot
+			}
+			if !kept || n.keys == nil {
+				continue
+			}
+			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+			open := c
+			if !cell_open(n.keys, &n.roster, &open) || len(open.body) < 8 {
+				continue
+			}
+			piece := get_u64(open.body)
+			#reverse for &x, i in n.typing {
+				if x.row == c.row && x.slot == c.slot && x.piece == piece {
+					delete(x.ops)
+					unordered_remove(&n.typing, i)
+				}
+			}
 		}
 	}
 }
 
-// Gives a session what is being typed by this node's other clients where it watches live text, or of a row it is shown,
-// from the start of each piece: to a peer sealed afresh, as it would have been sent had it watched all along. Always after
-// the session has been sent the row, for a reader takes no live text for a row it does not hold.
+// Gives a session what is being typed by others where it watches live text, or in a row it is shown, from the start of
+// each piece, whole however full its pipe: to a peer only what this node's own clients type, sealed afresh, as it would
+// have been sent had it watched all along. Only once the session has been sent everything it was owed (see pump), for a
+// reader takes no live text for a row it does not hold.
 @(private)
-typing_give :: proc(to: ^Session, only: Maybe(Id) = nil, shown := false) {
+typing_give :: proc(to: ^Session) {
 	n := to.node
 	if len(n.typing) == 0 || !to.ready {
 		return
@@ -2064,18 +2090,13 @@ typing_give :: proc(to: ^Session, only: Maybe(Id) = nil, shown := false) {
 		if x.session == to.id || len(x.ops) == 0 || n.now >= x.last + TYPING_MS || (to.role != .Open && !x.mine) {
 			continue
 		}
-		if row, ok := only.?; ok && x.row != row {
+		places := row_places(&n.store, x.row)
+		if !(live_watched(to, &places) || session_shows(to, x.row)) {
 			continue
-		}
-		if !shown {
-			places := row_places(&n.store, x.row)
-			if !(live_watched(to, &places) || session_shows(to, x.row)) {
-				continue
-			}
 		}
 		l := Live{row = x.row, slot = x.slot, piece = x.piece, body = x.ops[:]}
 		if to.role == .Open {
-			send_live(to, &l)
+			send_live(to, &l, true)
 			continue
 		}
 		scope := row_scope(x.row)
@@ -2085,7 +2106,7 @@ typing_give :: proc(to: ^Session, only: Maybe(Id) = nil, shown := false) {
 		}
 		l.stamp = node_stamp(n)
 		if live_seal(n, keyring_scope(n.keys, scope) if n.keys != nil else nil, .Signed in info.flags, &l) {
-			send_live(to, &l)
+			send_live(to, &l, true)
 		}
 	}
 }
@@ -2287,6 +2308,11 @@ pump :: proc(s: ^Session) {
 	for go && len(s.out) - s.sent < OUT_HIGH && s.task_head < len(s.tasks) {
 		go = unit_step(s, run_task, &s.tasks[s.task_head])
 	}
+	// After all the rows the session was owed, and once its pipe has room for live text: what is being typed.
+	if go && s.typing_due && s.task_head == len(s.tasks) && len(s.out) - s.sent <= OUT_LIVE {
+		s.typing_due = false
+		typing_give(s)
+	}
 	if go && s.initiator && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && s.task_head == len(s.tasks) {
 		s.told = true
 		cells_close(s)
@@ -2439,10 +2465,6 @@ run_task :: proc(s: ^Session, t: ^Task) {
 			}
 		}
 		send_synced(s, &task)
-	case .Typing:
-		s.task_head += 1
-		cells_close(s)
-		typing_give(s)
 	}
 }
 
