@@ -3,7 +3,6 @@
 // devices through a relay of zspd's and through the Durable Object. `node test/end_to_end.ts [names...]`
 
 import { spawn } from "node:child_process";
-import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { Client, columns } from "../src/client.ts";
@@ -11,7 +10,7 @@ import type { Connect, Wire } from "../src/node.ts";
 import { open } from "../src/nodejs.ts";
 import { live } from "./live.ts";
 import { mirrorSuite } from "./mirror.ts";
-import { cloud, eventually, exists, expectEqual, node, procs, proxy, TMP, token, zspd, zspdConnect } from "./procs.ts";
+import { cloud, eventually, exists, expectEqual, node, stopAll, cleanUp, proxy, TMP, token, zspd, zspdConnect } from "./procs.ts";
 
 // Pipes that can be broken, as a crash of the pipe breaks them.
 class Pipes {
@@ -231,7 +230,7 @@ const tests: Record<string, () => Promise<void>> = {
       });
       c.close();
       await d.close();
-      for (const p of procs.splice(0)) p.kill();
+      await stopAll();
     }
   },
   // The TypeScript client, of zspd, as the Luau client is: the same suite, the same answers.
@@ -287,7 +286,7 @@ async function main(): Promise<void> {
       process.stdout.write(out);
       failed ||= code !== 0;
     }
-    rmSync(TMP, { recursive: true, force: true });
+    await cleanUp();
     process.exit(failed ? 1 : 0);
   }
   const name = names[0];
@@ -300,9 +299,9 @@ async function main(): Promise<void> {
     failed = true;
     console.log(`FAIL ${name}: ${e instanceof Error ? e.stack : e}\n     in ${TMP}`);
   } finally {
-    for (const p of procs.splice(0)) p.kill();
+    await stopAll();
   }
-  if (!failed) rmSync(TMP, { recursive: true, force: true });
+  if (!failed) await cleanUp();
   process.exit(failed ? 1 : 0);
 }
 

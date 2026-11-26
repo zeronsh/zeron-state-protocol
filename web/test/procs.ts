@@ -1,7 +1,7 @@
 // Processes for the tests: zspd devices and relays, and the Durable Object under workerd.
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -113,4 +113,16 @@ export async function proxy(to: string): Promise<{ url: string; connections: () 
     connections: () => count,
     swallow: () => live.forEach((s) => (s.swallowed = true)),
   };
+}
+
+/** Stops every process started, once each has gone. */
+export async function stopAll(): Promise<void> {
+  const going = procs.splice(0).map((p) => (p.exitCode !== null || p.signalCode !== null ? Promise.resolve() : new Promise<void>((done) => (p.once("exit", () => done()), p.kill()))));
+  await Promise.all(going);
+}
+
+/** Removes what the tests kept, waiting out a system that lets go of files a little after their process has gone, as Windows does. */
+export async function cleanUp(): Promise<void> {
+  await stopAll();
+  rmSync(TMP, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 }

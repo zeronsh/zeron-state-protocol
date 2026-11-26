@@ -4,13 +4,13 @@
 // restart, with nothing to reach. `node test/browsers.ts [names...]`
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createServer as http } from "node:http";
 import { createServer as tcp, connect as dial } from "node:net";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { Chrome, findChrome, type Page } from "./chrome.ts";
-import { cloud, eventually, exists, expectEqual, node, procs, ROOT, TMP, token, zspd, zspdConnect } from "./procs.ts";
+import { cloud, eventually, exists, expectEqual, node, stopAll, cleanUp, ROOT, TMP, token, zspd, zspdConnect } from "./procs.ts";
 import { Client, columns } from "../src/client.ts";
 import type { Side } from "./browser.ts";
 
@@ -169,7 +169,7 @@ const tests: Record<string, () => Promise<void>> = {
     await call(first, "put", "br", "notes", many);
     await first.close();
     pages.splice(pages.indexOf(first), 1);
-    for (const p of procs.splice(0)) p.kill();
+    await stopAll();
     const later = await page();
     const back = await call<{ key: string; space?: string }>(later, "device", "br");
     expectEqual(back.key, key);
@@ -213,12 +213,12 @@ async function main(): Promise<void> {
       console.log(`FAIL ${name}: ${e instanceof Error ? e.stack : e}\n     in ${TMP}`);
     } finally {
       for (const p of pages.splice(0)) await p.close().catch(() => {});
-      for (const p of procs.splice(0)) p.kill();
+      await stopAll();
     }
   }
   await chrome.close();
   site.close();
-  if (!failed) rmSync(TMP, { recursive: true, force: true });
+  if (!failed) await cleanUp();
   process.exit(failed ? 1 : 0);
 }
 
