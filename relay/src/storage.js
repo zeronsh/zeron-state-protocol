@@ -44,9 +44,6 @@ export class Storage {
     this.#budget = !env.STORE ? 0 : limit > 0 ? Math.min(budget, Math.floor(limit / 4)) : budget;
   }
 
-  // Told when what an operation needed could not be kept here: the node then fails, and the relay says it is full.
-  onFull;
-
   get made() {
     return this.#made;
   }
@@ -247,6 +244,9 @@ export class Storage {
   #cache_put(kind, key, bytes) {
     const budget = kind === 0 ? Math.floor((this.#budget * 3) / 4) : Math.floor(this.#budget / 4);
     if (bytes.length > CACHE_ROW || bytes.length > budget) return;
+    // What lies at a place never changes: a run already cached there at least as long holds all of this.
+    const [longer] = this.#read(`SELECT 1 AS x FROM cache${kind} WHERE key = ? AND length(data) >= ?`, key, bytes.length);
+    if (longer) return;
     try {
       while (this.#cached[kind] + bytes.length > budget) {
         const old = this.#read(`SELECT key, length(data) AS n FROM cache${kind} ORDER BY key LIMIT 16`);
@@ -273,8 +273,9 @@ export class Storage {
 
   // ---------------------------------------------------------------- R2
 
-  // Starts what the node asked for, as many at once as is reasonable. `done(op, ok, absent, bytes)` hears of each: the
-  // `done` given when it was started, of the node that asked, whatever has become of that node by the time it finishes.
+  // Starts what the node asked for, as many at once as is reasonable. `done(op, ok, absent, bytes, full)` hears of each:
+  // the `done` given when it was started, of the node that asked, whatever has become of that node by the time it
+  // finishes. `full` is where it was to be kept here, and there was no room.
   run(done) {
     this.#done = done;
     this.#start();
@@ -290,9 +291,10 @@ export class Storage {
         (e) => (e instanceof Full ? { ok: false, full: true } : (console.log("R2", e?.message ?? e), { ok: false })),
       ).then(async (r) => {
         if (r.full) {
-          // Kept here, and no room: nothing will make room, so it is said at once.
+          // Kept here, and no room: nothing will make room, so it is said at once, to the node that asked.
           this.#running--;
-          this.onFull?.();
+          done(op, false, false, undefined, true);
+          this.#start();
           return;
         }
         if (!r.ok) {
@@ -343,6 +345,11 @@ export class Storage {
       }
       times[what] = median(each);
     };
+    if (this.#bucket instanceof Here) {
+      // No bucket: nothing but SQLite to measure.
+      await time("sqlite sync", 5, () => (this.#sql.exec("SELECT 1"), this.#ctx.storage.sync()));
+      return times;
+    }
     await time("put 1 MiB", 3, () => this.#bucket.put(key, new Uint8Array(1 << 20)));
     await time("get 4 KiB", 7, async () => (await this.#bucket.get(key, { range: { offset: 4096, length: 4096 } })).arrayBuffer());
     await time("get 64 KiB", 5, async () => (await this.#bucket.get(key, { range: { offset: 65536, length: 65536 } })).arrayBuffer());
@@ -415,28 +422,43 @@ class Here {
     this.#s = storage;
   }
   #key = (key, part) => `${key}#${String(part).padStart(6, "0")}`;
-  async get(key, { range }) {
-    const rows = this.#s.select("SELECT key, data FROM object WHERE key >= ? AND key < ? ORDER BY key", key + "#", key + "$");
-    if (rows.length === 0) return null;
-    const size = rows.reduce((n, r) => n + r.data.byteLength, 0);
-    const out = new Uint8Array(Math.max(0, Math.min(range.length, size - range.offset)));
+  // Only the parts the range is in are read. Past its end, nothing; of an object never put, null.
+  async get(key, { range } = {}) {
+    const offset = range?.offset ?? 0, length = range?.length ?? Infinity;
+    const first = Math.floor(offset / PART), last = length === Infinity ? Infinity : Math.floor((offset + Math.max(length, 1) - 1) / PART);
+    const rows = this.#s.select(
+      "SELECT key, data FROM object WHERE key >= ? AND key < ? ORDER BY key",
+      this.#key(key, first),
+      last === Infinity ? key + "$" : this.#key(key, last + 1),
+    );
+    if (rows.length === 0 && this.#s.select("SELECT 1 AS x FROM object WHERE key >= ? AND key < ? LIMIT 1", key + "#", key + "$").length === 0) {
+      return null;
+    }
+    const size = rows.reduce((n, r) => n + r.data.byteLength, 0); // of the parts read, from the first
+    const out = new Uint8Array(Math.max(0, Math.min(length, first * PART + size - offset)));
     for (let at = 0; at < out.length; ) {
-      const off = range.offset + at, part = new Uint8Array(rows[Math.floor(off / PART)].data);
+      const off = offset + at, part = new Uint8Array(rows[Math.floor(off / PART) - first].data);
       const n = Math.min(out.length - at, part.length - (off % PART));
       out.set(part.subarray(off % PART, off % PART + n), at);
       at += n;
     }
     return { arrayBuffer: async () => out.buffer };
   }
+  // Whole or not at all: what could not all be kept leaves none of itself behind.
   async put(key, body) {
-    const bytes = new Uint8Array(body);
+    const bytes = body instanceof Uint8Array ? body : new Uint8Array(body);
     this.#s.drop("DELETE FROM object WHERE key >= ? AND key < ?", key + "#", key + "$");
-    for (let at = 0, part = 0; at < bytes.length || part === 0; at += PART, part++) {
-      this.#s.write("INSERT INTO object VALUES (?, ?)", this.#key(key, part), bytes.subarray(at, Math.min(bytes.length, at + PART)));
+    try {
+      for (let at = 0, part = 0; at < bytes.length || part === 0; at += PART, part++) {
+        this.#s.write("INSERT INTO object VALUES (?, ?)", this.#key(key, part), bytes.subarray(at, Math.min(bytes.length, at + PART)));
+      }
+    } catch (e) {
+      this.#s.drop("DELETE FROM object WHERE key >= ? AND key < ?", key + "#", key + "$");
+      throw e;
     }
   }
   async delete(keys) {
-    for (const key of keys) this.#s.drop("DELETE FROM object WHERE key >= ? AND key < ?", key + "#", key + "$");
+    for (const key of Array.isArray(keys) ? keys : [keys]) this.#s.drop("DELETE FROM object WHERE key >= ? AND key < ?", key + "#", key + "$");
   }
 }
 

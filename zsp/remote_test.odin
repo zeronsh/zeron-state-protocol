@@ -107,10 +107,13 @@ model_host :: proc(h: ^Model_Host) -> Remote_Host {
 			if rand.int_max(4) < (3 if h.stingy else 1) {
 				return // it would rather not
 			}
-			h.rows += 1
 			if old, ok := h.cache[kind][key]; ok {
+				if len(old) >= len(bytes) {
+					return // as the relay's: what lies at a place never changes, and the longer holds the shorter
+				}
 				delete(old)
 			}
+			h.rows += 1
 			h.cache[kind][key] = slice.clone(bytes)
 		},
 		cache_drop = proc(data: rawptr, kind: Cached, lo, hi: u64) {

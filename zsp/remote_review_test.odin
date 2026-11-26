@@ -635,3 +635,125 @@ remote_opening_asks_for_the_tops :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, asked, "the tops were not asked for")
 }
+
+// Changes flushed, then a count beyond a window that misses: the count is still owed once what it wanted has come, and
+// the session does not sleep owing it.
+@(test)
+review_counts_owed_stay_owed :: proc(t: ^testing.T) {
+	state := seeded(77)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	s.lazy = .Remote
+	sim_init(t, &s, 2, 0, 1, 64)
+	defer sim_destroy(&s)
+	relay := s.nodes[2]
+	r := &relay.remote.remote
+	relay.remote.host.fail = 0
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+
+	a := s.nodes[0]
+	place :: proc(s: ^Sim, a: ^Sim_Node, v: u64) {
+		s.now += 3
+		a.node.now = sim_now(s, a)
+		body: [24]byte
+		put_u64(body[:], 1 << 32 | 5)
+		put_u64(body[8:], 5)
+		put_u64(body[16:], v)
+		row := node_id(&a.node, 1)
+		_ = node_write(&a.node, {{row, PLACE, .Place, node_stamp(&a.node), body[:]}})
+	}
+	for i in u64(0) ..< 600 {
+		place(&s, a, (i + 1) * 10)
+		if i % 100 == 99 {
+			sim_settle(&s)
+		}
+		free_all(context.temp_allocator)
+	}
+	sim_settle(&s)
+	r.want_checkpoint = true
+	sim_settle(&s)
+	// The leftmost leaf in a later pack than the leaves about the window.
+	place(&s, a, 2)
+	sim_settle(&s)
+	r.want_checkpoint = true
+	sim_settle(&s)
+
+	at_relay := s.links[1].b
+	out := &s.links[1].a.out
+	at := frame_begin(out, .Watch)
+	write_varint(out, 999)
+	write_u8(out, transmute(u8)Watch_Flags{data = true, counts = true})
+	write_key(out, Key{1 << 32 | 5, 5, 5500, 0, 0})
+	write_key(out, Key{1 << 32 | 5, 5, 5600, 0, 0})
+	write_varint(out, 0)
+	frame_end(out, at)
+	sim_settle(&s)
+	watch := -1
+	for w, i in at_relay.watches {
+		if w.id == 999 {
+			watch = i
+		}
+	}
+	testing.expect(t, watch >= 0)
+	if watch < 0 {
+		return
+	}
+	before := at_relay.watches[watch].before
+
+	for _, c in r.pages {
+		free(c.pg)
+	}
+	clear(&r.pages)
+	for kind in Cached {
+		for _, b in relay.remote.host.cache[kind] {
+			delete(b)
+		}
+		clear(&relay.remote.host.cache[kind])
+	}
+	place(&s, a, 1)
+	sim_settle(&s)
+	testing.expectf(t, at_relay.watches[watch].before == before + 1, "counted %d before the window, not %d", at_relay.watches[watch].before, before + 1)
+}
+
+// A relay woken with its cache as it was asks R2 for nothing, and leaves the latest pack cached whole.
+@(test)
+review_warm_wake_asks_nothing :: proc(t: ^testing.T) {
+	keeps :: proc(data: rawptr, kind: Cached, key: u64, bytes: []byte) {
+		h := (^Model_Host)(data)
+		if old, ok := h.cache[kind][key]; ok {
+			delete(old)
+		}
+		h.cache[kind][key] = slice.clone(bytes)
+	}
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	x.remote.host.cache_put = keeps
+	for store_work(&x.store) {}
+	for i in u64(0) ..< 3000 {
+		review_commit(&x.store, {review_cell(i + 1, 1, 10 + i, {byte(i), byte(i >> 8), 1, 2})})
+	}
+	x.remote.want_checkpoint = true
+	remote_store_settle(t, &x)
+	first := x.remote.kept_gen << PACK_SHIFT
+	cached := len(x.host.cache[.Page][first]) / PAGE_SIZE
+	testing.expectf(t, cached > 2 * PAGE_RUN, "only %d pages cached", cached)
+	probe := make([]byte, PAGE_SIZE)
+	defer delete(probe)
+	target := first + 2 * PAGE_RUN
+	testing.expect(t, x.remote.host.cache_get(x.remote.host.data, .Page, target, probe))
+
+	remote_store_close(&x)
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	x.remote.host.cache_put = keeps
+	remote_ops(&x.remote)
+	gets := x.remote.stats.gets
+	for len(x.host.ops) > 0 {
+		review_answer(&x.host, &x.remote, 0, true)
+	}
+	testing.expectf(t, gets == 0, "%d gets on a warm wake", gets)
+	testing.expect(t, x.remote.host.cache_get(x.remote.host.data, .Page, target, probe), "the latest pack is no longer cached whole")
+}

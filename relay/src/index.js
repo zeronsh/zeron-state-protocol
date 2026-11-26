@@ -70,10 +70,6 @@ export class Space extends DurableObject {
     // Nothing is stored until someone admitted has something to store: merely knocking leaves no trace. Until
     // then a sleeping object's sockets remember which space it is.
     this.#storage = new Storage(ctx, env);
-    this.#storage.onFull = () => {
-      this.#broken = true;
-      this.#settle();
-    };
     const sockets = ctx.getWebSockets();
     for (const ws of sockets) this.#space ??= ws.deserializeAttachment()?.space;
     this.#space ??= this.#storage.kept("space");
@@ -129,8 +125,9 @@ export class Space extends DurableObject {
       authenticate: (id, device, ptr, len) => this.#judge(id, hex(view(device, 32)), view(ptr, len).slice()),
       now: () => Date.now(),
     }));
-    this.#done = (op, ok, absent, bytes) => {
+    this.#done = (op, ok, absent, bytes, full) => {
       if (epoch !== this.#epoch || !this.#wasm) return; // an earlier node's, let go of
+      if (full) return void this.#fail(); // to be kept here, and no room for it
       const n = bytes?.length ?? 0;
       if (n > 0) this.#view(this.#wasm.buffer(n), n).set(bytes);
       this.#wasm.done(op.id, ok, absent, n);
@@ -243,6 +240,7 @@ export class Space extends DurableObject {
   // After every event: make it durable, say what follows from it, start fetching what it wants, and be ready to sleep.
   #settle() {
     if (!this.#wasm) return;
+    if (this.#broken) return void this.#fail(); // as where the roster could not be kept: nothing more is done
     const more = this.#wasm.settle();
     // What failed to be kept is said to nobody: not passed on, and no session saved as though it had been.
     if (this.#broken || this.#wasm.failed()) return void this.#fail();

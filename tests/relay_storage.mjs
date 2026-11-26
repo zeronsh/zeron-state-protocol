@@ -297,7 +297,6 @@ async function kept_here_without_a_bucket(seed) {
     const ctx = { storage: { sql, sync: async () => {} }, waitUntil: (p) => waits.push(p) };
     const s = new Storage(ctx, limit ? { STORAGE_LIMIT: String(limit) } : {});
     let full = 0;
-    s.onFull = () => full++;
     const space = new Uint8Array(32).fill(seed & 255);
     s.open(space);
     const memory = new Uint8Array(4 << 20);
@@ -306,14 +305,16 @@ async function kept_here_without_a_bucket(seed) {
     const ask = (id, kind, number, off, len, size) =>
       new Promise((done) => {
         host.start(id, kind, number, off, len, 0, size);
-        s.run((op, ok, absent, bytes) => done({ ok, absent, bytes }));
-        if (limit && full) done({ full: true });
+        s.run((op, ok, absent, bytes, isFull) => (isFull && full++, done({ ok, absent, bytes })));
       });
     const size = (2 << 20) + 12345;
     for (let i = 0; i < size; i++) memory[i] = (i * 7 + (i >> 11)) & 255;
     const put = await Promise.race([ask(1, 3, 9, 0, 0, size), new Promise((go) => setTimeout(() => go({ full: true }), 200))]);
     if (limit) {
       assert.ok(full === 1 && !put.ok, `no room for it: told ${full} times`);
+      const left = sql.exec("SELECT count(*) AS n FROM object").one().n;
+      assert.equal(left, 0, `what could not be kept whole left ${left} part(s) of it`);
+      assert.ok((await ask(2, 0, 9, 0, 10, 0)).absent, "and is not there");
       continue;
     }
     assert.ok(put.ok);
@@ -377,6 +378,77 @@ async function cancelled_is_not_started(seed) {
   assert.ok(!s.busy);
 }
 
+// Full, heard by the node whose operation it was, and only by it; and whatever waits behind it is started all the same.
+async function full_is_heard_by_its_own(seed) {
+  const sql = new Sql(), waits = [], gates = [];
+  const ctx = { storage: { sql, sync: () => new Promise((go) => gates.push(go)) }, waitUntil: (p) => waits.push(p) };
+  const s = new Storage(ctx, { STORAGE_LIMIT: String(1 << 20) });
+  const space = new Uint8Array(32).fill(seed & 255);
+  s.open(space);
+  const memory = new Uint8Array(3 << 20);
+  const host = s.imports((ptr, len) => memory.subarray(ptr, ptr + len), space);
+  host.log_write(0, 0, 1);
+  const heard = [[], []];
+  for (let i = 1; i <= 8; i++) host.start(i, 3, i, 0, 0, 0, (2 << 20) + 100); // as many as are started at once, none of which fits
+  s.run((op, ok, absent, bytes, full) => heard[0].push([op.id, ok, !!full]));
+  s.cancel();
+  host.start(9, 0, 1, 0, 10, 0, 0); // the next node's
+  s.run((op, ok, absent, bytes, full) => heard[1].push([op.id, ok, !!full]));
+  for (let i = 0; i < 100 && (gates.length > 0 || s.busy); i++) {
+    while (gates.length > 0) gates.shift()();
+    await new Promise((go) => setTimeout(go, 1));
+  }
+  await Promise.all(waits);
+  assert.equal(heard[0].length, 8, `the first heard of ${heard[0].length} of its 8`);
+  assert.ok(heard[0].every(([, ok, full]) => !ok && full), `the first heard ${JSON.stringify(heard[0])}`);
+  assert.deepEqual(heard[1], [[9, true, false]], `the next heard ${JSON.stringify(heard[1])}`);
+}
+
+// With no bucket bound, objects are read a part at a time, only the parts a read wants; and probing measures what
+// there is to measure, leaving nothing behind.
+async function kept_here_read_as_wanted(seed) {
+  const sql = new Sql(), waits = [];
+  const ctx = { storage: { sql, sync: async () => {} }, waitUntil: (p) => waits.push(p) };
+  const s = new Storage(ctx, {});
+  const space = new Uint8Array(32).fill(seed & 255);
+  s.open(space);
+  assert.ok(typeof (await s.probe()) === "object", "probed before anything was kept");
+  const memory = new Uint8Array(10 << 20);
+  for (let i = 0; i < memory.length; i += 4093) memory[i] = (i >> 12) & 255;
+  const host = s.imports((ptr, len) => memory.subarray(ptr, ptr + len), space);
+  host.log_write(0, 0, 1);
+  await s.probe();
+  assert.equal(sql.exec("SELECT count(*) AS n FROM object").one().n, 0, "probing left something behind");
+  const ask = (id, kind, number, off, len, size) =>
+    new Promise((done) => {
+      host.start(id, kind, number, off, len, 0, size);
+      s.run((op, ok, absent, bytes) => done({ ok, absent, bytes }));
+    });
+  assert.ok((await ask(1, 3, 7, 0, 0, 10 << 20)).ok);
+  for (const [off, len] of [[(5 << 20) + 4096, 4096], [(3 << 20) - 100, 200], [(10 << 20) - 10, 100], [(10 << 20) + 5, 10]]) {
+    const before = s.stats.rowsRead;
+    const got = await ask(2, 0, 7, off, len, 0);
+    const want = Math.max(0, Math.min(len, (10 << 20) - off));
+    assert.ok(got.ok && !got.absent && got.bytes.length === want, `a read of ${len} at ${off}: ${got.bytes?.length}`);
+    for (let i = 0; i < want; i++) assert.equal(got.bytes[i], memory[off + i]);
+    const parts = Math.max(1, Math.floor((off + Math.max(want, 1) - 1) / (1 << 20)) - Math.floor(off / (1 << 20)) + 1);
+    assert.ok(s.stats.rowsRead - before <= parts + 1, `a read of ${len} at ${off} read ${s.stats.rowsRead - before} rows`);
+  }
+  assert.ok((await ask(3, 0, 8, 0, 10, 0)).absent, "what was never put is not there");
+  await Promise.all(waits);
+}
+
+// A run of pages cached is not shortened by a shorter run put under the same key: what it held, it still holds.
+async function cached_run_kept_longest(seed) {
+  const { host, memory } = harness(seed, { CACHE_BYTES: String(1 << 22) });
+  host.log_write(0, 0, 1);
+  for (let i = 0; i < 8 * 4096; i++) memory[i] = (i >> 12) + 1;
+  host.cache_put(0, 1000, 0, 8 * 4096);
+  host.cache_put(0, 1000, 0, 2 * 4096);
+  assert.equal(host.cache_get(0, 1005, 1 << 21, 4096), 1, "the page of the longer run is no longer cached");
+  assert.equal(memory[1 << 21], 6);
+}
+
 for (let seed = first; seed < first + seeds; seed++) {
   await log_matches(seed);
   await cache_is_sound(seed);
@@ -387,5 +459,8 @@ for (let seed = first; seed < first + seeds; seed++) {
   if (seed === first) await the_next_waits_to_say(seed);
   if (seed % 5 === 0) await kept_here_without_a_bucket(seed);
   if (seed % 5 === 0) await full_leaves_nothing_behind(seed);
+  if (seed === first) await full_is_heard_by_its_own(seed);
+  if (seed % 5 === 0) await kept_here_read_as_wanted(seed);
+  if (seed === first) await cached_run_kept_longest(seed);
 }
 console.log(`ok   relay storage held to its model over ${seeds} seeds`);

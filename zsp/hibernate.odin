@@ -10,9 +10,10 @@ session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || len(s.tasks) > 0 || len(s.refused) > 0 || s.closing {
 		return false
 	}
-	// Nor anything more that is not saved: changes it has yet to be sent (as where storage answered "not yet"), a
-	// comparison owed, an acknowledgement owed, or the host's verdict on it. Better it reconnects than misses any.
-	if s.cursor != n.events.next || s.recompare || s.seq_in > s.acked_in || (s.greeted && !s.accepted) {
+	// Nor anything more that is not saved: changes it has yet to be sent (as where storage answered "not yet"), counts
+	// owed for them, a comparison owed, an acknowledgement owed, or the host's verdict on it. Better it reconnects than
+	// misses any.
+	if s.cursor != n.events.next || s.counts_due || s.recompare || s.seq_in > s.acked_in || (s.greeted && !s.accepted) {
 		return false
 	}
 	write_varint(w, u64(s.id))

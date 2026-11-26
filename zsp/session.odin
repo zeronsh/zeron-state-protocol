@@ -64,6 +64,7 @@ Session :: struct {
 	stalled:   bool, // a frame in input read what storage did not yet have: see lazy.odin
 	recompare: bool, // session_recompare is owed, where storage may answer "not yet"
 	beyond_due: bool, // and what lies beyond its windows is to be counted, as when it was revived
+	counts_due: bool, // changes have been sent since what lies beyond its windows was last counted
 	out:       [dynamic]byte,
 	sent:      int,
 	tasks:     [dynamic]Task, // bulk work, done as the pipe drains
@@ -2109,8 +2110,9 @@ pump :: proc(s: ^Session) {
 		go = unit_step(s, proc(s: ^Session, _: ^Task) {session_recompare(s)})
 		s.recompare &&= !go
 	}
-	if go && s.cursor != n.events.next {
+	if go && (s.cursor != n.events.next || s.counts_due) {
 		go = flush_changes(s, OUT_HIGH) && unit_step(s, proc(s: ^Session, _: ^Task) {tell_counts(s)})
+		s.counts_due &&= !go
 	}
 	for go && len(s.out) - s.sent < OUT_HIGH && s.task_head < len(s.tasks) {
 		go = unit_step(s, run_task, &s.tasks[s.task_head])
@@ -2146,6 +2148,8 @@ pump :: proc(s: ^Session) {
 @(private)
 flush_changes :: proc(s: ^Session, high := max(int)) -> bool {
 	n := s.node
+	// Whoever flushes, the counts are owed until pump has told them.
+	s.counts_due ||= s.cursor != n.events.next
 	if s.cursor < n.events.first && !unit_step(s, proc(s: ^Session, _: ^Task) {resync(s)}) {
 		return false
 	}
