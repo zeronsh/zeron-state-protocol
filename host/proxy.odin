@@ -282,7 +282,7 @@ proxied_guard :: proc(data: rawptr, first: []byte) -> Inspection {
 	verdict, reason := http_verdict(pc.sp, pc.device, first, first_look = !pc.looked)
 	pc.looked = true
 	if verdict == .Reject {
-		forward_reject(pc.forward, http_forbidden(reason))
+		forward_reply(pc.forward, http_forbidden(reason))
 	}
 	return verdict
 }

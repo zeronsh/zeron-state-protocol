@@ -478,9 +478,18 @@ http_guard :: proc(data: rawptr, first: []byte) -> Inspection {
 	verdict, reason := http_verdict(c.sp, c.device, first, first_look = !c.looked)
 	c.looked = true
 	if verdict == .Reject {
-		forward_reject(c.forward, http_forbidden(reason))
+		forward_reply(c.forward, http_forbidden(reason))
 	}
 	return verdict
+}
+
+// What a forward's socket is told as it is rejected, by an inspector that rejects it. Only that: the bridge rejects it
+// once the inspector has returned, for rejecting may end it, and then nothing of it may be touched.
+@(private)
+forward_reply :: proc(f: ^Forward, reply: []byte) {
+	delete(f.reply)
+	f.reply = make([]byte, len(reply))
+	copy(f.reply, reply)
 }
 
 @(private)

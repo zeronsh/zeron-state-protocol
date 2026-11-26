@@ -1241,6 +1241,25 @@ def test_ports():
             while data := s.recv(4096):
                 got += data
             assert got.startswith(b"HTTP/1.1 403 "), (request, got)
+    # Refused as it says all it will at once (its request, then the end of it): the refusal is still read.
+    def socks_to(address, port):
+        s = socket.create_connection(proxy, 5)
+        s.sendall(b"\x05\x01\x00")
+        assert s.recv(2) == b"\x05\x00"
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(address)]) + address.encode() + struct.pack(">H", port))
+        assert s.recv(10)[1] == 0
+        return s
+
+    for open_one in [lambda: socks_to("bee.zsp.internal", port)] + ([lambda: socket.create_connection((bee, port), 5)] if direct else []):
+        for _ in range(5):
+            with open_one() as s:
+                s.sendall(b"GET / HTTP/1.1\r\nHost: attacker.example\r\n\r\n")
+                s.shutdown(socket.SHUT_WR)
+                got = b""
+                while data := s.recv(4096):
+                    got += data
+                assert got.startswith(b"HTTP/1.1 403 "), got
+    assert a.p.poll() is None
     with socket.create_connection(proxy, 5) as s:  # a word with the request, however short, is not what came first
         s.sendall(b"CONNECT bee.zsp.internal:%d HTTP/1.1\r\n\r\nG" % port)
         time.sleep(0.2)
