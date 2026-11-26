@@ -1511,6 +1511,7 @@ def test_offers_end():
     cb.until(lambda: len(cb.devices) == 3)
     quiet = free_port()
     Service("127.0.0.1", quiet, banner=b"hi\r\n")
+    ca.offers()  # the client ready to ask, which on a slow machine is a while: not what is timed
     start = time.monotonic()
     ca.offer(quiet, 1)
     assert time.monotonic() - start < 0.5, "answered at once, not at the next deadline"
