@@ -28,6 +28,7 @@ Store :: struct {
 	cells:       Tree,
 	waste:       Tree,
 	outbox:      Tree, // rows a partial replica has yet to place in a full one
+	repair:      Tree, // rows whose shelf entries are to be sought out, where storage may answer "not yet"
 	partial:     bool,
 	stale:       ^[dynamic]Id, // when set, collects rows whose offered cells were dominated
 	clock:       u64, // highest stamp time seen
@@ -46,6 +47,17 @@ Store :: struct {
 
 	// Recent changes, for tailing. See events.odin.
 	events:      Ring,
+
+	// Where reads may answer "not yet", the log past the checkpoint is replayed a record at a time: see lazy.odin.
+	replaying:   bool,
+	step_missed: int, // reads that missed before the step under way began
+	replay_at:   u64, // the next record, or where to look for it
+	replay_tail: u64, // the end of the last sound record
+	repair_at:   Key, // how far over the shelf repair_steps has gone
+	repair_added: [dynamic]Id, // rows to be repaired that came along since it began
+	evac:        Evacuation, // where storage may answer "not yet", of a segment, a step at a time
+	evacuated:   [dynamic]u64, // whose living have all been moved, to be dropped at the next checkpoint
+	dropped:     [dynamic]u64, // dropped, and their waste yet to be forgotten
 }
 
 Header :: struct {
@@ -59,6 +71,7 @@ Header :: struct {
 	cells:      Page_No,
 	waste:      Page_No,
 	outbox:     Page_No,
+	repair:     Page_No,
 	next:       Page_No,
 	sum:        u64,
 }
@@ -126,7 +139,16 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 	s.checkpoint = best.log
 	s.shelf.root, s.cells.root = best.shelf, best.cells
 	s.waste.root, s.outbox.root = best.waste, best.outbox
+	s.repair.root = best.repair
 	s.next = max(best.next, HEADER_PAGES)
+	if store_lazy(s) {
+		// Nothing may be read here that might not be at hand: what is free is never sought, and the log is
+		// replayed by store_work, a record at a time, before anything else is done.
+		s.buf_base = max(u64)
+		s.replaying = true
+		s.replay_at, s.replay_tail = s.checkpoint, s.checkpoint
+		return true
+	}
 	find_free(s)
 	return replay(s)
 }
@@ -140,6 +162,11 @@ store_close :: proc(s: ^Store) {
 	delete(s.free)
 	delete(s.pending)
 	delete(s.buf)
+	delete(s.repair_added)
+	delete(s.evacuated)
+	delete(s.dropped)
+	delete(s.fresh)
+	delete(s.retired)
 	ring_destroy(&s.events)
 	s.disk.close(s.disk.data)
 	s^ = {}
@@ -257,7 +284,7 @@ find_free :: proc(s: ^Store) {
 			mark(s, used, e.child, level - 1)
 		}
 	}
-	for t in ([]Tree{s.shelf, s.cells, s.waste, s.outbox}) {
+	for t in ([]Tree{s.shelf, s.cells, s.waste, s.outbox, s.repair}) {
 		if t.root != 0 {
 			mark(s, used, t.root, int(page(s, t.root).level))
 		}
@@ -653,6 +680,10 @@ log_bytes :: proc(s: ^Store, off: u64, n: int) -> []byte {
 	}
 	b := make([]byte, n, context.temp_allocator)
 	if !s.disk.log_read(s.disk.data, off, b) {
+		if step_doubtful(s) {
+			// Not yet at hand, or asked for by something that was: zeroes stand in, and the step is undone.
+			return b
+		}
 		s.failed = true
 		return nil
 	}
@@ -714,15 +745,16 @@ store_sync :: proc(s: ^Store) -> bool {
 
 @(require_results)
 store_wants_checkpoint :: proc(s: ^Store) -> bool {
-	return store_tail(s) - s.checkpoint > CHECKPOINT_TAIL || len(s.dirty) > CHECKPOINT_DIRTY
+	return store_tail(s) - s.checkpoint > CHECKPOINT_TAIL || len(s.dirty) > CHECKPOINT_DIRTY || s.serial != s.serial_kept
 }
 
 // Writes the trees, so that the log before this point need never be replayed.
 store_checkpoint :: proc(s: ^Store) -> bool {
-	if s.checkpoint == store_tail(s) && len(s.dirty) == 0 && s.serial == s.serial_kept {
+	if s.replaying || (s.checkpoint == store_tail(s) && len(s.dirty) == 0 && s.serial == s.serial_kept) {
 		return true
 	}
-	victims := evacuate(s)
+	// Where storage may answer "not yet", evacuation is a job of its own (evac_steps), done before.
+	victims := s.evacuated[:] if store_lazy(s) else evacuate(s)
 	store_sync(s) or_return
 	if s.failed {
 		return false
@@ -748,6 +780,7 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 		cells      = s.cells.root,
 		waste      = s.waste.root,
 		outbox     = s.outbox.root,
+		repair     = s.repair.root,
 		next       = s.next,
 	}
 	h.sum = header_sum(&h)
@@ -772,8 +805,13 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 	for seg in victims {
 		// Forgotten only now: after a crash before this point the segment is simply evacuated again.
 		s.disk.log_drop(s.disk.data, seg)
-		tree_delete(s, &s.waste, {0, 0, 0, 0, seg})
+		if store_lazy(s) {
+			append(&s.dropped, seg) // and its waste is forgotten in a step: see store_work
+		} else {
+			tree_delete(s, &s.waste, {0, 0, 0, 0, seg})
+		}
 	}
+	clear(&s.evacuated)
 	return true
 }
 
@@ -854,9 +892,9 @@ store_lose :: proc(s: ^Store, rows: []Id) {
 	forget(s, lost[:])
 }
 
-// Unholds cells, as though they had never come. Where they lay is not read: it may be unreadable.
+// Unholds cells, as though they had never come. Unless `read`, where they lay is not read: it may be unreadable.
 @(private)
-forget :: proc(s: ^Store, lost: []Leaf) {
+forget :: proc(s: ^Store, lost: []Leaf, read := false) {
 	if len(lost) == 0 {
 		return
 	}
@@ -864,14 +902,40 @@ forget :: proc(s: ^Store, lost: []Leaf) {
 	rows := make(map[Id]bool, context.temp_allocator) // to whether its places are in doubt
 	doubt := false
 	for leaf in lost {
-		c, at := cell_unkey(leaf)
-		tree_delete(s, &s.cells, leaf.key)
-		waste_add(s, at.off, at.len)
+		c, _ := cell_unkey(leaf)
 		shelved := c.kind == .Place || c.kind == .Grave
 		rows[c.row] = rows[c.row] || shelved
 		doubt ||= shelved
 	}
-	if doubt {
+	// Where they can be read, a row's places are those it is shelved at, and are unshelved by name.
+	was := make(map[Id]Places, context.temp_allocator)
+	if read && doubt {
+		for row, shelved in rows {
+			if shelved {
+				was[row] = row_places(s, row)
+			}
+		}
+	}
+	for leaf in lost {
+		_, at := cell_unkey(leaf)
+		tree_delete(s, &s.cells, leaf.key)
+		waste_add(s, at.off, at.len)
+	}
+	if read {
+		for _, &places in was {
+			for k in places.keys[:places.count] {
+				tree_delete(s, &s.shelf, k)
+			}
+		}
+	} else if doubt && store_lazy(s) {
+		// Every entry of the row must be sought, and the shelf may be more than can be had at once: see repair_steps.
+		for row, shelved in rows {
+			if shelved {
+				tree_put(s, &s.repair, {row[0], row[1], 0, 0, 0}, {})
+				append(&s.repair_added, row)
+			}
+		}
+	} else if doubt {
 		old := make([dynamic]Key, context.temp_allocator)
 		scan := tree_scan(s, s.shelf, KEY_MIN, KEY_MAX)
 		for entry in tree_next(&scan) {

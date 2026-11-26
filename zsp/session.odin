@@ -17,6 +17,7 @@ LIVE_LATE :: 60 << 26 // a minute of stamp time: 60 * 1024 ms * 2^16
 LIST_MAX :: 32 // reconcile ranges this small by listing them
 FANOUT :: 16
 MAX_REFUSED :: 4096
+MAX_STALLED :: 4 * MAX_FRAME // input held while storage fetches what a frame needs
 
 Role :: enum u8 {
 	Peer, // sealed cells over an authenticated channel
@@ -60,6 +61,8 @@ Session :: struct {
 
 	input:     [dynamic]byte, // an incomplete frame, or frames awaiting the host's verdict
 	busy:      bool, // within session_input
+	stalled:   bool, // a frame in input read what storage did not yet have: see lazy.odin
+	recompare: bool, // session_recompare is owed, where storage may answer "not yet"
 	out:       [dynamic]byte,
 	sent:      int,
 	tasks:     [dynamic]Task, // bulk work, done as the pipe drains
@@ -304,6 +307,7 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 		bytes = s.input[:]
 	}
 	used := 0
+	stalled := false
 	for !s.closing && (s.accepted || !s.greeted) {
 		r := Reader{buf = bytes[used:]}
 		n := read_varint(&r)
@@ -322,14 +326,16 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 		}
 		frame := r.buf[r.pos:][:n]
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		if f := session_frame(s, frame); f != .None {
-			session_fail(s, f)
+		if !frame_step(s, frame) {
+			stalled = true // and again when what it read has come
+			break
 		}
 		used += r.pos + int(n)
 	}
+	s.stalled = stalled
 	rest := bytes[used:]
-	if len(rest) > MAX_FRAME + 16 {
-		session_fail(s, .Malformed)
+	if len(rest) > (MAX_STALLED if stalled else MAX_FRAME + 16) {
+		session_fail(s, .Failed if stalled else .Malformed)
 	}
 	if len(s.input) > 0 {
 		copy(s.input[:], rest)
@@ -389,7 +395,9 @@ session_frame :: proc(s: ^Session, frame: []byte) -> Fault {
 		on_watch(s, &r)
 	case .Unwatch:
 		// What was committed while the watch stood is owed to it.
-		flush_changes(s)
+		if !flush_changes(s) {
+			return .None // to be done again, when what it needs has come
+		}
 		on_unwatch(s, read_varint(&r))
 	case .Recon:
 		on_recon(s, &r)
@@ -739,6 +747,7 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 		return
 	}
 	asked := [2]Key{lo, hi}
+	missed := store_misses(&n.store)
 	if limit > 0 && flags.data {
 		from, to := tree_prefix(n, n.shelf, lo).count, tree_prefix(n, n.shelf, hi).count
 		if u64(to - from) > limit {
@@ -748,6 +757,20 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 				hi, _ = tree_select(n, n.shelf, from + int(limit))
 			}
 		}
+	}
+	// Everything read is read before anything is done, so that a step undone has done nothing beyond this session.
+	mine: Sum
+	recon: Recon_Writer
+	same := false
+	if flags.data && !flags.adopt {
+		mine = store_range(&n.store, lo, hi)
+		same = flags.known && asked == {lo, hi} && mine == theirs
+		if !same && flags.known && !(theirs.count == 0 && s.role == .Open) {
+			recon = recon_prepare(s, id, lo, hi, theirs, mine)
+		}
+	}
+	if store_misses(&n.store) != missed {
+		return
 	}
 	on_unwatch(s, id)
 	if !s.initiator && id < INTEREST {
@@ -775,8 +798,6 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 		append(&s.tasks, Task{kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
 		return
 	}
-	mine := store_range(&n.store, lo, hi)
-	same := flags.known && asked == {lo, hi} && mine == theirs
 	switch {
 	case same:
 		append(&s.tasks, Task{kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
@@ -784,7 +805,7 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 		append(&s.tasks, Task{kind = .Fill, lo = lo, hi = hi})
 		append(&s.tasks, Task{kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
 	case:
-		recon_start(s, id, lo, hi, theirs, mine)
+		recon_finish(&recon, lo, hi, theirs)
 	}
 }
 
@@ -914,11 +935,21 @@ watch_beyond :: proc(n: ^Node, w: ^Watch) -> (before, after: int) {
 // Once per burst of changes, however many there were.
 @(private)
 tell_counts :: proc(s: ^Session) {
-	for &w in s.watches {
+	missed := store_misses(&s.node.store)
+	beyond := make([][2]int, len(s.watches), context.temp_allocator)
+	for &w, i in s.watches {
+		if w.counts && w.level && !w.far {
+			beyond[i][0], beyond[i][1] = watch_beyond(s.node, &w)
+		}
+	}
+	if store_misses(&s.node.store) != missed {
+		return // read before anything is done: to be done again
+	}
+	for &w, i in s.watches {
 		if !w.counts || !w.level || w.far {
 			continue
 		}
-		before, after := watch_beyond(s.node, &w)
+		before, after := beyond[i][0], beyond[i][1]
 		if before != w.before || after != w.after {
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = w.settled})
 			w.before, w.after = before, after
@@ -1040,15 +1071,27 @@ recon_describe :: proc(w: ^Recon_Writer, lo, hi: Key, mine: Sum) {
 // Opens the comparison of a watched range, from the side that owns the data.
 @(private)
 recon_start :: proc(s: ^Session, id: u64, lo, hi: Key, theirs: Sum, mine: Sum) {
-	w := recon_begin(s, id, true, lo)
-	switch {
-	case theirs.count == 0:
-		// Nothing to compare, only to send.
-		append(&s.tasks, Task{kind = .Fill, lo = lo, hi = hi})
-	case:
+	w := recon_prepare(s, id, lo, hi, theirs, mine)
+	recon_finish(&w, lo, hi, theirs)
+}
+
+// What recon_start reads, read; recon_finish does what it does.
+@(private)
+recon_prepare :: proc(s: ^Session, id: u64, lo, hi: Key, theirs: Sum, mine: Sum) -> (w: Recon_Writer) {
+	w = recon_begin(s, id, true, lo)
+	if theirs.count != 0 {
 		recon_describe(&w, lo, hi, mine)
 	}
-	recon_end(&w)
+	return
+}
+
+@(private)
+recon_finish :: proc(w: ^Recon_Writer, lo, hi: Key, theirs: Sum) {
+	if theirs.count == 0 {
+		// Nothing to compare, only to send.
+		append(&w.s.tasks, Task{kind = .Fill, lo = lo, hi = hi})
+	}
+	recon_end(w)
 }
 
 // The id's low bit says whether the sender owns the watched data (it answers a watch) or watches.
@@ -1690,6 +1733,7 @@ on_live :: proc(s: ^Session, r: ^Reader) {
 		return
 	}
 	signed := .Signed in info.flags
+	missed := store_misses(&n.store)
 	keys := keyring_scope(n.keys, scope) if n.keys != nil else nil
 	sealed, open := l, l
 	if s.role == .Open {
@@ -1717,10 +1761,15 @@ on_live :: proc(s: ^Session, r: ^Reader) {
 		if !live_open(n, keys, signed, &open) {
 			return
 		}
+	}
+	places := row_places(&n.store, l.row)
+	if store_misses(&n.store) != missed {
+		return // read before anything is done: to be done again
+	}
+	if s.role != .Open {
 		n.recent[n.recent_at] = l.stamp.salt
 		n.recent_at = (n.recent_at + 1) % len(n.recent)
 	}
-	places := row_places(&n.store, l.row)
 	for to in n.sessions {
 		if to == s || !to.ready || !(live_watched(to, &places) || session_shows(to, l.row)) {
 			continue
@@ -1905,8 +1954,13 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 	}
 	if n.keys == nil {
 		for to in n.sessions {
+			// What was committed before goes before: all of it, to everyone it goes to, or nothing yet.
+			if to.ready && to.peer == device && !flush_changes(to) {
+				return
+			}
+		}
+		for to in n.sessions {
 			if to.ready && to.peer == device {
-				flush_changes(to) // what was committed before goes before
 				cells_close(to)
 				at := frame_begin(&to.out, .Signal)
 				append(&to.out, ..s.peer[:])
@@ -2026,14 +2080,18 @@ node_balance :: proc(n: ^Node) {
 @(private)
 pump :: proc(s: ^Session) {
 	n := s.node
-	if s.cursor != n.events.next {
-		flush_changes(s, OUT_HIGH)
-		tell_counts(s)
+	go := true
+	if s.recompare {
+		go = unit_step(s, proc(s: ^Session, _: ^Task) {session_recompare(s)})
+		s.recompare &&= !go
 	}
-	for len(s.out) - s.sent < OUT_HIGH && s.task_head < len(s.tasks) {
-		run_task(s, &s.tasks[s.task_head])
+	if go && s.cursor != n.events.next {
+		go = flush_changes(s, OUT_HIGH) && unit_step(s, proc(s: ^Session, _: ^Task) {tell_counts(s)})
 	}
-	if s.initiator && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && s.task_head == len(s.tasks) {
+	for go && len(s.out) - s.sent < OUT_HIGH && s.task_head < len(s.tasks) {
+		go = unit_step(s, run_task, &s.tasks[s.task_head])
+	}
+	if go && s.initiator && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && s.task_head == len(s.tasks) {
 		s.told = true
 		cells_close(s)
 		at := frame_begin(&s.out, .Synced)
@@ -2060,19 +2118,29 @@ pump :: proc(s: ^Session) {
 	}
 }
 
+// Sends what has changed since the session last heard. False if it stopped at something storage did not yet have.
 @(private)
-flush_changes :: proc(s: ^Session, high := max(int)) {
+flush_changes :: proc(s: ^Session, high := max(int)) -> bool {
 	n := s.node
-	if s.cursor < n.events.first {
-		resync(s)
+	if s.cursor < n.events.first && !unit_step(s, proc(s: ^Session, _: ^Task) {resync(s)}) {
+		return false
 	}
 	for s.cursor < n.events.next && len(s.out) - s.sent < high {
-		c := ring_at(&n.events, s.cursor)
-		s.cursor += 1
-		covered := c.row == s.whole && s.cursor <= s.whole_to
-		if c.origin != s.id && !covered {
-			emit_change(s, &c)
+		if !unit_step(s, flush_one) {
+			return false
 		}
+	}
+	return true
+}
+
+@(private)
+flush_one :: proc(s: ^Session, _: ^Task) {
+	n := s.node
+	c := ring_at(&n.events, s.cursor)
+	s.cursor += 1
+	covered := c.row == s.whole && s.cursor <= s.whole_to
+	if c.origin != s.id && !covered {
+		emit_change(s, &c)
 	}
 }
 
@@ -2149,8 +2217,18 @@ run_task :: proc(s: ^Session, t: ^Task) {
 			}
 		}
 	case .Synced:
+		missed := store_misses(&n.store)
+		beyond := make([][2]int, len(s.watches), context.temp_allocator)
+		for &w, i in s.watches {
+			if w.id == task.watch && !task.restart && w.data {
+				beyond[i][0], beyond[i][1] = watch_beyond(n, &w)
+			}
+		}
+		if store_misses(&n.store) != missed {
+			return // read before anything is done: to be done again
+		}
 		s.task_head += 1
-		for &w in s.watches {
+		for &w, i in s.watches {
 			if w.id == task.watch {
 				w.level = !task.restart
 				w.settled = task.settled
@@ -2158,7 +2236,7 @@ run_task :: proc(s: ^Session, t: ^Task) {
 				if task.restart || !w.data {
 					continue
 				}
-				w.before, w.after = watch_beyond(n, &w)
+				w.before, w.after = beyond[i][0], beyond[i][1]
 				task.before, task.after = w.before, w.after
 			}
 		}
@@ -2187,7 +2265,9 @@ session_recompare :: proc(s: ^Session) {
 	if !s.ready {
 		return
 	}
-	flush_changes(s)
+	if !flush_changes(s) {
+		return // undone, and done again
+	}
 	if s.role == .Open {
 		resync(s)
 		return

@@ -16,6 +16,9 @@ Disk :: struct {
 	page_write: proc(data: rawptr, no: Page_No, bytes: []byte) -> bool,
 	page_sync:  proc(data: rawptr) -> bool,
 	close:      proc(data: rawptr),
+	// Storage that may answer "not yet", as a cache over object storage does: a page that is not yet here reads as
+	// EMPTY_PAGE, log_read returns false, and this counts both. Nil for storage that always answers. See lazy.odin.
+	missed:     proc(data: rawptr) -> int,
 }
 
 // A disk in memory, which can also forget everything that was not synced.

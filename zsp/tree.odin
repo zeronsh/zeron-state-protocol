@@ -47,6 +47,11 @@ Pager :: struct {
 	free:    [dynamic]Page_No, // reusable now
 	pending: [dynamic]Page_No, // reusable once the checkpoint that abandoned them is durable
 	next:    Page_No, // first page number never used
+	// Within a step that may be undone (see lazy.odin), pages dirty before it are copied rather than changed, and
+	// none is dropped until the step is kept.
+	step:    bool,
+	fresh:   map[Page_No]struct{}, // dirtied within it
+	retired: [dynamic]Page_No, // dirty before it, and given up by it
 }
 
 Tree :: struct {
@@ -65,7 +70,7 @@ page :: #force_inline proc(p: ^Pager, no: Page_No) -> ^Page {
 
 @(private)
 page_new :: proc(p: ^Pager, level: u16) -> (no: Page_No, pg: ^Page) {
-	if len(p.free) > 0 {
+	if len(p.free) > 0 && !p.step {
 		no = pop(&p.free)
 	} else {
 		no = p.next
@@ -74,12 +79,25 @@ page_new :: proc(p: ^Pager, level: u16) -> (no: Page_No, pg: ^Page) {
 	pg = new(Page)
 	pg.level = level
 	p.dirty[no] = pg
+	if p.step {
+		p.fresh[no] = {}
+	}
 	return
 }
 
 @(private)
 page_drop :: proc(p: ^Pager, no: Page_No) {
 	if pg, ok := p.dirty[no]; ok {
+		if p.step {
+			if no not_in p.fresh {
+				append(&p.retired, no)
+				return
+			}
+			delete_key(&p.fresh, no)
+			free(pg)
+			delete_key(&p.dirty, no)
+			return
+		}
 		free(pg)
 		delete_key(&p.dirty, no)
 		append(&p.free, no)
@@ -92,7 +110,13 @@ page_drop :: proc(p: ^Pager, no: Page_No) {
 @(private)
 page_own :: proc(p: ^Pager, no: Page_No) -> (Page_No, ^Page) {
 	if pg, ok := p.dirty[no]; ok {
-		return no, pg
+		if !p.step || no in p.fresh {
+			return no, pg
+		}
+		fresh, copy := page_new(p, 0)
+		copy^ = pg^
+		append(&p.retired, no)
+		return fresh, copy
 	}
 	old := p.disk.page(p.disk.data, no)
 	fresh, pg := page_new(p, 0)

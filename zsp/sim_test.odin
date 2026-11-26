@@ -19,6 +19,7 @@ Sim_Node :: struct {
 	secret: Key32,
 	relay:  bool,
 	full:   bool,
+	slow:   ^Slow_Disk, // a relay whose storage may answer "not yet"; else disk
 	roster, roster_old, kept: []byte, // as persisted
 	skew:   i64, // of its clock, in milliseconds
 }
@@ -41,6 +42,7 @@ Sim :: struct {
 	rows:   [dynamic]Id,
 	ring:   int,
 	bytes:  int,
+	lazy:   bool, // relays' storage may answer "not yet"
 }
 
 @(private)
@@ -66,6 +68,10 @@ sim_init :: proc(t: ^testing.T, s: ^Sim, full, partial, relays, ring: int) {
 		keyring_init(&x.keys, x.secret)
 		x.relay = i >= full + partial
 		x.full = i < full || x.relay
+		if x.relay && s.lazy {
+			x.slow = new(Slow_Disk)
+			x.slow.stingy = true
+		}
 		x.skew = rand.int63_max(600_000) - 300_000
 		append(&s.nodes, x)
 		if !x.relay {
@@ -86,7 +92,11 @@ sim_init :: proc(t: ^testing.T, s: ^Sim, full, partial, relays, ring: int) {
 
 @(private)
 sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
-	assert(node_init(&x.node, memory_disk(&x.disk), s.space, nil if x.relay else &x.keys, x.full, s.ring))
+	disk := slow_disk(x.slow) if x.slow != nil else memory_disk(&x.disk)
+	assert(node_init(&x.node, disk, s.space, nil if x.relay else &x.keys, x.full, s.ring))
+	if x.slow != nil {
+		x.slow.store = &x.node.store
+	}
 	x.node.host.random = proc(_: rawptr, into: []byte) {
 		sim_random(into)
 	}
@@ -193,6 +203,10 @@ sim_destroy :: proc(s: ^Sim) {
 		node_destroy(&x.node)
 		keyring_destroy(&x.keys)
 		memory_disk_destroy(&x.disk)
+		if x.slow != nil {
+			slow_disk_destroy(x.slow)
+			free(x.slow)
+		}
 		delete(x.roster)
 		delete(x.roster_old)
 		delete(x.kept)
@@ -261,6 +275,15 @@ sim_settle :: proc(s: ^Sim) {
 			busy |= sim_pass(s, l.b, l.a)
 		}
 		for x in s.nodes {
+			if x.slow != nil {
+				// The host brings what was asked for, and what waited for it goes on; and its cache lets things go.
+				if rand.int_max(4) == 0 {
+					slow_evict(x.slow, 64)
+				}
+				fetched := slow_fetch(x.slow, all = true)
+				waiting := node_retry(&x.node)
+				busy |= fetched > 0 || waiting
+			}
 			if store_unsynced(&x.node.store) {
 				node_sync(&x.node)
 				busy = true
@@ -359,6 +382,17 @@ sim_write :: proc(s: ^Sim, x: ^Sim_Node) {
 @(private)
 sim_check :: proc(s: ^Sim, looked := false) {
 	want: Maybe(Census)
+	for x in s.nodes {
+		if x.slow != nil {
+			testing.expectf(s.t, x.slow.unguarded == 0, "a relay read %d times what it did not have, outside a step", x.slow.unguarded)
+			x.slow.all = true
+		}
+	}
+	defer for x in s.nodes {
+		if x.slow != nil {
+			x.slow.all = false
+		}
+	}
 	for x, i in s.nodes {
 		testing.expectf(s.t, !x.node.failed && x.node.roster.serial == s.nodes[0].node.roster.serial, "node %d missed a roster, or failed", i)
 		scan := tree_scan(&x.node, x.node.cells, KEY_MIN, KEY_MAX)
@@ -457,9 +491,18 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 			}
 			node_destroy(&x.node)
 			// Of what was written and not synced, some may be there and some not.
-			if end := memory_disk_end(&x.disk); end > x.disk.kept && x.disk.kept / SEGMENT == end / SEGMENT {
-				d := memory_disk(&x.disk)
-				d.log_truncate(&x.disk, x.disk.kept + u64(rand.int_max(int(end - x.disk.kept) + 1)))
+			m := &x.slow.m if x.slow != nil else &x.disk
+			if end := memory_disk_end(m); end > m.kept && m.kept / SEGMENT == end / SEGMENT {
+				d := memory_disk(m)
+				d.log_truncate(m, m.kept + u64(rand.int_max(int(end - m.kept) + 1)))
+			}
+			if x.slow != nil {
+				// What was fetched was in memory, and is gone with it.
+				clear(&x.slow.pages)
+				clear(&x.slow.blocks)
+				clear(&x.slow.want_pages)
+				clear(&x.slow.want_blocks)
+				x.slow.store = nil
 			}
 			newest := &s.nodes[0].node.roster
 			if x != s.nodes[0] && newest.serial > 0 && rand.int_max(3) == 0 {
@@ -477,6 +520,20 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 				testing.expect(s.t, keyring_load(&x.keys, x.kept))
 			}
 			sim_boot(s, x)
+		case r < 60 && s.lazy:
+			x := rand.choice(s.nodes[:])
+			if x.slow != nil {
+				switch rand.int_max(4) {
+				case 0:
+					slow_evict(x.slow, 3)
+				case 1:
+					// What it holds goes out to where it must be fetched from.
+					store_sync(&x.node.store)
+					store_checkpoint(&x.node.store)
+				}
+				slow_fetch(x.slow)
+				node_retry(&x.node)
+			}
 		case:
 			if len(s.links) > 0 {
 				l := rand.choice(s.links[:])
@@ -493,12 +550,24 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 
 @(test)
 network_converges :: proc(t: ^testing.T) {
+	sim_worlds(t, lazy = false)
+}
+
+// And through relays whose storage holds only some of what they keep at hand, fetching the rest as it is wanted.
+@(test)
+network_converges_through_slow_relays :: proc(t: ^testing.T) {
+	sim_worlds(t, lazy = true)
+}
+
+@(private)
+sim_worlds :: proc(t: ^testing.T, lazy: bool) {
 	SEEDS :: #config(ZSP_SEEDS, 6)
 	FIRST :: #config(ZSP_FIRST_SEED, 0)
 	for seed in FIRST ..< FIRST + SEEDS {
-		state := seeded(u64(seed) + 100)
+		state := seeded(u64(seed) + (300 if lazy else 100))
 		context.random_generator = rand.default_random_generator(&state)
 		s: Sim
+		s.lazy = lazy
 		sim_init(t, &s, full = 3, partial = 1, relays = 1 + seed % 2, ring = 8 if seed % 3 == 0 else 256)
 		defer sim_destroy(&s)
 		sim_chaos(&s, 800)
@@ -534,6 +603,11 @@ network_converges :: proc(t: ^testing.T) {
 		sim_rotate(&s, restore = true)
 		sim_settle(&s)
 		sim_look(&s)
+		for x in s.nodes {
+			if x.slow != nil {
+				testing.expectf(t, x.slow.missed > 20, "a slow relay missed only %d reads", x.slow.missed)
+			}
+		}
 		if testing.failed(t) {
 			fmt.println("seed", seed)
 			return

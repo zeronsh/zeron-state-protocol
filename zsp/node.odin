@@ -29,6 +29,8 @@ Node :: struct {
 	recent:      [64]u64, // salts of live frames lately passed on
 	recent_at:   int,
 	host:        Host,
+	current:     ^Step, // the step under way, where storage may answer "not yet"
+	sweep:       Sweep, // what a roster has made unlawful, yet to be gone over
 }
 
 // Everything this package leaves to whoever embeds it. Any field may be nil.
@@ -98,6 +100,7 @@ node_destroy :: proc(n: ^Node) {
 		session_close(n.sessions[0])
 	}
 	rpc_destroy(n)
+	sweep_reset(&n.sweep)
 	for it in n.interests {
 		delete(it.reports)
 	}
@@ -143,6 +146,7 @@ node_take :: proc(n: ^Node, r: Roster) -> bool {
 		renamed ||= member_name(&old.members[i]) != member_name(&r.members[i])
 	}
 	swept := roster_sweep(n, &old)
+	sweeping := len(n.sweep.plans) > 0 // as a job, where storage may answer "not yet"
 	if n.keys != nil {
 		keyring_forget(n.keys)
 	}
@@ -169,8 +173,13 @@ node_take :: proc(n: ^Node, r: Roster) -> bool {
 	if n.host.roster != nil {
 		n.host.roster(n.host.data, n.roster.bytes)
 	}
-	n.serial = n.roster.serial
-	ok := n.serial == n.serial_kept || store_checkpoint(&n.store)
+	if sweeping {
+		n.sweep.serial = n.roster.serial // the store says so once the sweep is done
+	} else {
+		n.serial = n.roster.serial
+	}
+	// Where storage may answer "not yet", checkpoints are the host's to make, and store_wants_checkpoint says so.
+	ok := n.serial == n.serial_kept || store_lazy(&n.store) || store_checkpoint(&n.store)
 	for s in n.sessions {
 		if s.greeted && s.accepted {
 			send_roster(s) // and to one whose own, older, is still on its way
@@ -206,6 +215,9 @@ node_member :: proc(n: ^Node) -> bool {
 // or the right they were written by. One sealed under an old key by someone who merely had not heard is
 // sealed again, under a key that had not, its identity unchanged, by every device that can; what cannot be is
 // dropped. Either way all replicas come to hold the same.
+//
+// Where storage may answer "not yet", the sweep is a job, done a step at a time (sweep_work); until it is done the
+// store still says it was last held against the roster before, so that a sweep cut short is begun again.
 @(private)
 roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 	if old.serial == 0 && n.serial >= n.roster.serial {
@@ -213,8 +225,7 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 	}
 	// Of two rosters drawn up at once, one is dropped: what was held by it is held to nothing.
 	fork := old.serial != 0 && !roster_extends(old, &n.roster)
-	lost: [dynamic]Leaf // not in temporary memory, which is given back below
-	defer delete(lost)
+	plans := make([dynamic]Sweep_Plan, context.temp_allocator)
 	for &info in n.roster.scopes {
 		// With no roster to compare with, every end is new.
 		was := roster_scope(old, info.id)
@@ -241,75 +252,152 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 				}
 			}
 		}
-		if from == max(u64) {
-			continue
-		}
-		late := make([dynamic]Leaf, context.temp_allocator)
-		scan := tree_scan(n, n.cells, scope_lo(info.id), scope_hi(info.id))
-		for leaf in tree_next(&scan) {
-			if leaf.key[3] > from {
-				append(&late, leaf)
-			}
-		}
-		if n.partial && node_wrote(n, &info) {
-			// Whoever took what this holds may be among those who have gone, and may have told nobody.
-			scan = tree_scan(n, n.shelf, scope_lo(info.id), scope_hi(info.id))
-			for leaf in tree_next(&scan) {
-				row := key_row(leaf.key)
-				tree_put(n, &n.outbox, {row[0], row[1], 0, 0, 0}, {})
-			}
-		}
-		for leaf in late {
-			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-			c, at := cell_unkey(leaf)
-			c.body = log_bytes(&n.store, at.off, at.len)
-			if c.body == nil {
-				continue
-			}
-			if cell_authentic(&n.roster, &c) if fork else cell_lawful(&n.roster, &c) {
-				if c.kind == .Bundle && .Signed in info.flags {
-					// Some of it may be, and the rest be there no longer, for whoever reads it.
-					swept = true
-					n.forgot += 1
-				}
-				continue
-			}
-			swept = true
-			// Under the key that was in force at its time: the same, whichever rosters a device heard or missed.
-			epoch := 1
-			for epoch < int(info.epoch) && (c.stamp.time > info.closed[epoch - 1] || epoch_void(&info, epoch)) {
-				epoch += 1
-			}
-			mine := .Signed not_in info.flags || cell_mine(n, old, &c)
-			by: By
-			if mine && cell_reopen(n, &c, &by) && cell_seal(n.keys, &n.roster, &c, epoch, by.as) {
-				if !store_replace(&n.store, &c) {
-					return // the checkpoint to come fails too
-				}
-				// Someone who had heard already may have refused it, and will take it now.
-				places := row_places(&n.store, c.row)
-				ring_push(&n.events, {c.row, c.slot, c.kind, c.stamp, 0}, &places, &places)
-				if n.partial {
-					tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
-				}
-			} else {
-				append(&lost, leaf)
-			}
+		if from != max(u64) {
+			append(&plans, Sweep_Plan{scope = info.id, from = from})
 		}
 	}
 	if fork {
 		for was in old.scopes {
 			if roster_scope(&n.roster, was.id) == nil {
-				scan := tree_scan(n, n.cells, scope_lo(was.id), scope_hi(was.id))
-				for leaf in tree_next(&scan) {
-					append(&lost, leaf)
-				}
+				append(&plans, Sweep_Plan{scope = was.id, gone = true})
 			}
 		}
 	}
-	swept ||= len(lost) > 0
-	forget(&n.store, lost[:])
+	w := &n.sweep
+	w.fork ||= fork
+	for p in plans {
+		merged := false
+		for &q in w.plans {
+			if q.scope == p.scope {
+				q.from, q.gone, merged = min(q.from, p.from), q.gone || p.gone, true
+			}
+		}
+		if !merged {
+			append(&w.plans, p)
+		}
+	}
+	if len(w.plans) == 0 {
+		return
+	}
+	// Begun again from the first, should it have been under way: what was dropped already is not found again.
+	w.at, w.cursor, w.started = 0, {}, false
+	if !store_lazy(&n.store) {
+		for !sweep_step(n, old, max(int)) {}
+		swept = w.swept
+		sweep_reset(w)
+	}
 	return
+}
+
+// What a roster has made unlawful in one scope: cells later than `from`, or, of a scope there is no more, all.
+@(private)
+Sweep_Plan :: struct {
+	scope: Scope,
+	from:  u64,
+	gone:  bool,
+}
+
+@(private)
+Sweep :: struct {
+	plans:   [dynamic]Sweep_Plan,
+	fork:    bool,
+	at:      int, // the plan under way
+	cursor:  Key, // and where in its scope
+	started: bool,
+	swept:   bool, // something was dropped or sealed again
+	serial:  u64, // of the roster swept to
+}
+
+@(private)
+sweep_reset :: proc(w: ^Sweep) {
+	delete(w.plans)
+	w^ = {}
+}
+
+// Goes over up to `budget` cells of what is to be swept. True when all of it has been.
+@(private)
+sweep_step :: proc(n: ^Node, old: ^Roster, budget: int) -> (done: bool) {
+	w := &n.sweep
+	if w.at >= len(w.plans) {
+		return true
+	}
+	plan := w.plans[w.at]
+	info := roster_scope(&n.roster, plan.scope)
+	if !w.started {
+		w.started = true
+		w.cursor = scope_lo(plan.scope)
+		if info != nil && n.partial && node_wrote(n, info) {
+			// Whoever took what this holds may be among those who have gone, and may have told nobody.
+			scan := tree_scan(n, n.shelf, scope_lo(plan.scope), scope_hi(plan.scope))
+			for leaf in tree_next(&scan) {
+				row := key_row(leaf.key)
+				tree_put(n, &n.outbox, {row[0], row[1], 0, 0, 0}, {})
+			}
+		}
+	}
+	late := make([dynamic]Leaf, context.temp_allocator)
+	lost: [dynamic]Leaf // not in temporary memory, which is given back below
+	defer delete(lost)
+	scan := tree_scan(n, n.cells, w.cursor, scope_hi(plan.scope))
+	finished := true
+	seen := 0
+	for leaf in tree_next(&scan) {
+		if seen == budget {
+			w.cursor = leaf.key
+			finished = false
+			break
+		}
+		seen += 1
+		if plan.gone {
+			append(&lost, leaf)
+		} else if leaf.key[3] > plan.from {
+			append(&late, leaf)
+		}
+	}
+	for leaf in late {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		c, at := cell_unkey(leaf)
+		c.body = log_bytes(&n.store, at.off, at.len)
+		if c.body == nil || info == nil {
+			continue
+		}
+		if cell_authentic(&n.roster, &c) if w.fork else cell_lawful(&n.roster, &c) {
+			if c.kind == .Bundle && .Signed in info.flags {
+				// Some of it may be, and the rest be there no longer, for whoever reads it.
+				w.swept = true
+				n.forgot += 1
+			}
+			continue
+		}
+		w.swept = true
+		// Under the key that was in force at its time: the same, whichever rosters a device heard or missed.
+		epoch := 1
+		for epoch < int(info.epoch) && (c.stamp.time > info.closed[epoch - 1] || epoch_void(info, epoch)) {
+			epoch += 1
+		}
+		mine := .Signed not_in info.flags || cell_mine(n, old, &c)
+		by: By
+		if mine && cell_reopen(n, &c, &by) && cell_seal(n.keys, &n.roster, &c, epoch, by.as) {
+			if !store_replace(&n.store, &c) {
+				return true // the checkpoint to come fails too
+			}
+			// Someone who had heard already may have refused it, and will take it now.
+			places := row_places(&n.store, c.row)
+			ring_push(&n.events, {c.row, c.slot, c.kind, c.stamp, 0}, &places, &places)
+			if n.partial {
+				tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
+			}
+		} else {
+			append(&lost, leaf)
+		}
+	}
+	w.swept ||= len(lost) > 0
+	forget(&n.store, lost[:], read = true) // as they were, just now
+	if finished {
+		w.at += 1
+		w.started = false
+	}
+	return w.at >= len(w.plans)
 }
 
 // Whether this device signed a cell, and so can sign it again.
