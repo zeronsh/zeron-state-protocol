@@ -254,6 +254,11 @@ relayed_flush :: proc(r: ^Relayed) {
 	buf: [RELAY_PACKET]byte
 	now := now_us()
 	for {
+		// While its own way to the relay is full, what the link would send waits in it, unsent: dropped here, it would
+		// be taken for the path's congestion. It goes when the pipe has drained, as the host runs again then.
+		if zsp.node_link_backlogged(&r.space.node, r.via, RELAY_PACKET) {
+			return
+		}
 		if r.session != nil && !r.session.closing {
 			link_feed(r.session, r.link)
 		}
@@ -277,7 +282,10 @@ relayed_deadline :: proc(sp: ^Space) -> (due: pipe.Time) {
 		return pipe.Time(time.tick_add(t, d)._nsec / 1000)
 	}
 	for r in sp.relayed {
-		nearer(&due, pipe.link_deadline(r.link))
+		// Held back by its own pipe, it can do nothing when its deadline comes: the pipe draining wakes the host.
+		if !zsp.node_link_backlogged(&sp.node, r.via, RELAY_PACKET) {
+			nearer(&due, pipe.link_deadline(r.link))
+		}
 		if r.link.state == .Dialling {
 			nearer(&due, at(r.next_knock, 0))
 		}
