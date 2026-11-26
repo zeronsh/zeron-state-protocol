@@ -68,7 +68,7 @@ Host :: struct {
 	dns_server:   Dns,
 	catch:        Catch,
 	proxy_server: Proxy,
-	later:        [dynamic]Later,
+	later:        [dynamic]^Answer,
 	public:       Relay_Public,
 	public_dead:  [dynamic]^Public_Out,
 	shared:       []byte, // everything is received into this
@@ -414,8 +414,9 @@ host_destroy :: proc(h: ^Host) {
 	}
 	delete(h.streams)
 	delete(h.spaces)
-	for l in h.later {
-		delete(l.say)
+	for a in h.later {
+		delete(a.say) // its space, and so its call, gone before it began
+		free(a)
 	}
 	delete(h.later)
 	for c in h.public_dead {

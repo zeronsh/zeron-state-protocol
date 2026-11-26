@@ -104,35 +104,82 @@ may_configure :: proc(sp: ^Space, s: ^zsp.Session) -> bool {
 	return false
 }
 
-// Says one message in a call and ends it, once the method that answers it has returned its handler, which it is
-// given to return: nothing more is heard of the call.
+// Says an answer in a call and ends it, once the method that answers it has returned the handler it is given to
+// return. An answer longer than the call's credit goes as credit comes, in as many messages as that takes, which
+// together are the answer: as every client gathers them.
 @(private)
 call_answer :: proc(sp: ^Space, call: u64, b: []byte) -> ^Call_Handler {
-	append(&sp.host.later, Later{sp, call, slice.clone(b)})
-	return &answered
+	a := new(Answer)
+	a.sp, a.call, a.say, a.queued = sp, call, slice.clone(b), true
+	a.on_room = proc(h: ^Call_Handler, call: u64) {
+		a := (^Answer)(h)
+		if !a.queued {
+			answer_go(a)
+		}
+	}
+	a.on_end = proc(h: ^Call_Handler, call: u64) {
+		a := (^Answer)(h)
+		if host_call_find(a.sp, a.call) == nil {
+			answer_over(a) // this side had ended too
+		}
+	}
+	a.on_fault = proc(h: ^Call_Handler, call: u64, _: zsp.Call_Fault) {
+		answer_over((^Answer)(h))
+	}
+	append(&sp.host.later, a)
+	return &a.handler
 }
 
-// Something to do once whatever is under way has returned: said in host_settle, straight after the events of a tick.
 @(private)
-Later :: struct {
-	sp:   ^Space,
-	call: u64,
-	say:  []byte, // owned: said in the call, which then ends
+Answer :: struct {
+	using handler: Call_Handler,
+	sp:     ^Space,
+	call:   u64,
+	say:    []byte, // owned
+	sent:   int,
+	queued: bool, // in h.later: begun once whatever is under way has returned
+	over:   bool, // the call is: freed once it is out of h.later
 }
 
+// Says as much of the answer as credit allows, and ends the call once all of it is said.
+@(private)
+answer_go :: proc(a: ^Answer) {
+	for first := true; first || a.sent < len(a.say); first = false {
+		n := min(len(a.say) - a.sent, call_room(a.sp, a.call), zsp.CALL_WINDOW)
+		if (n <= 0 && len(a.say) > 0) || !call_send(a.sp, a.call, a.say[a.sent:][:max(n, 0)]) {
+			return // the rest when there is room
+		}
+		a.sent += max(n, 0)
+	}
+	call_end(a.sp, a.call)
+	if host_call_find(a.sp, a.call) == nil {
+		answer_over(a) // the other side had ended: over both ways
+	}
+}
+
+@(private)
+answer_over :: proc(a: ^Answer) {
+	a.over = true
+	if !a.queued {
+		delete(a.say)
+		free(a)
+	}
+}
+
+// Answers begun straight after the events of a tick, in host_settle: the call is the host's to speak in by then.
 @(private)
 later_run :: proc(h: ^Host) {
 	for len(h.later) > 0 {
 		todo := h.later
 		h.later = nil
-		for l in todo {
-			call_send(l.sp, l.call, l.say)
-			call_end(l.sp, l.call)
-			delete(l.say)
+		for a in todo {
+			a.queued = false
+			if a.over {
+				answer_over(a)
+			} else {
+				answer_go(a)
+			}
 		}
 		delete(todo)
 	}
 }
-
-@(private)
-answered: Call_Handler

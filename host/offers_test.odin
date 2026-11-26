@@ -74,6 +74,23 @@ entries_round_trip :: proc(t: ^testing.T) {
 	}
 	_, zero := entries_read({1, 0, 22, 0, 0, 0}) // scope 0 is nobody's
 	testing.expect(t, !zero)
+	// What no device would say is not believed of one: no port, no address for a host, no one-word name, nor more
+	// than a device says at once, which would be kept and said again to every client that asks.
+	big := strings.repeat("a", 63, context.temp_allocator)
+	for bad in ([]Port_Entry{{0, 1, "", ""}, {22, 1, "nas.local", ""}, {22, 1, strings.repeat("1", 200, context.temp_allocator), ""}, {22, 1, "", "a b"}, {22, 1, "", cat(big, "a")}}) {
+		one := make([dynamic]byte, context.temp_allocator)
+		entries_put(&one, {bad})
+		_, believed := entries_read(one[:])
+		testing.expectf(t, !believed, "%v", bad)
+	}
+	many := make([dynamic]Port_Entry, context.temp_allocator)
+	for i in 1 ..= 2000 {
+		append(&many, Port_Entry{u16(i), 1, "", big})
+	}
+	lots := make([dynamic]byte, context.temp_allocator)
+	entries_put(&lots, many[:])
+	_, believed := entries_read(lots[:])
+	testing.expect(t, !believed)
 }
 
 @(private = "file")

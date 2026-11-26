@@ -110,17 +110,8 @@ offer_parse :: proc(words: []string) -> (o: Offer, ok: bool) {
 // and another machine's ports come a few at a time.
 @(require_results)
 offer_sound :: proc(o: ^Offer) -> bool {
-	if o.lo == 0 || o.lo > o.hi || o.scope == 0 || len(o.name) > 63 {
+	if o.lo == 0 || o.lo > o.hi || o.scope == 0 || !offer_name_sound(o.name) {
 		return false
-	}
-	// One word, as a device keeps it in its offers file: no space of any kind, nor what is not UTF-8 or is a control.
-	if !utf8.valid_string(o.name) {
-		return false
-	}
-	for r in o.name {
-		if unicode.is_space(r) || unicode.is_control(r) {
-			return false
-		}
 	}
 	if o.host == "" {
 		return true
@@ -137,6 +128,21 @@ offer_sound :: proc(o: ^Offer) -> bool {
 		return ip != net.IP6_Loopback && ip != {} && !pipe.address_is_v4(a) // nor this machine by another name
 	}
 	return false
+}
+
+// One word of at most 63 bytes, as a device keeps it in its offers file: no space of any kind, nor what is not UTF-8
+// or is a control.
+@(require_results)
+offer_name_sound :: proc(name: string) -> bool {
+	if len(name) > 63 || !utf8.valid_string(name) {
+		return false
+	}
+	for r in name {
+		if unicode.is_space(r) || unicode.is_control(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // As offer_parse reads it.
@@ -387,9 +393,10 @@ entries_put :: proc(w: ^[dynamic]byte, list: []Port_Entry) {
 // In temporary memory; the strings point into `b`.
 @(require_results)
 entries_read :: proc(b: []byte) -> (list: []Port_Entry, ok: bool) {
+	// As a device says it (offered_to): so much at most, of ports, names and addresses, else it is not believed.
 	r := zsp.Reader{buf = b}
 	n := zsp.read_varint(&r)
-	if r.bad || n > u64(len(b)) {
+	if r.bad || n > u64(len(b)) || len(b) > MAX_LIST + 10 {
 		return
 	}
 	out := make([]Port_Entry, n, context.temp_allocator)
@@ -398,10 +405,13 @@ entries_read :: proc(b: []byte) -> (list: []Port_Entry, ok: bool) {
 		scope := zsp.read_varint(&r)
 		e.host = string(zsp.read_bytes(&r))
 		e.name = string(zsp.read_bytes(&r))
-		if r.bad || scope == 0 || scope >= u64(max(zsp.Scope)) {
+		if r.bad || scope == 0 || scope >= u64(max(zsp.Scope)) || !offer_name_sound(e.name) {
 			return
 		}
 		e.port, e.scope = u16(port[0]) << 8 | u16(port[1]), zsp.Scope(scope)
+		if e.port == 0 || e.host != "" && net.parse_address(e.host) == nil {
+			return
+		}
 	}
 	return out, zsp.read_done(&r)
 }

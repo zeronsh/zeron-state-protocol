@@ -661,6 +661,9 @@ zsp.ports    first message: lease varint (seconds, at most 600; 0 for once)
 entries      n varint ‖ n × { port (2) ‖ scope varint ‖ host bytes (empty for the callee's own machine) ‖ name bytes }
 ```
 
+Entries are at most 60 KiB (and 10 bytes more for n), each of a port that is not 0, a host that is empty or an address, and a name of
+one word (as an offer's, below). What is not so is not believed: the call is cancelled, and nothing of it kept.
+
 A port is reached by a zsp.tcp call in the scope it is offered in, and in no other: the callee lets a call through only if an offer in
 the call's scope covers the port, the caller and the target. A device connecting to a port it has not yet heard the other offer asks
 in the first scope both share.
@@ -730,6 +733,9 @@ zsp.expose   0 | 1 ‖ port (2) ‖ prefix bytes ‖ flags (1: 1 PROXY v2) | 2 �
              answered with n varint ‖ n × { port (2) ‖ prefix bytes ‖ flags (1) ‖ label bytes ‖
              m varint ‖ m × { relay (32) ‖ status (1) ‖ url bytes } }
 ```
+
+An answer to a local client may be longer than the call's credit: it then comes in as many messages as credit allows, and is all of
+them together, until End.
 
 Only a client its host accepted for every scope (scope 0) may change what the device offers or exposes; another is *denied*. An offer
 in a scope the device may not call in is *denied*, for it could never be taken up, and so is one whose name is not one word: at most 63
