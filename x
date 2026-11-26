@@ -32,12 +32,15 @@ web_small() {
 web_deps() {
 	[ -d web/node_modules ] || (cd web && npm ci --silent)
 }
+relay_deps() {
+	[ -d relay/node_modules ] || (cd relay && npm install --silent)
+}
 stale() { # whether a file is older than any Odin it is built from
-	[ ! -f "$1" ] || [ -n "$(find zsp find web/wasm -name "*.odin" -newer "$1")" ]
+	[ ! -f "$1" ] || [ -n "$(find zsp find pipe web/wasm -name "*.odin" -newer "$1")" ]
 }
 
 end_to_end() {
-	[ -d relay/node_modules ] || (cd relay && npm install --silent)
+	relay_deps
 	$PYTHON tests/end_to_end.py "$@"
 }
 
@@ -82,6 +85,7 @@ test)
 	(! stale web/src/node.wasm || web_wasm || echo web >>build/failed) &
 	(! stale build/node-small.wasm || web_small || echo web >>build/failed) &
 	web_deps
+	relay_deps # before anything that runs the Durable Object, the web tests among them
 	[ -f relay/src/relay.wasm ] && [ -z "$(find zsp relay/wasm -name "*.odin" -newer relay/src/relay.wasm)" ] || wasm || echo wasm >>build/failed
 	wait
 	[ ! -f build/failed ]

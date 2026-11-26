@@ -583,8 +583,14 @@ export class Node {
     let ws: WebSocket;
     try {
       ws = new Socket(url);
-    } catch {
-      queueMicrotask(() => this.#lost(id));
+    } catch (e) {
+      // Refused at once, as a ws:// relay from an https:// page is: lost, and tried again in a while, as any.
+      this.#options.log?.("warning", `cannot reach a relay at ${url}: ${e instanceof Error ? e.message : e}`);
+      queueMicrotask(() => {
+        if (this.#stopped) return;
+        this.#wasm!.closed(id);
+        this.#kick();
+      });
       return;
     }
     ws.binaryType = "arraybuffer";

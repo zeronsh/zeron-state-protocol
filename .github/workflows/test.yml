@@ -29,8 +29,6 @@ jobs:
           python-version: "3.12"
       - name: tools
         run: |
-          npm install --prefix relay
-          npm ci --prefix web
           case "$RUNNER_OS" in
             Linux) sudo apt-get install -y -q lld; lune=linux-x86_64; luau=ubuntu ;;
             macOS) brew install -q lld; lune=macos-aarch64; luau=macos ;;
@@ -40,6 +38,7 @@ jobs:
           curl -sSLo lune.zip https://github.com/lune-org/lune/releases/download/v0.11.1/lune-0.11.1-$lune.zip && unzip -qo lune.zip
           curl -sSLo luau.zip https://github.com/luau-lang/luau/releases/download/0.748/luau-$luau.zip && unzip -qo luau.zip
           echo "$HOME/tools" >> "$GITHUB_PATH"
+      # What node needs, ./x installs, as it would on a fresh checkout anywhere.
       - run: ./x check
       - run: ./x test
       - if: runner.os == 'Linux'

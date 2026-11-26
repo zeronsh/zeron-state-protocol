@@ -108,6 +108,22 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   client.close();
 }
 
+// A relay that cannot even be dialled, as a ws:// one from an https:// page cannot, is tried again soon, as any is.
+{
+  let dials = 0;
+  class Refused {
+    constructor() {
+      dials++;
+      throw new DOMException("refused", "SecurityError");
+    }
+  }
+  const node = await Node.open({ volume: new MemoryVolume(), module, log: () => {}, WebSocket: Refused as unknown as typeof WebSocket });
+  node.join("ab".repeat(32), { key: "cd".repeat(32), url: "ws://127.0.0.1:1" });
+  await new Promise((done) => setTimeout(done, 1500));
+  assert(dials >= 3, `dialled ${dials} times in a second and a half`);
+  await node.close();
+}
+
 // Where a relay keeps a space, a proxy's query staying at the end.
 assert.equal(spaceUrl("wss://relay.example/", "ab"), "wss://relay.example/ab");
 assert.equal(spaceUrl("wss://relay.example/zsp?key=1", "ab"), "wss://relay.example/zsp/ab?key=1");
