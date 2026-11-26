@@ -10,7 +10,7 @@ ring_free :: proc() -> bool {
 	params := uring.DEFAULT_PARAMS
 	params.flags += {.SUBMIT_ALL, .COOP_TASKRUN, .SINGLE_ISSUER}
 	ring: uring.Ring
-	if uring.init(&ring, &params, 2048) != linux.Errno.NONE {
+	if uring.init(&ring, &params, #config(ODIN_NBIO_QUEUE_SIZE, 2048)) != linux.Errno.NONE {
 		return false
 	}
 	uring.destroy(&ring)
