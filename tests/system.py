@@ -63,14 +63,20 @@ def main():
         cc.offer(port, 1, host=other)
 
     # Any application, by name, through the system's own resolver.
-    eventually("the system finds the name", lambda: socket.gethostbyname("bee.zsp.internal") == "127.77.0.3", timeout=15)
+    def found(name, address):
+        try:
+            return socket.gethostbyname(name) == address
+        except OSError:
+            return False  # not yet: the system remembers that there was none for five seconds
+
+    eventually("the system finds the name", lambda: found("bee.zsp.internal", "127.77.0.3"), timeout=20)
     if shutil.which("curl"):
         eventually("curl reaches it", lambda: run("curl", "-s", "-m", "3", "http://bee.zsp.internal:%d/" % port).stdout == "bee's", timeout=15)
         print(f"ok   curl http://bee.zsp.internal:{port}/")
     assert http_get("bee.zsp.internal", port) == (200, b"bee's")
     print("ok   a socket of Python's, by name")
     if other:
-        eventually("and the other, at the same port", lambda: http_get("see.zsp.internal", port) == (200, b"see's"), timeout=15)
+        eventually("and the other, at the same port", lambda: found("see.zsp.internal", "127.77.0.4") and http_get("see.zsp.internal", port) == (200, b"see's"), timeout=20)
         assert http_get("bee.zsp.internal", port) == (200, b"bee's")
         print(f"ok   two devices at port {port}")
     if keys:
