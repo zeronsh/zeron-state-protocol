@@ -198,6 +198,51 @@ const Shelf = m.map({ a: m.list(16, Item), A: m.list(17, Item), keys: m.record(c
   d.close();
 }
 
+// Moved before its client knows the scope, it is asked where it was moved to.
+{
+  const p = peer(random, now, false);
+  const doc = { scope: 1, name: "moved", schema: Shelf };
+  let last!: m.Found<m.At<typeof Shelf, readonly ["a"]>>;
+  const asked = m.ask(p.client, doc, ["a"], { order: ["n"], limit: 2 }, (x) => (last = x));
+  asked.move(1);
+  admit(p);
+  const d = m.open(p.client, doc);
+  void d.set({ a: [{ n: 1 }, { n: 2 }, { n: 3 }, { n: 4 }] });
+  run(p);
+  share(p);
+  assert.equal(last.status, "ready");
+  assert.equal(last.first, 1, "moved before it was asked, and asked from the start");
+  assert.deepEqual(
+    last.rows.map((r) => r.n),
+    [2, 3],
+  );
+  asked.stop();
+  d.close();
+}
+
+// Of a tree, every node beneath one that answers is given with it, and so are the maps within each, which are asked for
+// too: by another, which holds none of them.
+{
+  const Plan = m.map({ tree: m.tree(16, m.map({ name: c.string(17), more: m.map({ note: c.string(16) }) })) });
+  const a = peer(random, now), b = peer(random, now);
+  const doc = { scope: 1, name: "plan", schema: Plan };
+  const d = m.open(a.client, doc);
+  void d.set({ tree: [{ name: "top", more: { note: "up" }, children: [{ name: "mid", more: { note: "middle" }, children: [{ name: "low", more: { note: "down" } }] }] }] });
+  run(a);
+  share(a, b);
+  let got!: m.Found<m.At<typeof Plan, readonly ["tree"]>>;
+  const asked = m.ask(b.client, doc, ["tree"], { where: where.is("name", "top") }, (x) => (got = x));
+  for (let i = 0; i < 4; i++) run(b);
+  assert.equal(got.status, "ready");
+  const top = got.rows[0];
+  assert.equal(top.more.note, "up");
+  assert.equal(top.children[0].name, "mid");
+  assert.equal(top.children[0].more.note, "middle", "the maps within a node beneath were not asked for");
+  assert.equal(top.children[0].children[0].more.note, "down");
+  asked.stop();
+  d.close();
+}
+
 // Records, of values and of maps, and trees, at any depth; and whose each is. A path says where, or it is no path.
 {
   const p = peer(random, now);
