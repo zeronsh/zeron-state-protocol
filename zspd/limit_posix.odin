@@ -3,12 +3,6 @@ package main
 
 import "core:sys/posix"
 
-linux_getuid :: proc() -> u32 {
-	return u32(posix.getuid())
-}
-
-darwin_getuid :: linux_getuid
-
 // As many open files as the system lets this process have, not the few a shell gives by default (256 on macOS): a
 // relay holds a socket for everyone it serves. macOS refuses more than OPEN_MAX however high the hard limit is.
 raise_file_limit :: proc() {

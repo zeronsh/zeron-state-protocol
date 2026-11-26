@@ -1,9 +1,13 @@
 package host
 
+import "core:strings"
 import "core:time"
 import "../zsp"
 
-// Calls whose end is this host: the methods it serves itself, by names beginning "zsp.", and the calls it makes.
+// Calls whose end is this host: the methods it answers itself, in-process, and the calls it makes. This is how an
+// application that embeds the host builds a service on calls without its bytes going through a local client's pipe:
+// host_serve a method, and answer each call with a Call_Handler; host_call another device's. A method the host does
+// not serve passes on to a local client that does, so the two may be mixed. See examples/forward.
 //
 // Every call's messages are credited as whoever receives them is done with them, so that nothing is held but
 // what the receiver has room for. A window starts at the protocol's 256 KiB and doubles, to 4 MiB, while its
@@ -17,10 +21,11 @@ Caller :: struct {
 	device: zsp.Key32, // the calling device; this device's own for a local client
 	local:  ^zsp.Session, // non-nil when a local client of this node called its own device
 	who:    []byte, // for whom, as §12 settles it; valid during the answer only
-	relay:  bool, // a relay called (zsp.public only)
 }
 
-// Whoever answers a method. Returns the handler for the call, or nil to fault it with `fault`.
+// Whoever answers a method. Returns the handler for the call, or nil to fault it with `fault` (.Cancelled is taken
+// for .Denied, and .Unserved passes the call on to a local client that serves the method, if one does). The node has
+// checked already that the caller and this device may call in the scope.
 Host_Method :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: []byte) -> (h: ^Call_Handler, fault: zsp.Call_Fault)
 
 // What a call's end is told. Any field may be nil. A handler is its owner's to free, once it has been told that
@@ -45,15 +50,29 @@ Host_Call :: struct {
 	since:     time.Tick,
 }
 
-// Serves a method on every space. A later one for the same method replaces it.
+// Serves a method on every space, in every scope, in place of any local client that serves it; nil ceases to. A later
+// one for the same method replaces it. A method's name is 1 to 255 bytes. The name is copied.
 host_serve :: proc(h: ^Host, method: string, answer: Host_Method) {
-	assert(zsp.hosted(method), "the host serves only methods beginning zsp.")
-	h.methods[method] = answer
+	assert(len(method) > 0 && len(method) <= zsp.MAX_METHOD, "a method's name is 1 to 255 bytes")
+	if answer == nil {
+		if method in h.methods {
+			key, _ := delete_key(&h.methods, method)
+			delete(key)
+		}
+		return
+	}
+	if method in h.methods {
+		h.methods[method] = answer
+	} else {
+		h.methods[strings.clone(method)] = answer
+	}
 }
 
-// Calls a method a device serves itself. Returns 0 if it cannot be called: no right, no path, or too many calls.
-host_call :: proc(sp: ^Space, device: zsp.Key32, scope: zsp.Scope, method: string, first: []byte, handler: ^Call_Handler) -> u64 {
-	call := zsp.node_call_method(&sp.node, device, scope, method, first)
+// Calls a method of another device: whatever answers it there, its host or a local client. `urgency` is that of the
+// link stream the call takes, 0 the most urgent and 7 the least: what someone types into wants 1, a bulk copy 6. Returns
+// 0 if it cannot be called: no right, no path, or too many calls. What comes back goes to the handler.
+host_call :: proc(sp: ^Space, device: zsp.Key32, scope: zsp.Scope, method: string, first: []byte, handler: ^Call_Handler, urgency: u8 = zsp.URGENCY) -> u64 {
+	call := zsp.node_call_method(&sp.node, device, scope, method, first, urgency)
 	if call != 0 {
 		append(&sp.calls, Host_Call{call = call, handler = handler, window = zsp.CALL_WINDOW, since = time.tick_now()})
 	}
@@ -171,12 +190,12 @@ host_method :: proc(data: rawptr, call: u64, from: zsp.Caller_Info, scope: zsp.S
 	}
 	// Recorded first: whatever the answer says at once is said within the call.
 	append(&sp.calls, Host_Call{call = call, window = zsp.CALL_WINDOW, since = time.tick_now()})
-	handler, fault := answer(sp, call, {from.device, from.local, from.who, from.relay}, scope, first)
+	handler, fault := answer(sp, call, {from.device, from.local, from.who}, scope, first)
 	c := host_call_find(sp, call)
 	if handler == nil {
 		if c != nil {
 			host_call_forget(sp, call)
-			return fault if fault != .Cancelled else .Unserved
+			return fault if fault != .Cancelled else .Denied
 		}
 		return nil // it ended itself already
 	}

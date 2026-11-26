@@ -1,7 +1,6 @@
 package host
 
 import "core:nbio"
-import "core:sync"
 import "core:testing"
 import "core:time"
 import "../pipe"
@@ -16,17 +15,10 @@ relayed_holds_back_for_its_own_backlog :: proc(t: ^testing.T) {
 	testing.expect(t, world_init(t, &w, udp = false))
 	defer world_destroy(&w)
 	testing.expect(t, world_ready(&w, direct = false))
-	e: Echo
-	testing.expect(t, echo_start(&e))
-	defer echo_stop(&e)
-	open_port = u16(e.port)
-	w.hosts[2].port_permitted = permit_open_port
-	g: Gate
-	testing.expect(t, gate_open(&g, &w, u16(e.port)))
-	defer gate_close(&g)
-	c := Client{port = g.port, send = 8 << 20, read_too = true}
-	th := client_start(&c)
-	testing.expect(t, world_run(&w, proc(w: ^World, c: rawptr) -> bool {return sync.atomic_load(&(^Client)(c).heard) > 256 << 10}, &c))
+	echo_serve(&w.hosts[2])
+	p: Pump
+	testing.expect(t, pump_start(&p, &w, 8 << 20))
+	testing.expect(t, world_run(&w, proc(w: ^World, p: rawptr) -> bool {return (^Pump)(p).got > 256 << 10}, &p))
 	a := world_space(&w, 1)
 	testing.expect_value(t, len(a.relayed), 1)
 	l := a.relayed[0].link
@@ -41,9 +33,8 @@ relayed_holds_back_for_its_own_backlog :: proc(t: ^testing.T) {
 	testing.expectf(t, numbered == 0, "%d packets sent while its own pipe was full, and so dropped", numbered)
 
 	// And when it has room again, all of it goes, as it was.
-	testing.expect(t, world_run(&w, client_done, &c, 60 * time.Second))
-	testing.expectf(t, !c.reset && len(c.got) == len(c.sent) && string(c.got[:]) == string(c.sent[:]), "%d of %d came back", len(c.got), len(c.sent))
-	client_destroy(&c, th)
+	testing.expect(t, world_run(&w, pump_done, &p, 60 * time.Second))
+	testing.expectf(t, pump_whole(&p), "%d of %d came back, as they were: %v", p.got, p.total, !p.wrong)
 }
 
 // Review, round 1. Held back by its own pipe, with a call going on and CALL_ALIVE since the link last sent: the host
@@ -54,17 +45,10 @@ relayed_held_back_waits :: proc(t: ^testing.T) {
 	testing.expect(t, world_init(t, &w, udp = false))
 	defer world_destroy(&w)
 	testing.expect(t, world_ready(&w, direct = false))
-	e: Echo
-	testing.expect(t, echo_start(&e))
-	defer echo_stop(&e)
-	open_port = u16(e.port)
-	w.hosts[2].port_permitted = permit_open_port
-	g: Gate
-	testing.expect(t, gate_open(&g, &w, u16(e.port)))
-	defer gate_close(&g)
-	c := Client{port = g.port, send = 8 << 20, read_too = true}
-	th := client_start(&c)
-	testing.expect(t, world_run(&w, proc(w: ^World, c: rawptr) -> bool {return sync.atomic_load(&(^Client)(c).heard) > 256 << 10}, &c))
+	echo_serve(&w.hosts[2])
+	p: Pump
+	testing.expect(t, pump_start(&p, &w, 8 << 20))
+	testing.expect(t, world_run(&w, proc(w: ^World, p: rawptr) -> bool {return (^Pump)(p).got > 256 << 10}, &p))
 	a := world_space(&w, 1)
 	testing.expect_value(t, len(a.relayed), 1)
 	r := a.relayed[0]
@@ -93,8 +77,8 @@ relayed_held_back_waits :: proc(t: ^testing.T) {
 	// Spinning, it went round some ten thousand times; waiting, it wakes for what the transfer still brings, more often
 	// on Windows, where it went round 70 times.
 	testing.expectf(t, ticks < 500, "the host went round %d times in 50 ms, held back past CALL_ALIVE", ticks)
-	testing.expect(t, world_run(&w, client_done, &c, 60 * time.Second))
-	client_destroy(&c, th)
+	testing.expect(t, world_run(&w, pump_done, &p, 60 * time.Second))
+	testing.expect(t, pump_whole(&p))
 }
 
 // Review, round 11. A link only knocked for, and never heard from over, is no way to the device: a call put on it would
@@ -129,17 +113,10 @@ relayed_probing_waits :: proc(t: ^testing.T) {
 	testing.expect(t, world_init(t, &w, udp = false))
 	defer world_destroy(&w)
 	testing.expect(t, world_ready(&w, direct = false))
-	e: Echo
-	testing.expect(t, echo_start(&e))
-	defer echo_stop(&e)
-	open_port = u16(e.port)
-	w.hosts[2].port_permitted = permit_open_port
-	g: Gate
-	testing.expect(t, gate_open(&g, &w, u16(e.port)))
-	defer gate_close(&g)
-	c := Client{port = g.port, send = 8 << 20, read_too = true}
-	th := client_start(&c)
-	testing.expect(t, world_run(&w, proc(w: ^World, c: rawptr) -> bool {return sync.atomic_load(&(^Client)(c).heard) > 256 << 10}, &c))
+	echo_serve(&w.hosts[2])
+	p: Pump
+	testing.expect(t, pump_start(&p, &w, 8 << 20))
+	testing.expect(t, world_run(&w, proc(w: ^World, p: rawptr) -> bool {return (^Pump)(p).got > 256 << 10}, &p))
 	a := world_space(&w, 1)
 	testing.expect_value(t, len(a.relayed), 1)
 	r := a.relayed[0]
@@ -168,8 +145,8 @@ relayed_probing_waits :: proc(t: ^testing.T) {
 	relay.node.host.backlog = backlog
 	testing.expectf(t, r.link.in_flight > 0, "nothing in flight: %d", r.link.in_flight)
 	testing.expectf(t, ticks < 1000, "the host went round %d times in 300 ms, probing past CALL_ALIVE", ticks)
-	testing.expect(t, world_run(&w, client_done, &c, 60 * time.Second))
-	client_destroy(&c, th)
+	testing.expect(t, world_run(&w, pump_done, &p, 60 * time.Second))
+	testing.expect(t, pump_whole(&p))
 }
 
 // Review, round 11. A link closed as it sends (given up, or closed) is let go of then, its session with it: not when
@@ -181,18 +158,11 @@ closed_links_let_go_at_once :: proc(t: ^testing.T) {
 		testing.expect(t, world_init(t, &w, udp = direct))
 		defer world_destroy(&w)
 		testing.expect(t, world_ready(&w, direct = direct))
-		e: Echo
-		testing.expect(t, echo_start(&e))
-		defer echo_stop(&e)
-		open_port = u16(e.port)
-		w.hosts[2].port_permitted = permit_open_port
-		g: Gate
-		testing.expect(t, gate_open(&g, &w, u16(e.port)))
-		defer gate_close(&g)
-		c := Client{port = g.port, send = 64 << 10, read_too = true}
-		th := client_start(&c)
-		testing.expect(t, world_run(&w, client_done, &c))
-		client_destroy(&c, th)
+		echo_serve(&w.hosts[2])
+		p: Pump
+		testing.expect(t, pump_start(&p, &w, 64 << 10))
+		testing.expect(t, world_run(&w, pump_done, &p))
+		testing.expect(t, pump_whole(&p))
 		a := world_space(&w, 1)
 		session: ^zsp.Session
 		if direct {
@@ -222,18 +192,11 @@ relayed_closed_by_the_peer_let_go_at_once :: proc(t: ^testing.T) {
 	testing.expect(t, world_init(t, &w, udp = false))
 	defer world_destroy(&w)
 	testing.expect(t, world_ready(&w, direct = false))
-	e: Echo
-	testing.expect(t, echo_start(&e))
-	defer echo_stop(&e)
-	open_port = u16(e.port)
-	w.hosts[2].port_permitted = permit_open_port
-	g: Gate
-	testing.expect(t, gate_open(&g, &w, u16(e.port)))
-	defer gate_close(&g)
-	c := Client{port = g.port, send = 4096, read_too = true}
-	th := client_start(&c)
-	testing.expect(t, world_run(&w, client_done, &c))
-	client_destroy(&c, th)
+	echo_serve(&w.hosts[2])
+	p: Pump
+	testing.expect(t, pump_start(&p, &w, 4096))
+	testing.expect(t, world_run(&w, pump_done, &p))
+	testing.expect(t, pump_whole(&p))
 	a, b := world_space(&w, 1), world_space(&w, 2)
 	testing.expect(t, len(a.relayed) == 1 && len(b.relayed) == 1)
 	if len(a.relayed) != 1 || len(b.relayed) != 1 {

@@ -1,7 +1,6 @@
 package pipe
 
 import "core:crypto"
-import "core:crypto/aes"
 import "core:crypto/sha2"
 import "core:encoding/endian"
 import "../zsp"
@@ -38,7 +37,6 @@ Tls_Key :: struct {
 	key: zsp.Key32,
 	iv:  [12]byte,
 	n:   u64,
-	aes: bool, // AES-128-GCM, of which key has 16 bytes; else ChaCha20-Poly1305
 }
 
 TLS_RECORD :: 16384
@@ -338,7 +336,7 @@ tls_expand_to :: proc(secret: zsp.Key32, label: string, ctx: []byte, size: u8) -
 
 @(private)
 tls_key :: proc(k: ^Tls_Key, secret: zsp.Key32) {
-	k.key = tls_expand_to(secret, "key", nil, 16 if k.aes else 32)
+	k.key = tls_expand(secret, "key", nil)
 	iv := tls_expand_to(secret, "iv", nil, 12)
 	copy(k.iv[:], iv[:])
 	k.n = 0
@@ -362,13 +360,6 @@ tls_seal :: proc(k: ^Tls_Key, type: byte, plain: []byte, w: ^[dynamic]byte) {
 	resize(w, at + 5 + n)
 	iv := tls_nonce(k)
 	body := w[at + 5:][:len(plain) + 1]
-	if k.aes {
-		ctx: aes.Context_GCM = ---
-		aes.init_gcm(&ctx, k.key[:16])
-		aes.seal_gcm(&ctx, body, w[at + 5 + len(body):], iv[:], w[at:][:5], body)
-		aes.reset_gcm(&ctx)
-		return
-	}
 	zsp.chacha_seal(k.key[:], iv[:], body, w[at + 5 + len(body):], w[at:][:5], body)
 }
 
@@ -379,13 +370,6 @@ tls_open :: proc(k: ^Tls_Key, sealed, ad: []byte) -> (plain: []byte, ok: bool) {
 		return
 	}
 	iv := tls_nonce(k)
-	if k.aes {
-		ctx: aes.Context_GCM = ---
-		aes.init_gcm(&ctx, k.key[:16])
-		ok = aes.open_gcm(&ctx, sealed[:n], iv[:], ad, sealed[:n], sealed[n:])
-		aes.reset_gcm(&ctx)
-		return sealed[:n], ok
-	}
 	ok = zsp.chacha_open(k.key[:], iv[:], sealed[:n], ad, sealed[:n], sealed[n:])
 	return sealed[:n], ok
 }

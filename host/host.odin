@@ -25,35 +25,9 @@ Config :: struct {
 	udp_port:     Maybe(int), // links, on this port or any if zero
 	stun:         string, // host:port to ask for this machine's outside address
 	credential:   string, // presented to relays
-	// Every device of the first space by name and by address, on this machine: see names.odin. "" for none.
-	names:        string,
-	loopback:     [2]byte, // 127.a.b.c: a, and b's first value
-	dns:          Maybe(net.Endpoint), // where to answer for names
-	proxy:        Maybe(net.Endpoint), // SOCKS 5 and HTTP CONNECT, for applications that can use one
-	catch_at:     Maybe(net.Endpoint), // Linux: where zspd setup has connections to devices' addresses sent
-	// Lets anyone on this machine use other devices' ports, not only this user: for a machine whose users are one,
-	// where who connects cannot be told.
-	trust_local_users: bool,
-	// Whether a local client may change what this device offers and exposes; nil: one accepted for every scope may.
-	may_configure: proc(data: rawptr, s: ^zsp.Session) -> bool,
-	// A relay's exposure of devices' ports to the public, at <label>.<expose>: by TLS at `https`, with this certificate
-	// chain and key (PEM files), and by plain HTTP at `expose_http`, behind something else that speaks TLS.
-	expose:       string,
-	https:        Maybe(net.Endpoint),
-	expose_http:  Maybe(net.Endpoint),
-	tls_cert:     string,
-	tls_key:      string,
 	// Authentication, which is wholly the embedder's: see zsp.Host.authenticate. `data` is passed back.
 	data:         rawptr,
 	authenticate: proc(data: rawptr, s: ^zsp.Session, credential: []byte),
-	// Whether a caller may reach a TCP port through this device (zsp.tcp), and whether to tell the port who it
-	// is first, by what proxy_prelude says. Nil denies every port.
-	port_permitted: proc(sp: ^Space, caller: zsp.Key32, scope: zsp.Scope, port: u16, target: string) -> (ok: bool, proxy: bool),
-	// The bytes written to a port before anything else, when port_permitted asked for them (a PROXY header), in
-	// temporary memory: they are copied.
-	proxy_prelude:  proc(sp: ^Space, from: Caller, port: u16, target: string) -> []byte,
-	// The ports offered to a caller in a scope, for zsp.services to list (temporary memory).
-	ports_offered:  proc(sp: ^Space, from: Caller, scope: zsp.Scope) -> []Port_Offer,
 }
 
 Host :: struct {
@@ -65,17 +39,11 @@ Host :: struct {
 	listener:     net.TCP_Socket,
 	dialers:      [dynamic]^Dialer,
 	udp:          Udp,
-	dns_server:   Dns,
-	catch:        Catch,
-	proxy_server: Proxy,
-	later:        [dynamic]^Answer,
-	public:       Relay_Public,
-	public_dead:  [dynamic]^Public_Out,
 	shared:       []byte, // everything is received into this
 	sync_due:     time.Tick,
 	syncing:      bool, // sync_due is set
 	stopping:     bool,
-	methods:      map[string]Host_Method, // that the host serves itself
+	methods:      map[string]Host_Method, // that the host answers itself, in-process: see host_serve
 	accepting:    ^nbio.Operation,
 }
 
@@ -89,14 +57,8 @@ Space :: struct {
 	warned: bool, // of a clock
 	found: ^Found, // while anyone is asking anything
 	calls: [dynamic]Host_Call, // whose end is the host
-	bridges: [dynamic]^Bridge, // of calls to TCP connections
 	relayed: [dynamic]^Relayed, // links through relays
 	knocked: map[zsp.Key32]u64, // the newest knock heard from each device through relays: its dialler's stamp time
-	shares: [dynamic]Share, // what this device lets others do on it
-	services: [dynamic]^Service_Call, // calls to them, which a change may end
-	audit: Audit_Log,
-	naming: Naming,
-	ports:  ^Ports, // other devices' and this one's
 }
 
 @(private)
@@ -207,10 +169,6 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 				report(.Debug, "roster ", fmt.tprintf("%x", serial), " taken and kept")
 			}
 			dialers_refresh(s.host)
-			// Rights may have gone: whatever they allowed ends.
-			services_recheck(s)
-			forwards_recheck(s)
-			ports_roster(s)
 		},
 		signal       = links_signalled,
 		presence     = proc(data: rawptr, online: []zsp.Key32) {
@@ -222,24 +180,9 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		link         = relayed_input,
 		backlog      = stream_backlog,
 		flush        = stream_push_for,
-		exposure     = proc(data: rawptr, session: ^zsp.Session, type: u8, payload: []byte) {
-			sp := (^Space)(data)
-			switch {
-			case sp.host.relay && type == zsp.EXPOSE:
-				public_exposed(sp, session, payload)
-			case !sp.host.relay && type == zsp.EXPOSE + 1:
-				exposures_heard(sp, session, payload)
-			}
-		},
 	}
 	if !h.relay {
 		s.node.host.questions = questions(s)
-		shares_load(s)
-		if len(h.spaces) == 0 {
-			s.naming = {h.names, h.loopback}
-		}
-		ports_open(s)
-		catch_try(h)
 	}
 	append(&h.spaces, s)
 	return s
@@ -259,14 +202,9 @@ space_authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
 }
 
 space_close :: proc(s: ^Space) {
-	public_space_closed(s)
-	ports_close(s)
 	found_close(s)
-	bridges_close(s)
 	calls_close(s)
 	relayed_close(s)
-	shares_close(s)
-	audit_close(s)
 	if !zsp.store_sync(&s.node.store) {
 		report(.Error, "could not sync the log")
 	}
@@ -327,49 +265,6 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 	if port, ok := h.udp_port.?; ok {
 		udp_open(h, port) or_return
 	}
-	host_serve_builtin(h)
-	if h.relay && h.expose != "" && !public_open(h) {
-		return false
-	}
-	if !h.relay {
-		// What this device offers, unless whoever embeds it decides that otherwise.
-		if h.port_permitted == nil {
-			h.port_permitted = port_permitted
-			h.proxy_prelude = proc(sp: ^Space, from: Caller, port: u16, target: string) -> []byte {
-				return port_proxy_header(sp, from.device, port)
-			}
-			// What zsp.services lists: what is offered the caller, as zsp.ports says it.
-			h.ports_offered = proc(sp: ^Space, from: Caller, scope: zsp.Scope) -> []Port_Offer {
-				if sp.ports == nil || from.local != nil || from.relay {
-					return nil
-				}
-				// What listens is looked at only while somebody is kept up: else, now.
-				if p := sp.ports; len(p.watchers) == 0 || time.tick_diff(p.scanned, time.tick_now()) >= SCAN_EVERY {
-					ports_scan(p)
-				}
-				list, _ := offered_to(sp.ports, from.device, scope) // what is offered in the scope asked of, and nothing else
-				out := make([]Port_Offer, len(list), context.temp_allocator)
-				for e, i in list {
-					out[i] = {e.port, e.host, e.name}
-				}
-				return out
-			}
-		}
-		host_serve(h, "zsp.public", public_called)
-		host_serve(h, "zsp.expose", expose_called)
-		host_serve(h, "zsp.ports", ports_called)
-		host_serve(h, "zsp.nodes", nodes_called)
-		host_serve(h, "zsp.offers", offers_called)
-	}
-	if at, ok := h.dns.?; ok && !h.relay && h.names != "" {
-		dns_open(h, at)
-	}
-	if at, ok := h.catch_at.?; ok && !h.relay && h.names != "" {
-		catch_open(h, at) // tried once there is a space to try it for
-	}
-	if at, ok := h.proxy.?; ok && !h.relay && h.names != "" {
-		proxy_open(h, at)
-	}
 	return true
 }
 
@@ -402,10 +297,6 @@ host_destroy :: proc(h: ^Host) {
 		stream_close(h.streams[0])
 	}
 	udp_close(h)
-	public_close(h)
-	dns_close(h)
-	catch_close(h)
-	proxy_close(h)
 	for len(h.spaces) > 0 {
 		space_close(pop(&h.spaces))
 	}
@@ -414,17 +305,11 @@ host_destroy :: proc(h: ^Host) {
 	}
 	delete(h.streams)
 	delete(h.spaces)
-	for a in h.later {
-		delete(a.say) // its space, and so its call, gone before it began
-		free(a)
-	}
-	delete(h.later)
-	for c in h.public_dead {
-		free(c)
-	}
-	delete(h.public_dead)
 	delete(h.dialers)
 	delete(h.shared)
+	for method in h.methods {
+		delete(method)
+	}
 	delete(h.methods)
 	nbio.release_thread_event_loop()
 }
@@ -437,9 +322,6 @@ session_end :: proc(session: ^zsp.Session) {
 		report(.Warning, "this machine's clock and another's differ by more than a quarter of an hour: nothing passes between them")
 	}
 	report(.Debug, fmt.tprint("a session ended: ", session.role, " ", session.fault))
-	if s.host.relay {
-		public_session_closed(s.host, s, session.id)
-	}
 	zsp.session_close(session)
 }
 
@@ -463,18 +345,12 @@ host_settle :: proc(h: ^Host) {
 			h.stopping = true
 		}
 	}
-	later_run(h)
-	for c in h.public_dead {
-		free(c)
-	}
-	clear(&h.public_dead)
 	dialers_run(h, now)
 	links_run(h)
 	for s in h.spaces {
 		s.node.now = ms
 		found_run(s, now)
 		relayed_run(s, now)
-		ports_run(s, now)
 	}
 	links_flush(h)
 	for s in h.spaces {
@@ -496,9 +372,6 @@ host_settle :: proc(h: ^Host) {
 			busy := len(s.node.sessions) > 0
 			for x in h.streams {
 				busy ||= x.space == s
-			}
-			for c in h.public.conns {
-				busy ||= c.sp == s // the public may yet be reading what its device said before it left
 			}
 			if !busy {
 				unordered_remove(&h.spaces, i)
@@ -533,9 +406,6 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 	}
 	for s in h.spaces {
 		if t, set := found_deadline(s, time.tick_now()); set {
-			earliest(&due, &ok, t)
-		}
-		if t, set := ports_deadline(s); set {
 			earliest(&due, &ok, t)
 		}
 	}

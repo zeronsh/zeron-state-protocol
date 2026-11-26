@@ -2,104 +2,76 @@ package host
 
 import "base:runtime"
 import "core:fmt"
-import "core:net"
-import "core:os"
 import "core:slice"
-import "core:strings"
-import "core:sync"
 import "core:testing"
-import "core:thread"
 import "core:time"
 import "../zsp"
 
 // What streams cost and give, measured on this machine over loopback: a relay and two devices in one process, so the
 // CPU and memory are all three's together. Run by `./x bench streams`; a test that does nothing otherwise.
 //
-// For each path, directly over UDP and through the relay: the throughput of a forwarded TCP connection; the round trip
-// of a small message in a call, idle; the same while a bulk transfer runs, a file (zsp.get) and a forward (zsp.tcp);
-// and the CPU time and resident memory that cost.
+// For each path, directly over UDP and through the relay: the throughput of a bulk call; the round trip of a small
+// message in a call, idle; the same beneath a bulk call of a lesser urgency, and of the same; and the CPU time and
+// resident memory that cost.
 
 BENCH :: #config(ZSP_BENCH, false)
 BENCH_BYTES :: #config(ZSP_BENCH_BYTES, 64 << 20)
 
+// B's "sink": takes whatever it is told, counting it, and ends when the caller does.
 @(private)
-Sink :: struct {
-	listener: net.TCP_Socket,
-	port:     int,
-	thread:   ^thread.Thread,
-	got:      i64, // atomic
-	stop:     bool, // atomic
-}
+sunk: int
 
 @(private)
-sink_start :: proc(s: ^Sink) {
-	s.listener, _ = net.listen_tcp({net.IP4_Loopback, 0})
-	bound, _ := net.bound_endpoint(s.listener)
-	s.port = bound.port
-	s.thread = thread.create_and_start_with_poly_data(s, proc(s: ^Sink) {
-		for !sync.atomic_load(&s.stop) {
-			client, _, err := net.accept_tcp(s.listener)
-			if err != nil || sync.atomic_load(&s.stop) {
-				if err == nil {
-					net.close(client)
-				}
-				return
-			}
-			buf: [256 << 10]byte
-			for {
-				n, rerr := net.recv_tcp(client, buf[:])
-				if rerr != nil || n == 0 {
-					break
-				}
-				sync.atomic_add(&s.got, i64(n))
-			}
-			net.close(client)
-		}
-	})
-}
-
-@(private)
-sink_stop :: proc(s: ^Sink) {
-	sync.atomic_store(&s.stop, true)
-	if c, err := net.dial_tcp(net.Endpoint{net.IP4_Loopback, s.port}); err == nil {
-		net.close(c)
+bench_sink :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: []byte) -> (^Call_Handler, zsp.Call_Fault) {
+	@(static) sink := Call_Handler {
+		on_data = proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
+			sunk += len(bytes)
+			return true
+		},
+		on_end = proc(h: ^Call_Handler, call: u64) {
+			call_end((^Space)(h.data), call)
+		},
 	}
-	thread.join(s.thread)
-	thread.destroy(s.thread)
-	net.close(s.listener)
+	sink.data = sp
+	sunk += len(first)
+	return &sink, .Cancelled
 }
 
-// Pours bytes into a connection as fast as it takes them.
+// A's end of a bulk call: pours bytes into it as fast as credit allows, then ends.
 @(private)
-Source :: struct {
-	port:   int,
-	bytes:  int,
-	sent:   i64, // atomic
-	done:   bool, // atomic
-	thread: ^thread.Thread,
+Sender :: struct {
+	using handler: Call_Handler,
+	sp:    ^Space,
+	call:  u64,
+	total: int,
+	sent:  int,
+	done:  bool, // the other side has ended too
 }
 
 @(private)
-source_start :: proc(s: ^Source) {
-	s.thread = thread.create_and_start_with_poly_data(s, proc(s: ^Source) {
-		defer sync.atomic_store(&s.done, true)
-		c, err := net.dial_tcp(net.Endpoint{net.IP4_Loopback, s.port})
-		if err != nil {
+sender_start :: proc(s: ^Sender, w: ^World, total: int, urgency: u8) -> bool {
+	s.sp, s.total, s.data = world_space(w, 1), total, s
+	s.on_room = proc(h: ^Call_Handler, call: u64) {sender_fill((^Sender)(h.data))}
+	s.on_end = proc(h: ^Call_Handler, call: u64) {(^Sender)(h.data).done = true}
+	s.call = host_call(s.sp, w.keys[2].device, 1, "sink", nil, &s.handler, urgency)
+	if s.call == 0 {
+		return false
+	}
+	sender_fill(s)
+	return true
+}
+
+@(private)
+sender_fill :: proc(s: ^Sender) {
+	@(static) zeros: [64 << 10]byte
+	for s.sent < s.total {
+		n := min(s.total - s.sent, call_room(s.sp, s.call), len(zeros))
+		if n <= 0 || !call_send(s.sp, s.call, zeros[:n]) {
 			return
 		}
-		defer net.close(c)
-		buf: [256 << 10]byte
-		for i := 0; i < s.bytes; i += len(buf) {
-			n, serr := net.send_tcp(c, buf[:min(len(buf), s.bytes - i)])
-			sync.atomic_add(&s.sent, i64(n))
-			if serr != nil {
-				return
-			}
-		}
-		net.shutdown(c, .Send)
-		one: [1]byte
-		net.recv_tcp(c, one[:]) // until the other side lets go
-	})
+		s.sent += n
+	}
+	call_end(s.sp, s.call)
 }
 
 // A call whose messages come straight back: each round trip timed.
@@ -133,7 +105,7 @@ pinger_start :: proc(p: ^Pinger, w: ^World, want: int) -> bool {
 		}
 		return true
 	}
-	p.call = host_call(p.sp, w.keys[2].device, 1, "zsp.bench", nil, &p.handler)
+	p.call = host_call(p.sp, w.keys[2].device, 1, "bench", nil, &p.handler)
 	if p.call == 0 {
 		return false
 	}
@@ -184,31 +156,23 @@ bench_streams :: proc(t: ^testing.T) {
 		testing.expect(t, world_init(t, &w, udp = udp))
 		defer world_destroy(&w)
 		testing.expect(t, world_ready(&w, direct = udp))
-		host_serve(&w.hosts[2], "zsp.bench", bench_echo)
+		host_serve(&w.hosts[2], "bench", bench_echo)
+		host_serve(&w.hosts[2], "sink", bench_sink)
 		path := "udp  " if udp else "relay"
-		sink: Sink
-		sink_start(&sink)
-		defer sink_stop(&sink)
-		open_port = u16(sink.port)
-		w.hosts[2].port_permitted = permit_open_port
-		g: Gate
-		testing.expect(t, gate_open(&g, &w, u16(sink.port)))
-		defer gate_close(&g)
 
 		// Bulk alone.
 		before := usage()
 		start := time.tick_now()
-		src := Source{port = g.port, bytes = BENCH_BYTES}
-		source_start(&src)
-		world_run(&w, proc(w: ^World, s: rawptr) -> bool {return sync.atomic_load(&(^Sink)(s).got) >= BENCH_BYTES}, &sink, 120 * time.Second)
+		sunk = 0
+		src: Sender
+		testing.expect(t, sender_start(&src, &w, BENCH_BYTES, 6))
+		world_run(&w, proc(w: ^World, s: rawptr) -> bool {return (^Sender)(s).done}, &src, 120 * time.Second)
 		took := time.tick_since(start)
 		after := usage()
-		world_run(&w, proc(w: ^World, s: rawptr) -> bool {return sync.atomic_load(&(^Source)(s).done)}, &src, 30 * time.Second)
-		thread.join(src.thread)
-		thread.destroy(src.thread)
+		testing.expect_value(t, sunk, BENCH_BYTES)
 		mbps := f64(BENCH_BYTES) * 8 / time.duration_seconds(took) / 1e6
 		cpu := time.duration_seconds(after.cpu - before.cpu) / (f64(BENCH_BYTES) / f64(1 << 30))
-		fmt.eprintfln("  %s     a forward, %d MiB                      %.0f Mbit/s, %.2f s of CPU a GiB", path, BENCH_BYTES >> 20, mbps, cpu)
+		fmt.eprintfln("  %s     a bulk call, %d MiB                    %.0f Mbit/s, %.2f s of CPU a GiB", path, BENCH_BYTES >> 20, mbps, cpu)
 		world_run(&w, nobody_left)
 
 		// A small message's round trip, idle.
@@ -217,23 +181,12 @@ bench_streams :: proc(t: ^testing.T) {
 		world_run(&w, proc(w: ^World, p: rawptr) -> bool {return len((^Pinger)(p).samples) >= (^Pinger)(p).want}, &p)
 		fmt.eprintfln("  %s     round trip, idle                      %.3f ms median, %.3f ms at the 99th", path, percentile(p.samples[:], 50), percentile(p.samples[:], 99))
 
-		// The same while a file comes in bulk, and while a forward does.
-		for bulk in ([]string{"zsp.get", "zsp.tcp"}) {
+		// The same beneath a bulk call less urgent than it, and beneath one as urgent.
+		for urgency in ([]u8{6, 3}) {
 			clear(&p.samples)
-			done := sync.atomic_load(&sink.got)
-			busy := Source{port = g.port, bytes = BENCH_BYTES}
-			fetched: Outcomes
-			defer outcomes_destroy(&fetched)
-			file := in_world(&w, "bulk.bin")
-			if bulk == "zsp.tcp" {
-				source_start(&busy)
-			} else {
-				f, _ := os.open(file, {.Write, .Create, .Trunc})
-				os.truncate(f, i64(BENCH_BYTES))
-				os.close(f)
-				shares_set(world_space(&w, 2), strings.concatenate({"files 1 bulk read ", w.root}, context.temp_allocator))
-				host_get(world_space(&w, 1), w.keys[2].device, 1, "bulk/bulk.bin", in_world(&w, "fetched.bin"), outcome, &fetched)
-			}
+			sunk = 0
+			busy: Sender
+			testing.expect(t, sender_start(&busy, &w, BENCH_BYTES, urgency))
 			// Let it get going, then time round trips beneath it.
 			wait := time.tick_now()
 			world_run(&w, proc(w: ^World, at: rawptr) -> bool {return time.tick_since((^time.Tick)(at)^) > 300 * time.Millisecond}, &wait)
@@ -241,20 +194,9 @@ bench_streams :: proc(t: ^testing.T) {
 			ping_once(&p)
 			bulk_start := time.tick_now()
 			world_run(&w, proc(w: ^World, p: rawptr) -> bool {return len((^Pinger)(p).samples) >= (^Pinger)(p).want}, &p, 60 * time.Second)
-			moved := f64(sync.atomic_load(&sink.got) - done)
-			if bulk == "zsp.get" {
-				info, _ := os.stat(path_with(in_world(&w, "fetched.bin"), PART), context.temp_allocator)
-				moved = f64(info.size)
-			}
-			rate := moved * 8 / time.duration_seconds(time.tick_since(bulk_start) + 300 * time.Millisecond) / 1e6
-			fmt.eprintfln("  %s     round trip, beneath a %s           %.3f ms median, %.3f ms at the 99th, the bulk at %.0f Mbit/s", path, bulk, percentile(p.samples[:], 50), percentile(p.samples[:], 99), rate)
-			if bulk == "zsp.tcp" {
-				world_run(&w, proc(w: ^World, s: rawptr) -> bool {return sync.atomic_load(&(^Source)(s).done)}, &busy, 120 * time.Second)
-				thread.join(busy.thread)
-				thread.destroy(busy.thread)
-			} else {
-				world_run(&w, proc(w: ^World, o: rawptr) -> bool {return len((^Outcomes)(o).results) > 0}, &fetched, 120 * time.Second)
-			}
+			rate := f64(sunk) * 8 / time.duration_seconds(time.tick_since(bulk_start) + 300 * time.Millisecond) / 1e6
+			fmt.eprintfln("  %s     round trip, beneath bulk at urgency %d  %.3f ms median, %.3f ms at the 99th, the bulk at %.0f Mbit/s", path, urgency, percentile(p.samples[:], 50), percentile(p.samples[:], 99), rate)
+			world_run(&w, proc(w: ^World, s: rawptr) -> bool {return (^Sender)(s).done}, &busy, 120 * time.Second)
 		}
 		delete(p.samples)
 		call_end(world_space(&w, 1), p.call)

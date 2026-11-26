@@ -7,14 +7,12 @@ import "core:net"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
-import "core:sync"
 import "core:testing"
-import "core:thread"
 import "core:time"
 import "../zsp"
 
 // A relay and two devices, A and B, in one process and on one event loop, over loopback: the whole of the host,
-// sockets and all, under a test's eye. A owns the space; both may call, run and reach files in scope 1.
+// sockets and all, under a test's eye. A owns the space; both may call in scope 1.
 
 @(private)
 World :: struct {
@@ -31,7 +29,7 @@ World :: struct {
 }
 
 @(private)
-world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = {.Read, .Write, .Call, .Shell, .Files}, relays := 1) -> bool {
+world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = {.Read, .Write, .Call}, relays := 1) -> bool {
 	w.t = t
 	w.count = 3 if relays == 1 else 4
 	base, terr := os.temp_directory(context.temp_allocator)
@@ -59,7 +57,7 @@ world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = 
 	none: zsp.Roster
 	d := zsp.draft_from(&none, now_ms() << 16)
 	home := zsp.draft_scope(&d)
-	zsp.draft_grant(&d, w.keys[1].device, w.keys[1].signer, home, {.Read, .Write, .Call, .Shell, .Files}).owner = true
+	zsp.draft_grant(&d, w.keys[1].device, w.keys[1].signer, home, {.Read, .Write, .Call}).owner = true
 	zsp.draft_grant(&d, w.keys[2].device, w.keys[2].signer, home, grant_b)
 	zsp.draft_scope(&d) // scope 2, which B has no part of
 	roster, signed := zsp.roster_sign(&w.keys[1], root, &d, context.temp_allocator)
@@ -180,110 +178,161 @@ world_ready :: proc(w: ^World, direct: bool) -> bool {
 	}, &direct)
 }
 
-// ---------------------------------------------------------------- a TCP service to reach, on a thread of its own
+// ---------------------------------------------------------------- a service on calls, and a caller that fills it
 
+// Calls whose end is a host, and calls, no longer under way on A or B.
 @(private)
-Echo :: struct {
-	listener: net.TCP_Socket,
-	port:     int,
-	thread:   ^thread.Thread,
-	accepted: i32, // atomic
-	read:     i64, // atomic; bytes
-	stalled:  bool, // reads nothing: a reader that never reads
-	giving_up: bool, // a send gives up now and then, to see whether the test is over: never where what it sends counts,
-	// for on Windows a send that gives up may have sent some of what it was given, and nobody can say how much
-	stop:     bool, // atomic
-	guard:    sync.Mutex,
-	current:  net.TCP_Socket, // the connection being echoed, if any; under guard
-	serving:  bool, // under guard
+nobody_left :: proc(w: ^World, _: rawptr) -> bool {
+	return len(world_space(w, 1).calls) + len(world_space(w, 2).calls) + len(world_space(w, 1).node.calls) + len(world_space(w, 2).node.calls) == 0
 }
 
-// Echoes whatever each connection says until it says no more, then says no more itself.
+// B's end of "echo": says back whatever it is told, as fast as credit allows, and credits what it is told only once it
+// has said it back, so that a caller that does not read holds the echo up, and the echo the caller, and nothing piles up.
 @(private)
-echo_start :: proc(e: ^Echo, stalled := false, giving_up := false) -> bool {
-	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
-	if err != nil {
+Echoer :: struct {
+	using handler: Call_Handler,
+	sp:       ^Space,
+	call:     u64,
+	held:     [dynamic]byte, // told, not yet said back
+	owed:     int, // of that, credit not yet given
+	heard_end: bool,
+}
+
+@(private)
+echo_serve :: proc(h: ^Host) {
+	host_serve(h, "echo", proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: []byte) -> (^Call_Handler, zsp.Call_Fault) {
+		e := new(Echoer)
+		e.sp, e.call, e.data = sp, call, e
+		append(&e.held, ..first) // the first message is credited as it is taken
+		e.on_data = proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
+			e := (^Echoer)(h.data)
+			append(&e.held, ..bytes)
+			e.owed += len(bytes)
+			echoer_flush(e)
+			return false
+		}
+		e.on_room = proc(h: ^Call_Handler, call: u64) {echoer_flush((^Echoer)(h.data))}
+		e.on_end = proc(h: ^Call_Handler, call: u64) {
+			e := (^Echoer)(h.data)
+			e.heard_end = true
+			echoer_flush(e)
+		}
+		e.on_fault = proc(h: ^Call_Handler, call: u64, fault: zsp.Call_Fault) {echoer_free((^Echoer)(h.data))}
+		echoer_flush(e)
+		return e, .Cancelled
+	})
+}
+
+@(private)
+echoer_flush :: proc(e: ^Echoer) {
+	sent := 0
+	for sent < len(e.held) {
+		n := min(len(e.held) - sent, call_room(e.sp, e.call), 64 << 10)
+		if n <= 0 || !call_send(e.sp, e.call, e.held[sent:][:n]) {
+			break
+		}
+		sent += n
+	}
+	remove_range(&e.held, 0, sent)
+	if credit := min(sent, e.owed); credit > 0 {
+		e.owed -= credit
+		call_consumed(e.sp, e.call, credit)
+	}
+	if e.heard_end && len(e.held) == 0 {
+		call_end(e.sp, e.call) // over for both, so nothing more is said to it
+		echoer_free(e)
+	}
+}
+
+@(private)
+echoer_free :: proc(e: ^Echoer) {
+	delete(e.held)
+	free(e)
+}
+
+// A's end: sends `total` bytes of a pattern as credit allows, then ends, and checks what comes back byte for byte.
+@(private)
+Pump :: struct {
+	using handler: Call_Handler,
+	sp:      ^Space,
+	call:    u64,
+	total:   int,
+	sent:    int,
+	got:     int,
+	wrong:   bool, // something came back that was not what was sent
+	ended:   bool, // the other side has said all
+	faulted: bool,
+	fault:   zsp.Call_Fault,
+}
+
+@(private)
+pump_byte :: proc(i: int) -> byte {
+	return byte(i * 7 + i / 251)
+}
+
+// Begins a pump of `total` bytes from A to "echo" at B. False if the call cannot be made.
+@(private)
+pump_start :: proc(p: ^Pump, w: ^World, total: int, urgency: u8 = zsp.URGENCY) -> bool {
+	p.sp, p.total, p.data = world_space(w, 1), total, p
+	p.on_data = proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
+		p := (^Pump)(h.data)
+		for b in bytes {
+			p.wrong ||= b != pump_byte(p.got)
+			p.got += 1
+		}
+		return true
+	}
+	p.on_room = proc(h: ^Call_Handler, call: u64) {pump_fill((^Pump)(h.data))}
+	p.on_end = proc(h: ^Call_Handler, call: u64) {
+		p := (^Pump)(h.data)
+		p.ended = true
+		if p.sent == p.total {
+			call_end(p.sp, p.call)
+		}
+	}
+	p.on_fault = proc(h: ^Call_Handler, call: u64, fault: zsp.Call_Fault) {
+		p := (^Pump)(h.data)
+		p.faulted, p.fault = true, fault
+	}
+	p.call = host_call(p.sp, w.keys[2].device, 1, "echo", nil, &p.handler, urgency)
+	if p.call == 0 {
 		return false
 	}
-	e.listener = listener
-	bound, _ := net.bound_endpoint(listener)
-	e.port = bound.port
-	e.stalled = stalled
-	e.giving_up = giving_up
-	e.thread = thread.create_and_start_with_poly_data(e, proc(e: ^Echo) {
-		for !sync.atomic_load(&e.stop) {
-			client, _, err := net.accept_tcp(e.listener)
-			if err != nil {
-				return
-			}
-			if sync.atomic_load(&e.stop) {
-				net.close(client)
-				return
-			}
-			sync.atomic_add(&e.accepted, 1)
-			sync.mutex_lock(&e.guard)
-			e.current, e.serving = client, true
-			sync.mutex_unlock(&e.guard)
-			// A reset that comes while nothing can be sent may be heard late: so, where it may, a send gives up now
-			// and then, to see whether the test is over.
-			if e.giving_up {
-				net.set_option(client, .Send_Timeout, 200 * time.Millisecond)
-			}
-			if e.stalled {
-				for !sync.atomic_load(&e.stop) {
-					time.sleep(10 * time.Millisecond)
-				}
-				sync.mutex_lock(&e.guard)
-				e.serving = false
-				net.close(client)
-				sync.mutex_unlock(&e.guard)
-				return
-			}
-			buf: [32 << 10]byte
-			for {
-				n, rerr := net.recv_tcp(client, buf[:])
-				if rerr != nil || n == 0 {
-					break
-				}
-				sync.atomic_add(&e.read, i64(n))
-				for sent := 0; sent < n && !sync.atomic_load(&e.stop); {
-					m, serr := net.send_tcp(client, buf[sent:n])
-					sent += m
-					if serr != nil && serr != .Timeout && serr != .Would_Block {
-						break
-					}
-				}
-				if sync.atomic_load(&e.stop) {
-					break
-				}
-			}
-			net.shutdown(client, .Send)
-			sync.mutex_lock(&e.guard)
-			e.serving = false
-			net.close(client)
-			sync.mutex_unlock(&e.guard)
-		}
-	})
+	pump_fill(p)
 	return true
 }
 
 @(private)
-echo_stop :: proc(e: ^Echo) {
-	sync.atomic_store(&e.stop, true)
-	// A connection still open at the end, as a test may leave one that it stopped in the midst of, would hold the
-	// echo in its read for ever, the world that would end it run no more: so it is ended here.
-	sync.mutex_lock(&e.guard)
-	if e.serving {
-		net.shutdown(e.current, .Both)
+pump_fill :: proc(p: ^Pump) {
+	buf: [32 << 10]byte
+	for p.sent < p.total && !p.faulted {
+		n := min(p.total - p.sent, call_room(p.sp, p.call), len(buf))
+		if n <= 0 {
+			return
+		}
+		for i in 0 ..< n {
+			buf[i] = pump_byte(p.sent + i)
+		}
+		if !call_send(p.sp, p.call, buf[:n]) {
+			return
+		}
+		p.sent += n
 	}
-	sync.mutex_unlock(&e.guard)
-	// Wake an accept that may still be waiting: closing the listener would not, everywhere.
-	if s, err := net.dial_tcp(net.Endpoint{net.IP4_Loopback, e.port}); err == nil {
-		net.close(s)
+	if p.sent == p.total && !p.faulted {
+		call_end(p.sp, p.call)
 	}
-	thread.join(e.thread)
-	thread.destroy(e.thread)
-	net.close(e.listener)
+}
+
+// Whether a pump is over: all of it back, as it was, and both sides done; or failed.
+@(private)
+pump_done :: proc(w: ^World, data: rawptr) -> bool {
+	p := (^Pump)(data)
+	return p.faulted || p.ended && p.got == p.total
+}
+
+@(private)
+pump_whole :: proc(p: ^Pump) -> bool {
+	return !p.faulted && !p.wrong && p.ended && p.got == p.total && p.sent == p.total
 }
 
 // A relay goes, as a process that dies does: every connection to it closed at once.

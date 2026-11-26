@@ -13,7 +13,6 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
-import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:time"
@@ -26,55 +25,19 @@ USAGE :: `zspd - Zeron State Protocol node
   zspd create <dir>                          make a space, owned by this device
   zspd key <dir>                             print what an admin needs to admit this device
   zspd scope <dir> [signed]                  add a scope to the space
-  zspd admit <dir> <key> <scope> [read|vouch|shell|files ...]
+  zspd admit <dir> <key> <scope> [read|vouch ...]
                                              grant a device a scope: to read, write and call; only to read; to say
-                                             for whom, too, and be believed; to use what devices share of terminals
-                                             and commands, or of files
+                                             for whom, too, and be believed
   zspd revoke <dir> <key> [scope]            end a device's grants
   zspd subject <dir> <key> <text>            say whose a device is: an account, a name, as you know them
-  zspd name <dir> <key> [name]               name a device, as other devices will reach it: <name>.zsp.internal;
-                                             without a name, unname it
-  zspd members <dir>                         list devices: key, @name, rights in each scope, whose it is
+  zspd members <dir>                         list devices: key, rights in each scope, whose it is
   zspd admin <dir> <key> [off]               let a device do all of this but make admins and owners, or no longer
   zspd owner <dir> <key>                     make a device an owner too, for good
   zspd relay <dir> <key> <url>               name a relay for the space's devices to meet at
   zspd join <dir> <space> <relay-key> <url>  become a device of a space that has admitted this one
   zspd peer <dir> <roster-file>              join from a roster file instead of a relay
-  zspd nodes <dir>                           list devices as the node running here reaches them: name, address,
-                                             whether it can, and what each offers this one
-  zspd offer <dir> <port[-port]> <scope> [device=<key>] [host=<address>] [name=<name>] [proxy]
-                                             offer this machine's ports (or another's, from here) to the devices
-                                             that may call in the scope, or to one of them; only those listening
-                                             are listed. Nothing is offered unless it is offered
-  zspd unoffer <dir> <port[-port]> <scope> [device=<key>] [host=<address>]
-                                             take an offer back: whoever is using it is cut off
-  zspd offers <dir>                          list what this device offers
-  zspd expose <dir> <port> [name=<name>] [proxy]
-                                             expose a port of this machine to the public, outside the space,
-                                             through each relay that will, at https://<name>-<id>.<its domain>;
-                                             proxy: say where each connection came from (PROXY protocol v2)
-  zspd unexpose <dir> <port>                 take it back: whoever is using it is cut off, and its name is gone
-  zspd exposures <dir>                       list what is exposed, and where
-  zspd setup [--undo] [--dry-run] [run's --names, --loopback, --dns, --catch] [--devices=<n>]
-                                             as root, once: have every application here find devices by name
-                                             and reach them by address; says each step as it takes it
   zspd run <dir> [options]                   run a device's node
   zspd serve <dir> [options]                 run a relay
-
-  zspd share <dir> [line ...]                say what this device shares, or share instead, a line each:
-                                             "shell <scope> [terminal] [commands]",
-                                             "files <scope> <name> read|write <path>"; "" for nothing
-  zspd services <dir> <device>               what a device offers this one
-  zspd connect <dir> <device> <port> [host]  join stdin and stdout to a TCP port there, or one it reaches (as an ssh
-                                             ProxyCommand, say)
-  zspd exec <dir> <device> [--] <argv...>    run a command there: its stdin, stdout and stderr are these, its exit
-                                             code this one's (128 and the signal, if one ended it; 255 if it could
-                                             not run), and signals sent here go there
-  zspd terminal <dir> <device>               a terminal there, the user's shell, in this one
-  zspd ls <dir> <device> [path]              list a folder there; with no path, the shares of files
-  zspd get <dir> <device> <remote> [local]   fetch a file or a folder; again, after a break, it takes up where it
-                                             stopped
-  zspd put <dir> <device> <local> <remote>   send a file or a folder
 
   --listen=<addr:port>   serve WebSockets here (run: 127.0.0.1:0, serve: 0.0.0.0:8787)
   --udp=<port>           use this port for direct links
@@ -83,28 +46,7 @@ USAGE :: `zspd - Zeron State Protocol node
   --partial              replicate only what local clients watch
   --credential=<text>    present this to relays
   --allow=<space,...>    serve only these spaces
-  --expose=<domain>      serve: let devices expose ports to the public at <label>.<domain>, whose names lead here
-  --https=<addr:port>    serve: be the public's way in, by TLS, here (0.0.0.0:443)
-  --tls-cert=<file>      serve: the certificate chain for *.<domain>, PEM, the leaf first
-  --tls-key=<file>       serve: its key, PEM: ECDSA P-256 or P-384, or RSA
-  --expose-http=<addr:port>  serve: and by plain HTTP here, behind something else that speaks TLS
-  --names=<suffix>       run: find devices as <name>.<suffix> (zsp.internal)
-  --no-names             run: give devices no names or addresses here
-  --loopback=<127.a.b>   run: the first of the addresses devices are given (127.77.0)
-  --dns=<addr:port>      run: answer for names here (127.77.0.1:5053; :53 on Windows)
-  --catch=<addr:port>    run, Linux: where zspd setup sends connections to devices' addresses (127.0.0.1:5054)
-  --proxy=<addr:port>    run: be a SOCKS 5 and HTTP proxy to devices here (127.0.0.1:1080); --no-proxy for none
-  --trust-local-users    run: let anyone on this machine reach other devices' ports, not only this user
   --verbose
-
-  <device>               a device's key, the start of one, or whose it is, as the roster says
-  <path>, <remote>       a share's name, then the path within it, '/' between
-  <remote>, <local>      where what is sent or fetched goes: there; or, ending in '/', a share alone, or for a file a
-                         folder that is there already, into it, under its own name
-  --scope=N              call in this scope (1)
-  --cwd=<dir>            exec: begin there, not at home
-  --env=NAME[=value]     exec: set this, or with no value unset it
-  --replace              put: over what is there
 `
 
 main :: proc() {
@@ -116,18 +58,12 @@ run :: proc() -> int {
 		raise_file_limit()
 	}
 	args := os.args[1:]
-	if len(args) >= 1 && args[0] == "setup" {
-		return setup(args[1:])
-	}
 	if len(args) < 2 {
 		os.write_string(os.stderr, USAGE)
 		return 2
 	}
 	verbose := false
 	for a in args {
-		if a == "--" {
-			break // what follows is a command's, not this one's
-		}
 		verbose ||= a == "--verbose"
 	}
 	// Standard output is for answers.
@@ -179,10 +115,6 @@ run :: proc() -> int {
 					rights -= {.Write, .Call}
 				case "vouch":
 					rights += {.Vouch}
-				case "shell":
-					rights += {.Shell}
-				case "files":
-					rights += {.Files}
 				case:
 					return false
 				}
@@ -217,28 +149,6 @@ run :: proc() -> int {
 			}
 			return false
 		})
-	case "name":
-		ok = len(rest) >= 1 && len(rest) <= 2 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
-			key, hexed := parse_hex(args[0], 64)
-			if !hexed {
-				key = parse_hex(args[0], 32) or_return
-			}
-			device: zsp.Key32
-			copy(device[:], key)
-			name := args[1] if len(args) > 1 else ""
-			if zsp.draft_name(&a.draft, device, name) {
-				return true
-			}
-			switch {
-			case name != "" && !zsp.device_name_valid(name):
-				say(os.stderr, "a name is 1 to 63 lower-case letters, digits and hyphens, with no hyphen at either end\n")
-			case zsp.roster_member(&a.roster, device) == nil:
-				say(os.stderr, "no such device\n")
-			case:
-				say(os.stderr, "another device has that name\n")
-			}
-			return false
-		})
 	case "members":
 		ok = members(dir)
 	case "admin":
@@ -262,34 +172,8 @@ run :: proc() -> int {
 		ok = len(rest) == 3 && join(dir, rest[0], rest[1], rest[2])
 	case "peer":
 		ok = len(rest) == 1 && join_from_roster(dir, rest[0])
-	case "nodes":
-		ok = nodes(dir)
-	case "offer", "unoffer":
-		ok = offer(dir, rest, args[0] == "unoffer")
-	case "offers":
-		ok = offer(dir, nil, false)
-	case "expose", "unexpose":
-		ok = len(rest) >= 1 && expose(dir, rest, args[0] == "unexpose")
-	case "exposures":
-		ok = expose(dir, nil, false)
 	case "run", "serve":
 		return serve(dir, rest, args[0] == "serve")
-	case "share":
-		return share(dir, rest)
-	case "services":
-		return services(dir, rest)
-	case "connect":
-		return connect(dir, rest)
-	case "exec":
-		return exec(dir, rest)
-	case "terminal":
-		return terminal(dir, rest)
-	case "ls":
-		return ls(dir, rest)
-	case "get":
-		return get(dir, rest)
-	case "put":
-		return put(dir, rest)
 	case:
 		os.write_string(os.stderr, USAGE)
 		return 2
@@ -395,15 +279,12 @@ members :: proc(dir: string) -> bool {
 			continue
 		}
 		say(os.stdout, to_hex(m.device[:]), to_hex(m.signer[:]))
-		if len(m.hostname) > 0 {
-			say(os.stdout, " @", string(m.hostname))
-		}
 		buf: [10]byte
 		for g in m.grants {
 			if g.until != 0 {
 				continue
 			}
-			say(os.stdout, " ", strconv.write_uint(buf[:], u64(g.scope), 10), ":", "r" if .Read in g.rights else "", "w" if .Write in g.rights else "", "c" if .Call in g.rights else "", "v" if .Vouch in g.rights else "", "s" if .Shell in g.rights else "", "f" if .Files in g.rights else "")
+			say(os.stdout, " ", strconv.write_uint(buf[:], u64(g.scope), 10), ":", "r" if .Read in g.rights else "", "w" if .Write in g.rights else "", "c" if .Call in g.rights else "", "v" if .Vouch in g.rights else "")
 		}
 		say(os.stdout, " owner" if m.owner else " admin" if m.admin else "", "\t", string(m.subject), "\n")
 	}
@@ -628,12 +509,7 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		udp_port     = 0,
 		data         = &policy,
 		authenticate = authenticate,
-		names        = "" if relay else host.NAMES,
-		loopback     = {77, 0},
 	}
-	dns := ""
-	catch := "127.0.0.1:5054" when ODIN_OS == .Linux else ""
-	proxy := "127.0.0.1:1080"
 	listen := "0.0.0.0:8787" if relay else "127.0.0.1:0"
 	for a in args {
 		eq := strings.index_byte(a, '=')
@@ -671,52 +547,6 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 				copy(id[:], bytes)
 				append(&policy.spaces, id)
 			}
-		case "--names":
-			if !host.suffix_valid(value) {
-				os.write_string(os.stderr, USAGE)
-				return 2
-			}
-			config.names = value
-		case "--no-names":
-			config.names = ""
-		case "--loopback":
-			base, parsed := parse_loopback(value)
-			if !parsed {
-				os.write_string(os.stderr, USAGE)
-				return 2
-			}
-			config.loopback = base
-		case "--dns":
-			dns = value
-		case "--catch":
-			catch = value
-		case "--proxy":
-			proxy = value
-		case "--no-proxy":
-			proxy = ""
-		case "--trust-local-users":
-			config.trust_local_users = true
-		case "--expose":
-			if !host.suffix_valid(value) {
-				os.write_string(os.stderr, USAGE)
-				return 2
-			}
-			config.expose = value
-		case "--https", "--expose-http":
-			ep, parsed := net.parse_endpoint(value)
-			if !parsed {
-				os.write_string(os.stderr, USAGE)
-				return 2
-			}
-			if name == "--https" {
-				config.https = ep
-			} else {
-				config.expose_http = ep
-			}
-		case "--tls-cert":
-			config.tls_cert = value
-		case "--tls-key":
-			config.tls_key = value
 		case "--verbose":
 		case:
 			os.write_string(os.stderr, USAGE)
@@ -729,40 +559,6 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		return 2
 	}
 	config.listen = at
-	if config.expose != "" && config.https == nil && config.expose_http == nil {
-		config.https = net.Endpoint{net.IP4_Any, 443}
-	}
-	if config.https != nil && (config.tls_cert == "" || config.tls_key == "") {
-		say(os.stderr, "the public's way in by TLS needs --tls-cert and --tls-key\n")
-		return 2
-	}
-	if config.names != "" {
-		if dns == "" {
-			base := config.loopback
-			config.dns = net.Endpoint{net.IP4_Address{127, base[0], base[1], 1}, DNS_PORT}
-		} else if ep, parsed := net.parse_endpoint(dns); parsed {
-			config.dns = ep
-		} else {
-			os.write_string(os.stderr, USAGE)
-			return 2
-		}
-		if proxy != "" {
-			ep, parsed := net.parse_endpoint(proxy)
-			if !parsed {
-				os.write_string(os.stderr, USAGE)
-				return 2
-			}
-			config.proxy = ep
-		}
-		if catch != "" {
-			ep, parsed := net.parse_endpoint(catch)
-			if !parsed {
-				os.write_string(os.stderr, USAGE)
-				return 2
-			}
-			config.catch_at = ep
-		}
-	}
 
 	h: host.Host
 	if !host.host_init(&h, config) {
@@ -813,335 +609,4 @@ local_token :: proc(dir: string) -> string {
 	token := strings.clone(to_hex(b[:]))
 	host.save(path, transmute([]byte)token)
 	return token
-}
-
-// Calls a zsp.* method of this device's own host, as a local client of the node running here. The messages that
-// come back, or a fault; not ok if no node is running here.
-// An answer's messages, which together are it.
-joined :: proc(data: [][]byte) -> []byte {
-	all := make([dynamic]byte, context.temp_allocator)
-	for d in data {
-		append(&all, ..d)
-	}
-	return all[:]
-}
-
-local_call :: proc(dir, method: string, body: []byte) -> (data: [dynamic][]byte, fault: int, ok: bool) {
-	data = make([dynamic][]byte, context.temp_allocator)
-	address, aerr := os.read_entire_file(in_dir(dir, "address"), context.temp_allocator)
-	token, terr := os.read_entire_file(in_dir(dir, "token"), context.temp_allocator)
-	endpoint, parsed := net.parse_endpoint(string(address))
-	secret, have := host.device_secret(dir)
-	if aerr != nil || terr != nil || !parsed || !have {
-		return
-	}
-	device := zsp.x25519_public(secret)
-	socket, err := net.dial_tcp(endpoint)
-	if err != nil {
-		return
-	}
-	defer net.close(socket)
-	net.set_option(socket, .Receive_Timeout, 5 * time.Second)
-	request := pipe.ws_request(string(address), "/")
-	net.send_tcp(socket, transmute([]byte)request)
-	send :: proc(socket: net.TCP_Socket, frames: []byte) {
-		message := make([dynamic]byte, context.temp_allocator)
-		pipe.ws_put(&message, .Binary, frames, true)
-		net.send_tcp(socket, message[:])
-	}
-	frames := make([dynamic]byte, context.temp_allocator)
-	at := zsp.frame_begin(&frames, .Hello)
-	append(&frames, zsp.VERSION, 0)
-	resize(&frames, len(frames) + 32)
-	zsp.write_varint(&frames, 0)
-	zsp.write_bytes(&frames, token)
-	zsp.frame_end(&frames, at)
-	send(socket, frames[:])
-	buf: [16 << 10]byte
-	got := make([dynamic]byte, context.temp_allocator)
-	stream := make([dynamic]byte, context.temp_allocator)
-	used, read := 0, 0
-	called := false
-	for {
-		n, rerr := net.recv_tcp(socket, buf[:])
-		if n <= 0 || rerr != nil {
-			return data, fault, fault != 0
-		}
-		append(&got, ..buf[:n])
-		if used == 0 {
-			head := pipe.http_head(got[:]) or_continue
-			used = head.size
-		}
-		for {
-			op, payload, size, _, result := pipe.ws_take(got[used:])
-			if result != .Message {
-				break
-			}
-			used += size
-			if op == .Binary {
-				append(&stream, ..payload)
-			}
-		}
-		r := zsp.Reader{buf = stream[read:]}
-		for {
-			before := r.pos
-			frame := zsp.read_bytes(&r)
-			if r.bad || len(frame) == 0 {
-				read += before
-				break
-			}
-			f := zsp.Reader{buf = frame[1:]}
-			#partial switch zsp.Message(frame[0]) {
-			case .Roster:
-				if called || len(frame) < 9 {
-					continue
-				}
-				// What this client may do: it calls in the first scope it may call in.
-				_ = zsp.read_take(&f, 8)
-				for !f.bad && f.pos < len(f.buf) {
-					scope := zsp.read_varint(&f)
-					rights := zsp.read_u8(&f)
-					_ = zsp.read_take(&f, 32)
-					if f.bad || rights & 4 == 0 || called {
-						continue
-					}
-					called = true
-					out := make([dynamic]byte, context.temp_allocator)
-					at = zsp.frame_begin(&out, .Call)
-					zsp.write_varint(&out, 1)
-					append(&out, ..device[:])
-					zsp.write_varint(&out, scope)
-					zsp.write_bytes(&out, transmute([]byte)method)
-					zsp.write_bytes(&out, nil)
-					append(&out, ..body)
-					zsp.frame_end(&out, at)
-					at = zsp.frame_begin(&out, .Flow)
-					zsp.write_varint(&out, 2)
-					append(&out, byte(zsp.Flow.End))
-					zsp.frame_end(&out, at)
-					send(socket, out[:])
-				}
-			case .Flow:
-				tag := zsp.read_varint(&f)
-				kind := zsp.Flow(zsp.read_u8(&f))
-				if f.bad || tag != 1 << 1 | 1 {
-					continue
-				}
-				switch kind {
-				case .Data:
-					// Taken: as much again may come, for an answer longer than a call's credit comes as credit does.
-					append(&data, slice.clone(f.buf[f.pos:], context.temp_allocator))
-					credit := make([dynamic]byte, context.temp_allocator)
-					cat := zsp.frame_begin(&credit, .Flow)
-					zsp.write_varint(&credit, 2)
-					append(&credit, byte(zsp.Flow.Credit))
-					zsp.write_varint(&credit, u64(len(f.buf) - f.pos))
-					zsp.frame_end(&credit, cat)
-					send(socket, credit[:])
-				case .End:
-					return data, 0, true
-				case .Fault:
-					return data, int(f.buf[f.pos]) if f.pos < len(f.buf) else 4, true
-				case .Cancel, .Credit:
-				}
-			}
-		}
-	}
-}
-
-FAULTS := [?]string{"cancelled", "denied", "unreachable", "unserved", "lost", "overrun", "busy"}
-
-// What the node running here knows of each device.
-nodes :: proc(dir: string) -> bool {
-	data, fault, ok := local_call(dir, "zsp.nodes", nil)
-	if !ok || fault != 0 || len(data) == 0 {
-		say(os.stderr, "no node is running here\n" if !ok else FAULTS[min(fault, len(FAULTS) - 1)], "\n" if ok else "")
-		return false
-	}
-	r := zsp.Reader{buf = joined(data[:])}
-	n := zsp.read_varint(&r)
-	for _ in 0 ..< n {
-		device := zsp.read_take(&r, 32)
-		name := string(zsp.read_bytes(&r))
-		ip := zsp.read_take(&r, 4)
-		flags := zsp.read_u8(&r)
-		subject := string(zsp.read_bytes(&r))
-		count := zsp.read_varint(&r)
-		ports := make([dynamic]string, context.temp_allocator)
-		for _ in 0 ..< count {
-			p := zsp.read_take(&r, 2)
-			_ = zsp.read_varint(&r)
-			target := string(zsp.read_bytes(&r))
-			label := string(zsp.read_bytes(&r))
-			if r.bad {
-				break
-			}
-			buf: [8]byte
-			text := strconv.write_uint(buf[:], u64(p[0]) << 8 | u64(p[1]), 10)
-			text = strings.concatenate({text, "(" if label != "" || target != "" else "", label, "@" if target != "" else "", target, ")" if label != "" || target != "" else ""}, context.temp_allocator)
-			append(&ports, text)
-		}
-		if r.bad {
-			return false
-		}
-		state := "this device" if flags & 1 != 0 else "direct" if flags & 4 != 0 else "reachable" if flags & 2 != 0 else "away"
-		say(os.stdout, name if name != "" else to_hex(device), "\t", fmt.tprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]), "\t", state, "\t", strings.join(ports[:], ",", context.temp_allocator), "\t", subject, "\n")
-	}
-	return true
-}
-
-// Offers, takes back, or lists what this device offers: through the node running here, or in its file if none is.
-offer :: proc(dir: string, args: []string, remove: bool) -> bool {
-	o: host.Offer
-	op := byte(0)
-	if args != nil {
-		parsed: bool
-		o, parsed = host.offer_parse(args)
-		if !parsed {
-			say(os.stderr, "an offer is <port>[-<port>] <scope> [device=<key>] [host=<address>] [name=<name>] [proxy];\na host is an address of another machine, and of it no more than 1024 ports at once\n")
-			return false
-		}
-		op = 2 if remove else 1
-	}
-	body := make([dynamic]byte, context.temp_allocator)
-	append(&body, op)
-	if op != 0 {
-		host.offer_put(&body, &o)
-	}
-	data, fault, running := local_call(dir, "zsp.offers", body[:])
-	if running {
-		if fault != 0 || len(data) == 0 {
-			say(os.stderr, "the node running here refused: ", FAULTS[min(fault, len(FAULTS) - 1)], " (no such offer, or too many)\n" if fault == 1 else "\n")
-			return false
-		}
-		r := zsp.Reader{buf = joined(data[:])}
-		n := zsp.read_varint(&r)
-		for _ in 0 ..< n {
-			x := host.offer_read(&r) or_return
-			if op == 0 {
-				say(os.stdout, host.offer_text(&x), "\n")
-			}
-		}
-		return true
-	}
-	// Nobody is running: the file is the offers, and is read at the next start.
-	_, name := read_space(dir) or_return
-	path := in_dir(in_dir(dir, name), "offers")
-	data_file, _ := os.read_entire_file(path, context.temp_allocator)
-	lines := make([dynamic]string, context.temp_allocator)
-	found := false
-	text := string(data_file)
-	for whole in strings.split_lines_iterator(&text) {
-		line := strings.trim_space(whole)
-		x, ok := host.offer_parse(strings.fields(line, context.temp_allocator))
-		same := ok && op != 0 && x.lo == o.lo && x.hi == o.hi && x.scope == o.scope && x.device == o.device && x.host == o.host
-		found ||= same
-		if op == 0 && ok {
-			say(os.stdout, line, "\n")
-		}
-		if line != "" && !same {
-			append(&lines, line)
-		}
-	}
-	switch {
-	case op == 0:
-		return true
-	case remove && !found:
-		say(os.stderr, "no such offer\n")
-		return false
-	case !remove:
-		append(&lines, host.offer_text(&o))
-	}
-	append(&lines, "")
-	return host.save(path, transmute([]byte)strings.join(lines[:], "\n", context.temp_allocator))
-}
-
-// 127.a.b, as --loopback takes it.
-parse_loopback :: proc(value: string) -> (base: [2]byte, ok: bool) {
-	parts := strings.split(value, ".", context.temp_allocator)
-	if len(parts) != 3 || parts[0] != "127" {
-		return
-	}
-	a, aok := strconv.parse_uint(parts[1], 10)
-	b, bok := strconv.parse_uint(parts[2], 10)
-	if !aok || !bok || a == 0 || a > 255 || b > 255 {
-		return // not 127.0: localhost's, and its name server's (127.0.0.53), and the reverse zone would be all of theirs
-	}
-	return {byte(a), byte(b)}, true
-}
-
-parse_int :: proc(value: string) -> (int, bool) {
-	return strconv.parse_int(value, 10)
-}
-
-// A private IPv6 address (RFC 4193) with a global id of its own, drawn now.
-draw_ula :: proc() -> string {
-	g: [5]byte
-	crypto.rand_bytes(g[:])
-	return fmt.tprintf("fd%02x:%02x%02x:%02x%02x::1", g[0], g[1], g[2], g[3], g[4])
-}
-
-// Exposes a port to the public, takes it back, or lists what is exposed: through the node running here, or in its file.
-expose :: proc(dir: string, args: []string, remove: bool) -> bool {
-	body := make([dynamic]byte, context.temp_allocator)
-	port: u64
-	prefix, proxy := "", false
-	if args != nil {
-		parsed: bool
-		port, parsed = strconv.parse_u64(args[0], 10)
-		if !parsed || port == 0 || port > 65535 {
-			say(os.stderr, "a port is a number\n")
-			return false
-		}
-		for a in args[1:] {
-			key, eq, value := strings.partition(a, "=")
-			switch {
-			case key == "proxy" && eq == "" && !remove:
-				proxy = true
-			case key == "name" && eq != "" && !remove && zsp.exposure_prefix_valid(value):
-				prefix = value
-			case:
-				say(os.stderr, "zspd expose <dir> <port> [name=<name>] [proxy]: a name is up to 20 lower-case letters, digits and hyphens\n")
-				return false
-			}
-		}
-		append(&body, 2 if remove else 1, byte(port >> 8), byte(port))
-		if !remove {
-			zsp.write_bytes(&body, transmute([]byte)prefix)
-			append(&body, 1 if proxy else 0)
-		}
-	} else {
-		append(&body, 0)
-	}
-	data, fault, running := local_call(dir, "zsp.expose", body[:])
-	if !running {
-		say(os.stderr, "no node is running here: run it, then expose; what is exposed is said to relays as they are reached\n")
-		return false
-	}
-	if fault != 0 || len(data) == 0 {
-		say(os.stderr, "the node running here refused: ", FAULTS[min(fault, len(FAULTS) - 1)], " (exposed already, not exposed, or too many)\n" if fault == 1 else "\n")
-		return false
-	}
-	r := zsp.Reader{buf = joined(data[:])}
-	n := zsp.read_varint(&r)
-	for _ in 0 ..< n {
-		pb := zsp.read_take(&r, 2)
-		_ = zsp.read_bytes(&r)
-		flags := zsp.read_u8(&r)
-		label := string(zsp.read_bytes(&r))
-		m := zsp.read_varint(&r)
-		if r.bad {
-			return false
-		}
-		say(os.stdout, fmt.tprintf("%d\t%s%s", u16(pb[0]) << 8 | u16(pb[1]), label, " proxy" if flags & 1 != 0 else ""))
-		STATUS := [?]string{"", "that relay exposes nothing", "taken", "too many there"}
-		for _ in 0 ..< m {
-			_ = zsp.read_take(&r, 32)
-			status := zsp.read_u8(&r)
-			url := string(zsp.read_bytes(&r))
-			say(os.stdout, "\t", url if status == 0 else STATUS[min(int(status), len(STATUS) - 1)])
-		}
-		say(os.stdout, "\n")
-	}
-	return !r.bad
 }
