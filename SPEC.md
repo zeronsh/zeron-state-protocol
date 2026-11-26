@@ -470,7 +470,8 @@ Data frames:
 
 Runs count downward from the largest. Loss recovery is RFC 9002's, less the delay a peer says it held an acknowledgement for, up to 25 ms; congestion
 control is the sender's affair. A packet that is not wholly understood, or that there is no room for, goes unacknowledged. A link with nothing in
-flight sends nothing.
+flight sends nothing. A sender gives a link up when what it has in flight goes unacknowledged through six probes and at least 10 seconds: on a fast
+path six probes come to less than a second, which a busy machine, or a relay's, may be silent for without being gone.
 
 Streams are numbered: 0 is open from the start, and the dialler opens 2, 4, 6 … and the other 1, 3, 5 …, each the next of its own, implicitly by its
 first frame. Each other stream's first bytes, each way, are a header: urgency (1) ‖ after varint: it is delivered no earlier than `after` bytes of

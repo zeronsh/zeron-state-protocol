@@ -43,6 +43,9 @@ ACK_DELAY :: 5 * MS
 MAX_ACK_DELAY :: 25 * MS // that a peer's word is believed about
 MAX_PROBES :: 6
 PROBE_MOST :: 2_000 * MS // between them, unless the path is slower than that
+// And with nothing heard for so long, at the least, however short the probes were: on a fast path six of them come to
+// less than a second, which a busy machine, or a relay's, can be silent for without being gone.
+LINK_DEAD :: Time(#config(ZSP_LINK_DEAD, 10_000)) * MS
 MAX_PATH_PROBES :: 3
 MAX_HEADER :: 11 // urgency, then a varint
 
@@ -142,6 +145,7 @@ Link :: struct {
 	acked_any:   bool,
 	waiting:     Time, // since when, for word of what is in flight: more being sent is none
 	probes:      int,
+	quiet_since: Time, // since when nothing was heard of what is in flight, while probing
 	want_probe:  bool,
 	closing:     bool,
 
@@ -1716,8 +1720,11 @@ link_expire :: proc(l: ^Link, now: Time) {
 	if l.in_flight == 0 || now < link_timeout(l) {
 		return
 	}
+	if l.probes == 0 {
+		l.quiet_since = l.waiting
+	}
 	l.probes += 1
-	if l.probes > MAX_PROBES {
+	if l.probes > MAX_PROBES && now - l.quiet_since >= LINK_DEAD {
 		l.state = .Closed
 		return
 	}
@@ -1743,7 +1750,7 @@ link_expire :: proc(l: ^Link, now: Time) {
 @(private)
 link_timeout :: proc(l: ^Link) -> Time {
 	pto := Time(l.srtt + max(4 * l.rttvar, 1000)) + ACK_DELAY
-	return l.waiting + max(min(pto << uint(l.probes), PROBE_MOST), pto) + 1
+	return l.waiting + max(min(pto << uint(min(l.probes, 20)), PROBE_MOST), pto) + 1
 }
 
 // When link_output must next be called, absent other reasons; zero for never.

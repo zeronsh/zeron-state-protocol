@@ -1,6 +1,6 @@
 """Real processes on real sockets: a relay, devices and clients. Run by `./x test`."""
 
-import json, os, re, shutil, socket, struct, subprocess, sys, tempfile, time, urllib.request
+import json, os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "clients", "python"))
@@ -1564,6 +1564,33 @@ def test_offers_end():
     with open(os.path.join(a.dir, zspd_space(a), "audit.log")) as f:
         audit = f.read()
     assert audit.count('"service":"offer"') == 3 and b.key in audit
+
+
+def test_forward_outlasts_a_pause():
+    """A connection to another device's port, carried by a relay, outlasts the relay's being silent for a while, as a
+    busy machine's may be: the link between the devices waits before it gives up, however fast the path was."""
+    if not hasattr(signal, "SIGSTOP"):
+        return  # nothing here stops a process and lets it go on
+    relay, (a, b) = ports_space(2)
+    ca, cb = a.client(), b.client()
+    cb.until(lambda: len(cb.devices) == 2)
+    port = free_port()
+    Service("127.0.0.1", port, banner=b"hi\r\n")
+    ca.offer(port, 1)
+    proxy = ("127.0.0.1", int(b.options[-1].rsplit(":", 1)[1]))
+    with socket.create_connection(proxy, 5) as s:
+        s.sendall(b"\x05\x01\x00")
+        s.recv(2)
+        s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(address_of(cb, a.key)) + struct.pack(">H", port))
+        assert s.recv(10)[1] == 0 and s.recv(4) == b"hi\r\n"
+        time.sleep(1.5)  # quiet, with a call under way: the link asks after the other end
+        os.kill(relay.p.pid, signal.SIGSTOP)
+        try:
+            time.sleep(2)
+        finally:
+            os.kill(relay.p.pid, signal.SIGCONT)
+        s.sendall(b"still")
+        assert s.recv(5) == b"still"
 
 
 CERTS = os.path.join(ROOT, "tests", "certs")

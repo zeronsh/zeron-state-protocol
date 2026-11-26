@@ -339,6 +339,34 @@ link_holds_what_it_accepts :: proc(t: ^testing.T) {
 	testing.expect(t, n.links[1].early <= MAX_EARLY && refused > 0)
 }
 
+// A pause of a second or two on a fast path, as a busy machine or a relay's has, is outlasted: a link waits LINK_DEAD
+// with nothing heard before it gives up, however short its probes were. Else every call on it would be lost.
+@(test)
+link_outlasts_a_pause :: proc(t: ^testing.T) {
+	state := rand.create(9)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	n.delay = 500 // half a millisecond: a relay on this machine, or nearby
+	for i in 0 ..< 50 {
+		link_write(&n.links[i % 2], 0, {1, 2, 3})
+		for net_step(&n) {
+		}
+	}
+	n.loss = 1
+	link_write(&n.links[0], 0, {4, 5, 6})
+	start := n.now
+	for n.now - start < 3000 * MS && net_step(&n) {
+	}
+	testing.expectf(t, n.links[0].state == .Open, "closed after %v ms of silence", (n.now - start) / MS)
+	n.loss = 0
+	for net_step(&n) {
+	}
+	testing.expect(t, n.links[0].state == .Open && n.links[1].state == .Open)
+	testing.expect(t, strings.has_suffix(string(n.got[1][:]), "\x04\x05\x06"))
+}
+
 // Nobody is there any more, and it is found out, however often there is more to say to them, and however slow the path was.
 @(test)
 link_to_nobody_is_closed :: proc(t: ^testing.T) {
