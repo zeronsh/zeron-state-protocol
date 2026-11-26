@@ -33,20 +33,33 @@ exposure_label :: proc(space, device: Key32, prefix: string, nonce: [EXPOSE_NONC
 	sha2.update(&ctx, nonce[:])
 	sum: [32]byte
 	sha2.final(&ctx, sum[:])
-	alphabet := "abcdefghijklmnopqrstuvwxyz234567"
-	id: [16]byte
-	bits, have, at := u32(0), 0, 0
-	for b in sum[:10] {
-		bits = bits << 8 | u32(b)
-		have += 8
-		for have >= 5 {
-			have -= 5
-			id[at] = alphabet[(bits >> uint(have)) & 31]
-			at += 1
-		}
-	}
+	id := base32_80(sum[:10])
 	if prefix == "" {
 		return strings.clone(string(id[:]), allocator)
 	}
 	return strings.concatenate({prefix, "-", string(id[:])}, allocator)
+}
+
+// The name of a device that nobody chose (§17): the first ten bytes of its key in base32.
+@(require_results)
+name_id :: proc(device: Key32) -> [16]byte {
+	device := device
+	return base32_80(device[:10])
+}
+
+// Ten bytes as sixteen letters of RFC 4648 base32, in lower case: 80 bits, and no padding.
+@(private, require_results)
+base32_80 :: proc(ten: []byte) -> (out: [16]byte) {
+	alphabet := "abcdefghijklmnopqrstuvwxyz234567"
+	bits, have, at := u32(0), 0, 0
+	for b in ten[:10] {
+		bits = bits << 8 | u32(b)
+		have += 8
+		for have >= 5 {
+			have -= 5
+			out[at] = alphabet[(bits >> uint(have)) & 31]
+			at += 1
+		}
+	}
+	return
 }

@@ -130,5 +130,45 @@ for (const c of v.cells) {
   assert.deepEqual(hmac(prk, send, Buffer.from([2])), x.recv);
 }
 
+// Names, addresses and exposure (§17).
+{
+  const n = v.names;
+  const base32 = (b) => {
+    let bits = 0, have = 0, out = "";
+    for (const x of b) {
+      bits = ((bits << 8) | x) & 0xffff;
+      have += 8;
+      while (have >= 5) (have -= 5), (out += "abcdefghijklmnopqrstuvwxyz234567"[(bits >> have) & 31]);
+    }
+    return out;
+  };
+  const varint = (x) => {
+    const out = [];
+    for (; x >= 128; x = Math.floor(x / 128)) out.push((x % 128) | 128);
+    return Buffer.from([...out, x]);
+  };
+  const str = (s) => Buffer.concat([varint(Buffer.byteLength(s)), Buffer.from(s)]);
+  for (const x of n.ids) assert.equal(base32(bytes(x.device).subarray(0, 10)), x.id);
+  for (const x of n.addresses) {
+    const [, a, b] = x.loopback.split(".").map(Number), at = x.index + 2;
+    assert.equal(x.address, `127.${a}.${b + (at >> 8)}.${at & 255}`);
+  }
+  for (const x of n.labels) {
+    const id = base32(sha(Buffer.from("zsp-expose"), bytes(x.space), bytes(x.device), str(x.prefix), bytes(x.nonce)).subarray(0, 10));
+    assert.equal(x.label, x.prefix ? `${x.prefix}-${id}` : id);
+  }
+  const port = (p) => Buffer.from([p >> 8, p & 255]);
+  assert.deepEqual(Buffer.concat([varint(n.entries.list.length), ...n.entries.list.map((e) => Buffer.concat([port(e.port), varint(e.scope), str(e.host), str(e.name)]))]), bytes(n.entries.wire));
+  const o = n.offer;
+  assert.deepEqual(Buffer.concat([port(o.lo), port(o.hi), varint(o.scope), bytes(o.device), str(o.host), str(o.name), Buffer.from([o.proxy ? 1 : 0])]), bytes(o.wire));
+  // A roster that names any device says so first, and is signed whole, as any is.
+  const r = bytes(n.roster.bytes);
+  assert.equal(r.subarray(0, 6).toString(), "zsp-r2");
+  assert.deepEqual(r.subarray(6, 38), bytes(n.roster.space));
+  const space = createPublicKey({ key: Buffer.concat([der.ed, bytes(n.roster.space)]), format: "der", type: "spki" });
+  assert(verify(null, r.subarray(0, -64), space, r.subarray(-64)));
+  assert(r.includes(str("desk")));
+}
+
 // A whole session against a live relay is tests/end_to_end.py's business.
 console.log("ok");

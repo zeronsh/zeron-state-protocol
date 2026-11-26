@@ -39,25 +39,8 @@ suffix_valid :: proc(suffix: string) -> bool {
 	return true
 }
 
-@(private)
-BASE32 := "abcdefghijklmnopqrstuvwxyz234567"
-
 // The name nobody chose: 80 bits of the device's key, in lower-case base32.
-@(require_results)
-name_id :: proc(device: zsp.Key32) -> (out: [16]byte) {
-	device := device
-	bits, have, n := u32(0), 0, 0
-	for b in device[:10] {
-		bits = bits << 8 | u32(b)
-		have += 8
-		for have >= 5 {
-			have -= 5
-			out[n] = BASE32[(bits >> uint(have)) & 31]
-			n += 1
-		}
-	}
-	return
-}
+name_id :: zsp.name_id
 
 // The address applications reach a device at, from this one. Not every member has one: those beyond the range,
 // and those whose grants have all ended.

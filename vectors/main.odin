@@ -34,6 +34,7 @@ main :: proc() {
 	links()
 	files()
 	services()
+	names()
 	fmt.println(`  "version": 1`)
 	fmt.println("}")
 }
@@ -465,4 +466,85 @@ services :: proc() {
 		fmt.printfln(`    {{"message": "%s", "bytes": "%s"}}%s`, m.name, h(m.bytes), "," if i + 1 < len(messages) else "")
 	}
 	fmt.println("  ],")
+}
+
+// Names, addresses and exposure (§17): what a device works out for itself, and what two of them must agree on.
+names :: proc() {
+	fmt.println(`  "names": {`)
+	fmt.print(`    "ids": [`)
+	for n in 0 ..< 4 {
+		k: zsp.Keyring
+		zsp.keyring_init(&k, key_of(byte(n * 40 + 1)))
+		id := zsp.name_id(k.device)
+		fmt.printf(`%s{{"device": "%s", "id": "%s"}}`, ", " if n > 0 else "", h(k.device[:]), string(id[:]))
+	}
+	fmt.println(`],`)
+	// The address of the member at an index, from 127.a.b: 127.a.(b + (index + 2) / 256).((index + 2) mod 256).
+	fmt.print(`    "addresses": [`)
+	cases := [][3]int{{77, 0, 0}, {77, 0, 1}, {77, 0, 253}, {77, 0, 254}, {77, 0, 1000}, {90, 3, 7}}
+	for c, i in cases {
+		v := c[2] + 2
+		fmt.printf(`%s{{"loopback": "127.%d.%d", "index": %d, "address": "127.%d.%d.%d"}}`, ", " if i > 0 else "", c[0], c[1], c[2], c[0], c[1] + v / 256, v % 256)
+	}
+	fmt.println(`],`)
+	fmt.print(`    "labels": [`)
+	prefixes := []string{"", "web", "a-b-c"}
+	for n in 0 ..< 3 {
+		space, device := key_of(byte(200 + n)), key_of(byte(100 + n))
+		nonce: [zsp.EXPOSE_NONCE]byte
+		for &b, i in nonce {
+			b = byte(i * 7 + n)
+		}
+		prefix := prefixes[n]
+		fmt.printf(`%s{{"space": "%s", "device": "%s", "prefix": "%s", "nonce": "%s", "label": "%s"}}`, ", " if n > 0 else "", h(space[:]), h(device[:]), prefix, h(nonce[:]), zsp.exposure_label(space, device, prefix, nonce))
+	}
+	fmt.println(`],`)
+	// zsp.ports: n varint ‖ n × { port (2) ‖ scope varint ‖ host bytes ‖ name bytes }
+	entries := [?]struct {
+		port:  u16,
+		scope: u64,
+		host:  string,
+		name:  string,
+	}{{22, 1, "", "ssh"}, {5432, 300, "10.0.0.4", ""}, {65535, 1 << 31, "", ""}}
+	w: [dynamic]byte
+	zsp.write_varint(&w, u64(len(entries)))
+	fmt.print(`    "entries": {"list": [`)
+	for e, i in entries {
+		append(&w, byte(e.port >> 8), byte(e.port))
+		zsp.write_varint(&w, e.scope)
+		zsp.write_bytes(&w, transmute([]byte)e.host)
+		zsp.write_bytes(&w, transmute([]byte)e.name)
+		fmt.printf(`%s{{"port": %d, "scope": %d, "host": "%s", "name": "%s"}}`, ", " if i > 0 else "", e.port, e.scope, e.host, e.name)
+	}
+	fmt.printfln(`], "wire": "%s"}},`, h(w[:]))
+	// An offer, as zsp.offers says it: lo (2) ‖ hi (2) ‖ scope varint ‖ device (32) ‖ host bytes ‖ name bytes ‖ flags (1)
+	offer: [dynamic]byte
+	append(&offer, 0x1f, 0x40, 0x1f, 0x4a)
+	zsp.write_varint(&offer, 3)
+	dev := key_of(7)
+	append(&offer, ..dev[:])
+	zsp.write_bytes(&offer, nil)
+	zsp.write_bytes(&offer, transmute([]byte)string("dev"))
+	append(&offer, 1)
+	fmt.printfln(`    "offer": {{"lo": 8000, "hi": 8010, "scope": 3, "device": "%s", "host": "", "name": "dev", "proxy": true, "wire": "%s"}},`, h(dev[:]), h(offer[:]))
+	// A roster that names devices: zsp-r2, a name after each member's subject.
+	owner, other: zsp.Keyring
+	zsp.keyring_init(&owner, key_of(11))
+	zsp.keyring_init(&other, key_of(12))
+	root := key_of(13)
+	none: zsp.Roster
+	d := zsp.draft_from(&none, 1700000000000 << 16)
+	d.random = proc(into: []byte) {
+		for &b, i in into {
+			b = byte(i * 13 + 5)
+		}
+	}
+	home := zsp.draft_scope(&d)
+	zsp.draft_grant(&d, owner.device, owner.signer, home, {.Write, .Call}).owner = true
+	zsp.draft_grant(&d, other.device, other.signer, home, {.Write, .Call})
+	_ = zsp.draft_name(&d, other.device, "desk")
+	roster, _ := zsp.roster_sign(&owner, root, &d)
+	space := zsp.ed25519_public(root)
+	fmt.printfln(`    "roster": {{"space": "%s", "names": ["", "desk"], "bytes": "%s"}}`, h(space[:]), h(roster))
+	fmt.println(`  },`)
 }
