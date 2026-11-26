@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Node, spaceUrl } from "../src/node.ts";
-import { Client } from "../src/client.ts";
+import { Client, columns } from "../src/client.ts";
 import { MemoryVolume, type File } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
 import { BIN } from "./procs.ts";
@@ -161,6 +161,31 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   clearInterval(letting);
   await new Promise((done) => setTimeout(done, 0));
   assert(second);
+}
+
+// One client of a device that begins to look while another of its clients is typing sees what was typed before it
+// looked, and the rest as it is typed: not once the piece is sealed, a second after it began.
+{
+  const node = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  node.create();
+  const writer = new Client({ connect: node.connect }), reader = new Client({ connect: node.connect });
+  while (!writer.may(1, "write") || !reader.may(1, "read")) await new Promise((done) => setTimeout(done, 1));
+  const Note = { body: columns.text(17) };
+  let id = "";
+  await writer.write(1, (change) => (id = change.insert(Note, "late", 1, {})));
+  const editor = writer.text(id, Note.body);
+  editor.append("typed before it looked");
+  await new Promise((done) => setTimeout(done, 200));
+  let shown: string | undefined;
+  const looked = Date.now();
+  const w = reader.window({ scope: 1, list: "late", table: Note }, (state) => (shown = state.rows[0]?.body));
+  while (shown !== "typed before it looked" && Date.now() - looked < 5000) await new Promise((done) => setTimeout(done, 1));
+  assert(Date.now() - looked < 500, `shown ${Date.now() - looked} ms after looking: once sealed, not live`);
+  editor.close();
+  w.stop();
+  writer.close();
+  reader.close();
+  await node.close();
 }
 
 // A relay that cannot even be dialled, as a ws:// one from an https:// page cannot, is tried again soon, as any is.

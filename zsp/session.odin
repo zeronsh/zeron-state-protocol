@@ -144,6 +144,7 @@ Task :: struct {
 		Cell, // one cell
 		Fill, // every row in a range
 		Synced,
+		Typing, // what this node's clients are typing where it now watches
 	},
 	settled: bool,
 	restart: bool,
@@ -819,8 +820,9 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 	}
 	w := Watch{id = id, lo = lo, hi = hi, data = flags.data, live = flags.live, counts = flags.counts}
 	append(&s.watches, w)
-	if w.live {
-		typing_give(s, &w, {})
+	// What is being typed there goes once whatever this watch has the session sent goes: after this watch's tasks.
+	defer if w.live && len(n.typing) > 0 {
+		append(&s.tasks, Task{kind = .Typing})
 	}
 
 	// Data interests spread outward from clients, and live ones through relays.
@@ -1569,6 +1571,9 @@ emit_row :: proc(s: ^Session, row: Id) {
 		c := row_next(&s.node.store, &scan) or_break
 		emit_cell(s, &c)
 	}
+	if len(s.node.typing) > 0 {
+		typing_give(s, row) // now that it holds the row, what is being typed in it, where it watches
+	}
 }
 
 @(private)
@@ -1819,8 +1824,11 @@ on_live :: proc(s: ^Session, r: ^Reader) {
 	if s.role != .Open {
 		n.recent[n.recent_at] = l.stamp.salt
 		n.recent_at = (n.recent_at + 1) % len(n.recent)
+		if n.keys != nil {
+			typing_keep(n, s, &open, false) // for this node's clients, who may not yet hold the row
+		}
 	} else {
-		typing_keep(n, s, &l)
+		typing_keep(n, s, &l, true)
 	}
 	for to in n.sessions {
 		if to == s || !to.ready || !(live_watched(to, &places) || session_shows(to, l.row)) {
@@ -1917,7 +1925,7 @@ session_show :: proc(s: ^Session, row: Id) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	emit_row(s, row)
 	cells_close(s)
-	typing_give(s, nil, row)
+	typing_give(s, row, true)
 }
 
 @(private)
@@ -1964,12 +1972,15 @@ live_watched :: proc(s: ^Session, places: ^Places) -> bool {
 	return false
 }
 
-// A piece one of this node's clients is typing, as far as it has gone. A piece is a stream of operations from its start,
-// and live frames from its middle are of no use to a reader that missed the start: so a reader whose watch comes once it
-// has begun, as one does that only now looks, or whose watch has yet to reach the writer when typing begins, is given
-// it from the start, and the rest as it comes.
+// A piece being typed, as far as it has gone: by one of this node's clients, or by another device, as heard from a peer.
+// A piece is a stream of operations from its start, and live frames from its middle are of no use to a reader that missed
+// the start: so a reader whose watch comes once it has begun, as one does that only now looks, or whose watch has yet to
+// reach the writer when typing begins, is given it from the start, and the rest as it comes; and so is a client of this
+// node that is sent the row only after the piece began to come, as one is that begins to look at it now. What another
+// device typed goes only to this node's clients: to a peer, only what this node's own clients typed, sealed afresh.
 Typing :: struct {
-	session: u32,
+	session: u32, // whence it came
+	mine:    bool, // typed by a client of this node
 	row:     Id,
 	slot:    Slot,
 	piece:   u64,
@@ -1977,16 +1988,20 @@ Typing :: struct {
 	last:    u64, // when it was last typed in
 }
 
-// Keeps what a client typed, from the start of its piece: as long as it goes on from where the piece had got to.
+// Keeps what was typed, from the start of its piece: as long as it goes on from where the piece had got to.
 @(private)
-typing_keep :: proc(n: ^Node, s: ^Session, l: ^Live) {
-	at := -1
+typing_keep :: proc(n: ^Node, s: ^Session, l: ^Live, mine: bool) {
 	#reverse for &x, i in n.typing {
 		if n.now >= x.last + TYPING_MS {
 			delete(x.ops)
 			unordered_remove(&n.typing, i)
-		} else if x.session == s.id && x.row == l.row && x.slot == l.slot {
+		}
+	}
+	at := -1
+	for x, i in n.typing {
+		if x.session == s.id && x.row == l.row && x.slot == l.slot {
 			at = i
+			break
 		}
 	}
 	if at >= 0 && n.typing[at].piece != l.piece {
@@ -2007,14 +2022,14 @@ typing_keep :: proc(n: ^Node, s: ^Session, l: ^Live) {
 			delete(n.typing[oldest].ops)
 			unordered_remove(&n.typing, oldest)
 		}
-		append(&n.typing, Typing{session = s.id, row = l.row, slot = l.slot, piece = l.piece})
+		append(&n.typing, Typing{session = s.id, mine = mine, row = l.row, slot = l.slot, piece = l.piece})
 		at = len(n.typing) - 1
 	}
 	x := &n.typing[at]
 	have := u64(len(x.ops))
-	if l.offset > have || have + u64(len(l.body)) - l.offset > TYPING_BYTES {
+	if l.offset > have || l.offset + u64(len(l.body)) > TYPING_BYTES {
 		delete(x.ops)
-		unordered_remove(&n.typing, at) // what is kept would not be the piece from its start
+		unordered_remove(&n.typing, at) // what is kept would not be the piece from its start, or would be too long
 		return
 	}
 	if l.offset + u64(len(l.body)) > have {
@@ -2035,34 +2050,26 @@ typing_end :: proc(n: ^Node, session: u32, row: Id, slot: Slot, piece: u64) {
 	}
 }
 
-// Gives a session that now watches, or is now shown a row, what is being typed there by this node's other clients, from
-// the start of each piece: to a peer sealed afresh, as it would have been sent had it watched all along.
+// Gives a session what is being typed by this node's other clients where it watches live text, or of a row it is shown,
+// from the start of each piece: to a peer sealed afresh, as it would have been sent had it watched all along. Always after
+// the session has been sent the row, for a reader takes no live text for a row it does not hold.
 @(private)
-typing_give :: proc(to: ^Session, w: ^Watch, shown: Id) {
+typing_give :: proc(to: ^Session, only: Maybe(Id) = nil, shown := false) {
 	n := to.node
 	if len(n.typing) == 0 || !to.ready {
 		return
 	}
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	for &x in n.typing {
-		if x.session == to.id || len(x.ops) == 0 || n.now >= x.last + TYPING_MS {
+		if x.session == to.id || len(x.ops) == 0 || n.now >= x.last + TYPING_MS || (to.role != .Open && !x.mine) {
 			continue
 		}
-		if w == nil {
-			if x.row != shown {
-				continue
-			}
-		} else {
-			missed := store_misses(&n.store)
+		if row, ok := only.?; ok && x.row != row {
+			continue
+		}
+		if !shown {
 			places := row_places(&n.store, x.row)
-			if store_misses(&n.store) != missed {
-				continue // not at hand: a hint, and droppable as any is
-			}
-			covered := false
-			for k in places.keys[:places.count] {
-				covered ||= range_has(w, k)
-			}
-			if !covered {
+			if !(live_watched(to, &places) || session_shows(to, x.row)) {
 				continue
 			}
 		}
@@ -2432,6 +2439,10 @@ run_task :: proc(s: ^Session, t: ^Task) {
 			}
 		}
 		send_synced(s, &task)
+	case .Typing:
+		s.task_head += 1
+		cells_close(s)
+		typing_give(s)
 	}
 }
 
