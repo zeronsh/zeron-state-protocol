@@ -201,3 +201,28 @@ public_out_kept_written_goes :: proc(t: ^testing.T) {
 	testing.expectf(t, c.sent < 64 << 10, "kept %d already written (of %d kept, %d added)", c.sent, len(c.out), added)
 	testing.expect(t, len(c.out) < added) // and some has been written
 }
+
+// A space closes while a device is kept up with what it is offered: the watch's call goes first, and nothing of the
+// watch is touched once it is freed.
+@(test)
+watch_closed_with_its_space :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	context.allocator = mem.tracking_allocator(&track)
+	{
+		ts: Test_Space
+		test_space(t, &ts)
+		defer test_space_destroy(&ts)
+		ts.space.ports = new(Ports)
+		ts.space.ports.space = &ts.space
+		first := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&first, 600)
+		h, fault := ports_called(&ts.space, 77, {device = ts.keys[1].device}, 1, first[:])
+		testing.expect(t, h != nil && fault == {})
+		append(&ts.space.calls, Host_Call{call = 77, handler = h})
+		ports_close(&ts.space) // as space_close does: ports, then calls
+		calls_close(&ts.space)
+	}
+	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
+}

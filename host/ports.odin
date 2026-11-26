@@ -84,6 +84,10 @@ ports_close :: proc(sp: ^Space) {
 		remote_drop(pop(&p.remotes))
 	}
 	for w in p.watchers {
+		// Its call goes first, so that nothing calls what is freed; one already ended is its call's, freed as it ends.
+		if hc := host_call_find(sp, w.call); hc != nil && hc.handler == &w.handler {
+			call_cancel(sp, w.call)
+		}
 		free(w)
 	}
 	for &o in p.offers {
