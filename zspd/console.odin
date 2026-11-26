@@ -260,17 +260,45 @@ loop_awake: ^nbio.Event_Loop
 @(private = "file")
 loop_guard: sync.Mutex
 
+// Woken by an operation it is given to do, not by nbio.wake_up alone: a loop that is not yet asleep as it is woken so,
+// as on Windows, sleeps on as though it had not been, while what it is given it looks for before it sleeps.
+@(private = "file")
+loop_waker: ^nbio.Operation // made ready on the loop's thread; whoever wakes it takes it
+
 loop_wake :: proc() {
 	sync.mutex_lock(&loop_guard)
-	if loop_awake != nil {
-		nbio.wake_up(loop_awake)
+	if loop_awake != nil && loop_waker != nil {
+		op := loop_waker
+		loop_waker = nil // and if there is none, one is on its way already, and wakes it
+		nbio.exec(op)
 	}
 	sync.mutex_unlock(&loop_guard)
 }
 
-// Says which loop to wake, or with nil that there is none to.
+// On the loop's thread: a waker ready for the next who would wake it.
+@(private = "file")
+loop_waker_ready :: proc() {
+	op := nbio.prep_timeout(0, proc(op: ^nbio.Operation) {
+		op.detached = false // the loop takes it back after this
+		sync.mutex_lock(&loop_guard)
+		if loop_awake != nil {
+			loop_waker_ready()
+		}
+		sync.mutex_unlock(&loop_guard)
+	})
+	nbio.detach(op)
+	loop_waker = op
+}
+
+// Says which loop to wake, or with nil that there is none to. On that loop's thread.
 loop_wakes :: proc(loop: ^nbio.Event_Loop) {
 	sync.mutex_lock(&loop_guard)
 	loop_awake = loop
+	if loop != nil && loop_waker == nil {
+		loop_waker_ready()
+	} else if loop == nil && loop_waker != nil {
+		nbio.reattach(loop_waker) // never done, nor will be
+		loop_waker = nil
+	}
 	sync.mutex_unlock(&loop_guard)
 }
