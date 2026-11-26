@@ -808,7 +808,7 @@ remote_work :: proc(r: ^Remote) -> (waiting: bool) {
 	tail := store_tail(s)
 	// That is, once it holds half the room it has past what it keeps, and a checkpoint would let some of it go: what object
 	// storage has, as soon as it has it.
-	if r.local_most > 0 && !s.replaying && tail - r.local_from > (r.local_most - min(r.local_most, r.local_keep)) / 2 &&
+	if r.local_most > 0 && !s.replaying && tail - r.local_from > r.local_keep + (r.local_most - min(r.local_most, r.local_keep)) / 2 &&
 	   min(r.uploaded, tail - min(tail, r.local_keep)) > r.local_from {
 		r.want_checkpoint = true
 	}

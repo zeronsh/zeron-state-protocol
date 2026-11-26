@@ -1382,3 +1382,42 @@ review_dead_tops_go_on_waking :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, left == 0, "%d pages of dead pack %d still kept", left, pack1)
 }
+
+// Where the host has some room, a small write once object storage has caught up is no reason for a checkpoint: what
+// it keeps is not counted as what it must let go of.
+@(test)
+review_little_room_small_writes_no_checkpoint :: proc(t: ^testing.T) {
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	for store_work(&x.store) {}
+	remote_limits(&x.remote, 2 << 20, 4 << 20) // as a relay sets them for a STORAGE_LIMIT of 8 MiB
+	big := make([]byte, 8192)
+	defer delete(big)
+	turn :: proc(t: ^testing.T, x: ^Remote_Store) {
+		testing.expect(t, store_sync(&x.store))
+		remote_work(&x.remote)
+		remote_ops(&x.remote)
+		for len(x.host.ops) > 0 {
+			review_answer(&x.host, &x.remote, 0, true)
+		}
+		free_all(context.temp_allocator)
+	}
+	n := u64(0)
+	for store_tail(&x.store) <= (3 << 20) + 65536 {
+		n += 1
+		big[0] = byte(n)
+		review_commit(&x.store, {review_cell(n, DATA, 10 + n, big)})
+		turn(t, &x)
+	}
+	before := x.remote.stats.checkpoints
+	small: [100]byte
+	for i in u64(0) ..< 20 {
+		n += 1
+		small[0] = byte(i)
+		review_commit(&x.store, {review_cell(n, DATA, 10 + n, small[:])})
+		turn(t, &x)
+	}
+	testing.expectf(t, x.remote.stats.checkpoints == before, "%d checkpoints for 20 small writes: tail %d, local_from %d, uploaded %d", x.remote.stats.checkpoints - before, store_tail(&x.store), x.remote.local_from, x.remote.uploaded)
+}

@@ -13,7 +13,7 @@ EXE=
 # An event loop's ring of 256 rather than 2048: the kernel finds the smaller run of memory it wants even when it is
 # fragmented, as on busy machines where a big one at times could not be had; what does not fit waits its turn.
 STRICT="-vet -strict-style -define:ODIN_NBIO_QUEUE_SIZE=256"
-SIZED=zsp.review_little_room_whatever_quiet,zsp.review_little_room_pack_before_extent # run at full size too
+SIZED=zsp.review_little_room_whatever_quiet,zsp.review_little_room_pack_before_extent,zsp.review_little_room_small_writes_no_checkpoint # run at full size too
 SMALL="-define:ZSP_SEGMENT=262144 -define:ZSP_LOOSE=12 -define:ZSP_ALIKE=3 -define:ZSP_GC_HOT=4 -define:ZSP_GC_DEAD=1 -define:ZSP_EXTENT=131072 -define:ZSP_LOG_BLOCK=16384 -define:ZSP_LOCAL_KEEP=0" # so that tests roll and reclaim segments
 
 wasm() {
