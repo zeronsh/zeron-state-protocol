@@ -23,9 +23,7 @@ Node :: struct {
 	next_watch:  u64,
 	calls:       [dynamic]Call,
 	serving:     [dynamic]Serving,
-	tunnels:     [dynamic]Tunnel,
 	next_call:   u64,
-	next_tunnel: u32,
 	recent:      [64]u64, // salts of live frames lately passed on
 	recent_at:   int,
 	host:        Host,
@@ -52,6 +50,13 @@ Host :: struct {
 	method:       proc(data: rawptr, call: u64, from: Caller_Info, scope: Scope, method: string, first: []byte) -> Maybe(Call_Fault),
 	// What is said in calls whose end is the host: as a method's server, or as a caller by node_call_method.
 	flow:         proc(data: rawptr, call: u64, kind: Flow, payload: []byte),
+	// A session for calls to a device there is no session with, if the host can make one: a link through a relay.
+	// It need not be open yet; what is said on it waits until it is.
+	reach:        proc(data: rawptr, device: Key32) -> ^Session,
+	// A packet of a link, through the relay this node dialled by the session `relay`, from a device present there.
+	link:         proc(data: rawptr, relay: u32, from: Key32, packet: []byte),
+	// How many bytes the host's pipe holds for a session, not yet sent: on a relay, so as to drop rather than queue.
+	backlog:      proc(data: rawptr, s: ^Session) -> int,
 }
 
 // Whoever answers questions about what is here, if anyone does: see package find. Open sessions ask them.
@@ -531,7 +536,6 @@ node_sync :: proc(n: ^Node) -> bool {
 	return true
 }
 
-@(private)
 node_session :: proc(n: ^Node, id: u32) -> ^Session {
 	for s in n.sessions {
 		if s.id == id {

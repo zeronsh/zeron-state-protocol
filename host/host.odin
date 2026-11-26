@@ -63,6 +63,7 @@ Space :: struct {
 	found: ^Found, // while anyone is asking anything
 	calls: [dynamic]Host_Call, // whose end is the host
 	bridges: [dynamic]^Bridge, // of calls to TCP connections
+	relayed: [dynamic]^Relayed, // links through relays
 	audit: Audit_Log,
 }
 
@@ -178,6 +179,9 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		},
 		method       = host_method,
 		flow         = host_flow,
+		reach        = relayed_reach,
+		link         = relayed_input,
+		backlog      = stream_backlog,
 	}
 	if !h.relay {
 		s.node.host.questions = questions(s)
@@ -203,6 +207,7 @@ space_close :: proc(s: ^Space) {
 	found_close(s)
 	bridges_close(s)
 	calls_close(s)
+	relayed_close(s)
 	audit_close(s)
 	if !zsp.store_sync(&s.node.store) {
 		report(.Error, "could not sync the log")
@@ -343,11 +348,18 @@ host_settle :: proc(h: ^Host) {
 	for s in h.spaces {
 		s.node.now = ms
 		found_run(s, now)
+		relayed_run(s, now)
 	}
+	links_flush(h)
+	for s in h.spaces {
+		for r in s.relayed {
+			relayed_flush(r)
+		}
+	}
+	// Last, so that what links had to say through relays goes out at once.
 	#reverse for s in h.streams {
 		stream_flush(s)
 	}
-	links_flush(h)
 	if h.relay {
 		// A space nobody is in costs nothing.
 		#reverse for s, i in h.spaces {
@@ -393,6 +405,11 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 	}
 	if t := links_deadline(h); t != 0 {
 		earliest(&due, &ok, time.Tick{i64(t) * 1000})
+	}
+	for s in h.spaces {
+		if t := relayed_deadline(s); t != 0 {
+			earliest(&due, &ok, time.Tick{i64(t) * 1000})
+		}
 	}
 	return
 }

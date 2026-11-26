@@ -1980,6 +1980,7 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 		return
 	}
 	if n.keys == nil {
+		link := len(rest) > 0 && Post(rest[0]) == .Link
 		for to in n.sessions {
 			// What was committed before goes before: all of it, to everyone it goes to, or nothing yet.
 			if to.ready && to.peer == device && !flush_changes(to) {
@@ -1988,6 +1989,9 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 		}
 		for to in n.sessions {
 			if to.ready && to.peer == device {
+				if link && session_backlog(to) > LINK_QUEUE {
+					continue // dropped, as a router would: it is sent again, and its sender slows
+				}
 				cells_close(to)
 				at := frame_begin(&to.out, .Signal)
 				append(&to.out, ..s.peer[:])
@@ -2000,9 +2004,15 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 	if len(rest) == 0 {
 		return
 	}
-	if kind := Post(rest[0]); kind != .Plain {
-		tunnel_input(s, device, kind, rest[1:])
+	switch Post(rest[0]) {
+	case .Plain:
+	case .Link:
+		if m := roster_member(&n.roster, device); m != nil && member_active(m) && n.host.link != nil && s.peer_relay {
+			n.host.link(n.host.data, s.id, device, rest[1:])
+		}
 		return
+	case:
+		return // what an earlier version said, or a later one will
 	}
 	rest = rest[1:]
 	sealed := Reader{buf = rest}
@@ -2049,7 +2059,6 @@ on_presence :: proc(s: ^Session, r: ^Reader) {
 	if r.bad {
 		return
 	}
-	tunnels_prune(s)
 	node_balance(n)
 	reach_tell(n)
 	if n.host.presence != nil {

@@ -24,6 +24,70 @@ Sim_Node :: struct {
 	missed: int, // reads it missed, before it last crashed
 	roster, roster_old, kept: []byte, // as persisted
 	skew:   i64, // of its clock, in milliseconds
+	relayed: [dynamic]Sim_Relayed, // sessions for calls, carried through a relay
+}
+
+// A session for calls with a device reached only through a relay, its bytes carried in links' packets there. (The
+// host carries them in a link, with its loss recovery; here the relay drops nothing it is not made to.)
+@(private)
+Sim_Relayed :: struct {
+	device: Key32,
+	session: ^Session,
+	mine:   bool, // this end began it
+	via:    u32, // the session with the relay
+}
+
+@(private)
+sim_relayed_find :: proc(x: ^Sim_Node, device: Key32, mine: bool) -> ^Sim_Relayed {
+	for &r in x.relayed {
+		if r.device == device && r.mine == mine {
+			return &r
+		}
+	}
+	return nil
+}
+
+// A session with the relay where a device is present.
+@(private)
+sim_relay_with :: proc(x: ^Sim_Node, device: Key32) -> u32 {
+	for s in x.node.sessions {
+		if s.ready && s.peer_relay && !s.closing && slice.contains(s.online[:], device) {
+			return s.id
+		}
+	}
+	return max(u32)
+}
+
+// Moves what relayed sessions have to say into their relays; lets go of those no relay can carry any longer.
+@(private)
+sim_relayed_pump :: proc(s: ^Sim) -> (busy: bool) {
+	for x in s.nodes {
+		for i := len(x.relayed) - 1; i >= 0; i -= 1 {
+			r := &x.relayed[i]
+			if node_session(&x.node, r.via) == nil {
+				r.via = sim_relay_with(x, r.device)
+			}
+			if r.via == max(u32) || r.session.closing {
+				session_close(r.session)
+				unordered_remove(&x.relayed, i)
+				busy = true
+				continue
+			}
+			out := session_output(r.session)
+			if len(out) == 0 {
+				continue
+			}
+			n := min(len(out), 32 << 10)
+			blob := make([]byte, n + 1, context.temp_allocator)
+			blob[0] = 0 if r.mine else 1
+			copy(blob[1:], out[:n])
+			if node_post_link(&x.node, r.via, r.device, blob) {
+				session_sent(r.session, n)
+				busy = true
+			}
+		}
+	}
+	return
 }
 
 @(private)
@@ -151,7 +215,7 @@ sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 		sim_random(into)
 	}
 	x.node.host.authenticate = proc(_: rawptr, s: ^Session, credential: []byte) {
-		if s.role == .Peer {
+		if s.role != .Open {
 			session_accept(s)
 		} else if string(credential) == "let me in" {
 			session_accept(s, {{0, {.Read, .Write, .Call}, 0}})
@@ -168,6 +232,39 @@ sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 		assert(node_adopt(&x.node, s.roster))
 	}
 	x.node.host.data = x
+	if !x.relay {
+		x.node.host.reach = proc(data: rawptr, device: Key32) -> ^Session {
+			x := (^Sim_Node)(data)
+			if r := sim_relayed_find(x, device, true); r != nil {
+				return r.session
+			}
+			via := sim_relay_with(x, device)
+			if via == max(u32) {
+				return nil
+			}
+			session := session_open(&x.node, .Calls, true, device)
+			append(&x.relayed, Sim_Relayed{device, session, true, via})
+			return session
+		}
+		x.node.host.link = proc(data: rawptr, relay: u32, from: Key32, packet: []byte) {
+			x := (^Sim_Node)(data)
+			if len(packet) == 0 {
+				return
+			}
+			// What the other end began comes to the session this end answers with, and the other way about.
+			mine := packet[0] == 1
+			r := sim_relayed_find(x, from, mine)
+			if r == nil {
+				if mine {
+					return // this end has let it go
+				}
+				append(&x.relayed, Sim_Relayed{from, session_open(&x.node, .Calls, false, from), false, relay})
+				r = &x.relayed[len(x.relayed) - 1]
+			}
+			r.via = relay
+			session_input(r.session, packet[1:])
+		}
+	}
 	x.node.host.roster = proc(data: rawptr, bytes: []byte) {
 		x := (^Sim_Node)(data)
 		delete(x.roster_old)
@@ -250,6 +347,10 @@ sim_destroy :: proc(s: ^Sim) {
 		sim_cut(s, 0)
 	}
 	for x in s.nodes {
+		for r in x.relayed {
+			session_close(r.session)
+		}
+		delete(x.relayed)
 		node_destroy(&x.node)
 		keyring_destroy(&x.keys)
 		memory_disk_destroy(&x.disk)
@@ -422,6 +523,7 @@ sim_settle :: proc(s: ^Sim) {
 			busy |= sim_pass(s, l.a, l.b, l.lanes, 0)
 			busy |= sim_pass(s, l.b, l.a, l.lanes, 1)
 		}
+		busy |= sim_relayed_pump(s)
 		for x in s.nodes {
 			if x.remote != nil {
 				remote_ops(&x.remote.remote)

@@ -234,105 +234,78 @@ settle :: proc(s: ^Sim, cs: ..^Caller) {
 	}
 }
 
-// What a relay saw, it cannot say again.
+// A relay carries links' packets between devices it serves, and drops them, rather than queue them, when a device
+// has more waiting than it can take; it drops nothing else. A device takes them only through a relay it dialled,
+// and only from a member.
 @(test)
-tunnels_refuse_replay :: proc(t: ^testing.T) {
+relays_carry_links :: proc(t: ^testing.T) {
 	state := seeded(22)
 	context.random_generator = rand.default_random_generator(&state)
 	s: Sim
 	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
 	defer sim_destroy(&s)
-	a, b := s.nodes[0], s.nodes[1]
+	a, b, relay := s.nodes[0], s.nodes[1], s.nodes[2]
 	sim_link(&s, 0, 2)
 	sim_link(&s, 1, 2)
 	sim_settle(&s)
-	ca, cb := Caller{s = sim_client(&s, a)}, Caller{s = sim_client(&s, b)}
-	defer caller_destroy(&ca)
-	defer caller_destroy(&cb)
-	caller_serve(&cb, 1, "echo")
-	heard := make([dynamic]byte, context.temp_allocator)
-	round :: proc(s: ^Sim, heard: ^[dynamic]byte) {
-		// Everything the relay says to b, as it says it.
-		for _ in 0 ..< 12 {
-			for l in s.links {
-				for pair in ([][2]^Session{{l.a, l.b}, {l.b, l.a}}) {
-					out := session_output(pair[0])
-					copied := make([]byte, len(out), context.temp_allocator)
-					copy(copied, out)
-					session_sent(pair[0], len(out))
-					if l.an == 1 && pair[0] == l.b {
-						append(heard, ..copied)
-					}
-					session_input(pair[1], copied)
-				}
+	Heard :: struct {
+		packets: int,
+		bytes:   int,
+		via:     u32,
+		from:    Key32,
+	}
+	heard: Heard
+	b.node.host.data = &heard
+	b.node.host.link = proc(data: rawptr, relay: u32, from: Key32, packet: []byte) {
+		h := (^Heard)(data)
+		h.packets += 1
+		h.bytes += len(packet)
+		h.via, h.from = relay, from
+	}
+	via: u32
+	for x in a.node.sessions {
+		if x.peer_relay {
+			via = x.id
+		}
+	}
+	packet: [8192]byte
+	testing.expect(t, node_post_link(&a.node, via, b.keys.device, packet[:]))
+	sim_settle(&s)
+	testing.expect(t, heard.packets == 1 && heard.bytes == len(packet) && heard.from == a.keys.device)
+	// b's session at the relay takes nothing for a while: what piles up past the relay's queue is dropped there.
+	to_b: ^Session
+	for x in relay.node.sessions {
+		if x.peer == b.keys.device {
+			to_b = x
+		}
+	}
+	for x in s.links {
+		if x.a.node == &a.node || x.b.node == &a.node {
+			for _ in 0 ..< 200 {
+				node_post_link(&a.node, via, b.keys.device, packet[:])
+				sim_pass(&s, x.a, x.b)
+				sim_pass(&s, x.b, x.a)
 			}
 		}
 	}
-	caller_call(&ca, 1, b.keys.device, 1, "echo", "pay the bill")
-	round(&s, &heard)
-	caller_read(&cb)
-	testing.expect_value(t, len(cb.calls), 1)
-	at_b: ^Session
-	for l in s.links {
-		if l.an == 1 {
-			at_b = l.a
-		}
-	}
-	testing.expect(t, session_input(at_b, heard[:]))
-	testing.expect(t, session_input(at_b, heard[:]))
-	caller_read(&cb)
-	testing.expect_value(t, len(cb.calls), 1)
-	// And the tunnel survives the attempt.
-	caller_call(&ca, 2, b.keys.device, 1, "echo", "again")
-	round(&s, &heard)
-	caller_read(&cb)
-	testing.expect_value(t, len(cb.calls), 2)
-	session_close(ca.s)
-	session_close(cb.s)
-}
-
-// Whoever is called begins again, and the relay between never notices.
-@(test)
-tunnels_are_begun_again :: proc(t: ^testing.T) {
-	state := seeded(23)
-	context.random_generator = rand.default_random_generator(&state)
-	s: Sim
-	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
-	defer sim_destroy(&s)
-	a, b := s.nodes[0], s.nodes[1]
-	sim_link(&s, 0, 2)
-	sim_link(&s, 1, 2)
+	testing.expectf(t, len(to_b.out) - to_b.sent <= LINK_QUEUE + len(packet) + 64, "the relay holds %d for b", len(to_b.out) - to_b.sent)
+	heard = {}
 	sim_settle(&s)
-	ca, cb := Caller{s = sim_client(&s, a)}, Caller{s = sim_client(&s, b)}
-	defer caller_destroy(&ca)
-	defer caller_destroy(&cb)
-	caller_serve(&cb, 1, "echo")
-	forget :: proc(x: ^Sim_Node) {
-		for &u in x.node.tunnels {
-			tunnel_free(&u)
+	testing.expectf(t, heard.packets > 0 && heard.packets < 200, "%d of 200 came", heard.packets)
+	// Nobody else's packets are taken: not from a session that is not with a relay.
+	before := heard.packets
+	w: [dynamic]byte
+	defer delete(w)
+	at := frame_begin(&w, .Signal)
+	append(&w, ..a.keys.device[:])
+	append(&w, u8(Post.Link), 1, 2, 3)
+	frame_end(&w, at)
+	for x in s.links {
+		if x.b.node == &b.node && x.b.peer_relay {
+			session_input(x.b, w[:]) // as though a relay said it: it is one
+			testing.expect_value(t, heard.packets, before + 1)
 		}
-		clear(&x.node.tunnels)
-		clear(&x.node.calls)
 	}
-	caller_call(&ca, 1, b.keys.device, 1, "echo", "once")
-	settle(&s, &ca, &cb)
-	testing.expect_value(t, len(cb.calls), 1)
-	forget(b)
-	// What is said in it now tells this end that it is no more, and the next call goes through.
-	caller_flow(&ca, 1, CALLER, .Data, "more")
-	settle(&s, &ca, &cb)
-	testing.expect(t, len(ca.faults) == 1 && ca.faults[0] == .Lost && len(a.node.calls) == 0)
-	caller_call(&ca, 2, b.keys.device, 1, "echo", "twice")
-	settle(&s, &ca, &cb)
-	testing.expect_value(t, len(cb.calls), 2)
-	testing.expect_value(t, string(cb.first[:]), "twice")
-	// And the other way about: what is served to one who has forgotten asking comes to an end.
-	forget(a)
-	caller_flow(&cb, cb.calls[1], CALLEE, .Data, "answer")
-	settle(&s, &ca, &cb)
-	testing.expect(t, cb.faults[len(cb.faults) - 1] == .Lost && len(b.node.calls) == 0 && len(b.node.tunnels) == 0)
-	session_close(ca.s)
-	session_close(cb.s)
 }
 
 // Who is called has, by then, what the caller wrote before calling.
@@ -376,6 +349,7 @@ calls_come_after_what_they_are_about :: proc(t: ^testing.T) {
 					sim_pass(&s, l.a, l.b, l.lanes, 0)
 					sim_pass(&s, l.b, l.a, l.lanes, 1)
 				}
+				sim_relayed_pump(&s)
 				caller_read(&cb)
 				caller_read(&ca)
 				if len(b.node.calls) > calls {

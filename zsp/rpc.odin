@@ -7,18 +7,14 @@ import "core:strings"
 //
 // A call is two streams of messages, one each way, addressed to a device and made within a scope. Each
 // node along the way is a router: it knows a call by its two ends and passes messages between them. A
-// call takes the direct link to the device when there is one, and otherwise a tunnel through a relay.
-// It stays on the path it began on, and fails if that path fails: at most once, never twice.
-//
-// Between devices without a direct link, a tunnel is one Noise channel per caller and callee, whose
-// messages a relay forwards as opaque signals. The relay keeps nothing for it and, since every message
-// counts, can neither replay nor reorder what it carries.
+// call takes a direct session with the device when there is one, and otherwise one the host makes for
+// calls alone, over a link that a relay carries (Host.reach). It stays on the session it began on, and
+// fails if that fails: at most once, never twice.
 
 CALL_WINDOW :: 256 << 10 // bytes a side may send before the other grants more
 MAX_CALLS :: 4096
 MAX_METHOD :: 255
 MAX_FLOW :: 1024 // of anything but data
-MAX_PENDING :: 64 // frames awaiting a tunnel, past which no more calls join them
 
 Flow :: enum u8 {
 	Data   = 0, // one message
@@ -50,7 +46,6 @@ SELF :: max(u32) // the session of an end that is this node itself
 End :: struct {
 	host:    bool, // an end that is this node's host, as a method's server or as a caller
 	session: u32,
-	tunnel:  u32, // within that session, if not zero
 	lane:    u64, // within that session, if not zero
 	id:      u64,
 	ended:   bool, // has sent its last message
@@ -73,39 +68,18 @@ Serving :: struct {
 	method:  string, // owned
 }
 
-@(private)
-Tunnel :: struct {
-	id:        u32,
-	relay:     u32, // session
-	peer:      Key32,
-	mine:      bool, // this end dialled, and calls out on it
-	open:      bool,
-	handshake: Handshake,
-	channel:   Channel,
-	next:      Channel, // answered but unproven; replaces `channel` when it proves itself
-	pending:   [dynamic][dynamic]byte, // frames awaiting the handshake
-}
-
+// What a Signal carries, by its first byte.
 @(private)
 Post :: enum u8 {
-	Plain  = 0, // sealed to the device, for the host
-	First  = 1,
-	Second = 2,
-	Out    = 3, // tunnel data from whoever dialled it
-	Back   = 4, // and to them
-	No_Out = 5, // data came in a tunnel unknown here, dialled by whoever this is for,
-	No_Back = 6, // or by whoever says so
+	Plain = 0, // sealed to the device, for its host
+	Link  = 7, // a packet of a link the relay carries (§14), which it may drop
 }
 
 rpc_destroy :: proc(n: ^Node) {
 	for s in n.serving {
 		delete(s.method)
 	}
-	for &t in n.tunnels {
-		tunnel_free(&t)
-	}
 	delete(n.serving)
-	delete(n.tunnels)
 	delete(n.calls)
 }
 
@@ -140,7 +114,7 @@ on_serve :: proc(s: ^Session, r: ^Reader) {
 
 // id, device, scope, method, for whom, first message
 @(private)
-on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil, lane: ^Lane = nil) {
+on_call :: proc(s: ^Session, r: ^Reader, lane: ^Lane = nil) {
 	n := s.node
 	id := read_varint(r)
 	device := read_key32(r)
@@ -152,7 +126,7 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil, lane: ^Lane = ni
 		r.bad = true
 		return
 	}
-	from := End{session = s.id, tunnel = tunnel.id if tunnel != nil else 0, lane = lane.id if lane != nil else 0, id = id, granted = CALL_WINDOW}
+	from := End{session = s.id, lane = lane.id if lane != nil else 0, id = id, granted = CALL_WINDOW}
 	if lane != nil {
 		lane.calls += 1
 	}
@@ -162,18 +136,18 @@ on_call :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil, lane: ^Lane = ni
 		end_release(n, from)
 	}
 	for c in n.calls {
-		if c.ends[CALLER].session == from.session && c.ends[CALLER].tunnel == from.tunnel && c.ends[CALLER].id == id {
+		if c.ends[CALLER].session == from.session && c.ends[CALLER].id == id {
 			r.bad = true // an id may be used again only once its call is over
 			return
 		}
 	}
 	local := s.role == .Open
-	caller := s.peer if tunnel == nil else tunnel.peer
+	caller := s.peer
 	own := method == ""
 	need := Right.Read if own else Right.Call
 	allowed := need in (session_rights(s, scope) if local else device_rights(n, caller, scope))
 	// A relay this device dialled may call it for what it makes public, and for nothing else.
-	public := method == PUBLIC && scope == 0 && !local && s.peer_relay && tunnel == nil
+	public := method == PUBLIC && scope == 0 && !local && s.peer_relay
 	if public {
 		allowed = true
 	} else if local {
@@ -278,32 +252,25 @@ call_out :: proc(n: ^Node, c: ^Call, device: Key32, method: string, who, body: [
 			direct = p
 		}
 	}
-	if p := direct; p != nil {
-		to.session = p.id
-		flush_changes(p) // it may be about them
-		cells_close(p)
-		w := &p.out
-		if l := lane_open(p, c.urgency); l != nil {
-			to.lane = l.id
-			l.calls += 1
-			w = lane_out(p, l)
-		}
-		append(&n.calls, c^)
-		call_put(w, nil, to.id, device, c.scope, method, who, body)
-		return nil
+	if direct == nil && n.host.reach != nil {
+		// None yet: the host begins one for calls, through a relay; what is said waits until it is open.
+		direct = n.host.reach(n.host.data, device)
 	}
-	t := tunnel_to(n, device)
-	if t == nil {
+	p := direct
+	if p == nil || p.closing {
 		return .Unreachable
 	}
-	if len(t.pending) >= MAX_PENDING {
-		return .Busy
+	to.session = p.id
+	flush_changes(p) // it may be about them
+	cells_close(p)
+	w := &p.out
+	if l := lane_open(p, c.urgency); l != nil {
+		to.lane = l.id
+		l.calls += 1
+		w = lane_out(p, l)
 	}
-	to.session, to.tunnel = t.relay, t.id
 	append(&n.calls, c^)
-	frame: [dynamic]byte
-	call_put(&frame, nil, to.id, device, c.scope, method, who, body)
-	tunnel_send(n, t, frame)
+	call_put(w, nil, to.id, device, c.scope, method, who, body)
 	return nil
 }
 
@@ -383,7 +350,7 @@ node_flow :: proc(n: ^Node, call: u64, kind: Flow, payload: []byte = nil) {
 node_calling :: proc(n: ^Node, s: ^Session) -> bool {
 	for &c in n.calls {
 		for e in c.ends {
-			if e.session == s.id && e.tunnel == 0 {
+			if e.session == s.id {
 				return true
 			}
 		}
@@ -458,7 +425,7 @@ device_rights :: proc(n: ^Node, device: Key32, scope: Scope) -> Rights {
 
 // id and which side speaks, kind, payload
 @(private)
-on_flow :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
+on_flow :: proc(s: ^Session, r: ^Reader) {
 	n := s.node
 	tag := read_varint(r)
 	kind := Flow(read_u8(r))
@@ -468,10 +435,9 @@ on_flow :: proc(s: ^Session, r: ^Reader, tunnel: ^Tunnel = nil) {
 		return
 	}
 	side := int(tag & 1)
-	tid := tunnel.id if tunnel != nil else 0
 	for &c, i in n.calls {
 		from := &c.ends[side]
-		if from.session == s.id && from.tunnel == tid && from.id == tag >> 1 {
+		if from.session == s.id && from.id == tag >> 1 {
 			flow_pass(n, i, side, kind, payload)
 			return
 		}
@@ -557,29 +523,18 @@ call_flow :: proc(n: ^Node, to: ^End, speaker: int, kind: Flow, payload: []byte)
 		}
 		return
 	}
-	if to.tunnel == 0 {
-		cells_close(s)
-		put(&s.out, to.id, speaker, kind, payload)
-		return
-	}
-	for &t in n.tunnels {
-		if t.id == to.tunnel {
-			frame: [dynamic]byte
-			put(&frame, to.id, speaker, kind, payload)
-			tunnel_send(n, &t, frame)
-			return
-		}
-	}
+	cells_close(s)
+	put(&s.out, to.id, speaker, kind, payload)
 }
 
 // A path has failed: every call on it is lost.
 @(private)
-calls_lost :: proc(n: ^Node, session: u32, tunnel: u32 = 0, lane: u64 = 0) {
+calls_lost :: proc(n: ^Node, session: u32, lane: u64 = 0) {
 	// One at a time, looking afresh: whoever is told may end other calls, or begin them.
 	outer: for {
 		for c, i in n.calls {
 			for e, side in c.ends {
-				if e.session == session && (tunnel == 0 || e.tunnel == tunnel) && (lane == 0 || e.lane == lane) {
+				if e.session == session && (lane == 0 || e.lane == lane) {
 					other := c.ends[1 - side]
 					call_end_now(n, i)
 					call_flow(n, &other, side, .Fault, {u8(Call_Fault.Lost)})
@@ -624,12 +579,6 @@ rpc_session_closed :: proc(n: ^Node, s: ^Session) {
 		}
 	}
 	calls_lost(n, s.id)
-	#reverse for &t, i in n.tunnels {
-		if t.relay == s.id {
-			tunnel_free(&t)
-			unordered_remove(&n.tunnels, i)
-		}
-	}
 }
 
 // Grants have changed: calls that could no longer be made are ended.
@@ -640,13 +589,13 @@ rpc_roster_changed :: proc(n: ^Node) {
 	}
 	// One at a time, looking afresh: whoever is told may end other calls, or begin them.
 	Caller_Key :: struct {
-		session, tunnel: u32,
-		id:              u64,
+		session: u32,
+		id:      u64,
 	}
 	still := make([dynamic]Caller_Key, context.temp_allocator) // looked at, and still allowed
 	outer: for {
 		for &c, i in n.calls {
-			key := Caller_Key{c.ends[CALLER].session, c.ends[CALLER].tunnel, c.ends[CALLER].id}
+			key := Caller_Key{c.ends[CALLER].session, c.ends[CALLER].id}
 			if c.public || slice.contains(still[:], key) {
 				continue // no grant governs it, or it was looked at
 			}
@@ -657,13 +606,7 @@ rpc_roster_changed :: proc(n: ^Node) {
 				if s == nil || s.role == .Open {
 					continue
 				}
-				device := s.peer
-				for t in n.tunnels {
-					if t.id == e.tunnel {
-						device = t.peer
-					}
-				}
-				allowed &&= need in device_rights(n, device, c.scope)
+				allowed &&= need in device_rights(n, s.peer, c.scope)
 			}
 			if !allowed {
 				ends := c.ends
@@ -679,191 +622,31 @@ rpc_roster_changed :: proc(n: ^Node) {
 	}
 }
 
-// ---------------------------------------------------------------- tunnels
+// ---------------------------------------------------------------- links through relays
 
-@(private)
-tunnel_free :: proc(t: ^Tunnel) {
-	for p in t.pending {
-		delete(p)
+// Hands a relay a packet of a link to another device present there, by the session with it. False if there
+// is no such session, or it has so much to send already that the packet would only wait: as though lost.
+node_post_link :: proc(n: ^Node, relay: u32, device: Key32, packet: []byte) -> bool {
+	s := node_session(n, relay)
+	if s == nil || !s.ready || !s.peer_relay || s.closing || session_backlog(s) > LINK_QUEUE {
+		return false
 	}
-	delete(t.pending)
-	t^ = {}
+	post(s, device, .Link, packet)
+	return true
 }
 
-@(private)
-tunnel_new :: proc(n: ^Node, relay: u32, peer: Key32, mine: bool) -> ^Tunnel {
-	n.next_tunnel += 1
-	append(&n.tunnels, Tunnel{id = n.next_tunnel, relay = relay, peer = peer, mine = mine})
-	return &n.tunnels[len(n.tunnels) - 1]
-}
+// What a relay holds for a link's packets, beyond which it drops them: enough to keep a fast path full, little
+// enough that what is urgent does not wait long behind it. Loss recovery, end to end, makes up the rest.
+LINK_QUEUE :: 256 << 10
 
+// What is queued for a session's peer and not yet on its way: here, and in its host's pipe.
 @(private)
-tunnel_to :: proc(n: ^Node, device: Key32) -> ^Tunnel {
-	for &t in n.tunnels {
-		if t.mine && t.peer == device {
-			return &t
-		}
+session_backlog :: proc(s: ^Session) -> int {
+	queued := len(s.out) - s.sent
+	if n := s.node; n.host.backlog != nil {
+		queued += n.host.backlog(n.host.data, s)
 	}
-	for s in n.sessions {
-		if !s.ready || !s.peer_relay || !slice.contains(s.online[:], device) {
-			continue
-		}
-		t := tunnel_new(n, s.id, device, true)
-		eph: Key32
-		node_random(n, eph[:])
-		first, ok := handshake_start(&t.handshake, n.keys.secret, device, n.space, eph)
-		if !ok {
-			pop(&n.tunnels)
-			return nil
-		}
-		post(s, device, .First, first[:])
-		return t
-	}
-	return nil
-}
-
-// Takes ownership of the frame.
-@(private)
-tunnel_send :: proc(n: ^Node, t: ^Tunnel, frame: [dynamic]byte) {
-	if !t.open {
-		append(&t.pending, frame)
-		return
-	}
-	frame := frame
-	defer delete(frame)
-	s := node_session(n, t.relay)
-	if s == nil {
-		return
-	}
-	w := make([dynamic]byte, context.temp_allocator)
-	write_u64(&w, t.channel.send_n)
-	channel_seal(&t.channel, &w, frame[:])
-	post(s, t.peer, .Out if t.mine else .Back, w[:])
-}
-
-// A signal for a tunnel. They travel in order, so a message that is not newer than the last is a replay.
-@(private)
-tunnel_input :: proc(s: ^Session, from: Key32, kind: Post, blob: []byte) {
-	n := s.node
-	m := roster_member(&n.roster, from)
-	if m == nil || !member_active(m) {
-		return
-	}
-	mine := kind == .Second || kind == .Back
-	t: ^Tunnel
-	for &x in n.tunnels {
-		if x.peer == from && x.mine == mine && (x.relay == s.id || !x.open) {
-			t = &x
-		}
-	}
-	switch kind {
-	case .Plain:
-	case .First:
-		eph: Key32
-		node_random(n, eph[:])
-		second, channel, ok := handshake_answer(n.keys.secret, n.space, blob, eph)
-		if !ok || channel.peer != from {
-			return
-		}
-		if t == nil {
-			t = tunnel_new(n, s.id, from, false)
-		}
-		t.next = channel
-		post(s, from, .Second, second[:])
-	case .Second:
-		if t == nil || t.open {
-			return
-		}
-		channel, ok := handshake_finish(&t.handshake, blob, from)
-		if !ok {
-			return
-		}
-		t.channel, t.open = channel, true
-		pending := t.pending
-		t.pending = nil
-		for p in pending {
-			tunnel_send(n, t, p)
-		}
-		delete(pending)
-	case .No_Out, .No_Back:
-		// Whoever it was begun with has begun again. Nothing of it is lost but what was already.
-		#reverse for &x, i in n.tunnels {
-			if x.relay == s.id && x.peer == from && x.mine == (kind == .No_Out) && x.open {
-				calls_lost(n, s.id, x.id)
-				tunnel_free(&x)
-				unordered_remove(&n.tunnels, i)
-			}
-		}
-	case .Out, .Back:
-		if t == nil {
-			post(s, from, .No_Out if kind == .Out else .No_Back, nil)
-			return
-		}
-		if len(blob) < 8 {
-			return
-		}
-		number := get_u64(blob)
-		plain: []byte
-		ok: bool
-		if t.open {
-			plain, ok = tunnel_open(&t.channel, number, blob[8:])
-		}
-		if !ok && t.next.recv != {} {
-			fresh := t.next
-			if plain, ok = tunnel_open(&fresh, number, blob[8:]); ok {
-				// The caller began again; whatever it had in flight before is gone.
-				if t.open {
-					calls_lost(n, t.relay, t.id)
-				}
-				t.channel, t.next, t.open, t.relay = fresh, {}, true, s.id
-			}
-		}
-		if !ok {
-			return
-		}
-		r := Reader{buf = plain}
-		frame := read_bytes(&r)
-		if r.bad || len(frame) == 0 {
-			return
-		}
-		tid := t.id
-		inner := Reader{buf = frame[1:]}
-		for &x in n.tunnels {
-			if x.id == tid {
-				#partial switch Message(frame[0]) {
-				case .Call:
-					on_call(s, &inner, &x)
-				case .Flow:
-					on_flow(s, &inner, &x)
-				}
-				return
-			}
-		}
-	}
-}
-
-@(private)
-tunnel_open :: proc(c: ^Channel, number: u64, sealed: []byte) -> (plain: []byte, ok: bool) {
-	if number < c.recv_n {
-		return
-	}
-	copied := slice.clone(sealed, context.temp_allocator) // a failed open must leave it for another try
-	plain = channel_open_at(c, number, copied, nil) or_return
-	c.recv_n = number + 1
-	return plain, true
-}
-
-// Devices have gone from a relay, and their tunnels with them.
-@(private)
-tunnels_prune :: proc(s: ^Session) {
-	n := s.node
-	#reverse for &t, i in n.tunnels {
-		if t.relay == s.id && !slice.contains(s.online[:], t.peer) {
-			calls_lost(n, s.id, t.id)
-			tunnel_free(&t)
-			unordered_remove(&n.tunnels, i)
-		}
-	}
+	return queued
 }
 
 @(private)

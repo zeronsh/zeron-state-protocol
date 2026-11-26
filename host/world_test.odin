@@ -20,16 +20,20 @@ import "../zsp"
 World :: struct {
 	t:      ^testing.T,
 	root:   string, // a directory of its own, removed after
-	hosts:  [3]Host, // the relay, A, B
+	hosts:  [4]Host, // the relay, A, B, and a second relay if asked for
 	space:  zsp.Key32,
 	url:    string,
-	keys:   [3]zsp.Keyring,
-	dirs:   [3]string,
+	urls:   [2]string,
+	keys:   [4]zsp.Keyring,
+	dirs:   [4]string,
+	count:  int, // hosts
+	dead:   [4]bool, // destroyed already
 }
 
 @(private)
-world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = {.Read, .Write, .Call, .Shell, .Files}) -> bool {
+world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = {.Read, .Write, .Call, .Shell, .Files}, relays := 1) -> bool {
 	w.t = t
+	w.count = 3 if relays == 1 else 4
 	base, terr := os.temp_directory(context.temp_allocator)
 	if terr != nil {
 		return false
@@ -39,9 +43,9 @@ world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = 
 	if err != nil {
 		return false
 	}
-	names := [3]string{"relay", "a", "b"}
+	names := [4]string{"relay", "a", "b", "relay2"}
 	dirs := &w.dirs
-	for name, i in names {
+	for name, i in names[:w.count] {
 		dirs[i], _ = filepath.join({w.root, name}) // the hosts keep them
 		secret, ok := device_secret(dirs[i])
 		if !ok {
@@ -68,9 +72,13 @@ world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = 
 		os.make_directory_all(dir)
 		save(file_in(dir, "roster"), roster) or_return
 	}
-	host_init(&w.hosts[0], {dir = dirs[0], relay = true, full = true, listen = net.Endpoint{net.IP4_Loopback, 0}}) or_return
-	bound, _ := net.bound_endpoint(w.hosts[0].listener)
-	w.url = strings.concatenate({"ws://", net.endpoint_to_string(bound, context.temp_allocator), "/", name})
+	which := [2]int{0, 3}
+	for i in which[:relays] {
+		host_init(&w.hosts[i], {dir = dirs[i], relay = true, full = true, listen = net.Endpoint{net.IP4_Loopback, 0}}) or_return
+		bound, _ := net.bound_endpoint(w.hosts[i].listener)
+		w.urls[0 if i == 0 else 1] = strings.concatenate({"ws://", net.endpoint_to_string(bound, context.temp_allocator), "/", name})
+	}
+	w.url = w.urls[0]
 	for i in 1 ..= 2 {
 		config := Config{dir = dirs[i], full = true, listen = net.Endpoint{net.IP4_Loopback, 0}}
 		if udp {
@@ -80,7 +88,10 @@ world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = 
 		if space_open(&w.hosts[i], w.space) == nil {
 			return false
 		}
-		dial(&w.hosts[i], w.hosts[i].spaces[0], w.keys[0].device, w.url)
+		dial(&w.hosts[i], w.hosts[i].spaces[0], w.keys[0].device, w.urls[0])
+		if relays > 1 {
+			dial(&w.hosts[i], w.hosts[i].spaces[0], w.keys[3].device, w.urls[1])
+		}
 		dialers_refresh(&w.hosts[i])
 	}
 	return true
@@ -88,10 +99,12 @@ world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = 
 
 @(private)
 world_destroy :: proc(w: ^World) {
-	for i := 2; i >= 0; i -= 1 {
-		host_destroy(&w.hosts[i])
+	for i := w.count - 1; i >= 0; i -= 1 {
+		if !w.dead[i] {
+			host_destroy(&w.hosts[i])
+		}
 	}
-	for &k in w.keys {
+	for &k in w.keys[:w.count] {
 		zsp.keyring_destroy(&k)
 	}
 	os.remove_all(w.root)
@@ -99,7 +112,9 @@ world_destroy :: proc(w: ^World) {
 	for d in w.dirs {
 		delete(d)
 	}
-	delete(w.url)
+	for u in w.urls {
+		delete(u)
+	}
 }
 
 @(private)
@@ -112,14 +127,19 @@ world_space :: proc(w: ^World, i: int) -> ^Space {
 world_run :: proc(w: ^World, done: proc(w: ^World, data: rawptr) -> bool, data: rawptr = nil, within := 20 * time.Second) -> bool {
 	start := time.tick_now()
 	for time.tick_since(start) < within {
-		for &h in w.hosts {
-			host_settle(&h)
+		for &h, i in w.hosts[:w.count] {
+			if !w.dead[i] {
+				host_settle(&h)
+			}
 		}
 		if done(w, data) {
 			return true
 		}
 		wait := 20 * time.Millisecond
-		for &h in w.hosts {
+		for &h, i in w.hosts[:w.count] {
+			if w.dead[i] {
+				continue
+			}
 			if due, ok := host_deadline(&h); ok {
 				wait = min(wait, max(time.tick_diff(time.tick_now(), due), 0))
 			}
@@ -240,4 +260,11 @@ echo_stop :: proc(e: ^Echo) {
 	thread.join(e.thread)
 	thread.destroy(e.thread)
 	net.close(e.listener)
+}
+
+// A relay goes, as a process that dies does: every connection to it closed at once.
+@(private)
+world_kill :: proc(w: ^World, i: int) {
+	w.dead[i] = true
+	host_destroy(&w.hosts[i])
 }

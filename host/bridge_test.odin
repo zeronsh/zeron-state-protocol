@@ -189,6 +189,8 @@ forward_reaches_a_port :: proc(t: ^testing.T) {
 		th := client_start(&c)
 		testing.expect(t, world_run(&w, client_done, &c, 60 * time.Second))
 		testing.expectf(t, !c.reset && len(c.got) == len(c.sent) && string(c.got[:]) == string(c.sent[:]), "udp %v: %d of %d came back", udp, len(c.got), len(c.sent))
+		// Without UDP, a link the relay carries; with it, none.
+		testing.expect_value(t, len(world_space(&w, 1).relayed) > 0, !udp)
 		client_destroy(&c, th)
 		// Both ends let go of everything.
 		testing.expect(t, world_run(&w, proc(w: ^World, _: rawptr) -> bool {
@@ -394,4 +396,49 @@ forward_holds_little_for_a_reader_that_never_reads :: proc(t: ^testing.T) {
 		testing.expect(t, world_run(&w, client_done, &c))
 		client_destroy(&c, th)
 	}
+}
+
+// The relay a forward goes through dies, mid-transfer, as a process does; another both devices are at carries the
+// link on, and not a byte is lost.
+@(test)
+forward_outlives_its_relay :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false, relays = 2))
+	defer world_destroy(&w)
+	testing.expect(t, world_run(&w, proc(w: ^World, _: rawptr) -> bool {
+		// Both devices at both relays.
+		for i in 1 ..= 2 {
+			at := 0
+			for s in world_space(w, i).node.sessions {
+				if s.ready && s.peer_relay && len(s.online) > 0 {
+					at += 1
+				}
+			}
+			if at < 2 {
+				return false
+			}
+		}
+		return true
+	}))
+	e: Echo
+	testing.expect(t, echo_start(&e))
+	defer echo_stop(&e)
+	open_port = u16(e.port)
+	w.hosts[2].port_permitted = permit_open_port
+	g: Gate
+	testing.expect(t, gate_open(&g, &w, u16(e.port)))
+	defer gate_close(&g)
+	c := Client{port = g.port, send = 8 << 20, read_too = true, slow = true}
+	th := client_start(&c)
+	testing.expect(t, world_run(&w, proc(w: ^World, c: rawptr) -> bool {return sync.atomic_load(&(^Client)(c).heard) > 256 << 10}, &c))
+	// Whichever relay carries it goes.
+	a := world_space(&w, 1)
+	testing.expect_value(t, len(a.relayed), 1)
+	via := zsp.node_session(&a.node, a.relayed[0].via)
+	world_kill(&w, 0 if via.peer == w.keys[0].device else 3)
+	testing.expect(t, world_run(&w, client_done, &c, 60 * time.Second))
+	testing.expectf(t, !c.reset && len(c.got) == len(c.sent) && string(c.got[:]) == string(c.sent[:]), "%d of %d came back", len(c.got), len(c.sent))
+	client_destroy(&c, th)
+	testing.expect(t, world_run(&w, nobody_left))
+	testing.expectf(t, len(g.status) == 2 && g.status[1] == .Closed, "%v", g.status[:])
 }
