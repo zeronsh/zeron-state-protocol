@@ -2474,7 +2474,11 @@ def main(tests=globals(), file=__file__):
         code = one(names[0], tests, file)
         if code == 0:
             shutil.rmtree(TMP, ignore_errors=True)
-        sys.exit(code)
+        # Out at once, said and done: a test's servers run in threads that may yet be writing (a reset peer's
+        # traceback, say), and an interpreter shutting down under them can fail for that alone.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
     os.rmdir(TMP)
     runs = [subprocess.Popen([sys.executable, file, n], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for n in names]
     for r in runs:
