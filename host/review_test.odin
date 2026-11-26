@@ -541,6 +541,7 @@ review_exec_credits_whole_messages :: proc(t: ^testing.T) {
 		free(e)
 	}
 	dummy: Process
+	dummy.input = auto_cast uintptr(1) // open, as far as anyone asks: never written to, input being held already
 	e.sp, e.call, e.p, e.data, e.on_data = a, 777, &dummy, e, exec_on_data
 	append(&e.held, 'A') // held already, so what comes is held too
 	append(&a.calls, Host_Call{call = 777, handler = &e.handler, window = zsp.CALL_WINDOW, since = time.tick_now()})

@@ -431,16 +431,23 @@ process_free_ends_its_group :: proc(t: ^testing.T) {
 		testing.expectf(t, false, "could not start: %v", err)
 		return
 	}
+	// Its id, on a line of its own: whatever else comes first, as what it started may say something too.
+	process_test_id :: proc(out: string) -> (id: int, ok: bool) {
+		rest := out
+		for line in strings.split_lines_iterator(&rest) {
+			if id, ok = strconv.parse_int(strings.trim_space(line)); ok {
+				return
+			}
+		}
+		return
+	}
 	if !testing.expect(t, ran_until(&r, proc(r: ^Ran) -> bool {
-		return strings.index_byte(string(r.out[:]), '\n') >= 0
-	})) {
+		_, found := process_test_id(string(r.out[:]))
+		return found
+	}), "no process id") {
 		return
 	}
-	first := strings.trim_space(string(r.out[:strings.index_byte(string(r.out[:]), '\n')]))
-	child, ok := strconv.parse_int(first)
-	if !testing.expectf(t, ok, "no process id in %q", first) {
-		return
-	}
+	child, _ := process_test_id(string(r.out[:]))
 	if !testing.expect(t, process_test_alive(t, child), "what it started is not running to begin with") {
 		return
 	}
