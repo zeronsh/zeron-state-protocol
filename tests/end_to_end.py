@@ -1116,6 +1116,12 @@ def test_names_over_ipv6():
         # As many addresses as there are devices, all within 127.a.b.2 to 127.a.255.255.
         assert subprocess.run([BIN, "setup", "--dry-run", "--loopback=127.77.255", "--devices=600"], capture_output=True).returncode != 0
         assert subprocess.run([BIN, "setup", "--dry-run", "--loopback=127.77.254", "--devices=300"], capture_output=True).returncode == 0
+        # Not 127.0, which is localhost's, its name server's (127.0.0.53) and its reverse zone; nor a name server among
+        # the addresses whose connections go to the catch-all, where TCP's would be lost.
+        for flags in (["--loopback=127.0.0"], ["--loopback=127.0.9"], ["--dns=127.77.0.5:5053"], ["--dns=127.77.200.1:5053"]):
+            assert subprocess.run([BIN, "setup", "--dry-run", *flags], capture_output=True).returncode != 0, flags
+        assert subprocess.run([BIN, "setup", "--dry-run", "--dns=127.77.0.1:5053"], capture_output=True).returncode == 0
+    assert subprocess.run([BIN, "run", os.path.join(TMP, "n6-none"), "--loopback=127.0.0"], capture_output=True, timeout=10).returncode != 0
 
 
 def test_services_by_scope():

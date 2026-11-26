@@ -90,6 +90,11 @@ setup :: proc(args: []string) -> int {
 			return usage()
 		}
 		s.dns = ep
+		// Not where TCP is sent to the catch-all, as it is for every address from 127.a.b.2 on: its TCP would be lost.
+		if ip, v4 := ep.address.(net.IP4_Address); v4 && ip[0] == 127 && ip[1] == s.loopback[0] && (ip[2] > s.loopback[1] || ip[2] == s.loopback[1] && ip[3] >= 2) {
+			say(os.stderr, "a name server at ", net.endpoint_to_string(ep, context.temp_allocator), " would be among the devices' addresses, whose TCP goes elsewhere: 127.", fmt.tprint(s.loopback[0]), ".", fmt.tprint(s.loopback[1]), ".1, or another\n")
+			return 2
+		}
 	}
 	if !s.dry && !is_root() {
 		say(os.stderr, "zspd setup changes how this machine resolves names and reaches addresses: run it as root",

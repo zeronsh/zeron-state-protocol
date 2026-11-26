@@ -1047,8 +1047,8 @@ parse_loopback :: proc(value: string) -> (base: [2]byte, ok: bool) {
 	}
 	a, aok := strconv.parse_uint(parts[1], 10)
 	b, bok := strconv.parse_uint(parts[2], 10)
-	if !aok || !bok || a > 255 || b > 255 {
-		return
+	if !aok || !bok || a == 0 || a > 255 || b > 255 {
+		return // not 127.0: localhost's, and its name server's (127.0.0.53), and the reverse zone would be all of theirs
 	}
 	return {byte(a), byte(b)}, true
 }
