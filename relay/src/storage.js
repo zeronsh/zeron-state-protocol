@@ -79,6 +79,7 @@ export class Storage {
     this.#tables();
     for (const kind of [0, 1, 2]) {
       this.#cached[kind] = this.#sql.exec(`SELECT coalesce(sum(length(data)), 0) AS n FROM cache${kind}`).one().n;
+      this.#trim(kind, 0); // as kept by a relay that shared the room otherwise
     }
     const [row] = this.#sql.exec("SELECT off, data FROM log ORDER BY off DESC LIMIT 1").toArray();
     this.#tail = row && row.data.byteLength < LOG_ROW ? { off: row.off, bytes: grow(new Uint8Array(row.data), LOG_ROW), len: row.data.byteLength } : undefined;
@@ -253,23 +254,34 @@ export class Storage {
   }
 
   // Kept if there is room, the oldest let go to make it; never at the cost of what must be kept.
+  // Pages half, the log a quarter, and the trees' tops a quarter, apart, so that what else is read never crowds them out.
+  #share(kind) {
+    return Math.floor((this.#budget * [2, 1, 1][kind]) / 4);
+  }
+
+  // Lets go of the oldest, until there is room for `room` more.
+  #trim(kind, room) {
+    while (this.#cached[kind] + room > this.#share(kind)) {
+      const old = this.#read(`SELECT key, length(data) AS n FROM cache${kind} ORDER BY key LIMIT 16`);
+      if (old.length === 0) break;
+      for (const { key: k, n } of old) {
+        this.#shrink(`DELETE FROM cache${kind} WHERE key = ?`, k);
+        this.#cached[kind] -= n;
+      }
+    }
+  }
+
   #cache_put(kind, key, bytes) {
-    // Pages half, the log a quarter, and the trees' tops a quarter, apart, so that what else is read never crowds them
-    // out.
-    const budget = Math.floor((this.#budget * [2, 1, 1][kind]) / 4);
-    if (bytes.length > CACHE_ROW || bytes.length > budget) return;
+    const budget = this.#share(kind);
+    // A run longer than a row may be, or than there is room for, is kept as far as it fits: its first pages, whole.
+    const most = Math.min(CACHE_ROW, budget);
+    if (bytes.length > most) bytes = bytes.subarray(0, kind === 1 ? most : most - (most % PAGE));
+    if (bytes.length === 0) return;
     // What lies at a place never changes: a run already cached there at least as long holds all of this.
     const [longer] = this.#read(`SELECT 1 AS x FROM cache${kind} WHERE key = ? AND length(data) >= ?`, key, bytes.length);
     if (longer) return;
     try {
-      while (this.#cached[kind] + bytes.length > budget) {
-        const old = this.#read(`SELECT key, length(data) AS n FROM cache${kind} ORDER BY key LIMIT 16`);
-        if (old.length === 0) break;
-        for (const { key: k, n } of old) {
-          this.#shrink(`DELETE FROM cache${kind} WHERE key = ?`, k);
-          this.#cached[kind] -= n;
-        }
-      }
+      this.#trim(kind, bytes.length);
       const [had] = this.#read(`SELECT length(data) AS n FROM cache${kind} WHERE key = ?`, key);
       this.write(`INSERT INTO cache${kind} VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET data = excluded.data`, key, bytes.slice());
       this.#cached[kind] += bytes.length - (had?.n ?? 0);

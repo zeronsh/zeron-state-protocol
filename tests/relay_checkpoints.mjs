@@ -69,12 +69,14 @@ const { MemoryVolume } = await import(pathToFileURL(join(REPO, "web/src/volume.t
 const { loadModule } = await import(pathToFileURL(join(REPO, "web/src/wasm.ts")).href);
 
 
-const tmp = mkdtempSync(join(tmpdir(), "zsp-ckpt-"));
-try {
+
+// A relay of its own, with a web device to write through it.
+async function world(extra) {
+  const tmp = mkdtempSync(join(tmpdir(), "zsp-ckpt-"));
   const spaceId = execFileSync(ZSPD, ["create", tmp], { encoding: "utf8" }).trim();
   const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
-  const sql = new Sql(), sockets = new Set();
-  const env = { RELAY_SECRET: relaySecret, STATS: "1", QUIET_MS: "100" };
+  const sql = new Sql(), sockets = new Set(), servers = [];
+  const env = { RELAY_SECRET: relaySecret, STATS: "1", QUIET_MS: "100", ...extra };
   const ctx = { storage: { sql, sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
   const doSpace = new Space(ctx, env);
   class BridgeWS {
@@ -82,7 +84,7 @@ try {
     constructor(url) {
       this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
       doSpace.fetch(new Request(url.replace(/^ws/, "http")));
-      const { server, pair } = nextPair; this._s = server;
+      const { server, pair } = nextPair; this._s = server; servers.push(server);
       pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
       pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
       queueMicrotask(() => { this.readyState = 1; this._emit("open", {}); });
@@ -100,32 +102,69 @@ try {
   const node = await Node.open({ volume: vol, module: mod, WebSocket: BridgeWS, log: () => {} });
   execFileSync(ZSPD, ["relay", tmp, relayPub, "ws://relay.local"]);
   assert(node.adopt(readFileSync(join(tmp, spaceId, "roster"))));
-  const schema = { body: columns.bytes(16) };
   const client = new Client({ connect: node.connect.bind(node) });
   await new Promise((r) => setTimeout(r, 100));
   const stats = async () => JSON.parse(await (await doSpace.fetch(new Request("http://relay.local/" + spaceId + "?stats"))).text()).node;
-  const s0 = await stats();
+  const end = async () => {
+    client.close();
+    await node.close();
+    rmSync(tmp, { recursive: true, force: true });
+  };
+  return { client, stats, servers, end };
+}
 
-  // Writing on, some 600 KiB of it, written as fast as it is taken: no checkpoint until it stops.
-  let order = 1;
-  for (let i = 0; i < 40; i++) {
-    await client.write(1, (ch) => { for (let j = 0; j < 1; j++) ch.insert(schema, "items", order++, { body: new Uint8Array(16000).fill(i) }); });
+const schema = { body: columns.bytes(16) };
+
+{
+  const { client, stats, end } = await world({});
+  try {
+    const s0 = await stats();
+    // Writing on, some 600 KiB of it, written as fast as it is taken: no checkpoint until it stops.
+    let order = 1;
+    for (let i = 0; i < 40; i++) {
+      await client.write(1, (ch) => ch.insert(schema, "items", order++, { body: new Uint8Array(16000).fill(i) }));
+    }
+    const s1 = await stats();
+    assert.equal(s1.checkpoints - s0.checkpoints, 0, `${s1.checkpoints - s0.checkpoints} checkpoints while writing went on`);
+    assert.ok(s1.tail - s1.checkpoint > 500_000, `only ${s1.tail - s1.checkpoint} to replay`);
+    // Stopped: once quiet, it checkpoints, and waking would replay next to nothing.
+    await new Promise((r) => setTimeout(r, 600));
+    const s2 = await stats();
+    assert.equal(s2.checkpoints - s1.checkpoints, 1, `${s2.checkpoints - s1.checkpoints} checkpoints once quiet`);
+    assert.ok(s2.tail - s2.checkpoint < 1000, `${s2.tail - s2.checkpoint} left to replay`);
+    // A little more, and quiet again: too little to be worth a checkpoint.
+    await client.write(1, (ch) => ch.insert(schema, "items", order++, { body: new Uint8Array(2000) }));
+    await new Promise((r) => setTimeout(r, 600));
+    const s3 = await stats();
+    assert.equal(s3.checkpoints, s2.checkpoints, "a checkpoint for a little");
+    console.log("ok   a relay checkpoints when writing stops, not while it goes on");
+  } finally {
+    await end();
   }
-  const s1 = await stats();
-  assert.equal(s1.checkpoints - s0.checkpoints, 0, `${s1.checkpoints - s0.checkpoints} checkpoints while writing went on`);
-  assert.ok(s1.tail - s1.checkpoint > 500_000, `only ${s1.tail - s1.checkpoint} to replay`);
+}
 
-  // Stopped: once quiet, it checkpoints, and waking would replay next to nothing.
-  await new Promise((r) => setTimeout(r, 600));
-  const s2 = await stats();
-  assert.equal(s2.checkpoints - s1.checkpoints, 1, `${s2.checkpoints - s1.checkpoints} checkpoints once quiet`);
-  assert.ok(s2.tail - s2.checkpoint < 1000, `${s2.tail - s2.checkpoint} left to replay`);
-
-  // A little more, and quiet again: too little to be worth a checkpoint.
-  await client.write(1, (ch) => ch.insert(schema, "items", order++, { body: new Uint8Array(2000) }));
-  await new Promise((r) => setTimeout(r, 600));
-  const s3 = await stats();
-  assert.equal(s3.checkpoints, s2.checkpoints, "a checkpoint for a little");
-  client.close(); await node.close();
-  console.log("ok   a relay checkpoints when writing stops, not while it goes on");
-} finally { rmSync(tmp, { recursive: true, force: true }); }
+{
+  // A relay that fills, with a checkpoint waiting for quiet: once it has let everyone go, nothing of it is left waiting.
+  const armed = new Set(), set = globalThis.setTimeout, clear = globalThis.clearTimeout;
+  globalThis.setTimeout = (f, ms, ...a) => {
+    const id = set(() => (armed.delete(id), f(...a)), ms);
+    if (ms === 60000) armed.add(id);
+    return id;
+  };
+  globalThis.clearTimeout = (id) => (armed.delete(id), clear(id));
+  const { client, servers, end } = await world({ STORAGE_LIMIT: "600000", QUIET_MS: "60000" });
+  try {
+    let order = 1;
+    for (let i = 0; i < 40 && !servers.some((w) => w.closed); i++) {
+      await Promise.race([client.write(1, (ch) => ch.insert(schema, "items", order++, { body: new Uint8Array(30000).fill(i) })), new Promise((r) => setTimeout(r, 300))]);
+    }
+    assert.ok(servers.some((w) => w.closed?.code === 1011), "it never filled");
+    assert.equal(armed.size, 0, `${armed.size} checkpoint(s) still waiting for quiet once it failed`);
+    console.log("ok   a relay that fails leaves nothing waiting");
+  } finally {
+    for (const id of armed) clear(id);
+    globalThis.setTimeout = set;
+    globalThis.clearTimeout = clear;
+    await end();
+  }
+}

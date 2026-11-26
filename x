@@ -13,6 +13,7 @@ EXE=
 # An event loop's ring of 256 rather than 2048: the kernel finds the smaller run of memory it wants even when it is
 # fragmented, as on busy machines where a big one at times could not be had; what does not fit waits its turn.
 STRICT="-vet -strict-style -define:ODIN_NBIO_QUEUE_SIZE=256"
+SIZED=zsp.review_little_room_whatever_quiet,zsp.review_little_room_pack_before_extent # run at full size too
 SMALL="-define:ZSP_SEGMENT=262144 -define:ZSP_LOOSE=12 -define:ZSP_ALIKE=3 -define:ZSP_GC_HOT=4 -define:ZSP_GC_DEAD=1 -define:ZSP_EXTENT=131072 -define:ZSP_LOG_BLOCK=16384 -define:ZSP_LOCAL_KEEP=0" # so that tests roll and reclaim segments
 
 wasm() {
@@ -93,6 +94,8 @@ test)
 		[ $p = host ] && [ -n "$EXE" ] && one=-define:ODIN_TEST_THREADS=1
 		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL $one -define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 -define:ZSP_FIND_RUN=64 -define:ZSP_FIND_HOT=0 >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &
 	done
+	# And what shows only at the sizes a relay runs with, where CHECKPOINT_TAIL is larger than an extent.
+	(odin test zsp -out:build/zsp-sized-test$EXE $STRICT -define:ODIN_TEST_NAMES=$SIZED >build/zsp-sized.log 2>&1 || echo zsp-sized >>build/failed; cat build/zsp-sized.log) &
 	(odin build zspd -out:build/zspd$EXE -debug $STRICT -define:ZSP_CALL_ALIVE=1000 || echo zspd >>build/failed) &
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
 	(odin build examples/apps -out:build/apps$EXE -debug $STRICT || echo examples >>build/failed) &

@@ -495,6 +495,33 @@ async function log_read_a_row_once(seed) {
   assert.equal(memory[1 << 21], 29);
 }
 
+// A run larger than there is room for, as a big checkpoint's on a host with little, is kept as far as it fits, not
+// dropped whole.
+async function long_run_kept_in_part(seed) {
+  const { host, memory } = harness(seed, { CACHE_BYTES: String(1 << 20) }); // room for 64 pages
+  host.log_write(0, 0, 1);
+  for (let i = 0; i < 512 * 4096; i++) memory[i] = (i >> 12) & 255;
+  host.cache_put(0, 3 << 20, 0, 512 * 4096);
+  assert.equal(host.cache_get(0, (3 << 20) + 5, 3 << 20, 4096), 1, "none of a long run kept");
+  assert.equal(memory[3 << 20], 5);
+}
+
+// A cache filled by a relay that shared its room otherwise is brought within this one's shares once the space opens.
+async function cache_trimmed_on_opening(seed) {
+  const sql = new Sql(), waits = [];
+  const ctx = { storage: { sql, sync: async () => {} }, waitUntil: (p) => waits.push(p) };
+  const env = { STORE: new Bucket(random(seed), 0), CACHE_BYTES: String(1 << 20) };
+  const space = new Uint8Array(32).fill(seed & 255);
+  const first = new Storage(ctx, env);
+  first.open(space);
+  first.make(space);
+  for (let k = 0; k < 48; k++) sql.exec("INSERT INTO cache0 VALUES (?, ?)", k * 16, new Uint8Array(16 * 1024)); // 3/4 MiB of pages
+  const s = new Storage(ctx, env);
+  s.open(space);
+  const n = sql.exec("SELECT coalesce(sum(length(data)), 0) AS n FROM cache0").one().n;
+  assert.ok(n <= 1 << 19, `${n} bytes of pages kept, past their share`);
+}
+
 for (let seed = first; seed < first + seeds; seed++) {
   await log_matches(seed);
   await cache_is_sound(seed);
@@ -510,5 +537,7 @@ for (let seed = first; seed < first + seeds; seed++) {
   if (seed === first) await cached_run_kept_longest(seed);
   if (seed === first) await tops_outlast_the_rest(seed);
   if (seed === first) await log_read_a_row_once(seed);
+  if (seed === first) await long_run_kept_in_part(seed);
+  if (seed === first) await cache_trimmed_on_opening(seed);
 }
 console.log(`ok   relay storage held to its model over ${seeds} seeds`);

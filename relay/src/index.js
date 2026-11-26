@@ -100,6 +100,7 @@ export class Space extends DurableObject {
     }
     this.#sockets.clear();
     this.#ending.clear();
+    this.#unquiet();
     this.#wasm = undefined;
     this.#epoch++;
     this.#storage.cancel();
@@ -241,6 +242,12 @@ export class Space extends DurableObject {
 
   #done;
 
+  // Nothing waits for quiet: not for a node let go of, nor once what it was waiting to see has happened.
+  #unquiet() {
+    clearTimeout(this.#quiet);
+    this.#quiet = undefined;
+  }
+
   // After every event: make it durable, say what follows from it, start fetching what it wants, and be ready to sleep.
   #settle() {
     if (!this.#wasm) return;
@@ -282,8 +289,7 @@ export class Space extends DurableObject {
     this.#storage.run(this.#done);
     // Writing has perhaps stopped: if nothing more happens for a moment, the log waking would replay is made short.
     // Until then the object stays awake, which costs that moment; it does not hibernate with much to replay.
-    clearTimeout(this.#quiet);
-    this.#quiet = undefined;
+    this.#unquiet();
     if (this.#wasm.quiet_due()) {
       const epoch = this.#epoch;
       this.#quiet = setTimeout(() => {
@@ -305,6 +311,7 @@ export class Space extends DurableObject {
   // that what a read then costs can be measured. Only where STATS is set.
   #evict(how) {
     if (this.#wasm) {
+      this.#unquiet();
       this.#wasm = undefined;
       this.#epoch++;
       this.#sockets.clear();

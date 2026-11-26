@@ -465,6 +465,12 @@ tree_next :: proc(c: ^Cursor) -> (leaf: Leaf, ok: bool) {
 				top.i += 1
 				return leaf, key_cmp(&leaf.key, &c.hi) < 0
 			}
+			// A child past the first begins at its key: one beginning at or past the end holds nothing scanned for, and is
+			// not read, as a leaf not at hand would be, empty, and those after it read in turn to the tree's end.
+			if top.i > 0 && key_cmp(&top.pg.branch[top.i].key, &c.hi) >= 0 {
+				c.depth = 0
+				return
+			}
 			c.path[c.depth] = {page(c.pager, top.pg.branch[top.i].child), 0}
 			c.depth += 1
 			continue

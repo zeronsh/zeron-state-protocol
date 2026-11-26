@@ -1103,6 +1103,8 @@ review_readers_read_ahead_each :: proc(t: ^testing.T) {
 // rather than a round a level down the tree.
 @(test)
 review_cold_lookup_is_one_round :: proc(t: ^testing.T) {
+	state := seeded(COLD_SEED)
+	context.random_generator = rand.default_random_generator(&state)
 	x: Remote_Store
 	defer model_host_destroy(&x.host)
 	remote_store_open(t, &x)
@@ -1119,7 +1121,7 @@ review_cold_lookup_is_one_round :: proc(t: ^testing.T) {
 	for i := u64(0); i < ROWS; i += 100 {
 		cells: [100]Cell
 		for j in u64(0) ..< 100 {
-			cells[j] = review_cell(i + j + 1, 1, 10 + i + j, {byte(j)})
+			cells[j] = review_cell(i + j + 1, DATA, 10 + i + j, {byte(j)})
 		}
 		review_commit(&x.store, cells[:])
 		free_all(context.temp_allocator)
@@ -1139,27 +1141,38 @@ review_cold_lookup_is_one_round :: proc(t: ^testing.T) {
 	remote_store_open(t, &x)
 	defer remote_store_close(&x)
 	x.remote.host.cache_put = keeps
-	rounds := 0
-	for {
+	// Whatever there is to replay is, first: what is counted is a read of a woken store, not its waking.
+	for x.store.replaying {
+		store_work(&x.store)
+		remote_ops(&x.remote)
+		for len(x.host.ops) > 0 {
+			review_answer(&x.host, &x.remote, 0, true)
+		}
+	}
+	remote_rest(&x.remote)
+	rounds, wanted := 0, 0
+	for tries := 0; tries < 10; tries += 1 {
 		step := store_begin(&x.store)
-		cs := row_scan(&x.store, review_cell(12345, 1, 0, nil).row)
+		cs := row_scan(&x.store, review_cell(12345, DATA, 0, nil).row)
 		for _ in row_next(&x.store, &cs) {}
 		missed := store_missed(&x.store, &step)
 		store_end(&x.store, &step, false)
 		if !missed {
 			break
 		}
-		rounds += 1
+		// Rounds of fetching pages: the log, where the value is in R2, is a round of its own.
+		if len(x.remote.want_pages) > 0 {
+			rounds += 1
+			wanted += len(x.remote.want_pages)
+		}
 		remote_ops(&x.remote)
 		for len(x.host.ops) > 0 {
 			review_answer(&x.host, &x.remote, 0, true)
 		}
 		remote_rest(&x.remote)
-		if rounds > 10 {
-			break
-		}
 	}
-	testing.expectf(t, rounds <= 1, "%d rounds of fetching for one row", rounds)
+	testing.expectf(t, rounds <= 1, "%d rounds of fetching pages for one row", rounds)
+	testing.expectf(t, wanted <= 1, "%d pages wanted for one row", wanted)
 }
 
 // While writing goes on, no checkpoint until the log waking would replay is CHECKPOINT_TAIL long; once it stops, one if
@@ -1199,4 +1212,173 @@ review_checkpoints_wait_for_quiet :: proc(t: ^testing.T) {
 	// On and on: one at CHECKPOINT_TAIL, quiet or not.
 	write(t, &x, n + 2, u64(CHECKPOINT_TAIL / 1000) + 2, body)
 	testing.expect(t, x.remote.stats.checkpoints >= before + 2)
+}
+
+COLD_SEED :: #config(COLD_SEED, 11)
+
+// Where the host has little room, writing that goes on is checkpointed so that it need not wait, whatever QUIET_TAIL is.
+@(test)
+review_little_room_whatever_quiet :: proc(t: ^testing.T) {
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	for store_work(&x.store) {}
+	remote_limits(&x.remote, 750_000, 1_500_000)
+	x.remote.quiet_tail = 64 << 20
+	body := make([]byte, 8192)
+	defer delete(body)
+	stalled := false
+	for i in u64(0) ..< 500 {
+		body[0] = byte(i)
+		review_commit(&x.store, {review_cell(i + 1, DATA, 10 + i, body)})
+		testing.expect(t, store_sync(&x.store))
+		if remote_full(&x.remote) {
+			stalled = true
+			break
+		}
+		remote_work(&x.remote)
+		remote_ops(&x.remote)
+		for len(x.host.ops) > 0 {
+			review_answer(&x.host, &x.remote, 0, true)
+		}
+		free_all(context.temp_allocator)
+	}
+	testing.expectf(t, !stalled, "writing waited, with R2 answering at once: tail %d, local_from %d, checkpoint %d, most %d", store_tail(&x.store), x.remote.local_from, x.store.checkpoint, x.remote.local_most)
+}
+
+// A checkpoint that lands before the extent it was to let go of is followed, once the extent lands, by one that does.
+@(test)
+review_little_room_pack_before_extent :: proc(t: ^testing.T) {
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	for store_work(&x.store) {}
+	remote_limits(&x.remote, 0, 2 * EXTENT)
+	body := make([]byte, 8192)
+	defer delete(body)
+	n := u64(0)
+	for store_tail(&x.store) <= EXTENT {
+		n += 1
+		body[0] = byte(n)
+		review_commit(&x.store, {review_cell(n, DATA, 10 + n, body)})
+		testing.expect(t, store_sync(&x.store))
+		remote_work(&x.remote)
+		remote_ops(&x.remote)
+		free_all(context.temp_allocator)
+	}
+	review_answer_all(&x, .Put_Pack, true)
+	review_answer_all(&x, .Put_Extent, true)
+	stalled := false
+	for store_tail(&x.store) <= 2 * EXTENT + 16384 {
+		n += 1
+		body[0] = byte(n)
+		review_commit(&x.store, {review_cell(n, DATA, 10 + n, body)})
+		testing.expect(t, store_sync(&x.store))
+		if remote_full(&x.remote) {
+			stalled = true
+			break
+		}
+		remote_work(&x.remote)
+		remote_ops(&x.remote)
+		for len(x.host.ops) > 0 {
+			review_answer(&x.host, &x.remote, 0, true)
+		}
+		free_all(context.temp_allocator)
+	}
+	testing.expectf(t, !stalled, "writing waited: tail %d, local_from %d, uploaded %d, checkpoint %d, most %d", store_tail(&x.store), x.remote.local_from, x.remote.uploaded, x.store.checkpoint, x.remote.local_most)
+}
+
+// A host whose cache has turned over but kept the trees' tops asks R2 for nothing as it wakes: the head of the latest
+// pack it asks for is its branches, and it has them.
+@(test)
+review_cold_wake_asks_nothing :: proc(t: ^testing.T) {
+	keeps :: proc(data: rawptr, kind: Cached, key: u64, bytes: []byte) {
+		h := (^Model_Host)(data)
+		if old, ok := h.cache[kind][key]; ok {
+			delete(old)
+		}
+		h.cache[kind][key] = slice.clone(bytes)
+	}
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	x.remote.host.cache_put = keeps
+	for store_work(&x.store) {}
+	for i in u64(0) ..< 1500 {
+		review_commit(&x.store, {review_cell(i + 1, DATA, 100 + i, {byte(i)})})
+	}
+	x.remote.want_checkpoint = true
+	remote_store_settle(t, &x)
+	testing.expectf(t, x.remote.kept_pages > PAGE_RUN, "a pack of %d pages", x.remote.kept_pages)
+	remote_store_close(&x)
+	for kind in ([?]Cached{.Page, .Log}) {
+		for _, b in x.host.cache[kind] {
+			delete(b)
+		}
+		clear(&x.host.cache[kind])
+	}
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	remote_ops(&x.remote)
+	testing.expectf(t, x.remote.stats.gets == 0, "%d gets as it woke, its tops at hand", x.remote.stats.gets)
+}
+
+// What the host kept of a pack, or an extent, being deleted when it died is let go of when it wakes, as at the commit
+// that would have: dead tops do not stay among the tops for ever.
+@(test)
+review_dead_tops_go_on_waking :: proc(t: ^testing.T) {
+	keeps :: proc(data: rawptr, kind: Cached, key: u64, bytes: []byte) {
+		h := (^Model_Host)(data)
+		if old, ok := h.cache[kind][key]; ok {
+			delete(old)
+		}
+		h.cache[kind][key] = slice.clone(bytes)
+	}
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	x.remote.host.cache_put = keeps
+	for store_work(&x.store) {}
+	for i in u64(0) ..< 200 {
+		review_commit(&x.store, {review_cell(i + 1, DATA, 100 + i, {byte(i)})})
+	}
+	x.remote.want_checkpoint = true
+	remote_store_settle(t, &x)
+	pack1 := x.remote.kept_gen
+	for i in u64(0) ..< 200 {
+		review_commit(&x.store, {review_cell(i + 1, DATA, 900 + i, {byte(i + 1)})})
+	}
+	x.remote.want_checkpoint = true
+	for _ in 0 ..< 10 {
+		if x.remote.inflight != nil {
+			break
+		}
+		remote_work(&x.remote)
+		remote_ops(&x.remote)
+		review_answer_all(&x, .Get_Pages, true)
+	}
+	// It dies after the manifest is written, before what it superseded is let go of here.
+	drop := x.remote.host.cache_drop
+	x.remote.host.cache_drop = proc(_: rawptr, _: Cached, _, _: u64) {}
+	review_answer_all(&x, .Put_Pack, true)
+	x.remote.host.cache_drop = drop
+	remote_store_close(&x)
+	for op in x.host.ops {
+		model_free(op)
+	}
+	clear(&x.host.ops)
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	remote_store_settle(t, &x)
+	left := 0
+	for kind in ([?]Cached{.Page, .Top}) {
+		for k, b in x.host.cache[kind] {
+			if k >> PACK_SHIFT == pack1 {
+				left += len(b) / PAGE_SIZE
+			}
+		}
+	}
+	testing.expectf(t, left == 0, "%d pages of dead pack %d still kept", left, pack1)
 }

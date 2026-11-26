@@ -237,9 +237,16 @@ remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_bu
 		append(&r.deletes, Remote_Object{g, true})
 		remote_redelete(r, {g, true})
 	}
-	// What was being deleted is deleted, and again later, should a put that was under way land after.
+	// What was being deleted is deleted, and again later, should a put that was under way land after; and whatever the
+	// host kept of it goes, as it would have at the commit that named it, had the host lived to.
 	for d in r.deletes {
 		remote_redelete(r, d)
+		if d.pack {
+			host.cache_drop(host.data, .Page, d.number << PACK_SHIFT, (d.number + 1) << PACK_SHIFT)
+			host.cache_drop(host.data, .Top, d.number << PACK_SHIFT, (d.number + 1) << PACK_SHIFT)
+		} else {
+			host.cache_drop(host.data, .Log, d.number * EXTENT, (d.number + 1) * EXTENT)
+		}
 	}
 	if len(r.deletes) > 0 {
 		remote_delete(r, r.deletes[:])
@@ -250,12 +257,20 @@ remote_open :: proc(r: ^Remote, host: Remote_Host, page_budget := 4096, block_bu
 	}
 	// The latest pack begins with the branches it changed, the roots of every tree among them: asked for at once, they
 	// are at hand in one read, rather than a read a level as each tree is first gone down. Unless the host has them.
+	// Branches come first in a pack: where the first run is at hand, and its last page is no branch, there are none past it.
 	if r.kept_gen > 0 {
-		for run in Page_No(0) ..< min(2, (r.kept_pages + PAGE_RUN - 1) / PAGE_RUN) {
-			no := r.kept_gen << PACK_SHIFT | run * PAGE_RUN
-			probe: Page
-			if !remote_cached(r, no, &probe) {
-				r.want_pages[no] = {}
+		first := r.kept_gen << PACK_SHIFT
+		probe: Page
+		have := remote_cached(r, first, &probe)
+		if !have {
+			r.want_pages[first] = {}
+		}
+		if r.kept_pages > PAGE_RUN {
+			bytes := ([^]byte)(&probe)[:size_of(Page)]
+			last := first + PAGE_RUN - 1
+			branches_on := !have || (host.cache_get(host.data, .Top, last, bytes) && page_sound(&probe, last) && probe.level > 0)
+			if branches_on && !remote_cached(r, first + PAGE_RUN, &probe) {
+				r.want_pages[first + PAGE_RUN] = {}
 			}
 		}
 	}
@@ -791,7 +806,10 @@ remote_work :: proc(r: ^Remote) -> (waiting: bool) {
 	// Writing waits for the host's storage to hold less of the log: a checkpoint lets it go, once object storage has it.
 	// And where the host has little room, writing that goes on is checkpointed often enough that it need seldom wait.
 	tail := store_tail(s)
-	if r.local_most > 0 && !s.replaying && tail - s.checkpoint > max(r.quiet_tail, (r.local_most - min(r.local_most, r.local_keep)) / 2) {
+	// That is, once it holds half the room it has past what it keeps, and a checkpoint would let some of it go: what object
+	// storage has, as soon as it has it.
+	if r.local_most > 0 && !s.replaying && tail - r.local_from > (r.local_most - min(r.local_most, r.local_keep)) / 2 &&
+	   min(r.uploaded, tail - min(tail, r.local_keep)) > r.local_from {
 		r.want_checkpoint = true
 	}
 	if remote_full(r) && min(r.uploaded, tail - min(tail, r.local_keep)) > r.local_from {
