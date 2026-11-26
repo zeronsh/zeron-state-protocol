@@ -26,7 +26,7 @@ EMPTY_PAGE: Page
 Step :: struct {
 	active:  bool, // this began the step; else an enclosing one decides
 	missed:  int, // reads answered "not yet" before it began
-	roots:   [5]Page_No,
+	roots:   [6]Page_No,
 	next:    Page_No,
 	pending: int,
 	clock:   u64,
@@ -61,7 +61,10 @@ store_begin :: proc(s: ^Store) -> (t: Step) {
 	}
 	t.active = true
 	s.step_missed = t.missed
-	t.roots = {s.shelf.root, s.cells.root, s.waste.root, s.outbox.root, s.repair.root}
+	t.roots = {s.shelf.root, s.cells.root, s.waste.root, s.outbox.root, s.repair.root, 0}
+	if s.remote != nil {
+		t.roots[5] = s.remote.packs.root
+	}
 	t.next = s.next
 	t.pending = len(s.pending)
 	t.clock, t.forgot = s.clock, s.forgot
@@ -111,6 +114,9 @@ store_end :: proc(s: ^Store, t: ^Step, keep: bool) {
 	clear(&p.fresh)
 	clear(&p.retired)
 	s.shelf.root, s.cells.root, s.waste.root, s.outbox.root, s.repair.root = t.roots[0], t.roots[1], t.roots[2], t.roots[3], t.roots[4]
+	if s.remote != nil {
+		s.remote.packs.root = t.roots[5]
+	}
 	p.next = t.next
 	resize(&p.pending, t.pending)
 	s.clock, s.forgot = t.clock, t.forgot
@@ -620,4 +626,6 @@ replay_steps :: proc(s: ^Store) -> (waiting: bool) {
 	s.replaying = false
 	return false
 }
+
+
 

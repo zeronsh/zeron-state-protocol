@@ -19,6 +19,7 @@ Model_Host :: struct {
 	zombies:  [dynamic]Zombie, // under way when it crashed, and perhaps landing yet
 	clock:    u64, // milliseconds
 	fail:     int, // one in this many operations fails
+	stingy:   bool, // its cache seldom keeps anything
 	// What it cost.
 	rows:     int, // writes to its own storage
 	class_a:  int,
@@ -103,7 +104,7 @@ model_host :: proc(h: ^Model_Host) -> Remote_Host {
 		},
 		cache_put = proc(data: rawptr, kind: Cached, key: u64, bytes: []byte) {
 			h := (^Model_Host)(data)
-			if rand.int_max(4) == 0 {
+			if rand.int_max(4) < (3 if h.stingy else 1) {
 				return // it would rather not
 			}
 			h.rows += 1
@@ -468,8 +469,10 @@ remote_store_matches_quick :: proc(t: ^testing.T) {
 		context.random_generator = rand.default_random_generator(&state)
 		x: Remote_Store
 		x.host.fail = 0 if seed == 0 else 5
+		x.host.stingy = seed % 2 == 1
+		budget := 8 if x.host.stingy else 64
 		defer model_host_destroy(&x.host)
-		remote_store_open(t, &x)
+		remote_store_open(t, &x, budget, budget / 8 + 1)
 		remote_store_settle(t, &x)
 		batches := make([dynamic][]Cell)
 		defer {
@@ -492,7 +495,7 @@ remote_store_matches_quick :: proc(t: ^testing.T) {
 			}
 			return census(&q)
 		}
-		crashes, checkpoints := 0, 0
+		crashes, checkpoints, relocated := 0, 0, 0
 		for round in 0 ..< 600 {
 			context.user_index = seed * 1000 + round
 			cells := make([]Cell, 1 + rand.int_max(8))
@@ -528,8 +531,9 @@ remote_store_matches_quick :: proc(t: ^testing.T) {
 				}
 				model_crash(&x.host)
 				checkpoints += x.remote.stats.checkpoints
+				relocated += x.remote.stats.relocated
 				remote_store_close(&x)
-				remote_store_open(t, &x)
+				remote_store_open(t, &x, budget, budget / 8 + 1)
 				if rand.int_max(2) == 0 {
 					remote_store_settle(t, &x)
 				} else {
@@ -618,7 +622,81 @@ remote_store_matches_quick :: proc(t: ^testing.T) {
 			testing.expectf(t, Remote_Object{g, true} in x.host.objects, "seed %d: pack %d is named and gone", seed, g)
 		}
 		checkpoints += x.remote.stats.checkpoints
+		relocated += x.remote.stats.relocated
+		// What object storage holds is not much more than what lives: what is superseded is soon deleted.
+		stored, reached := 0, 0
+		for o, b in x.host.objects {
+			if o.pack {
+				stored += len(b) / PAGE_SIZE
+			}
+		}
+		remote_store_step(t, &x, &reached, proc(s: ^Store, data: rawptr) {
+			n := (^int)(data)
+			n^ = 0
+			walk :: proc(s: ^Store, no: Page_No, n: ^int) {
+				n^ += 1
+				pg := page(s, no)
+				if pg.level > 0 {
+					for e in pg.branch[:pg.count] {
+						walk(s, e.child, n)
+					}
+				}
+			}
+			for t in ([]Tree{s.shelf, s.cells, s.waste, s.outbox, s.repair, s.remote.packs}) {
+				if t.root != 0 {
+					walk(s, t.root, n)
+				}
+			}
+		})
+		testing.expectf(t, stored <= 3 * reached + 64, "seed %d: %d pages stored for %d that live", seed, stored, reached)
 		testing.expectf(t, crashes > 0 && checkpoints > 10, "seed %d: %d crashes, %d checkpoints", seed, crashes, checkpoints)
 		remote_store_close(&x)
 	}
+}
+
+// A step undone puts back every root it changed, the remote's packs tree among them.
+@(test)
+remote_step_undone_puts_back_packs :: proc(t: ^testing.T) {
+	state := seeded(42)
+	context.random_generator = rand.default_random_generator(&state)
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	remote_store_open(t, &x)
+	defer remote_store_close(&x)
+	for _ in 0 ..< 50 {
+		cells: [4]Cell
+		for &c in cells {
+			c = random_cell(200, 1_000_000)
+		}
+		remote_store_step(t, &x, &cells, proc(s: ^Store, data: rawptr) {
+			store_commit(s, (^[4]Cell)(data)[:])
+		})
+		free_all(context.temp_allocator)
+	}
+	x.remote.want_checkpoint = true
+	remote_store_settle(t, &x)
+	testing.expect(t, x.remote.packs.root != 0 && x.remote.packs.root < TEMP_PAGES)
+	// Nothing at hand: the next read misses.
+	for _, c in x.remote.pages {
+		free(c.pg)
+	}
+	clear(&x.remote.pages)
+	for kind in Cached {
+		for _, b in x.host.cache[kind] {
+			delete(b)
+		}
+		clear(&x.host.cache[kind])
+	}
+	s := &x.store
+	before := x.remote.packs.root
+	cells := s.cells.root
+	st := store_begin(s)
+	tree_put(s, &x.remote.packs, {0, 0, 0, 0, 1 << 40}, {1, 1})
+	testing.expect(t, x.remote.packs.root != before)
+	_, _ = tree_get(s, s.cells, KEY_MIN)
+	testing.expect(t, store_missed(s, &st))
+	store_end(s, &st, false)
+	testing.expect_value(t, x.remote.packs.root, before)
+	testing.expect_value(t, s.cells.root, cells)
+	remote_store_settle(t, &x)
 }

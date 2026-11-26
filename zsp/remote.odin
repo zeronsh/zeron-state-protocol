@@ -178,6 +178,7 @@ Remote :: struct {
 	uploading:     u32, // the op putting an extent
 	upload_to:     u64, // where uploaded will be once it is done
 	gc:            Pack_GC,
+	gc_after:      u64, // no pack is chosen to be emptied until the one after this is durable
 }
 
 // Opens the remote side: what the manifest says, before store_open.
@@ -516,8 +517,9 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 		r.stats.got += u64(len(bytes))
 		if got > 0 {
 			r.host.cache_put(r.host.data, .Page, first, bytes[:got * PAGE_SIZE])
-		} else if absent && s != nil {
-			// A page that is named and not there: the store cannot be read.
+		} else if absent && s != nil && !remote_deleted(r, {op.number, true}) {
+			// A page that is named and not there: the store cannot be read. (Of a pack deleted since it was asked for,
+			// it is no longer named: whatever asked for it will ask for something else.)
 			s.failed = true
 		}
 	case .Get_Log:
@@ -964,6 +966,20 @@ remote_commit :: proc(r: ^Remote) {
 	}
 }
 
+// Whether something was deleted lately: named to be deleted, or to be deleted again.
+@(private)
+remote_deleted :: proc(r: ^Remote, o: Remote_Object) -> bool {
+	if slice.contains(r.deletes[:], o) {
+		return true
+	}
+	for d in r.redelete {
+		if d.object == o {
+			return true
+		}
+	}
+	return false
+}
+
 @(private)
 remote_redelete :: proc(r: ^Remote, o: Remote_Object) {
 	for d in r.redelete {
@@ -1051,8 +1067,8 @@ remote_gc_steps :: proc(r: ^Remote) -> (waiting: bool) {
 	s := r.store
 	g := &r.gc
 	if !g.active {
-		if r.inflight != nil || len(s.dirty) > CHECKPOINT_DIRTY / 2 {
-			return false // when there is room in the next checkpoint
+		if r.inflight != nil || len(s.dirty) > CHECKPOINT_DIRTY / 2 || r.kept_gen < r.gc_after {
+			return false // when there is room in the next checkpoint, and what was last copied on is durable
 		}
 		t := store_begin(s)
 		gen, total, found := remote_gc_victim(r)
@@ -1103,6 +1119,10 @@ remote_gc_steps :: proc(r: ^Remote) -> (waiting: bool) {
 	}
 	delete(g.hints)
 	g^ = {}
+	// What was copied on goes into the next checkpoint, which is then due; and until it is durable the books are not
+	// yet what they will be, so nothing else is chosen.
+	r.want_checkpoint = true
+	r.gc_after = r.next_gen
 	return false
 }
 
