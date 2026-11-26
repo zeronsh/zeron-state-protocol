@@ -921,6 +921,9 @@ govern :: proc "c" (op: Govern, size: int) -> int {
 		}
 		result = int(id)
 	case .Admit:
+		if b[68] & ~transmute(u8)zsp.RIGHTS_ALL != 0 {
+			return NO_SUCH // a right nobody knows: the roster would be none
+		}
 		rights := transmute(zsp.Rights)b[68] + {.Read}
 		zsp.draft_grant(&d, key(b, 0), key(b, 32), zsp.Scope(u32le(b, 64)), rights)
 	case .Revoke:
