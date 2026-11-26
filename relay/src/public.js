@@ -108,6 +108,7 @@ export class Call {
   }
 
   end() {
+    if (this.fault !== null || this.endedOut) return; // cancelled, or said: nothing more of it
     this.endedOut = true;
     this.pipe.say(this.id, 1);
   }
@@ -338,7 +339,10 @@ async function socket(request, url, call) {
   server.addEventListener("close", (e) => {
     if (closed) return;
     closed = true;
-    say(8, cat(new Uint8Array([(e.code ?? 1000) >> 8, (e.code ?? 1000) & 255]), enc.encode(e.reason ?? "")));
+    // A status only if it is one a Close frame may carry: else none, as for one that said none (1005) or vanished (1006).
+    const code = e.code;
+    const sayable = code >= 1000 && code <= 1014 && code !== 1004 && code !== 1005 && code !== 1006 || code >= 3000 && code <= 4999;
+    say(8, sayable ? cat(new Uint8Array([code >> 8, code & 255]), enc.encode(e.reason ?? "")) : new Uint8Array(0));
     chain.then(() => call.end());
   });
   (async () => {
