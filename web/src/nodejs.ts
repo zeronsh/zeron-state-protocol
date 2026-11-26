@@ -3,6 +3,7 @@
 import { Client } from "./client.ts";
 import type { Device, Relay } from "./index.ts";
 import { Node, type NodeOptions, type Rights } from "./node.ts";
+import { nodeDatagrams, type UdpOptions } from "./udp-node.ts";
 import { NodeVolume } from "./volume-node.ts";
 import { loadModule } from "./wasm.ts";
 
@@ -11,9 +12,11 @@ export { Node } from "./node.ts";
 export { NodeVolume } from "./volume-node.ts";
 export { MemoryVolume } from "./volume.ts";
 
-export interface OpenOptions extends Partial<Omit<NodeOptions, "module" | "volume">> {
+export interface OpenOptions extends Partial<Omit<NodeOptions, "module" | "volume" | "datagrams">> {
   /** The directory it keeps what it holds in. */
   dir: string;
+  /** Links straight to other devices, over UDP, on this port or any; or none, and everything through relays. */
+  udp?: UdpOptions | false;
 }
 
 let compiled: Promise<WebAssembly.Module> | undefined;
@@ -21,7 +24,8 @@ let compiled: Promise<WebAssembly.Module> | undefined;
 /** Opens the device kept in a directory, making it if there is none. */
 export async function open(options: OpenOptions): Promise<Device & { readonly node: Node }> {
   compiled ??= loadModule();
-  const node = await Node.open({ ...options, volume: new NodeVolume(options.dir), module: await compiled });
+  const datagrams = options.udp === false ? undefined : await nodeDatagrams(options.udp ?? {});
+  const node = await Node.open({ ...options, volume: new NodeVolume(options.dir), module: await compiled, datagrams });
   return {
     node,
     id: node.id,

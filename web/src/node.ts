@@ -22,6 +22,20 @@ export type Connect = (receive: (data: Uint8Array) => void, closed: () => void) 
 
 export type Level = "debug" | "info" | "warning" | "error";
 
+/** UDP, where the platform has it, as Node does and a browser does not: for direct links between devices. */
+export interface Datagrams {
+  /** The port it is bound to. */
+  readonly port: number;
+  /** A STUN server, by which to learn this machine's outside address. */
+  readonly stun?: { ip: Uint8Array; port: number };
+  /** Every packet that comes, from an address as 16 bytes, IPv4 mapped, and a port. */
+  listen(receive: (ip: Uint8Array, port: number, data: Uint8Array) => void): void;
+  send(ip: Uint8Array, port: number, data: Uint8Array): void;
+  /** This machine's addresses, each with its network's broadcast address if it is IPv4. */
+  interfaces(): { ip: Uint8Array; broadcast?: Uint8Array }[];
+  close(): void;
+}
+
 export interface NodeOptions {
   /** Where it keeps what it holds. */
   volume: Volume;
@@ -38,6 +52,8 @@ export interface NodeOptions {
    * networks that forget sooner.
    */
   keepalive?: { idle: number; wait: number };
+  /** UDP, for links straight to other devices; without it, everything goes through relays. */
+  datagrams?: Datagrams;
   log?: (level: Level, text: string) => void;
 }
 
@@ -62,6 +78,9 @@ interface Exports {
   create(): number;
   govern(op: number, size: number): number;
   members(): number;
+  links_open(port: number, size: number): void;
+  links_announce(): void;
+  packet(size: number): void;
 }
 
 /** What a device may be granted in a scope, beyond reading, which every grant includes. */
@@ -412,6 +431,7 @@ export class Node {
     }
     this.#conns.clear();
     this.#wasm?.stop();
+    this.#options.datagrams?.close();
     await this.store.close();
   }
 
@@ -468,6 +488,13 @@ export class Node {
         if (c?.kind === "socket") c.ws.close();
         else if (c?.kind === "client" && c.open) (c.open = false), this.#deliveries.push([c, new Uint8Array(0)]);
       },
+      udp_send: (ip: number, port: number, ptr: number, len: number) => this.#options.datagrams?.send(view(ip, 16).slice(), port, view(ptr, len).slice()),
+      udp_interfaces: (into: number, most: number) => {
+        const list = (this.#options.datagrams?.interfaces() ?? []).slice(0, most);
+        const b = view(into, 20 * list.length);
+        list.forEach((i, k) => (b.set(i.ip, 20 * k), b.fill(0, 20 * k + 16, 20 * k + 20), i.broadcast && b.set(i.broadcast, 20 * k + 16)));
+        return list.length;
+      },
       say: (level: number, ptr: number, len: number) => log(LEVELS[Math.min(4, Math.floor(level / 10))], decoder.decode(view(ptr, len))),
     };
     const odin_env = {
@@ -502,6 +529,28 @@ export class Node {
     }
     if (!wasm.start(this.#options.full === false ? 0 : 1)) throw new Error("could not open the store");
     this.#space = hex(space.subarray(0, 32));
+    const udp = this.#options.datagrams;
+    if (udp) {
+      udp.listen((ip, port, data) => {
+        if (this.#stopped) return;
+        const b = this.#bytes(wasm.buffer(18 + data.length), 18 + data.length);
+        b.set(ip);
+        b[16] = port >> 8;
+        b[17] = port & 255;
+        b.set(data, 18);
+        wasm.packet(18 + data.length);
+        this.#kick();
+      });
+      const stun = udp.stun;
+      const at = wasm.buffer(stun ? 18 : 0);
+      if (stun) {
+        const b = this.#bytes(at, 18);
+        b.set(stun.ip);
+        b[16] = stun.port >> 8;
+        b[17] = stun.port & 255;
+      }
+      wasm.links_open(udp.port, stun ? 18 : 0);
+    }
     if (space.length > 64) {
       const relay = space.subarray(32);
       this.#bytes(wasm.buffer(relay.length), relay.length).set(relay);

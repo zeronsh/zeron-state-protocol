@@ -5,7 +5,8 @@
 import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
-import { Client } from "../src/client.ts";
+import { readFileSync } from "node:fs";
+import { Client, columns } from "../src/client.ts";
 import type { Connect, Wire } from "../src/node.ts";
 import { open } from "../src/nodejs.ts";
 import { live } from "./live.ts";
@@ -85,7 +86,70 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
   return { a: clients[0], b: clients[1], breakPipes: () => pipes.break(), close: () => Promise.all(closers.map((f) => f())) };
 }
 
+// Rows of a list, as a zspd device's client sees them.
+function watched(client: Client, list: string): () => number {
+  let rows = 0;
+  client.window({ scope: 1, list, table: {}, size: 1000 }, (st) => (rows = st.rows.length));
+  return () => rows;
+}
+
 const tests: Record<string, () => Promise<void>> = {
+  // Introduced by a relay, a web device and a zspd device link directly, and need it no more.
+  async web_links() {
+    const relay = await node("serve", join(TMP, "l-relay"));
+    const owner = join(TMP, "l-owner");
+    const sid = zspd("create", owner);
+    zspd("relay", owner, relay.key, relay.url);
+    let linked = false;
+    const d = await open({ dir: join(TMP, "l-web"), log: (_, text) => (linked ||= text === "linked directly") });
+    zspd("admit", owner, d.key, "1");
+    const o = await node("run", owner, "--udp=0");
+    await d.join(sid, relay);
+    const ca = new Client({ connect: d.connect });
+    const cb = new Client({ connect: zspdConnect(o.address), credential: token(owner) });
+    await eventually("both may write", () => ca.may(1, "write") && cb.may(1, "write"));
+    const seen = watched(cb, "x");
+    await ca.write(1, (change) => change.insert({}, "x", 0, {}));
+    await eventually("they link directly", () => linked, 15000);
+    await new Promise((done) => setTimeout(done, 300));
+    relay.p.kill(); // and nothing is missed
+    for (let i = 1; i <= 50; i++) void ca.write(1, (change) => change.insert({ v: columns.bytes(16) }, "x", i, { v: crypto.getRandomValues(new Uint8Array(2000)) }));
+    await eventually("what is written arrives, with no relay", () => seen() === 51);
+    // And live text goes the same way.
+    let body = "";
+    const Note = { body: columns.text(17) };
+    let id = "";
+    await ca.write(1, (change) => (id = change.insert(Note, "notes", 1, {})));
+    cb.window({ scope: 1, list: "notes", table: Note }, (st) => (body = st.rows[0]?.body ?? ""));
+    await new Promise((done) => setTimeout(done, 200));
+    const editor = ca.text(id, Note.body);
+    editor.append("direct");
+    await eventually("live text arrives directly", () => body === "direct");
+    editor.close();
+    ca.close();
+    cb.close();
+    await d.close();
+  },
+  // On one network, with no relay at all: a web device and a zspd device hear each other's beacons.
+  async web_lan() {
+    const owner = join(TMP, "n-owner");
+    const sid = zspd("create", owner);
+    let linked = false;
+    const d = await open({ dir: join(TMP, "n-web"), log: (_, text) => (linked ||= text === "linked directly") });
+    zspd("admit", owner, d.key, "1");
+    if (!(await d.adopt(readFileSync(join(owner, sid, "roster"))))) throw new Error("the roster was not taken");
+    const o = await node("run", owner, "--udp=0");
+    const ca = new Client({ connect: d.connect });
+    const cb = new Client({ connect: zspdConnect(o.address), credential: token(owner) });
+    await eventually("both may write", () => ca.may(1, "write") && cb.may(1, "write"));
+    const seen = watched(ca, "x");
+    await eventually("beacons meet", () => linked, 15000);
+    await cb.write(1, (change) => change.insert({}, "x", 1, {}));
+    await eventually("no servers", () => seen() === 1);
+    ca.close();
+    cb.close();
+    await d.close();
+  },
   // A web device makes the space and governs it: zspd devices are admitted to it as to any other.
   async web_governs() {
     const relay = await node("serve", join(TMP, "g-relay"));

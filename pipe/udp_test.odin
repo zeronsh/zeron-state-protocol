@@ -1,3 +1,4 @@
+#+build !js
 package pipe
 
 import "core:container/priority_queue"

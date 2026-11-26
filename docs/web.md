@@ -69,11 +69,13 @@ answers with `pong`, and the Durable Object answers without waking (SPEC.md §7)
 **A device governs its space as zspd does.** `create`, `scope`, `admit`, `revoke`, `subject`, `admin`, `owner` and `relay` sign a new
 roster, adopt it and say it to everyone.
 
-## What it does not do
+## Links
 
-A browser has no UDP, so it makes no direct links (§14): everything it says goes through a relay. Neither does a device in Node,
-yet, though Node has UDP. A browser could link to another browser by WebRTC, which would need a kind of signal and of link the
-protocol does not have; zspd devices could not take part.
+In Node, a device links straight to others over UDP, as zspd does (SPEC.md §14): those that share a relay swap addresses through
+it and knock on each other's doors at once; those on one network hear each other's beacons and need no relay at all. `open({ dir,
+udp: false })` makes none, and `udp: { port, stun }` says where. A browser has no UDP, so everything a browser's device says goes
+through a relay. Browsers could link to each other by WebRTC, but that would need a kind of signal and of link the protocol does not
+have, and zspd devices could not take part.
 
 ## Working on it
 
@@ -87,7 +89,7 @@ builds `web/dist` (zsp.js, worker.js and node.wasm, side by side: each finds the
 | `test/mirror_model.ts` | structured state to its model, as `luau/tests/mirror_model.luau` |
 | `test/store.ts` | what is said to be durable, through crashes at any moment, small segments, and files that open late |
 | `test/node.ts` | a device on its own |
-| `test/end_to_end.ts` | `test/live.ts`, which is `luau/tests/live.luau`, over every way devices meet: the client of zspd; web devices with zspd devices through zspd's relay and the Durable Object; two web devices; a space a web device governs; keepalive |
+| `test/end_to_end.ts` | `test/live.ts`, which is `luau/tests/live.luau`, over every way devices meet: the client of zspd; web devices with zspd devices through zspd's relay and the Durable Object; two web devices; a space a web device governs; keepalive; direct links, and beacons with no relay |
 | `test/browsers.ts` | headless Chrome: the live suite against a zspd device and between browser devices through the Durable Object; tabs sharing a device and handing it on; a device the same after a restart, with no relay |
 
 Chrome is found where the platform keeps it, or at `$CHROME`; without it, `test/browsers.ts` says so and passes, but in CI it fails.
