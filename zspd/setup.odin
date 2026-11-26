@@ -79,6 +79,10 @@ setup :: proc(args: []string) -> int {
 			return usage()
 		}
 	}
+	if int(s.loopback[1]) + (s.devices + 1) / 256 > 255 {
+		say(os.stderr, "so many devices have no addresses past 127.", fmt.tprint(s.loopback[0]), ".255.255: fewer, or a lower --loopback\n")
+		return 2
+	}
 	s.dns = {net.IP4_Address{127, s.loopback[0], s.loopback[1], 1}, DNS_PORT}
 	if dns != "" {
 		ep, ok := net.parse_endpoint(dns)

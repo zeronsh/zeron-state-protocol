@@ -1104,6 +1104,9 @@ def test_names_over_ipv6():
         for flag in ("--catch=127.0.0.1:0", "--dns=127.0.0.1:0"):
             assert subprocess.run([BIN, "setup", "--dry-run", flag], capture_output=True).returncode != 0, flag
         assert subprocess.run([BIN, "setup", "--dry-run", "--names=tunnel.example.id"], capture_output=True).returncode == 0
+        # As many addresses as there are devices, all within 127.a.b.2 to 127.a.255.255.
+        assert subprocess.run([BIN, "setup", "--dry-run", "--loopback=127.77.255", "--devices=600"], capture_output=True).returncode != 0
+        assert subprocess.run([BIN, "setup", "--dry-run", "--loopback=127.77.254", "--devices=300"], capture_output=True).returncode == 0
 
 
 def test_services_by_scope():
