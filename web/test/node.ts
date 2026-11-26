@@ -113,6 +113,36 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   client.close();
 }
 
+// And it says so at once, though files are still being opened, which a full disk may keep from ever being done: it lets
+// go of what it has open, and what is opened after is let go of as it comes.
+{
+  let failing = false;
+  class Failing extends MemoryVolume {
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f || !/^(keys|roster)\./.test(name)) return f;
+      const write = f.write.bind(f);
+      f.write = (b, at) => {
+        if (failing) throw new Error("the disk is full");
+        return write(b, at);
+      };
+      return f;
+    }
+  }
+  const volume = new Failing({ slow: true });
+  const settling = setInterval(() => volume.settle(), 1);
+  const node = await Node.open({ volume, module, log: () => {} });
+  let failure: Error | undefined;
+  node.onFailure = (e) => (failure = e);
+  node.create(); // which writes, and so opens segments ahead, in the volume's own time
+  while (volume.waiting === 0) await new Promise((done) => setTimeout(done, 1));
+  clearInterval(settling); // and now nothing more is opened
+  failing = true;
+  assert.throws(() => node.scope(true), /storage has failed/);
+  await new Promise((done) => setTimeout(done, 100));
+  assert(failure, "it waited for files being opened to say it had stopped");
+}
+
 // Closed twice, it is closed once, and the second waits for the first: for what is being opened to be, and its files to be
 // let go of.
 {

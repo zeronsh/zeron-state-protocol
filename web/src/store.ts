@@ -454,6 +454,23 @@ export class Store {
     this.#closed = true;
   }
 
+  /**
+   * Closes every file it has open now, making nothing more durable, for storage has failed: what is being opened is
+   * closed as it comes, and so is waited for by nothing, which a full disk may keep from ever being done.
+   */
+  letGo(): void {
+    this.#abandoned = true;
+    this.#closed = true;
+    for (const f of this.#segments.values()) f.close();
+    this.#segments.clear();
+    for (const [a, b] of this.#kept.values()) a.file.close(), b.file.close();
+    this.#kept.clear();
+    this.#tree.close();
+    this.#find.close();
+    this.#journal.close();
+    this.volume.close?.();
+  }
+
   /** Closes every file, once whatever was being opened or removed is done. */
   async close(): Promise<void> {
     this.#closed = true;

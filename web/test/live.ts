@@ -189,7 +189,8 @@ export async function live({ a, b, breakPipes, say = console.log }: Sides): Prom
   check(held(b).windows.size > 0, "a window lingers");
   await sleep(300);
   check(held(b).windows.size === 0 && held(b).pages.size === 0, "and then is let go");
-  check(held(b).rows.size <= 1, `${held(b).rows.size} rows linger`);
+  // And so are its rows, but for what is still to be acknowledged, which a busy machine may take its time over.
+  await eventually("its rows are let go", () => held(b).rows.size <= 1);
 }
 
 // Questions, asked of one device about what another writes.

@@ -61,6 +61,11 @@ export class MemoryVolume implements Volume {
     this.#files.delete(name);
   }
 
+  /** How many are waiting to be opened or removed. */
+  get waiting(): number {
+    return this.#waiting.length;
+  }
+
   /** Lets whatever is waiting to be opened or removed be. */
   settle(): void {
     for (const done of this.#waiting.splice(0)) done();

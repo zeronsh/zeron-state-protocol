@@ -444,6 +444,11 @@ export class Node {
   }
 
   async #close(): Promise<void> {
+    this.#stop();
+    await this.store.close();
+  }
+
+  #stop(): void {
     this.#stopped = true;
     clearTimeout(this.#timer);
     clearTimeout(this.#draining);
@@ -454,7 +459,6 @@ export class Node {
     this.#conns.clear();
     this.#wasm?.stop();
     this.#options.datagrams?.close();
-    await this.store.close();
   }
 
   // ---------------------------------------------------------------- the module
@@ -703,11 +707,16 @@ export class Node {
     setTimeout(() => this.#tick(), 0);
   }
 
-  // Said once its files are let go of, so that whoever is told may open them.
+  // Said once its files are let go of, so that whoever is told may open them; at once, for nothing more is made durable,
+  // and so nothing being opened is waited for.
   #fail(error: Error): void {
     if (this.#failure) return;
     this.#failure = error;
-    const tell = () => this.onFailure?.(error);
-    this.close().then(tell, tell);
+    if (!this.#closing) {
+      this.#stop();
+      this.store.letGo();
+      this.#closing = Promise.resolve();
+    }
+    this.onFailure?.(error);
   }
 }
