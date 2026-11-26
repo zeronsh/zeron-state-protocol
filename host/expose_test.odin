@@ -226,3 +226,37 @@ watch_closed_with_its_space :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
 }
+
+// A space closes while a refused connection's reply is still being drained: the connection is let go with it, not
+// waited on for ever.
+@(test)
+bridges_close_lets_go_of_the_refused :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	ts: Test_Space
+	test_space(t, &ts)
+	defer test_space_destroy(&ts)
+	ln, lerr := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, lerr == nil)
+	defer net.close(ln)
+	at, _ := net.bound_endpoint(ln)
+	client, cerr := net.dial_tcp(at)
+	testing.expect(t, cerr == nil)
+	defer net.close(client)
+	accepted, _, aerr := net.accept_tcp(ln)
+	testing.expect(t, aerr == nil)
+	f := bridge(&ts.space, 0, accepted)
+	testing.expect(t, f != nil)
+	if f == nil {
+		return
+	}
+	forward_reject(f, transmute([]byte)string("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"))
+	buf: [256]byte
+	n, _ := net.recv_tcp(client, buf[:]) // the reply is read, and the client stays: the refused is drained
+	testing.expect(t, n > 0)
+	testing.expect_value(t, len(ts.space.bridges), 1)
+	bridges_close(&ts.space) // as space_close does
+	testing.expect_value(t, len(ts.space.bridges), 0)
+	n, _ = net.recv_tcp(client, buf[:])
+	testing.expect_value(t, n, 0) // and closed
+}

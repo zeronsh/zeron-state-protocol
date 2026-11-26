@@ -727,7 +727,11 @@ bridges_close :: proc(sp: ^Space) {
 	for len(sp.bridges) > 0 {
 		b := sp.bridges[len(sp.bridges) - 1]
 		b.call = 0
-		bridge_abort(b, .Lost)
+		if b.over {
+			bridge_finish(b) // refused, and its reply still drained: let go with the space, as nothing else will now
+		} else {
+			bridge_abort(b, .Lost)
+		}
 	}
 	delete(sp.bridges)
 }
