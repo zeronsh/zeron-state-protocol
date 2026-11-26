@@ -4,6 +4,9 @@ package pipe
 import "core:container/priority_queue"
 import "core:math/rand"
 import "core:encoding/endian"
+import "core:encoding/hex"
+import "core:os"
+import "core:strings"
 import "core:slice"
 import "core:testing"
 import "../zsp"
@@ -819,4 +822,34 @@ stream_carries_both_ways :: proc(t: ^testing.T) {
 		testing.expectf(t, string(got0) == string(sent[0][:]), "seed %d: %d of %d one way", seed, len(got0), len(sent[0]))
 		testing.expectf(t, string(got1) == string(sent[1][:]), "seed %d: %d of %d the other", seed, len(got1), len(sent[1]))
 	}
+}
+
+// The packet vectors.json gives opens, by its key and counter, to the frames it says.
+@(test)
+link_packet_as_vectors_say :: proc(t: ^testing.T) {
+	c: zsp.Channel
+	for &b, i in c.recv {
+		b = 60 + byte(i)
+	}
+	frames := [?]byte{3, 4, 0xe8, 0x07, 5, 'h', 'e', 'l', 'l', 'o', 1}
+	packet := make([]byte, 13 + len(frames) + zsp.TAG, context.temp_allocator)
+	packet[0] = byte(Type.Data)
+	endian.unchecked_put_u32le(packet[1:], 0xdecafbad)
+	endian.unchecked_put_u64le(packet[5:], 77)
+	copy(packet[13:], frames[:])
+	sealer := zsp.Channel{send = c.recv}
+	zsp.channel_seal_in_place(&sealer, 77, packet[13:], packet[:13])
+	plain, ok := zsp.channel_open_at(&c, 77, packet[13:], packet[:13])
+	testing.expect(t, ok && string(plain) == string(frames[:]))
+	// And it is what the vectors hold.
+	text, err := os.read_entire_file("vectors/vectors.json", context.temp_allocator)
+	if err != nil {
+		text, err = os.read_entire_file("../vectors/vectors.json", context.temp_allocator)
+	}
+	testing.expect(t, err == nil)
+	sealed := make([]byte, len(packet), context.temp_allocator)
+	copy(sealed, packet[:13])
+	copy(sealed[13:], frames[:])
+	zsp.channel_seal_in_place(&sealer, 77, sealed[13:], sealed[:13])
+	testing.expect(t, strings.contains(string(text), string(hex.encode(sealed, context.temp_allocator))))
 }

@@ -4,6 +4,8 @@ the file is current and that the other implementations agree with it.
 */
 package vectors
 
+import "core:crypto/sha2"
+import "core:encoding/endian"
 import "core:encoding/hex"
 import "core:fmt"
 import "core:math/rand"
@@ -29,6 +31,9 @@ main :: proc() {
 	lists()
 	handshake()
 	texts()
+	links()
+	files()
+	services()
 	fmt.println(`  "version": 1`)
 	fmt.println("}")
 }
@@ -275,6 +280,189 @@ texts :: proc() {
 			fmt.printf(`%s{{"kind": %d, "stamp": "%s", "body": "%s"}}`, ", " if i > 0 else "", int(c.kind), h(s[:]), h(c.body))
 		}
 		fmt.printfln(`], "text": "%s"}}%s`, string(w[:]), "," if doc + 1 < DOCS else "")
+	}
+	fmt.println("  ],")
+}
+
+// A link's data frames, each with what it encodes (§14), one sealed packet carrying them, and the header that begins a stream.
+links :: proc() {
+	Frame :: struct {
+		name:  string,
+		bytes: []byte,
+	}
+	f :: proc(parts: ..[]byte) -> []byte {
+		w: [dynamic]byte
+		for p in parts {
+			append(&w, ..p)
+		}
+		return w[:]
+	}
+	v :: proc(n: u64) -> []byte {
+		w: [dynamic]byte
+		zsp.write_varint(&w, n)
+		return w[:]
+	}
+	b :: proc(bytes: string) -> []byte {
+		w: [dynamic]byte
+		zsp.write_bytes(&w, transmute([]byte)bytes)
+		return w[:]
+	}
+	frames := []Frame {
+		{"ping", {1}},
+		// Packets 100 and 98…99 seen, 40 µs after 100 came; 97 not, nor 95…96 seen: gap 1, run 2, then the end.
+		{"ack 100, 98-99 behind a gap of none; then 95-96 after a gap of 1; delay 40", f({2}, v(100), v(40), v(3), v(1), v(2), v(0))},
+		{"stream 4 at 1000: hello", f({3}, v(4), v(1000), b("hello"))},
+		{"datagram: hi", f({4}, b("hi"))},
+		{"close", {5}},
+		{"fin 3 at 7: bye", f({6}, v(3), v(7), b("bye"))},
+		{"reset 4 at 4096", f({7}, v(4), v(4096))},
+		{"stop 5", f({8}, v(5))},
+		{"window 0 to 524288", f({9}, v(0), v(524288))},
+		{"limit 2097152, 300 streams", f({10}, v(2097152), v(300))},
+		{"header: urgency 1, after 300", f({1}, v(300))},
+	}
+	fmt.println(`  "link_frames": [`)
+	for fr, i in frames {
+		fmt.printfln(`    {{"frame": "%s", "bytes": "%s"}}%s`, fr.name, h(fr.bytes), "," if i + 1 < len(frames) else "")
+	}
+	fmt.println("  ],")
+	// The packet: type, receiver (little-endian), counter (little-endian), then the frames sealed with that counter as
+	// the nonce, the 13 bytes before them associated data.
+	c: zsp.Channel
+	c.send = key_of(60)
+	plain := f(frames[2].bytes, frames[0].bytes)
+	packet := make([]byte, 13 + len(plain) + zsp.TAG)
+	packet[0] = 0x43
+	endian.unchecked_put_u32le(packet[1:], 0xdecafbad)
+	endian.unchecked_put_u64le(packet[5:], 77)
+	copy(packet[13:], plain)
+	zsp.channel_seal_in_place(&c, 77, packet[13:], packet[:13])
+	fmt.printfln(`  "link_packet": {{"key": "%s", "receiver": "decafbad", "counter": 77, "frames": "%s", "packet": "%s"}},`, h(c.send[:]), h(plain), h(packet))
+}
+
+// Files hashed in chunks (§16): each chunk of a MiB by SHA-256, the file by SHA-256 of the chunks' hashes. The content of
+// each is byte i = i * 7 + i / 251, mod 256.
+files :: proc() {
+	CHUNK :: 1 << 20
+	sizes := []int{0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK + CHUNK / 2}
+	fmt.println(`  "files": [`)
+	for size, n in sizes {
+		data := make([]byte, size)
+		for &x, i in data {
+			x = byte(i * 7 + i / 251)
+		}
+		file: sha2.Context_256
+		sha2.init_256(&file)
+		fmt.printf(`    {{"size": %d, "chunks": [`, size)
+		for at, k := 0, 0; at < size; at, k = at + CHUNK, k + 1 {
+			chunk: [32]byte
+			one: sha2.Context_256
+			sha2.init_256(&one)
+			sha2.update(&one, data[at:min(at + CHUNK, size)])
+			sha2.final(&one, chunk[:])
+			sha2.update(&file, chunk[:])
+			fmt.printf(`%s"%s"`, ", " if k > 0 else "", h(chunk[:]))
+		}
+		whole: [32]byte
+		sha2.final(&file, whole[:])
+		fmt.printfln(`], "file": "%s"}}%s`, h(whole[:]), "," if n + 1 < len(sizes) else "")
+	}
+	fmt.println("  ],")
+}
+
+// What services say (§16), byte for byte.
+services :: proc() {
+	Message :: struct {
+		name:  string,
+		bytes: []byte,
+	}
+	w :: proc() -> [dynamic]byte {return {}}
+	strs :: proc(w: ^[dynamic]byte, s: ..string) {
+		zsp.write_varint(w, u64(len(s)))
+		for x in s {
+			zsp.write_bytes(w, transmute([]byte)x)
+		}
+	}
+	exec := w()
+	append(&exec, 0)
+	strs(&exec, "ls", "-l", "/tmp")
+	strs(&exec, "LANG=C", "HOME")
+	zsp.write_bytes(&exec, transmute([]byte)string("/srv"))
+	pty := w()
+	append(&pty, 0, 24, 0, 80)
+	zsp.write_bytes(&pty, transmute([]byte)string("xterm-256color"))
+	strs(&pty)
+	strs(&pty, "COLORTERM=truecolor")
+	zsp.write_bytes(&pty, nil)
+	get := w()
+	zsp.write_bytes(&get, transmute([]byte)string("docs/report.pdf"))
+	zsp.write_varint(&get, 3 << 20)
+	zsp.write_bytes(&get, {0xaa, 0xbb, 0xcc})
+	put := w()
+	zsp.write_bytes(&put, transmute([]byte)string("docs/new/report.pdf"))
+	zsp.write_varint(&put, 2621440)
+	zsp.write_varint(&put, 1700000000123)
+	zsp.write_bytes(&put, {1, 2, 3, 4})
+	append(&put, 3)
+	list := w()
+	zsp.write_bytes(&list, transmute([]byte)string("docs/sub"))
+	entry := w()
+	append(&entry, 1)
+	zsp.write_bytes(&entry, transmute([]byte)string("a.txt"))
+	zsp.write_varint(&entry, 1234)
+	zsp.write_varint(&entry, 1700000000000)
+	listed := w()
+	append(&listed, 0, 1, 3, 2, 3)
+	zsp.write_bytes(&listed, transmute([]byte)string("docs"))
+	append(&listed, 3, 0, 22)
+	zsp.write_bytes(&listed, nil)
+	zsp.write_bytes(&listed, transmute([]byte)string("ssh"))
+	exit := w()
+	append(&exit, 3)
+	zsp.write_varint(&exit, 1)
+	append(&exit, 0)
+	killed := w()
+	append(&killed, 3)
+	zsp.write_varint(&killed, 0)
+	append(&killed, 9)
+	got := w()
+	append(&got, 0)
+	zsp.write_varint(&got, 2621440)
+	zsp.write_varint(&got, 1700000000123)
+	zsp.write_bytes(&got, {0xaa, 0xbb, 0xcc})
+	zsp.write_varint(&got, 1 << 20)
+	from := w()
+	append(&from, 0)
+	zsp.write_varint(&from, 2 << 20)
+	denied := w()
+	append(&denied, 1)
+	append(&denied, "not shared with you")
+	messages := []Message {
+		{"zsp.tcp to port 22 of 127.0.0.1", {0, 22, '1', '2', '7', '.', '0', '.', '0', '.', '1'}},
+		{"zsp.exec ls -l /tmp, LANG=C and without HOME, in /srv", exec[:]},
+		{"zsp.pty 24 rows by 80, xterm-256color, the user's shell, COLORTERM=truecolor", pty[:]},
+		{"zsp.get docs/report.pdf from 3 MiB, as it was", get[:]},
+		{"zsp.put docs/new/report.pdf of 2.5 MiB, replacing, making folders", put[:]},
+		{"zsp.list docs/sub", list[:]},
+		{"an entry: a.txt, 1234 bytes", entry[:]},
+		{"zsp.services: terminals and commands, docs to read and write, port 22 as ssh", listed[:]},
+		{"status: ok", {0}},
+		{"status: denied, with a reason", denied[:]},
+		{"zsp.get answered: 2.5 MiB, from 1 MiB", got[:]},
+		{"zsp.put answered: from 2 MiB", from[:]},
+		{"input: ls", {0, 'l', 's', '\n'}},
+		{"signal: interrupt", {1, 2}},
+		{"resize: 50 rows by 132", {2, 0, 50, 0, 132}},
+		{"output: hi", {1, 'h', 'i'}},
+		{"errors: no", {2, 'n', 'o'}},
+		{"exited 1", exit[:]},
+		{"killed by 9", killed[:]},
+		{"a chunk's hash follows its bytes", {2, 0x5e, 0x88, 0x48, 0x98, 0xda, 0x28, 0x04, 0x71, 0x51, 0xd0, 0xe5, 0x6f, 0x8d, 0xc6, 0x29, 0x27, 0x73, 0x60, 0x3d, 0x0d, 0x6a, 0xab, 0xbd, 0xd6, 0x2a, 0x11, 0xef, 0x72, 0x1d, 0x15, 0x42, 0xd8}},
+		{"the end of a file sent whole, with its hash", {3, 0, 0x5e, 0x88, 0x48, 0x98, 0xda, 0x28, 0x04, 0x71, 0x51, 0xd0, 0xe5, 0x6f, 0x8d, 0xc6, 0x29, 0x27, 0x73, 0x60, 0x3d, 0x0d, 0x6a, 0xab, 0xbd, 0xd6, 0x2a, 0x11, 0xef, 0x72, 0x1d, 0x15, 0x42, 0xd8}},
+	}
+	fmt.println(`  "services": [`)
+	for m, i in messages {
+		fmt.printfln(`    {{"message": "%s", "bytes": "%s"}}%s`, m.name, h(m.bytes), "," if i + 1 < len(messages) else "")
 	}
 	fmt.println("  ],")
 }

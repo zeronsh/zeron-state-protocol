@@ -1,6 +1,8 @@
 package host
 
 import "core:crypto"
+import "core:crypto/sha2"
+import "core:encoding/hex"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -312,4 +314,38 @@ services_listed :: proc(t: ^testing.T) {
 	call_end(a, call)
 	want := [?]byte{0, 1, 1, 2, 1, 4, 'd', 'o', 'c', 's'}
 	testing.expectf(t, string(heard.got[:]) == string(want[:]), "%v", heard.got[:])
+}
+
+// What vectors.json says of files, this host's hashing says too.
+@(test)
+files_hash_as_vectors_say :: proc(t: ^testing.T) {
+	text, err := os.read_entire_file("vectors/vectors.json", context.temp_allocator)
+	if err != nil {
+		text, err = os.read_entire_file("../vectors/vectors.json", context.temp_allocator)
+	}
+	testing.expect(t, err == nil)
+	sizes := []int{0, 1, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK + CHUNK / 2}
+	for size in sizes {
+		data := make([]byte, size, context.temp_allocator)
+		for &x, i in data {
+			x = byte(i * 7 + i / 251)
+		}
+		h: Hashing
+		hashing_init(&h)
+		rest := data
+		for len(rest) > 0 {
+			taken, ended := hashing_feed(&h, rest)
+			rest = rest[taken:]
+			if ended {
+				hashing_chunk(&h)
+			}
+		}
+		if h.filled > 0 {
+			hashing_chunk(&h)
+		}
+		whole: [32]byte
+		sha2.final(&h.file, whole[:])
+		hexed := hex.encode(whole[:], context.temp_allocator)
+		testing.expectf(t, strings.contains(string(text), strings.concatenate({`"file": "`, string(hexed), `"`}, context.temp_allocator)), "size %d", size)
+	}
 }
