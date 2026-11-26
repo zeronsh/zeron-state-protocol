@@ -110,7 +110,7 @@ many, and where runs differed, both:
 | a page of 50 rows of 100,000, to a client that holds none | 0.6 to 1.1 ms; in a browser, of 20,000, 1.2 to 2.6 ms |
 | a question of 100,000 rows: the first 50 of 1,000, by a number | 2.5 ms |
 | a streamed token, client to client of one device | 20 to 40 µs; in a browser, tab to worker to tab, 0.1 ms |
-| a streamed token, web device to relay to web device's screen | 0.1 ms in Node; in a browser, by the live suite's 10th token, 4 to 5 ms |
+| a streamed token, web device to relay to web device's screen | 0.1 ms in Node, 0.2 ms between browsers; the first tokens of a new text, 1 ms, and 4 to 5 ms in a browser |
 | memory, holding 100,000 rows and a page | 30 to 36 MB of the node's, 15 MB of the client's |
 | `./x test` | 2.5 s longer than without any of it: 55 s |
 

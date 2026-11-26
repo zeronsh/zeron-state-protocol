@@ -93,7 +93,7 @@ const zsp = {
     devices.set(name, d);
     return { key: d.key, opened: performance.now() - t };
   },
-  async benchRun(name: string, rows: number): Promise<Record<string, number>> {
+  async benchRun(name: string, rows: number, other?: string): Promise<Record<string, number>> {
     const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
     const M = { author: columns.string(16), body: columns.text(17), stars: columns.number(18) };
     const c = clientOf(name);
@@ -127,6 +127,9 @@ const zsp = {
     let id = "";
     await c.write(1, (ch) => (id = ch.insert(M, "tokens", 1, {})));
     const reader = new Client({ connect: devices.get(name)!.connect });
+    const far = other ? new Client({ connect: devices.get(other)!.connect }) : undefined;
+    let there = "";
+    far?.window({ scope: 1, list: "tokens", table: M }, (st) => (there = st.rows[0]?.body ?? ""));
     let shown = "";
     reader.window({ scope: 1, list: "tokens", table: M }, (st) => (shown = st.rows[0]?.body ?? ""));
     for (let i = 0; i < 2000 && !reader.ready; i++) await sleep(1);
@@ -142,9 +145,21 @@ const zsp = {
       while (shown !== said) await turn();
       tokens.push(performance.now() - t);
     }
+    const across: number[] = [];
+    if (far) {
+      for (let i = 0; i < 2000 && there !== said; i++) await sleep(5);
+      for (let i = 0; i < 200; i++) {
+        said += `far${i} `;
+        t = performance.now();
+        editor.append(`far${i} `);
+        while (there !== said) await turn();
+        across.push(performance.now() - t);
+      }
+      far.close();
+    }
     editor.close();
     reader.close();
-    return { write: median(writes), bulk, page: median(pages), token: median(tokens) };
+    return { write: median(writes), bulk, page: median(pages), token: median(tokens), across: far ? median(across) : NaN };
   },
   /** Runs the live suite with a and b as said. */
   async live(a: Side, b: Side): Promise<string> {

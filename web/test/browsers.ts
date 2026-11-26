@@ -186,14 +186,16 @@ const bench = async () => {
   const { key, opened } = await call<{ key: string; opened: number }>(p, "benchOpen", "bench");
   s.admit(key, "ann", false);
   await call(p, "join", "bench", s.sid, relay);
+  await browserDevice(p, "bench-b", s, relay, "bob", false);
   const rows = 20000;
-  const r = await call<Record<string, number>>(p, "benchRun", "bench", rows);
+  const r = await call<Record<string, number>>(p, "benchRun", "bench", rows, "bench-b");
   const ms = (x: number) => (x < 1 ? `${(x * 1000).toFixed(0)} µs` : `${x.toFixed(x < 10 ? 2 : 0)} ms`);
   console.log(`opening a device made from nothing: worker, node and store     ${ms(opened)}`);
   console.log(`one small durable write, in the origin's file system           ${ms(r.write)}`);
   console.log(`writing ${rows} rows, a thousand to a write                      ${ms(r.bulk)}, ${((rows / r.bulk) * 1000).toFixed(0)} rows/s`);
   console.log(`a page of 50 rows of ${rows}, to a client that holds none          ${ms(r.page)}`);
   console.log(`a streamed token, from one client of the device to another       ${ms(r.token)}`);
+  console.log(`a streamed token, to another browser device through zspd's relay  ${ms(r.across)}`);
 };
 
 async function main(): Promise<void> {
