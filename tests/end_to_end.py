@@ -1102,6 +1102,30 @@ def test_names_over_ipv6():
         assert "resolvectl dns zsp0 %s " % dns in script, script
 
 
+def test_services_by_scope():
+    """What a device lists among its services is what it offers in the scope asked of, and what listens now, though
+    nobody has been kept up with it."""
+    _, (a, b) = space("sv", "sw")
+    two = zspd("scope", a.dir, "signed")
+    zspd("admit", a.dir, zspd("key", b.dir), two)
+    ca, cb = a.client(), b.client()
+    cb.until(lambda: int(two) in cb.scopes)
+    web = free_port()
+    Service("127.0.0.1", web, says=b"x")
+    ca.offer(web, 1, name="local")
+    ca.offer(9999, int(two), host="10.0.0.5", name="secret")
+
+    def listed(scope):
+        answer = cb.call(bytes.fromhex(a.key), scope, "zsp.services")
+        assert answer["fault"] is None, answer
+        return b"".join(answer["data"])
+
+    one = listed(1)
+    assert b"\x03" + struct.pack(">H", web) in one and b"local" in one, one
+    assert b"secret" not in one and struct.pack(">H", 9999) not in one, one
+    assert b"secret" in listed(int(two))
+
+
 def test_ports():
     """Offered ports, reached by name from any application, by address or proxy: two devices on one port, a service that
     speaks first, and nothing that is not offered, nor to anyone a web page sent."""
