@@ -255,6 +255,7 @@ def test_terminal():
     master, slave = os.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 90, 0, 0))
     before = termios.tcgetattr(slave)
+    name = os.ttyname(slave)
     p = subprocess.Popen(
         [BIN, "terminal", a.dir, "tm-b"], stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
         preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0),
@@ -303,8 +304,18 @@ def test_terminal():
         assert p.poll() is None
         # Its end is this one's, and the terminal is as it was.
         type(b"exit 3\r")
-        assert p.wait(10) == 3
-        assert termios.tcgetattr(slave) == before
+        # Read as a terminal does, for what is shown last may be more than a terminal holds unread (as on macOS).
+        deadline = time.monotonic() + 10
+        while p.poll() is None and time.monotonic() < deadline:
+            if select.select([master], [], [], 0.1)[0]:
+                seen += os.read(master, 65536)
+        assert p.poll() == 3, (p.poll(), seen[-300:])
+        # Opened again by its name: macOS takes back what was open on a terminal whose session has ended.
+        again = os.open(name, os.O_RDWR | os.O_NOCTTY)
+        try:
+            assert termios.tcgetattr(again) == before
+        finally:
+            os.close(again)
     finally:
         if p.poll() is None:
             p.kill()
