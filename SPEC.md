@@ -676,12 +676,12 @@ nothing. What a browser sends begins with a request line, `method SP target SP H
 
 - empty lines before it are skipped, and a line may end in LF alone, as the most lenient server would read it;
 - bytes that cannot begin such a line pass at once, and are not HTTP; bytes that can are held until they cannot, or the head is whole;
+  except that a browser writes its request's head at once, and what comes by loopback at once is read at once, so what comes first, if
+  it is a token and nothing after (not even a space), is no browser's and passes;
 - the head must have exactly one `Host`, at most one `Origin`, and no folded or malformed header lines; a `Host` (and a target in absolute
   form) is a name or address, then `:` and digits if anything, naming the device; an `Origin` is `http` or `https`, `://`, a name or
   address of the space, then `:` and digits if anything, and nothing else (so not `null`);
 - only the first request of a connection is looked at: a browser keeps a connection for the one origin its first request named.
-
-A client that speaks first with a few letters and nothing after, waiting for an answer, waits until it says more.
 
 **Exposure.** A device may expose a port of its own machine to the public, through relays that will, one port at a time, under a
 **label**:

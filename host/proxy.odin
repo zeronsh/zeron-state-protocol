@@ -30,6 +30,7 @@ Proxy_Client :: struct {
 	greeted: bool, // SOCKS: the greeting has been answered
 	polling: ^nbio.Operation,
 	request: pipe.Proxy_Request,
+	looked:  bool, // what came with the request has been judged once
 }
 
 @(private)
@@ -223,7 +224,8 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 	// it, by the forward's inspector. Until what came is enough to judge, more is waited for.
 	inspect: proc(data: rawptr, first: []byte) -> Inspection = proxied_guard
 	if len(early) > 0 {
-		verdict, reason := http_verdict(sp, device, early[:])
+		verdict, reason := http_verdict(sp, device, early[:], first_look = !c.looked)
+		c.looked = true
 		switch verdict {
 		case .Reject:
 			proxy_say_no(c, reason)
@@ -241,7 +243,7 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 	}
 	ports_wanted(sp, device)
 	pc := new(Proxied)
-	pc^ = {sp, device, rem, r.reply, c.socket, nil}
+	pc^ = {sp, device, rem, r.reply, c.socket, nil, len(early) > 0}
 	// The forward has the socket now.
 	p := &h.proxy_server
 	for x, i in p.waiting {
@@ -278,7 +280,8 @@ proxy_say_no :: proc(c: ^Proxy_Client, reason: string) {
 @(private)
 proxied_guard :: proc(data: rawptr, first: []byte) -> Inspection {
 	pc := (^Proxied)(data)
-	verdict, reason := http_verdict(pc.sp, pc.device, first)
+	verdict, reason := http_verdict(pc.sp, pc.device, first, first_look = !pc.looked)
+	pc.looked = true
 	if verdict == .Reject {
 		forward_reject(pc.forward, http_forbidden(reason))
 	}
@@ -302,6 +305,7 @@ Proxied :: struct {
 	reply:  type_of(pipe.Proxy_Request{}.reply),
 	socket: net.TCP_Socket,
 	forward: ^Forward,
+	looked:  bool, // the guard has seen what came first
 }
 
 // The device has connected, or would not: the application is told so, as its proxy would tell it.

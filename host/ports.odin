@@ -399,6 +399,7 @@ Connection :: struct {
 	device:  zsp.Key32,
 	sp:      ^Space,
 	forward: ^Forward,
+	looked:  bool, // the guard has seen what came first
 }
 
 @(private)
@@ -469,7 +470,8 @@ connection_done :: proc(data: rawptr, status: Forward_Status) {
 @(private)
 http_guard :: proc(data: rawptr, first: []byte) -> Inspection {
 	c := (^Connection)(data)
-	verdict, reason := http_verdict(c.sp, c.device, first)
+	verdict, reason := http_verdict(c.sp, c.device, first, first_look = !c.looked)
+	c.looked = true
 	if verdict == .Reject {
 		forward_reject(c.forward, http_forbidden(reason))
 	}
@@ -484,12 +486,14 @@ http_forbidden :: proc(reason: string) -> []byte {
 // Whether the first bytes of a connection are a web request, and if so whether it may pass (SPEC §17). Whatever a
 // browser sends begins with a request line, `<method> <target> HTTP/<d>.<d>`, the method any token in any case (fetch
 // sends what it is given); so whatever cannot begin so is no browser's, and passes, and whatever can is waited for
-// until it is whole. The head is read as the most lenient server would read it (empty lines before it, lines that
-// end in LF alone), and anything a server could read two ways is refused: two Hosts or Origins, a folded line, a
-// line that is no header. Only the first request is looked at: a browser keeps a connection for one origin, the one
-// whose name the first request carries.
+// until it is whole. But a browser writes its request's head at once, and these connections come by loopback, where
+// what is written at once is read at once: so what came first (`first_look`), if it is a token and nothing after,
+// not even a space, is no browser's either. The head is read as the most lenient server would read it (empty lines
+// before it, lines that end in LF alone), and anything a server could read two ways is refused: two Hosts or
+// Origins, a folded line, a line that is no header. Only the first request is looked at: a browser keeps a
+// connection for one origin, the one whose name the first request carries.
 @(private)
-http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte) -> (Inspection, string) {
+http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look := false) -> (Inspection, string) {
 	b := first
 	for len(b) > 0 && (b[0] == '\r' || b[0] == '\n') {
 		b = b[1:]
@@ -500,7 +504,7 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte) -> (Inspectio
 		i += 1
 	}
 	if i == len(b) {
-		return .More, ""
+		return .Pass if first_look else .More, ""
 	}
 	if i == 0 || b[i] != ' ' {
 		return .Pass, ""

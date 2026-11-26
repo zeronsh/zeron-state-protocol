@@ -1132,11 +1132,8 @@ def test_ports():
     if direct:
         s = socket.create_connection((bee, quiet), 3)
         assert s.recv(64) == b"SSH-2.0-zsp-test\r\n"
-        s.sendall(b"SSH-2.0-client\r\n")  # a line: what could begin a web request is held until it cannot
-        got = b""
-        while len(got) < 16:
-            got += s.recv(64)
-        assert got == b"SSH-2.0-client\r\n"
+        s.sendall(b"hello")  # a word, and nothing after: no browser's
+        assert s.recv(64) == b"hello"
         s.shutdown(socket.SHUT_WR)
         got = b""
         while data := s.recv(64):

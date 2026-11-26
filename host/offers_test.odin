@@ -164,6 +164,17 @@ web_pages_reach_only_their_own :: proc(t: ^testing.T) {
 	testing.expect_value(t, verdict(sp, desk, "GE"), Inspection.More)
 	testing.expect_value(t, verdict(sp, desk, "\r\n"), Inspection.More)
 	testing.expect_value(t, verdict(sp, desk, "patch /x HTTP/1."), Inspection.More)
+	// What came first, a token and nothing after, is no browser's, which writes its request's head at once: a client
+	// that says a word and waits. A space, and it might be one.
+	first :: proc(sp: ^Space, device: zsp.Key32, request: string) -> Inspection {
+		v, _ := http_verdict(sp, device, transmute([]byte)request, first_look = true)
+		return v
+	}
+	testing.expect_value(t, first(sp, desk, "hello"), Inspection.Pass)
+	testing.expect_value(t, first(sp, desk, "e"), Inspection.Pass)
+	testing.expect_value(t, verdict(sp, desk, "hello"), Inspection.More)
+	testing.expect_value(t, first(sp, desk, "patch /x HTTP/1."), Inspection.More)
+	testing.expect_value(t, first(sp, desk, cat("patch / HTTP/1.1\r\n", "Host: attacker.example\r\n\r\n")), Inspection.Reject)
 	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk"), Inspection.More)
 	// Not HTTP at all: an SSH client, TLS.
 	testing.expect_value(t, verdict(sp, desk, "SSH-2.0-OpenSSH_9.6\r\n"), Inspection.Pass)
