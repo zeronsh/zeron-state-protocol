@@ -230,7 +230,7 @@ run :: proc() -> int {
 				return true
 			}
 			switch {
-			case name != "" && !zsp.name_valid(name):
+			case name != "" && !zsp.device_name_valid(name):
 				say(os.stderr, "a name is 1 to 63 lower-case letters, digits and hyphens, with no hyphen at either end\n")
 			case zsp.roster_member(&a.roster, device) == nil:
 				say(os.stderr, "no such device\n")

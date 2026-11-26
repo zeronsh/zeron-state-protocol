@@ -65,8 +65,8 @@ setup :: proc(args: []string) -> int {
 			dns = value
 		case "--catch":
 			ep, ok := net.parse_endpoint(value)
-			if !ok {
-				return usage()
+			if !ok || ep.port == 0 {
+				return usage() // the system is told the port: it must be one
 			}
 			s.catch_at = ep
 		case "--devices":
@@ -82,7 +82,7 @@ setup :: proc(args: []string) -> int {
 	s.dns = {net.IP4_Address{127, s.loopback[0], s.loopback[1], 1}, DNS_PORT}
 	if dns != "" {
 		ep, ok := net.parse_endpoint(dns)
-		if !ok {
+		if !ok || ep.port == 0 {
 			return usage()
 		}
 		s.dns = ep
@@ -292,7 +292,7 @@ when ODIN_OS == .Linux {
 					a, aok := number(words[0])
 					b, bok := number(words[1])
 					n, nok := number(words[2])
-					if aok && bok && nok && a >= 0 && a <= 255 && b >= 0 && b <= 255 && n > 0 && n <= 65000 {
+					if aok && bok && nok && a >= 0 && a <= 255 && b >= 0 && b <= 255 && n > 0 && n <= 65533 {
 						s.loopback, s.devices = {byte(a), byte(b)}, n
 					}
 				}

@@ -1100,6 +1100,10 @@ def test_names_over_ipv6():
     if sys.platform.startswith("linux"):
         script = subprocess.run([BIN, "setup", "--dry-run", "--dns=" + dns], capture_output=True, text=True).stdout
         assert "resolvectl dns zsp0 %s " % dns in script, script
+        # A port the system is to be told must be one; a domain may have a label "id".
+        for flag in ("--catch=127.0.0.1:0", "--dns=127.0.0.1:0"):
+            assert subprocess.run([BIN, "setup", "--dry-run", flag], capture_output=True).returncode != 0, flag
+        assert subprocess.run([BIN, "setup", "--dry-run", "--names=tunnel.example.id"], capture_output=True).returncode == 0
 
 
 def test_services_by_scope():

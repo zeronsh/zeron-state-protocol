@@ -130,7 +130,7 @@ names_resolve :: proc(t: ^testing.T) {
 
 @(test)
 suffixes :: proc(t: ^testing.T) {
-	for good in ([]string{"zsp.internal", "internal", "a-b.c1.home.arpa"}) {
+	for good in ([]string{"zsp.internal", "internal", "a-b.c1.home.arpa", "tunnel.example.id", "id.example.com"}) {
 		testing.expectf(t, suffix_valid(good), "%q is a suffix", good)
 	}
 	for bad in ([]string{"", ".", "zsp.", ".zsp", "zsp..internal", "Zsp.internal", "-a.b", "a b"}) {

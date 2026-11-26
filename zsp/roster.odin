@@ -275,7 +275,7 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 		m.subject = read_bytes(&rd)
 		if named {
 			m.hostname = read_bytes(&rd)
-			if len(m.hostname) > 0 && !name_valid(string(m.hostname)) {
+			if len(m.hostname) > 0 && !device_name_valid(string(m.hostname)) {
 				return
 			}
 			for other in r.members[:i] {
@@ -350,8 +350,7 @@ roster_version :: proc(magic: []byte) -> (named, known: bool) {
 // hyphen at either end. So it means the same to every application that looks it up, and no two can be confused.
 @(require_results)
 name_valid :: proc(name: string) -> bool {
-	// "id" is not anybody's: <id>.id.<suffix> are the names nobody chooses (§17).
-	if len(name) == 0 || len(name) > 63 || name[0] == '-' || name[len(name) - 1] == '-' || name == "id" {
+	if len(name) == 0 || len(name) > 63 || name[0] == '-' || name[len(name) - 1] == '-' {
 		return false
 	}
 	for c in transmute([]byte)name {
@@ -360,6 +359,12 @@ name_valid :: proc(name: string) -> bool {
 		}
 	}
 	return true
+}
+
+// Whether a name may be a device's: a DNS label, and not "id", which is the zone of the names nobody chooses (§17).
+@(require_results)
+device_name_valid :: proc(name: string) -> bool {
+	return name_valid(name) && name != "id"
 }
 
 // The member a name is given to, if any.
@@ -675,7 +680,7 @@ draft_revoke :: proc(d: ^Draft, device: Key32, scope: Scope = 0) {
 // Names a device, or with "" unnames it. Refused if the name is not one, or is another's in force; one whose
 // grants have all ended gives it up.
 draft_name :: proc(d: ^Draft, device: Key32, name: string) -> bool {
-	if name != "" && !name_valid(name) {
+	if name != "" && !device_name_valid(name) {
 		return false
 	}
 	m: ^Member
