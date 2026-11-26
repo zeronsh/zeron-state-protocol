@@ -933,10 +933,17 @@ review_interrupts_held_once :: proc(t: ^testing.T) {
 // Output nobody reads stops at the window, and the process with it; read again, all of it comes, and its end.
 @(test)
 review_output_held_then_read_comes_whole :: proc(t: ^testing.T) {
+	for direct in ([]bool{true, false}) {
+		review_output_held(t, direct)
+	}
+}
+
+@(private)
+review_output_held :: proc(t: ^testing.T, direct: bool) {
 	w: World
-	testing.expect(t, world_init(t, &w))
+	testing.expect(t, world_init(t, &w, udp = direct))
 	defer world_destroy(&w)
-	testing.expect(t, world_ready(&w, direct = true))
+	testing.expect(t, world_ready(&w, direct = direct))
 	a, b := world_space(&w, 1), world_space(&w, 2)
 	testing.expect(t, shares_set(b, "shell 1 commands"))
 	WRITTEN :: 8 << 20
