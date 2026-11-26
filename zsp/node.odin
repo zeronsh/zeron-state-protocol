@@ -26,6 +26,7 @@ Node :: struct {
 	next_call:   u64,
 	recent:      [64]u64, // salts of live frames lately passed on
 	recent_at:   int,
+	typing:      [dynamic]Typing, // pieces this node's clients are typing, as far as they have gone
 	host:        Host,
 	current:     ^Step, // the step under way, where storage may answer "not yet"
 	sweep:       Sweep, // what a roster has made unlawful, yet to be gone over
@@ -124,6 +125,10 @@ node_destroy :: proc(n: ^Node) {
 	}
 	delete(n.sessions)
 	delete(n.interests)
+	for &x in n.typing {
+		delete(x.ops)
+	}
+	delete(n.typing)
 	roster_destroy(&n.roster)
 	store_close(&n.store)
 	n^ = {}

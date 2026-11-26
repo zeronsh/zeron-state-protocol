@@ -271,6 +271,37 @@ const tests: Record<string, () => Promise<void>> = {
   },
   // A browser cannot ping a WebSocket, so a web device says "ping", which every relay answers: a quiet connection is
   // kept, and one that has quietly died is known to have, and dialled again.
+  // One who begins to look while another is typing sees what was typed before it looked, and the rest as it is typed:
+  // not once the piece is sealed, a second after it began, as when frames from the middle of a piece reached a reader that
+  // had missed its start. Through zspd's relay and the Durable Object, a web device typing and a zspd device looking.
+  async late_reader() {
+    for (const kind of ["zspd", "cloud"]) {
+      const relay = kind === "zspd" ? await node("serve", join(TMP, "lr-relay")) : await cloud();
+      const s = await space("lr-" + kind, relay, ["web", "zspd"]);
+      const Note = { title: columns.string(16), body: columns.text(17) };
+      await eventually("it may write", () => s.a.may(1, "write") && s.b.may(1, "read"));
+      let id = "";
+      await s.a.write(1, (change) => (id = change.insert(Note, "late", 1, { title: "note" })));
+      const editor = s.a.text(id, Note.body);
+      editor.append("typed before anyone looked");
+      await new Promise((done) => setTimeout(done, 200)); // said, and dropped, as nobody looked
+      let shown: string | undefined;
+      const looked = Date.now();
+      const w = s.b.window({ scope: 1, list: "late", table: Note }, (state) => (shown = state.rows[0]?.body));
+      await eventually("what was typed before it looked", () => shown === "typed before anyone looked");
+      const first = Date.now() - looked;
+      const began = Date.now();
+      editor.append(", and after");
+      await eventually("and what is typed after", () => shown === "typed before anyone looked, and after");
+      const after = Date.now() - began;
+      // A piece is sealed a second after it began: what is shown sooner was live.
+      if (first >= 500 || after >= 500) throw new Error(`${kind}: shown ${first} ms after looking, and ${after} ms after typing: once sealed, not live`);
+      editor.close();
+      w.stop();
+      await s.close();
+      await stopAll();
+    }
+  },
   async keepalive() {
     for (const kind of ["zspd", "cloud"]) {
       const relay = kind === "zspd" ? await node("serve", join(TMP, "k-relay")) : await cloud();
