@@ -79,7 +79,7 @@ objects, and devices in the same city:
 | 25 MB written in bulk | 2.3 to 3 s; $0.00006 a MB: a row of SQLite a burst, a put an extent, a put a checkpoint |
 | a new device sent 25 MB | 4 to 6 s; some 40 gets, $0.00004 in all |
 | a window of 50 from an object woken from eviction | 10 to 360 ms; at most 4 gets |
-| the same with nothing cached | 0.2 to 1 s; 4 to 11 gets, $0.00002 at most |
+| the same with nothing cached | 0.2 to 1.1 s; 4 to 11 gets, $0.00002 at most: rounds of reads one after another, down the trees and to the log |
 | a device that has everything, back | one fingerprint; nothing read from R2 |
 | R2 from an object | a get of 4 KiB 22 to 43 ms, of 1 MiB 35 to 49 ms; a put of 1 MiB 176 to 230 ms; from another continent, ten times that |
 | kept in the object | the log's last 4 MiB and the cache: some 1 to 5 MB, $0.001 a month |
