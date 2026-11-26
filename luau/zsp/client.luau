@@ -1963,6 +1963,13 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		if was == nil then
 			local row = self.rows[id]
 			if row then
+				-- What editors have open in the row is their own writing, sent whatever becomes of this change: first, then,
+				-- so that undoing the change cannot take it back.
+				for k, t in row.texts do
+					if t.open ~= "" then
+						self:_seal(row, k)
+					end
+				end
 				local slots = {}
 				for k, cs in row.slots do
 					slots[k] = table.clone(cs)
@@ -1979,11 +1986,6 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	end
 	local function put(row: string, slot: number, kind: number, body: string)
 		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 192 bytes")
-		-- What an editor has open in the slot is its own writing, sent whatever becomes of this change: first, then.
-		local held = self.rows[row]
-		if held and held.texts[slot] and held.texts[slot].open ~= "" then
-			self:_seal(held, slot)
-		end
 		local stamp = self:_stamp()
 		keep(row, slot)
 		rows[row] = true

@@ -583,9 +583,20 @@ do
 		sent = sent or h.self.said[k].kind == CELLS
 	end
 	assert(sent, "and sent, as typing is")
+	-- And so when another slot of the row was touched first.
+	editor.insert(11, "more")
+	assert(not pcall(function()
+		h.client:write(1, function(change)
+			change.set(id, Note, { title = "other" })
+			change.set(id, Note, { body = "written over" })
+			error("not after all")
+		end)
+	end))
+	h.run()
+	assert(shown.rows[1].body == "hello!typedmore", `the typing is kept when another slot was touched first: {shown.rows[1].body}`)
 	editor.close()
 	h.run()
-	assert(shown.rows[1].body == "hello!typed", shown.rows[1].body)
+	assert(shown.rows[1].body == "hello!typedmore", shown.rows[1].body)
 
 	-- A value that cannot be read as its column's kind is no value, and all else is shown as ever.
 	local Strict = { title = zsp.string(16), body = zsp.text(17), n = zsp.custom(18, function(v: any): string
@@ -619,7 +630,7 @@ do
 	codec.put(c, string.rep("\254", 14) .. "\1\1")
 	codec.put_bytes(c, body)
 	h.tell(CELLS, "\0" .. codec.string(c))
-	assert(shown.rows[1].body == "hello!typed", "the text is as it was")
+	assert(shown.rows[1].body == "hello!typedmore", "the text is as it was")
 end
 
 -- Before the scope is known every map's id is nothing: two maps are not taken for one another meanwhile.
