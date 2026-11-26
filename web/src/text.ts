@@ -763,6 +763,7 @@ export function order(t: Text): Map<string, number> {
 
 // Types bytes just after an element, deleted or not ("" for the start), and says what the first is called.
 export function after(t: Text, after: string, bytes: Uint8Array | string, fresh: () => string): string {
+  if (bytes.length === 0) return ""; // nothing is put, and nothing named
   begin(t, fresh);
   let lp = "";
   let lo = 0;
