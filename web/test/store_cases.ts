@@ -3,15 +3,19 @@
 
 import assert from "node:assert/strict";
 import { Store } from "../src/store.ts";
-import { MemoryVolume } from "../src/volume.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MemoryVolume, type Volume } from "../src/volume.ts";
+import { NodeVolume } from "../src/volume-node.ts";
 
 const SEGMENT = 1000;
 const bytes = (ch: string, n: number) => new TextEncoder().encode(ch.repeat(n));
 const turn = () => new Promise((done) => setTimeout(done, 0));
 
 // Opens a store, letting what it waits to open be opened meanwhile.
-async function opened(volume: MemoryVolume): Promise<Store> {
-  const settling = setInterval(() => volume.settle(), 1);
+async function opened(volume: Volume): Promise<Store> {
+  const settling = setInterval(() => (volume as MemoryVolume).settle?.(), 1);
   try {
     return await Store.open(volume, SEGMENT);
   } finally {
@@ -154,6 +158,24 @@ async function settleOnce(volume: MemoryVolume, s: Store): Promise<void> {
   clearInterval(settling);
   s = await opened(volume);
   assert.equal(read(s, 9), "b".repeat(40), "and it was lost when the store closed");
+}
+
+// Cut short, so that its file is to go, and written again at once where files open at once: the file that is written to
+// is not removed after, whichever kind of volume it is.
+for (const volume of [new MemoryVolume(), new NodeVolume(mkdtempSync(join(tmpdir(), "zsp-store-")))]) {
+  let s = await opened(volume);
+  assert(s.logWrite(1 * SEGMENT, bytes("a", 30)));
+  assert(s.logSync());
+  s.logTruncate(100);
+  assert(s.logWrite(1 * SEGMENT, bytes("b", 40)));
+  assert(s.logSync());
+  await new Promise((done) => setTimeout(done, 20));
+  assert((await volume.list()).includes("00000001.log"), "the file written to was removed");
+  await s.close();
+  s = await opened(volume);
+  assert.equal(read(s, 1), "b".repeat(40), "and what was written to it lost");
+  await s.close();
+  if (volume instanceof NodeVolume) rmSync(volume.path, { recursive: true, force: true });
 }
 
 console.log("ok");

@@ -69,6 +69,7 @@ export class Store {
   #opening = new Map<number, Promise<void>>();
   #held = new Map<number, Held>();
   #dropped = new Set<number>(); // while being opened
+  #removing = new Map<number, number>(); // segments whose files are to be removed, and how many times, not yet done
   #dirty = new Set<File>();
   #tree!: File;
   #find!: File;
@@ -162,7 +163,8 @@ export class Store {
     const n = Math.floor(off / this.segment);
     const at = off % this.segment;
     let f = this.#segments.get(n);
-    if (!f && !this.#held.has(n) && this.volume.openNow) {
+    // Opened at once where it can be, unless its file is yet to be removed: then held, and opened after, in order.
+    if (!f && !this.#held.has(n) && this.volume.openNow && !this.#removing.has(n)) {
       f = this.volume.openNow(segmentName(n), true)!;
       this.#segments.set(n, f);
     }
@@ -272,7 +274,16 @@ export class Store {
       f.close();
       this.#dirty.delete(f);
       this.#segments.delete(n);
-      this.#after(() => this.volume.remove(segmentName(n)));
+      this.#removing.set(n, (this.#removing.get(n) ?? 0) + 1);
+      this.#after(async () => {
+        try {
+          await this.volume.remove(segmentName(n));
+        } finally {
+          const k = this.#removing.get(n)! - 1;
+          if (k > 0) this.#removing.set(n, k);
+          else this.#removing.delete(n);
+        }
+      });
     } else if (this.#opening.has(n)) {
       this.#dropped.add(n);
     }
