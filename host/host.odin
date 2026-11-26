@@ -376,6 +376,9 @@ host_run :: proc(h: ^Host) -> bool {
 		if due, ok := host_deadline(h); ok {
 			wait = max(time.tick_diff(time.tick_now(), due), 0)
 		}
+		if loop_held_back() {
+			wait = 0 // what it holds back goes to the system only by a tick that does not wait
+		}
 		if err := nbio.tick(wait); err != nil {
 			report(.Error, "the event loop failed")
 			return false
