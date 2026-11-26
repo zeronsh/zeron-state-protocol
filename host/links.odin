@@ -23,6 +23,9 @@ STUN_WAIT :: 400 * time.Millisecond
 BEACON_PORT :: 9083
 ANNOUNCES :: 4 // at once, then 0.3, 1.2 and 4.8 seconds apart
 ANNOUNCE_AFTER :: 300 * time.Millisecond
+// What a link that may be to a process gone is given to answer a poke, before another is sought: long enough for a busy
+// machine to say something, short enough that a device that started again is reached again soon.
+SUSPECT_WAIT :: 3 * time.Second
 MAX_CANDIDATES :: 16
 
 @(private)
@@ -58,13 +61,18 @@ Peer :: struct {
 	knocked:    u64, // the latest knock heard, by the knocker's clock
 	address:    pipe.Address, // where it was last heard from
 	far:        bool, // beyond a NAT
-	used:       time.Tick,
+	used:       time.Tick, // something was sent or heard, last
+	answered:   time.Tick, // something was heard, last
 	knocks:     int, // left
 	next_knock: time.Tick,
 	tried:      time.Tick, // when candidates were last sent
 	ever_tried: bool,
 	heard:      time.Tick, // a beacon, last answered
 	owed:       bool, // candidates are to be sent once the outside address is known
+	suspect:    time.Tick, // since when the link may be to a process gone (a beacon came while it has a session), if set
+	suspect_at: pipe.Address, // where that beacon said the device is
+	reknocks:   int, // left, of knocking anew beside a link that did not answer
+	next_reknock: time.Tick,
 }
 
 @(private)
@@ -300,6 +308,7 @@ peer_heard :: proc(p: ^Peer, l: ^pipe.Link, from: pipe.Address) {
 	p.address = from
 	p.far = !address_near(p.space.host, from)
 	p.used = time.tick_now()
+	p.answered = p.used
 	if l.state == .Closed {
 		if l == p.link {
 			peer_drop(p) // told so: its session ends now, and no call is put on it meanwhile
@@ -328,7 +337,7 @@ peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
 		}
 		p.link, p.answer = p.answer, nil
 	}
-	p.knocks = 0
+	p.knocks, p.reknocks, p.suspect = 0, 0, {}
 	p.session = zsp.session_open(&p.space.node, .Peer, peer_dials(p), p.device)
 	session_link(p.session, p.link)
 }
@@ -439,6 +448,7 @@ peer_drop :: proc(p: ^Peer) {
 		}
 	}
 	p.link, p.answer = nil, nil
+	p.suspect, p.reknocks = {}, 0
 }
 
 // On this machine or this network, where nothing in between keeps state that could lapse.
@@ -602,7 +612,7 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 		at := from
 		at.port = u16(port)
 		if p.session != nil {
-			peer_restarted(p, at)
+			peer_suspect(p, at)
 			return
 		}
 		if p.knocks > 0 {
@@ -628,14 +638,28 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 	}
 }
 
-// A beacon from a device this one has a session with, from another port than its link's. A device with a session says
-// none but when it starts, or its network changes; so it has started again, or moved, and the link here may be to a
-// process that is gone, which a quiet link would not find out for a long while, nor would the other dial, not being the
-// one to. The dialler knocks anew, on a link of its own beside the old one, which gives way to it only once it is
-// proven, as it does to a knock answered.
+// A beacon from a device this one has a session with. A device with a session says none but when it starts, or its
+// network changes; so it may have started again, and the link here be to a process that is gone, which a quiet link
+// would not find out for a long while, nor would the other dial, not being the one to. Or the beacon may be an old one,
+// said again by anyone, for none is bound to a time. So nothing is believed of it: the link is poked, and a live peer
+// answers that at once, which settles it. Only if nothing comes back on the link for SUSPECT_WAIT is another sought
+// (peer_silent), and the link it makes gives way only once it is proven.
 @(private)
-peer_restarted :: proc(p: ^Peer, at: pipe.Address) {
-	if !peer_dials(p) || at.port == p.address.port {
+peer_suspect :: proc(p: ^Peer, at: pipe.Address) {
+	if p.suspect != {} || p.link == nil {
+		return // being looked into already
+	}
+	p.suspect, p.suspect_at = time.tick_now(), at
+	pipe.link_poke(p.link)
+}
+
+// The link did not answer: the dialler knocks anew where the beacon said, beside the old link; the other tells the
+// dialler where it is, so that it knocks.
+@(private)
+peer_silent :: proc(p: ^Peer) {
+	report(.Debug, "a link that answered nothing, sought anew at ", net.endpoint_to_string(address_to(p.suspect_at), context.temp_allocator))
+	if !peer_dials(p) {
+		beacon_send(p.space, p.suspect_at)
 		return
 	}
 	if p.answer == nil {
@@ -647,12 +671,8 @@ peer_restarted :: proc(p: ^Peer, at: pipe.Address) {
 		p.answer = l
 		peer_wire(p, l)
 	}
-	if p.answer.state == .Open {
-		return
-	}
-	report(.Debug, "knocking again for a device heard from elsewhere: ", net.endpoint_to_string(address_to(at), context.temp_allocator))
-	buf: [pipe.PACKET]byte
-	udp_send(p.space.host, pipe.link_hello(p.answer, buf[:]), at)
+	p.reknocks = KNOCKS
+	p.next_reknock = time.tick_now()
 }
 
 // Announces this device to the local network. Call at start, and when the network changes. A broadcast may be
@@ -710,6 +730,29 @@ links_run :: proc(h: ^Host) {
 			peer_drop(p)
 		}
 		if p.session != nil {
+			if p.suspect != {} {
+				if time.tick_diff(p.suspect, p.answered) >= 0 {
+					p.suspect = {} // it answered: alive
+				} else if time.tick_diff(p.suspect, now) >= SUSPECT_WAIT {
+					p.suspect = {}
+					peer_silent(p)
+				}
+			}
+			if p.reknocks > 0 && time.tick_diff(p.next_reknock, now) >= 0 {
+				p.reknocks -= 1
+				p.next_reknock = time.tick_add(now, KNOCK_EVERY)
+				if p.answer != nil && p.answer.state != .Open {
+					buf: [pipe.PACKET]byte
+					udp_send(h, pipe.link_hello(p.answer, buf[:]), p.suspect_at)
+					if p.reknocks == 0 {
+						pipe.link_destroy(p.answer) // never answered: let go
+						free(p.answer)
+						p.answer = nil
+					}
+				} else {
+					p.reknocks = 0
+				}
+			}
 			if p.session.closing && len(zsp.session_output(p.session)) == 0 && pipe.link_quiet(p.link) {
 				pipe.link_close(p.link)
 			}
@@ -797,6 +840,12 @@ links_deadline :: proc(h: ^Host) -> (due: pipe.Time) {
 			}
 			if p.far {
 				nearer(&due, at(p.used, NAT_IDLE + time.Millisecond))
+			}
+			if p.suspect != {} {
+				nearer(&due, at(p.suspect, SUSPECT_WAIT))
+			}
+			if p.reknocks > 0 {
+				nearer(&due, at(p.next_reknock, 0))
 			}
 		} else if p.knocks > 0 {
 			nearer(&due, at(p.next_knock, 0))

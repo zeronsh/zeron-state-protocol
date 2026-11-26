@@ -1,6 +1,8 @@
 package host
 
+import "core:net"
 import "core:testing"
+import "core:time"
 import "../pipe"
 import "../zsp"
 
@@ -65,34 +67,67 @@ knocks_are_heard_once :: proc(t: ^testing.T) {
 	testing.expect(t, pipe.link_answers(p.answer, new[:n]))
 }
 
-// A device that starts again, its key the same and its port another, is heard from by beacon while the one that dials
-// it still has a session on a link to the process that is gone. The dialler knocks anew, on a link beside the old one;
-// a beacon from the port the link already has changes nothing.
+// A beacon from a device while a session with it stands: a live peer answers the poke it brings, and nothing more is
+// sent, though the beacon say it is elsewhere (it may be an old one, said again by anyone). One that answers nothing,
+// as a process gone does, is sought anew where the beacon said: the dialler knocks there, beside its link, and the other
+// tells the dialler where it is.
 @(test)
-a_device_started_again_is_dialled_again :: proc(t: ^testing.T) {
-	w: World
-	testing.expect(t, world_init(t, &w))
-	defer world_destroy(&w)
-	testing.expect(t, world_ready(&w, direct = true))
-	dialler := 1 if string(w.keys[1].device[:]) < string(w.keys[2].device[:]) else 2
-	other := 3 - dialler
-	h := &w.hosts[dialler]
-	p: ^Peer
-	for x in h.udp.links {
-		if x.device == w.keys[other].device && x.session != nil {
-			p = x
+a_device_started_again_is_found_again :: proc(t: ^testing.T) {
+	for silent in ([]bool{false, true}) {
+		for dial in ([]bool{true, false}) {
+			w: World
+			testing.expect(t, world_init(t, &w))
+			defer world_destroy(&w)
+			testing.expect(t, world_ready(&w, direct = true))
+			dialler := 1 if string(w.keys[1].device[:]) < string(w.keys[2].device[:]) else 2
+			here := dialler if dial else 3 - dialler
+			there := 3 - here
+			// Where the beacon says it is: a socket of the test's own, to see what is sent there.
+			watch, err := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+			testing.expect(t, err == nil)
+			defer net.close(watch)
+			net.set_option(watch, .Receive_Timeout, 200 * time.Millisecond)
+			bound, _ := net.bound_endpoint(watch)
+			// As a process gone without a word looks from here: what the link sends goes to a socket nobody reads.
+			void, verr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
+			testing.expect(t, verr == nil)
+			defer net.close(void)
+			if silent {
+				world_run(&w, proc(_: ^World, _: rawptr) -> bool {return false}, nil, 200 * time.Millisecond) // what it said last, heard
+				for x in w.hosts[here].udp.links {
+					if x.device == w.keys[there].device {
+						gone, _ := net.bound_endpoint(void)
+						x.address = address_from(gone)
+					}
+				}
+			}
+			beacon := zsp.beacon_seal(&world_space(&w, there).node, bound.port)
+			beacon_heard(&w.hosts[here], beacon, address_from(net.Endpoint{net.IP4_Loopback, 9}))
+			heard := make([dynamic]byte, context.temp_allocator)
+			until := time.tick_add(time.tick_now(), SUSPECT_WAIT + time.Second)
+			for time.tick_diff(time.tick_now(), until) > 0 && len(heard) == 0 {
+				world_run(&w, proc(_: ^World, _: rawptr) -> bool {return false}, nil, 50 * time.Millisecond)
+				buf: [2048]byte
+				if n, _, rerr := net.recv_udp(watch, buf[:]); rerr == nil && n > 0 {
+					append(&heard, buf[0])
+				}
+			}
+			p: ^Peer
+			for x in w.hosts[here].udp.links {
+				if x.device == w.keys[there].device {
+					p = x
+				}
+			}
+			switch {
+			case !silent:
+				testing.expectf(t, len(heard) == 0, "a live peer, dialler %v: %v sent where the beacon said", dial, heard[:])
+				testing.expect(t, p != nil && p.session != nil && p.answer == nil)
+			case dial:
+				testing.expectf(t, len(heard) > 0 && heard[0] == byte(pipe.Type.First), "dialler: %v", heard[:])
+				testing.expect(t, p != nil && p.session != nil && p.answer != nil, "it keeps its session meanwhile")
+			case:
+				testing.expectf(t, len(heard) > 0 && heard[0] == byte(BEACON), "the other: %v", heard[:])
+			}
 		}
 	}
-	testing.expect(t, p != nil && p.answer == nil)
-	if p == nil {
-		return
-	}
-	same := zsp.beacon_seal(&world_space(&w, other).node, int(p.address.port))
-	beacon_heard(h, same, p.address)
-	testing.expect(t, p.answer == nil, "a beacon from where the link is knocks for nothing")
-	moved := p.address
-	moved.port += 1
-	again := zsp.beacon_seal(&world_space(&w, other).node, int(moved.port))
-	beacon_heard(h, again, moved)
-	testing.expect(t, p.answer != nil && p.session != nil, "it knocks anew, and keeps the session it has meanwhile")
 }

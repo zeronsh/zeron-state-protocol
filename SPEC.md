@@ -492,7 +492,10 @@ had lately nothing to send. Out-of-order data, held, is bounded by these windows
 
 The device with the lesser key dials. Devices that share a relay swap candidate addresses, 18 bytes each (IPv6 or mapped IPv4, then port, big-endian), in signals of kind 0, and
 both send to all of the other's at once. On a local network a device broadcasts from its link socket, at start and a few times soon after, to UDP port 9083, and a device that hears it and should be dialled answers that socket with the same: 0x44 ‖ salt (8) ‖
-XChaCha20-Poly1305 under derive(space, "zsp-beacon"), nonce 0 (8) ‖ salt ‖ 0 ‖ 0x42 ‖ 0 (6), of device (32) ‖ link port (2, big-endian), no associated data.
+XChaCha20-Poly1305 under derive(space, "zsp-beacon"), nonce 0 (8) ‖ salt ‖ 0 ‖ 0x42 ‖ 0 (6), of device (32) ‖ link port (2, big-endian), no associated data. A beacon is bound to no time, so anyone may say an old one
+again: a device that hears one from a device it has a link to asks after the link, and only if nothing comes back on it for a
+few seconds (3, here) does it act as though it had no link, the dialler knocking where the beacon says and the other answering it in kind;
+the new link takes the old one's place only once it is proven. So a device that starts again is found again soon, and a beacon said again moves nothing.
 
 A link over UDP through a NAT is closed after 25 idle seconds, before the NAT forgets it, and dialled again when there is something to say. While a call is under
 way on a link, an end that has said nothing on it for 15 seconds pings; and so does one whose relay says that the device has gone.
