@@ -158,5 +158,19 @@ for (const [code, reason] of [[1004, ""], [1015, ""], [2000, ""], [999, ""], [50
   check(`a port's close with ${code} and ${reason.length} bytes`, server.closedWith !== null, JSON.stringify(p.said));
 }
 
+// An answer says its length, as the port said it: a body's, and a HEAD's of the body it would have.
+for (const method of ["GET", "HEAD"]) {
+  const call = new Call(pipe(), 1);
+  setTimeout(() => {
+    call.flow(0, new Uint8Array([0]));
+    call.flow(0, enc.encode(`HTTP/1.1 200 OK\r\nContent-Length: ${method === "HEAD" ? 12345 : 5}\r\n\r\n${method === "HEAD" ? "" : "hello"}`));
+    call.flow(1, new Uint8Array());
+  }, 10);
+  const res = await serve(new Request("https://app.example.test/", { method }), "app", () => call);
+  const length = res.headers.get("content-length");
+  check(`a ${method}'s length`, length === (method === "HEAD" ? "12345" : "5"), String(length));
+  await res.arrayBuffer();
+}
+
 if (failed) process.exit(1);
 console.log("ok   relay/test/public.mjs");
