@@ -25,7 +25,7 @@ def spent(a, b):
     d = {k: s1[k] - s0[k] for k in ("gets", "puts", "deletes", "got", "put", "rowsWritten", "rowsRead")}
     d["dollars"] = d["puts"] * CLASS_A + d["gets"] * CLASS_B + d["rowsWritten"] * ROW_WRITTEN
     n0, n1 = a.get("node") or {}, b.get("node") or {}
-    d["node"] = {k: n1[k] - n0.get(k, 0) for k in n1 if k != "dirty"}
+    d["node"] = {k: n1[k] - n0.get(k, 0) for k in n1 if k not in ("dirty", "uploaded", "local_from", "tail")}
     return d
 
 

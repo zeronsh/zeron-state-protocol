@@ -289,7 +289,7 @@ export class Space extends DurableObject {
     if (this.#wasm) {
       const n = this.#wasm.stats();
       const d = new DataView(this.#view(this.#wasm.data(), n).slice().buffer);
-      const names = ["gets", "puts", "deletes", "got", "put", "checkpoints", "extents", "fetched_pages", "local_hits", "relocated", "dirty", "log_gets"];
+      const names = ["gets", "puts", "deletes", "got", "put", "checkpoints", "extents", "fetched_pages", "local_hits", "relocated", "dirty", "log_gets", "uploaded", "local_from", "tail"];
       out.node = Object.fromEntries(names.map((k, i) => [k, Number(d.getBigUint64(i * 8, false))]));
       out.memory = this.#wasm.memory.buffer.byteLength;
     }

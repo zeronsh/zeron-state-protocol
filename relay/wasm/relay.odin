@@ -243,13 +243,13 @@ done :: proc "c" (id: u32, ok, absent: bool, size: int) {
 	free_all(context.temp_allocator)
 }
 
-// What it has cost so far, into the buffer: twelve numbers.
+// What it has cost so far, and where its log stands, into the buffer: fifteen numbers.
 @(export)
 stats :: proc "c" () -> int {
 	context = runtime.default_context()
 	clear(&message)
 	st := remote.stats
-	for v in ([?]u64{u64(st.gets), u64(st.puts), u64(st.deletes), st.got, st.put, u64(st.checkpoints), u64(st.extents), u64(st.fetched_pages), u64(st.local_hits), u64(st.relocated), u64(len(node.store.dirty)), u64(st.log_gets)}) {
+	for v in ([?]u64{u64(st.gets), u64(st.puts), u64(st.deletes), st.got, st.put, u64(st.checkpoints), u64(st.extents), u64(st.fetched_pages), u64(st.local_hits), u64(st.relocated), u64(len(node.store.dirty)), u64(st.log_gets), remote.uploaded, remote.local_from, zsp.store_tail(&node.store) if !node.store.replaying else 0}) {
 		zsp.write_u64(&message, v)
 	}
 	return len(message)
