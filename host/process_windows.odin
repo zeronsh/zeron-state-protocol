@@ -47,7 +47,7 @@ Process :: struct {
 	freed:    bool,
 	console_guard: sync.Mutex, // held while the console is resized or closed, on whichever thread
 	pipe_check: ^nbio.Operation, // once it has ended: whether a read of its output waits on a pipe at its end
-	stuck:    [2]bool, // seen so once already
+	stuck:    [2]^nbio.Operation, // the read seen waiting on a pipe that is gone, once already
 }
 
 HPCON :: distinct rawptr
@@ -404,6 +404,10 @@ process_free :: proc(p: ^Process) {
 		}
 	}
 	process_input_close(p)
+	if p.write_op != nil {
+		nbio.remove(p.write_op) // what says input was let go of, its input closed already
+		p.write_op = nil
+	}
 	for &h, i in p.output {
 		if h != nil {
 			win.CloseHandle(h)
@@ -469,6 +473,15 @@ process_listen :: proc(p: ^Process, i: int) {
 		})
 		return
 	}
+	if gone, waiting := process_pipe_gone(p.output[i]); gone && waiting == 0 {
+		// At its end already: not read, for core:nbio might never say so (see process_watch_pipes). Told on the loop's
+		// next turn, not within whatever asked for more.
+		p.read_ops[i] = nbio.next_tick_poly2(p, i, proc(op: ^nbio.Operation, p: ^Process, i: int) {
+			p.read_ops[i] = nil
+			process_eof(p, i)
+		})
+		return
+	}
 	p.read_ops[i] = nbio.read_poly2(nbio.Handle(p.output[i]), 0, p.bufs[i], p, i, proc(op: ^nbio.Operation, p: ^Process, i: int) {
 		p.read_ops[i] = nil
 		if op.read.err != nil {
@@ -523,6 +536,20 @@ process_check_done :: proc(p: ^Process) {
 @(private)
 process_flush :: proc(p: ^Process) {
 	if p.write_op != nil || len(p.held) == 0 {
+		return
+	}
+	if gone, _ := process_pipe_gone(p.input); gone {
+		// Its stdin is closed, and what is held never will be taken: let go of, and said on the loop's next turn, not
+		// written, for core:nbio might never say how the write went.
+		process_input_close(p)
+		p.write_op = nbio.next_tick_poly(p, proc(op: ^nbio.Operation, p: ^Process) {
+			p.write_op = nil
+			if p.events.on_room != nil && !p.freed {
+				p.telling += 1
+				p.events.on_room(p.events.data)
+				process_told(p)
+			}
+		})
 		return
 	}
 	p.writing, p.held = p.held, p.writing
@@ -611,46 +638,78 @@ process_exited :: proc(op: ^nbio.Operation) {
 	win.GetExitCodeProcess(p.process, &code)
 	p.exit = {code = int(code)}
 	p.reaped = true
+	p.telling += 1 // held, for what is told may let it go
 	process_check_done(p)
-	if !p.told && !p.freed {
-		process_check_pipes(p)
+	if !process_told(p) {
+		return
+	}
+	if !p.told {
+		process_watch_pipes(p)
 	}
 }
 
-// core:nbio on Windows may wait for ever on a read of a pipe that broke as the read was made, its end told by no
-// completion: so once the process has ended, a pipe still being read that says it is broken and empty, twice over a
-// while apart (time for any completion on its way to come), is taken to be at its end.
+// core:nbio on Windows may wait for ever on a read or a write of a pipe that broke as it was made, its end told by no
+// completion. So a pipe is asked before each whether its other end has gone (process_pipe_gone); and, for one that
+// went between the asking and the reading, once the process has ended the same read still waiting on a pipe that is
+// gone and empty, at two looks 100 ms apart (time for any completion on its way to be told), is taken to be its end.
 @(private)
-process_check_pipes :: proc(p: ^Process) {
-	p.pipe_check = nil
-	for i in 0 ..< 2 {
-		h := p.output[i]
-		if h == nil || p.read_ops[i] == nil {
-			p.stuck[i] = false
-			continue
-		}
-		avail: win.DWORD
-		broken := !win.PeekNamedPipe(h, nil, 0, nil, &avail, nil) && win.GetLastError() == win.ERROR_BROKEN_PIPE
-		if !broken {
-			p.stuck[i] = false
-			continue
-		}
-		if !p.stuck[i] {
-			p.stuck[i] = true
-			continue
-		}
-		nbio.remove(p.read_ops[i])
-		p.read_ops[i] = nil
-		process_eof(p, i)
-		if p.freed || p.told {
-			return
-		}
-	}
-	if p.output[0] != nil || p.output[1] != nil {
+process_watch_pipes :: proc(p: ^Process) {
+	if p.pipe_check == nil && (p.output[0] != nil || p.output[1] != nil) {
 		p.pipe_check = nbio.timeout_poly(100 * time.Millisecond, p, proc(op: ^nbio.Operation, p: ^Process) {
+			p.pipe_check = nil
 			process_check_pipes(p)
 		})
 	}
+}
+
+@(private)
+process_check_pipes :: proc(p: ^Process) {
+	if p.freed || p.told {
+		return
+	}
+	p.telling += 1 // held, for what is told may let it go
+	for i in 0 ..< 2 {
+		op := p.read_ops[i]
+		if p.output[i] == nil || op == nil || op.type != .Read || p.got[i] > 0 {
+			p.stuck[i] = nil
+			continue
+		}
+		gone, waiting := process_pipe_gone(p.output[i])
+		if !gone || waiting > 0 {
+			p.stuck[i] = nil
+			continue
+		}
+		if p.stuck[i] != op {
+			p.stuck[i] = op // seen so once: looked at again in a while
+			continue
+		}
+		nbio.remove(op)
+		p.read_ops[i] = nil
+		p.stuck[i] = nil
+		process_eof(p, i)
+		if p.freed || p.told {
+			break
+		}
+	}
+	if process_told(p) && !p.told {
+		process_watch_pipes(p)
+	}
+}
+
+// Whether the other end of a pipe has gone, and how much is waiting in it to be read.
+@(private)
+process_pipe_gone :: proc(h: win.HANDLE) -> (gone: bool, waiting: u32) {
+	Pipe_Local :: struct {
+		type, configuration, most_instances, instances, in_quota, read_available: u32,
+		out_quota, write_available, state, end: u32,
+	}
+	CLOSING :: 4 // FILE_PIPE_CLOSING_STATE: the other end has closed its handle
+	info: Pipe_Local
+	io: win.IO_STATUS_BLOCK
+	if win.NtQueryInformationFile(h, &io, &info, size_of(info), .FilePipeLocalInformation) < 0 {
+		return false, 0
+	}
+	return info.state == CLOSING, info.read_available
 }
 
 // Stops, or lets go on, everything in its job.

@@ -755,9 +755,6 @@ review_environment_of_many_entries :: proc(t: ^testing.T) {
 // said to it, a signal above all, can still be said.
 @(test)
 review_input_for_a_closed_stdin_is_credited :: proc(t: ^testing.T) {
-	when ODIN_OS == .Windows {
-		return
-	}
 	w: World
 	testing.expect(t, world_init(t, &w))
 	defer world_destroy(&w)
@@ -766,10 +763,12 @@ review_input_for_a_closed_stdin_is_credited :: proc(t: ^testing.T) {
 	testing.expect(t, shares_set(b, "shell 1 commands"))
 	first := make([dynamic]byte, context.temp_allocator)
 	append(&first, 0)
+	// Python, as every system it is tested on has it: its stdin closed, it says so, and goes on.
+	python := "python" when ODIN_OS == .Windows else "python3"
 	zsp.write_varint(&first, 3)
-	zsp.write_bytes(&first, transmute([]byte)string("sh"))
+	zsp.write_bytes(&first, transmute([]byte)python)
 	zsp.write_bytes(&first, transmute([]byte)string("-c"))
-	zsp.write_bytes(&first, transmute([]byte)string("exec <&-; printf closed; sleep 30"))
+	zsp.write_bytes(&first, transmute([]byte)string("import os, sys, time; os.close(0); sys.stdout.write('closed'); sys.stdout.flush(); time.sleep(30)"))
 	zsp.write_varint(&first, 0)
 	zsp.write_bytes(&first, nil)
 	recv: Review_Recv

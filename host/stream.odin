@@ -531,10 +531,17 @@ dialer_deadline :: proc(d: ^Dialer) -> (t: time.Tick, ok: bool) {
 	case .Up:
 		wait := PONG_WAIT if d.stream.pinged else PING_IDLE
 		return time.tick_add(d.stream.quiet_at, wait), true
-	case .Resolving, .Dialling:
+	case .Resolving:
+		// Its thread wakes the loop when the name is known, by nbio.wake_up, which on Windows wakes a loop only if it is
+		// asleep already: so the loop looks again within a while, whatever it is told.
+		return time.tick_add(time.tick_now(), RESOLVE_LOOK), true
+	case .Dialling:
 	}
 	return
 }
+
+// How long a loop waits, at most, while a relay's name is being resolved, without looking whether it is.
+RESOLVE_LOOK :: 25 * time.Millisecond
 
 @(private)
 dialers_run :: proc(h: ^Host, now: time.Tick) {
