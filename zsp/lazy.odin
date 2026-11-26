@@ -210,6 +210,9 @@ frame_step :: proc(s: ^Session, frame: []byte) -> bool {
 	if n.store.replaying || remote_full(n.store.remote) {
 		return false // when the store has caught up
 	}
+	// Cells being gathered are ended first: a frame closed in the step may be cut short where it lies, before the mark,
+	// which rolling back to the mark would not undo.
+	cells_close(s)
 	m := session_mark(s)
 	t := store_begin(&n.store)
 	outer := n.current
@@ -247,6 +250,7 @@ unit_step :: proc(s: ^Session, unit: proc(s: ^Session, t: ^Task), t: ^Task = nil
 	if n.store.replaying {
 		return false
 	}
+	cells_close(s) // as frame_step's
 	m := session_mark(s)
 	step := store_begin(&n.store)
 	unit(s, t)

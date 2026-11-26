@@ -1991,9 +1991,14 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 			return // larger than any signal there is
 		}
 		for to in n.sessions {
-			// What was committed before goes before: all of it, to everyone it goes to, or nothing yet.
-			if to.ready && to.peer == device && !flush_changes(to) {
-				return
+			// What was committed before goes before: all of it, to everyone it goes to, or nothing yet. Whole frames,
+			// whether the signal goes after them or not.
+			if to.ready && to.peer == device {
+				flushed := flush_changes(to)
+				cells_close(to)
+				if !flushed {
+					return
+				}
 			}
 		}
 		for to in n.sessions {

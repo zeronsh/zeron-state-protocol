@@ -232,3 +232,127 @@ review_lanes_given_up_hold_nothing :: proc(t: ^testing.T) {
 	ok := session_lane_input(b_sess, 10000, 3, partial[:])
 	testing.expectf(t, ok && !b_sess.closing && b_sess.lane_held == len(partial), "held %d, ok %v, closing %v", b_sess.lane_held, ok, b_sess.closing)
 }
+
+// Round 8. A signal a relay drops for a session with too much waiting leaves no frame of that session's open, to be
+// cut short in place and then rolled back over by a step that missed in a lazy store: what the peer is sent stays
+// whole frames, and the change it was owed comes.
+@(test)
+review_dropped_signal_leaves_frames_whole :: proc(t: ^testing.T) {
+	state := seeded(801)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	s.lazy = .Remote
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
+	defer sim_destroy(&s)
+	a, b, relay := s.nodes[0], s.nodes[1], s.nodes[2]
+	r := &relay.remote.remote
+	relay.remote.host.fail = 0
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	rows := make([dynamic]Id, context.temp_allocator)
+	for i in u64(0) ..< 120 {
+		s.now += 3
+		a.node.now = sim_now(&s, a)
+		row := node_id(&a.node, 1)
+		append(&rows, row)
+		body: [24]byte
+		put_u64(body[:], 1 << 32 | 5)
+		put_u64(body[8:], 5)
+		put_u64(body[16:], i + 1)
+		_ = node_write(&a.node, {{row, PLACE, .Place, node_stamp(&a.node), body[:]}})
+		if i % 40 == 39 {
+			sim_settle(&s)
+		}
+	}
+	sim_settle(&s)
+	r.want_checkpoint = true
+	sim_settle(&s)
+	remote_rest(r)
+	forget :: proc(relay: ^Sim_Node, r: ^Remote) {
+		for no, entry in r.pages {
+			if no != 0 {
+				free(entry.pg)
+				delete_key(&r.pages, no)
+			}
+		}
+		for kind in Cached {
+			for _, bytes in relay.remote.host.cache[kind] {
+				delete(bytes)
+			}
+			clear(&relay.remote.host.cache[kind])
+		}
+	}
+	forget(relay, r)
+	to_a, to_b := s.links[0].b, s.links[1].b
+	filler := make([]byte, 8000, context.temp_allocator)
+	for len(to_b.out) - to_b.sent < LINK_QUEUE - 9000 {
+		sig := make([dynamic]byte, context.temp_allocator)
+		sat := frame_begin(&sig, .Signal)
+		append(&sig, ..b.keys.device[:])
+		write_u8(&sig, u8(Post.Link))
+		append(&sig, ..filler)
+		frame_end(&sig, sat)
+		testing.expect(t, session_input(to_a, sig[:]))
+	}
+	// One small change, owed to b.
+	s.now += 3
+	a.node.now = sim_now(&s, a)
+	small_row := node_id(&a.node, 1)
+	pbody: [24]byte
+	put_u64(pbody[:], 1 << 32 | 5)
+	put_u64(pbody[8:], 5)
+	put_u64(pbody[16:], 99999)
+	_ = node_write(&a.node, {{small_row, PLACE, .Place, node_stamp(&a.node), pbody[:]}})
+	a_out := session_output(s.links[0].a)
+	testing.expect(t, session_input(to_a, a_out))
+	session_sent(s.links[0].a, len(a_out))
+	for to_a.stalled {
+		remote_work(r)
+		remote_ops(r)
+		for len(relay.remote.host.ops) > 0 {
+			review_answer(&relay.remote.host, r, 0, true)
+		}
+		node_retry(&relay.node)
+	}
+	// A signal that takes b's session past what a relay holds for it: dropped.
+	sig := make([dynamic]byte, context.temp_allocator)
+	sat := frame_begin(&sig, .Signal)
+	append(&sig, ..b.keys.device[:])
+	write_u8(&sig, u8(Post.Link))
+	append(&sig, ..make([]byte, 9000, context.temp_allocator))
+	frame_end(&sig, sat)
+	testing.expect(t, session_input(to_a, sig[:]))
+	// Then a frame on b's session that answers in part and misses in part, so is rolled back.
+	forget(relay, r)
+	want := make([dynamic]byte, context.temp_allocator)
+	wat := frame_begin(&want, .Want)
+	write_u8(&want, 0)
+	write_varint(&want, 2)
+	write_pair(&want, rows[len(rows) - 1])
+	write_varint(&want, 1)
+	write_u8(&want, u8(Kind.Value))
+	write_u8(&want, 0)
+	write_stamp(&want, Stamp{s.now + 100, 2})
+	write_pair(&want, rows[0])
+	write_varint(&want, 1)
+	write_u8(&want, u8(Kind.Value))
+	write_u8(&want, 0)
+	write_stamp(&want, Stamp{1, 1})
+	frame_end(&want, wat)
+	_ = session_input(to_b, want[:])
+	out := session_queued(to_b)
+	rd := Reader{buf = out}
+	whole := true
+	for rd.pos < len(rd.buf) && !rd.bad {
+		size := read_varint(&rd)
+		frame := read_take(&rd, int(size))
+		whole &&= len(frame) > 0 && frame[0] != 0
+	}
+	ok := session_input(s.links[1].a, out)
+	session_sent(to_b, len(out))
+	sim_settle(&s)
+	scan := row_scan(&b.node.store, small_row)
+	_, has := row_next(&b.node.store, &scan)
+	testing.expectf(t, ok && whole && !rd.bad && has, "frames whole %v, b has the change %v", whole && !rd.bad, has)
+}
