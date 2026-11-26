@@ -1504,8 +1504,12 @@ def test_expose():
     def huge_one():
         c, _ = huge.accept()
         c.recv(65536)
-        try:
-            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 67108864\r\n\r\n" + b"x" * (64 << 20))
+        try:  # without end, until whatever buffers there are (Windows' are large) are full and it is cut off
+            c.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            chunk = b"100000\r\n" + b"x" * (1 << 20) + b"\r\n"
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                c.sendall(chunk)
         except OSError:
             stalled.append(time.monotonic())
 
