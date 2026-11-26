@@ -16,15 +16,19 @@ loop_gives_what_it_held_back :: proc(t: ^testing.T) {
 	defer net.close(listener)
 	at, _ := net.bound_endpoint(listener)
 	// Sockets that say nothing, each polled: the operations that fill what the loop gives the system, and stay.
-	IDLE :: 300
-	idle: [IDLE]net.TCP_Socket
+	// More than io_uring's ring holds, as the tests build it (256), on Linux; elsewhere fewer, within what the system
+	// lets wait to be accepted and a test may have open, each accepted as it comes.
+	IDLE :: 300 when ODIN_OS == .Linux else 60
+	idle, accepted: [IDLE]net.TCP_Socket
 	polls: [IDLE]^nbio.Operation
-	for &s in idle {
+	for &s, i in idle {
 		s, err = net.dial_tcp(at)
 		testing.expect(t, err == nil)
+		accepted[i], _, _ = net.accept_tcp(listener)
 	}
-	defer for s in idle {
+	defer for s, i in idle {
 		net.close(s)
+		net.close(accepted[i])
 	}
 	for s, i in idle {
 		polls[i] = nbio.poll_poly(s, .Receive, &polls[i], proc(op: ^nbio.Operation, p: ^^nbio.Operation) {
