@@ -1099,6 +1099,28 @@ do
 	pass(b, a, mine, true)
 	assert(#db.state().tasks[1].steps == 1, "b let go of what is in a row that came back")
 	assert(#da.state().tasks[1].steps == 1, "and so a has lost it")
+
+	-- A text left out of what is set is empty, as it reads, and is emptied as an edit: what another types meanwhile is kept.
+	since = #a.out
+	da.update(function(d)
+		d.tasks[1].notes = "draft"
+	end)
+	run(a)
+	pass(a, b, since, true)
+	assert(db.state().tasks[1].notes == "draft")
+	mine = #b.out
+	db.update(function(d)
+		d.tasks[1].notes = "draft, and more"
+	end)
+	run(b)
+	since = #a.out
+	local t = da.state().tasks[1]
+	da.set({ title = da.state().title, tasks = { { id = t.id, title = t.title, tags = {}, steps = t.steps, plan = {} } } })
+	run(a)
+	pass(b, a, mine, true)
+	pass(a, b, since, true)
+	assert(da.state().tasks[1].notes == ", and more", `a has {da.state().tasks[1].notes}`)
+	assert(db.state().tasks[1].notes == ", and more", `b has {db.state().tasks[1].notes}`)
 	da.stop()
 	db.stop()
 end

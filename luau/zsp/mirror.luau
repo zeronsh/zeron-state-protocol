@@ -551,8 +551,9 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 
 	-- A map: the same table as before if nothing in it is other than it was.
 	local function build_map(s: Schema, id: string): any
-		local was = nodes[id]
-		if was and not dirty_node[id] and schema_of[id] == s and not plain then
+		-- A map read as another's schema, as every map is while the scope is not known and all ids are nothing, is not this one.
+		local was = if schema_of[id] == s then nodes[id] else nil
+		if was and not dirty_node[id] and not plain then
 			return was
 		end
 		dirty_node[id] = nil
@@ -1243,9 +1244,10 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					local nv, ov = new[name], if old then old[name] else nil
 					if c.who then
 						continue
-					elseif c.text and not made and type(nv) == "string" then
-						-- As edits, so that what others type meanwhile is kept.
-						if nv ~= ov then
+					elseif c.text and not made and (nv == nil or type(nv) == "string") then
+						-- As edits, so that what others type meanwhile is kept. A text left out is empty, as it reads.
+						nv = nv or ""
+						if nv ~= (ov or "") then
 							change.edit(id, c.slot, function(t, fresh)
 								local was = text.read(t)
 								local a, z = 0, 0

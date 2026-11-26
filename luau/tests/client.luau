@@ -600,4 +600,19 @@ do
 	assert(shown.rows[1].body == "hello!", "the text is as it was")
 end
 
+-- Before the scope is known every map's id is nothing: two maps are not taken for one another meanwhile.
+do
+	local h = harness()
+	local m = zsp.mirror
+	local doc = m.open(h.client, {
+		scope = 1,
+		name = "early",
+		schema = m.map({ a = m.map({ x = zsp.string(16) }), b = m.map({ y = zsp.number(17) }) }),
+	})
+	h.run()
+	local st = doc.state()
+	assert(not rawequal(st.a, st.b), "a and b are not one map")
+	doc.stop()
+end
+
 print("ok")
