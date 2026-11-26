@@ -124,6 +124,38 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await node.close();
 }
 
+// Nothing is said in text by a relay but "pong": one that says anything else is not gone on with, but dialled again.
+{
+  let dials = 0;
+  class Chatty extends EventTarget {
+    binaryType = "arraybuffer";
+    readyState = 0;
+    bufferedAmount = 0;
+    onopen: (() => void) | null = null;
+    onmessage: ((e: { data: unknown }) => void) | null = null;
+    onclose: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor() {
+      super();
+      dials++;
+      setTimeout(() => {
+        this.readyState = 1;
+        this.onopen?.();
+        this.onmessage?.({ data: "hello" });
+      }, 1);
+    }
+    send() {}
+    close() {
+      this.readyState = 3;
+    }
+  }
+  const node = await Node.open({ volume: new MemoryVolume(), module, log: () => {}, WebSocket: Chatty as unknown as typeof WebSocket });
+  node.join("ab".repeat(32), { key: "cd".repeat(32), url: "ws://127.0.0.1:1" });
+  await new Promise((done) => setTimeout(done, 1000));
+  assert(dials >= 2, `a relay that chatted in text was gone on with: dialled ${dials} times`);
+  await node.close();
+}
+
 // Where a relay keeps a space, a proxy's query staying at the end.
 assert.equal(spaceUrl("wss://relay.example/", "ab"), "wss://relay.example/ab");
 assert.equal(spaceUrl("wss://relay.example/zsp?key=1", "ab"), "wss://relay.example/zsp/ab?key=1");

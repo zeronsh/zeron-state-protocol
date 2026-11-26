@@ -285,7 +285,7 @@ function putWhere(x: Writing, c: Where): void {
       codec.putU8(w, 10);
       column(x, c.column, c.text, WORDS);
       codec.putU8(w, how.phrase ? 2 : how.any ? 1 : 0);
-      codec.putU8(w, (how.prefix ? 1 : 0) + (how.inside ? 2 : 0) + Math.min(Math.max(how.typos ?? 0, 0), 3) * 4);
+      codec.putU8(w, (how.prefix ? 1 : 0) + (how.inside ? 2 : 0) + Math.min(Math.max(Math.trunc(how.typos ?? 0), 0), 3) * 4);
       codec.putUtf8(w, c.text);
       break;
     }

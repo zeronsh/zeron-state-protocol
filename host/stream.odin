@@ -206,7 +206,8 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 			}
 		case .Text:
 			// Nothing is said in text but this, by whoever cannot send a WebSocket's own ping: a browser.
-			if !fin || string(payload) != "ping" {
+			// And not within a message in several frames, which nothing may come between (RFC 6455 5.4).
+			if !fin || s.fragmented || string(payload) != "ping" {
 				return false
 			}
 			stream_put(s, .Text, transmute([]byte)string("pong"))

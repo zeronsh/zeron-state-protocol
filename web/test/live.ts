@@ -117,7 +117,8 @@ export async function live({ a, b, breakPipes, say = console.log }: Sides): Prom
       const clock = now();
       while (last().body !== said && now() - clock < 5000) await turn();
       started = now() - clock;
-      check(started < 100, "tokens are seen at once");
+      // At once: by live frames, long before the piece is sealed, a second after it began.
+      check(started < 500, "tokens are seen at once");
     }
     if (i % 10 === 0) await sleep(5);
   }

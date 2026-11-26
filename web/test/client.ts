@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import * as codec from "../src/codec.ts";
 import { Client, columns as c, type Answer, type State } from "../src/client.ts";
 import * as text from "../src/text.ts";
+import * as ask from "../src/ask.ts";
 import { where } from "../src/ask.ts";
 
 const HELLO = 1, ROSTER = 2, WATCH = 3, CELLS = 7, ACK = 8, SYNCED = 10;
@@ -277,6 +278,31 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   const titles = [...row.slots.get(16)!.values()].map((cell) => new TextDecoder().decode(cell.body));
   assert.deepEqual(titles, ["kept"], "what the new title killed is not back");
   assert.equal(text.read(h.client.heldText(id, Note.body.slot)!), "typed");
+}
+
+// What is asked of it is checked before anything is done: ids, devices and slots of the wrong size, and typos that are not
+// a whole number; and text is what was written, a byte order mark and all.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let seen!: State<typeof Note>;
+  h.client.window({ scope: 1, list: "a", table: Note }, (x) => (seen = x));
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "\ufeffmarked" })));
+  h.run();
+  assert.equal(seen.rows[0].title, "\ufeffmarked");
+  const said = h.self.said.length;
+  assert.throws(() => h.client.call("abcd", 1, "m", "x"), RangeError);
+  assert.equal(h.self.said.length, said, "nothing was said of it");
+  assert.throws(() => h.client.write(1, (change) => change.place(id, "b", 1, 0)), RangeError);
+  assert.throws(() => h.client.write(1, (change) => change.place(id, "b", 1, 16)), RangeError);
+  assert.throws(() => h.client.text("abcd", Note.body), RangeError);
+  assert.throws(() => h.client.held("zz"), RangeError);
+  const tag = () => rep("\0", 16);
+  const typos = (n: number) => s(ask.write({ scope: 1, table: Note, where: where.matches("title", "x", { typos: n as 1 }) }, tag)[0]);
+  assert.equal(typos(1.5), typos(1));
 }
 
 // A client that is closed is not connected, says so, and what it was calling is lost.

@@ -198,6 +198,13 @@ const tests: Record<string, () => Promise<void>> = {
     await call(follower, "put", "lf", "notes", ["two"]);
     expectEqual((await call<string[]>(follower, "titles", "lf", "notes", 2)).join(), "one,two");
   },
+  // A pipe of one's own may be given a view of a buffer its giver goes on using: what it hands on is its own copy.
+  async browser_pipe_copies() {
+    const p = await page();
+    await call(p, "device", "pc");
+    await call(p, "create", "pc");
+    expectEqual(await call<string>(p, "sendView", "pc"), "intact");
+  },
   // Whichever tab joins, makes or adopts a space, every tab's device says it is of it.
   async browser_space_told() {
     const one = await page();

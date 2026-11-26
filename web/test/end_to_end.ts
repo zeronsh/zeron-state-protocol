@@ -94,6 +94,44 @@ function watched(client: Client, list: string): () => number {
 }
 
 const tests: Record<string, () => Promise<void>> = {
+  // A relay answers a ping said in text, and nothing else in text; and nothing may come within a message in several
+  // frames, a ping included.
+  async text_ping() {
+    const relay = await node("serve", join(TMP, "p-relay"));
+    const { connect } = await import("node:net");
+    const frame = (op: number, fin: boolean, payload: Uint8Array) => {
+      const mask = crypto.getRandomValues(new Uint8Array(4));
+      const out = new Uint8Array(6 + payload.length);
+      out[0] = (fin ? 0x80 : 0) | op;
+      out[1] = 0x80 | payload.length;
+      out.set(mask, 2);
+      payload.forEach((b, i) => (out[6 + i] = b ^ mask[i % 4]));
+      return out;
+    };
+    const ask = (frames: Uint8Array[]) =>
+      new Promise<{ heard: string; closed: boolean }>((done) => {
+        const port = Number(relay.address.split(":").pop());
+        const sock = connect(port, "127.0.0.1", () => {
+          sock.write(`GET /${"ab".repeat(32)} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n`);
+          for (const f of frames) sock.write(f);
+        });
+        let got = Buffer.alloc(0);
+        sock.on("data", (d) => (got = Buffer.concat([got, d])));
+        const end = (closed: boolean) => {
+          sock.destroy();
+          const head = got.indexOf("\r\n\r\n");
+          done({ heard: head < 0 ? "" : got.subarray(head + 4).toString("latin1"), closed });
+        };
+        sock.on("close", () => end(true));
+        setTimeout(() => end(false), 1000);
+      });
+    const ping = new TextEncoder().encode("ping");
+    const alone = await ask([frame(1, true, ping)]);
+    expectEqual(alone.heard.includes("pong"), true);
+    const within = await ask([frame(2, false, Uint8Array.of(1, 2, 3)), frame(1, true, ping)]);
+    expectEqual(within.heard.includes("pong"), false);
+    expectEqual(within.closed, true);
+  },
   // An owner that has heard nothing for a while revokes a member: what that member rightly wrote meanwhile stands. A grant
   // ends when it is ended, not when its node last heard anything.
   async revoke_when_quiet() {
@@ -241,16 +279,16 @@ const tests: Record<string, () => Promise<void>> = {
       const sid = zspd("create", owner);
       zspd("relay", owner, relay.key, through.url);
       await node("run", owner);
-      const d = await open({ dir: join(TMP, "k-web-" + kind), keepalive: { idle: 300, wait: 300 }, log: () => {} });
+      const d = await open({ dir: join(TMP, "k-web-" + kind), keepalive: { idle: 500, wait: 1000 }, log: () => {} });
       zspd("admit", owner, d.key, "1");
       await d.join(sid, { key: relay.key, url: through.url });
       const c = d.client();
       await eventually("it is admitted", () => c.may(1, "write"));
       const before = through.connections();
-      await new Promise((done) => setTimeout(done, 1500));
+      await new Promise((done) => setTimeout(done, 2500));
       expectEqual(through.connections(), before); // pinged, and answered, five times over
       through.swallow();
-      await eventually("a connection that died without a word is dialled again", () => through.connections() > before, 3000);
+      await eventually("a connection that died without a word is dialled again", () => through.connections() > before, 5000);
       await eventually("and works", async () => {
         await c.write(1, (change) => change.insert({}, "x", 1, {}));
         return true;

@@ -80,7 +80,10 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     worker.postMessage({ connect: port2 } satisfies Command, [port2]);
     return {
       send: (data) => {
-        if (open) port1.postMessage({ data } satisfies Say, [data.buffer as ArrayBuffer]);
+        // A copy, of its own, is handed over: what was given may be a view of something its giver goes on using.
+        if (!open) return;
+        const own = data.slice();
+        port1.postMessage({ data: own } satisfies Say, [own.buffer]);
       },
       close: () => {
         if (!open) return;

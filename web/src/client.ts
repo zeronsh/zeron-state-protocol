@@ -28,7 +28,14 @@ const PIECE_MS = 1000; // or this long after it began,
 const LIVE_MS = 10000; // and live text unconfirmed for this long is dropped
 
 const utf8 = new TextEncoder();
-const fromUtf8 = new TextDecoder();
+const fromUtf8 = new TextDecoder("utf-8", { ignoreBOM: true }); // a byte order mark, if one was written, is read
+const ROW_ID = /^[0-9a-fA-F]{32}$/, DEVICE_ID = /^[0-9a-fA-F]{64}$/;
+
+// A row's id, as the protocol keeps it.
+function rowId(id: string): string {
+  if (!ROW_ID.test(id)) throw new RangeError("a row's id is 32 hex digits");
+  return codec.binary(codec.unhex(id));
+}
 const toBytes = (data: Uint8Array | string): Uint8Array => (typeof data === "string" ? utf8.encode(data) : data);
 
 // ---------------------------------------------------------------- what the host lends
@@ -1612,7 +1619,7 @@ export class Client {
   text(id: string, col: Column<string>): Editor {
     if (!col.text) throw new Error("not a text column");
     const slot = col.slot;
-    const bin = codec.binary(codec.unhex(id));
+    const bin = rowId(id);
     let early: (() => void)[] | undefined = this.#rows.has(bin) ? undefined : []; // what is done before there is a row to do it to
     const row = this.#row(bin);
     row.held.set(slot, (row.held.get(slot) ?? 0) + 1);
@@ -1706,7 +1713,7 @@ export class Client {
 
   /** A row as it is held: its cells by slot and stamp, or undefined. Not to be changed. */
   held(id: string): Stored | undefined {
-    return this.#rows.get(codec.binary(codec.unhex(id)));
+    return this.#rows.get(rowId(id));
   }
 
   /** A text column of a held row, as it is; undefined if the row is not held. */
@@ -1840,14 +1847,11 @@ export class Client {
     };
     const place = (bin: string, list: string, order: number, slot?: number) => {
       if (!Number.isSafeInteger(order) || order < 0) throw new RangeError("an order is a whole number from 0 to 2^53");
+      if (slot !== undefined && (!Number.isInteger(slot) || slot < 1 || slot > 15)) throw new RangeError("a row is placed in slots 1 to 15");
       const tag = this.tag(scope, list);
       put(bin, slot ?? 1, PLACE, codec.bytesOf(tag + codec.u64(order)));
     };
-    const idOf = (id: string) => {
-      const bin = codec.binary(codec.unhex(id));
-      if (bin.length !== 16) throw new Error("a row's id is 32 hex digits");
-      return bin;
-    };
+    const idOf = rowId;
     // Done here, so that what is refused throws here; and should it throw, as if it had never been.
     let resolve!: () => void;
     const result = new Promise<void>((done) => (resolve = done));
@@ -1959,6 +1963,7 @@ export class Client {
 
   /** Calls a method on a device, by its id. Set ondata, onend and onfault on the result before the turn is out. */
   call(device: string, scope: number, method: string, data: Uint8Array | string = new Uint8Array()): Call {
+    if (!DEVICE_ID.test(device)) throw new RangeError("a device's id is 64 hex digits");
     const id = ++this.#nextCall;
     const live = this.#call(id, 0, device, method);
     const first = toBytes(data);

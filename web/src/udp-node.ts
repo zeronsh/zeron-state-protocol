@@ -44,8 +44,11 @@ export interface UdpOptions {
 export async function nodeDatagrams(options: UdpOptions = {}): Promise<Datagrams> {
   let receive: (ip: Uint8Array, port: number, data: Uint8Array) => void = () => {};
   const hear = (msg: Buffer, from: { address: string; port: number }) => receive(bytesOf(from.address), from.port, new Uint8Array(msg));
+  // A socket's error is a packet that did not go, or a network that went: links notice what that means, and the process
+  // goes on.
   const bind = (s: Socket, port: number, address?: string) =>
     new Promise<boolean>((done) => {
+      s.on("error", () => {});
       s.once("error", () => done(false));
       s.bind({ port, address, exclusive: false }, () => done(true));
     });

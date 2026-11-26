@@ -52,6 +52,12 @@ web_test() {
 	node test/node.ts
 	node test/vectors.ts ../vectors/vectors.json
 	node test/ask.ts
+	node test/utf8.ts
+	node test/store_cases.ts
+	node test/mirror_edge.ts
+	node test/package.ts
+	node test/udp.ts
+	node test/find_memory.ts
 	for t in text mirror_model mirror_interop store end_to_end browsers; do
 		args=
 		[ $t = store ] && args=../build/node-small.wasm

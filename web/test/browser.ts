@@ -113,6 +113,22 @@ const zsp = {
     const c = clientOf(name);
     void c.write(1, (change) => change.insert({ v: columns.bytes(16) }, list, Date.now(), { v: new Uint8Array(size).fill(7) }));
   },
+  /** Sends a hello down a pipe of one's own as a view of a larger buffer, as a caller may: whether that buffer is intact. */
+  async sendView(name: string): Promise<string> {
+    const big = new ArrayBuffer(1024);
+    const hello = new Uint8Array(big, 100, 38);
+    hello.set([37, 1, 1, 4]);
+    let closed = false;
+    const wire = devices.get(name)!.connect(() => {}, () => (closed = true))!;
+    try {
+      wire.send(hello);
+    } catch (e) {
+      return "threw: " + (e as Error).message;
+    }
+    await sleep(50);
+    wire.close();
+    return big.byteLength === 1024 && !closed ? "intact" : "detached";
+  },
   /** Writes notes to a list of scope 1, and resolves once they are durable on the device. */
   async put(name: string, list: string, titles: string[]): Promise<void> {
     const c = clientOf(name);

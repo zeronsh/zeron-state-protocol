@@ -603,7 +603,9 @@ export class Node {
     ws.onmessage = (e: MessageEvent) => {
       if (this.#conns.get(id)?.kind !== "socket") return;
       if (typeof e.data === "string") {
-        this.#wasm!.heard(id); // "pong", or nothing it need understand
+        // Nothing is said in text but "pong", to a ping: whatever says anything else is not a relay to go on with.
+        if (e.data === "pong") this.#wasm!.heard(id);
+        else ws.close(), this.#lost(id);
         return;
       }
       const data = new Uint8Array(e.data as ArrayBuffer);
