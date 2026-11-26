@@ -326,23 +326,31 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 	}
 	host.save(in_dir(in_dir(dir, name), "roster.old"), data) or_return
 	host.save(path, bytes) or_return
-	announce(dir, bytes)
-	return true
+	return announce(dir, bytes)
 }
 
-// Hands a roster to the node running here, if one is, so that the change takes effect at once.
-announce :: proc(dir: string, roster: []byte) {
-	_, _ = speak(dir, roster)
+// Hands a roster to the node running here, if one is, so that the change takes effect at once. One that is there but
+// does not say it has it, as a busy one may not at once, is asked again; and if it never does, that is said.
+announce :: proc(dir: string, roster: []byte) -> bool {
+	for _ in 0 ..< 3 {
+		_, confirmed, reached := speak(dir, roster)
+		if confirmed || !reached {
+			return true // taken; or no node runs here, and it reads the roster when it starts
+		}
+	}
+	say(os.stderr, "the node running here did not say it has the change: it takes it when it next starts\n")
+	return false
 }
 
 // What the node running here, if one is, thinks the time is: no earlier than anything it has seen.
 running_clock :: proc(dir: string) -> u64 {
-	clock, _ := speak(dir, nil)
+	clock, _, _ := speak(dir, nil)
 	return clock
 }
 
-// Greets the node running here, with a roster if there is one to hand over, and hears what it says back.
-speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool) {
+// Greets the node running here, with a roster if there is one to hand over, and hears what it says back: its clock,
+// whether it said it, and whether anything was there to speak to.
+speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool, reached: bool) {
 	address, aerr := os.read_entire_file(in_dir(dir, "address"), context.temp_allocator)
 	token, terr := os.read_entire_file(in_dir(dir, "token"), context.temp_allocator)
 	endpoint, parsed := net.parse_endpoint(string(address))
@@ -354,6 +362,7 @@ speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool) {
 		return
 	}
 	defer net.close(socket)
+	reached = true
 	request := pipe.ws_request(string(address), "/")
 	net.send_tcp(socket, transmute([]byte)request)
 	frames := make([dynamic]byte, context.temp_allocator)
@@ -371,9 +380,10 @@ speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool) {
 	message := make([dynamic]byte, context.temp_allocator)
 	pipe.ws_put(&message, .Binary, frames[:], true)
 	net.send_tcp(socket, message[:])
-	// Its answer, which begins with its clock, says it has read this far.
+	// Its answer, which begins with its clock, says it has read this far. Until then the line stays open: what was sent
+	// on one closed before a busy node read it may not be read at all.
 	buf: [4096]byte
-	net.set_option(socket, .Receive_Timeout, 2 * time.Second)
+	net.set_option(socket, .Receive_Timeout, 10 * time.Second)
 	got := make([dynamic]byte, context.temp_allocator)
 	stream := make([dynamic]byte, context.temp_allocator)
 	used := 0
@@ -404,7 +414,7 @@ speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool) {
 				break
 			}
 			if zsp.Message(frame[0]) == .Roster && len(frame) >= 9 {
-				return zsp.get_u64(frame[1:]), true
+				return zsp.get_u64(frame[1:]), true, true
 			}
 		}
 	}

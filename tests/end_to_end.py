@@ -334,9 +334,18 @@ def test_luau():
     try:
         p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "live.luau"), *args], capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired as e: # it waits on its sockets once something has gone wrong
-        raise AssertionError((e.stderr or b"").decode()) from None
+        raise timed_out(e) from None
     sys.stdout.write(p.stdout.replace("ok\n", ""))
     assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stderr
+
+
+def timed_out(e):
+    """What a process said before it was given up on: bytes, as Python keeps them, but text on Windows."""
+    said = []
+    for out in (e.stdout, e.stderr):
+        if out:
+            said.append(out.decode(errors="replace") if isinstance(out, bytes) else out)
+    return AssertionError("timed out, having said:\n" + "\n".join(said)[-4000:])
 
 
 def test_mirror():
@@ -348,7 +357,7 @@ def test_mirror():
     try:
         p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "mirror.luau"), *args], capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired as e:
-        raise AssertionError((e.stderr or b"").decode()) from None
+        raise timed_out(e) from None
     sys.stdout.write(p.stdout.replace("ok\n", ""))
     assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stdout[-2000:] + p.stderr
 
@@ -577,6 +586,53 @@ def test_durable_object():
     cc.watch(1, 1, "chat")
     cc.until(lambda: len(cc.list(1, "chat")) == 300)
     assert not os.path.exists(os.path.join(d.dir, zspd_space(a), "roster"))
+
+
+def test_busy_node_takes_change():
+    """A change made beside a running node that is slow to answer is held out to it until it says it has it."""
+    import threading
+
+    d = Node("busy").dir
+    zspd("create", d)
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(4)
+    with open(os.path.join(d, "address"), "w") as f:
+        f.write("127.0.0.1:%d" % server.getsockname()[1])
+    with open(os.path.join(d, "token"), "w") as f:
+        f.write("t")
+    hung_up, heard = [], []
+
+    def busy():
+        # As a node that takes three seconds to answer: did whoever spoke wait for it?
+        server.settimeout(30)
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            got = b""
+            while b"\r\n\r\n" not in got or len(got) < 60:
+                got += conn.recv(4096)
+            heard.append(got)
+            time.sleep(3)
+            conn.setblocking(False)
+            try:
+                hung_up.append(conn.recv(1, socket.MSG_PEEK) == b"")
+            except BlockingIOError:
+                hung_up.append(False)
+            conn.setblocking(True)
+            answer = bytes([9, 2]) + (1).to_bytes(8, "big")
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" + bytes([0x82, len(answer)]) + answer)
+            conn.close()
+
+    t = threading.Thread(target=busy, daemon=True)
+    t.start()
+    p = subprocess.run([BIN, "scope", d], capture_output=True, text=True, timeout=60)
+    server.close()
+    assert p.returncode == 0, p.stderr
+    assert len(hung_up) == 2 and not any(hung_up), hung_up  # asked its clock, then handed the change, waiting each time
+    assert any(b"\x02" in h for h in heard)
 
 
 def test_relay_full():
