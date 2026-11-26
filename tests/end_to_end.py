@@ -1512,7 +1512,9 @@ def test_quiet_while_kept_up():
         return  # where the time used cannot be had
     time.sleep(3)
     used = [cpu_seconds(d.p.pid) - t for d, t in zip((a, b), before)]
-    assert max(used) < 0.15, f"kept up, and yet busy: {used} s of processor in 3 s"
+    # What is listening is looked at every 2 s while someone is kept up, at a cost that grows with the sockets the machine
+    # has (hundreds, with every other test running beside this one): nothing like a node that never rests, at 3 s.
+    assert max(used) < 0.5, f"kept up, and yet busy: {used} s of processor in 3 s"
 
 
 def test_offers_end():
