@@ -375,6 +375,7 @@ session_output :: proc(s: ^Session) -> []byte {
 
 // What is queued for the peer already, without making more: for a host to send in the midst of the session's work.
 session_queued :: proc(s: ^Session) -> []byte {
+	cells_close(s) // whole frames only: cells being gathered are ended here, and go on in another
 	return s.out[s.sent:]
 }
 

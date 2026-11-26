@@ -119,3 +119,18 @@ share_remove :: proc(d: Share_Dir, name: string) {
 		win.DeleteFileW(w)
 	}
 }
+
+// A file or folder in a share, opened by its path to read: only one on a disk, as nothing else there is a file.
+@(private)
+share_open_read :: proc(path: string) -> (f: ^os.File, status: Status) {
+	err: os.Error
+	f, err = os.open(path, {.Read})
+	if err != nil {
+		return nil, .Not_Found
+	}
+	if win.GetFileType(win.HANDLE(os.fd(f))) != win.FILE_TYPE_DISK {
+		os.close(f)
+		return nil, .Not_Found
+	}
+	return f, .Ok
+}

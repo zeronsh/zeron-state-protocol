@@ -106,3 +106,19 @@ share_status :: proc(e: posix.Errno) -> Status {
 	}
 	return .Failed
 }
+
+// A file or folder in a share, opened by its path to read, never waiting to be: a FIFO, or a device, would hold this
+// host up until something else opened it too, so only a regular file or a folder is opened at all.
+@(private)
+share_open_read :: proc(path: string) -> (f: ^os.File, status: Status) {
+	fd := posix.open(strings.clone_to_cstring(path, context.temp_allocator), {.NONBLOCK, .CLOEXEC})
+	if fd < 0 {
+		return nil, .Not_Found
+	}
+	st: posix.stat_t
+	if posix.fstat(fd, &st) != .OK || !(posix.S_ISREG(st.st_mode) || posix.S_ISDIR(st.st_mode)) {
+		posix.close(fd)
+		return nil, .Not_Found
+	}
+	return os.new_file(uintptr(fd), path), .Ok
+}

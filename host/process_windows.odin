@@ -44,6 +44,7 @@ Process :: struct {
 	told:     bool,
 	telling:  int,
 	freed:    bool,
+	console_guard: sync.Mutex, // held while the console is resized or closed, on whichever thread
 }
 
 HPCON :: distinct rawptr
@@ -184,7 +185,7 @@ process_start :: proc(spec: Process_Spec, events: Process_Events) -> (p: ^Proces
 	if job == nil {
 		return nil, process_error("cannot make a job object", win.GetLastError())
 	}
-	defer if err != "" {
+	defer if err != "" && job != nil {
 		win.CloseHandle(job)
 	}
 	limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION
@@ -277,6 +278,8 @@ process_start :: proc(spec: Process_Spec, events: Process_Events) -> (p: ^Proces
 			nbio.associate_handle(uintptr(h))
 		}
 	}
+	// The process's now, and closed by process_free, whatever happens: not by what is deferred here too.
+	mine, console, job = {}, nil, nil
 	p.exit_op = nbio.prep_timeout(0, process_exited)
 	p.exit_op.user_data[0] = p
 	nbio.detach(p.exit_op)
@@ -312,6 +315,11 @@ process_input :: proc(p: ^Process, bytes: []byte) -> int {
 	append(&p.held, ..bytes[:n])
 	process_flush(p)
 	return n
+}
+
+// Whether its input is over for good, closed by it or for it: what is given it now will never be taken.
+process_input_closed :: proc(p: ^Process) -> bool {
+	return p.freed || p.input == nil || p.reaped || sync.atomic_load(&p.ended)
 }
 
 process_input_room :: proc(p: ^Process) -> int {
@@ -358,10 +366,18 @@ process_signal :: proc(p: ^Process, s: Signal) {
 }
 
 process_resize :: proc(p: ^Process, rows, cols: u16) {
-	if p.freed || p.console == nil || sync.atomic_load(&p.taken) {
+	if p.freed || p.console == nil {
 		return
 	}
-	ResizePseudoConsole(p.console, {X = win.SHORT(cols), Y = win.SHORT(rows)})
+	// Not while the wait's thread is closing the console, which it may be doing as this is asked: then there is
+	// nothing to resize, and waiting for it could wait on output that only this thread reads.
+	if !sync.mutex_try_lock(&p.console_guard) {
+		return
+	}
+	defer sync.mutex_unlock(&p.console_guard)
+	if !sync.atomic_load(&p.taken) {
+		ResizePseudoConsole(p.console, {X = win.SHORT(cols), Y = win.SHORT(rows)})
+	}
 }
 
 process_free :: proc(p: ^Process) {
@@ -506,6 +522,11 @@ process_flush :: proc(p: ^Process) {
 		p.write_op = nil
 		if op.write.err != nil {
 			process_input_close(p) // its stdin is gone, or the console is: what was held never will be taken
+			if p.events.on_room != nil && !p.freed {
+				p.telling += 1
+				p.events.on_room(p.events.data) // so that it is let go of
+				process_told(p)
+			}
 			return
 		}
 		clear(&p.writing)
@@ -552,8 +573,12 @@ process_input_close :: proc(p: ^Process) {
 process_ended :: proc "system" (data: rawptr, timed_out: win.BOOLEAN) {
 	context = runtime.default_context()
 	p := (^Process)(data)
-	if p.console != nil && !sync.atomic_exchange(&p.taken, true) {
-		ClosePseudoConsole(p.console)
+	if p.console != nil {
+		sync.mutex_lock(&p.console_guard)
+		if !sync.atomic_exchange(&p.taken, true) {
+			ClosePseudoConsole(p.console)
+		}
+		sync.mutex_unlock(&p.console_guard)
 	}
 	op := p.exit_op
 	sync.atomic_store(&p.ended, true)
@@ -685,6 +710,11 @@ process_command_line :: proc(argv: []string) -> win.wstring {
 @(private)
 process_environment :: proc(spec: Process_Spec) -> rawptr {
 	list := make([dynamic]string, context.temp_allocator)
+	// Where each name the spec gives is given last, in any case: looked up, not searched for, however many it gives.
+	last := make(map[string]int, len(spec.env), context.temp_allocator)
+	for entry, i in spec.env {
+		last[strings.to_upper(process_env_name(entry), context.temp_allocator)] = i
+	}
 	block := win.GetEnvironmentStringsW()
 	if block != nil {
 		for at := ([^]u16)(block); at[0] != 0; {
@@ -693,16 +723,16 @@ process_environment :: proc(spec: Process_Spec) -> rawptr {
 				n += 1
 			}
 			entry, _ := win.utf16_to_utf8(at[:n], context.temp_allocator)
-			name := process_env_name(entry)
+			name := strings.to_upper(process_env_name(entry), context.temp_allocator)
 			// What the spec says instead, or for a terminal, its own kind instead of the host's.
-			if !process_env_names(spec, name) && !(spec.pty && strings.equal_fold(name, "TERM")) {
+			if name not_in last && !(spec.pty && name == "TERM") {
 				append(&list, entry)
 			}
 			at = at[n + 1:]
 		}
 		win.FreeEnvironmentStringsW(block)
 	}
-	if spec.pty && !process_env_names(spec, "TERM") {
+	if spec.pty && "TERM" not_in last {
 		append(&list, strings.concatenate({"TERM=", spec.term if spec.term != "" else "xterm-256color"}, context.temp_allocator))
 	}
 	for entry, i in spec.env {
@@ -710,11 +740,7 @@ process_environment :: proc(spec: Process_Spec) -> rawptr {
 		if len(name) == len(entry) {
 			continue
 		}
-		later := false
-		for other in spec.env[i + 1:] {
-			later ||= strings.equal_fold(process_env_name(other), name)
-		}
-		if !later {
+		if last[strings.to_upper(name, context.temp_allocator)] == i {
 			append(&list, entry)
 		}
 	}
@@ -737,16 +763,6 @@ process_env_name :: proc(entry: string) -> string {
 		return entry[:eq + min(1, len(entry))]
 	}
 	return entry
-}
-
-@(private)
-process_env_names :: proc(spec: Process_Spec, name: string) -> bool {
-	for entry in spec.env {
-		if strings.equal_fold(process_env_name(entry), name) {
-			return true
-		}
-	}
-	return false
 }
 
 @(private)

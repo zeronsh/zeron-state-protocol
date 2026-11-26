@@ -109,7 +109,9 @@ Link :: struct {
 	opened:      u64, // streams this end has opened
 	may_open:    u64, // how many it may have opened, by the peer's word
 	peer_floor:  u64, // every stream the peer opened, counted from 1, up to this is done with
-	peer_done:   [dynamic]u64, // and these beyond it, ascending
+	peer_done:   [dynamic][2]u64, // and these beyond it, as runs from first to last, ascending and apart: no more of
+	// them than STREAMS + 1, for what lies between them was opened and goes on, or was passed over, and the peer may have
+	// no more than STREAMS of those together
 	peer_opened: u64, // the most it has opened
 	peer_may:    u64, // how many it may have opened, as last told: as many as are done with, and STREAMS more
 	peer_retired: u64, // of those it opened, how many are done with
@@ -721,6 +723,32 @@ stream_finished :: proc(s: ^Stream) -> bool {
 	return sent && s.told
 }
 
+// A stream the peer opened is done with: joined to the runs of those that are, and the floor raised past them.
+@(private)
+peer_done_add :: proc(l: ^Link, n: u64) {
+	i := 0
+	for i < len(l.peer_done) && l.peer_done[i][1] < n {
+		i += 1
+	}
+	after := i > 0 && l.peer_done[i - 1][1] + 1 == n
+	before := i < len(l.peer_done) && l.peer_done[i][0] == n + 1
+	switch {
+	case after && before:
+		l.peer_done[i - 1][1] = l.peer_done[i][1]
+		ordered_remove(&l.peer_done, i)
+	case after:
+		l.peer_done[i - 1][1] = n
+	case before:
+		l.peer_done[i][0] = n
+	case:
+		inject_at(&l.peer_done, i, [2]u64{n, n})
+	}
+	if len(l.peer_done) > 0 && l.peer_done[0][0] == l.peer_floor + 1 {
+		l.peer_floor = l.peer_done[0][1]
+		ordered_remove(&l.peer_done, 0)
+	}
+}
+
 @(private)
 link_sweep :: proc(l: ^Link) {
 	#reverse for s, i in l.streams {
@@ -731,16 +759,7 @@ link_sweep :: proc(l: ^Link) {
 			stream_unlist(l, s)
 		}
 		if !stream_mine(l, s.id) {
-			n := stream_number(s.id)
-			at := len(l.peer_done)
-			for at > 0 && l.peer_done[at - 1] > n {
-				at -= 1
-			}
-			inject_at(&l.peer_done, at, n)
-			for len(l.peer_done) > 0 && l.peer_done[0] == l.peer_floor + 1 {
-				l.peer_floor += 1
-				ordered_remove(&l.peer_done, 0)
-			}
+			peer_done_add(l, stream_number(s.id))
 			l.peer_retired += 1
 			if l.peer_retired + STREAMS >= l.peer_may + STREAMS / 4 {
 				l.limit_due = true
@@ -905,8 +924,11 @@ stream_heard :: proc(l: ^Link, id: u64) -> (s: ^Stream, ok: bool) {
 	if n <= l.peer_floor {
 		return nil, true
 	}
-	for x in l.peer_done {
-		if x == n {
+	for run in l.peer_done {
+		if n < run[0] {
+			break
+		}
+		if n <= run[1] {
 			return nil, true
 		}
 	}

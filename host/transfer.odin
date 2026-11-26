@@ -255,6 +255,9 @@ transfer_part_open :: proc(t: ^Transfer, identity: []byte, from: u64) -> bool {
 		r := zsp.Reader{buf = kept}
 		_ = zsp.read_bytes(&r)
 		chunks := int(from / CHUNK)
+		if r.bad || len(kept) < r.pos + chunks * 32 {
+			return false // cut short since it was read: nothing to take up from
+		}
 		for i in 0 ..< chunks {
 			sha2.update(&t.hashing.file, kept[r.pos + i * 32:][:32])
 		}

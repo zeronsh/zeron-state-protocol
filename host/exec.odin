@@ -152,6 +152,9 @@ exec_exited :: proc(data: rawptr, exit: Exit) {
 	call_send(e.sp, e.call, w[:])
 	exec_close_audit(e, "")
 	service_end(e.sp, e.call)
+	// Ended, and all it said told: let go of now, its terminal or pipes with it, whenever the caller says it has done.
+	process_free(e.p)
+	e.p = nil
 	c := host_call_find(e.sp, e.call)
 	heard := c != nil && c.heard_end
 	call_end(e.sp, e.call)
@@ -181,6 +184,10 @@ exec_on_data :: proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
 			}
 			payload = payload[taken:]
 		}
+		if process_input_closed(e.p) {
+			exec_input_drop(e) // never to be taken: let go of, and credited, with what waited before it
+			return true
+		}
 		// The tag and what was taken are credited now, what is held as it is taken: the whole message, in the end.
 		call_consumed(e.sp, call, 1 + taken)
 		append(&e.held, ..payload)
@@ -200,6 +207,10 @@ exec_on_data :: proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
 @(private)
 exec_input_room :: proc(data: rawptr) {
 	e := (^Exec)(data)
+	if process_input_closed(e.p) {
+		exec_input_drop(e)
+		return
+	}
 	if len(e.held) > 0 {
 		n := process_input(e.p, e.held[:])
 		remove_range(&e.held, 0, n)
@@ -208,6 +219,13 @@ exec_input_room :: proc(data: rawptr) {
 	if len(e.held) == 0 && e.ending {
 		process_end_input(e.p)
 	}
+}
+
+// Input held for a process that will never take it: let go of, and credited, so that the call goes on.
+@(private)
+exec_input_drop :: proc(e: ^Exec) {
+	call_consumed(e.sp, e.call, len(e.held))
+	clear(&e.held)
 }
 
 @(private)

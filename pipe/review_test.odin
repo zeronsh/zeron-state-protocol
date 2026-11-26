@@ -257,3 +257,38 @@ review_empty_stream_ends_after_stream_0 :: proc(t: ^testing.T) {
 	_ = link_input(&n.links[1], seal_data_packet(&n.links[0], 1, w[:], wire[:]), n.now)
 	testing.expectf(t, fin_at == max(u64), "its end was told with stream 0 at %v, short of 10", fin_at)
 }
+
+// Round 2. Streams the peer has done with, beyond the first it has not, are remembered in runs: however many it opens
+// and ends while one stays open, what is kept of them stays small.
+@(test)
+review_streams_done_with_are_kept_in_runs :: proc(t: ^testing.T) {
+	state := rand.create(201)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	first, ok0 := link_open(&n.links[0], urgency = 3)
+	testing.expect(t, ok0)
+	testing.expect(t, link_write(&n.links[0], first, transmute([]byte)string("keep")))
+	for _ in 0 ..< 4000 {
+		id, ok := link_open(&n.links[0], urgency = 3)
+		testing.expect(t, ok)
+		testing.expect(t, link_write(&n.links[0], id, transmute([]byte)string("x")))
+		link_finish(&n.links[0], id)
+		for _ in 0 ..< 20 {
+			if !net_step(&n) {
+				break
+			}
+			if link_has(&n.links[1], id) {
+				link_finish(&n.links[1], id)
+			}
+		}
+	}
+	for _ in 0 ..< 500 {
+		if !net_step(&n) {
+			break
+		}
+	}
+	testing.expectf(t, len(n.links[1].peer_done) <= 2, "%d kept (floor %d, retired %d)", len(n.links[1].peer_done), n.links[1].peer_floor, n.links[1].peer_retired)
+	testing.expectf(t, n.links[1].peer_retired >= 3900, "only %d retired", n.links[1].peer_retired)
+}

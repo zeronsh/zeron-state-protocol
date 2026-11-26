@@ -135,3 +135,100 @@ review_relay_burst_is_forwarded :: proc(t: ^testing.T) {
 	forwarded += len(session_queued(to_b))
 	testing.expectf(t, forwarded >= COUNT * len(packet), "forwarded %d of %d", forwarded, COUNT * len(packet))
 }
+
+// Round 2. What a relay sends onward in the midst of a session's work is whole frames: the changes of a watch let go
+// of, still being gathered, are closed first, and nothing is left pointing past what was sent.
+@(test)
+review_relay_flush_takes_whole_frames :: proc(t: ^testing.T) {
+	state := seeded(201)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
+	defer sim_destroy(&s)
+	a, b, relay := s.nodes[0], s.nodes[1], s.nodes[2]
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	to_a, to_b: ^Session
+	for sess in relay.node.sessions {
+		if sess.peer == a.keys.device {
+			to_a = sess
+		} else if sess.peer == b.keys.device {
+			to_b = sess
+		}
+	}
+	watch_id := to_b.watches[0].id
+	filler := make([]byte, 8000, context.temp_allocator)
+	for len(to_b.out) - to_b.sent < LINK_QUEUE - 9000 {
+		sig := make([dynamic]byte, context.temp_allocator)
+		sat := frame_begin(&sig, .Signal)
+		append(&sig, ..b.keys.device[:])
+		write_u8(&sig, u8(Post.Link))
+		append(&sig, ..filler)
+		frame_end(&sig, sat)
+		testing.expect(t, session_input(to_a, sig[:]))
+	}
+	@(static) taken: [dynamic]byte
+	clear(&taken)
+	defer delete(taken)
+	relay.node.host.flush = proc(data: rawptr, sess: ^Session) {
+		out := session_queued(sess)
+		append(&taken, ..out)
+		session_sent(sess, len(out))
+	}
+	defer relay.node.host.flush = nil
+	sim_write(&s, a)
+	a_out := session_output(s.links[0].a)
+	testing.expect(t, session_input(to_a, a_out))
+	session_sent(s.links[0].a, len(a_out))
+	w_unwatch := make([dynamic]byte, context.temp_allocator)
+	uat := frame_begin(&w_unwatch, .Unwatch)
+	write_varint(&w_unwatch, watch_id)
+	frame_end(&w_unwatch, uat)
+	testing.expect(t, session_input(to_b, w_unwatch[:]))
+	sig := make([dynamic]byte, context.temp_allocator)
+	sat := frame_begin(&sig, .Signal)
+	append(&sig, ..b.keys.device[:])
+	write_u8(&sig, u8(Post.Link))
+	append(&sig, ..filler)
+	frame_end(&sig, sat)
+	_ = session_input(to_a, sig[:])
+	// All that went, and all that is left, parses as whole frames.
+	append(&taken, ..session_output(to_b))
+	r := Reader{buf = taken[:]}
+	for r.pos < len(r.buf) && !r.bad {
+		size := read_varint(&r)
+		frame := read_take(&r, int(size))
+		testing.expectf(t, r.bad || len(frame) > 0, "an empty frame at %d", r.pos)
+	}
+	testing.expect(t, !r.bad, "what went onward is not whole frames")
+}
+
+// Round 2. What lanes given up held is no longer counted against what lanes may hold: calls cut short, however many,
+// do not use up what a healthy one needs.
+@(test)
+review_lanes_given_up_hold_nothing :: proc(t: ^testing.T) {
+	state := seeded(202)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 64)
+	s.lanes = true
+	defer sim_destroy(&s)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	b_sess := s.links[0].b
+	partial := make([dynamic]byte, 0, (64 << 10) + 4, context.temp_allocator)
+	write_varint(&partial, 128 << 10)
+	resize(&partial, (64 << 10) + len(partial))
+	for i in 0 ..< 127 {
+		lane_id := u64(2 + i * 2)
+		testing.expect(t, session_lane_input(b_sess, lane_id, 3, partial[:]))
+		session_lane_heard(b_sess, lane_id, given_up = true)
+		if l := lane_find(b_sess, lane_id); l != nil {
+			session_lane_closed(b_sess, l)
+		}
+	}
+	testing.expectf(t, len(b_sess.lanes) == 0, "%d lanes left", len(b_sess.lanes))
+	ok := session_lane_input(b_sess, 10000, 3, partial[:])
+	testing.expectf(t, ok && !b_sess.closing && b_sess.lane_held == len(partial), "held %d, ok %v, closing %v", b_sess.lane_held, ok, b_sess.closing)
+}

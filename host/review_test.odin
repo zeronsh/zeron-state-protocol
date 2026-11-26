@@ -6,6 +6,7 @@ import "core:net"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:thread"
 import "core:time"
 import "../pipe"
 import "../zsp"
@@ -255,6 +256,15 @@ review_relayed_knocks :: proc(t: ^testing.T) {
 	relayed_input(b, 0, w.keys[1].device, first1)
 	testing.expect_value(t, len(b.relayed), 1)
 	orig := b.relayed[0]
+	// Answered, and heard from over it: a live link.
+	second_buf: [pipe.SECOND_SIZE + pipe.FIRST_SIZE]byte
+	testing.expect(t, pipe.link_input(&l1, pipe.link_hello(orig.link, second_buf[:]), now_us()))
+	testing.expect(t, pipe.link_write(&l1, 0, transmute([]byte)string("hello")))
+	out_buf: [RELAY_PACKET]byte
+	packet := pipe.link_output(&l1, out_buf[:], now_us())
+	testing.expect(t, packet != nil)
+	relayed_input(b, 0, w.keys[1].device, packet)
+	testing.expect(t, orig.proven, "the link was not heard from")
 	l2: pipe.Link
 	defer pipe.link_destroy(&l2)
 	testing.expect(t, pipe.link_dial(&l2, w.hosts[1].secret, w.keys[2].device, w.space, 200))
@@ -566,4 +576,257 @@ review_bridge_reset_at_once :: proc(t: ^testing.T) {
 	b := bridge(sp, 0, c, prelude)
 	testing.expectf(t, b == nil, "a bridge already over was handed back")
 	testing.expect_value(t, len(sp.bridges), 0)
+}
+
+// Round 2. Knocks, however many and each newer, leave at most one link not yet heard from beside one that has been.
+@(test)
+review_knocks_open_one_link_at_a_time :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = false))
+	b := world_space(&w, 2)
+	relay_id := b.node.sessions[0].id
+	wire: [pipe.FIRST_SIZE]byte
+	for i in 0 ..< 200 {
+		client: pipe.Link
+		testing.expect(t, pipe.link_dial(&client, w.hosts[1].secret, w.keys[2].device, w.space, u64(i + 1)))
+		relayed_input(b, relay_id, w.keys[1].device, pipe.link_hello(&client, wire[:]))
+		pipe.link_destroy(&client)
+	}
+	testing.expectf(t, len(b.relayed) <= 2, "%d links for one device", len(b.relayed))
+}
+
+// Round 2. What a call holds of this host's is let go of once its work is over, though its caller never says it has
+// done: a folder listed, a process ended, a file whose sending failed.
+@(test)
+review_finished_calls_hold_nothing :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = true))
+	a, b := world_space(&w, 1), world_space(&w, 2)
+	os.make_directory(in_world(&w, "shared"))
+	_ = os.write_entire_file(in_world(&w, "shared", "x"), transmute([]byte)string("x"))
+	testing.expect(t, shares_set(b, strings.concatenate({"files 1 docs write ", in_world(&w, "shared"), "\nshell 1 commands"}, context.temp_allocator)))
+	ended :: proc(w: ^World, d: rawptr) -> bool {return (^Review_Recv)(d).ended}
+
+	// A folder listed.
+	{
+		first := make([dynamic]byte, context.temp_allocator)
+		zsp.write_bytes(&first, transmute([]byte)string("docs"))
+		recv: Review_Recv
+		review_recv_init(&recv)
+		defer review_recv_destroy(&recv)
+		call := host_call(a, w.keys[2].device, 1, "zsp.list", first[:], &recv.handler)
+		testing.expect(t, world_run(&w, ended, &recv))
+		found := 0
+		for c in b.calls {
+			if c.handler != nil && c.handler.on_room != nil && c.handler.data != nil {
+				found += 1
+				lx := (^Lister)(c.handler.data)
+				testing.expectf(t, lx.f == nil, "the folder listed is still open (over %v read %v)", lx.over, lx.read)
+			}
+		}
+		testing.expect_value(t, found, 1)
+		call_end(a, call)
+		world_run(&w, nobody_left)
+	}
+	// A process ended.
+	when ODIN_OS != .Windows {{
+		first := make([dynamic]byte, context.temp_allocator)
+		append(&first, 0)
+		zsp.write_varint(&first, 1)
+		zsp.write_bytes(&first, transmute([]byte)string("true"))
+		zsp.write_varint(&first, 0)
+		zsp.write_bytes(&first, nil)
+		recv: Review_Recv
+		review_recv_init(&recv)
+		defer review_recv_destroy(&recv)
+		call := host_call(a, w.keys[2].device, 1, "zsp.exec", first[:], &recv.handler)
+		testing.expect(t, world_run(&w, ended, &recv))
+		for c in b.calls {
+			if c.handler != nil && c.handler.on_data == exec_on_data {
+				testing.expect(t, (^Exec)(c.handler.data).p == nil, "the process ended is still held")
+			}
+		}
+		call_end(a, call)
+		world_run(&w, nobody_left)
+	}}
+	// A file whose sending failed.
+	{
+		first := make([dynamic]byte, context.temp_allocator)
+		zsp.write_bytes(&first, transmute([]byte)string("docs/failed"))
+		zsp.write_varint(&first, 5)
+		zsp.write_varint(&first, 0)
+		zsp.write_bytes(&first, transmute([]byte)string("src"))
+		append(&first, 1)
+		recv: Review_Recv
+		review_recv_init(&recv)
+		defer review_recv_destroy(&recv)
+		call := host_call(a, w.keys[2].device, 1, "zsp.put", first[:], &recv.handler)
+		testing.expect(t, world_run(&w, proc(w: ^World, d: rawptr) -> bool {return len((^Review_Recv)(d).msgs) >= 1}, &recv))
+		call_send(a, call, transmute([]byte)string("\x01hello"))
+		bad: [33]byte
+		bad[0] = 2
+		call_send(a, call, bad[:])
+		testing.expect(t, world_run(&w, ended, &recv))
+		for c in b.calls {
+			if c.handler != nil && c.handler.on_data == put_on_data {
+				p := (^Put)(c.handler.data)
+				testing.expect(t, p.part == nil && p.meta == nil, "the failed file is still open")
+			}
+		}
+		call_end(a, call)
+		world_run(&w, nobody_left)
+	}
+}
+
+// Round 2. A FIFO in a share is no file to get or list, and asking for one holds up nothing: it is not waited on to be
+// opened, which would stop this host for everyone until something wrote to it.
+@(test)
+review_fifo_holds_up_nothing :: proc(t: ^testing.T) {
+	when ODIN_OS == .Windows {
+		return
+	}
+	w: World
+	testing.expect(t, world_init(t, &w))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = true))
+	a, b := world_space(&w, 1), world_space(&w, 2)
+	os.make_directory(in_world(&w, "shared"))
+	fifo := strings.clone(in_world(&w, "shared", "pipe"))
+	defer delete(fifo)
+	testing.expect(t, review_mkfifo(fifo))
+	testing.expect(t, shares_set(b, strings.concatenate({"files 1 docs read ", in_world(&w, "shared")}, context.temp_allocator)))
+	// Should it be waited on, it is opened from the other end in a while, so that the test ends.
+	unblock := thread.create_and_start_with_poly_data(fifo, proc(path: string) {
+		time.sleep(2 * time.Second)
+		review_fifo_poke(path)
+	})
+	defer {
+		thread.join(unblock)
+		thread.destroy(unblock)
+	}
+	for method in ([]string{"zsp.get", "zsp.list"}) {
+		first := make([dynamic]byte, context.temp_allocator)
+		zsp.write_bytes(&first, transmute([]byte)string("docs/pipe"))
+		if method == "zsp.get" {
+			zsp.write_varint(&first, 0)
+			zsp.write_bytes(&first, nil)
+		}
+		recv: Review_Recv
+		review_recv_init(&recv)
+		defer review_recv_destroy(&recv)
+		start := time.tick_now()
+		call := host_call(a, w.keys[2].device, 1, method, first[:], &recv.handler)
+		testing.expect(t, world_run(&w, proc(w: ^World, d: rawptr) -> bool {return len((^Review_Recv)(d).msgs) > 0}, &recv))
+		took := time.tick_since(start)
+		testing.expectf(t, took < time.Second, "%s of a FIFO held the host up for %v", method, took)
+		testing.expectf(t, len(recv.msgs) > 0 && Status(recv.msgs[0][0]) != .Ok, "%s of a FIFO was taken", method)
+		call_end(a, call)
+		world_run(&w, nobody_left)
+	}
+}
+
+when ODIN_OS == .Windows {
+	@(private)
+	review_mkfifo :: proc(path: string) -> bool {return false}
+	@(private)
+	review_fifo_poke :: proc(path: string) {}
+}
+
+// Round 2. An environment of many entries, as one message may carry, is made in time that grows with it, not with
+// its square: the host's one thread is not held up by it.
+@(test)
+review_environment_of_many_entries :: proc(t: ^testing.T) {
+	env := make([]string, 50_000, context.temp_allocator)
+	for &e in env {
+		e = "A="
+	}
+	start := time.tick_now()
+	_ = process_environment(Process_Spec{env = env})
+	took := time.tick_since(start)
+	testing.expectf(t, took < 200 * time.Millisecond, "%d entries took %v", len(env), took)
+}
+
+// Round 2. Input for a process that has closed its own, and goes on, is let go of and credited, so that what else is
+// said to it, a signal above all, can still be said.
+@(test)
+review_input_for_a_closed_stdin_is_credited :: proc(t: ^testing.T) {
+	when ODIN_OS == .Windows {
+		return
+	}
+	w: World
+	testing.expect(t, world_init(t, &w))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = true))
+	a, b := world_space(&w, 1), world_space(&w, 2)
+	testing.expect(t, shares_set(b, "shell 1 commands"))
+	first := make([dynamic]byte, context.temp_allocator)
+	append(&first, 0)
+	zsp.write_varint(&first, 3)
+	zsp.write_bytes(&first, transmute([]byte)string("sh"))
+	zsp.write_bytes(&first, transmute([]byte)string("-c"))
+	zsp.write_bytes(&first, transmute([]byte)string("exec <&-; printf closed; sleep 30"))
+	zsp.write_varint(&first, 0)
+	zsp.write_bytes(&first, nil)
+	recv: Review_Recv
+	review_recv_init(&recv)
+	defer review_recv_destroy(&recv)
+	call := host_call(a, w.keys[2].device, 1, "zsp.exec", first[:], &recv.handler)
+	testing.expect(t, world_run(&w, proc(w: ^World, d: rawptr) -> bool {
+		for m in (^Review_Recv)(d).msgs {
+			if len(m) > 1 && m[0] == 1 && strings.contains(string(m[1:]), "closed") {
+				return true
+			}
+		}
+		return false
+	}, &recv))
+	// Input, as much as credit allows, several windows over.
+	chunk := make([]byte, 1 + 16 << 10, context.temp_allocator)
+	sent := 0
+	for round := 0; round < 200 && sent < 4 * zsp.CALL_WINDOW; round += 1 {
+		for call_room(a, call) >= len(chunk) {
+			testing.expect(t, call_send(a, call, chunk))
+			sent += len(chunk)
+		}
+		world_run(&w, proc(w: ^World, _: rawptr) -> bool {return false}, nil, 20 * time.Millisecond)
+	}
+	testing.expectf(t, sent >= 4 * zsp.CALL_WINDOW, "only %d sent: credit was not given back", sent)
+	testing.expect(t, call_send(a, call, []byte{1, u8(Signal.Kill)}), "a signal could not be said")
+	testing.expect(t, world_run(&w, proc(w: ^World, d: rawptr) -> bool {return (^Review_Recv)(d).ended}, &recv))
+	call_end(a, call)
+	world_run(&w, nobody_left)
+}
+
+// Round 2. A record of a fetch's progress cut short since it was read is no reason to fail badly: the fetch is not
+// taken up from it.
+@(test)
+review_resume_from_a_cut_record :: proc(t: ^testing.T) {
+	dir, err := os.make_directory_temp("", "zsp-review-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer {
+		os.remove_all(dir)
+		delete(dir)
+	}
+	local := strings.clone(file_in(dir, "got"))
+	defer delete(local)
+	part := make([]byte, CHUNK, context.temp_allocator)
+	_ = os.write_entire_file(path_with(local, PART), part)
+	identity := []byte{1, 2, 3}
+	record := make([dynamic]byte, context.temp_allocator)
+	zsp.write_bytes(&record, identity)
+	_ = os.write_entire_file(path_with(path_with(local, PART), ".meta"), record[:]) // and no chunk's hash
+	tr: Transfer
+	tr.local = local
+	hashing_init(&tr.hashing)
+	ok := transfer_part_open(&tr, identity, CHUNK)
+	if tr.f != nil {
+		os.close(tr.f)
+	}
+	if tr.meta != nil {
+		os.close(tr.meta)
+	}
+	testing.expect(t, !ok, "taken up from a record that does not say how")
 }

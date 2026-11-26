@@ -134,7 +134,16 @@ lane_prune :: proc(s: ^Session, l: ^Lane) {
 			break
 		}
 	}
+	lane_drop_input(s, l)
 	lane_free(l)
+}
+
+// What waited on a lane, let go of: nor is it counted any longer against what lanes may hold.
+@(private)
+lane_drop_input :: proc(s: ^Session, l: ^Lane) {
+	s.lane_held -= len(l.input)
+	clear(&l.input)
+	shrink(&l.input)
 }
 
 @(private)
@@ -251,7 +260,7 @@ lane_frames :: proc(s: ^Session, l: ^Lane, bytes: []byte) -> (used: int) {
 @(private)
 lanes_take :: proc(s: ^Session) {
 	for i := 0; i < len(s.lanes); i += 1 {
-		if len(s.lanes[i].input) > 0 {
+		if len(s.lanes[i].input) > 0 && !s.lanes[i].heard {
 			lane_take(s, s.lanes[i])
 		}
 	}
@@ -271,7 +280,8 @@ session_lane_heard :: proc(s: ^Session, id: u64, given_up: bool) {
 		l.over = true // nothing goes on on it, nor can now
 	}
 	if given_up || len(l.input) > 0 {
-		// A frame cut short, or frames that will now never be whole: its calls cannot go on.
+		// A frame cut short, or frames that will now never be whole: its calls cannot go on, nor is any of it taken.
+		lane_drop_input(s, l)
 		calls_lost(s.node, s.id, lane = id)
 		l.over = true
 	}

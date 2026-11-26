@@ -195,10 +195,10 @@ serve_list :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first:
 			status_send(sp, call, status)
 			return refused_handler(), .Cancelled
 		}
-		err: os.Error
-		f, err = os.open(full, {.Read})
-		if err != nil {
-			status_send(sp, call, .Not_Found)
+		opened: Status
+		f, opened = share_open_read(full)
+		if opened != .Ok {
+			status_send(sp, call, opened)
 			return refused_handler(), .Cancelled
 		}
 		if !files_within(f, root) {
@@ -251,9 +251,10 @@ list_pump :: proc(l: ^Lister) {
 			clear(&l.w)
 			continue
 		}
-		// All of it said.
+		// All of it said: the folder let go of now, whenever the caller says it has done.
 		l.over = true
 		service_end(l.sp, l.call)
+		list_close(l)
 		heard := false
 		if c := host_call_find(l.sp, l.call); c != nil {
 			heard = c.heard_end
@@ -312,12 +313,18 @@ list_free :: proc(l: ^Lister) {
 	l.freed = true
 	l.over = true
 	service_end(l.sp, l.call)
+	list_close(l)
+	delete(l.w)
+	free(l)
+}
+
+@(private)
+list_close :: proc(l: ^Lister) {
 	if l.f != nil {
 		os.read_directory_iterator_destroy(&l.it)
 		os.close(l.f)
+		l.f = nil
 	}
-	delete(l.w)
-	free(l)
 }
 
 // ---------------------------------------------------------------- get
@@ -356,9 +363,9 @@ serve_get :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: 
 		status_send(sp, call, status)
 		return refused_handler(), .Cancelled
 	}
-	f, err := os.open(full, {.Read})
-	if err != nil {
-		status_send(sp, call, .Not_Found)
+	f, opened := share_open_read(full)
+	if opened != .Ok {
+		status_send(sp, call, opened)
 		return refused_handler(), .Cancelled
 	}
 	identity, info, ok := file_identity(f)
@@ -732,6 +739,7 @@ put_commit :: proc(p: ^Put) {
 		share_remove(p.dir, strings.concatenate({part_name, ".meta"}, context.temp_allocator))
 		p.status = .Ok
 	}
+	share_dir_close(&p.dir)
 	audit(p.sp, {device = p.caller, scope = p.scope, service = "files", detail = strings.concatenate({"put ", p.path}, context.temp_allocator), event = .Close, bytes_in = p.at - p.from})
 }
 
@@ -746,6 +754,7 @@ put_fail :: proc(p: ^Put, status: Status) {
 			os.truncate(p.meta, 0)
 		}
 	}
+	put_close(p) // what is kept is kept as it is, whenever the caller says it has done
 	w := [1]byte{u8(status)}
 	call_send(p.sp, p.call, w[:])
 	call_end(p.sp, p.call)
@@ -762,6 +771,21 @@ put_on_end :: proc(h: ^Call_Handler, call: u64) {
 		call_end(p.sp, call)
 	}
 	put_free(p)
+}
+
+// Lets go of its files and its folder: synced first, so that what came is there to resume from.
+@(private)
+put_close :: proc(p: ^Put) {
+	put_sync(p)
+	if p.part != nil {
+		os.close(p.part)
+		p.part = nil
+	}
+	if p.meta != nil {
+		os.close(p.meta)
+		p.meta = nil
+	}
+	share_dir_close(&p.dir)
 }
 
 @(private)
@@ -782,13 +806,7 @@ put_free :: proc(p: ^Put) {
 	}
 	p.freed = true
 	service_end(p.sp, p.call)
-	if p.part != nil {
-		os.close(p.part)
-	}
-	if p.meta != nil {
-		os.close(p.meta)
-	}
-	share_dir_close(&p.dir)
+	put_close(p)
 	delete(p.path)
 	delete(p.name)
 	free(p)

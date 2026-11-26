@@ -85,3 +85,17 @@ process_terminal_kind_alone :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, len(terms) == 1 && terms[0] == "TERM=xterm-zsp", "%v", terms[:])
 }
+
+@(private)
+review_mkfifo :: proc(path: string) -> bool {
+	return posix.mkfifo(strings.clone_to_cstring(path, context.temp_allocator), {.IRUSR, .IWUSR}) == .OK
+}
+
+// Opens a FIFO's writing end and lets go: so that whoever waits to open its reading end goes on.
+@(private)
+review_fifo_poke :: proc(path: string) {
+	fd := posix.open(strings.clone_to_cstring(path, context.temp_allocator), {.WRONLY, .NONBLOCK})
+	if fd >= 0 {
+		posix.close(fd)
+	}
+}

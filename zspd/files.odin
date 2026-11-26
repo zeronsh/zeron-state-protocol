@@ -474,6 +474,16 @@ files_probe :: proc(j: ^Files_Job, then: proc(j: ^Files_Job)) {
 	})
 }
 
+// How deep a folder is fetched or sent, at most.
+@(private = "file")
+MAX_DEPTH :: 64
+
+// Whether a listed name is one name: not one that would lead elsewhere, on any system, were it joined to a path.
+@(private = "file")
+entry_name_sound :: proc(name: string) -> bool {
+	return name != "" && name != "." && name != ".." && !strings.contains_any(name, "/\\:\x00")
+}
+
 // Lists the next folder there, if any is yet to be listed; else carries the files.
 @(private = "file")
 files_list :: proc(j: ^Files_Job) {
@@ -502,6 +512,13 @@ files_list :: proc(j: ^Files_Job) {
 			return
 		}
 		for e in entries {
+			// A name is one name, within the folder it is in: nothing that leads out of it, here or there, nor any
+			// deeper than a folder can sensibly be.
+			if !entry_name_sound(e.name) || strings.count(rel, "/") >= MAX_DEPTH {
+				say(os.stderr, remote_join(j.remote, rel), ": the listing makes no sense: ", e.name, "\n")
+				j.failed = true
+				continue
+			}
 			path := strings.clone(remote_join(rel, e.name))
 			switch {
 			case e.kind == ENTRY_FOLDER:

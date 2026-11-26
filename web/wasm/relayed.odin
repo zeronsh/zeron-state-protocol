@@ -196,6 +196,13 @@ relayed_input :: proc(data: rawptr, relay: u32, from: zsp.Key32, packet: []byte)
 			return
 		}
 		knocked[from] = l.channel.began
+		// One knocked for before and not yet heard from gives way: at most one waits to prove itself at a time.
+		for i := len(relayed) - 1; i >= 0; i -= 1 {
+			if x := relayed[i]; !x.mine && !x.proven && x.device == from {
+				ordered_remove(&relayed, i)
+				relayed_drop(x)
+			}
+		}
 		r := new(Relayed)
 		r.device, r.via, r.began = from, relay, l.channel.began
 		r.link = new(pipe.Link)

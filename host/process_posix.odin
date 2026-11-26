@@ -268,6 +268,11 @@ process_input :: proc(p: ^Process, bytes: []byte) -> int {
 	return taken
 }
 
+// Whether its input is over for good, closed by it or for it: what is given it now will never be taken.
+process_input_closed :: proc(p: ^Process) -> bool {
+	return p.freed || p.input < 0
+}
+
 process_input_room :: proc(p: ^Process) -> int {
 	if p.freed || p.input < 0 || p.ending {
 		return 0
@@ -482,7 +487,12 @@ process_flush :: proc(p: ^Process) {
 			return
 		}
 		if errno != nil {
-			process_input_close(p) // what was held for it never will be taken
+			process_input_close(p) // what was held for it never will be taken: said, so that it is let go of
+			if p.events.on_room != nil {
+				p.telling += 1
+				p.events.on_room(p.events.data)
+				process_told(p)
+			}
 			return
 		}
 	}
@@ -714,15 +724,20 @@ process_nonblocking :: proc(fd: posix.FD) {
 @(private)
 process_environment :: proc(spec: Process_Spec) -> [^]cstring {
 	list := make([dynamic]cstring, context.temp_allocator)
+	// Where each name the spec gives is given last: looked up, not searched for, however many it gives.
+	last := make(map[string]int, len(spec.env), context.temp_allocator)
+	for entry, i in spec.env {
+		last[process_env_name(entry)] = i
+	}
 	for i := 0; posix.environ[i] != nil; i += 1 {
 		entry := string(posix.environ[i])
 		name := process_env_name(entry)
-		if process_env_names(spec, name) || (spec.pty && name == "TERM") {
+		if name in last || (spec.pty && name == "TERM") {
 			continue // the spec's to say, or the terminal's own kind
 		}
 		append(&list, posix.environ[i])
 	}
-	if spec.pty && !process_env_names(spec, "TERM") {
+	if spec.pty && "TERM" not_in last {
 		term := spec.term if spec.term != "" else "xterm-256color"
 		append(&list, strings.clone_to_cstring(strings.concatenate({"TERM=", term}, context.temp_allocator), context.temp_allocator))
 	}
@@ -731,11 +746,7 @@ process_environment :: proc(spec: Process_Spec) -> [^]cstring {
 		if len(name) == len(entry) {
 			continue // a removal
 		}
-		later := false
-		for other in spec.env[i + 1:] {
-			later ||= process_env_name(other) == name
-		}
-		if !later {
+		if last[name] == i {
 			append(&list, strings.clone_to_cstring(entry, context.temp_allocator))
 		}
 	}
@@ -749,16 +760,6 @@ process_env_name :: proc(entry: string) -> string {
 		return entry[:eq]
 	}
 	return entry
-}
-
-@(private)
-process_env_names :: proc(spec: Process_Spec, name: string) -> bool {
-	for entry in spec.env {
-		if process_env_name(entry) == name {
-			return true
-		}
-	}
-	return false
 }
 
 // A variable as the child will have it.

@@ -1378,20 +1378,31 @@ function stopped(options: TransferOptions): void {
 export async function getTree(client: Client, device: string, scope: number, remote: string, local: string, options: TransferOptions = {}): Promise<TreeFile[]> {
   const folder = folderOf(options);
   const out: TreeFile[] = [];
-  const walk = async (rel: string): Promise<void> => {
+  const walk = async (rel: string, depth: number): Promise<void> => {
     await folder.make(here(local, rel));
     for (const e of await list(client, device, scope, there(remote, rel))) {
       stopped(options);
+      // A name is one name, within the folder it is in: nothing that leads out of it, nor any deeper than a folder
+      // can sensibly be.
+      if (!nameSound(e.name) || depth >= MAX_DEPTH) throw new ServiceError("malformed", "the listing makes no sense: " + e.name);
       const path = rel === "" ? e.name : rel + "/" + e.name;
-      if (e.kind === "folder") await walk(path);
+      if (e.kind === "folder") await walk(path, depth + 1);
       if (e.kind !== "file" || isPart(e.name)) continue;
       const mine = await folder.info(here(local, path));
       if (mine?.kind === "file" && mine.size === e.size && mine.modified === e.modified) out.push({ path });
       else out.push({ path, transferred: await get(client, device, scope, there(remote, path), here(local, path), options) });
     }
   };
-  await walk("");
+  await walk("", 0);
   return out;
+}
+
+/** How deep a folder is fetched, at most. */
+const MAX_DEPTH = 64;
+
+/** Whether a listed name is one name: not one that would lead elsewhere, on any system, were it joined to a path. */
+function nameSound(name: string): boolean {
+  return name !== "" && name !== "." && name !== ".." && !/[/\\:\0]/.test(name);
 }
 
 /**

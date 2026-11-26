@@ -143,6 +143,11 @@ gate_status :: proc(g: ^Gate, c: ^Client) -> []Forward_Status {
 			return f.status[:]
 		}
 	}
+	// A connection reset as soon as it is made may be said by the dialler never to have been, as macOS may say it, so
+	// that whence it came is not known here: then it is the one the gate took last.
+	if local == 0 && c.reset && len(g.each) > 0 {
+		return g.each[len(g.each) - 1].status[:]
+	}
 	return nil
 }
 

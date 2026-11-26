@@ -310,5 +310,130 @@ def test_terminal():
         os.close(master), os.close(slave)
 
 
+def test_get_takes_no_name_that_leads_out():
+    """A device that lists a folder with names leading out of it, as one that means harm may, has nothing written
+    anywhere but within the folder asked for: zspd get takes no such name. Played here by a node of this test's own."""
+    import base64, struct
+
+    def varint(n):
+        out = bytearray()
+        while n >= 0x80:
+            out.append((n & 0x7F) | 0x80)
+            n >>= 7
+        out.append(n)
+        return bytes(out)
+
+    def read_varint(buf, pos):
+        v = shift = 0
+        while True:
+            b = buf[pos]
+            pos += 1
+            v |= (b & 0x7F) << shift
+            if not (b & 0x80):
+                return v, pos
+            shift += 7
+
+    def frame(t, p):
+        b = bytes([t]) + p
+        return varint(len(b)) + b
+
+    def ws_send(c, p):
+        n = len(p)
+        c.sendall((bytes([0x82, n]) if n < 126 else bytes([0x82, 126]) + struct.pack("!H", n)) + p)
+
+    def ws_recv(c, raw):
+        def exact(k):
+            while len(raw) < k:
+                d = c.recv(4096)
+                if not d:
+                    return None
+                raw.extend(d)
+            o = bytes(raw[:k])
+            del raw[:k]
+            return o
+
+        h = exact(2)
+        if not h:
+            return None
+        n = h[1] & 0x7F
+        if n == 126:
+            n = struct.unpack("!H", exact(2))[0]
+        mask = exact(4) if (h[1] & 0x80) else b""
+        data = bytearray(exact(n))
+        for i in range(len(data) if mask else 0):
+            data[i] ^= mask[i & 3]
+        return bytes(data)
+
+    node_dir = os.path.join(TMP, "lo-node")
+    dest = os.path.join(TMP, "lo-work", "downloads")
+    escaped = os.path.join(TMP, "lo-escaped.txt")
+    os.makedirs(dest)
+    zspd("create", node_dir)
+    peer_hex = zspd("key", node_dir)[:64]
+    peer = bytes.fromhex(peer_hex)
+    payload = b"PWNED\n"
+    chunk = hashlib.sha256(payload).digest()
+    whole = hashlib.sha256(chunk).digest()
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    with open(os.path.join(node_dir, "address"), "w") as f:
+        f.write("127.0.0.1:%d" % srv.getsockname()[1])
+    with open(os.path.join(node_dir, "token"), "wb") as f:
+        f.write(b"tok")
+
+    def serve():
+        conn, _ = srv.accept()
+        req = b""
+        while b"\r\n\r\n" not in req:
+            req += conn.recv(4096)
+        head, rest = req.split(b"\r\n\r\n", 1)
+        raw = bytearray(rest)
+        key = [l.split(":", 1)[1].strip() for l in head.decode().split("\r\n") if l.lower().startswith("sec-websocket-key:")][0]
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        conn.sendall(f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode())
+        ws_recv(conn, raw)
+        ws_send(conn, frame(2, b"\x00" * 8 + varint(1) + b"\x7f" + b"\x00" * 32) + frame(12, peer + b"\x00"))
+        buf = bytearray()
+        while (msg := ws_recv(conn, raw)) is not None:
+            buf.extend(msg)
+            pos = 0
+            while pos < len(buf):
+                flen, p2 = read_varint(buf, pos)
+                if p2 + flen > len(buf):
+                    break
+                f = bytes(buf[p2 : p2 + flen])
+                pos = p2 + flen
+                if f[0] == 15:
+                    cid, q = read_varint(f, 1)
+                    q += 32
+                    _, q = read_varint(f, q)
+                    mlen, q = read_varint(f, q)
+                    method = f[q : q + mlen].decode()
+                    tag = varint((cid << 1) | 1)
+                    if method == "zsp.list":
+                        nm = b"../../lo-escaped.txt"
+                        ws_send(conn, frame(16, tag + b"\x00\x00\x01" + varint(len(nm)) + nm + varint(len(payload)) + b"\x00") + frame(16, tag + b"\x01"))
+                    elif method == "zsp.get":
+                        ws_send(
+                            conn,
+                            frame(16, tag + b"\x00\x00" + varint(len(payload)) + b"\x00\x01\x01\x00")
+                            + frame(16, tag + b"\x00\x01" + payload)
+                            + frame(16, tag + b"\x00\x02" + chunk)
+                            + frame(16, tag + b"\x00\x03\x00" + whole)
+                            + frame(16, tag + b"\x01"),
+                        )
+            del buf[:pos]
+        conn.close()
+        srv.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    code, out, err = cli("get", node_dir, peer_hex, "share", dest, timeout=10)
+    t.join(timeout=2)
+    assert not os.path.exists(escaped), (code, out, err)
+    assert code == 1 and b"makes no sense" in err, (code, out, err)
+
+
 if __name__ == "__main__":
     e2e.main(globals(), __file__)
