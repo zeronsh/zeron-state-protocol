@@ -33,6 +33,12 @@ Ports :: struct {
 	remotes:   [dynamic]^Remote,
 	reach:     u64, // a hash of who could be reached when last looked
 	warned:    bool, // that addresses cannot be listened at
+	// What this device exposes to the public: expose.odin.
+	exposures: [dynamic]Exposure,
+	exposed:   u64, // a count of changes to them
+	told:      map[u32]u64, // relay sessions, and the count they were last told
+	ever_told: map[u32]bool,
+	public:    [dynamic]^Public_In, // connections from the public, under way
 }
 
 Remote :: struct {
@@ -64,6 +70,7 @@ ports_open :: proc(sp: ^Space) {
 	p.space = sp
 	sp.ports = p
 	offers_load(p)
+	exposures_load(p)
 }
 
 @(private)
@@ -81,6 +88,16 @@ ports_close :: proc(sp: ^Space) {
 	for &o in p.offers {
 		offer_destroy(&o)
 	}
+	for len(p.public) > 0 {
+		public_in_drop(p.public[0])
+	}
+	for &e in p.exposures {
+		exposure_destroy(&e)
+	}
+	delete(p.exposures)
+	delete(p.public)
+	delete(p.told)
+	delete(p.ever_told)
 	delete(p.remotes)
 	delete(p.watchers)
 	delete(p.offers)
@@ -97,6 +114,7 @@ ports_run :: proc(sp: ^Space, now: time.Tick) {
 		return
 	}
 	offers_run(p, now)
+	exposures_tell(p)
 	reach := zsp.node_reach(&sp.node)
 	said := hash_bytes(slice.to_bytes(reach))
 	if said != p.reach {

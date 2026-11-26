@@ -49,6 +49,12 @@ USAGE :: `zspd - Zeron State Protocol node
   zspd unoffer <dir> <port[-port]> <scope> [device=<key>] [host=<address>]
                                              take an offer back: whoever is using it is cut off
   zspd offers <dir>                          list what this device offers
+  zspd expose <dir> <port> [name=<name>] [proxy]
+                                             expose a port of this machine to the public, outside the space,
+                                             through each relay that will, at https://<name>-<id>.<its domain>;
+                                             proxy: say where each connection came from (PROXY protocol v2)
+  zspd unexpose <dir> <port>                 take it back: whoever is using it is cut off, and its name is gone
+  zspd exposures <dir>                       list what is exposed, and where
   zspd setup [--undo] [--dry-run] [run's --names, --loopback, --dns, --catch] [--devices=<n>]
                                              as root, once: have every application here find devices by name
                                              and reach them by address; says each step as it takes it
@@ -77,6 +83,11 @@ USAGE :: `zspd - Zeron State Protocol node
   --partial              replicate only what local clients watch
   --credential=<text>    present this to relays
   --allow=<space,...>    serve only these spaces
+  --expose=<domain>      serve: let devices expose ports to the public at <label>.<domain>, whose names lead here
+  --https=<addr:port>    serve: be the public's way in, by TLS, here (0.0.0.0:443)
+  --tls-cert=<file>      serve: the certificate chain for *.<domain>, PEM, the leaf first
+  --tls-key=<file>       serve: its key, PEM: ECDSA P-256 or P-384, or RSA
+  --expose-http=<addr:port>  serve: and by plain HTTP here, behind something else that speaks TLS
   --names=<suffix>       run: find devices as <name>.<suffix> (zsp.internal)
   --no-names             run: give devices no names or addresses here
   --loopback=<127.a.b>   run: the first of the addresses devices are given (127.77.0)
@@ -254,6 +265,10 @@ run :: proc() -> int {
 		ok = offer(dir, rest, args[0] == "unoffer")
 	case "offers":
 		ok = offer(dir, nil, false)
+	case "expose", "unexpose":
+		ok = len(rest) >= 1 && expose(dir, rest, args[0] == "unexpose")
+	case "exposures":
+		ok = expose(dir, nil, false)
 	case "run", "serve":
 		return serve(dir, rest, args[0] == "serve")
 	case "share":
@@ -678,6 +693,27 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 			proxy = ""
 		case "--trust-local-users":
 			config.trust_local_users = true
+		case "--expose":
+			if !host.suffix_valid(value) {
+				os.write_string(os.stderr, USAGE)
+				return 2
+			}
+			config.expose = value
+		case "--https", "--expose-http":
+			ep, parsed := net.parse_endpoint(value)
+			if !parsed {
+				os.write_string(os.stderr, USAGE)
+				return 2
+			}
+			if name == "--https" {
+				config.https = ep
+			} else {
+				config.expose_http = ep
+			}
+		case "--tls-cert":
+			config.tls_cert = value
+		case "--tls-key":
+			config.tls_key = value
 		case "--verbose":
 		case:
 			os.write_string(os.stderr, USAGE)
@@ -690,6 +726,13 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		return 2
 	}
 	config.listen = at
+	if config.expose != "" && config.https == nil && config.expose_http == nil {
+		config.https = net.Endpoint{net.IP4_Any, 443}
+	}
+	if config.https != nil && (config.tls_cert == "" || config.tls_key == "") {
+		say(os.stderr, "the public's way in by TLS needs --tls-cert and --tls-key\n")
+		return 2
+	}
 	if config.names != "" {
 		if dns == "" {
 			base := config.loopback
@@ -1016,4 +1059,69 @@ draw_ula :: proc() -> string {
 	g: [5]byte
 	crypto.rand_bytes(g[:])
 	return fmt.tprintf("fd%02x:%02x%02x:%02x%02x::1", g[0], g[1], g[2], g[3], g[4])
+}
+
+// Exposes a port to the public, takes it back, or lists what is exposed: through the node running here, or in its file.
+expose :: proc(dir: string, args: []string, remove: bool) -> bool {
+	body := make([dynamic]byte, context.temp_allocator)
+	port: u64
+	prefix, proxy := "", false
+	if args != nil {
+		parsed: bool
+		port, parsed = strconv.parse_u64(args[0], 10)
+		if !parsed || port == 0 || port > 65535 {
+			say(os.stderr, "a port is a number\n")
+			return false
+		}
+		for a in args[1:] {
+			key, eq, value := strings.partition(a, "=")
+			switch {
+			case key == "proxy" && eq == "" && !remove:
+				proxy = true
+			case key == "name" && eq != "" && !remove && zsp.exposure_prefix_valid(value):
+				prefix = value
+			case:
+				say(os.stderr, "zspd expose <dir> <port> [name=<name>] [proxy]: a name is up to 20 lower-case letters, digits and hyphens\n")
+				return false
+			}
+		}
+		append(&body, 2 if remove else 1, byte(port >> 8), byte(port))
+		if !remove {
+			zsp.write_bytes(&body, transmute([]byte)prefix)
+			append(&body, 1 if proxy else 0)
+		}
+	} else {
+		append(&body, 0)
+	}
+	data, fault, running := local_call(dir, "zsp.expose", body[:])
+	if !running {
+		say(os.stderr, "no node is running here: run it, then expose; what is exposed is said to relays as they are reached\n")
+		return false
+	}
+	if fault != 0 || len(data) != 1 {
+		say(os.stderr, "the node running here refused: ", FAULTS[min(fault, len(FAULTS) - 1)], " (exposed already, not exposed, or too many)\n" if fault == 1 else "\n")
+		return false
+	}
+	r := zsp.Reader{buf = data[0]}
+	n := zsp.read_varint(&r)
+	for _ in 0 ..< n {
+		pb := zsp.read_take(&r, 2)
+		_ = zsp.read_bytes(&r)
+		flags := zsp.read_u8(&r)
+		label := string(zsp.read_bytes(&r))
+		m := zsp.read_varint(&r)
+		if r.bad {
+			return false
+		}
+		say(os.stdout, fmt.tprintf("%d\t%s%s", u16(pb[0]) << 8 | u16(pb[1]), label, " proxy" if flags & 1 != 0 else ""))
+		STATUS := [?]string{"", "that relay exposes nothing", "taken", "too many there"}
+		for _ in 0 ..< m {
+			_ = zsp.read_take(&r, 32)
+			status := zsp.read_u8(&r)
+			url := string(zsp.read_bytes(&r))
+			say(os.stdout, "\t", url if status == 0 else STATUS[min(int(status), len(STATUS) - 1)])
+		}
+		say(os.stdout, "\n")
+	}
+	return !r.bad
 }

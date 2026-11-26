@@ -36,6 +36,13 @@ Config :: struct {
 	trust_local_users: bool,
 	// Whether a local client may change what this device offers and exposes; nil: one accepted for every scope may.
 	may_configure: proc(data: rawptr, s: ^zsp.Session) -> bool,
+	// A relay's exposure of devices' ports to the public, at <label>.<expose>: by TLS at `https`, with this certificate
+	// chain and key (PEM files), and by plain HTTP at `expose_http`, behind something else that speaks TLS.
+	expose:       string,
+	https:        Maybe(net.Endpoint),
+	expose_http:  Maybe(net.Endpoint),
+	tls_cert:     string,
+	tls_key:      string,
 	// Authentication, which is wholly the embedder's: see zsp.Host.authenticate. `data` is passed back.
 	data:         rawptr,
 	authenticate: proc(data: rawptr, s: ^zsp.Session, credential: []byte),
@@ -62,6 +69,8 @@ Host :: struct {
 	catch:        Catch,
 	proxy_server: Proxy,
 	later:        [dynamic]Later,
+	public:       Relay_Public,
+	public_dead:  [dynamic]^Public_Out,
 	shared:       []byte, // everything is received into this
 	sync_due:     time.Tick,
 	syncing:      bool, // sync_due is set
@@ -213,6 +222,15 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		link         = relayed_input,
 		backlog      = stream_backlog,
 		flush        = stream_push_for,
+		exposure     = proc(data: rawptr, session: ^zsp.Session, type: u8, payload: []byte) {
+			sp := (^Space)(data)
+			switch {
+			case sp.host.relay && type == zsp.EXPOSE:
+				public_exposed(sp, session, payload)
+			case !sp.host.relay && type == zsp.EXPOSE + 1:
+				exposures_heard(sp, session, payload)
+			}
+		},
 	}
 	if !h.relay {
 		s.node.host.questions = questions(s)
@@ -309,6 +327,9 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 		udp_open(h, port) or_return
 	}
 	host_serve_builtin(h)
+	if h.relay && h.expose != "" && !public_open(h) {
+		return false
+	}
 	if !h.relay {
 		// What this device offers, unless whoever embeds it decides that otherwise.
 		if h.port_permitted == nil {
@@ -317,6 +338,8 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 				return port_proxy_header(sp, from.device, port)
 			}
 		}
+		host_serve(h, "zsp.public", public_called)
+		host_serve(h, "zsp.expose", expose_called)
 		host_serve(h, "zsp.ports", ports_called)
 		host_serve(h, "zsp.nodes", nodes_called)
 		host_serve(h, "zsp.offers", offers_called)
@@ -359,6 +382,7 @@ host_destroy :: proc(h: ^Host) {
 		stream_close(h.streams[0])
 	}
 	udp_close(h)
+	public_close(h)
 	dns_close(h)
 	catch_close(h)
 	proxy_close(h)
@@ -374,6 +398,10 @@ host_destroy :: proc(h: ^Host) {
 		delete(l.say)
 	}
 	delete(h.later)
+	for c in h.public_dead {
+		free(c)
+	}
+	delete(h.public_dead)
 	delete(h.dialers)
 	delete(h.shared)
 	delete(h.methods)
@@ -388,6 +416,9 @@ session_end :: proc(session: ^zsp.Session) {
 		report(.Warning, "this machine's clock and another's differ by more than a quarter of an hour: nothing passes between them")
 	}
 	report(.Debug, fmt.tprint("a session ended: ", session.role, " ", session.fault))
+	if s.host.relay {
+		public_session_closed(s.host, s, session.id)
+	}
 	zsp.session_close(session)
 }
 
@@ -412,6 +443,10 @@ host_settle :: proc(h: ^Host) {
 		}
 	}
 	later_run(h)
+	for c in h.public_dead {
+		free(c)
+	}
+	clear(&h.public_dead)
 	dialers_run(h, now)
 	links_run(h)
 	for s in h.spaces {
@@ -485,4 +520,8 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 		}
 	}
 	return
+}
+
+crypto_random :: proc(into: []byte) {
+	crypto.rand_bytes(into)
 }

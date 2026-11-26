@@ -596,7 +596,7 @@ tls_client_hello :: proc(t: ^Tls_Server, m: []byte, w: ^[dynamic]byte, find: Tls
 	}
 	ee := make([dynamic]byte, context.temp_allocator)
 	if alpn {
-		append(&ee, 0, 12, 0, 16, 0, 10, 0, 8)
+		append(&ee, 0, 16, 0, 11, 0, 9, 8) // ALPN: http/1.1, for whatever is behind speaks it
 		append(&ee, "http/1.1")
 	}
 	ext_len := len(ee)

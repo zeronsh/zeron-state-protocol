@@ -45,6 +45,8 @@ Host :: struct {
 	roster:       proc(data: rawptr, bytes: []byte), // a newer roster was adopted: persist it
 	signal:       proc(data: rawptr, from: Key32, blob: []byte), // from another member, via a relay
 	presence:     proc(data: rawptr, online: []Key32),
+	// A message between a device and a relay of what the device exposes to the public (types EXPOSE onwards).
+	exposure:     proc(data: rawptr, s: ^Session, type: u8, payload: []byte),
 	questions:    Questions,
 	// A call to a method the host serves itself (see hosted). Take it, answering nil, or say why not; what the host
 	// says in it goes by node_flow, and may be said at once. The node has checked rights to call already.

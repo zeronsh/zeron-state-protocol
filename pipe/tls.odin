@@ -200,6 +200,9 @@ tls_messages :: proc(t: ^Tls, w: ^[dynamic]byte) -> bool {
 			if m[0] == 20 {
 				tls_finished(t, m, w) or_return
 			} else {
+				if m[0] == 8 && !tls_extensions_sound(m[4:]) {
+					return false
+				}
 				sha2.update(&t.transcript, m)
 			}
 		case .Open:
@@ -284,6 +287,26 @@ tls_finished :: proc(t: ^Tls, m: []byte, w: ^[dynamic]byte) -> bool {
 	tls_key(&t.recv, t.server_app)
 	t.state = .Open
 	return true
+}
+
+// Whether the server's encrypted extensions are what they say they are: each as long as it says, and an ALPN
+// answer one protocol, the one offered.
+@(private)
+tls_extensions_sound :: proc(m: []byte) -> bool {
+	r := zsp.Reader{buf = m}
+	ext := zsp.Reader{buf = zsp.read_take(&r, tls_u16(&r))}
+	for !ext.bad && ext.pos < len(ext.buf) {
+		type := tls_u16(&ext)
+		body := zsp.Reader{buf = zsp.read_take(&ext, tls_u16(&ext))}
+		if type == 16 {
+			list := zsp.Reader{buf = zsp.read_take(&body, tls_u16(&body))}
+			name := zsp.read_take(&list, int(zsp.read_u8(&list)))
+			if list.bad || body.bad || list.pos != len(list.buf) || body.pos != len(body.buf) || string(name) != "http/1.1" {
+				return false
+			}
+		}
+	}
+	return !r.bad && !ext.bad && r.pos == len(r.buf)
 }
 
 @(private)
