@@ -70,7 +70,7 @@ proxy_accepted :: proc(op: ^nbio.Operation, h: ^Host) {
 	socket := op.accept.client
 	local, err := net.bound_endpoint(socket)
 	if err != nil || (!h.trust_local_users && !tcp_peer_is_mine(address_from(local), address_from(op.accept.client_endpoint))) {
-		socket_reset(socket)
+		socket_abort(socket)
 		return
 	}
 	if len(p.waiting) >= PROXY_GREETING_MAX {
@@ -108,7 +108,7 @@ proxy_client_close :: proc(c: ^Proxy_Client, reset: bool) {
 		nbio.remove(c.polling)
 	}
 	if reset {
-		socket_reset(c.socket)
+		socket_abort(c.socket)
 	}
 	delete(c.buf)
 	free(c)

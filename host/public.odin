@@ -220,7 +220,7 @@ public_accepted :: proc(op: ^nbio.Operation, h: ^Host, secure: bool) {
 		return
 	}
 	if len(rp.conns) >= PUBLIC_MAX {
-		socket_reset(op.accept.client)
+		socket_abort(op.accept.client)
 		return
 	}
 	c := new(Public_Out)
@@ -515,7 +515,7 @@ public_out_close :: proc(c: ^Public_Out, reset: bool) {
 		call_cancel(c.sp, c.call)
 	}
 	if reset {
-		socket_reset(c.socket)
+		socket_abort(c.socket)
 	} else {
 		net.close(c.socket)
 	}

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams|aead]|nat|system|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams|aead|ports]|nat|system|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -162,6 +162,9 @@ bench)
 		node web/build.ts
 		node --expose-gc web/test/bench.ts ${3:-100000}
 		node web/test/browsers.ts bench
+	elif [ "${2:-}" = ports ]; then # what names, ports and exposure cost: ./x bench ports
+		odin build zspd -out:build/zspd$EXE -o:speed $STRICT
+		$PYTHON tests/measure_ports.py
 	elif [ "${2:-}" = mirror ]; then # what structured state costs a client: ./x bench mirror [rows]
 		lune run luau/tests/mirror_bench.luau ${3:-2000}
 	elif [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]

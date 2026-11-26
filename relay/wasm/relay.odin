@@ -130,7 +130,7 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len
 			exposed(s, payload)
 		}
 	}
-	node.host.calls.flow = proc(_: rawptr, call: u64, kind: zsp.Flow, payload: []byte) {
+	node.host.flow = proc(_: rawptr, call: u64, kind: zsp.Flow, payload: []byte) {
 		public_flow(f64(call), u8(kind), raw_data(payload), len(payload))
 	}
 	node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, credential: []byte) {

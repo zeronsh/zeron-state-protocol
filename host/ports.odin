@@ -408,7 +408,7 @@ listener_accepted :: proc(op: ^nbio.Operation, l: ^Listener) {
 	}
 	local, err := net.bound_endpoint(op.accept.client)
 	if err != nil {
-		socket_reset(op.accept.client)
+		socket_abort(op.accept.client)
 		return
 	}
 	ports_accept(l.remote.ports.space, op.accept.client, local, op.accept.client_endpoint)
@@ -421,13 +421,13 @@ ports_accept :: proc(sp: ^Space, socket: net.TCP_Socket, local, from: net.Endpoi
 	ip, v4 := local.address.(net.IP4_Address)
 	m := address_member(sp, {ip[0], ip[1], ip[2], ip[3]}) if v4 && sp.ports != nil else nil
 	if m == nil || (!sp.host.trust_local_users && !tcp_peer_is_mine(address_from(local), address_from(from))) {
-		socket_reset(socket)
+		socket_abort(socket)
 		return
 	}
 	device := m.device
 	r := remote_for(sp.ports, device, make = slice.contains(zsp.node_reach(&sp.node), device))
 	if r == nil {
-		socket_reset(socket) // it cannot be reached: as if nothing were there
+		socket_abort(socket) // it cannot be reached: as if nothing were there
 		return
 	}
 	// What it said it offers says where to; a port it has not said is asked of it as this machine's, and it decides.
@@ -463,7 +463,7 @@ connection_done :: proc(data: rawptr, status: Forward_Status) {
 // page that sent it must be of this space. So a page elsewhere whose own name it has pointed here (DNS rebinding)
 // reaches nothing. Anything else passes.
 @(private)
-http_guard :: proc(data: rawptr, first: []byte) -> Inspect {
+http_guard :: proc(data: rawptr, first: []byte) -> Inspection {
 	c := (^Connection)(data)
 	verdict, reason := http_verdict(c.sp, c.device, first)
 	if verdict == .Reject {
@@ -474,7 +474,7 @@ http_guard :: proc(data: rawptr, first: []byte) -> Inspect {
 }
 
 @(private)
-http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte) -> (Inspect, string) {
+http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte) -> (Inspection, string) {
 	// A method, a space: or it is not HTTP, and none of this applies.
 	method := 0
 	for method < len(first) && method < 16 && first[method] >= 'A' && first[method] <= 'Z' {

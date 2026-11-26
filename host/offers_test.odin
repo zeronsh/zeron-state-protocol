@@ -133,31 +133,31 @@ web_pages_reach_only_their_own :: proc(t: ^testing.T) {
 	defer test_space_destroy(&ts)
 	sp := &ts.space
 	desk := ts.keys[1].device
-	verdict :: proc(sp: ^Space, device: zsp.Key32, request: string) -> Inspect {
+	verdict :: proc(sp: ^Space, device: zsp.Key32, request: string) -> Inspection {
 		v, _ := http_verdict(sp, device, transmute([]byte)request)
 		return v
 	}
 	id := name_id(ts.keys[2].device)
 	other := strings.concatenate({string(id[:]), ".id.zsp.internal"}, context.temp_allocator)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal:8080\r\n\r\n"), Inspect.Pass)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nhost: DESK.zsp.internal.\r\n\r\n"), Inspect.Pass)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: 127.77.0.3:8080\r\n\r\n"), Inspect.Pass)
-	testing.expect_value(t, verdict(sp, desk, cat("POST /x HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: http://", other, ":3000\r\n\r\nbody")), Inspect.Pass)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.0\r\n\r\n"), Inspect.Pass) // no browser leaves out the name
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal:8080\r\n\r\n"), Inspection.Pass)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nhost: DESK.zsp.internal.\r\n\r\n"), Inspection.Pass)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: 127.77.0.3:8080\r\n\r\n"), Inspection.Pass)
+	testing.expect_value(t, verdict(sp, desk, cat("POST /x HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: http://", other, ":3000\r\n\r\nbody")), Inspection.Pass)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.0\r\n\r\n"), Inspection.Pass) // no browser leaves out the name
 	// Not yet known.
-	testing.expect_value(t, verdict(sp, desk, "GE"), Inspect.More)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk"), Inspect.More)
+	testing.expect_value(t, verdict(sp, desk, "GE"), Inspection.More)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk"), Inspection.More)
 	// Not HTTP at all: an SSH client, TLS.
-	testing.expect_value(t, verdict(sp, desk, "SSH-2.0-OpenSSH_9.6\r\n"), Inspect.Pass)
-	testing.expect_value(t, verdict(sp, desk, "\x16\x03\x01\x02\x00"), Inspect.Pass)
+	testing.expect_value(t, verdict(sp, desk, "SSH-2.0-OpenSSH_9.6\r\n"), Inspection.Pass)
+	testing.expect_value(t, verdict(sp, desk, "\x16\x03\x01\x02\x00"), Inspection.Pass)
 	// A page elsewhere, whose own name now leads here; another device's name; and a page of another place.
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: attacker.example:8080\r\n\r\n"), Inspect.Reject)
-	testing.expect_value(t, verdict(sp, desk, cat("GET / HTTP/1.1\r\nHost: ", other, "\r\n\r\n")), Inspect.Reject)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"), Inspect.Reject)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: https://attacker.example\r\n\r\n"), Inspect.Reject)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: null\r\n\r\n"), Inspect.Reject)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nHost: attacker.example\r\n\r\n"), Inspect.Reject)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal.attacker.example\r\n\r\n"), Inspect.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: attacker.example:8080\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, cat("GET / HTTP/1.1\r\nHost: ", other, "\r\n\r\n")), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: https://attacker.example\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: null\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nHost: attacker.example\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal.attacker.example\r\n\r\n"), Inspection.Reject)
 }
 
 @(private = "file")

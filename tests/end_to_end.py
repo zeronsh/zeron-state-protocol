@@ -1092,9 +1092,12 @@ def test_ports():
         assert http_get(bee, port, host="attacker.example")[0] == 403
         assert http_get(bee, port, host="bee.zsp.internal", origin="https://attacker.example")[0] == 403
         assert http_get(bee, port, host="bee.zsp.internal", origin="http://bee.zsp.internal:%d" % port) == (200, b"bee's")
+    import json
+
     with open(os.path.join(b.dir, zspd_space(b), "audit.log")) as f:
-        audit = f.read()
-    assert a.key in audit and '"event":"Open"' in audit and '"event":"Change"' in audit
+        audit = [json.loads(line) for line in f]
+    assert any(e["event"] == "open" and e["device"] == a.key and e["service"] == "tcp" for e in audit), audit
+    assert any(e["event"] == "change" and e["service"] == "offer" for e in audit), audit
 
 
 def test_offers_end():

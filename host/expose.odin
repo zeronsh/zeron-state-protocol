@@ -50,6 +50,7 @@ Public_In :: struct {
 	forward: ^Forward,
 	tried6:  bool,
 	prelude: []byte, // owned
+	abandoned: bool, // over while dialling: the dial is left to finish, and this freed then
 }
 
 exposure_destroy :: proc(e: ^Exposure) {
@@ -318,6 +319,14 @@ public_dial :: proc(c: ^Public_In, six: bool) {
 	at := net.Endpoint{net.IP6_Loopback if six else net.IP4_Loopback, int(c.port)}
 	c.dialing = nbio.dial_poly(at, c, proc(op: ^nbio.Operation, c: ^Public_In) {
 		c.dialing = nil
+		if c.abandoned {
+			// Taken back meanwhile. Removing a dial that has connected would leak its socket: so it was let finish.
+			if op.dial.err == nil {
+				socket_abort(op.dial.socket)
+			}
+			public_in_free(c)
+			return
+		}
 		if op.dial.err != nil {
 			if !c.tried6 {
 				public_dial(c, true) // some listen on ::1 alone
@@ -364,8 +373,14 @@ public_in_drop :: proc(c: ^Public_In) {
 		}
 	}
 	if c.dialing != nil {
-		nbio.remove(c.dialing)
+		c.abandoned = true // freed when the dial ends
+		return
 	}
+	public_in_free(c)
+}
+
+@(private)
+public_in_free :: proc(c: ^Public_In) {
 	delete(c.label)
 	delete(c.early)
 	delete(c.prelude)

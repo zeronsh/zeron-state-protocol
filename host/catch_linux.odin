@@ -97,7 +97,7 @@ catch_accepted :: proc(op: ^nbio.Operation, h: ^Host) {
 	socket := op.accept.client
 	original, ok := original_destination(socket)
 	if !ok {
-		socket_reset(socket)
+		socket_abort(socket)
 		return
 	}
 	if original == c.probe {
@@ -112,7 +112,7 @@ catch_accepted :: proc(op: ^nbio.Operation, h: ^Host) {
 			return
 		}
 	}
-	socket_reset(socket) // somebody connected here directly, or to nobody's address
+	socket_abort(socket) // somebody connected here directly, or to nobody's address
 }
 
 // Where a connection the kernel redirected here was going.
