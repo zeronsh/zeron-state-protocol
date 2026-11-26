@@ -45,7 +45,7 @@ Forward_Status :: enum u8 {
 
 Inspection :: enum u8 {
 	More, // show me more
-	Pass, // let it all through, and stop showing me
+	Pass, // let it all through, and stop showing me; or, after forward_look_again, so much of it, and show me what follows
 	Reject, // end it
 }
 
@@ -83,7 +83,9 @@ Bridge :: struct {
 	status:      Forward_Status,
 	inspect:     proc(data: rawptr, first: []byte) -> Inspection,
 	held:        [dynamic]byte, // shown to the inspector, or given early, not yet sent
-	early:       int, // of held, given early, not for the inspector
+	early:       int, // of held, given early, or let through, not for the inspector
+	look_after:  int, // set by forward_look_again as an inspector passes: so much passes, and what follows is shown it
+	passing:     int, // of what is yet to come, so much is let through before the inspector is shown more
 	reply:       []byte, // owned; written before the end, on rejection
 	draining:    ^nbio.Operation, // a rejected connection's last read, or its time running out
 	dial6:       net.Endpoint, // where to try next, if the first address refuses
@@ -148,6 +150,13 @@ forward :: proc(
 		return nil // over already, and `done` told so
 	}
 	return b
+}
+
+// Said by an inspector as it returns Pass: only the first `n` bytes of what it was shown (and of what is yet to come,
+// if it was shown fewer) pass, and it is shown what follows them. For protocols of one message after another, each
+// to be judged: HTTP/1.1's requests on one connection.
+forward_look_again :: proc(f: ^Forward, n: int) {
+	f.look_after = n
 }
 
 // Ends a forward at once, with a reset.
@@ -566,7 +575,8 @@ bridge_read :: proc(b: ^Bridge) {
 	for _ in 0 ..< 16 {
 		room := call_room(b.sp, b.call)
 		if b.inspect != nil {
-			room = INSPECT_MOST - (len(b.held) - b.early) + 1
+			// What passes uninspected waits for credit as anything does; what is to be shown waits for the inspector.
+			room = room - b.early if b.passing > 0 else INSPECT_MOST - (len(b.held) - b.early) + 1
 		}
 		if room <= 0 {
 			return // on_room says when to go on
@@ -592,8 +602,8 @@ bridge_read :: proc(b: ^Bridge) {
 		}
 		if n == 0 {
 			b.eof = true
-			if b.inspect != nil {
-				bridge_abort(b, .Rejected) // it ended before it could be judged
+			if b.inspect != nil && len(b.held) > b.early {
+				bridge_abort(b, .Rejected) // it ended before what it said could be judged
 				return
 			}
 			call_end(b.sp, b.call)
@@ -603,27 +613,39 @@ bridge_read :: proc(b: ^Bridge) {
 		b.bytes_in += u64(n)
 		if b.inspect != nil {
 			append(&b.held, ..buf[:n])
-			switch b.inspect(b.done_data, b.held[b.early:]) {
-			case .More:
-				if len(b.held) - b.early >= INSPECT_MOST {
-					bridge_abort(b, .Rejected)
+			through := min(b.passing, n) // the rest of what was let through, as it comes
+			b.early += through
+			b.passing -= through
+			judged: for b.inspect != nil && len(b.held) > b.early {
+				switch b.inspect(b.done_data, b.held[b.early:]) {
+				case .More:
+					if len(b.held) - b.early >= INSPECT_MOST {
+						bridge_abort(b, .Rejected)
+						return
+					}
+					break judged
+				case .Reject:
+					if !b.over {
+						bridge_reject(b) // with what forward_reject said to reply, if it did
+					}
 					return
+				case .Pass:
+					if after := b.look_after; after > 0 {
+						b.look_after = 0
+						shown := len(b.held) - b.early
+						b.early += min(after, shown)
+						b.passing = max(after - shown, 0)
+						continue judged // what follows, if any of it has come
+					}
+					b.inspect = nil
 				}
-				continue
-			case .Reject:
-				if !b.over {
-					bridge_reject(b) // with what forward_reject said to reply, if it did
-				}
-				return
-			case .Pass:
-				b.inspect = nil
-				// What was held goes as credit allows; the rest waits in held until then.
-				bridge_send_held(b)
-				if len(b.held) > 0 {
-					return
-				}
-				continue
 			}
+			// What was held and let through goes as credit allows; the rest waits in held until then.
+			bridge_send_held(b)
+			if len(b.held) > 0 && (b.inspect == nil || b.early > 0) {
+				return
+			}
+			continue
 		}
 		if !call_send(b.sp, b.call, buf[:n]) {
 			bridge_abort(b, .Lost)

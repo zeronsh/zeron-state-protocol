@@ -240,9 +240,12 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 	// what came with the request is judged here, being sent before anything could judge it there; what comes after
 	// it, by the forward's inspector. Until what came is enough to judge, more is waited for.
 	inspect: proc(data: rawptr, first: []byte) -> Inspection = proxied_guard
-	if len(early) > 0 {
-		// Not as what came first: it came with the request, written at once with it, however short.
-		verdict, reason := http_verdict(sp, device, early[:])
+	// Each request that came with it, one after another (never as what came first: it was written at once with the
+	// proxy's request, however short); the forward's inspector judges those after.
+	judged := 0
+	judging: for judged < len(early) {
+		request := 0
+		verdict, reason := http_verdict(sp, device, early[judged:], request = &request)
 		switch verdict {
 		case .Reject:
 			proxy_say_no(c, reason)
@@ -255,7 +258,11 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 			proxy_client_wait(c) // read again from the start, with more
 			return
 		case .Pass:
-			inspect = nil
+			if request == 0 {
+				inspect = nil // no more to judge: not a web request, or one whose end is not to be found
+				break judging
+			}
+			judged += request
 		}
 	}
 	ports_wanted(sp, device)
@@ -276,6 +283,9 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 	// Told how it went, maybe before forward returns, and then pc is gone: so it is kept only if it is a forward.
 	if f := forward(sp, device, entry.scope, entry.port, entry.host, socket, proxied_done, pc, inspect, early[:]); f != nil {
 		pc.forward = f
+		if inspect != nil {
+			f.passing = max(judged - len(early), 0) // the rest of a body that came in part, before what is shown next
+		}
 	}
 }
 
@@ -297,10 +307,13 @@ proxy_say_no :: proc(c: ^Proxy_Client, reason: string) {
 @(private)
 proxied_guard :: proc(data: rawptr, first: []byte) -> Inspection {
 	pc := (^Proxied)(data)
-	verdict, reason := http_verdict(pc.sp, pc.device, first, first_look = !pc.looked)
+	request := 0
+	verdict, reason := http_verdict(pc.sp, pc.device, first, first_look = !pc.looked, request = &request)
 	pc.looked = true
 	if verdict == .Reject {
 		forward_reply(pc.forward, http_forbidden(reason))
+	} else if verdict == .Pass && request > 0 {
+		forward_look_again(pc.forward, request)
 	}
 	return verdict
 }

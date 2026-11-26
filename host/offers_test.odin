@@ -200,6 +200,30 @@ web_pages_reach_only_their_own :: proc(t: ^testing.T) {
 		testing.expectf(t, verdict(sp, desk, odd) == .Reject, "%q", odd)
 	}
 	testing.expect_value(t, verdict(sp, desk, "PROPFIND /x  HTTP/1"), Inspection.More) // its line not yet whole
+	// How long a request that passes is, so that the next on its connection is judged too; none where its end is not to
+	// be found (a body in chunks, an upgrade, CONNECT), and two lengths are refused.
+	length :: proc(sp: ^Space, device: zsp.Key32, request: string) -> (Inspection, int) {
+		n := 0
+		v, _ := http_verdict(sp, device, transmute([]byte)request, request = &n)
+		return v, n
+	}
+	head := "POST /x HTTP/1.1\r\nHost: desk.zsp.internal\r\nContent-Length: 5\r\n\r\n"
+	v, n := length(sp, desk, cat(head, "hello", "GET / HTTP/1.1\r\n"))
+	testing.expect(t, v == .Pass && n == len(head) + 5)
+	v, n = length(sp, desk, "\r\nGET / HTTP/1.1\r\nHost: desk.zsp.internal\r\n\r\n")
+	testing.expect(t, v == .Pass && n == len("\r\nGET / HTTP/1.1\r\nHost: desk.zsp.internal\r\n\r\n"))
+	for unbounded in ([]string{
+		"POST /x HTTP/1.1\r\nHost: desk.zsp.internal\r\nTransfer-Encoding: chunked\r\n\r\n",
+		"GET /ws HTTP/1.1\r\nHost: desk.zsp.internal\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+		"CONNECT desk.zsp.internal:443 HTTP/1.1\r\nHost: desk.zsp.internal\r\n\r\n",
+	}) {
+		v, n = length(sp, desk, unbounded)
+		testing.expectf(t, v == .Pass && n == 0, "%q: %v %d", unbounded, v, n)
+	}
+	v, _ = length(sp, desk, "POST /x HTTP/1.1\r\nHost: desk.zsp.internal\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n")
+	testing.expect_value(t, v, Inspection.Reject)
+	v, _ = length(sp, desk, "POST /x HTTP/1.1\r\nHost: desk.zsp.internal\r\nContent-Length: +5\r\n\r\n")
+	testing.expect_value(t, v, Inspection.Reject)
 	// What no server takes for a request still passes: a mail client's word, a file server's.
 	testing.expect_value(t, verdict(sp, desk, "USER bob\r\n"), Inspection.Pass)
 	testing.expect_value(t, verdict(sp, desk, "EHLO client.example\r\n"), Inspection.Pass)

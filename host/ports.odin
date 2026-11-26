@@ -475,10 +475,13 @@ connection_done :: proc(data: rawptr, status: Forward_Status) {
 @(private)
 http_guard :: proc(data: rawptr, first: []byte) -> Inspection {
 	c := (^Connection)(data)
-	verdict, reason := http_verdict(c.sp, c.device, first, first_look = !c.looked)
+	request := 0
+	verdict, reason := http_verdict(c.sp, c.device, first, first_look = !c.looked, request = &request)
 	c.looked = true
 	if verdict == .Reject {
 		forward_reply(c.forward, http_forbidden(reason))
+	} else if verdict == .Pass && request > 0 {
+		forward_look_again(c.forward, request) // and the next request on it, as this one
 	}
 	return verdict
 }
@@ -507,7 +510,7 @@ http_forbidden :: proc(reason: string) -> []byte {
 // Origins, a folded line, a line that is no header. Only the first request is looked at: a browser keeps a
 // connection for one origin, the one whose name the first request carries.
 @(private)
-http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look := false) -> (Inspection, string) {
+http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look := false, request: ^int = nil) -> (Inspection, string) {
 	b := first
 	for len(b) > 0 && (b[0] == '\r' || b[0] == '\n') {
 		b = b[1:]
@@ -585,8 +588,8 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 	}
 	// A web request: its head, whole, line by line.
 	rest := string(b[i + 1:])
-	host, origin: Maybe(string)
-	whole := false
+	host, origin, length: Maybe(string)
+	whole, unbounded := false, false
 	for len(rest) > 0 {
 		lf := strings.index_byte(rest, '\n')
 		if lf < 0 {
@@ -620,11 +623,19 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 				return .Reject, "two origins"
 			}
 			origin = value
+		case strings.equal_fold(name, "content-length"):
+			if length != nil {
+				return .Reject, "two lengths"
+			}
+			length = value
+		case strings.equal_fold(name, "transfer-encoding"), strings.equal_fold(name, "upgrade"):
+			unbounded = true // its end is not to be found from here: no browser sends it so but to change protocols
 		}
 	}
 	if !whole {
 		return .More, ""
 	}
+	head := len(first) - len(b) + i + 1 + len(b[i + 1:]) - len(rest)
 	h, has := host.?
 	if !has {
 		return .Reject, "a request must say which name it is for"
@@ -650,6 +661,24 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 		if sep == "" || (scheme != "http" && scheme != "https") || !ok || !names_space(sp, name) {
 			return .Reject, "pages of other places may not reach this"
 		}
+	}
+	// How long the request is, so that the next on the connection is judged too (a page may send its own after one
+	// that passed): the head and a body of Content-Length. Not where its end is not to be found, which a browser
+	// sends only to change protocols (an upgrade, CONNECT), its own request judged.
+	if request != nil && !unbounded && !strings.equal_fold(method, "CONNECT") {
+		body := 0
+		if l, has_length := length.?; has_length {
+			if len(l) == 0 || len(l) > 15 {
+				return .Reject, "a length that could be read two ways"
+			}
+			for c in transmute([]byte)l {
+				if c < '0' || c > '9' {
+					return .Reject, "a length that could be read two ways"
+				}
+				body = body * 10 + int(c - '0')
+			}
+		}
+		request^ = head + body
 	}
 	return .Pass, ""
 }

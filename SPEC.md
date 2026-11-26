@@ -685,7 +685,11 @@ nothing. What a browser sends begins with a request line, `method SP target SP H
 - the head must have exactly one `Host`, at most one `Origin`, and no folded or malformed header lines; a `Host` (and a target in absolute
   form) is a name or address, then `:` and digits if anything, naming the device; an `Origin` is `http` or `https`, `://`, a name or
   address of the space, then `:` and digits if anything, and nothing else (so not `null`);
-- only the first request of a connection is looked at: a browser keeps a connection for the one origin its first request named.
+- every request of a connection is looked at, one after another, each as long as its head and its `Content-Length` say; a page's
+  request that passes (an image's GET, which says no `Origin`) does not open the way for its next. Where a request's end is not to
+  be found (a body in chunks, an upgrade, CONNECT), what follows it passes, its own request judged; two `Content-Length`s, or one
+  that is not digits, are refused. A refused request ends its connection with the 403, and answers to requests sent with it, still
+  to come, are lost with it (browsers do not send requests ahead of answers).
 
 **Exposure.** A device may expose a port of its own machine to the public, through relays that will, one port at a time, under a
 **label**:

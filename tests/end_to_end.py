@@ -1300,7 +1300,6 @@ def test_ports():
             while data := s.recv(4096):
                 got += data
             assert got.startswith(b"HTTP/1.1 200 ") and got.endswith(b"got %d" % size), (size, got)
-    # Refused as it says all it will at once (its request, then the end of it): the refusal is still read.
     def socks_to(address, port):
         s = socket.create_connection(proxy, 5)
         s.sendall(b"\x05\x01\x00")
@@ -1308,6 +1307,67 @@ def test_ports():
         s.sendall(b"\x05\x01\x00\x03" + bytes([len(address)]) + address.encode() + struct.pack(">H", port))
         assert s.recv(10)[1] == 0
         return s
+
+    # Each request on a connection kept alive is judged, not the first alone: a page's request that passes (an image's
+    # GET, which says no Origin) does not open the way for its next (a POST that says it).
+    import http.server
+
+    class Keep(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.do_GET()
+
+        def log_message(self, *a):
+            pass
+
+    kept = http.server.ThreadingHTTPServer(("127.0.0.1", free_port()), Keep)
+    threading.Thread(target=kept.serve_forever, daemon=True).start()
+    kport = kept.server_address[1]
+    cb.offer(kport, 1)
+    eventually("that one", lambda: any(p["port"] == kport for n in ca.nodes() for p in n["ports"]))
+
+    def answers(s, count):
+        got, out = b"", []
+        while len(out) < count:
+            data = s.recv(65536)
+            if not data:
+                break
+            got += data
+            while b"\r\n\r\n" in got:
+                head, _, rest = got.partition(b"\r\n\r\n")
+                n = int(head.lower().split(b"content-length:")[1].split(b"\r\n")[0]) if b"content-length:" in head.lower() else 0
+                if len(rest) < n:
+                    break
+                out.append(head.split(b"\r\n")[0])
+                got = rest[n:]
+        return out
+
+    ways = [lambda: socks_to("bee.zsp.internal", kport)] + ([lambda: socket.create_connection((bee, kport), 5)] if direct else [])
+    for open_one in ways:
+        with open_one() as s:
+            s.sendall(b"GET /warm HTTP/1.1\r\nHost: bee.zsp.internal\r\n\r\n")
+            assert answers(s, 1) == [b"HTTP/1.1 200 OK"]
+            s.sendall(b"GET /again HTTP/1.1\r\nHost: bee.zsp.internal\r\n\r\n")
+            assert answers(s, 1) == [b"HTTP/1.1 200 OK"]  # a page's own, again
+            s.sendall(b"POST /reuse HTTP/1.1\r\nHost: bee.zsp.internal\r\nOrigin: http://other.example\r\nContent-Length: 5\r\n\r\nhello")
+            got = answers(s, 1)
+            assert got == [b"HTTP/1.1 403 Forbidden"], got
+        with open_one() as s:  # two at once (no browser does): the second is refused, and the connection with it
+            s.sendall(b"POST /a HTTP/1.1\r\nHost: bee.zsp.internal\r\nContent-Length: 3\r\n\r\nabc"
+                      b"GET /b HTTP/1.1\r\nHost: attacker.example\r\n\r\n")
+            got = answers(s, 2)
+            assert got[-1:] == [b"HTTP/1.1 403 Forbidden"] and len(got) <= 2, got
+    kept.shutdown()
+
+    # Refused as it says all it will at once (its request, then the end of it): the refusal is still read.
 
     for open_one in [lambda: socks_to("bee.zsp.internal", port)] + ([lambda: socket.create_connection((bee, port), 5)] if direct else []):
         for _ in range(5):
