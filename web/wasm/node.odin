@@ -43,7 +43,7 @@ foreign host {
 // does not answer in so long is gone.
 ping_idle: f64 = 45_000
 pong_wait: f64 = 15_000
-SYNC_MOST :: 100 // ms: the longest a commit waits to share a sync with others
+SYNC_MOST :: 100 * time.Millisecond // the longest a commit waits to share a sync with others
 MAX_PLAIN :: 60 << 10 // per Noise message
 PAGES_KEPT :: 2048 // of each kind, before the coldest are let go
 FIND_LINGER :: 10 * time.Second
@@ -82,9 +82,9 @@ next_conn: u32 = 1
 dialers: [dynamic]^Dialer
 tree_pages, find_pages: Pages
 message: [dynamic]byte // handed in and out
-synced_at: f64 // when the log was last synced, by the clock of `now`
-sync_took: f64 // and how long that took, in milliseconds
-sync_due: Maybe(f64)
+synced_at: time.Tick // when the log was last synced
+sync_took: time.Duration // and how long that took
+sync_due: Maybe(time.Tick)
 found: ^Found
 failed: bool
 started: bool
@@ -281,7 +281,7 @@ start :: proc "c" (full: bool) -> bool {
 		},
 		questions = questions(),
 	}
-	synced_at = now()
+	synced_at = time.tick_now()
 	started = true
 	dialers_refresh()
 	free_all(context.temp_allocator)
@@ -406,6 +406,12 @@ input :: proc "c" (id: u32, size: int) {
 	// One that is closing has its reason said, and is let go once it has.
 	if !ok && (c.session == nil || !c.session.closing) {
 		conn_drop(c)
+	}
+	// What was committed goes to the files now, rather than at the end of the burst: the store holds no more of it in
+	// memory than one input's worth, however much comes at once; and nor do its trees hold more than a checkpoint's.
+	zsp.store_flush(&node.store)
+	if zsp.store_wants_checkpoint(&node.store) {
+		sync()
 	}
 }
 
@@ -683,6 +689,21 @@ found_deadline :: proc(t: time.Tick) -> (wait: time.Duration, ok: bool) {
 
 // ---------------------------------------------------------------- running
 
+// Makes what was committed durable, and checkpoints if it is time to.
+@(private)
+sync :: proc() -> bool {
+	sync_due = nil
+	began := time.tick_now()
+	synced := zsp.node_sync(&node)
+	synced_at = time.tick_now()
+	sync_took = time.tick_diff(began, synced_at)
+	if !synced {
+		report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
+		failed = true
+	}
+	return synced
+}
+
 // Everything that follows from what has happened since the last call, once. Returns how many milliseconds until
 // there is something to do even if nothing happens; -1 for never, -2 if storage has failed and the node must stop.
 @(export)
@@ -714,17 +735,10 @@ tick :: proc "c" () -> f64 {
 	if zsp.store_unsynced(&node.store) && sync_due == nil {
 		// At once, unless syncing would then be busy more than half the time: so one writer waits for one sync, and many
 		// writing at once share them, however fast or slow the disk.
-		sync_due = max(t, synced_at + min(sync_took, SYNC_MOST))
+		sync_due = time.tick_add(synced_at, min(sync_took, SYNC_MOST))
 	}
-	if due, ok := sync_due.?; ok && now() >= due {
-		sync_due = nil
-		began := time.tick_now()
-		synced := zsp.node_sync(&node)
-		sync_took = f64(time.tick_since(began)) / f64(time.Millisecond)
-		synced_at = now()
-		if !synced {
-			report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
-			failed = true
+	if due, ok := sync_due.?; ok && time.tick_diff(due, time.tick_now()) >= 0 {
+		if !sync() {
 			return -2
 		}
 		// What was waiting for it may now be said.
@@ -748,7 +762,7 @@ tick :: proc "c" () -> f64 {
 		}
 	}
 	if due, ok := sync_due.?; ok {
-		sooner(&wait, due - t)
+		sooner(&wait, f64(time.tick_diff(time.tick_now(), due)) / f64(time.Millisecond))
 	}
 	for d in dialers {
 		if d.conn == nil && !d.dropped {

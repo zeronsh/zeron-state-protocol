@@ -98,6 +98,7 @@ const REFUSED: Record<number, string> = {
 };
 
 const HIGH = 256 << 10; // bytes in flight to a pipe before the node waits for it
+const PIECE = 64 << 10; // of what a client says, handed to the node at a time
 const DRAIN_POLL = 4; // ms between looks at a WebSocket's backlog, while it has one: nothing says when it drains
 const LEVELS: Level[] = ["debug", "info", "warning", "error", "error"];
 
@@ -360,8 +361,12 @@ export class Node {
     return {
       send: (data) => {
         if (!c.open || this.#stopped) return;
-        this.#put(data);
-        wasm.input(id, data.length);
+        // A piece at a time, so that the node never holds more than a piece of what was said at once.
+        for (let at = 0; at < data.length && c.open; at += PIECE) {
+          const piece = data.subarray(at, at + PIECE);
+          this.#put(piece);
+          wasm.input(id, piece.length);
+        }
         this.#kick();
       },
       close: () => {
