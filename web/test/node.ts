@@ -103,6 +103,8 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await new Promise((done) => setTimeout(done, 300));
   assert(failure, "it says that it has stopped");
   assert(!durable, "and says nothing more is durable");
+  assert.throws(() => node.member, /storage/, "and answers nothing it would make up");
+  assert.throws(() => node.members());
   client.close();
 }
 

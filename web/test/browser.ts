@@ -5,6 +5,7 @@ import type { Connect, Wire } from "../src/node.ts";
 import { live } from "./live.ts";
 
 const devices = new Map<string, Device>();
+const failures: string[] = []; // what this tab was told of nodes that stopped
 
 // Pipes that can be broken, as a crash of the pipe breaks them.
 const pipes = new Set<{ wire: Wire; closed: () => void }>();
@@ -56,7 +57,7 @@ const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 const zsp = {
   /** Opens this origin's device of a name; says its key. */
   async device(name: string, credential?: string): Promise<{ id: string; key: string; space?: string }> {
-    const d = await open({ name, credential });
+    const d = await open({ name, credential, onFailure: (e) => failures.push(e.message) });
     devices.set(name, d);
     return { id: d.id, key: d.key, space: d.space };
   },
@@ -88,6 +89,29 @@ const zsp = {
       (e: { fault: string }) => "fault " + e.fault,
     );
     return Promise.race([answer, sleep(ms).then(() => "nothing")]);
+  },
+  /** What this tab has been told of nodes that stopped. */
+  async failures(): Promise<string[]> {
+    return failures;
+  },
+  /** Whether the device is a member, or what went wrong in asking. */
+  async memberOrError(name: string): Promise<string> {
+    return devices.get(name)!.member().then(String, (e: Error) => "error: " + e.message);
+  },
+  /** The space this tab's device says it is of, as it knows it now. */
+  async spaceOf(name: string): Promise<string | undefined> {
+    return devices.get(name)!.space;
+  },
+  async adopt(name: string, roster: number[]): Promise<boolean> {
+    return devices.get(name)!.adopt(Uint8Array.from(roster));
+  },
+  async create(name: string): Promise<string> {
+    return devices.get(name)!.create();
+  },
+  /** Writes a note of so many bytes; its durability is not waited for. */
+  async putLarge(name: string, list: string, size: number): Promise<void> {
+    const c = clientOf(name);
+    void c.write(1, (change) => change.insert({ v: columns.bytes(16) }, list, Date.now(), { v: new Uint8Array(size).fill(7) }));
   },
   /** Writes notes to a list of scope 1, and resolves once they are durable on the device. */
   async put(name: string, list: string, titles: string[]): Promise<void> {

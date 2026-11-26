@@ -40,6 +40,10 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       fail(new Error(r.failed));
       return;
     }
+    if ("space" in r) {
+      space = r.space;
+      return;
+    }
     const a = answers.get(r.answer);
     answers.delete(r.answer);
     if (r.error !== undefined) a?.reject(new Error(r.error));
@@ -54,8 +58,9 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     open: { name: options.name ?? "default", full: options.full, credential: options.credential, wasm: options.wasm?.toString() },
   };
   worker.postMessage(command);
+  let space: string | undefined;
   const identity = await ask<{ id: string; key: string; space?: string }>("identity");
-  let space = identity.space;
+  space ??= identity.space;
 
   const connect: Connect = (receive, closed) => {
     const { port1, port2 } = new MessageChannel();
@@ -95,7 +100,11 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     join: async (s: string, relay: Relay) => {
       space = await ask<string>("join", s, relay);
     },
-    adopt: (roster: Uint8Array) => ask<boolean>("adopt", roster),
+    adopt: async (roster: Uint8Array) => {
+      const taken = await ask<boolean>("adopt", roster);
+      space = (await ask<{ space?: string }>("identity")).space;
+      return taken;
+    },
     member: () => ask<boolean>("member"),
     create: async () => (space = await ask<string>("create")),
     scope: (signed?: boolean) => ask<number>("scope", signed),

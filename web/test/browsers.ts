@@ -177,6 +177,42 @@ const tests: Record<string, () => Promise<void>> = {
     if (first !== "fault lost" && first !== "fault unserved") throw new Error(`a call to a tab that has gone: ${first}`);
     expectEqual(await call<string>(leader, "request", "tg", "where", 5000), "fault unserved");
   },
+  // When the storage of the tab running a device fails, every tab is told, nothing made up is said, and another tab's
+  // worker may then have the store, and runs it once it can.
+  async browser_leader_fails() {
+    const relay = await node("serve", join(TMP, "lf-relay"));
+    const s = await space("lf", relay);
+    const leader = await page();
+    await browserDevice(leader, "lf", s, relay, "ann", false);
+    const follower = await page();
+    await call(follower, "device", "lf");
+    await call(follower, "put", "lf", "notes", ["one"]);
+    await follower.quota(1);
+    for (let i = 0; i < 4; i++) await call(follower, "putLarge", "lf", "big", 900 << 10);
+    await eventually("both tabs are told", async () => (await call<string[]>(leader, "failures")).length > 0 && (await call<string[]>(follower, "failures")).length > 0);
+    await follower.quota();
+    await leader.close(); // its worker has let go already; this tab may stay or go
+    pages.splice(pages.indexOf(leader), 1);
+    // The follower's worker has the store now: it says what is so, and what it writes is durable.
+    await eventually("the follower runs it", async () => (await call<string>(follower, "memberOrError", "lf")) === "true");
+    await call(follower, "put", "lf", "notes", ["two"]);
+    expectEqual((await call<string[]>(follower, "titles", "lf", "notes", 2)).join(), "one,two");
+  },
+  // Whichever tab joins, makes or adopts a space, every tab's device says it is of it.
+  async browser_space_told() {
+    const one = await page();
+    const two = await page();
+    await call(one, "device", "st");
+    await call(two, "device", "st");
+    const made = await call<string>(two, "create", "st");
+    await eventually("the other tab knows", async () => (await call<string | undefined>(one, "spaceOf", "st")) === made);
+    // And a device that adopts a roster says it is of that roster's space.
+    const owner = join(TMP, "st-owner");
+    const sid = zspd("create", owner);
+    await call(one, "device", "st-adopt");
+    expectEqual(await call<boolean>(one, "adopt", "st-adopt", Array.from(readFileSync(join(owner, sid, "roster")))), true);
+    expectEqual(await call<string | undefined>(one, "spaceOf", "st-adopt"), sid);
+  },
   // A device is what it was after its tabs have all gone, with no relay to be had: its key, and what it held.
   async browser_restart() {
     const relay = await node("serve", join(TMP, "br-relay"));

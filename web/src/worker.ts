@@ -27,12 +27,14 @@ export type Command = { open: Options } | { connect: MessagePort } | { ask: numb
 /** What a device can be asked to do, by whichever tab. */
 export type Op = "identity" | "join" | "adopt" | "member" | "create" | "scope" | "admit" | "revoke" | "subject" | "admin" | "owner" | "relay" | "members";
 
-/** What a worker tells its tab. */
-export type Report = { answer: number; value?: unknown; error?: string } | { failed: string };
+/** What a worker tells its tab: an answer; that the node has stopped, its storage having failed; or the space it is of. */
+export type Report = { answer: number; value?: unknown; error?: string } | { failed: string } | { space: string | undefined };
 
 // Between workers, on the store's channel.
 type Shout =
   | { leader: true } // a worker has opened the store: whatever was carried to another is broken
+  | { failed: string } // its storage has failed: it has stopped, and lets another try
+  | { space: string | undefined } // the space the device is of, now
   | { open: string } // a pipe, on the channel of that name
   | { ask: string; op: Op; args: unknown[] }
   | { answer: string; value?: unknown; error?: string };
@@ -58,21 +60,41 @@ function open(o: Options): void {
   channel.onmessage = (e: MessageEvent<Shout>) => heard(e.data);
   // Whoever holds this runs the node, for as long as its tab lives.
   void navigator.locks.request("zsp:" + o.name, async () => {
+    let failed: Promise<Error>;
     try {
       const volume = await OpfsVolume.at("zsp/" + o.name);
       const module = await loadModule(o.wasm ? new URL(o.wasm, self.location.href) : undefined);
-      device = await Node.open({ volume, module, full: o.full, credential: o.credential });
-      device.onFailure = (error) => self.postMessage({ failed: error.message } satisfies Report);
+      const node = await Node.open({ volume, module, full: o.full, credential: o.credential });
+      failed = new Promise((done) => (node.onFailure = done));
+      device = node;
     } catch (error) {
-      self.postMessage({ failed: String(error) } satisfies Report);
+      fail(error instanceof Error ? error.message : String(error));
       return;
     }
     breakCarried();
     channel.postMessage({ leader: true } satisfies Shout);
+    tellSpace();
     // What this worker itself was waiting to hear, it now answers.
     for (const [id, s] of unheard) if ("ask" in s) heard({ answer: id, ...answer(s.op, s.args) });
-    await new Promise(() => {}); // held until the worker is gone
+    // Held until the worker is gone with its tab, or until the node stops of itself: then every tab is told, and another
+    // worker may have the store, and try.
+    const error = await failed;
+    device = undefined;
+    fail(error.message);
   });
+}
+
+// Every tab hears that the node has stopped, its storage having failed.
+function fail(message: string): void {
+  self.postMessage({ failed: message } satisfies Report);
+  channel.postMessage({ failed: message } satisfies Shout);
+}
+
+// Every tab hears what space the device is of, whichever tab changed it.
+function tellSpace(): void {
+  const space = device?.space;
+  self.postMessage({ space } satisfies Report);
+  channel.postMessage({ space } satisfies Shout);
 }
 
 function breakCarried(): void {
@@ -98,13 +120,20 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
         return { value: { id: d.id, key: d.key, space: d.space } };
       case "join":
         d.join(args[0] as string, args[1] as { key: string; url: string });
+        tellSpace();
         return { value: d.space };
-      case "adopt":
-        return { value: d.adopt(args[0] as Uint8Array) };
+      case "adopt": {
+        const taken = d.adopt(args[0] as Uint8Array);
+        tellSpace();
+        return { value: taken };
+      }
       case "member":
         return { value: d.member };
-      case "create":
-        return { value: d.create() };
+      case "create": {
+        const space = d.create();
+        tellSpace();
+        return { value: space };
+      }
       case "scope":
         return { value: d.scope(args[0] as boolean | undefined) };
       case "admit":
@@ -134,7 +163,11 @@ function shout(id: string, s: Shout): void {
 }
 
 function heard(s: Shout): void {
-  if ("leader" in s) {
+  if ("failed" in s) {
+    self.postMessage({ failed: s.failed } satisfies Report);
+  } else if ("space" in s) {
+    self.postMessage({ space: s.space } satisfies Report);
+  } else if ("leader" in s) {
     breakCarried(); // to one that is gone
     for (const u of unheard.values()) if (!("open" in u)) channel.postMessage(u);
   } else if ("answer" in s) {

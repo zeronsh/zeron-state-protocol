@@ -32,6 +32,8 @@ export interface Page {
   readonly id: string;
   /** Evaluates an expression, waiting for it if it is a promise, and gives back its value as JSON allows. */
   evaluate<T = unknown>(expression: string): Promise<T>;
+  /** Says how much the page's origin may store, or, with none, lets it have what it would. */
+  quota(bytes?: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -131,6 +133,10 @@ export class Chrome {
         const r = await this.#send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, sessionId);
         if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
         return r.result.value as T;
+      },
+      quota: async (bytes?: number) => {
+        const origin = new URL(url).origin;
+        await this.#send("Storage.overrideQuotaForOrigin", bytes === undefined ? { origin } : { origin, quotaSize: bytes }, sessionId);
       },
       close: async () => {
         this.#sessions.delete(sessionId);

@@ -213,8 +213,15 @@ export class Node {
     return this.#space;
   }
 
+  // A node that has stopped of itself answers nothing: what it would say is not so.
+  #working(): void {
+    if (this.#failure) throw this.#failure;
+    if (this.#stopped) throw new Error("the node is closed");
+  }
+
   /** Whether the roster it holds lets it do anything at all. */
   get member(): boolean {
+    this.#working();
     return this.#wasm !== undefined && this.#space !== undefined && this.#wasm.member() !== 0;
   }
 
@@ -223,6 +230,7 @@ export class Node {
    * the roster says of relays. `url` is the relay's, as `zspd relay` is given it, and the space is put after it.
    */
   join(space: string, relay: { key: string; url: string }): void {
+    this.#working();
     if (this.#space !== undefined) throw new Error("this device is of a space already");
     if (!/^[0-9a-f]{64}$/.test(space) || !/^[0-9a-f]{64}$/.test(relay.key)) throw new Error("a space and a relay's key are 64 hex digits");
     const url = utf8.encode(spaceUrl(relay.url, space));
@@ -236,6 +244,7 @@ export class Node {
 
   /** Becomes a device of a space by its roster alone, as `zspd peer` does; for there is no relay, or none yet. */
   adopt(roster: Uint8Array): boolean {
+    this.#working();
     if (this.#space === undefined) {
       // Taken for the space it names only if it is that space's: anything else would leave this device of no space at all.
       const wasm = this.#wasm!;
@@ -253,6 +262,7 @@ export class Node {
 
   /** Makes a space this device owns, as `zspd create` does, and becomes its first device. Returns its name. */
   create(): string {
+    this.#working();
     if (this.#space !== undefined) throw new Error("this device is of a space already");
     const wasm = this.#wasm!;
     this.#bytes(wasm.buffer(32), 32).set(this.#secret);
@@ -320,6 +330,7 @@ export class Node {
 
   /** Who is in the space, by the roster this device holds. */
   members(): Member[] {
+    this.#working();
     const wasm = this.#wasm!;
     const n = wasm.members();
     const b = this.#bytes(wasm.data(), n).slice();
@@ -356,6 +367,7 @@ export class Node {
   }
 
   #govern(op: number, payload: Uint8Array): number {
+    this.#working();
     const wasm = this.#wasm!;
     this.#bytes(wasm.buffer(payload.length), payload.length).set(payload);
     const r = wasm.govern(op, payload.length);
