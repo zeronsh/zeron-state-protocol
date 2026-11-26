@@ -9,16 +9,26 @@ local text = require("../zsp/text")
 local zsp = require("../zsp")
 local m = zsp.mirror
 
-local CELLS, ROSTER = 7, 2
+local CELLS, ROSTER, ASK, UNASK, ANSWER, FETCH = 7, 2, 32, 33, 34, 35
 local KEY = string.rep("k", 32)
 
 -- ---------------------------------------------------------------- clients that hear only each other
 
-type Peer = { client: any, receive: (any) -> (), deferred: { () -> () }, out: { string } }
+type Peer = {
+	client: any,
+	receive: (any) -> (),
+	deferred: { () -> () },
+	out: { string },
+	asked: { [number]: any },
+	said: { [number]: string },
+	entered: { [string]: boolean }, -- rows its own writing put in the list, which the node then sends whole
+}
+local store: (Peer, string) -> { [string]: boolean }
+local parse_question: (string) -> any
 
 local clock = 1800000000
 local function peer(): Peer
-	local self: Peer = { client = nil, receive = function() end, deferred = {}, out = {} }
+	local self: Peer = { client = nil, receive = function() end, deferred = {}, out = {}, asked = {}, said = {}, entered = {} }
 	self.client = zsp.connect({
 		credential = "x",
 		now = function(): number
@@ -44,11 +54,26 @@ local function peer(): Peer
 					local r = codec.reader(data)
 					while r.pos < r.len do
 						local body = codec.bytes(r)
-						if string.byte(body) == CELLS then
-							-- What it writes, as another would be sent it.
+						local kind = string.byte(body)
+						if kind == CELLS then
+							-- What it writes, as another would be sent it; and its own node has it.
 							local f = codec.reader(string.sub(body, 2))
 							codec.varint(f)
-							table.insert(self.out, codec.rest(f))
+							local cells = codec.rest(f)
+							table.insert(self.out, cells)
+							for id in store(self, cells) do
+								self.entered[id] = true
+							end
+						elseif kind == ASK or kind == FETCH then
+							local f = codec.reader(string.sub(body, 2))
+							local id = codec.varint(f)
+							self.asked[id] = parse_question(codec.rest(f))
+							self.said[id] = nil
+						elseif kind == UNASK then
+							local f = codec.reader(string.sub(body, 2))
+							local id = codec.varint(f)
+							self.asked[id] = nil
+							self.said[id] = nil
 						end
 					end
 				end,
@@ -65,16 +90,26 @@ local function peer(): Peer
 	return self
 end
 
-local function run(p: Peer)
+local answer: (Peer) -> boolean
+local enter: (Peer) -> boolean
+-- What the client itself defers, and nothing a node sends back.
+local function drain(p: Peer)
 	while #p.deferred > 0 do
 		(table.remove(p.deferred, 1) :: any)()
 	end
+end
+local function run(p: Peer)
+	repeat
+		while #p.deferred > 0 do
+			(table.remove(p.deferred, 1) :: any)()
+		end
+	until not enter(p) and not answer(p)
 end
 
 -- As a node would send it: whole rows, of what it holds; and nothing of a row it holds deleted, but a later deletion.
 type Held = { rows: { [string]: { [string]: string } }, dead: { [string]: string } }
 local nodes: { [Peer]: Held } = setmetatable({}, { __mode = "k" }) :: any
-local function hear(p: Peer, cells: string)
+store = function(p: Peer, cells: string): { [string]: boolean }
 	local node = nodes[p] or { rows = {}, dead = {} }
 	nodes[p] = node
 	local touched: { [string]: boolean } = {}
@@ -107,20 +142,30 @@ local function hear(p: Peer, cells: string)
 			touched[id] = true
 		end
 	end
-	-- Only what is in the list, as a watch of it is sent: a row with no place yet is nowhere until it has one.
+	return touched
+end
+
+-- Whole rows, as a node sends them, of those it holds that have a place.
+local function rows_of(node: Held, ids: { [string]: boolean }): string
 	local out = {}
-	for t in touched do
-		local placed = node.rows[t].grave ~= nil
-		for k in node.rows[t] do
-			placed = placed or string.byte(k, 2) == 2
-		end
-		if placed then
-			for _, c in node.rows[t] do
-				table.insert(out, c)
+	for t in ids do
+		local row = node.rows[t]
+		if row then
+			local placed = row.grave ~= nil
+			for k in row do
+				placed = placed or string.byte(k, 2) == 2
+			end
+			if placed then
+				for _, c in row do
+					table.insert(out, c)
+				end
 			end
 		end
 	end
-	cells = table.concat(out)
+	return table.concat(out)
+end
+
+local function send_cells(p: Peer, cells: string)
 	local w = codec.writer()
 	codec.put_u8(w, CELLS)
 	codec.put_varint(w, 0)
@@ -128,7 +173,309 @@ local function hear(p: Peer, cells: string)
 	local framed = codec.writer()
 	codec.put_bytes(framed, codec.string(w))
 	p.receive(codec.string(framed))
+end
+
+-- A row the client's own writing gives a place, or keeps in one, is sent whole, as a node sends what comes into what is
+-- watched: with what others wrote in it that was nowhere until then.
+enter = function(p: Peer): boolean
+	if next(p.entered) == nil then
+		return false
+	end
+	local ids = p.entered
+	p.entered = {}
+	send_cells(p, rows_of(nodes[p], ids))
+	return true
+end
+
+local function hear(p: Peer, cells: string)
+	local touched = store(p, cells)
+	local node = nodes[p]
+	-- Only what is in the list, as a watch of it is sent: a row with no place yet is nowhere until it has one.
+	send_cells(p, rows_of(node, touched))
 	run(p)
+end
+
+-- ---------------------------------------------------------------- a node that answers questions (SPEC 15), of what it holds
+
+parse_question = function(body: string): any
+	local r = codec.reader(body)
+	local function column(): any
+		local kind = codec.u8(r)
+		if kind == 7 or kind == 8 then
+			return { kind = kind }
+		elseif kind == 9 then
+			return { kind = kind, list = codec.take(r, 16) }
+		elseif kind == 10 then
+			return { kind = kind, slot = codec.u8(r) }
+		end
+		return { kind = kind, slot = codec.u8(r), path = codec.bytes(r) }
+	end
+	local function condition(): any
+		local op = codec.u8(r)
+		if op == 0 then
+			return { op = 0 }
+		elseif op == 1 or op == 2 then
+			local of = {}
+			for i = 1, codec.varint(r) do
+				of[i] = condition()
+			end
+			return { op = op, of = of }
+		elseif op == 3 then
+			return { op = 3, of = condition() }
+		elseif op == 4 then
+			local c = column()
+			local flags = codec.u8(r)
+			local lo = if bit32.btest(flags, 1) then codec.bytes(r) else nil
+			local hi = if bit32.btest(flags, 2) then codec.bytes(r) else nil
+			return { op = 4, column = c, flags = flags, lo = lo, hi = hi }
+		elseif op == 5 then
+			local c = column()
+			local set = {}
+			for i = 1, codec.varint(r) do
+				set[i] = codec.bytes(r)
+			end
+			return { op = 5, column = c, set = set }
+		elseif op == 6 or op == 7 then
+			return { op = op, column = column(), bytes = codec.bytes(r) }
+		elseif op == 8 then
+			return { op = 8, column = column() }
+		elseif op == 9 then
+			return { op = 9, list = codec.take(r, 16) }
+		elseif op == 11 then
+			local ids = {}
+			for _ = 1, codec.varint(r) do
+				ids[codec.take(r, 16)] = true
+			end
+			return { op = 11, ids = ids }
+		end
+		error(`the harness's node does not know condition {op}`)
+	end
+	local q: any = { scope = codec.varint(r) }
+	q.where = condition()
+	q.order = {}
+	for i = 1, codec.varint(r) do
+		local how = codec.u8(r)
+		local desc = codec.u8(r) == 1
+		q.order[i] = { how = how, desc = desc, column = if how == 0 then column() else nil }
+	end
+	q.from_end = codec.u8(r) == 1
+	q.offset = codec.varint(r)
+	q.limit = math.min(codec.varint(r), 1000)
+	assert(codec.varint(r) == 0, "the harness's node gives no totals")
+	return q
+end
+
+-- A row's cells, read from how the node keeps them.
+local function cells_of(row: { [string]: string }): { { kind: number, slot: number, stamp: string, body: string } }
+	local out = {}
+	for _, c in row do
+		local r = codec.reader(c)
+		local kind = codec.u8(r)
+		codec.take(r, 16)
+		local slot = codec.u8(r)
+		local stamp = codec.take(r, 16)
+		table.insert(out, { kind = kind, slot = slot, stamp = stamp, body = codec.bytes(r) })
+	end
+	return out
+end
+
+local function fold(s: string): string
+	return string.lower(s)
+end
+
+-- A column's value in a row, as the kind says it is compared; nil if it has none.
+local function value_of(cells: any, id: string, c: any): any
+	if c.kind == 7 or c.kind == 8 then
+		return nil -- not asked here
+	end
+	local best = nil
+	for _, cell in cells do
+		if cell.kind == 3 and cell.slot == c.slot and (not best or cell.stamp > best.stamp) then
+			best = cell
+		end
+	end
+	if not best or best.body == "" then
+		return nil
+	end
+	local body = best.body
+	if c.kind == 1 then
+		return body
+	elseif c.kind == 2 then
+		return fold(body)
+	elseif c.kind == 3 then
+		return if #body == 8 then string.unpack(">d", body) else nil
+	elseif c.kind == 4 then
+		return if #body == 1 then string.byte(body) else nil
+	elseif c.kind == 5 then
+		return if #body >= 16 then string.sub(body, 1, 16) else nil
+	end
+	return nil
+end
+
+local function bound(c: any, b: string): any
+	if c.kind == 2 then
+		return fold(b)
+	elseif c.kind == 3 then
+		return (string.unpack(">d", b))
+	elseif c.kind == 4 then
+		return string.byte(b)
+	end
+	return b
+end
+
+local function holds(q: any, cond: any, id: string, cells: any): boolean
+	local op = cond.op
+	if op == 0 then
+		return true
+	elseif op == 1 then
+		for _, x in cond.of do
+			if not holds(q, x, id, cells) then
+				return false
+			end
+		end
+		return true
+	elseif op == 2 then
+		for _, x in cond.of do
+			if holds(q, x, id, cells) then
+				return true
+			end
+		end
+		return false
+	elseif op == 3 then
+		return not holds(q, cond.of, id, cells)
+	elseif op == 4 then
+		local v = value_of(cells, id, cond.column)
+		if v == nil then
+			return false
+		end
+		if cond.lo then
+			local lo = bound(cond.column, cond.lo)
+			if v < lo or (v == lo and not bit32.btest(cond.flags, 4)) then
+				return false
+			end
+		end
+		if cond.hi then
+			local hi = bound(cond.column, cond.hi)
+			if v > hi or (v == hi and not bit32.btest(cond.flags, 8)) then
+				return false
+			end
+		end
+		return true
+	elseif op == 5 then
+		local v = value_of(cells, id, cond.column)
+		for _, b in cond.set do
+			if v ~= nil and v == bound(cond.column, b) then
+				return true
+			end
+		end
+		return false
+	elseif op == 6 or op == 7 then
+		local v = value_of(cells, id, cond.column)
+		local b = if cond.column.kind == 2 then fold(cond.bytes) else cond.bytes
+		if type(v) ~= "string" then
+			return false
+		end
+		return if op == 6 then string.sub(v, 1, #b) == b else string.find(v, b, 1, true) ~= nil
+	elseif op == 8 then
+		return value_of(cells, id, cond.column) ~= nil
+	elseif op == 9 then
+		for _, cell in cells do
+			if cell.kind == 2 and string.sub(cell.body, 1, 16) == cond.list then
+				return true
+			end
+		end
+		return false
+	elseif op == 11 then
+		return cond.ids[id] == true
+	end
+	return false
+end
+
+-- What answers a question, in its order, of the rows a node holds: the stretch asked for, and how many in all.
+local function evaluate(node: Held, q: any): ({ string }, number)
+	local found: { { id: string, cells: any } } = {}
+	for rid, row in node.rows do
+		if not row.grave then
+			local cells = cells_of(row)
+			local placed = false
+			for _, c in cells do
+				placed = placed or c.kind == 2
+			end
+			if placed and holds(q, q.where, rid, cells) then
+				table.insert(found, { id = rid, cells = cells })
+			end
+		end
+	end
+	table.sort(found, function(x: any, y: any): boolean
+		for _, o in q.order do
+			local a, b
+			if o.how == 0 then
+				a, b = value_of(x.cells, x.id, o.column), value_of(y.cells, y.id, o.column)
+			elseif o.how == 2 then
+				a, b = x.id, y.id -- when made, and then by the rest of the id
+			else
+				a, b = nil, nil
+			end
+			if a ~= b then
+				if a == nil then
+					return false
+				elseif b == nil then
+					return true
+				end
+				if o.desc then
+					return a > b
+				end
+				return a < b
+			end
+		end
+		return x.id < y.id
+	end)
+	local ids = {}
+	for k = q.offset + 1, math.min(#found, q.offset + q.limit) do
+		local at = if q.from_end then #found - k + 1 else k
+		table.insert(ids, found[at].id)
+	end
+	return ids, #found
+end
+
+-- Answers anything asked whose answer is not what was last said: rows first, then which. Whether anything was said.
+answer = function(p: Peer): boolean
+	local node = nodes[p] or { rows = {}, dead = {} }
+	nodes[p] = node
+	local said = false
+	for id, q in p.asked do
+		local ids, total = evaluate(node, q)
+		local first = q.offset
+		-- What would be said, and the rows themselves as they are now.
+		local set = {}
+		for _, rid in ids do
+			set[rid] = true
+		end
+		local rows = rows_of(node, set)
+		local w = codec.writer()
+		codec.put_varint(w, total)
+		codec.put_varint(w, first)
+		codec.put_varint(w, #ids)
+		for _, rid in ids do
+			codec.put(w, rid)
+		end
+		codec.put_varint(w, 0)
+		local said_now = codec.string(w) .. rows
+		if p.said[id] ~= said_now then
+			p.said[id] = said_now
+			said = true
+			send_cells(p, rows)
+			local a = codec.writer()
+			codec.put_u8(a, ANSWER)
+			codec.put_varint(a, id)
+			codec.put_u8(a, 1)
+			codec.put(a, string.sub(said_now, 1, #said_now - #rows))
+			local framed = codec.writer()
+			codec.put_bytes(framed, codec.string(a))
+			p.receive(codec.string(framed))
+		end
+	end
+	return said
 end
 
 -- ---------------------------------------------------------------- what a document should be, from nothing
@@ -448,7 +795,8 @@ end
 
 -- ---------------------------------------------------------------- changes of every kind
 
-local Task = m.map({ title = zsp.string(16), done = zsp.boolean(17), notes = zsp.text(18), tags = m.list(19, zsp.string(16)) })
+local Step = m.map({ name = zsp.string(16) })
+local Task = m.map({ title = zsp.string(16), done = zsp.boolean(17), notes = zsp.text(18), tags = m.list(19, zsp.string(16)), steps = m.list(20, Step), plan = m.map({ due = zsp.number(16) }) })
 local Person = m.map({ role = zsp.string(16), bio = zsp.text(17), pets = m.list(18, m.map({ name = zsp.string(16) })) })
 local Board = m.map({
 	title = zsp.string(16),
@@ -470,7 +818,7 @@ local function mutate(d: any)
 	for _ = 1, math.random(1, 5) do
 		local r = math.random(16)
 		if r == 1 then
-			table.insert(d.tasks, math.random(1, #d.tasks + 1), { title = word(), done = math.random(2) == 1, tags = { word() } })
+			table.insert(d.tasks, math.random(1, #d.tasks + 1), { title = word(), done = math.random(2) == 1, tags = { word() }, steps = { { name = word() } }, plan = { due = math.random(9) } })
 		elseif r == 2 and #d.tasks > 0 then
 			table.remove(d.tasks, math.random(#d.tasks))
 		elseif r == 3 and #d.tasks > 1 then
@@ -485,6 +833,16 @@ local function mutate(d: any)
 			table.insert(t.tags, math.random(1, #t.tags + 1), word())
 			if #t.tags > 2 and math.random(2) == 1 then
 				table.remove(t.tags, 1)
+			end
+			t.plan.due = if math.random(4) == 1 then nil else math.random(9)
+			if math.random(2) == 1 then
+				table.insert(t.steps, math.random(1, #t.steps + 1), { name = word() })
+			elseif #t.steps > 0 then
+				local x = table.remove(t.steps, math.random(#t.steps))
+				if math.random(2) == 1 then
+					x.name = word()
+					table.insert(t.steps, math.random(1, #t.steps + 1), x)
+				end
 			end
 		elseif r == 5 then
 			d.scores[word()] = if math.random(3) == 1 then nil else math.random(100)
@@ -571,7 +929,7 @@ local function mutate(d: any)
 					table.insert(keep, t)
 				end
 			end
-			table.insert(keep, { title = word(), tags = {} })
+			table.insert(keep, { title = word(), tags = {}, steps = {}, plan = {} })
 			d.tasks = keep
 		end
 	end
@@ -714,6 +1072,182 @@ local ok, why = xpcall(function()
 				error(`seed {seed}, client {i}, {what}: {where_differ(docs[i].state(), want, "")}\n  mirror {ids(docs[i].state().tasks)}\n  model  {ids(want.tasks)}`)
 			end
 		end
+		-- What is asked about is what the document shows there that answers, as a node orders it; given without its own
+		-- lists, records and trees of rows.
+		local function check_ask(i: number, what: string, asker: Peer?)
+			local want = model(peers[i].client, Board)
+			local by = asker or peers[i]
+			local q = zsp.where
+			local root = derive("")
+			local path: { string }, cond: any, pred: (any) -> boolean, kind: string = { "tasks" }, nil, function(_: any)
+				return true
+			end, "list"
+			local by_title = math.random(2) == 1
+			local function some(t: any): string?
+				local ks = {}
+				for k in t or {} do
+					table.insert(ks, k)
+				end
+				return if #ks > 0 then ks[math.random(#ks)] else nil
+			end
+			local r = math.random(6)
+			if r == 1 then
+				local c = math.random(3)
+				if c == 1 then
+					local v = math.random(2) == 1
+					cond, pred = q.is("done", v), function(x: any)
+						return x.done == v
+					end
+				elseif c == 2 then
+					local w = word()
+					cond, pred = q.is("title", w), function(x: any)
+						return x.title == w
+					end
+				end
+			elseif r == 2 then
+				local lo, hi = math.random(0, 60), math.random(40, 100)
+				path, kind, by_title = { "scores" }, "record", false
+				cond, pred = q.between("value", lo, hi), function(x: any)
+					return x >= lo and x <= hi
+				end
+			elseif r == 3 then
+				local w = word()
+				path, kind = { "people" }, "record"
+				cond, pred = q.is("role", w), function(x: any)
+					return x.role == w
+				end
+			elseif r == 4 then
+				local w = word()
+				path, kind = { "outline" }, "tree"
+				if math.random(2) == 1 then
+					cond, pred = q.is("name", w), function(x: any)
+						return x.name == w
+					end
+				end
+			elseif r == 5 then
+				path = { "people", some(want.people) or word(), "pets" }
+			else
+				local t = want.tasks[math.random(math.max(1, #want.tasks))]
+				path = { "tasks", if t then t.id else string.rep("\1", 16), "steps" }
+				if math.random(2) == 1 then
+					local w = word()
+					cond, pred = q.is("name", w), function(x: any)
+						return x.name == w
+					end
+				end
+			end
+			if kind ~= "list" and kind ~= "tree" and kind ~= "record" then
+				error("no kind")
+			end
+			-- What the model says.
+			local box: any = want
+			local s: any = Board
+			local k = 1
+			while box ~= nil and k <= #path do
+				local b = s.boxes[path[k]]
+				box = box[path[k]]
+				if k == #path then
+					break
+				end
+				local key = path[k + 1]
+				if b.kind == "record" then
+					box = if box then box[key] else nil
+				else
+					local found = nil
+					for _, x in box or {} do
+						if x.id == key then
+							found = x
+						end
+					end
+					box = found
+				end
+				s = b.of
+				k += 2
+			end
+			local function strip(v: any): any
+				if type(v) ~= "table" then
+					return v
+				end
+				local out = {}
+				for f, x in v do
+					if f == "children" then
+						local kids = {}
+						for j, n in x do
+							kids[j] = strip(n)
+						end
+						out.children = kids
+					elseif f ~= "steps" and f ~= "pets" then
+						out[f] = x
+					end
+				end
+				return out
+			end
+			local members = {}
+			if kind == "record" then
+				for key, v in box or {} do
+					table.insert(members, { id = derive(root, path[#path], key), key = key, v = v })
+				end
+			else
+				local function walk(level: any)
+					for _, n in level or {} do
+						table.insert(members, { id = n.id, v = n })
+						walk(n.children)
+					end
+				end
+				walk(box)
+			end
+			local order_by = if path[#path] == "tasks" then "title" elseif path[#path] == "people" then "role" else "name"
+			local got: any = nil
+			local asked = m.ask(by.client, { scope = 1, name = document, schema = Board }, path, { where = cond, order = if by_title then { order_by } else nil, limit = 1000 }, function(a)
+				got = a
+			end)
+			run(by)
+			-- Which rows answer is the node's to say, by the bytes in them, as it orders them; that they are what the
+			-- document shows, and are given as it shows them, the mirror's.
+			local first_asked = math.huge
+			for qid in by.asked do
+				first_asked = math.min(first_asked, qid)
+			end
+			local by_id = {}
+			for _, x in members do
+				by_id[x.id] = x
+			end
+			local expected = {}
+			for _, rid in (evaluate(nodes[by], by.asked[first_asked])) do
+				if by_id[rid] then
+					table.insert(expected, by_id[rid])
+				end
+			end
+			local _ = pred
+			local function fail(why: string)
+				failures += 1
+				local shown = {}
+				for _, x in expected do
+					table.insert(shown, show(strip(x.v)))
+				end
+				local given = {}
+				for _, x in got.rows do
+					table.insert(given, show(x))
+				end
+				error(`seed {seed}, client {i}, {what}, asking about {table.concat(path, "/")} ({if by_title then order_by else "newest"}): {why}\n  want {table.concat(shown, " ")}\n  got  {table.concat(given, " ")}`)
+			end
+			if got.status ~= "ready" then
+				fail(`it is {got.status}`)
+			end
+			if #got.rows ~= #expected then
+				fail(`{#got.rows} rows, not {#expected}`)
+			end
+			for j, x in expected do
+				if not equal(got.rows[j], strip(x.v)) then
+					fail(`row {j} differs: {where_differ(got.rows[j], strip(x.v), "") or "?"}`)
+				end
+				if kind == "record" and got.keys[j] ~= x.key then
+					fail(`key {j} is {tostring(got.keys[j])}, not {x.key}`)
+				end
+			end
+			asked.stop()
+			run(by)
+		end
 		for step = 1, 30 do
 			clock += math.random() * 3
 			-- Some write; each change reads back as what was set.
@@ -730,7 +1264,9 @@ local ok, why = xpcall(function()
 						mutate(d)
 						draft = plain(d)
 					end)
-					run(peers[i])
+					-- As written, before the node sends anything back: what comes back with it (others' writing, in rows
+					-- this one put in the list) is news, and is held to the model below.
+					drain(peers[i])
 					if not equal(docs[i].state(), draft, false) then
 						failures += 1
 						local function strip(v: any): any
@@ -748,7 +1284,11 @@ local ok, why = xpcall(function()
 						print("differ", where_differ(strip(draft), strip(docs[i].state()), ""))
 											error(`seed {seed} step {step}, client {i}: what was set is not what is read\n  set  {show(draft)}\n  read {show(docs[i].state())}`)
 					end
+					run(peers[i])
 					check(i, `step {step}, after writing`)
+				if math.random(3) == 1 then
+					check_ask(i, `step {step}, after writing`)
+				end
 					for k = before + 1, #peers[i].out do
 						table.insert(log, peers[i].out[k])
 					end
@@ -783,6 +1323,7 @@ local ok, why = xpcall(function()
 				hear(peers[i], log[k])
 			end
 			check(i, "at the end")
+			check_ask(i, "at the end")
 		end
 		-- Each writes once more, which lets go of what nothing shows; and once that is everywhere, nothing is kept that is not
 		-- shown, but keys that were let go of, which hold nothing.
@@ -835,6 +1376,21 @@ local ok, why = xpcall(function()
 																					error(`seed {seed}, client {i}: a row is kept that nothing shows (kind {w.kind})`)
 					end
 				end
+			end
+		end
+		-- One that has heard it all and opened nothing: it holds only what it asks about, and finds the same.
+		do
+			local reader = peer()
+			for k = 1, #log do
+				hear(reader, log[k])
+			end
+			for _, p2 in peers do
+				for _, c in p2.out do
+					hear(reader, c)
+				end
+			end
+			for _ = 1, 6 do
+				check_ask(1, "by one that opened nothing", reader)
 			end
 		end
 		for i = 2, n do

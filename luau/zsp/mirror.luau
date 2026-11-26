@@ -11,6 +11,7 @@
 -- out of room. A list of values is a text of the values themselves.
 
 local codec = require("./codec")
+local where = require("./ask").where
 local sha256 = require("./sha256")
 local text = require("./text")
 
@@ -254,9 +255,12 @@ export type Doc = {
 	read stop: () -> (),
 }
 
-function mirror.open(client: any, options: { scope: number, name: string, schema: Schema }, observer: ((any) -> ())?): Doc
+function mirror.open(client: any, options: { scope: number, name: string, schema: Schema, _held: boolean? }, observer: ((any) -> ())?): Doc
 	local scope, schema = options.scope, options.schema
 	assert(schema.kind == "map", "a document is a map")
+	-- Read over whatever rows the client holds, not over the whole document: what is not held is not known, rather than
+	-- gone. So it is for what is asked about (mirror.ask), which is read and not written.
+	local held = options._held == true
 	local list = "mirror/" .. options.name
 
 	-- Ids that are the same for everyone: of the document, of a map within a map, and of a record's entry.
@@ -453,8 +457,9 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					mark_box(key_of(w.owner, w.field), true)
 				end
 			end
-			-- What was in a row that is gone is gone with it, wherever it is.
-			if old and not w and (not row or row.dead) then
+			-- What was in a row that is gone is gone with it, wherever it is. Where only some rows are held, one that is not
+			-- held is not known to be gone.
+			if old and not w and (if held then row ~= nil and row.dead else (not row or row.dead)) then
 				dead_rows[id] = true -- deleted, and perhaps let go of from memory already
 			end
 			-- What is in a row that comes or goes is there or not with it.
@@ -1085,15 +1090,17 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		end
 	end
 
-	local window = client:window({ scope = scope, list = list, table = WINDOW, size = 0, from = "start", bare = true }, function()
-		refresh()
-	end)
+	local window = if held
+		then nil
+		else client:window({ scope = scope, list = list, table = WINDOW, size = 0, from = "start", bare = true }, function()
+			refresh()
+		end)
 	local unfollow = client:follow(function(id: string)
 		if not stopped and ours(id) then
 			dirty_rows[id] = true
 		end
 	end)
-	for _, e in window.entries() do
+	for _, e in if window then window.entries() else {} do
 		dirty_rows[e.row.id] = true
 	end
 	refresh()
@@ -1128,6 +1135,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 	end
 
 	local function set(state: any)
+		assert(not held, "what is asked about is read, not written")
 		assert(not stopped, "the document is closed")
 		assert(client:may(scope, "write"), "this client may not write there, or does not know yet that it may")
 		refresh()
@@ -1889,7 +1897,416 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		stop = function()
 			stopped = true
 			unfollow()
-			window.stop()
+			if window then
+				window.stop()
+			end
+		end,
+		-- For mirror.ask: read again what has changed among the rows held; the ids that are the same for everyone.
+		_refresh = refresh,
+		_derive = derive,
+		_mark = function(id: string)
+			dirty_rows[id] = true
+		end,
+	})
+end
+
+-- ---------------------------------------------------------------- asking
+
+-- The list, record or tree at a path: names of fields; a record's key or an item's or node's id after the name of what
+-- holds it. As { "tasks" }, { "people", "ann", "pets" }, { "tasks", id, "subtasks" }.
+type Place = {
+	owner: string, -- the row that holds it
+	field: string,
+	box: Schema,
+	chain: { string }, -- the rows on the way to it, the document's first
+	trees: { { owner: string, field: string } }, -- trees on the way, or it, all of whose nodes are needed to know which are there
+}
+
+local function place_of(schema: Schema, path: { string }, derive: (...string) -> string): Place
+	assert(#path > 0, "a path names what is asked about")
+	local s, owner = schema, derive("")
+	local chain, trees = { owner }, {}
+	local i = 1
+	while true do
+		local name = path[i]
+		local b = s.boxes[name]
+		assert(type(name) == "string" and b, `there is no {tostring(name)} to ask about`)
+		if b.kind == "map" then
+			assert(i < #path, "a map is not asked about, but what is in it")
+			owner = derive(owner, name)
+			table.insert(chain, owner)
+			s = b
+			i += 1
+		elseif i == #path then
+			assert(b.of.kind or b.kind == "record", "a list of values is in one row: it is read, not asked about")
+			if b.kind == "tree" then
+				table.insert(trees, { owner = owner, field = name })
+			end
+			return { owner = owner, field = name, box = b, chain = chain, trees = trees }
+		else
+			assert(b.of.kind == "map", `what is in {name} holds nothing`)
+			local k = path[i + 1]
+			assert(type(k) == "string", `{name} is followed by a key or an id`)
+			local id = if b.kind == "record" then derive(owner, name, k) else k
+			if b.kind == "tree" then
+				table.insert(trees, { owner = owner, field = name })
+			end
+			table.insert(chain, id)
+			owner = id
+			s = b.of
+			i += 2
+		end
+	end
+end
+
+-- What a path comes to in a state: the list, record or tree, if it is there.
+local function at_path(schema: Schema, state: any, path: { string }): any
+	local s, v = schema, state
+	local i = 1
+	local function find(level: any, id: string): any
+		for _, n in level or {} do
+			if n.id == id then
+				return n
+			end
+			local inside = if n.children then find(n.children, id) else nil
+			if inside then
+				return inside
+			end
+		end
+		return nil
+	end
+	while v ~= nil and i <= #path do
+		local name = path[i]
+		local b = s.boxes[name]
+		v = v[name]
+		if b.kind == "map" then
+			s = b
+			i += 1
+		elseif i == #path then
+			return v
+		else
+			local k = path[i + 1]
+			v = if v == nil then nil elseif b.kind == "record" then v[k] else find(v, k)
+			s = b.of
+			i += 2
+		end
+	end
+	return v
+end
+
+local BYTES_COLUMN: Column = table.freeze({ slot = WHERE, text = false, is = "bytes", encode = same, decode = same, who = nil })
+
+-- Whether what is under a name is of rows of its own, which are asked about by their path rather than given with what holds them.
+local function of_rows(b: Schema): boolean
+	return b.kind == "record" or b.kind == "tree" or (b.kind == "list" and b.of.kind ~= nil)
+end
+
+-- The ids of the maps within a map, and within those, made from its id.
+local function maps_within(s: Schema, id: string, derive: (...string) -> string, into: { string })
+	for name, b in s.boxes do
+		if b.kind == "map" then
+			local inner = derive(id, name)
+			table.insert(into, inner)
+			maps_within(b, inner, derive, into)
+		end
+	end
+end
+local KIND_OF = { list = ITEM, record = ENTRY, tree = NODE }
+
+export type Asking = {
+	read where: any?, -- conditions on the columns of what is asked about, by their names: zsp.where
+	read order: { string }?,
+	read offset: number?,
+	read limit: number?,
+	read from_end: boolean?,
+	read totals: { [string]: any }?,
+}
+
+-- What is in a list, record or tree of a document, as a node finds it: the rows that answer, as the maps (or values) the
+-- document shows, in the order asked for, and kept up as they change. Nothing needs to be open, nor is anything more held
+-- than the rows on the way and those that answer. A list's items are found by what their rows say they are in; whether
+-- they are, the rows on the way say, as they do when the document is open: what a node finds that the document would not
+-- show (rows written by one who minds nothing, or in what was deleted and not yet let go of) is not given, though a node
+-- counts it in `total` and `totals`. For a record, `keys` says whose each is.
+function mirror.ask(
+	client: any,
+	options: { scope: number, name: string, schema: Schema },
+	path: { string },
+	asking: Asking,
+	observer: (any) -> ()
+)
+	local scope, schema = options.scope, options.schema
+	local list = "mirror/" .. options.name
+	local doc: any = mirror.open(client, { scope = scope, name = options.name, schema = schema, _held = true })
+	local stopped = false
+	-- What is given of a map: what is in its own row and its maps, its children if it is a node; not its lists, records
+	-- and trees of rows. The same table for the same map.
+	local given: { [any]: any } = setmetatable({}, { __mode = "k" }) :: any
+	local function give(s: Schema, v: any, tree: Schema?): any
+		if type(v) ~= "table" then
+			return v
+		end
+		local out = given[v]
+		if out then
+			return out
+		end
+		out = {}
+		for k, x in v do
+			local b = s.boxes[k]
+			if k == "children" and tree then
+				local kids = {}
+				for i, n in x do
+					kids[i] = give(tree.of, n, tree)
+				end
+				out.children = table.freeze(kids)
+			elseif b and b.kind == "map" then
+				out[k] = give(b, x)
+			elseif not (b and of_rows(b)) then
+				out[k] = x
+			end
+		end
+		table.freeze(out)
+		given[v] = out
+		return out
+	end
+	local questions: { any } = {} -- what is asked, to be stopped
+	local answers: { [string]: any } = {} -- the latest of each: the rows that answer, the rows on the way, all of a tree's
+	local place: Place? = nil
+	local last: any = nil
+	local was_named: { [string]: boolean } = {}
+
+	local function tell()
+		if stopped or not place then
+			return
+		end
+		local p = place :: Place
+		-- What the answers name is read again, come or gone: a row held already is not necessarily sent again.
+		local named: { [string]: boolean } = {}
+		for _, a in answers do
+			for _, r in a.rows do
+				named[r.id] = true
+				doc._mark(r.id)
+			end
+		end
+		for id in was_named do
+			if not named[id] then
+				doc._mark(id)
+			end
+		end
+		was_named = named
+		doc._refresh()
+		local found = answers.found
+		local status = if found then found.status else "loading"
+		for name, a in answers do
+			if a.status ~= "ready" and status == "ready" then
+				status = if a.status == "denied" or a.status == "faulty" then a.status else "loading"
+			end
+			local _ = name
+		end
+		-- What the document shows there, by row id.
+		local shown: { [string]: any } = {}
+		local key_of: { [string]: string } = {}
+		local box = at_path(schema, doc.state(), path)
+		if p.box.kind == "record" then
+			for k, v in box or {} do
+				local id = doc._derive(p.owner, p.field, k)
+				shown[id] = v
+				key_of[id] = k
+			end
+		else
+			local function walk(level: any)
+				for _, n in level or {} do
+					shown[n.id] = n
+					if n.children then
+						walk(n.children)
+					end
+				end
+			end
+			walk(box)
+		end
+		local rows: { any }, keys: { string } = {}, {}
+		local of = p.box.of
+		for _, r in if found then found.rows else {} do
+			local v = shown[r.id]
+			if v ~= nil then
+				table.insert(rows, if of.kind then give(of, v, if p.box.kind == "tree" then p.box else nil) else v)
+				if key_of[r.id] then
+					table.insert(keys, key_of[r.id])
+				end
+			end
+		end
+		local answer = table.freeze({
+			rows = table.freeze(rows),
+			keys = if p.box.kind == "record" then table.freeze(keys) else nil,
+			status = status,
+			total = if found then found.total else 0,
+			first = if found then found.first else 0,
+			totals = if found then found.totals else {},
+		})
+		if last and last.status == answer.status and last.total == answer.total and last.first == answer.first and rawequal(last.totals, answer.totals) and #last.rows == #rows then
+			local same = true
+			for i, v in rows do
+				same = same and rawequal(last.rows[i], v) and (not last.keys or last.keys[i] == keys[i])
+			end
+			if same then
+				return
+			end
+		end
+		last = answer
+		observer(answer)
+	end
+
+	local function prefix(owner: string, field: string, kind: number): string
+		local w = codec.writer()
+		codec.put(w, owner)
+		codec.put_bytes(w, field)
+		codec.put_u8(w, kind)
+		return codec.string(w)
+	end
+
+	-- Rows asked for by id, a thousand to a question, asked again only when they change.
+	local by_id: { any } = {}
+	local by_id_of: { string } = {}
+	local function within_maps(ids: { string })
+		table.sort(ids)
+		local now = table.concat(ids)
+		if now == table.concat(by_id_of) then
+			return
+		end
+		by_id_of = ids
+		for _, q in by_id do
+			q.stop()
+		end
+		by_id = {}
+		for k in answers do
+			if string.sub(k, 1, 5) == "maps " then
+				answers[k] = nil
+			end
+		end
+		for n = 1, math.ceil(#ids / 1000) do
+			local part = table.move(ids, (n - 1) * 1000 + 1, math.min(#ids, n * 1000), 1, {})
+			local q: any = client:ask({ scope = scope, table = { ["\0where"] = BYTES_COLUMN }, where = where.ids(part), limit = 1000 }, function(a: any)
+				answers[`maps {n}`] = a
+				tell()
+			end)
+			table.insert(by_id, q)
+		end
+	end
+	local found_handle: any = nil
+	local function start(): boolean
+		if place or stopped then
+			return true
+		end
+		if not client.scopes[scope] then
+			return false
+		end
+		local p = place_of(schema, path, doc._derive)
+		place = p
+		local b = p.box
+		local columns: { [string]: any } = { ["\0where"] = BYTES_COLUMN }
+		if b.of.kind then
+			for name, c in b.of.columns do
+				columns[name] = c
+			end
+		else
+			columns.value = b.of
+		end
+		local within = prefix(p.owner, p.field, KIND_OF[b.kind]) .. (if b.kind == "record" then "\1" else "")
+		local condition = where.all(where.in_list(list), where.begins("\0where", within), asking.where or where.all())
+		found_handle = client:ask({
+			scope = scope,
+			table = columns,
+			where = condition,
+			order = asking.order,
+			offset = asking.offset,
+			limit = asking.limit,
+			from_end = asking.from_end,
+			totals = asking.totals,
+		}, function(a: any)
+			answers.found = a
+			-- And the maps within each that answers, which are there whether their rows are or not, but say what they hold.
+			if b.of.kind then
+				local ids: { string } = {}
+				for _, r in a.rows do
+					maps_within(b.of, r.id, doc._derive, ids)
+				end
+				within_maps(ids)
+			end
+			tell()
+		end)
+		table.insert(questions, found_handle)
+		-- The rows on the way: whether what answers is there is theirs to say.
+		local on_the_way: any = client:ask({ scope = scope, table = { ["\0where"] = BYTES_COLUMN }, where = where.ids(p.chain), limit = 1000 }, function(a: any)
+			answers.chain = a
+			tell()
+		end)
+		table.insert(questions, on_the_way)
+		-- Every node of a tree on the way: which are there, and where, is known only from all of them.
+		for i, t in p.trees do
+			local pages: { any } = {}
+			local function page(n: number)
+				pages[n] = true
+				local q: any
+				q = client:ask({
+					scope = scope,
+					table = { ["\0where"] = BYTES_COLUMN },
+					where = where.all(where.in_list(list), where.begins("\0where", prefix(t.owner, t.field, NODE))),
+					offset = (n - 1) * 1000,
+					limit = 1000,
+				}, function(a: any)
+					answers[`tree {i} {n}`] = a
+					local more = math.ceil(a.total / 1000)
+					for k = n + 1, more do
+						if not pages[k] then
+							page(k)
+						end
+					end
+					tell()
+				end)
+				table.insert(questions, q)
+			end
+			page(1)
+		end
+		return true
+	end
+
+	-- Ids are made with the scope's key: what is on the way is known once that is.
+	local waiting: { stop: (() -> ())? } = { stop = nil }
+	if not start() then
+		waiting.stop = client:on("status", function()
+			local unwait = waiting.stop
+			if start() and unwait then
+				waiting.stop = nil
+				unwait()
+			end
+		end)
+	end
+	observer(table.freeze({ rows = table.freeze({}), status = "loading", total = 0, first = 0, totals = {} }))
+
+	return table.freeze({
+		-- Another stretch of what answers.
+		move = function(offset: number, limit: number?)
+			if found_handle then
+				found_handle.move(offset, limit)
+			end
+		end,
+		stop = function()
+			if stopped then
+				return
+			end
+			stopped = true
+			local unwait = waiting.stop
+			if unwait then
+				waiting.stop = nil
+				unwait()
+			end
+			for _, q in questions do
+				q.stop()
+			end
+			for _, q in by_id do
+				q.stop()
+			end
+			doc.stop()
 		end,
 	})
 end

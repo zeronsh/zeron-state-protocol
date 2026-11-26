@@ -74,6 +74,34 @@ Whoever writes may write anything, and it is the same for everyone: rows that sa
 their own, markers that are another's, values that are not of their kind. Whatever cannot be read is nothing, and what holds
 anything a writer could not have put there is not shown.
 
+## Asking
+
+A document too big to hold whole need not be opened. What is in any of its lists, records or trees can be asked about, as any
+rows can, and a node finds what answers:
+
+```luau
+local open = m.ask(client, { scope = 1, name = "launch", schema = Board }, { "tasks" }, {
+	where = zsp.where.is("done", false),
+	order = { "title" },
+	limit = 50,
+}, function(answer)
+	render(answer.rows)
+end)
+open.move(50, 50) -- the next fifty
+open.stop()
+```
+
+A path names fields, and after the name of a record, list or tree, the key or id of what is in it: `{ "people", "ann", "pets" }`,
+`{ "tasks", id, "steps" }`. Conditions and orders name the columns of what is asked about, or `value` in a record of values.
+
+What is given is what the document would show there, as it would show it: each row as its map, with what is in its own row and
+in its maps, and a node with its children. Its own lists, records and trees of rows are asked about by their paths. A node finds
+rows by what they say they are in; whether they are, the rows on the way say, as they do when the document is open. So what a
+writer who minds nothing puts there, or what is in something deleted and not yet let go of, is not given, though a node counts it
+in `total` and `totals`. For a record, `keys` says whose each row is. It is kept up as the rows change, and nothing more is held
+than the rows on the way and those that answer, and for a tree all its nodes, since which of them are there is known only from all
+of them.
+
 ## What is kept
 
 Nothing that nothing shows. A deleted item or node is deleted, with everything in it. What others put in a row or a key while it was

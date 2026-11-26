@@ -88,7 +88,7 @@ table.freeze(ask)
 
 type Writing = { w: codec.Writer, columns: Columns, tag: (string) -> string, scope_tag: (number, string) -> string }
 
-local KINDS: { [string]: number } = { string = FOLD, text = FOLD, number = NUMBER, boolean = BOOL, id = ID, row = ID }
+local KINDS: { [string]: number } = { string = FOLD, text = FOLD, number = NUMBER, boolean = BOOL, id = ID, row = ID, bytes = BYTES }
 
 -- A column by its name in the table; "@created" and "@modified"; or name.path, into JSON, with what is wanted of
 -- it after a colon, as in meta.size:number, where no value says.
@@ -211,7 +211,9 @@ function put_where(x: Writing, c: Where)
 		end
 	elseif op == "begins" or op == "contains" then
 		codec.put_u8(w, if op == "begins" then 6 else 7)
-		column(x, a, b, FOLD)
+		-- A column of bytes is compared byte for byte; any other as text, without case or marks.
+		local _, _, is = find(x, a)
+		column(x, a, b, if is == "bytes" then BYTES else FOLD)
 		codec.put_bytes(w, b)
 	elseif op == "has" then
 		codec.put_u8(w, 8)

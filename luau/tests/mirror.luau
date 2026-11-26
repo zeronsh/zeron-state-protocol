@@ -187,6 +187,63 @@ local mine = a.state()
 assert(mine.title == "Launch" and #mine.tasks == 3 and mine.tasks[1].tags[2] == "now" and mine.outline[1].children[2].name == "risks", show(mine))
 assert(mine.tasks[1].id and mine.outline[1].id, "what is made has an id")
 level("the other has it")
+
+-- Asked about, without opening anything: a node finds what answers, and what the document shows of it is given.
+do
+	local q = zsp.where
+	local doc = { scope = 1, name = "board", schema = Board }
+	local open: any, people: any, outline: any = nil, nil, nil
+	local asked = m.ask(cb, doc, { "tasks" }, { where = q.is("done", false), order = { "title" } }, function(answer)
+		open = answer
+	end)
+	local asked_people = m.ask(cb, doc, { "people" }, { where = q.is("role", "lead") }, function(answer)
+		people = answer
+	end)
+	local asked_outline = m.ask(cb, doc, { "outline" }, { where = q.begins("name", "ri") }, function(answer)
+		outline = answer
+	end)
+	eventually("they are answered", function()
+		return open.status == "ready" and #open.rows == 2 and people.status == "ready" and #people.rows == 1 and outline.status == "ready" and #outline.rows == 1
+	end)
+	assert(open.rows[1].title == "ship it" and open.rows[2].title == "test it", show(open.rows))
+	assert(open.rows[1].id == mine.tasks[3].id and open.rows[2].tags and #open.rows[1].tags == 1, show(open.rows))
+	assert(people.keys[1] == "ann" and people.rows[1].bio == "writes", show(people))
+	assert(outline.rows[1].name == "risks" and #outline.rows[1].children == 0, show(outline.rows))
+
+	-- A row that says it is a task, with a marker that is nowhere: a node finds it, the document does not show it.
+	local Forged = {
+		["\0where"] = { slot = 255, text = false, is = "bytes", encode = function(v: any): any
+			return v
+		end, decode = function(v: any): any
+			return v
+		end },
+		title = zsp.string(16),
+		done = zsp.boolean(17),
+	}
+	ca:write(1, function(change)
+		change.insert(Forged :: any, "mirror/board", 0, { ["\0where"] = mine.id .. "\5tasks\1" .. string.rep("\7", 12), title = "forged", done = false })
+	end)
+	eventually("the node counts it", function()
+		return open.total == 3
+	end)
+	assert(#open.rows == 2, "but it is not given: " .. show(open.rows))
+
+	-- Kept up: what no longer answers goes, what comes to answer comes.
+	a.update(function(d)
+		d.tasks[3].done = true
+		d.people.ann.role = "writer"
+	end)
+	eventually("it is kept up", function()
+		return #open.rows == 1 and open.rows[1].title == "test it" and #people.rows == 0
+	end)
+	asked.stop()
+	asked_people.stop()
+	asked_outline.stop()
+	a.update(function(d)
+		d.tasks[3].done = false
+		d.people.ann.role = "lead"
+	end)
+end
 assert(rawequal(early, b.state()), "and the one opened early is told")
 assert(b.state().scores.bob == 5 and b.state().people.ann.bio == "writes" and b.state().meta.owner == "ann")
 
