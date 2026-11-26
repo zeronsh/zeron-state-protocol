@@ -226,7 +226,7 @@ function put_where(x: Writing, c: Where)
 		codec.put_u8(w, 10)
 		column(x, a, b, WORDS)
 		codec.put_u8(w, if how.phrase then 2 elseif how.any then 1 else 0)
-		codec.put_u8(w, (if how.prefix then 1 else 0) + (if how.inside then 2 else 0) + math.clamp(how.typos or 0, 0, 3) * 4)
+		codec.put_u8(w, (if how.prefix then 1 else 0) + (if how.inside then 2 else 0) + math.clamp(math.floor(how.typos or 0), 0, 3) * 4)
 		codec.put_bytes(w, b)
 	elseif op == "ids" then
 		codec.put_u8(w, 11)

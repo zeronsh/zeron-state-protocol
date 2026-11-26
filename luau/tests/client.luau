@@ -615,4 +615,16 @@ do
 	doc.stop()
 end
 
+-- How many letters may be wrong is a whole number: a part of one is not another flag.
+do
+	local ask = require("../zsp/ask")
+	local function asked(how: any): string
+		return (ask.write({ scope = 1, table = Note, where = zsp.where.matches("title", "x", how) }, function()
+			return string.rep("\0", 16)
+		end))
+	end
+	assert(asked({ typos = 1.5 }) == asked({ typos = 1 }), "one and a half is one")
+	assert(asked({ typos = 1.5 }) ~= asked({ typos = 1, inside = true }), "and not one inside words")
+end
+
 print("ok")

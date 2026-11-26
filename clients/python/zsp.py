@@ -149,6 +149,7 @@ def in_list(tag):
 
 
 def matches(col, text, mode=0, prefix=False, inside=False, edits=0):
+    edits = max(0, min(int(edits), 3))  # a whole number of letters, three at most: no more bits than that
     return b"\x0a" + col + bytes([mode, prefix | inside << 1 | edits << 2]) + put_bytes(text.encode())
 
 

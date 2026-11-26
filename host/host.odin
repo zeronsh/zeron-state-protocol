@@ -2,6 +2,7 @@ package host
 
 import "core:crypto"
 import "core:encoding/hex"
+import "core:fmt"
 import "core:nbio"
 import "core:net"
 import "core:os"
@@ -216,8 +217,14 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 	h.secret = device_secret(h.dir) or_return
 	h.device = zsp.x25519_public(h.secret)
 	h.shared = make([]byte, SHARED_BUFFER)
+	// The event loop's first failure is its last, for the thread: so whether it can be made is found out first. Where it
+	// is a ring the kernel keeps, one let go of by a process that has just ended may still count against what may be
+	// kept, a while, and so many starting at once, as tests do, may wait for it.
+	for tries := 0; !ring_free() && tries < 40; tries += 1 {
+		time.sleep(50 * time.Millisecond)
+	}
 	if err := nbio.acquire_thread_event_loop(); err != nil {
-		report(.Error, "the event loop failed")
+		report(.Error, "the event loop failed: ", fmt.tprint(err))
 		return false
 	}
 	if at, ok := h.listen.?; ok {
