@@ -141,27 +141,29 @@ dns_asker_wait :: proc(a: ^Dns_Asker, event: nbio.Poll_Event) {
 	})
 }
 
-// Reads what has come, answers whatever is whole, and sends what it can.
+// Sends what it can, then reads what has come and answers whatever is whole, over and over until it must wait: for
+// the asker to read (nothing more is read meanwhile, so what waits for it is one read's answers at most), or to ask.
 @(private)
 dns_asker_run :: proc(a: ^Dns_Asker) {
-	for a.sent < len(a.out) {
-		n, err := net.send_tcp(a.socket, a.out[a.sent:])
-		a.sent += n
-		if err == .Would_Block {
-			dns_asker_wait(a, .Send)
-			return
-		}
-		if err != nil {
-			dns_asker_close(a)
-			return
-		}
-	}
-	clear(&a.out)
-	a.sent = 0
 	for {
+		for a.sent < len(a.out) {
+			n, err := net.send_tcp(a.socket, a.out[a.sent:])
+			a.sent += n
+			if err == .Would_Block {
+				dns_asker_wait(a, .Send)
+				return
+			}
+			if err != nil {
+				dns_asker_close(a)
+				return
+			}
+		}
+		clear(&a.out)
+		a.sent = 0
 		n, err := net.recv_tcp(a.socket, a.buf[a.have:])
 		if err == .Would_Block {
-			break
+			dns_asker_wait(a, .Receive)
+			return
 		}
 		if err != nil || n == 0 {
 			dns_asker_close(a)
@@ -189,12 +191,7 @@ dns_asker_run :: proc(a: ^Dns_Asker) {
 			copy(a.buf[:], a.buf[2 + size:a.have])
 			a.have -= 2 + size
 		}
-		if len(a.out) > 0 {
-			dns_asker_run(a)
-			return
-		}
 	}
-	dns_asker_wait(a, .Receive)
 }
 
 @(private)

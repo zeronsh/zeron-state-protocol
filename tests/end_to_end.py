@@ -1026,6 +1026,24 @@ def test_names():
     assert resolve(a.dns, "bee.zsp.internal", 28) == 0  # no IPv6 address, and no error
     assert resolve(a.dns, "nobody.zsp.internal") == 3
     assert resolve(a.dns, "example.com") == 5
+    # By TCP, as many as anyone asks at once, each answered, however fast they are asked.
+    host, dport = a.dns.rsplit(":", 1)
+    name = b"".join(bytes([60]) + b"a" * 60 for _ in range(4)) + b"\0"
+    query = struct.pack(">HHHHHH", 7, 0x0100, 1, 0, 0, 0) + name + struct.pack(">HH", 1, 1)
+    asked = 60000
+    with socket.create_connection((host, int(dport)), 5) as s:
+        import threading
+
+        threading.Thread(target=lambda: s.sendall((struct.pack(">H", len(query)) + query) * asked), daemon=True).start()
+        got, answers = b"", 0
+        while answers < asked:
+            data = s.recv(1 << 20)
+            assert data, "the name server hung up after %d answers" % answers
+            got += data
+            while len(got) >= 2 and len(got) >= 2 + struct.unpack(">H", got[:2])[0]:
+                got = got[2 + struct.unpack(">H", got[:2])[0]:]
+                answers += 1
+    assert a.p.poll() is None
     # Renamed, the old name is nobody's; the address stays.
     zspd("name", a.dir, zspd("key", b.dir), "wasp")
     eventually("the new name", lambda: resolve(a.dns, "wasp.zsp.internal") == a.base[:-1] + "0.3")
