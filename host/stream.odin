@@ -60,9 +60,8 @@ stream_new :: proc(h: ^Host, socket: net.TCP_Socket) -> ^Stream {
 }
 
 @(private)
-stream_accepted :: proc(op: ^nbio.Operation) {
-	h := nbio_host
-	nbio.accept(op.accept.socket, stream_accepted)
+stream_accepted :: proc(op: ^nbio.Operation, h: ^Host) {
+	h.accepting = nbio.accept_poly(op.accept.socket, h, stream_accepted)
 	if op.accept.err != nil {
 		report(.Warning, "could not accept a connection")
 		return

@@ -390,3 +390,63 @@ calls_come_after_what_they_are_about :: proc(t: ^testing.T) {
 		session_close(cb.s)
 	}
 }
+
+// What the hosts in hosts_speak_at_once heard, and the call each cancels when another ends.
+@(private)
+Hosted :: struct {
+	n:      ^Node,
+	calls:  [dynamic]u64, // answered
+	faults: [dynamic]u64,
+	then:   u64, // to cancel, from within, when told a call is over
+}
+
+// A host may say anything in any call at once, from within being told something: here, told that one call is over,
+// it cancels another, which lies just before it among the node's calls. Each is let go of once, and no other.
+@(test)
+hosts_speak_at_once :: proc(t: ^testing.T) {
+	state := seeded(31)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 64)
+	defer sim_destroy(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	ha, hb := Hosted{n = &a.node}, Hosted{n = &b.node}
+	defer delete(ha.calls)
+	defer delete(ha.faults)
+	defer delete(hb.calls)
+	defer delete(hb.faults)
+	for x in ([]^Hosted{&ha, &hb}) {
+		x.n.host.data = x
+		x.n.host.method = proc(data: rawptr, call: u64, from: Caller_Info, scope: Scope, method: string, first: []byte) -> Maybe(Call_Fault) {
+			append(&(^Hosted)(data).calls, call)
+			return nil
+		}
+		x.n.host.flow = proc(data: rawptr, call: u64, kind: Flow, payload: []byte) {
+			h := (^Hosted)(data)
+			if kind == .Fault || kind == .Cancel {
+				append(&h.faults, call)
+				if h.then != 0 {
+					other := h.then
+					h.then = 0
+					node_flow(h.n, other, .Cancel)
+				}
+			}
+		}
+	}
+	keep := node_call_method(&a.node, b.keys.device, 1, "zsp.x", nil)
+	q := node_call_method(&a.node, b.keys.device, 1, "zsp.x", nil)
+	p := node_call_method(&a.node, b.keys.device, 1, "zsp.x", nil)
+	testing.expect(t, keep != 0 && q != 0 && p != 0)
+	sim_settle(&s)
+	testing.expect_value(t, len(hb.calls), 3)
+	// B cancels p, the last of A's calls; A, told so, cancels q, which comes before it.
+	ha.then = q
+	node_flow(&b.node, hb.calls[2], .Cancel)
+	sim_settle(&s)
+	testing.expectf(t, len(ha.faults) == 1 && ha.faults[0] == p, "%v", ha.faults[:])
+	testing.expect_value(t, len(a.node.calls), 1)
+	testing.expect(t, len(a.node.calls) == 1 && a.node.calls[0].ends[CALLER].id == keep)
+	testing.expect_value(t, len(b.node.calls), 1)
+}

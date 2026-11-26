@@ -28,6 +28,11 @@ Config :: struct {
 	// Authentication, which is wholly the embedder's: see zsp.Host.authenticate. `data` is passed back.
 	data:         rawptr,
 	authenticate: proc(data: rawptr, s: ^zsp.Session, credential: []byte),
+	// Whether a caller may reach a TCP port through this device (zsp.tcp), and whether to tell the port who it
+	// is first, by what proxy_prelude says. Nil denies every port.
+	port_permitted: proc(sp: ^Space, caller: zsp.Key32, scope: zsp.Scope, port: u16, target: string) -> (ok: bool, proxy: bool),
+	// The bytes written to a port before anything else, when port_permitted asked for them (a PROXY header).
+	proxy_prelude:  proc(sp: ^Space, from: Caller, port: u16, target: string) -> []byte,
 }
 
 Host :: struct {
@@ -43,6 +48,8 @@ Host :: struct {
 	sync_due:     time.Tick,
 	syncing:      bool, // sync_due is set
 	stopping:     bool,
+	methods:      map[string]Host_Method, // that the host serves itself
+	accepting:    ^nbio.Operation,
 }
 
 Space :: struct {
@@ -54,6 +61,9 @@ Space :: struct {
 	seen: u64, // events already noticed by links_poke
 	warned: bool, // of a clock
 	found: ^Found, // while anyone is asking anything
+	calls: [dynamic]Host_Call, // whose end is the host
+	bridges: [dynamic]^Bridge, // of calls to TCP connections
+	audit: Audit_Log,
 }
 
 @(private)
@@ -166,6 +176,8 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		presence     = proc(data: rawptr, online: []zsp.Key32) {
 			links_greet((^Space)(data), online)
 		},
+		method       = host_method,
+		flow         = host_flow,
 	}
 	if !h.relay {
 		s.node.host.questions = questions(s)
@@ -189,6 +201,9 @@ space_authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
 
 space_close :: proc(s: ^Space) {
 	found_close(s)
+	bridges_close(s)
+	calls_close(s)
+	audit_close(s)
 	if !zsp.store_sync(&s.node.store) {
 		report(.Error, "could not sync the log")
 	}
@@ -244,21 +259,16 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 			return false
 		}
 		h.listener = listener
-		nbio.accept(listener, stream_accepted)
-		nbio_host = h
+		h.accepting = nbio.accept_poly(listener, h, stream_accepted)
 	}
 	if port, ok := h.udp_port.?; ok {
 		udp_open(h, port) or_return
 	}
+	host_serve_builtin(h)
 	return true
 }
 
-// The event loop is the thread's, and so is the host that runs on it.
-@(thread_local, private)
-nbio_host: ^Host
-
 host_run :: proc(h: ^Host) -> bool {
-	nbio_host = h
 	dialers_refresh(h)
 	for !h.stopping {
 		host_settle(h)
@@ -276,6 +286,10 @@ host_run :: proc(h: ^Host) -> bool {
 }
 
 host_destroy :: proc(h: ^Host) {
+	if h.accepting != nil {
+		nbio.remove(h.accepting)
+		net.close(h.listener)
+	}
 	for len(h.streams) > 0 {
 		stream_close(h.streams[0])
 	}
@@ -290,6 +304,7 @@ host_destroy :: proc(h: ^Host) {
 	delete(h.spaces)
 	delete(h.dialers)
 	delete(h.shared)
+	delete(h.methods)
 	nbio.release_thread_event_loop()
 }
 

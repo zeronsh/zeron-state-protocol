@@ -24,6 +24,8 @@ Right :: enum u8 {
 	Write, // implies Read
 	Call, // make and answer calls; needs neither, yet comes with Read, as every grant does
 	Vouch, // be believed about whom it writes and calls for: its host knows its users, and is trusted to
+	Shell, // run commands and open terminals on devices that offer them in the scope
+	Files, // read and write files on devices that offer them in the scope
 }
 Rights :: distinct bit_set[Right;u8]
 

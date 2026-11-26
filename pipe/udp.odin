@@ -874,6 +874,8 @@ link_frames :: proc(l: ^Link, plain: []byte, now: Time) -> (eliciting: bool, kep
 			return
 		}
 	}
+	// What cannot be read is not acknowledged: it may be a frame of a later version, but it is never data dropped.
+	kept &&= !r.bad
 	return
 }
 

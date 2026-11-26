@@ -764,3 +764,59 @@ stream_waits_for_stream_0 :: proc(t: ^testing.T) {
 	testing.expect(t, string(heard[1].got[id][:]) == "\x09")
 	testing.expect_value(t, heard[1].first[id], 5)
 }
+
+// Both ends pour bytes into one stream at once, as an echo does, as fast as the link lets them: every byte arrives,
+// in order, both ways.
+@(test)
+stream_carries_both_ways :: proc(t: ^testing.T) {
+	for seed in 0 ..< 6 {
+		state := rand.create(u64(31 + seed))
+		context.random_generator = rand.default_random_generator(&state)
+		n: Net
+		net_init(t, &n)
+		defer net_destroy(&n)
+		heard: [2]Heard
+		defer heard_destroy(&heard[0])
+		defer heard_destroy(&heard[1])
+		heard_wire(&n.links[0], &heard[0])
+		heard_wire(&n.links[1], &heard[1])
+		n.rate = 0 if seed % 2 == 0 else 50
+		n.delay = Time(seed % 3) * MS
+		n.loss = 0.01 if seed >= 4 else 0
+		for net_step(&n) && n.now < 50 * MS {}
+		id, _ := link_open(&n.links[0], 2)
+		sent: [2][dynamic]byte
+		defer delete(sent[0])
+		defer delete(sent[1])
+		chunk: [16 << 10]byte
+		for &b, i in chunk {
+			b = byte(i * 7 + i / 251)
+		}
+		total := 0
+		for steps := 0; steps < 200_000 && total < 6 << 20; steps += 1 {
+			for side in 0 ..< 2 {
+				if side == 1 && id not_in heard[1].got {
+					continue
+				}
+				room := link_room(&n.links[side], id)
+				if room > 0 {
+					k := min(room, len(chunk) - rand.int_max(100))
+					at := len(sent[side]) % len(chunk)
+					piece := make([]byte, k, context.temp_allocator)
+					for &b, i in piece {
+						b = chunk[(at + i) % len(chunk)]
+					}
+					link_write(&n.links[side], id, piece)
+					append(&sent[side], ..piece)
+					total += k
+				}
+			}
+			net_step(&n)
+		}
+		for net_step(&n) {}
+		got0 := heard[1].got[id][:]
+		got1 := heard[0].got[id][:]
+		testing.expectf(t, string(got0) == string(sent[0][:]), "seed %d: %d of %d one way", seed, len(got0), len(sent[0]))
+		testing.expectf(t, string(got1) == string(sent[1][:]), "seed %d: %d of %d the other", seed, len(got1), len(sent[1]))
+	}
+}
