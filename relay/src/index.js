@@ -10,6 +10,10 @@ import { Storage, Full, hex } from "./storage.js";
 
 const FULL = "this relay can keep no more of this space";
 
+// How long after a burst begins its connections are kept for hibernation again. Until then waking finds nothing of
+// theirs kept, and they reconnect; an object hibernates only once quiet for longer, and a timer due holds it awake.
+const KEEP_AFTER = 100;
+
 const unhex = (s) => Uint8Array.from(s.match(/../g) ?? [], (b) => parseInt(b, 16));
 
 function instantiate(host) {
@@ -64,6 +68,8 @@ export class Space extends DurableObject {
   #broken = false; // storage failed where the node was not there to be told
   #quiet; // a timer: once nothing has happened for QUIET_MS, a checkpoint if one is worth it
   #ending = new Set(); // connections whose input failed: let go of once what they have to hear is said, if anything is
+  #kept = new Set(); // connections whose attachment holds what they are now, for waking after hibernation
+  #keeping = false; // keeping them again is due
 
   constructor(ctx, env) {
     super(ctx, env);
@@ -101,6 +107,7 @@ export class Space extends DurableObject {
     this.#sockets.clear();
     this.#ending.clear();
     this.#unquiet();
+    this.#kept.clear();
     this.#wasm = undefined;
     this.#epoch++;
     this.#storage.cancel();
@@ -164,6 +171,7 @@ export class Space extends DurableObject {
         continue;
       }
       this.#sockets.set(id, ws);
+      this.#kept.add(id); // what it was kept as is what it is: out of date as soon as anything happens
       this.#next = Math.max(this.#next, id + 1);
     }
     if (lost) exports.present(), this.#settle();
@@ -224,12 +232,14 @@ export class Space extends DurableObject {
   #gone(ws) {
     const { id } = ws.deserializeAttachment();
     if (!this.#sockets.delete(id)) return;
+    this.#kept.delete(id);
     this.#wasm.closed(id);
     this.#settle();
   }
 
   #drop(id, ws) {
     if (!this.#sockets.delete(id)) return;
+    this.#kept.delete(id);
     this.#wasm.closed(id);
     ws.close(1008, "");
   }
@@ -274,15 +284,7 @@ export class Space extends DurableObject {
       }
       this.#ending.clear();
     }
-    for (const [id, ws] of this.#sockets) {
-      const n = this.#wasm.save(id);
-      const state = n > 0 ? this.#view(this.#wasm.data(), n).slice() : undefined;
-      try {
-        ws.serializeAttachment({ id, space: this.#space, state });
-      } catch {
-        ws.serializeAttachment({ id, space: this.#space }); // too much to carry: after a sleep, it reconnects
-      }
-    }
+    this.#unkeep();
     this.#wasm.ops(); // what taking output wanted, fetched now: not when something next happens
     this.#wasm.rest();
     if (this.#broken || this.#wasm.failed()) return void this.#fail();
@@ -306,15 +308,48 @@ export class Space extends DurableObject {
     }
   }
 
+  // What each connection was kept as is out of date now: let go of, once a burst, so that waking in its midst reconnects
+  // rather than resumes from it. Kept again once the burst is over, rather than after every message, which cost a fifth
+  // of what the object could pass on.
+  #unkeep() {
+    for (const [id, ws] of this.#sockets) {
+      if (this.#kept.delete(id)) ws.serializeAttachment({ id, space: this.#space });
+    }
+    if (this.#keeping) return;
+    this.#keeping = true;
+    const epoch = this.#epoch;
+    this.ctx.waitUntil(new Promise((go) => setTimeout(() => {
+      this.#keeping = false;
+      if (epoch === this.#epoch) this.#keep();
+      go();
+    }, KEEP_AFTER)));
+  }
+
+  #keep() {
+    if (!this.#wasm) return;
+    for (const [id, ws] of this.#sockets) {
+      const n = this.#wasm.save(id);
+      const state = n > 0 ? this.#view(this.#wasm.data(), n).slice() : undefined;
+      try {
+        ws.serializeAttachment({ id, space: this.#space, state });
+        if (state) this.#kept.add(id);
+      } catch {
+        ws.serializeAttachment({ id, space: this.#space }); // too much to carry: after a sleep, it reconnects
+      }
+    }
+  }
+
   // As though evicted and woken: the node starts again from its sockets and its storage, its own cache kept ("warm"),
   // all but the trees' tops let go of ("cold": as much as a cache can have turned over), or everything ("empty"), so
   // that what a read then costs can be measured. Only where STATS is set.
   #evict(how) {
     if (this.#wasm) {
       this.#unquiet();
+      this.#keep(); // as hibernation finds them: only ever once quiet
       this.#wasm = undefined;
       this.#epoch++;
       this.#sockets.clear();
+      this.#kept.clear();
       this.#storage.cancel();
       if (how === "cold" || how === "empty") this.#storage.forget(how === "empty");
       this.#begin() && this.#settle();

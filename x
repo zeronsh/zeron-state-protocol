@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams]|nat|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams|aead]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -16,8 +16,9 @@ STRICT="-vet -strict-style -define:ODIN_NBIO_QUEUE_SIZE=256"
 SIZED=zsp.review_little_room_whatever_quiet,zsp.review_little_room_pack_before_extent,zsp.review_little_room_small_writes_no_checkpoint # run at full size too
 SMALL="-define:ZSP_SEGMENT=262144 -define:ZSP_LOOSE=12 -define:ZSP_ALIKE=3 -define:ZSP_GC_HOT=4 -define:ZSP_GC_DEAD=1 -define:ZSP_EXTENT=131072 -define:ZSP_LOG_BLOCK=16384 -define:ZSP_LOCAL_KEEP=0" # so that tests roll and reclaim segments
 
+# The relay for speed, with WebAssembly's 128-bit vectors, which Workers have: what it does is mostly ChaCha20-Poly1305.
 wasm() {
-	odin build relay/wasm -target:js_wasm32 -o:size -out:relay/src/relay.wasm -no-entry-point $STRICT \
+	odin build relay/wasm -target:js_wasm32 -o:speed -target-features:simd128 -out:relay/src/relay.wasm -no-entry-point $STRICT \
 		-extra-linker-flags:"--strip-all -z stack-size=262144 --stack-first"
 }
 
@@ -120,6 +121,8 @@ test)
 	node examples/relay/test.mjs
 	node tests/relay_storage.mjs
 	node tests/relay_settle.mjs && node tests/relay_checkpoints.mjs
+	node tests/relay_keep.mjs
+	node bench/aead_wasm/run.mjs simd check # zsp's ChaCha20-Poly1305 held to core's in WebAssembly, as the relay runs it
 	$PYTHON examples/apps/test.py
 	$PYTHON examples/organization.py
 	end_to_end
@@ -164,6 +167,14 @@ bench)
 	elif [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]
 		odin build bench/find -out:build/bench-find$EXE -o:speed $STRICT
 		build/bench-find$EXE ${3:-1000000}
+	elif [ "${2:-}" = aead ]; then # what sealing and opening cost, by message size: ./x bench aead, ./x bench aead wasm
+		if [ "${3:-}" = wasm ]; then
+			node bench/aead_wasm/run.mjs && node bench/aead_wasm/run.mjs simd
+		else
+			odin build bench/aead -out:build/bench-aead$EXE -o:speed $STRICT
+			shift 2
+			build/bench-aead$EXE "$@"
+		fi
 	elif [ "${2:-}" = edits ]; then # what it costs to keep up with one edit of a text: ./x bench edits
 		odin build bench/edits -out:build/bench-edits$EXE -o:speed $STRICT
 		build/bench-edits$EXE
