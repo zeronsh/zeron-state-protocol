@@ -271,9 +271,9 @@ port_permitted :: proc(sp: ^Space, caller: zsp.Key32, scope: zsp.Scope, port: u1
 	if p == nil || caller == sp.host.device {
 		return
 	}
-	// The scope called in carries the call; the offer's own says whom it is for.
+	// Only what is offered in the scope called in: the scope is what was granted, and what is said of the call.
 	for &o in p.offers {
-		if (o.device != {} && o.device != caller) || port < o.lo || port > o.hi || o.host != target {
+		if o.scope != scope || (o.device != {} && o.device != caller) || port < o.lo || port > o.hi || o.host != target {
 			continue
 		}
 		if .Call not_in zsp.device_rights(&sp.node, caller, o.scope) || .Call not_in zsp.device_rights(&sp.node, sp.host.device, o.scope) {

@@ -1,6 +1,7 @@
 package host
 
 import "core:encoding/hex"
+import "core:fmt"
 import "core:strings"
 import "core:testing"
 import "../pipe"
@@ -124,6 +125,20 @@ offers_permit :: proc(t: ^testing.T) {
 	testing.expect(t, !ok)
 	list, _ = offered_to(sp.ports, c)
 	testing.expect_value(t, len(list), 0)
+
+	// In the scope it is offered in, and no other: a call in one scope reaches nothing offered only in another,
+	// though the caller may call in both.
+	d = zsp.draft_from(&sp.node.roster, 2000)
+	two := zsp.draft_scope(&d)
+	zsp.draft_grant(&d, ts.keys[0].device, ts.keys[0].signer, two, {.Write, .Call})
+	zsp.draft_grant(&d, b, ts.keys[1].signer, two, {.Write, .Call})
+	roster, signed = zsp.roster_sign(&ts.keys[0], ts.root, &d, context.temp_allocator)
+	testing.expect(t, signed && zsp.node_adopt(&sp.node, roster))
+	offer(t, &ts, fmt.tprintf("6000 %d", two))
+	ok, _ = port_permitted(sp, b, two, 6000, "")
+	testing.expect(t, ok)
+	ok, _ = port_permitted(sp, b, 1, 6000, "")
+	testing.expect(t, !ok)
 }
 
 @(test)

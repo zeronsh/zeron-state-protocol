@@ -659,6 +659,10 @@ zsp.ports    first message: lease varint (seconds, at most 600; 0 for once)
 entries      n varint ‖ n × { port (2) ‖ scope varint ‖ host bytes (empty for the callee's own machine) ‖ name bytes }
 ```
 
+A port is reached by a zsp.tcp call in the scope it is offered in, and in no other: the callee lets a call through only if an offer in
+the call's scope covers the port, the caller and the target. A device connecting to a port it has not yet heard the other offer asks
+in the first scope both share.
+
 A device asks what another offers when anyone on it seems to want it, and keeps it up while that lasts: a name looked up, a connection
 made, a client asking (60 seconds, here); and no sooner, so that a quiet space costs nothing however many devices come and go. The callee looks again at what is listening every 2 seconds while anyone is kept up,
 and never otherwise. An offer marked so says who connects before anything else: the PROXY protocol's second version, from the caller's
