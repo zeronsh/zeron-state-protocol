@@ -1188,11 +1188,13 @@ def test_expose():
     got = slow.recv(1 << 16)
     time.sleep(1)  # reading nothing, while the device would send 8 MB
     rss = memory_of(relay.p.pid)
-    while len(got) < len(data):
-        got += slow.recv(1 << 16)
+    while b"\r\n\r\n" not in got or len(got.partition(b"\r\n\r\n")[2]) < len(data):  # the body, not the head with it
+        more = slow.recv(1 << 16)
+        assert more, "the answer ended short"
+        got += more
         if len(got) < 1 << 20:
             time.sleep(0.001)
-    assert got.endswith(data[-1000:])
+    assert got.partition(b"\r\n\r\n")[2] == data
     if rss:
         assert rss < 24 << 20, f"the relay held {rss >> 20} MB for a reader that did not read"
         print(f"     a reader that did not read: the relay at {rss >> 20} MB")
