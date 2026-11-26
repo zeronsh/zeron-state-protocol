@@ -127,7 +127,7 @@ Watch_Flags :: bit_field u8 {
 }
 
 Synced_Flags :: bit_field u8 {
-	settled: bool | 1, // a full replica has confirmed this, or none is reachable
+	settled: bool | 1, // a full replica has confirmed this, and none has gone since
 	restart: bool | 1, // not an end but a beginning: the range is about to be sent afresh
 	denied:  bool | 1, // the watcher may not read this
 	_:       u8   | 5,
@@ -273,11 +273,14 @@ session_close :: proc(s: ^Session) {
 				continue
 			}
 			unordered_remove(&it.reports, i)
-			// The last to be heard stands, though it is gone: nobody knows better.
-			if to := node_session(n, it.session); to != nil && len(it.reports) > 0 {
+			// The last to be heard stands, though it is gone: nobody knows better. But what is here is kept up by
+			// nobody now, and is said to be no more than what is here.
+			if to := node_session(n, it.session); to != nil {
 				for &w in to.watches {
-					if w.id == it.watch.id && w.data {
+					if w.id == it.watch.id && w.data && len(it.reports) > 0 {
 						interest_beyond(n, &it, &w)
+					} else if w.id == it.watch.id && w.data && w.settled && !slice.contains(s.owed[:], it.id) {
+						append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi})
 					}
 				}
 			}
@@ -834,7 +837,7 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 			up.data = false
 		}
 		if it := interest_add(s, up, limit, flags.back); it != nil {
-			settled = it.waiting == 0
+			settled = interest_sure(&it^)
 		}
 	}
 	if !flags.data {
@@ -1015,12 +1018,21 @@ interest_settled :: proc(n: ^Node, id: u64) {
 		if it.waiting > 0 || to == nil {
 			return
 		}
+		// Settled if a full replica has said so; otherwise none can be reached, and what is here is all there is, as
+		// is said.
 		for w in to.watches {
 			if w.id == it.watch.id {
-				append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = true})
+				append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = interest_sure(&it)})
 			}
 		}
 	}
+}
+
+// Whether a full replica has confirmed what an interest asks for, and every one asked has answered; or it asks for
+// nothing that only a full replica could confirm.
+@(private)
+interest_sure :: proc(it: ^Interest) -> bool {
+	return it.waiting == 0 && (!it.watch.data || len(it.reports) > 0)
 }
 
 @(private)
@@ -2558,7 +2570,7 @@ resync :: proc(s: ^Session) {
 			append(&s.tasks, Task{kind = .Fill, lo = w.lo, hi = w.hi})
 			settled := true
 			for &it in n.interests {
-				settled &&= it.session != s.id || it.watch.id != w.id || it.waiting == 0
+				settled &&= it.session != s.id || it.watch.id != w.id || interest_sure(&it)
 			}
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = settled})
 		} else {

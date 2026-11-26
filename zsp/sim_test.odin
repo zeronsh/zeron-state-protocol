@@ -1061,30 +1061,67 @@ partial_replica :: proc(t: ^testing.T) {
 	_, before, _, _ = last(ui, 3)
 	testing.expect_value(t, before, 1057)
 
-	// A relay that dies owing an answer leaves the client with what there is, and told so.
+	// A relay that dies owing an answer leaves the client with what there is, and told so: that it is no more than that.
 	session_sent(ui, len(session_output(ui)))
 	sim_watch(ui, 2, list_lo({1 << 32 | 6, 5}), list_hi({1 << 32 | 6, 5}), 50, {data = true})
-	settled :: proc(ui: ^Session) -> (said, settled: bool) {
+	settled :: proc(ui: ^Session, watch: u64) -> (said, settled: bool) {
 		out := session_output(ui)
 		r := Reader{buf = out}
 		for r.pos < len(out) {
 			frame := read_bytes(&r)
 			if Message(frame[0]) == .Synced {
 				f := Reader{buf = frame[1:]}
-				said = read_varint(&f) == 2
-				settled = said && Synced_Flags(read_u8(&f)).settled
+				if read_varint(&f) == watch {
+					said = true
+					settled = Synced_Flags(read_u8(&f)).settled
+				}
 			}
 		}
 		session_sent(ui, len(out))
 		return
 	}
-	said, done := settled(ui)
+	said, done := settled(ui, 2)
 	testing.expect(t, said && !done)
 	for len(s.links) > 0 {
 		sim_cut(&s, 0)
 	}
-	said, done = settled(ui)
+	said, done = settled(ui, 2)
+	testing.expect(t, said && !done)
+
+	// So does one that dies having said so; and one that comes back says so again.
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	said, done = settled(ui, 3)
 	testing.expect(t, said && done)
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	said, done = settled(ui, 3)
+	testing.expect(t, said && !done)
+	// Nor is a window first watched with nobody to ask settled.
+	sim_watch(ui, 4, list_lo({1 << 32 | 5, 5}), list_hi({1 << 32 | 5, 5}), 10, {data = true, back = true})
+	said, done = settled(ui, 4)
+	testing.expect(t, said && !done)
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	out := session_output(ui)
+	r := Reader{buf = out}
+	latest: [5]Maybe(bool)
+	for r.pos < len(out) {
+		frame := read_bytes(&r)
+		if Message(frame[0]) == .Synced {
+			f := Reader{buf = frame[1:]}
+			if id := read_varint(&f); id < len(latest) {
+				latest[id] = Synced_Flags(read_u8(&f)).settled
+			}
+		}
+	}
+	session_sent(ui, len(out))
+	for id in ([]int{3, 4}) {
+		testing.expectf(t, latest[id] == true, "watch %d is not settled again: %v", id, latest[id])
+	}
 }
 
 // A device that was a full replica and is now a partial one loses nothing it wrote meanwhile, however long ago its store
