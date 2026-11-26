@@ -509,10 +509,24 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 		i += 1
 	}
 	if i == len(b) {
-		return .Pass if first_look else .More, ""
+		// A short word and nothing else, the whole of what came first: not a browser's, which says its request's head
+		// at once. Anything longer might be the start of one (a read takes so much, and no more).
+		if first_look && i > 0 && i <= FIRST_WORD_MOST && len(b) == len(first) {
+			return .Pass, ""
+		}
+		return .More, ""
+	}
+	// What does not read as a request line passes, being no web request; but not one that begins with a method of
+	// HTTP's, which a server would read as a request however it went on.
+	method := string(b[:i])
+	not_a_line :: proc(method: string) -> (Inspection, string) {
+		if http_method(method) {
+			return .Reject, "a request that could be read two ways"
+		}
+		return .Pass, ""
 	}
 	if i == 0 || b[i] != ' ' {
-		return .Pass, ""
+		return not_a_line(method)
 	}
 	i += 1
 	target_start := i
@@ -523,7 +537,7 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 		return .More, ""
 	}
 	if i == target_start || b[i] != ' ' {
-		return .Pass, ""
+		return not_a_line(method)
 	}
 	target := string(b[target_start:i])
 	i += 1
@@ -534,7 +548,7 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 		}
 		c := b[i + k]
 		if version[k] == 'd' ? !(c >= '0' && c <= '9') : c != version[k] {
-			return .Pass, ""
+			return not_a_line(method)
 		}
 	}
 	i += len(version)
@@ -545,7 +559,7 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 		return .More, ""
 	}
 	if b[i] != '\n' {
-		return .Pass, ""
+		return not_a_line(method)
 	}
 	// A web request: its head, whole, line by line.
 	rest := string(b[i + 1:])
@@ -654,6 +668,19 @@ http_authority :: proc(a: string) -> (host: string, ok: bool) {
 		}
 	}
 	return host, true
+}
+
+FIRST_WORD_MOST :: 64 // the longest word that, coming first and alone, is taken as no browser's
+
+// Whether a method is one of HTTP's own (RFC 9110 §9, RFC 5789), in any case, as fetch sends what it is given.
+@(private)
+http_method :: proc(m: string) -> bool {
+	for known in ([]string{"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"}) {
+		if strings.equal_fold(m, known) {
+			return true
+		}
+	}
+	return false
 }
 
 // A character of an HTTP token (RFC 9110 §5.6.2).

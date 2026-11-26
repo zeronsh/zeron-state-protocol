@@ -175,6 +175,25 @@ web_pages_reach_only_their_own :: proc(t: ^testing.T) {
 	testing.expect_value(t, verdict(sp, desk, "hello"), Inspection.More)
 	testing.expect_value(t, first(sp, desk, "patch /x HTTP/1."), Inspection.More)
 	testing.expect_value(t, first(sp, desk, cat("patch / HTTP/1.1\r\n", "Host: attacker.example\r\n\r\n")), Inspection.Reject)
+	// Only a short word, the whole of what came, and nothing before it: a read of 16 KiB of method is not the whole
+	// of what was written, and an empty line is not a word.
+	testing.expect_value(t, first(sp, desk, strings.repeat("A", 16384, context.temp_allocator)), Inspection.More)
+	testing.expect_value(t, first(sp, desk, strings.repeat("A", 65, context.temp_allocator)), Inspection.More)
+	testing.expect_value(t, first(sp, desk, "\r\n"), Inspection.More)
+	testing.expect_value(t, first(sp, desk, "\r\nGET"), Inspection.More)
+	// A method of HTTP's that goes on as no request line does is refused, not passed: a server reads it as one.
+	for odd in ([]string{
+		"GET /secret\r\nHost: attacker.example\r\n\r\n", // HTTP/0.9
+		"GET  /secret HTTP/1.1\r\nHost: attacker.example\r\n\r\n",
+		"GET /secret HTTP/1.1 \r\nHost: attacker.example\r\n\r\n",
+		"GET /secret?\xc3\xa9 HTTP/1.1\r\nHost: attacker.example\r\n\r\n",
+		"post\t/ HTTP/1.1\r\n\r\n",
+	}) {
+		testing.expectf(t, verdict(sp, desk, odd) == .Reject, "%q", odd)
+	}
+	// What no server takes for a request still passes: a mail client's word, a file server's.
+	testing.expect_value(t, verdict(sp, desk, "USER bob\r\n"), Inspection.Pass)
+	testing.expect_value(t, verdict(sp, desk, "EHLO client.example\r\n"), Inspection.Pass)
 	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk"), Inspection.More)
 	// Not HTTP at all: an SSH client, TLS.
 	testing.expect_value(t, verdict(sp, desk, "SSH-2.0-OpenSSH_9.6\r\n"), Inspection.Pass)

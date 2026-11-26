@@ -1213,6 +1213,14 @@ def test_ports():
             while data := s.recv(4096):
                 got += data
             assert got.startswith(b"HTTP/1.1 403 "), (request, got)
+    with socket.create_connection(proxy, 5) as s:  # a word with the request, however short, is not what came first
+        s.sendall(b"CONNECT bee.zsp.internal:%d HTTP/1.1\r\n\r\nG" % port)
+        time.sleep(0.2)
+        s.sendall(b"ET / HTTP/1.1\r\nHost: attacker.example\r\n\r\n")
+        got = b""
+        while data := s.recv(4096):
+            got += data
+        assert got.startswith(b"HTTP/1.1 403 "), got
     import json
 
     with open(os.path.join(b.dir, zspd_space(b), "audit.log")) as f:

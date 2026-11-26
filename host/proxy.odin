@@ -30,7 +30,6 @@ Proxy_Client :: struct {
 	greeted: bool, // SOCKS: the greeting has been answered
 	polling: ^nbio.Operation,
 	request: pipe.Proxy_Request,
-	looked:  bool, // what came with the request has been judged once
 }
 
 @(private)
@@ -224,8 +223,8 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 	// it, by the forward's inspector. Until what came is enough to judge, more is waited for.
 	inspect: proc(data: rawptr, first: []byte) -> Inspection = proxied_guard
 	if len(early) > 0 {
-		verdict, reason := http_verdict(sp, device, early[:], first_look = !c.looked)
-		c.looked = true
+		// Not as what came first: it came with the request, written at once with it, however short.
+		verdict, reason := http_verdict(sp, device, early[:])
 		switch verdict {
 		case .Reject:
 			proxy_say_no(c, reason)
