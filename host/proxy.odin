@@ -30,6 +30,7 @@ Proxy_Client :: struct {
 	greeted: bool, // SOCKS: the greeting has been answered
 	polling: ^nbio.Operation,
 	request: pipe.Proxy_Request,
+	eof:     bool, // it has said all it will
 }
 
 @(private)
@@ -117,44 +118,33 @@ proxy_client_close :: proc(c: ^Proxy_Client, reset: bool) {
 @(private)
 proxy_client_read :: proc(c: ^Proxy_Client) {
 	h := c.host
-	for {
+	// Read until the request is whole, and no further: what follows it (a body, the first of a conversation) is the
+	// forward's to read, and only the request is held to PROXY_HEAD_MAX.
+	result := pipe.Proxy_Result.More
+	for result == .More && !c.eof {
 		n, err := net.recv_tcp(c.socket, h.shared[:min(len(h.shared), PROXY_HEAD_MAX + 1 - len(c.buf))])
 		if err == .Would_Block {
 			break
 		}
-		if err != nil || n == 0 || len(c.buf) + n > PROXY_HEAD_MAX {
+		if err != nil {
 			proxy_client_close(c, reset = true)
 			return
 		}
-		append(&c.buf, ..h.shared[:n])
-	}
-	if len(c.buf) == 0 {
-		proxy_client_wait(c)
-		return
-	}
-	result: pipe.Proxy_Result
-	if c.buf[0] == 5 {
-		if !c.greeted {
-			used: int
-			used, result = pipe.socks_greeting(c.buf[:])
-			if result == .Done {
-				greeted := pipe.SOCKS_GREETED
-				net.send_tcp(c.socket, greeted[:])
-				remove_range(&c.buf, 0, used)
-				c.greeted = true
-				result = .More
-				if len(c.buf) > 0 {
-					c.request, result = pipe.socks_request(c.buf[:])
-				}
-			}
-		} else {
-			c.request, result = pipe.socks_request(c.buf[:])
+		if n == 0 {
+			c.eof = true // it has said all it will: what it said may yet be a whole request
 		}
-	} else {
-		c.request, result = pipe.http_proxy_request(c.buf[:])
+		append(&c.buf, ..h.shared[:n])
+		result = proxy_client_parse(c)
+		if result == .More && len(c.buf) > PROXY_HEAD_MAX {
+			result = .Broken
+		}
 	}
 	switch result {
 	case .More:
+		if c.eof {
+			proxy_client_close(c, reset = true) // ended before it said where to
+			return
+		}
 		proxy_client_wait(c)
 	case .Broken:
 		if c.greeted {
@@ -165,6 +155,34 @@ proxy_client_read :: proc(c: ^Proxy_Client) {
 	case .Done:
 		proxy_client_go(c)
 	}
+}
+
+// What has come of the request so far: whole, not yet, or no request at all.
+@(private)
+proxy_client_parse :: proc(c: ^Proxy_Client) -> (result: pipe.Proxy_Result) {
+	if len(c.buf) == 0 {
+		return .More
+	}
+	if c.buf[0] == 5 {
+		if !c.greeted {
+			used: int
+			used, result = pipe.socks_greeting(c.buf[:])
+			if result != .Done {
+				return
+			}
+			greeted := pipe.SOCKS_GREETED
+			net.send_tcp(c.socket, greeted[:])
+			remove_range(&c.buf, 0, used)
+			c.greeted = true
+			if len(c.buf) == 0 {
+				return .More
+			}
+		}
+		c.request, result = pipe.socks_request(c.buf[:])
+		return
+	}
+	c.request, result = pipe.http_proxy_request(c.buf[:])
+	return
 }
 
 // It has said where to: if that is a device of this space, forward to it.
@@ -230,8 +248,8 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 			proxy_say_no(c, reason)
 			return
 		case .More:
-			if len(c.buf) >= PROXY_HEAD_MAX {
-				proxy_say_no(c, "too long a request")
+			if len(c.buf) >= PROXY_HEAD_MAX || c.eof {
+				proxy_say_no(c, "a request that is not whole")
 				return
 			}
 			proxy_client_wait(c) // read again from the start, with more

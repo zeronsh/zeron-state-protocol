@@ -1248,6 +1248,46 @@ def test_ports():
         while data := s.recv(4096):
             got += data
         assert got.startswith(b"HTTP/1.1 200 ") and got.endswith(b"bee's"), got
+    # A request with more body than a request's head may be, and one whose client says all at once and shuts its side.
+    counter = socket.create_server(("127.0.0.1", free_port()))
+
+    def count_each():
+        import threading
+
+        while True:
+            try:
+                c, _ = counter.accept()
+            except OSError:
+                return
+
+            def one(c):
+                with c:
+                    got = b""
+                    while b"\r\n\r\n" not in got and (data := c.recv(65536)):
+                        got += data
+                    head, _, body = got.partition(b"\r\n\r\n")
+                    length = int(head.lower().split(b"content-length:")[1].split(b"\r\n")[0])
+                    while len(body) < length and (data := c.recv(65536)):
+                        body += data
+                    said = b"got %d" % len(body)
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(said), said))
+
+            threading.Thread(target=one, args=(c,), daemon=True).start()
+
+    import threading
+
+    threading.Thread(target=count_each, daemon=True).start()
+    cport = counter.getsockname()[1]
+    cb.offer(cport, 1)
+    eventually("that offer too", lambda: any(p["port"] == cport for n in ca.nodes() for p in n["ports"]))
+    for size in (8 << 10, 20 << 10):
+        with socket.create_connection(proxy, 5) as s:
+            s.sendall(b"POST http://bee.zsp.internal:%d/ HTTP/1.1\r\nHost: bee.zsp.internal:%d\r\nContent-Length: %d\r\n\r\n" % (cport, cport, size) + b"x" * size)
+            s.shutdown(socket.SHUT_WR)
+            got = b""
+            while data := s.recv(4096):
+                got += data
+            assert got.startswith(b"HTTP/1.1 200 ") and got.endswith(b"got %d" % size), (size, got)
     # Refused as it says all it will at once (its request, then the end of it): the refusal is still read.
     def socks_to(address, port):
         s = socket.create_connection(proxy, 5)
