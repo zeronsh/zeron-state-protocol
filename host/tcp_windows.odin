@@ -42,9 +42,11 @@ tcp_entries :: proc() -> (out: [dynamic]Tcp_Entry, ok: bool) {
 	for family in ([]u32{2, 23}) {
 		size: u32
 		buf: []byte
+		read := false
 		for _ in 0 ..< 4 {
 			result := GetExtendedTcpTable(raw_data(buf), &size, false, family, TCP_TABLE_OWNER_PID_ALL, 0)
 			if result == 0 {
+				read = true
 				break
 			}
 			if result != ERROR_INSUFFICIENT_BUFFER {
@@ -52,6 +54,9 @@ tcp_entries :: proc() -> (out: [dynamic]Tcp_Entry, ok: bool) {
 			}
 			size += size / 4 + 1024 // room for sockets made meanwhile
 			buf, _ = mem.make_aligned([]byte, int(size), 16, context.temp_allocator) // the table is of words
+		}
+		if !read {
+			return // it grew faster than it could be read: not known, rather than taken for empty
 		}
 		if len(buf) < 4 {
 			continue // none of this family
