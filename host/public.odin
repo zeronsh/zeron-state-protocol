@@ -17,6 +17,7 @@ import "../zsp"
 MAX_EXPOSED :: 4096 // labels at one relay
 PUBLIC_MAX :: 1024 // connections from the public at once
 PUBLIC_HEAD_MAX :: 16 << 10
+PUBLIC_READS :: 16 // reads of one connection, at most, before the others have their turn
 PUBLIC_OUT_MAX :: 256 << 10 // for the public, unwritten: no more is read from it until that has gone
 PUBLIC_HELLO :: 10 * time.Second // to say where to, after which it is let go
 
@@ -325,7 +326,9 @@ public_out_wait :: proc(c: ^Public_Out) {
 @(private)
 public_out_read :: proc(c: ^Public_Out) {
 	h := c.h
-	for !c.closed {
+	// So many reads, and then the others have their turn: what comes and makes nothing to pass on (records that are
+	// empty, or say nothing) does not keep the relay from everyone else.
+	for reads := 0; !c.closed && reads < PUBLIC_READS; reads += 1 {
 		n, err := net.recv_tcp(c.socket, h.shared)
 		if err == .Would_Block {
 			break
@@ -381,7 +384,7 @@ public_out_read :: proc(c: ^Public_Out) {
 		} else {
 			append(&c.pending, ..bytes)
 		}
-		if len(c.pending) >= 256 << 10 {
+		if len(c.pending) >= 256 << 10 || len(c.out) - c.sent >= PUBLIC_OUT_MAX {
 			break // enough waiting: no more is read until it has gone
 		}
 	}

@@ -52,6 +52,7 @@ Tls_Server :: struct {
 	session_len: int,
 	alert:      u8, // why it ended, if it was this end's doing
 	update_owed: bool, // the client asked for a KeyUpdate: one is sent, however many it asked for at once
+	ccs_seen:   bool, // its one change_cipher_spec, for middleboxes' sake: a second is refused
 }
 
 // What a server says for a name: the identity to prove, or nil to refuse.
@@ -288,9 +289,10 @@ tls_accept :: proc(t: ^Tls_Server, bytes: []byte, plain, w: ^[dynamic]byte, find
 		type, body := rest[0], rest[5:][:n]
 		used += 5 + n
 		if type == 20 {
-			if t.state != .Flight && t.state != .Retried || n != 1 || body[0] != 1 {
-				return tls_fail(t, 10, w) // unexpected_message
+			if t.state != .Flight && t.state != .Retried || n != 1 || body[0] != 1 || t.ccs_seen {
+				return tls_fail(t, 10, w) // unexpected_message: and one is all a client sends (RFC 8446 §5)
 			}
+			t.ccs_seen = true
 			continue // change_cipher_spec, for appearances
 		}
 		if t.state == .Flight || t.state == .Open {

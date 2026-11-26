@@ -255,3 +255,22 @@ tls_server_retries_any_case :: proc(t: ^testing.T) {
 	testing.expect(t, tls_accept(&s, second[:], &plain, &out, find, &id))
 	testing.expect_value(t, s.state, Tls_Server_State.Flight)
 }
+
+// One change_cipher_spec is taken, for middleboxes' sake; another is not: a client cannot keep the server busy with
+// records that say nothing.
+@(test)
+tls_server_one_change_cipher_spec :: proc(t: ^testing.T) {
+	id: Tls_Identity
+	testing.expect(t, tls_identity_load(&id, #load("../tests/certs/p256.pem"), #load("../tests/certs/p256.key")))
+	defer tls_identity_destroy(&id)
+	c: Tls
+	s: Tls_Server
+	defer tls_destroy(&c)
+	defer tls_server_destroy(&s)
+	to_s, to_c, plain := make([dynamic]byte, context.temp_allocator), make([dynamic]byte, context.temp_allocator), make([dynamic]byte, context.temp_allocator)
+	tls_start(&c, "a.expose.test", &to_s)
+	testing.expect(t, tls_accept(&s, to_s[:], &plain, &to_c, find, &id))
+	testing.expect(t, tls_accept(&s, {20, 3, 3, 0, 1, 1}, &plain, &to_c, find, &id))
+	testing.expect(t, !tls_accept(&s, {20, 3, 3, 0, 1, 1}, &plain, &to_c, find, &id))
+	testing.expect_value(t, s.alert, 10)
+}

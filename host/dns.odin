@@ -12,6 +12,7 @@ import "../pipe"
 
 DNS_TCP_MAX :: 8 // askers by TCP at once
 DNS_TCP_BUFFER :: 2 + 512 // a question is short: a longer one is not one
+DNS_TCP_TURN :: 16 // reads of one asker, at most, before the others have their turn
 
 @(private)
 Dns :: struct {
@@ -142,10 +143,11 @@ dns_asker_wait :: proc(a: ^Dns_Asker, event: nbio.Poll_Event) {
 }
 
 // Sends what it can, then reads what has come and answers whatever is whole, over and over until it must wait: for
-// the asker to read (nothing more is read meanwhile, so what waits for it is one read's answers at most), or to ask.
+// the asker to read (nothing more is read meanwhile, so what waits for it is one read's answers at most), or to ask;
+// or until it has had its turn, when it goes on once the others have had theirs.
 @(private)
 dns_asker_run :: proc(a: ^Dns_Asker) {
-	for {
+	for turn := 0; ; turn += 1 {
 		for a.sent < len(a.out) {
 			n, err := net.send_tcp(a.socket, a.out[a.sent:])
 			a.sent += n
@@ -160,6 +162,10 @@ dns_asker_run :: proc(a: ^Dns_Asker) {
 		}
 		clear(&a.out)
 		a.sent = 0
+		if turn == DNS_TCP_TURN {
+			dns_asker_wait(a, .Receive) // ready at once if more has come: but after the others
+			return
+		}
 		n, err := net.recv_tcp(a.socket, a.buf[a.have:])
 		if err == .Would_Block {
 			dns_asker_wait(a, .Receive)

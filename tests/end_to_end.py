@@ -1046,6 +1046,38 @@ def test_names():
                 got = got[2 + struct.unpack(">H", got[:2])[0]:]
                 answers += 1
     assert a.p.poll() is None
+    # And however fast one asker asks and reads, the others are answered meanwhile.
+    stop = threading.Event()
+
+    def ask_on():
+        with socket.create_connection((host, int(dport)), 5) as s:
+            s.settimeout(1)
+
+            def read_on():
+                while not stop.is_set():
+                    try:
+                        if not s.recv(1 << 20):
+                            return
+                    except OSError:
+                        pass
+
+            threading.Thread(target=read_on, daemon=True).start()
+            frames = (struct.pack(">H", len(query)) + query) * 200
+            while not stop.is_set():
+                try:
+                    s.sendall(frames)
+                except OSError:
+                    return
+
+    flood = threading.Thread(target=ask_on, daemon=True)
+    flood.start()
+    time.sleep(0.3)
+    try:
+        for _ in range(5):
+            assert resolve(a.dns, "bee.zsp.internal") == a.base[:-1] + "0.3"  # in under 2 s, each
+    finally:
+        stop.set()
+        flood.join(5)
     # Renamed, the old name is nobody's; the address stays.
     zspd("name", a.dir, zspd("key", b.dir), "wasp")
     eventually("the new name", lambda: resolve(a.dns, "wasp.zsp.internal") == a.base[:-1] + "0.3")
@@ -1708,6 +1740,17 @@ def test_own_ports_kept():
                 pass
 
 
+def client_hello(name):
+    """A TLS 1.3 ClientHello for a name, as a record: X25519 and AES-128-GCM, its key share any 32 bytes."""
+    sni = name.encode()
+    ext = (struct.pack(">HHHBH", 0, len(sni) + 5, len(sni) + 3, 0, len(sni)) + sni
+           + struct.pack(">HHBH", 43, 3, 2, 0x0304) + struct.pack(">HHHH", 10, 4, 2, 0x001D)
+           + struct.pack(">HHHHH", 13, 6, 4, 0x0403, 0x0804) + struct.pack(">HHHHH", 51, 38, 36, 0x001D, 32) + os.urandom(32))
+    body = struct.pack(">H", 0x0303) + os.urandom(32) + b"\x00" + struct.pack(">HH", 2, 0x1301) + b"\x01\x00" + struct.pack(">H", len(ext)) + ext
+    hello = bytes([1]) + len(body).to_bytes(3, "big") + body
+    return struct.pack(">BHH", 22, 0x0301, len(hello)) + hello
+
+
 def test_public_held_off():
     """The public cannot keep the public out: what is not TLS, what fails its handshake, and what says nothing leave
     nothing behind at the relay, and someone who has something to ask is still answered."""
@@ -1738,6 +1781,32 @@ def test_public_held_off():
                 s.sendall(junk)
     eventually("the relay holds nothing of them", lambda: fds() <= before)
     assert public_get(https, name)[:2] == (200, b"still here")
+
+    # One that says nothing, as fast as it can (change_cipher_spec after change_cipher_spec, mid-handshake), keeps
+    # nobody else waiting.
+    import threading
+
+    stop = threading.Event()
+
+    def babble():
+        with socket.create_connection(("127.0.0.1", https), 5) as s:
+            s.sendall(client_hello(name))
+            while not stop.is_set():
+                try:
+                    s.sendall(b"\x14\x03\x03\x00\x01\x01" * 4096)
+                except OSError:
+                    return
+
+    babbler = threading.Thread(target=babble, daemon=True)
+    babbler.start()
+    time.sleep(0.3)
+    try:
+        start = time.monotonic()
+        assert public_get(https, name)[:2] == (200, b"still here")
+        assert time.monotonic() - start < 2, time.monotonic() - start
+    finally:
+        stop.set()
+        babbler.join(5)
 
     # More than it holds at once of connections that say nothing: the longest silent make room.
     silent = [socket.create_connection(("127.0.0.1", https), 5) for _ in range(1100)]
