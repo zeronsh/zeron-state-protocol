@@ -526,16 +526,29 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 		return .More, ""
 	}
 	// What does not read as a request line passes, being no web request; but not one that begins with a method of
-	// HTTP's, which a server would read as a request however it went on.
+	// HTTP's, nor one that began as a request does (a token, a space) and names HTTP's version on its first line:
+	// a server would read either as a request however it went on. That line is waited for, but only so far.
 	method := string(b[:i])
-	not_a_line :: proc(method: string) -> (Inspection, string) {
+	not_a_line :: proc(method: string, b: []byte = nil) -> (Inspection, string) {
 		if http_method(method) {
+			return .Reject, "a request that could be read two ways"
+		}
+		if b == nil {
+			return .Pass, ""
+		}
+		line := b
+		if lf := strings.index_byte(string(b), '\n'); lf >= 0 {
+			line = b[:lf]
+		} else if len(b) < LINE_LOOK {
+			return .More, ""
+		}
+		if strings.contains(string(line), "HTTP/") {
 			return .Reject, "a request that could be read two ways"
 		}
 		return .Pass, ""
 	}
 	if i == 0 || b[i] != ' ' {
-		return not_a_line(method)
+		return not_a_line(method, b if i > 0 && b[i] == '\t' else nil) // a tab after a token: as a space would be
 	}
 	i += 1
 	target_start := i
@@ -546,7 +559,7 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 		return .More, ""
 	}
 	if i == target_start || b[i] != ' ' {
-		return not_a_line(method)
+		return not_a_line(method, b)
 	}
 	target := string(b[target_start:i])
 	i += 1
@@ -557,7 +570,7 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 		}
 		c := b[i + k]
 		if version[k] == 'd' ? !(c >= '0' && c <= '9') : c != version[k] {
-			return not_a_line(method)
+			return not_a_line(method, b)
 		}
 	}
 	i += len(version)
@@ -568,7 +581,7 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte, first_look :=
 		return .More, ""
 	}
 	if b[i] != '\n' {
-		return not_a_line(method)
+		return not_a_line(method, b)
 	}
 	// A web request: its head, whole, line by line.
 	rest := string(b[i + 1:])
@@ -680,6 +693,7 @@ http_authority :: proc(a: string) -> (host: string, ok: bool) {
 }
 
 FIRST_WORD_MOST :: 64 // the longest word that, coming first and alone, is taken as no browser's
+LINE_LOOK :: 2048 // how far a line that began as a request does, and then did not, is waited for to its end
 
 // Whether a method is one of HTTP's own (RFC 9110 §9, RFC 5789), in any case, as fetch sends what it is given.
 @(private)

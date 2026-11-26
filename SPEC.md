@@ -676,8 +676,9 @@ nothing. What a browser sends begins with a request line, `method SP target SP H
 
 - empty lines before it are skipped, and a line may end in LF alone, as the most lenient server would read it;
 - bytes that cannot begin such a line pass at once, and are not HTTP, unless they begin with one of HTTP's own methods (GET, HEAD, POST,
-  PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH, in any case), which a server would read as a request however it went on: those are
-  refused. Bytes that can begin such a line are held until they cannot, or the head is whole;
+  PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH, in any case), or with a token and a space (or tab) and a first line that names
+  `HTTP/`: a server would read either as a request however it went on, and those are refused. That line is waited for to its end,
+  over 2 KiB at most. Bytes that can begin such a line are held until they cannot, or the head is whole;
 - except that a browser writes its request's head at once, and what comes by loopback at once is read at once: so what comes first on a
   connection, if it is the whole of the first read, a token of at most 64 bytes, and nothing before or after it, is no browser's and
   passes. What comes with a proxy's request is never taken so;

@@ -105,8 +105,8 @@ http_proxy_request :: proc(b: []byte) -> (r: Proxy_Request, result: Proxy_Result
 	first, _, rest := strings.partition(head, "\r\n")
 	method, _, tail := strings.partition(first, " ")
 	target, _, version := strings.partition(tail, " ")
-	if !strings.has_prefix(version, "HTTP/1.") {
-		return r, .Broken
+	if (version != "HTTP/1.1" && version != "HTTP/1.0") || method == "" || target == "" {
+		return r, .Broken // a request line, exactly: a proxy that read it otherwise than the device's server would be no guard
 	}
 	r.used = end + 4
 	if method == "CONNECT" {

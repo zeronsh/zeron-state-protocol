@@ -191,6 +191,15 @@ web_pages_reach_only_their_own :: proc(t: ^testing.T) {
 	}) {
 		testing.expectf(t, verdict(sp, desk, odd) == .Reject, "%q", odd)
 	}
+	// Nor one with another method that names HTTP's version on its line (WebDAV's, or any a page may send).
+	for odd in ([]string{
+		"PROPFIND /dav HTTP/1.1 \r\nHost: attacker.example\r\n\r\n",
+		"PROPFIND /direct  HTTP/1.1\r\nHost: attacker.example\r\n\r\n",
+		"MKCOL\t/x HTTP/1.1\r\n\r\n",
+	}) {
+		testing.expectf(t, verdict(sp, desk, odd) == .Reject, "%q", odd)
+	}
+	testing.expect_value(t, verdict(sp, desk, "PROPFIND /x  HTTP/1"), Inspection.More) // its line not yet whole
 	// What no server takes for a request still passes: a mail client's word, a file server's.
 	testing.expect_value(t, verdict(sp, desk, "USER bob\r\n"), Inspection.Pass)
 	testing.expect_value(t, verdict(sp, desk, "EHLO client.example\r\n"), Inspection.Pass)
