@@ -353,6 +353,21 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   h.run();
   assert.equal(editor.read(), "start more typed", "the editor's typing was lost here");
   assert(pieces().includes(" typed"), "and said to the node");
+  // And so when the change touched another slot of the row first.
+  editor.append(" more");
+  h.run();
+  assert.throws(
+    () =>
+      h.client.write(1, (change) => {
+        change.set(id, Note, { title: "other" });
+        change.set(id, Note, { body: "over" });
+        throw new Error("no");
+      }),
+    /no/,
+  );
+  h.run();
+  assert.equal(editor.read(), "start more typed more", "the editor's typing was lost when another slot was touched first");
+  assert.equal(pieces().split(" more").length, 3, "and said to the node");
   editor.close();
 }
 
