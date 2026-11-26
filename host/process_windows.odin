@@ -47,6 +47,8 @@ Process :: struct {
 	freed:    bool,
 	console_guard: sync.Mutex, // held while the console is resized or closed, on whichever thread
 	pipe_check: ^nbio.Operation, // once it has ended: whether a read of its output waits on a pipe at its end
+	write_check: ^nbio.Operation, // while a write waits: whether on a pipe whose reader has gone
+	write_stuck: ^nbio.Operation, // the write seen waiting so, once already
 	stuck:    [2]^nbio.Operation, // the read seen waiting on a pipe that is gone, once already
 }
 
@@ -408,6 +410,10 @@ process_free :: proc(p: ^Process) {
 		nbio.remove(p.write_op) // what says input was let go of, its input closed already
 		p.write_op = nil
 	}
+	if p.write_check != nil {
+		nbio.remove(p.write_check)
+		p.write_check = nil
+	}
 	for &h, i in p.output {
 		if h != nil {
 			win.CloseHandle(h)
@@ -553,6 +559,7 @@ process_flush :: proc(p: ^Process) {
 		return
 	}
 	p.writing, p.held = p.held, p.writing
+	defer process_watch_write(p)
 	p.write_op = nbio.write_poly(nbio.Handle(p.input), 0, p.writing[:], p, proc(op: ^nbio.Operation, p: ^Process) {
 		p.write_op = nil
 		if op.write.err != nil {
@@ -694,6 +701,42 @@ process_check_pipes :: proc(p: ^Process) {
 	if process_told(p) && !p.told {
 		process_watch_pipes(p)
 	}
+}
+
+// A write that waits on a pipe whose reader went between the asking and the writing (see process_watch_pipes): the
+// same write still waiting on a pipe that is gone, at two looks 200 ms apart, never will be done, and its input is let go.
+@(private)
+process_watch_write :: proc(p: ^Process) {
+	if p.write_check == nil && p.write_op != nil && p.write_op.type == .Write {
+		p.write_check = nbio.timeout_poly(200 * time.Millisecond, p, proc(op: ^nbio.Operation, p: ^Process) {
+			p.write_check = nil
+			process_check_write(p)
+		})
+	}
+}
+
+@(private)
+process_check_write :: proc(p: ^Process) {
+	op := p.write_op
+	if p.freed || p.input == nil || op == nil || op.type != .Write {
+		p.write_stuck = nil
+		return
+	}
+	if gone, _ := process_pipe_gone(p.input); !gone {
+		p.write_stuck = nil
+	} else if p.write_stuck != op {
+		p.write_stuck = op
+	} else {
+		p.write_stuck = nil
+		process_input_close(p) // the write taken back with it
+		if p.events.on_room != nil {
+			p.telling += 1
+			p.events.on_room(p.events.data)
+			process_told(p)
+		}
+		return
+	}
+	process_watch_write(p)
 }
 
 // Whether the other end of a pipe has gone, and how much is waiting in it to be read.
