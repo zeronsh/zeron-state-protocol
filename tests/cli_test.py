@@ -23,8 +23,12 @@ def ok(*args, input=b""):
 
 
 def roster(d, a):
-    with open(os.path.join(d.dir, e2e.zspd_space(a), "roster"), "rb") as f:
-        return f.read()
+    """A device's roster as it has it now; or nothing, while it is being put in place, which Windows lets nobody read."""
+    try:
+        with open(os.path.join(d.dir, e2e.zspd_space(a), "roster"), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 def shared(name, *shares):
@@ -32,7 +36,7 @@ def shared(name, *shares):
     relay, (a, b) = space(name + "a", name + "b")
     zspd("admit", a.dir, zspd("key", a.dir), "1", "shell", "files")
     zspd("subject", a.dir, zspd("key", b.dir), name + "-b")
-    eventually("b hears of it", lambda: roster(b, a) == roster(a, a))
+    eventually("b hears of it", lambda: roster(b, a) is not None and roster(b, a) == roster(a, a))
     zspd("share", b.dir, *shares)
     return a, b
 
@@ -160,7 +164,7 @@ def test_files():
     assert not os.path.exists(os.path.join(docs, "one.txt"))
     # Nor by a device without the right, whatever is shared.
     zspd("admit", a.dir, zspd("key", a.dir), "1")
-    eventually("b hears of it", lambda: roster(b, a) == roster(a, a))
+    eventually("b hears of it", lambda: roster(b, a) is not None and roster(b, a) == roster(a, a))
     code, out, err = cli("ls", a.dir, "fl-b", "docs")
     assert code == 1 and b"denied" in err, (out, err)
 
