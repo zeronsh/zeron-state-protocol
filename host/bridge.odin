@@ -566,7 +566,9 @@ bridge_read :: proc(b: ^Bridge) {
 	}
 	if len(b.held) > 0 && (b.inspect == nil || b.early > 0) {
 		bridge_send_held(b) // what was given early, or an inspector let through, as credit allows
-		if len(b.held) > 0 && b.inspect == nil {
+		if len(b.held) > 0 && (b.inspect == nil || b.early > 0) {
+			// Nothing more is read while what may go waits for credit: the socket is held back as the call is, and
+			// its end is not heard before what it said before it has gone.
 			return
 		}
 	}
