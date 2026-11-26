@@ -189,6 +189,9 @@ export function chunkMessage(hash: Uint8Array): Uint8Array {
   return out;
 }
 
+/** What follows a file's last bytes: the last chunk's hash, then the end and the file's hash. */
+const TRAIL = 1 + 32 + (2 + 32);
+
 /** The end of a file sent: how it went, and the file's hash. */
 export function endMessage(status: Refusal | "ok", hash?: Uint8Array): Uint8Array {
   const out = new Uint8Array(2 + (hash ? 32 : 0));
@@ -1124,7 +1127,8 @@ class Fetch extends Transfer {
         if (payload.length < 1 || payload[0] !== 0) return this.#fail(payload.length > 0 ? (REFUSALS[payload[0] - 1] ?? "failed") : "malformed");
         if (this.#awaiting || this.at !== this.size) return this.#fail("malformed");
         const hash = this.hashing.file();
-        if (payload.length === 33 && !equal(payload.subarray(1), hash)) return this.#fail("changed");
+        // From the start, the file's hash comes and must agree; taken up later, every chunk's has, kept or come.
+        if ((this.from === 0 && payload.length !== 33) || (payload.length === 33 && !equal(payload.subarray(1), hash))) return this.#fail("changed");
         return this.#commit(hash);
       }
       default:
@@ -1262,10 +1266,11 @@ class Send extends Transfer {
     this.#pumping = true;
     try {
       for (;;) {
+        // Credit for what follows the last bytes is kept back from them, so that it can always go when they have.
         const room = this.call.room;
-        if (this.finished || room < 1 + 32 + 2 + 32) return; // onroom says when to go on
+        if (this.finished || room < (this.at < this.size ? 1 + 1 + TRAIL : TRAIL)) return; // onroom says when to go on
         if (this.at < this.size) {
-          const n = Math.min(room - 1, FILE_READ, this.size - this.at, CHUNK - this.hashing.filled);
+          const n = Math.min(room - 1 - TRAIL, FILE_READ, this.size - this.at, CHUNK - this.hashing.filled);
           const buf = new Uint8Array(1 + n);
           const got = await this.#f.read(buf.subarray(1), this.at);
           if (this.finished) return;

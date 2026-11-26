@@ -54,6 +54,7 @@ Service_Call :: struct {
 	caller: zsp.Key32,
 	scope:  zsp.Scope,
 	name:   string, // the share's, for files; owned
+	path:   string, // where the share was when the call began, for files; owned
 	write:  bool, // needs a share that may be written
 	terminal: bool, // needs a share of terminals; else of commands
 	data:   rawptr,
@@ -179,6 +180,7 @@ shares_close :: proc(sp: ^Space) {
 	for len(sp.services) > 0 {
 		c := pop(&sp.services)
 		delete(c.name)
+		delete(c.path)
 		free(c)
 	}
 	delete(sp.services)
@@ -241,7 +243,10 @@ share_for :: proc(sp: ^Space, from: Caller, scope: zsp.Scope, kind: Share_Kind, 
 @(private)
 service_begin :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, kind: Share_Kind, name: string, write, terminal: bool, data: rawptr, stop: proc(data: rawptr)) {
 	c := new(Service_Call)
-	c^ = {call, kind, from.device, scope, strings.clone(name), write, terminal, data, stop}
+	c^ = {call, kind, from.device, scope, strings.clone(name), "", write, terminal, data, stop}
+	if share, status := share_for(sp, from, scope, kind, name, write, terminal); status == .Ok && kind == .Files {
+		c.path = strings.clone(share.path)
+	}
 	append(&sp.services, c)
 }
 
@@ -251,6 +256,7 @@ service_end :: proc(sp: ^Space, call: u64) {
 		if c.call == call {
 			unordered_remove(&sp.services, i)
 			delete(c.name)
+			delete(c.path)
 			free(c)
 			return
 		}
@@ -265,13 +271,15 @@ services_recheck :: proc(sp: ^Space) {
 		}
 		c := sp.services[i]
 		from := Caller{device = c.caller}
-		if _, status := share_for(sp, from, c.scope, c.kind, c.name, c.write, c.terminal); status == .Ok {
+		// Allowed still, and for files, the same folder: a share of that name now somewhere else is another share.
+		if share, status := share_for(sp, from, c.scope, c.kind, c.name, c.write, c.terminal); status == .Ok && (c.kind != .Files || share.path == c.path) {
 			continue
 		}
 		audit(sp, {device = c.caller, scope = c.scope, service = "shell" if c.kind == .Shell else "files", detail = c.name, event = .Denied, peer = "no longer allowed"})
 		call, data, stop := c.call, c.data, c.stop
 		unordered_remove(&sp.services, i)
 		delete(c.name)
+		delete(c.path)
 		free(c)
 		call_fault(sp, call, .Denied)
 		stop(data)
@@ -340,11 +348,12 @@ serve_services :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, fi
 	return refused_handler(), .Cancelled
 }
 
-// The shares themselves, for the device's own clients alone: an empty first message asks for them as text, any other
-// is new shares to put in their place.
+// The shares themselves, for the device's own clients alone, and of those only one that may act in every scope (as
+// zspd's own may): an empty first message asks for them as text, any other is new shares to put in their place. A
+// client let into some scopes neither sees where shares are here nor makes any.
 @(private)
 serve_shares :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: []byte) -> (^Call_Handler, zsp.Call_Fault) {
-	if from.local == nil {
+	if from.local == nil || !local_owner(from.local) {
 		return nil, .Denied
 	}
 	if len(first) == 0 {
@@ -357,6 +366,17 @@ serve_shares :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, firs
 		status_send(sp, call, .Malformed, "a share makes no sense")
 	}
 	return refused_handler(), .Cancelled
+}
+
+// Whether a local client may act in every scope: a grant for scope 0 with Write and Call.
+@(private)
+local_owner :: proc(s: ^zsp.Session) -> bool {
+	for g in s.grants {
+		if g.scope == 0 && g.until == 0 && .Write in g.rights && .Call in g.rights {
+			return true
+		}
+	}
+	return false
 }
 
 // A port someone offers, as zsp.services lists it.

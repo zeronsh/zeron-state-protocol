@@ -293,16 +293,19 @@ bridge_attach :: proc(b: ^Bridge, socket: net.TCP_Socket, prelude: []byte) {
 
 @(private)
 bridge_free :: proc(b: ^Bridge) {
-	for x, i in b.sp.bridges {
-		if x == b {
-			unordered_remove(&b.sp.bridges, i)
-			break
+	if b.sp != nil {
+		for x, i in b.sp.bridges {
+			if x == b {
+				unordered_remove(&b.sp.bridges, i)
+				break
+			}
 		}
 	}
 	if b.dialling != nil {
 		// A dial taken back may have connected all the same, and then nobody would close what it made: so it is
-		// left to finish, and closes what it made itself.
+		// left to finish, and closes what it made itself. Its space may be gone by then, so it lets go of that now.
 		b.abandoned = true
+		b.sp = nil
 		return
 	}
 	if b.draining != nil {
@@ -681,7 +684,8 @@ bridges_close :: proc(sp: ^Space) {
 // port (2, big-endian) ‖ host: a TCP connection to that port, there or, if the host is empty, here.
 @(private)
 serve_tcp :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: []byte) -> (^Call_Handler, zsp.Call_Fault) {
-	if len(first) < 2 || from.relay {
+	// Not for relays, nor for the device's own clients: what they would reach here they reach already, or are not let.
+	if len(first) < 2 || from.relay || from.local != nil {
 		return nil, .Denied
 	}
 	port := endian.unchecked_get_u16be(first)

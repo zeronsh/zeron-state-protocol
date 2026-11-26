@@ -574,14 +574,15 @@ status      0 ok ‖ what the method says · or code (1) ‖ reason (UTF-8), and
 
 What it lets others do is the device's to say, in the scopes it says: **shares**, of terminals and commands (shell), and of folders of files, each by
 a name and for reading or writing too (files). Nothing is shared until its owner says, and whoever would use a share needs besides, in its scope,
-Call and Shell or Files (§3). When either changes, every call no longer allowed is faulted *denied* at once, and its process killed or its file closed.
+Call and Shell or Files (§3). When either changes, every call no longer allowed is faulted *denied* at once, and its process killed or its file closed;
+a share of files moved to another folder is another share.
 Every opening, refusal and close is written down by the host, with who and what but none of what passed. A host does not answer its own local
 clients but by `zsp.services` and `zsp.share`, nor relays but by `zsp.public`.
 
 | method | first message | then |
 |---|---|---|
 | `zsp.services` | – | n × service, End: 1 shell ‖ flags (1: 1 terminal, 2 commands) · 2 files ‖ flags (1: 1 read, 2 write) ‖ name bytes · 3 tcp ‖ port (2) ‖ host bytes ‖ name bytes; what the caller's rights let it use |
-| `zsp.share` | – or the shares, as text | the shares as text, or the new ones taken; for local clients alone |
+| `zsp.share` | – or the shares, as text | the shares as text, or the new ones taken; for local clients alone, granted every scope (scope 0, Write and Call) |
 | `zsp.tcp` | port (2) ‖ host bytes | a TCP connection, there or by default to its loopback: bytes each way as messages, End a half-close, Fault or Cancel a reset |
 | `zsp.exec` | flags (1) ‖ n varint ‖ n × argument bytes ‖ m varint ‖ m × environment bytes ‖ folder bytes | a process |
 | `zsp.pty` | rows (2) ‖ columns (2) ‖ TERM bytes ‖ as `zsp.exec` after its flags | a process with a terminal; no arguments, the user's shell |
@@ -595,9 +596,13 @@ Integers of two bytes are big-endian. A process's messages are tagged: to it, `0
 NAME alone removing one. A call cancelled kills the process and all it started.
 
 Paths are a share's name and then the path within it, `/` between, whatever the system; none may lead out of the share, by `..` or by a link, which is
-judged by where the file opened really is. An empty path lists the shares of files. A file is hashed in chunks of 1 MiB, each by SHA-256, and the file
+judged by where the file opened really is. A file is put only in a folder reached from the share without any link, and the folders made on the way
+likewise, so a link in a share is never written through. No name in a path is `.` or `..`, holds `\`, `:` or NUL, ends in `.` or a space (on some
+systems another's name), or ends in `.zsp-part` or `.zsp-part.meta` (a receiver's own, below). A put names a file, not the share or a folder. An
+empty path lists the shares of files. A file is hashed in chunks of 1 MiB, each by SHA-256, and the file
 by SHA-256 of its chunks' hashes in order. Whoever has the file sends it from `from` as `1 ‖ bytes`, each chunk followed by `2 ‖ its hash (32)`, then
-`3 ‖ status (1) ‖ [the file's hash (32)]` (with it unless resumed), and End; the receiver checks each chunk as it comes, and a put ends with its
+`3 ‖ status (1) ‖ [the file's hash (32)]`, and End: with the hash in every *ok* of a put, and of a get unless resumed, and not taken without it. A
+sender whose file is no longer the one it was by its identity ends with *changed*. Credit for what follows the last bytes is kept back from them. the receiver checks each chunk as it comes, and a put ends with its
 verdict, a status (1), once the sender has ended. **Resuming**: what was received is kept with the hashes of its whole chunks; asked again, a
 transfer takes up at the end of those that are still what their hashes say, if the file is the one it was by its `identity`, an opaque value its
 holder gives for it (here, its size, time and identity on its disk); otherwise it begins again. A file received is put in place whole, with the

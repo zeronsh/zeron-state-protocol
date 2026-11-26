@@ -173,15 +173,17 @@ exec_on_data :: proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
 			return true
 		}
 		e.bytes_in += u64(len(payload))
+		taken := 0
 		if len(e.held) == 0 {
-			n := process_input(e.p, payload)
-			if n == len(payload) {
+			taken = process_input(e.p, payload)
+			if taken == len(payload) {
 				return true
 			}
-			call_consumed(e.sp, call, n)
-			payload = payload[n:]
+			payload = payload[taken:]
 		}
-		append(&e.held, ..payload) // credited as it is taken
+		// The tag and what was taken are credited now, what is held as it is taken: the whole message, in the end.
+		call_consumed(e.sp, call, 1 + taken)
+		append(&e.held, ..payload)
 		return false
 	case 1:
 		if len(payload) == 1 {

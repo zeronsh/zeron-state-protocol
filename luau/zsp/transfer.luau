@@ -412,7 +412,8 @@ function on_data(self: State, message: string)
 			return
 		end
 		self.hash = self.hashing.file.final()
-		if #rest == 32 and rest ~= self.hash then
+		-- From the start, the file's hash comes and must agree; taken up later, every chunk's has, kept or come.
+		if (self.from == 0 and #rest ~= 32) or (#rest == 32 and rest ~= self.hash) then
 			fail(self, "changed")
 			return
 		end
@@ -594,6 +595,9 @@ function put_begin(self: State, said: string)
 	pump(self)
 end
 
+-- What follows a file's last bytes: the last chunk's hash, then the end and the file's hash.
+local TRAIL = (1 + 32) + (2 + 32)
+
 -- Sends as much of the file as credit allows, each chunk followed by its hash; then the end.
 function pump(self: State)
 	if not self.put or not self.begun or self.finished or self.sent_all then
@@ -601,12 +605,13 @@ function pump(self: State)
 	end
 	local call = self.call :: Call
 	while true do
+		-- Credit for what follows the last bytes is kept back from them, so that it can always go when they have.
 		local room = call.room()
-		if room < 1 + 32 + 2 + 32 then
+		if room < (if self.at < self.size then 1 + 1 + TRAIL else TRAIL) then
 			return -- on_room says when to go on
 		end
 		if self.at < self.size then
-			local n = math.min(room - 1, READ, self.size - self.at, CHUNK - self.at % CHUNK)
+			local n = math.min(room - 1 - TRAIL, READ, self.size - self.at, CHUNK - self.at % CHUNK)
 			local bytes: string?
 			if self.f then
 				bytes = (self.f :: File).read(self.at, n)

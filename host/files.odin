@@ -21,6 +21,7 @@ import "../zsp"
 //     put:  path bytes ‖ size varint ‖ modified varint ‖ identity bytes ‖ flags (1: 1 replace, 2 make the folders)
 //                                                                → status ‖ from varint
 //     then, from whoever has the file:   1 ‖ bytes · 2 ‖ the hash of the chunk just ended (32) · 3 ‖ status ‖ [the file's hash (32)]
+//     the file's hash is in every Ok of a put, and of a get begun from the start; without it, neither is taken.
 //     put ends with the receiver's verdict: status (1), once the sender has ended.
 //     list: path bytes                                          → status, then messages of entries, then the end
 //           entry = kind (1: 1 file, 2 folder, 3 other) ‖ name bytes ‖ size varint ‖ modified varint
@@ -65,9 +66,10 @@ hashing_chunk :: proc(h: ^Hashing) -> (hash: [32]byte) {
 
 // ---------------------------------------------------------------- paths
 
-// The share named first in a path, and where the rest of it is here: if the caller may, and it stays within.
+// The share named first in a path, and where the rest of it is here: if the caller may, and it stays within. `parts`
+// are the names within the share, in temporary memory.
 @(private)
-files_resolve :: proc(sp: ^Space, from: Caller, scope: zsp.Scope, path: string, write: bool) -> (share: ^Share, root, full: string, status: Status) {
+files_resolve :: proc(sp: ^Space, from: Caller, scope: zsp.Scope, path: string, write: bool) -> (share: ^Share, root, full: string, parts: []string, status: Status) {
 	name, rest := path, ""
 	if slash := strings.index_byte(path, '/'); slash >= 0 {
 		name, rest = path[:slash], path[slash + 1:]
@@ -76,33 +78,62 @@ files_resolve :: proc(sp: ^Space, from: Caller, scope: zsp.Scope, path: string, 
 	if status != .Ok {
 		return
 	}
-	parts := make([dynamic]string, 0, 8, context.temp_allocator)
-	append(&parts, share.path)
+	names := make([dynamic]string, 0, 8, context.temp_allocator)
 	for part in strings.split_iterator(&rest, "/") {
 		if part == "" {
 			continue
 		}
-		if part == "." || part == ".." || strings.contains_any(part, "\x00\\:") || strings.has_suffix(part, PART) {
-			return nil, "", "", .Denied
+		if !file_name_valid(part) {
+			return nil, "", "", nil, .Denied
 		}
-		append(&parts, part)
+		append(&names, part)
 	}
 	root_real, ok := path_real(share.path)
 	if !ok {
-		return nil, "", "", .Not_Found
+		return nil, "", "", nil, .Not_Found
 	}
-	full, _ = filepath.join(parts[:], context.temp_allocator)
-	return share, root_real, full, .Ok
+	whole := make([dynamic]string, 0, len(names) + 1, context.temp_allocator)
+	append(&whole, root_real)
+	append(&whole, ..names[:])
+	full, _ = filepath.join(whole[:], context.temp_allocator)
+	return share, root_real, full, names[:], .Ok
+}
+
+// Whether a name may be one within a share: not one that leads elsewhere or names something else, on any system (on
+// Windows a name ending in a dot or a space is another's, and a colon names a stream of a file), nor one this side
+// keeps its own progress in.
+@(private)
+file_name_valid :: proc(name: string) -> bool {
+	switch {
+	case name == "" || name == "." || name == "..":
+		return false
+	case strings.contains_any(name, "\x00\\:"):
+		return false
+	case name[len(name) - 1] == '.' || name[len(name) - 1] == ' ':
+		return false
+	case strings.has_suffix(name, PART) || strings.has_suffix(name, PART + ".meta"):
+		return false
+	}
+	return true
+}
+
+// Whether a real path is the root's, or within it.
+@(private)
+within :: proc(real, root: string) -> bool {
+	if real == root {
+		return true
+	}
+	if !strings.has_prefix(real, root) {
+		return false
+	}
+	return root[len(root) - 1] == '/' || root[len(root) - 1] == '\\' || real[len(root)] == PATH_SEPARATOR
 }
 
 // Whether a file opened is within the share, wherever its path led.
 @(private)
 files_within :: proc(f: ^os.File, root: string) -> bool {
 	real, ok := file_real(f)
-	if !ok {
-		return false
-	}
-	return real == root || (strings.has_prefix(real, root) && (real[len(root)] == PATH_SEPARATOR || strings.has_suffix(root, "/") || strings.has_suffix(root, "\\")))
+	return ok && within(real, root)
 }
 
 // What says a file is the one it was: its size, when it was last written, and which it is on its disk.
@@ -129,6 +160,24 @@ unix_ms :: proc(t: time.Time) -> u64 {
 
 // ---------------------------------------------------------------- list
 
+// Listed as it is read, a message at a time and only as credit allows, so that a folder of a million names costs no
+// more than one, and a caller who reads slowly holds it up rather than filling memory here.
+@(private)
+Lister :: struct {
+	using handler: Call_Handler,
+	sp:     ^Space,
+	call:   u64,
+	scope:  zsp.Scope,
+	from:   Caller,
+	f:      ^os.File, // the folder, or nil for the shares themselves
+	it:     os.Read_Directory_Iterator,
+	next:   int, // the next share, listing those
+	w:      [dynamic]byte, // the message under way
+	read:   bool, // all of it
+	over:   bool,
+	freed:  bool,
+}
+
 @(private)
 serve_list :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: []byte) -> (^Call_Handler, zsp.Call_Fault) {
 	r := zsp.Reader{buf = first}
@@ -137,65 +186,138 @@ serve_list :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first:
 		status_send(sp, call, .Malformed)
 		return refused_handler(), .Cancelled
 	}
-	w := make([dynamic]byte, 0, 4096, context.temp_allocator)
-	flush :: proc(sp: ^Space, call: u64, w: ^[dynamic]byte) {
-		if len(w) > 0 {
-			call_send(sp, call, w[:])
-			clear(w)
+	f: ^os.File
+	share_name := ""
+	if path != "" {
+		_, root, full, _, status := files_resolve(sp, from, scope, path, false)
+		if status != .Ok {
+			audit(sp, {device = from.device, subject = string(from.who), scope = scope, service = "files", detail = path, event = .Denied})
+			status_send(sp, call, status)
+			return refused_handler(), .Cancelled
+		}
+		err: os.Error
+		f, err = os.open(full, {.Read})
+		if err != nil {
+			status_send(sp, call, .Not_Found)
+			return refused_handler(), .Cancelled
+		}
+		if !files_within(f, root) {
+			os.close(f)
+			status_send(sp, call, .Denied)
+			return refused_handler(), .Cancelled
+		}
+		share_name = path[:strings.index_byte(path, '/') if strings.contains_rune(path, '/') else len(path)]
+	}
+	l := new(Lister)
+	l.sp, l.call, l.scope, l.f = sp, call, scope, f
+	l.from = {device = from.device, relay = from.relay, local = from.local} // who is let go with the call
+	if f != nil {
+		l.it = os.read_directory_iterator_create(f)
+	}
+	l.data = l
+	l.on_room = proc(h: ^Call_Handler, call: u64) {list_pump((^Lister)(h.data))}
+	l.on_data = proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {return true}
+	l.on_end = proc(h: ^Call_Handler, call: u64) {
+		l := (^Lister)(h.data)
+		if l.over {
+			list_free(l) // ours was said already
 		}
 	}
-	entry :: proc(sp: ^Space, call: u64, w: ^[dynamic]byte, kind: u8, name: string, size: u64, modified: u64) {
-		if len(w) + len(name) + 32 > FILE_READ {
-			flush(sp, call, w)
+	l.on_fault = proc(h: ^Call_Handler, call: u64, fault: zsp.Call_Fault) {list_free((^Lister)(h.data))}
+	status_send(sp, call, .Ok)
+	if f != nil {
+		service_begin(sp, call, from, scope, .Files, share_name, false, false, l, proc(data: rawptr) {list_free((^Lister)(data))})
+	}
+	list_pump(l)
+	return &l.handler, .Cancelled
+}
+
+@(private)
+list_pump :: proc(l: ^Lister) {
+	for !l.over {
+		if len(l.w) == 0 && !l.read {
+			list_fill(l)
 		}
+		if len(l.w) > 0 {
+			if call_room(l.sp, l.call) < len(l.w) {
+				return // on_room says when to go on
+			}
+			if !call_send(l.sp, l.call, l.w[:]) {
+				l.over = true
+				call_fault(l.sp, l.call, .Overrun)
+				list_free(l)
+				return
+			}
+			clear(&l.w)
+			continue
+		}
+		// All of it said.
+		l.over = true
+		service_end(l.sp, l.call)
+		heard := false
+		if c := host_call_find(l.sp, l.call); c != nil {
+			heard = c.heard_end
+			call_end(l.sp, l.call)
+		} else {
+			heard = true
+		}
+		if heard {
+			list_free(l)
+		}
+		return
+	}
+}
+
+// The next message of entries, or the end of them.
+@(private)
+list_fill :: proc(l: ^Lister) {
+	entry :: proc(w: ^[dynamic]byte, kind: u8, name: string, size: u64, modified: u64) {
 		append(w, kind)
 		zsp.write_bytes(w, transmute([]byte)name)
 		zsp.write_varint(w, size)
 		zsp.write_varint(w, modified)
 	}
-	if path == "" {
-		// The shares of files, as folders.
-		status_send(sp, call, .Ok)
-		for s in sp.shares {
-			if _, status := share_for(sp, from, scope, .Files, s.name); s.kind == .Files && s.scope == scope && status == .Ok {
-				entry(sp, call, &w, 2, s.name, 0, 0)
+	for len(l.w) + 512 <= FILE_READ {
+		if l.f == nil {
+			// The shares of files, as folders.
+			if l.next >= len(l.sp.shares) {
+				l.read = true
+				return
 			}
+			s := l.sp.shares[l.next]
+			l.next += 1
+			if _, status := share_for(l.sp, l.from, l.scope, .Files, s.name); s.kind == .Files && s.scope == l.scope && status == .Ok {
+				entry(&l.w, 2, s.name, 0, 0)
+			}
+			continue
 		}
-		flush(sp, call, &w)
-		call_end(sp, call)
-		return refused_handler(), .Cancelled
-	}
-	share, root, full, status := files_resolve(sp, from, scope, path, false)
-	if status != .Ok {
-		audit(sp, {device = from.device, subject = string(from.who), scope = scope, service = "files", detail = path, event = .Denied})
-		status_send(sp, call, status)
-		return refused_handler(), .Cancelled
-	}
-	_ = share
-	f, err := os.open(full, {.Read})
-	if err != nil {
-		status_send(sp, call, .Not_Found)
-		return refused_handler(), .Cancelled
-	}
-	defer os.close(f)
-	if !files_within(f, root) {
-		status_send(sp, call, .Denied)
-		return refused_handler(), .Cancelled
-	}
-	// Listed as it is read, a message at a time, so that a folder of a million names costs no more than one.
-	status_send(sp, call, .Ok)
-	it := os.read_directory_iterator_create(f)
-	defer os.read_directory_iterator_destroy(&it)
-	for info in os.read_directory_iterator(&it) {
-		if strings.has_suffix(info.name, PART) || strings.has_suffix(info.name, PART + ".meta") {
+		info, _, more := os.read_directory_iterator(&l.it)
+		if !more {
+			l.read = true
+			return
+		}
+		if strings.has_suffix(info.name, PART) || strings.has_suffix(info.name, PART + ".meta") || len(info.name) > 255 {
 			continue
 		}
 		kind: u8 = 1 if info.type == .Regular else 2 if info.type == .Directory else 3
-		entry(sp, call, &w, kind, info.name, u64(max(info.size, 0)), unix_ms(info.modification_time))
+		entry(&l.w, kind, info.name, u64(max(info.size, 0)), unix_ms(info.modification_time))
 	}
-	flush(sp, call, &w)
-	call_end(sp, call)
-	return refused_handler(), .Cancelled
+}
+
+@(private)
+list_free :: proc(l: ^Lister) {
+	if l.freed {
+		return
+	}
+	l.freed = true
+	l.over = true
+	service_end(l.sp, l.call)
+	if l.f != nil {
+		os.read_directory_iterator_destroy(&l.it)
+		os.close(l.f)
+	}
+	delete(l.w)
+	free(l)
 }
 
 // ---------------------------------------------------------------- get
@@ -214,7 +336,8 @@ Get :: struct {
 	from:    u64,
 	hashing: Hashing,
 	identity: []byte, // owned
-	over:    bool,
+	over:    bool, // ours said
+	freed:   bool,
 }
 
 @(private)
@@ -227,7 +350,7 @@ serve_get :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: 
 		status_send(sp, call, .Malformed)
 		return refused_handler(), .Cancelled
 	}
-	_, root, full, status := files_resolve(sp, from, scope, path, false)
+	_, root, full, _, status := files_resolve(sp, from, scope, path, false)
 	if status != .Ok {
 		audit(sp, {device = from.device, subject = string(from.who), scope = scope, service = "files", detail = path, event = .Denied})
 		status_send(sp, call, status)
@@ -286,39 +409,46 @@ serve_get :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: 
 	return &g.handler, .Cancelled
 }
 
+// What follows a file's last bytes: the last chunk's hash, then the verdict and the file's hash.
+GET_TRAIL :: (1 + 32) + (2 + 32)
+
 // Sends as much as credit allows: bytes, and after each chunk its hash; at the end, the verdict and the file's hash.
+// Credit for what follows the last bytes is kept back from them, so that it can always go when they have.
 @(private)
 get_pump :: proc(g: ^Get) {
-	if g.over {
-		return
-	}
 	buf: [1 + FILE_READ]byte
-	for {
+	for !g.over {
 		room := call_room(g.sp, g.call)
-		if room < 1 + 32 + 1 + 32 {
-			return // on_room says when to go on
-		}
 		if g.at < g.size {
-			n := min(room - 1, FILE_READ, int(g.size - g.at), CHUNK - g.hashing.filled)
+			if room < 1 + 1 + GET_TRAIL {
+				return // on_room says when to go on
+			}
+			n := min(room - 1 - GET_TRAIL, FILE_READ, int(g.size - g.at), CHUNK - g.hashing.filled)
 			got, err := os.read_at(g.f, buf[1:][:n], i64(g.at))
 			if err != nil || got == 0 {
 				get_finish(g, .Changed) // it shrank, or went
 				return
 			}
 			buf[0] = 1
-			call_send(g.sp, g.call, buf[:1 + got])
+			if !get_send(g, buf[:1 + got]) {
+				return
+			}
 			hashing_feed(&g.hashing, buf[1:][:got])
 			g.at += u64(got)
 			if g.hashing.filled < CHUNK && g.at < g.size {
 				continue
 			}
+		} else if room < GET_TRAIL {
+			return
 		}
 		if g.hashing.filled > 0 {
 			hash := hashing_chunk(&g.hashing)
 			w: [33]byte
 			w[0] = 2
 			copy(w[1:], hash[:])
-			call_send(g.sp, g.call, w[:])
+			if !get_send(g, w[:]) {
+				return
+			}
 		}
 		if g.at == g.size {
 			// Still the file it was, all the while?
@@ -327,6 +457,18 @@ get_pump :: proc(g: ^Get) {
 			return
 		}
 	}
+}
+
+// Sends, or if there is not the credit after all, ends the call as no better than lost.
+@(private)
+get_send :: proc(g: ^Get, bytes: []byte) -> bool {
+	if call_send(g.sp, g.call, bytes) {
+		return true
+	}
+	g.over = true
+	call_fault(g.sp, g.call, .Overrun)
+	get_free(g)
+	return false
 }
 
 @(private)
@@ -340,14 +482,19 @@ get_finish :: proc(g: ^Get, status: Status) {
 		copy(w[2:], hash[:])
 		n += 32
 	}
-	call_send(g.sp, g.call, w[:n])
+	if !get_send(g, w[:n]) {
+		return
+	}
 	audit(g.sp, {device = g.caller, scope = g.scope, service = "files", detail = strings.concatenate({"get ", g.path}, context.temp_allocator), event = .Close, bytes_out = g.at - g.from, peer = "" if status == .Ok else "changed while sent"})
 	g.over = true
 	service_end(g.sp, g.call)
+	// All of it read: the file is let go now, whenever the caller says it has done.
+	os.close(g.f)
+	g.f = nil
 	call := g.call
 	sp := g.sp
-	if host_call_find(sp, call) != nil {
-		heard := host_call_find(sp, call).heard_end
+	if c := host_call_find(sp, call); c != nil {
+		heard := c.heard_end
 		call_end(sp, call)
 		if heard {
 			get_free(g)
@@ -359,12 +506,14 @@ get_finish :: proc(g: ^Get, status: Status) {
 
 @(private)
 get_free :: proc(g: ^Get) {
-	if g.f == nil {
+	if g.freed {
 		return
 	}
+	g.freed = true
 	service_end(g.sp, g.call)
-	os.close(g.f)
-	g.f = nil
+	if g.f != nil {
+		os.close(g.f)
+	}
 	delete(g.path)
 	delete(g.identity)
 	free(g)
@@ -380,7 +529,8 @@ Put :: struct {
 	caller:   zsp.Key32,
 	scope:    zsp.Scope,
 	path:     string, // owned, as asked for
-	target:   string, // owned, here
+	dir:      Share_Dir, // where it goes, held open
+	name:     string, // owned, its name there
 	part:     ^os.File,
 	meta:     ^os.File, // the source's identity, and the hashes of the chunks taken
 	size:     u64,
@@ -408,46 +558,49 @@ serve_put :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: 
 		status_send(sp, call, .Malformed)
 		return refused_handler(), .Cancelled
 	}
-	_, root, full, status := files_resolve(sp, from, scope, path, true)
-	if status == .Ok && strings.trim_suffix(path, "/") == path[:strings.index_byte(path, '/')] {
-		status = .Denied // the share itself is no file
+	_, root, _, parts, status := files_resolve(sp, from, scope, path, true)
+	if status == .Ok && (len(parts) == 0 || strings.has_suffix(path, "/")) {
+		status = .Denied // the share itself, or a folder, is no file
 	}
 	if status != .Ok {
 		audit(sp, {device = from.device, subject = string(from.who), scope = scope, service = "files", detail = strings.concatenate({"put ", path}, context.temp_allocator), event = .Denied})
 		status_send(sp, call, status)
 		return refused_handler(), .Cancelled
 	}
-	dir := filepath.dir(full)
-	if flags & 2 != 0 && !os.exists(dir) {
-		if !files_mkdirs(dir, root) {
-			status_send(sp, call, .Denied)
-			return refused_handler(), .Cancelled
-		}
+	name := parts[len(parts) - 1]
+	part_name := strings.concatenate({name, PART}, context.temp_allocator)
+	meta_name := strings.concatenate({part_name, ".meta"}, context.temp_allocator)
+	// Every folder on the way, made if asked, and none a link: nothing is made or written before that is known.
+	dir, dstatus := share_dir_open(root, parts[:len(parts) - 1], flags & 2 != 0)
+	if dstatus != .Ok {
+		audit(sp, {device = from.device, subject = string(from.who), scope = scope, service = "files", detail = strings.concatenate({"put ", path}, context.temp_allocator), event = .Denied})
+		status_send(sp, call, dstatus, "cannot write there")
+		return refused_handler(), .Cancelled
 	}
-	if os.exists(full) && flags & 1 == 0 {
+	if exists, regular := share_kind(dir, name); exists && (flags & 1 == 0 || !regular) {
+		share_dir_close(&dir)
 		status_send(sp, call, .Exists)
 		return refused_handler(), .Cancelled
 	}
-	part_path := path_with(full, PART)
-	meta_path := path_with(part_path, ".meta")
-	part, perr := os.open(part_path, {.Read, .Write, .Create}, os.Permissions{.Read_User, .Write_User})
-	if perr != nil {
-		status_send(sp, call, .Not_Found if !os.exists(dir) else .Failed, "cannot write there")
-		return refused_handler(), .Cancelled
-	}
-	if !files_within(part, root) {
-		os.close(part)
-		status_send(sp, call, .Denied)
+	part, pstatus := share_file_open(dir, part_name, create = true)
+	if pstatus != .Ok {
+		share_dir_close(&dir)
+		status_send(sp, call, pstatus, "cannot write there")
 		return refused_handler(), .Cancelled
 	}
 	p := new(Put)
-	p.sp, p.call, p.caller, p.scope, p.part = sp, call, from.device, scope, part
+	p.sp, p.call, p.caller, p.scope, p.part, p.dir = sp, call, from.device, scope, part, dir
 	p.path = strings.clone(path)
-	p.target = strings.clone(full)
+	p.name = strings.clone(name)
 	p.size, p.modified = size, modified
 	hashing_init(&p.hashing)
 	// What was taken before from this same source, chunk by chunk, if anything was.
-	if kept, err := os.read_entire_file(meta_path, context.temp_allocator); err == nil {
+	if kept_file, kstatus := share_file_open(dir, meta_name); kstatus == .Ok {
+		kept_size, _ := os.file_size(kept_file)
+		kept := make([]byte, clamp(kept_size, 0, 1 << 20), context.temp_allocator)
+		got, _ := os.read_at(kept_file, kept, 0)
+		kept = kept[:max(got, 0)]
+		os.close(kept_file)
 		mr := zsp.Reader{buf = kept}
 		was := zsp.read_bytes(&mr)
 		was_size := zsp.read_varint(&mr)
@@ -461,14 +614,10 @@ serve_put :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: 
 			p.from = u64(chunks) * CHUNK
 		}
 	}
-	if p.from == 0 {
-		os.truncate(part, 0)
-	} else {
-		os.truncate(part, i64(p.from))
-	}
+	os.truncate(part, i64(p.from))
 	p.at, p.synced = p.from, p.from
-	meta, merr := os.open(meta_path, {.Read, .Write, .Create} if p.from > 0 else {.Read, .Write, .Create, .Trunc}, os.Permissions{.Read_User, .Write_User})
-	if merr != nil {
+	meta, mstatus := share_file_open(dir, meta_name, create = true, truncate = p.from == 0)
+	if mstatus != .Ok {
 		put_free(p)
 		status_send(sp, call, .Failed, "cannot write there")
 		return refused_handler(), .Cancelled
@@ -480,14 +629,11 @@ serve_put :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: 
 		zsp.write_varint(&w, size)
 		os.write(meta, w[:])
 	} else {
-		at, _ := os.file_size(meta)
-		chunks := p.from / CHUNK
 		// Keep exactly the header and the hashes of the chunks kept.
-		mr := zsp.Reader{buf = make([]byte, at, context.temp_allocator)}
-		os.read_at(meta, mr.buf, 0)
-		_ = zsp.read_bytes(&mr)
-		_ = zsp.read_varint(&mr)
-		os.truncate(meta, i64(mr.pos) + i64(chunks) * 32)
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_bytes(&w, source)
+		zsp.write_varint(&w, size)
+		os.truncate(meta, i64(len(w)) + i64(p.from / CHUNK) * 32)
 		os.seek(meta, 0, .End)
 	}
 	p.data = p
@@ -508,24 +654,6 @@ serve_put :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: 
 		put_free(p)
 	})
 	return &p.handler, .Cancelled
-}
-
-// Makes the folders on the way to `dir`, each checked to be within the share as it is made.
-@(private)
-files_mkdirs :: proc(dir, root: string) -> bool {
-	if os.exists(dir) {
-		real, ok := path_real(dir)
-		return ok && (real == root || strings.has_prefix(real, root))
-	}
-	parent := filepath.dir(dir)
-	if parent == dir || !files_mkdirs(parent, root) {
-		return false
-	}
-	if os.make_directory(dir) != nil {
-		return false
-	}
-	real, ok := path_real(dir)
-	return ok && strings.has_prefix(real, root)
 }
 
 @(private)
@@ -575,7 +703,7 @@ put_on_data :: proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
 		}
 		whole: [32]byte
 		sha2.final(&p.hashing.file, whole[:])
-		if len(payload) == 33 && string(payload[1:]) != string(whole[:]) {
+		if len(payload) != 33 || string(payload[1:]) != string(whole[:]) {
 			put_fail(p, .Changed)
 			return true
 		}
@@ -586,22 +714,22 @@ put_on_data :: proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
 	return true
 }
 
-// Whole and checked: made durable, put in place, its time set as the sender's, its record of progress let go.
+// Whole and checked: made durable, its time set as the sender's, put in place, its record of progress let go.
 @(private)
 put_commit :: proc(p: ^Put) {
 	p.done = true
 	put_sync(p)
+	modified := time.unix(i64(p.modified / 1000), i64(p.modified % 1000) * 1_000_000)
+	os.fchange_times(p.part, modified, modified)
 	os.close(p.part)
 	p.part = nil
 	os.close(p.meta)
 	p.meta = nil
-	part_path := path_with(p.target, PART)
-	modified := time.unix(i64(p.modified / 1000), i64(p.modified % 1000) * 1_000_000)
-	os.change_times(part_path, modified, modified)
-	if os.rename(part_path, p.target) != nil {
+	part_name := strings.concatenate({p.name, PART}, context.temp_allocator)
+	if !share_rename(p.dir, part_name, p.name) {
 		p.status = .Failed
 	} else {
-		os.remove(path_with(part_path, ".meta"))
+		share_remove(p.dir, strings.concatenate({part_name, ".meta"}, context.temp_allocator))
 		p.status = .Ok
 	}
 	audit(p.sp, {device = p.caller, scope = p.scope, service = "files", detail = strings.concatenate({"put ", p.path}, context.temp_allocator), event = .Close, bytes_in = p.at - p.from})
@@ -660,8 +788,9 @@ put_free :: proc(p: ^Put) {
 	if p.meta != nil {
 		os.close(p.meta)
 	}
+	share_dir_close(&p.dir)
 	delete(p.path)
-	delete(p.target)
+	delete(p.name)
 	free(p)
 }
 

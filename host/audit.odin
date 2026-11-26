@@ -36,21 +36,16 @@ Audit_Log :: struct {
 	size:  i64,
 }
 
+AUDIT_FIELD :: 1024 // the most of any one field written, in bytes: a path, a command, a reason
+
 // Writes down one thing that happened. Failing to is reported, and does not stop what was audited.
 audit :: proc(sp: ^Space, a: Audit) {
 	if sp == nil || sp.dir == "" {
 		return
 	}
 	log := &sp.audit
-	if log.file == nil {
-		path := file_in(sp.dir, "audit.log")
-		f, err := os.open(path, {.Write, .Create, .Append}, os.Permissions{.Read_User, .Write_User})
-		if err != nil {
-			report(.Warning, "cannot write the audit log")
-			return
-		}
-		log.file = f
-		log.size, _ = os.file_size(f)
+	if log.file == nil && !audit_open(sp, false) {
+		return
 	}
 	b := strings.builder_make(context.temp_allocator)
 	strings.write_string(&b, `{"at":`)
@@ -76,17 +71,40 @@ audit :: proc(sp: ^Space, a: Audit) {
 	strings.write_string(&b, "}\n")
 	line := strings.to_string(b)
 	if log.size + i64(len(line)) > AUDIT_MOST {
+		// Set aside, the one before let go; or if it cannot be, begun again rather than grown without end.
 		audit_close(sp)
 		path := file_in(sp.dir, "audit.log")
-		os.rename(path, path_with(path, ".1"))
-		audit(sp, a)
-		return
+		aside := path_with(path, ".1")
+		os.remove(aside)
+		begin := os.rename(path, aside) != nil
+		if begin {
+			report(.Warning, "cannot set the audit log aside; it begins again")
+		}
+		if !audit_open(sp, begin) {
+			return
+		}
 	}
 	if _, err := os.write(log.file, transmute([]byte)line); err != nil {
 		report(.Warning, "cannot write the audit log")
 		return
 	}
 	log.size += i64(len(line))
+}
+
+@(private)
+audit_open :: proc(sp: ^Space, empty: bool) -> bool {
+	flags := os.File_Flags{.Write, .Create, .Append}
+	if empty {
+		flags += {.Trunc}
+	}
+	f, err := os.open(file_in(sp.dir, "audit.log"), flags, os.Permissions{.Read_User, .Write_User})
+	if err != nil {
+		report(.Warning, "cannot write the audit log")
+		return false
+	}
+	sp.audit.file = f
+	sp.audit.size, _ = os.file_size(f)
+	return true
 }
 
 @(private)
@@ -105,7 +123,11 @@ json_field :: proc(b: ^strings.Builder, name, value: string) {
 	strings.write_string(b, `,"`)
 	strings.write_string(b, name)
 	strings.write_string(b, `":`)
-	json_string(b, value)
+	if len(value) > AUDIT_FIELD {
+		json_string(b, strings.concatenate({value[:AUDIT_FIELD], "…"}, context.temp_allocator))
+	} else {
+		json_string(b, value)
+	}
 }
 
 // A string as JSON has it, whatever bytes it holds: what is not UTF-8 is written as the code points of its bytes.

@@ -10,6 +10,8 @@ import "../../zsp"
 
 @(private)
 relayed: [dynamic]^Relayed
+@(private)
+knocked: map[zsp.Key32]u64 // the newest knock heard from each device through relays: its dialler's stamp time
 
 // Lets a session over a link send each call on a stream of its own.
 @(private)
@@ -100,14 +102,18 @@ Relayed :: struct {
 	next_knock: time.Tick,
 	used:       time.Tick, // last heard from, or said to
 	began:      u64, // the dialler's stamp time of its first message
+	proven:     bool, // the other end has been heard from over it, genuinely
 }
 
 // A session for calls to a device, through a relay: the one there is, or one begun now.
 @(private)
 relayed_reach :: proc(data: rawptr, device: zsp.Key32) -> ^zsp.Session {
-	for r in relayed {
-		if r.device == device && r.session != nil && !r.session.closing && r.link.state != .Closed {
-			return r.session
+	// One heard from first: beside it there may be one newly knocked for, not yet shown to be anyone's.
+	for proven in ([]bool{true, false}) {
+		for r in relayed {
+			if r.device == device && r.session != nil && !r.session.closing && r.link.state != .Closed && (r.proven || r.mine) == proven {
+				return r.session
+			}
 		}
 	}
 	via, ok := relay_with(device)
@@ -166,9 +172,10 @@ relayed_input :: proc(data: rawptr, relay: u32, from: zsp.Key32, packet: []byte)
 		return
 	}
 	if pipe.Type(packet[0]) == .First {
-		// The same knock again: its answer was lost, or is on its way.
+		// The same knock again: its answer was lost, or is on its way; it goes back the way this one came.
 		for r in relayed {
 			if !r.mine && r.device == from && pipe.link_answers(r.link, packet) {
+				r.via = relay
 				relayed_hello(r)
 				return
 			}
@@ -181,19 +188,14 @@ relayed_input :: proc(data: rawptr, relay: u32, from: zsp.Key32, packet: []byte)
 			pipe.link_destroy(&l)
 			return
 		}
-		// A knock older than one heard is anyone's to have kept: ignored. A newer one replaces the link it began
-		// before, whose calls are lost: its dialler has begun again.
-		for r, i in relayed {
-			if !r.mine && r.device == from {
-				if l.channel.began <= r.began {
-					pipe.link_destroy(&l)
-					return
-				}
-				relayed_drop(r)
-				ordered_remove(&relayed, i)
-				break
-			}
+		// A knock no newer than the newest heard from that device, however long ago, is anyone's to have kept:
+		// ignored. A newer one is answered with a link beside any there is, which goes on until the new one proves
+		// itself: a knock alone proves nothing, for one kept back may be played later.
+		if began, heard := knocked[from]; heard && l.channel.began <= began {
+			pipe.link_destroy(&l)
+			return
 		}
+		knocked[from] = l.channel.began
 		r := new(Relayed)
 		r.device, r.via, r.began = from, relay, l.channel.began
 		r.link = new(pipe.Link)
@@ -217,8 +219,24 @@ relayed_input :: proc(data: rawptr, relay: u32, from: zsp.Key32, packet: []byte)
 			r.via = relay
 			r.used = time.tick_now()
 			r.knocks = 0
+			if !r.proven {
+				r.proven = true
+				relayed_supersede(r)
+			}
 		}
 		return
+	}
+}
+
+// A link the other end has now spoken over replaces any it knocked for before, whose calls are lost: it began again.
+@(private)
+relayed_supersede :: proc(r: ^Relayed) {
+	for i := len(relayed) - 1; i >= 0; i -= 1 {
+		x := relayed[i]
+		if x != r && !x.mine && !r.mine && x.device == r.device && x.began < r.began {
+			ordered_remove(&relayed, i)
+			relayed_drop(x)
+		}
 	}
 }
 
@@ -250,6 +268,8 @@ relayed_close :: proc() {
 	}
 	delete(relayed)
 	relayed = nil
+	delete(knocked)
+	knocked = nil
 }
 
 // What each has to say, said; what is over, let go.

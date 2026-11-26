@@ -67,6 +67,7 @@ Space :: struct {
 	calls: [dynamic]Host_Call, // whose end is the host
 	bridges: [dynamic]^Bridge, // of calls to TCP connections
 	relayed: [dynamic]^Relayed, // links through relays
+	knocked: map[zsp.Key32]u64, // the newest knock heard from each device through relays: its dialler's stamp time
 	shares: [dynamic]Share, // what this device lets others do on it
 	services: [dynamic]^Service_Call, // calls to them, which a change may end
 	audit: Audit_Log,

@@ -251,6 +251,9 @@ def hash_message(chunk):
     return bytes([CHUNK_HASH]) + chunk
 
 
+TRAIL = (1 + 32) + (2 + 32)  # what follows a file's last bytes: the last chunk's hash, then the end and the file's hash
+
+
 def done_message(status, whole=b""):
     return bytes([FILE_DONE, status]) + whole
 
@@ -586,7 +589,7 @@ class Transfer:
         self.put, self.local, self.remote = put, local, remote
         self.call = self.f = self.meta = None
         self.size = self.modified = self.at = self.start = 0
-        self.hashing, self.pending = Hashing(), b""
+        self.hashing, self.pending, self.identity = Hashing(), b"", b""
         self.awaiting = self.begun = self.sent_all = self.finished = False
         self.status, self.reason, self.bytes, self.resumed, self.hash = OK, "", 0, 0, b""
 
@@ -623,7 +626,8 @@ class Transfer:
             self.f.close()
             raise IsADirectoryError(self.local + " is no file")
         self.size, self.modified = st.st_size, max(st.st_mtime_ns, 0) // 1_000_000
-        return first_put(self.remote, self.size, self.modified, file_identity(st), replace, folders)
+        self.identity = file_identity(st)
+        return first_put(self.remote, self.size, self.modified, self.identity, replace, folders)
 
     def on_data(self, message):
         if self.finished or not message:
@@ -689,7 +693,8 @@ class Transfer:
             if self.awaiting or self.at != self.size:
                 return self.fail(MALFORMED)
             self.hash = self.hashing.file.digest()
-            if len(payload) == 33 and bytes(payload[1:]) != self.hash:
+            # From the start, the file's hash comes and must agree; taken up later, every chunk's has, kept or come.
+            if (self.start == 0 and len(payload) != 33) or (len(payload) == 33 and bytes(payload[1:]) != self.hash):
                 return self.fail(CHANGED)
             self.commit()
         else:
@@ -729,11 +734,12 @@ class Transfer:
         if not self.wants_room():
             return
         while True:
+            # Credit for what follows the last bytes is kept back from them, so that it can always go when they have.
             room = min(self.call["room"], CALL_WINDOW)
-            if room < 1 + 32 + 2 + 32:
-                return
             if self.at < self.size:
-                n = min(room - 1, FILE_READ, self.size - self.at, CHUNK - self.hashing.filled)
+                if room < 1 + 1 + TRAIL:
+                    return
+                n = min(room - 1 - TRAIL, FILE_READ, self.size - self.at, CHUNK - self.hashing.filled)
                 self.f.seek(self.at)
                 got = self.f.read(n)
                 if not got:
@@ -744,16 +750,18 @@ class Transfer:
                 self.bytes += len(got)
                 if self.hashing.filled < CHUNK and self.at < self.size:
                     continue
+            elif room < TRAIL:
+                return
             if self.hashing.filled > 0:
                 self.call.send(hash_message(self.hashing.end_chunk()))
             if self.at == self.size:
+                # Still the file it was, all the while? If not, what went may be some of each, and is said to be.
                 try:
-                    os.fstat(self.f.fileno())
-                    status = OK
+                    same = file_identity(os.fstat(self.f.fileno())) == self.identity
                 except OSError:
-                    status = CHANGED
+                    same = False
                 self.hash = self.hashing.file.digest()
-                self.call.send(done_message(status, self.hash))
+                self.call.send(done_message(OK, self.hash) if same else done_message(CHANGED))
                 self.sent_all = True
                 self.call.end()
                 return
@@ -1220,7 +1228,7 @@ class Client:
         c = t.call
         try:
             while not t.finished:
-                self.until(lambda: c["data"] or c["ended"] or (t.wants_room() and c["room"] >= 1 + 32 + 2 + 32), timeout)
+                self.until(lambda: c["data"] or c["ended"] or (t.wants_room() and c["room"] >= 1 + 1 + TRAIL), timeout)
                 if c["data"]:
                     message = c.next(0)
                     t.on_data(message)

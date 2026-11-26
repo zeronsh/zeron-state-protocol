@@ -44,6 +44,7 @@ Transfer :: struct {
 	hashing:  Hashing,
 	pending:  [32]byte,
 	awaiting: bool,
+	identity: []byte, // owned: the file being sent, as it was when begun
 	begun:    bool, // the status came
 	sent_all: bool,
 	result:   Transfer_Result,
@@ -99,6 +100,8 @@ transfer_put :: proc(local, remote: string, replace, folders: bool, port: Port, 
 	t.remote = strings.clone(remote)
 	t.size = u64(info.size)
 	t.modified = unix_ms(info.modification_time)
+	t.identity = make([]byte, len(identity))
+	copy(t.identity, identity)
 	hashing_init(&t.hashing)
 	w := make([dynamic]byte, context.temp_allocator)
 	zsp.write_bytes(&w, transmute([]byte)remote)
@@ -210,7 +213,8 @@ transfer_on_data :: proc(t: ^Transfer, bytes: []byte) -> bool {
 			return true
 		}
 		sha2.final(&t.hashing.file, t.result.hash[:])
-		if len(payload) == 33 && string(payload[1:]) != string(t.result.hash[:]) {
+		// From the start, the file's hash comes and must agree; taken up later, every chunk's has, kept or come.
+		if (t.from == 0 && len(payload) != 33) || (len(payload) == 33 && string(payload[1:]) != string(t.result.hash[:])) {
 			transfer_fail(t, .Changed)
 			return true
 		}
@@ -263,7 +267,8 @@ transfer_part_open :: proc(t: ^Transfer, identity: []byte, from: u64) -> bool {
 	return true
 }
 
-// Sends as much of the file as credit allows, each chunk followed by its hash; then the end.
+// Sends as much of the file as credit allows, each chunk followed by its hash; then the end. Credit for what follows
+// the last bytes is kept back from them, so that it can always go when they have.
 transfer_pump :: proc(t: ^Transfer) {
 	if !t.put || !t.begun || t.finished || t.sent_all {
 		return
@@ -271,40 +276,52 @@ transfer_pump :: proc(t: ^Transfer) {
 	buf: [1 + FILE_READ]byte
 	for {
 		room := t.port.room(t.port.data)
-		if room < 1 + 32 + 2 + 32 {
-			return
-		}
 		if t.at < t.size {
-			n := min(room - 1, FILE_READ, int(t.size - t.at), CHUNK - t.hashing.filled)
+			if room < 1 + 1 + GET_TRAIL {
+				return
+			}
+			n := min(room - 1 - GET_TRAIL, FILE_READ, int(t.size - t.at), CHUNK - t.hashing.filled)
 			got, err := os.read_at(t.f, buf[1:][:n], i64(t.at))
 			if err != nil || got == 0 {
 				transfer_fail(t, .Changed)
 				return
 			}
 			buf[0] = 1
-			t.port.send(t.port.data, buf[:1 + got])
+			if !t.port.send(t.port.data, buf[:1 + got]) {
+				transfer_fail(t, .Failed)
+				return
+			}
 			hashing_feed(&t.hashing, buf[1:][:got])
 			t.at += u64(got)
 			t.result.bytes += u64(got)
 			if t.hashing.filled < CHUNK && t.at < t.size {
 				continue
 			}
+		} else if room < GET_TRAIL {
+			return
 		}
 		if t.hashing.filled > 0 {
 			hash := hashing_chunk(&t.hashing)
 			w: [33]byte
 			w[0] = 2
 			copy(w[1:], hash[:])
-			t.port.send(t.port.data, w[:])
+			if !t.port.send(t.port.data, w[:]) {
+				transfer_fail(t, .Failed)
+				return
+			}
 		}
 		if t.at == t.size {
+			// Still the file it was, all the while? If not, what went may be some of each, and is said to be.
 			identity, _, ok := file_identity(t.f)
-			_ = identity
+			same := ok && string(identity) == string(t.identity)
 			w: [34]byte
-			w[0], w[1] = 3, u8(Status.Ok if ok else Status.Changed)
+			w[0], w[1] = 3, u8(Status.Ok if same else Status.Changed)
 			sha2.final(&t.hashing.file, t.result.hash[:])
 			copy(w[2:], t.result.hash[:])
-			t.port.send(t.port.data, w[:])
+			if !t.port.send(t.port.data, w[:2 + (32 if same else 0)]) {
+				transfer_fail(t, .Failed)
+				return
+			}
 			t.sent_all = true
 			t.port.end(t.port.data)
 			return
@@ -384,6 +401,7 @@ transfer_free :: proc(t: ^Transfer) {
 	}
 	delete(t.local)
 	delete(t.remote)
+	delete(t.identity)
 	delete(t.result.reason)
 	free(t)
 }
