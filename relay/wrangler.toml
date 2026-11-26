@@ -9,18 +9,18 @@ command = "../x wasm"
 name = "SPACE"
 class_name = "Space"
 
-[[durable_objects.bindings]]
-name = "LABEL"
-class_name = "Label"
-
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Space"]
 
-# Where the public reaches what devices expose (SPEC §17): a label's own object knows which space's it is.
+# A class a relay once had, and has no more: migrations are for ever, so where it was made it is taken away.
 [[migrations]]
 tag = "v2-labels"
 new_sqlite_classes = ["Label"]
+
+[[migrations]]
+tag = "v3"
+deleted_classes = ["Label"]
 
 # Where a space is kept beyond what its object's own storage holds: without it, a space is kept in that storage alone
 # until it is full. `wrangler r2 bucket create zsp-relay` first.
@@ -30,4 +30,3 @@ bucket_name = "zsp-relay"
 
 # wrangler secret put RELAY_SECRET    64 hex digits: openssl rand -hex 32
 # wrangler secret put ACCESS_TOKEN    optional
-# EXPOSE_DOMAIN, a var: devices' exposed ports are https://<label>.<it>, given a route *.<it>/* to this Worker
