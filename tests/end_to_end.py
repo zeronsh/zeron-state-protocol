@@ -1230,7 +1230,7 @@ def test_expose():
         if len(got) < 1 << 20:
             time.sleep(0.001)
     assert got.partition(b"\r\n\r\n")[2] == data
-    if rss:
+    if rss and "asan" not in BIN:  # AddressSanitizer keeps what is freed a while, by design
         assert rss < 24 << 20, f"the relay held {rss >> 20} MB for a reader that did not read"
         print(f"     a reader that did not read: the relay at {rss >> 20} MB")
     slow.close()

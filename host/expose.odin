@@ -346,6 +346,8 @@ public_dial :: proc(c: ^Public_In, six: bool) {
 		append(&prelude, ..c.early[:])
 		credit := len(c.early)
 		c.forward = bridge(c.sp, c.call, op.dial.socket, prelude[:])
+		// The bridge is the call's now, and says when it is over: until then this stays, to be cut off by.
+		c.forward.done, c.forward.done_data = public_in_bridged, c
 		call_consumed(c.sp, c.call, credit)
 		clear(&c.early)
 	}, timeout = 10 * time.Second)
@@ -354,10 +356,25 @@ public_dial :: proc(c: ^Public_In, six: bool) {
 // Cut off: the exposure was taken back.
 @(private)
 public_in_cut :: proc(c: ^Public_In) {
-	call_fault(c.sp, c.call, .Denied)
 	if c.forward != nil {
-		forward_close(c.forward)
+		forward_close(c.forward) // which says so to public_in_bridged, which lets this go
+		return
 	}
+	call_fault(c.sp, c.call, .Denied)
+	public_in_drop(c)
+}
+
+// A connection from the public is over: written down, with what passed, and let go.
+@(private)
+public_in_bridged :: proc(data: rawptr, status: Forward_Status) {
+	if status == .Connected {
+		return
+	}
+	c := (^Public_In)(data)
+	if b := c.forward; b != nil {
+		audit(c.sp, {service = "public", detail = fmt.tprintf("%s:%d", c.label, c.port), event = .Close, peer = net.endpoint_to_string(address_to(c.from), context.temp_allocator), bytes_in = b.bytes_in, bytes_out = b.bytes_out})
+	}
+	c.forward = nil
 	public_in_drop(c)
 }
 
