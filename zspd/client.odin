@@ -127,6 +127,9 @@ client_open :: proc(c: ^Client, dir: string) -> bool {
 	return true
 }
 
+// The longest the loop waits without looking at what its threads may have said.
+CLIENT_WAIT :: 25 * time.Millisecond
+
 // Runs the loop until the command stops it, or the connection fails. False, with the reason in `failure`, if it failed.
 client_run :: proc(c: ^Client) -> bool {
 	for {
@@ -137,7 +140,9 @@ client_run :: proc(c: ^Client) -> bool {
 		if c.phase == .Closed || (c.stopping && client_drained(c)) {
 			break
 		}
-		if err := nbio.tick(nbio.NO_TIMEOUT); err != nil {
+		// Not for ever: what a thread reads, writes or catches for a command wakes the loop by nbio.wake_up, which on
+		// Windows wakes it only if it is asleep already, so that one told as it was about to sleep would sleep on.
+		if err := nbio.tick(CLIENT_WAIT); err != nil {
 			client_close(c, "the event loop failed")
 			break
 		}
