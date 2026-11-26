@@ -13,7 +13,7 @@ it always has.
 | the trees | | every page, in packs, one a checkpoint, `<space>/p/<generation>` |
 | a manifest | the trees' roots, the latest pack, how far the log is in R2, what is being deleted | |
 | the roster | the latest, and the one before | |
-| a cache | pages lately read or written, and stretches of log read here and there: 64 MiB at most, or a quarter of `STORAGE_LIMIT` | |
+| a cache | every tree's tops (its branches), apart, which nothing else read crowds out; pages lately read or written; and stretches of log read here and there: 64 MiB at most, or a quarter of `STORAGE_LIMIT` | |
 
 The log is written where it always was, one row of SQLite a burst of writing, rows rewritten as they fill up to 64 KiB. Once an extent is whole
 and durable it is put in R2, four at once. Once the checkpoint is past it too, and it is more than 4 MiB behind the end, the object lets its own
@@ -25,12 +25,20 @@ the pages in it by the keys that lead to them, and a tree of packs counts how ma
 whose pages are is deleted. One at least 64 generations old with fewer than half its pages the latest, and 64 or more not, has the rest
 touched, which copies them into the next pack, and is soon deleted in its turn.
 
+A checkpoint is a put, and costs as much as some three seconds of the object awake, while replaying what came after one
+on waking costs little: a bulk write's records next to nothing, a small one some 0.1 ms. So a relay does not
+checkpoint while writing goes on until there are 4 MiB of log to replay (sooner where `STORAGE_LIMIT` leaves it little
+room), and once nothing has happened for a second, it checkpoints if there are more than 256 KiB: what hibernates wakes
+with little to replay, and what is written on and on is put a checkpoint every few megabytes, not every few hundred
+kilobytes.
+
 ## Reading what is not at hand
 
 A read of a page or a stretch of log that is not in memory or the object's cache does not wait. It answers "not yet", and whatever was
 being done is undone, wholly, and done again once what it wanted has come (zsp/lazy.odin): a frame from a device, a unit of what is sent to
 one, a record replayed on waking, a step of larger work. Pages are fetched sixteen at once with their neighbours in the pack, which are their
-neighbours in the tree. The log is read ahead further each time a device reads on through it, up to an extent, for each of
+neighbours in the tree; and as every tree's branches are kept in the object's cache, whatever else it has let go of, only
+leaves are ever fetched, one round a tree, not one a level. The log is read ahead further each time a device reads on through it, up to an extent, for each of
 several devices at once, and the next stretch is asked for before it is reached; what was read ahead is kept until it is
 read. A record replayed on waking that misses has those after it replayed too, and undone with it, so that everything
 they miss is fetched in one round. Nothing polls, and nothing blocks: R2 says when it is done, and whatever waited goes on.
@@ -64,23 +72,28 @@ wrangler deploy
 ```
 
 `wrangler.toml` binds the bucket as `STORE`. Settings, all optional: `STORAGE_LIMIT`, bytes of SQLite a space may use; `FULL_WAIT`;
-`CACHE_BYTES`; `PAGES_KEPT` and `BLOCKS_KEPT`, the pages and 64 KiB stretches of log kept in memory (2048 and 64); `STATS`, `"1"` to answer
-`/<space>?stats` with what a space has cost, `?probe` with how long R2 takes, and `?evict` to start a space's node again as an evicted object
-does, for measuring. A space kept wholly in SQLite by an earlier relay is made again from its log when its object next wakes, checkpointing as
+`CACHE_BYTES`; `PAGES_KEPT` and `BLOCKS_KEPT`, the pages and 64 KiB stretches of log kept in memory (2048 and 64); `QUIET_MS` and
+`QUIET_TAIL`, how long nothing must happen before a checkpoint, and how much log there must be to replay for one (1000 and
+262144); `STATS`, `"1"` to answer `/<space>?stats` with what a space has cost, `?probe` with how long R2 takes, and
+`?evict=warm|cold|empty` to start a space's node again as an evicted object does, with its cache, with all but the trees'
+tops let go of, or with nothing, for measuring. A space kept wholly in SQLite by an earlier relay is made again from its log when its object next wakes, checkpointing as
 it goes, and its log moves to R2 an extent at a time.
 
 ## What it costs
 
-`python3 bench/relay.py [rows]`, under workerd here or against a deployed relay. On Cloudflare, with the bucket in the same region as the
-objects, and devices in the same city:
+`python3 bench/relay.py [rows]`, `bench/policy.py` and `bench/wake.py`, under workerd here or against a deployed relay. On
+Cloudflare, with the bucket in the same region as the objects, and devices in the same city:
 
 | | |
 |---|---|
 | a small write, device to relay to device | 26 to 38 ms, the round trip included; one row of SQLite written, $0.000001 |
-| 25 MB written in bulk | 2.3 to 3 s; $0.00006 a MB: a row of SQLite a burst, a put an extent, a put a checkpoint |
+| 25 MB written in bulk | 2.3 to 3 s; $0.000055 a MB: a row of SQLite a burst, a put an extent, a put a checkpoint |
+| 5 MB written steadily over 15 s | 2 checkpoints, 6 puts, $0.00007 a MB (30 checkpoints and $0.00012 a MB when one was every 256 KiB) |
+| what is next written after an object hibernated | 47 to 59 ms, the round trip included: some 15 ms more than when awake |
 | a new device sent 25 MB | 4 to 6 s; some 40 gets, $0.00004 in all |
-| a window of 50 from an object woken from eviction | 10 to 360 ms; at most 4 gets |
-| the same with nothing cached | 0.2 to 1.1 s; 4 to 11 gets, $0.00002 at most: rounds of reads one after another, down the trees and to the log |
+| a window of 50 from an object woken from eviction | 10 to 110 ms; at most 1 get |
+| the same with its cache turned over | 0.15 to 0.4 s; 3 to 5 gets, $0.00001 at most: leaves, then the log, as the device asks |
+| the same with nothing cached at all, not even the trees' tops | 0.2 to 0.55 s; 3 to 7 gets |
 | a device that has everything, back | one fingerprint; nothing read from R2 |
 | R2 from an object | a get of 4 KiB 22 to 43 ms, of 1 MiB 35 to 49 ms; a put of 1 MiB 176 to 230 ms; from another continent, ten times that |
 | kept in the object | the log's last 4 MiB and the cache: some 1 to 5 MB, $0.001 a month |

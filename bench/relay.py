@@ -108,6 +108,7 @@ def main():
     ways = [("latest", True, "warm"), ("earliest", False, "warm"), ("latest", True, "cold"), ("earliest", False, "cold")]
     if os.environ.get("ZSP_EMPTY"):  # and with not even the trees' tops kept, where the relay keeps them apart
         ways += [("latest", True, "empty"), ("earliest", False, "empty")]
+    ways = ways * int(os.environ.get("ZSP_REPEAT", "1"))  # windows vary with R2: measured again, for medians
     for i, (which, back, how) in enumerate(ways):
         p = e.Node(f"rp{i}", "run", "--credential=" + cloud.token, "--no-udp", "--partial")
         e.zspd("admit", a.dir, e.zspd("key", p.dir), "1")
@@ -124,7 +125,7 @@ def main():
         took = time.monotonic() - t
         s1 = stats(cloud, sid)
         d = spent(s0, s1)
-        results[f"window {which} {how}"] = {"ms": took * 1e3, **d}
+        results.setdefault(f"window {which} {how}", []).append({"ms": took * 1e3, **d})
         said = {"warm": "with its own cache", "cold": "with its cache turned over", "empty": "with nothing at hand"}[how]
         print(f"a window of the {which} 50 from a relay woken {said}: {took * 1e3:.0f} ms")
         line(f"window of the {which} 50, {how}", d)
