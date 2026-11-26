@@ -76,7 +76,13 @@ export class Chrome {
 
   static async #launch(bin: string, more: string[]): Promise<Chrome> {
     const profile = mkdtempSync(join(tmpdir(), "zsp-chrome-"));
-    const flags = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-gpu", ...more];
+    // Every page here is a tab of one window, so all but the last opened are hidden; and the first, hidden as soon as a
+    // second opens, is most often the one whose worker runs the node. A hidden tab's timers are held back, and on macOS
+    // its renderer, workers and all, is run at the least priority there is, so that on a busy machine a node that runs
+    // in milliseconds took tens of seconds (browser_tabs 5 to 30 s, against 1.5 to 5 s with these, on CI's macOS):
+    // which is Chrome's scheduling of tabs nobody is looking at, not what these tests are of.
+    const background = ["--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"];
+    const flags = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-gpu", ...background, ...more];
     const p = spawn(bin, [...flags, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
     const url = await new Promise<string>((resolve, reject) => {
       let err = "";
