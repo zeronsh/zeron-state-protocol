@@ -426,6 +426,8 @@ export class Space extends DurableObject {
     if (this.#wasm) {
       this.#unquiet();
       this.#keep(); // as hibernation finds them: only ever once quiet
+      for (const c of this.#calls.values()) c.flow(3, new Uint8Array()); // the public's calls go with the node
+      this.#calls.clear();
       this.#wasm = undefined;
       this.#epoch++;
       this.#sockets.clear();
