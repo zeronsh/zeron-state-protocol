@@ -395,6 +395,9 @@ stays on the path it began on: if that fails the call faults *lost*, and may or 
 
 A relay is a full replica without keys. It verifies rosters, enforces rights, merges, pages, reconciles and forwards; it serves each space separately. Which peer
 is a relay is never the peer's to say: it is one whose key was dialled as a relay's. A relay should store nothing for a space until someone its host accepts has something to store.
+Where it keeps what it holds is its own: no peer can tell, provided that what it has acknowledged survives it, and that it answers as a full
+replica would, if later. (The relay in relay/ keeps each space in object storage, with its object's own storage as a cache: see
+docs/relay-storage.md.)
 
 ```
 12 Presence   n × device (32)                    from a relay: who else is here

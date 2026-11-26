@@ -11,7 +11,7 @@ find/      answering questions about it: an index made when first asked, kept en
 pipe/      carrying it: UDP links, WebSocket, TLS, STUN. No I/O either
 host/      files, sockets, one thread, one event loop
 zspd/      a device's node, or a self-hosted relay: one consumer of the above
-relay/     the same relay as a Cloudflare Durable Object: zsp/ compiled to wasm, and plumbing
+relay/     the same relay as a Cloudflare Durable Object: zsp/ compiled to wasm, and plumbing; spaces kept in R2
 luau/zsp/  the query client
 web/       a device in a browser or Node: zsp/ and find/ compiled to wasm, and a client in TypeScript
 clients/   a whole client in the Python standard library, to show how little one needs
@@ -46,6 +46,9 @@ at a relay, or links to them directly from Node. Its client speaks to it as ever
 tests ([docs/web.md](docs/web.md)).
 
 **The log is the database.** A sealed cell is appended once. The bytes on disk are the bytes on the wire are the bytes on the relay.
+
+**A space has no size.** A relay on Cloudflare keeps a space in R2, with its Durable Object as its cache: what is not at hand is fetched
+without anything waiting for it, and the object keeps a few megabytes whatever the space comes to ([docs/relay-storage.md](docs/relay-storage.md)).
 
 **What was written long ago is written together.** A text typed a word at a time is a cell a second. Whoever writes the next has a hundred and more of them put into one, and those into one, so that a
 text of 8,000 pieces is at most some 200 cells to fetch, check and open, in three quarters of the room they took, or less; and everything that was ever said about it still holds, whoever is still on the old ones.
@@ -182,7 +185,9 @@ export { Space };
 export default relay({ authenticate: async ({ space, device, credential, env }) => isCustomer(credential, env) });
 ```
 
-`cd relay && wrangler secret put RELAY_SECRET && wrangler deploy`; `GET /` then answers with the key devices pin: fetch it once, with something that checks certificates, as a browser or curl does.
+`cd relay && wrangler r2 bucket create zsp-relay --location weur && wrangler secret put RELAY_SECRET && wrangler deploy`, the bucket where the objects
+will be; `GET /` then answers with the key devices pin: fetch it once, with something that checks certificates, as a browser or curl does. What
+it keeps where, and what that costs: [docs/relay-storage.md](docs/relay-storage.md).
 
 Embedding in Odin is the same question asked of `host.Config.authenticate`, or of `zsp.Host.authenticate` if you bring your own I/O.
 

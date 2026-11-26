@@ -99,6 +99,10 @@ def main():
     print(f"a new device has all {mb:.0f} MB in {took:.1f} s: {mb / took:.1f} MB/s")
     line("catching up", d)
 
+    # Only the writer stays: what follows is what a window costs, not what devices reconnecting cost.
+    b.stop()
+    c.stop()
+
     # A device that keeps only what its screen shows, new each time, served a window of 50 by a relay woken from
     # eviction: with its own cache, as it is, or with nothing at hand but its manifest and its log's tail.
     for i, (which, back, how) in enumerate((("latest", True, "warm"), ("earliest", False, "warm"), ("latest", True, "cold"), ("earliest", False, "cold"))):
@@ -125,7 +129,6 @@ def main():
 
     # A device that has it all already, back: one fingerprint, and what that costs the relay.
     s0 = stats(cloud, sid)
-    c.stop()
     c.start()
     time.sleep(3)
     s1 = stats(cloud, sid)
