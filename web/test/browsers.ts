@@ -177,8 +177,10 @@ const tests: Record<string, () => Promise<void>> = {
     expectEqual(await call<string>(leader, "request", "tg", "where", 5000), "here");
     await follower.close();
     pages.splice(pages.indexOf(follower), 1);
-    // One in flight as it goes may be lost; none goes unanswered, and the next is told there is nobody to answer.
-    const first = await call<string>(leader, "request", "tg", "where", 5000);
+    // Answered while it goes, which is not at once; then one in flight as it goes may be lost; none goes unanswered, and
+    // the next is told there is nobody to answer.
+    let first = "here";
+    await eventually("it is gone", async () => (first = await call<string>(leader, "request", "tg", "where", 5000)) !== "here");
     if (first !== "fault lost" && first !== "fault unserved") throw new Error(`a call to a tab that has gone: ${first}`);
     expectEqual(await call<string>(leader, "request", "tg", "where", 5000), "fault unserved");
   },
@@ -313,13 +315,18 @@ async function main(): Promise<void> {
   let failed = 0;
   for (const name of names) {
     const start = performance.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await tests[name]();
+      // However a page fails to answer, the test fails, by name, rather than waiting for ever.
+      const limit = new Promise<never>((_, fail) => (timer = setTimeout(() => fail(new Error("not done in three minutes")), 180000)));
+      await Promise.race([tests[name](), limit]);
       console.log(`ok   ${name} ${((performance.now() - start) / 1000).toFixed(2)}s`);
     } catch (e) {
       failed++;
       console.log(`FAIL ${name}: ${e instanceof Error ? e.stack : e}\n     in ${TMP}`);
     } finally {
+      clearTimeout(timer);
+      for (const go of held.splice(0)) go();
       for (const p of pages.splice(0)) await p.close().catch(() => {});
       await stopAll();
     }
