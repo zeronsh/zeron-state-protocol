@@ -2219,6 +2219,17 @@ def test_public_held_off():
     eventually("the relay holds nothing of them", lambda: fds() <= before)
     assert public_get(https, name)[:2] == (200, b"still here")
 
+    # Hellos for a name it has, each gone (reset) before its answer can be written: the relay writes into nothing, and
+    # makes nothing more of what it had read.
+    for _ in range(300):
+        s = socket.create_connection(("127.0.0.1", https), 5)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        s.sendall(client_hello(name))
+        s.close()
+    assert relay.p.poll() is None, "the relay fell over"
+    eventually("nor of those", lambda: fds() <= before)
+    assert public_get(https, name)[:2] == (200, b"still here")
+
     # One that says nothing, as fast as it can (change_cipher_spec after change_cipher_spec, mid-handshake), keeps
     # nobody else waiting.
     import threading

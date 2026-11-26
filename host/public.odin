@@ -277,6 +277,9 @@ public_accepted :: proc(op: ^nbio.Operation, h: ^Host, secure: bool) {
 			c.connected = true
 			bytes = bytes[1:]
 			public_out_forward(c)
+			if c.closed {
+				return true
+			}
 		}
 		if c.tls != nil {
 			pipe.tls_server_write(c.tls, bytes, &c.out)
@@ -373,8 +376,8 @@ public_out_read :: proc(c: ^Public_Out) {
 				c.call = 0
 			}
 			public_out_flush(c)
-			if !ok {
-				return
+			if !ok || c.closed {
+				return // or written into nothing, and let go
 			}
 			if c.call == 0 && c.tls.state == .Open && !public_out_route(c, pipe.tls_server_name(c.tls)) {
 				return
@@ -658,9 +661,11 @@ public_out_close :: proc(c: ^Public_Out, reset: bool) {
 	if c.tls != nil {
 		pipe.tls_server_destroy(c.tls)
 		free(c.tls)
+		c.tls = nil
 	}
 	delete(c.head)
 	delete(c.pending)
 	delete(c.out)
+	c.head, c.pending, c.out = nil, nil, nil
 	append(&c.h.public_dead, c) // freed once the tick is over
 }
