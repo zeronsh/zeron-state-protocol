@@ -7,8 +7,10 @@
 
 local asking = require("./ask")
 local codec = require("./codec")
+local services = require("./services")
 local sha256 = require("./sha256")
 local text = require("./text")
+local transfer = require("./transfer")
 
 local HELLO, ROSTER, WATCH, UNWATCH, CELLS, ACK = 1, 2, 3, 4, 7, 8
 local ASK, UNASK, ANSWER, FETCH = 32, 33, 34, 35
@@ -17,6 +19,9 @@ local GRAVE, PLACE, VALUE, PIECE, BUNDLE = 1, 2, 3, 4, 5
 local W_DATA, W_LIVE, W_BACK, W_ADOPT, W_COUNTS = 1, 2, 4, 8, 32
 local F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = 0, 1, 2, 3, 4
 local CALL_WINDOW = 262144
+local WINDOW_MOST = 16 * CALL_WINDOW -- what a receiver may credit ahead
+local WINDOW_QUICK = 0.25 -- seconds: a window used up within this grows
+local MESSAGE = 65536 -- what a stream's bytes are sent in, at most
 local MAX_OPEN = 1048576 - 192
 local ZERO32 = string.rep("\0", 32)
 
@@ -34,6 +39,7 @@ export type Host = {
 	defer: (f: () -> ()) -> (), -- runs f soon, once the current work is done
 	after: (seconds: number, f: () -> ()) -> () -> (), -- runs f later; returns a way to cancel it
 	linger: number?, -- seconds a window nobody observes stays warm: 5
+	files: transfer.Files?, -- for get and put to go through; without them, they take and give buffers
 }
 
 export type Column = {
@@ -126,13 +132,19 @@ export type Window = {
 	denied: boolean,
 	linger: (() -> ())?,
 }
+-- A call: a stream of messages each way. What comes is credited back, so that more may, once on_data is done with
+-- it; on_data returning false keeps it, until `consumed` says how much of it is done with. So a slow reader holds up
+-- whoever writes to it, and nothing piles up between them.
 export type Call = {
-	send: (data: string) -> (),
+	send: (data: string) -> (), -- what there is no credit for yet waits for it, here
 	finish: () -> (),
 	cancel: () -> (),
-	on_data: ((data: string) -> ())?,
+	consumed: (n: number) -> (), -- bytes kept from on_data are done with
+	room: () -> number, -- what may be sent now without waiting
+	on_data: ((data: string) -> ...boolean)?,
 	on_end: (() -> ())?,
 	on_fault: ((fault: string) -> ())?,
+	on_room: (() -> ())?, -- credit came: room grew
 	device: string,
 	method: string,
 	subject: string?, -- of one that is answered: whom whoever calls goes by
@@ -145,6 +157,67 @@ type Live_Call = {
 	theirs_ended: boolean,
 	credit: number,
 	queue: { string }, -- awaiting credit
+	queued: number, -- bytes of it
+	window: number, -- what the other side may have outstanding
+	used: number, -- of it, consumed since the window last grew
+	since: number,
+}
+
+-- A process on a device, with pipes (exec) or a terminal of its own (terminal). Output is credited as on_output and
+-- on_error are done with it, as a call's data is: returning false keeps it until `consumed`.
+export type Process = {
+	send: (input: string) -> (),
+	write: (input: string) -> (), -- the same: what is typed at a terminal
+	close_input: () -> (), -- no more input: its stdin is closed (a terminal's user would send ^D)
+	signal: (signal: number | string) -> (), -- by POSIX number or name: "interrupt", "terminate", "hangup", ...
+	kill: () -> (), -- the kill signal, to it and all it started; its exit is still told
+	resize: (rows: number, columns: number) -> (), -- a terminal's
+	close: () -> (), -- a terminal hung up: no more input, and the hangup signal
+	cancel: () -> (), -- given up on at once: it is killed, with all it started, and nothing more is told
+	consumed: (n: number) -> (),
+	room: () -> number,
+	on_output: ((data: string) -> ...boolean)?, -- and a terminal's output
+	on_error: ((data: string) -> ...boolean)?,
+	on_exit: ((code: number, signal: number) -> ())?, -- signal 0 unless one ended it
+	on_fail: ((why: string, reason: string) -> ())?, -- it could not be run, or its end is not known
+	on_room: (() -> ())?,
+	call: Call,
+}
+
+-- A TCP connection, made by a device on this one's behalf.
+export type Stream = {
+	send: (data: string) -> (),
+	close: () -> (), -- no more from here: a half-close
+	reset: () -> (), -- ended at once, both ways
+	consumed: (n: number) -> (),
+	room: () -> number,
+	on_open: (() -> ())?, -- the port was reached
+	on_data: ((data: string) -> ...boolean)?,
+	on_end: (() -> ())?, -- no more from there
+	on_close: ((why: string?, reason: string) -> ())?, -- over: why is nil when both ends closed as they should
+	on_room: (() -> ())?,
+	call: Call,
+}
+
+export type Service = services.Service
+export type Entry = services.Entry
+export type Files = transfer.Files
+export type File = transfer.File
+export type Transfer = transfer.Transfer
+export type Result = transfer.Result
+export type Resume = transfer.Resume
+export type Put_Options = transfer.Put_Options
+export type Exec_Options = {
+	env: { string }?, -- NAME=value over the host's own; NAME alone removes it
+	folder: string?, -- where it starts; the user's home if not said
+	input: string?, -- run: given it, and then no more
+}
+export type Terminal_Options = {
+	rows: number?, -- 24
+	columns: number?, -- 80
+	term: string?, -- "xterm-256color"
+	env: { string }?,
+	folder: string?,
 }
 
 local Faults = { "denied", "unreachable", "unserved", "lost", "overrun", "busy" }
@@ -2105,10 +2178,12 @@ function Client._call(self: Client, id: number, side: number, device: string, me
 		on_data = nil,
 		on_end = nil,
 		on_fault = nil,
+		on_room = nil,
 		send = function(data: string)
 			assert(#data <= CALL_WINDOW, "a message may be 256 KiB at most")
 			if not over() and not live.finishing then
 				table.insert(live.queue, data)
+				live.queued += #data
 				self:_drain(id, live)
 			end
 		end,
@@ -2124,6 +2199,17 @@ function Client._call(self: Client, id: number, side: number, device: string, me
 				self:_flow(id, side, F_CANCEL)
 			end
 		end,
+		consumed = function(n: number)
+			if not over() then
+				self:_consume(id, live, n)
+			end
+		end,
+		room = function(): number
+			if over() or live.finishing then
+				return 0
+			end
+			return math.max(live.credit - live.queued, 0)
+		end,
 	}
 	live = {
 		call = call,
@@ -2133,6 +2219,10 @@ function Client._call(self: Client, id: number, side: number, device: string, me
 		theirs_ended = false,
 		credit = CALL_WINDOW,
 		queue = {},
+		queued = 0,
+		window = CALL_WINDOW,
+		used = 0,
+		since = self.host.now(),
 	}
 	set[id] = live
 	return live
@@ -2143,6 +2233,7 @@ function Client._drain(self: Client, id: number, live: Live_Call)
 	while #live.queue > 0 and live.credit >= #live.queue[1] do
 		local data = table.remove(live.queue, 1) :: string
 		live.credit -= #data
+		live.queued -= #data
 		self:_flow(id, live.side, F_DATA, data)
 	end
 	if live.finishing and #live.queue == 0 and not live.mine_ended then
@@ -2152,6 +2243,28 @@ function Client._drain(self: Client, id: number, live: Live_Call)
 			(if live.side == 0 then self.calls else self.answers)[id] = nil
 		end
 	end
+end
+
+-- Credits what is done with. A window used up quickly grows, to 4 MiB, so that a long path is kept full by a reader that
+-- keeps up; one that does not never gets more than it has room for.
+function Client._consume(self: Client, id: number, live: Live_Call, n: number)
+	if n <= 0 then
+		return
+	end
+	local credit = n
+	live.used += n
+	if live.used >= live.window then
+		local now = self.host.now()
+		if now - live.since < WINDOW_QUICK and live.window < WINDOW_MOST then
+			credit += live.window
+			live.window *= 2
+		end
+		live.used = 0
+		live.since = now
+	end
+	local w = codec.writer()
+	codec.put_varint(w, credit)
+	self:_flow(id, live.side, F_CREDIT, codec.string(w))
 end
 
 -- Calls a method on a device. Set on_data, on_end and on_fault on the result before yielding.
@@ -2180,10 +2293,10 @@ function Client.call(self: Client, device: string, scope: number, method: string
 	return live.call
 end
 
--- One question, one answer; yields the coroutine it is called from. Returns the answer, or nil and why not.
-function Client.request(self: Client, device: string, scope: number, method: string, data: string): (string?, string?)
+-- Makes a call and yields until it is over: every message that came, in order, or nil and why not.
+function Client._gather(self: Client, device: string, scope: number, method: string, data: string): ({ string }?, string?)
 	local thread = coroutine.running()
-	local answer: string? = nil
+	local messages: { string } = {}
 	local fault: string? = nil
 	local waiting, settled = false, false
 	local function settle()
@@ -2196,7 +2309,7 @@ function Client.request(self: Client, device: string, scope: number, method: str
 	end
 	local call = self:call(device, scope, method, data)
 	call.on_data = function(d: string)
-		answer = (answer or "") .. (d :: string)
+		table.insert(messages, d)
 	end
 	call.on_end = settle
 	call.on_fault = function(f)
@@ -2211,7 +2324,16 @@ function Client.request(self: Client, device: string, scope: number, method: str
 	if fault then
 		return nil, fault
 	end
-	return answer or "", nil
+	return messages, nil
+end
+
+-- One question, one answer; yields the coroutine it is called from. Returns the answer, or nil and why not.
+function Client.request(self: Client, device: string, scope: number, method: string, data: string): (string?, string?)
+	local messages, fault = self:_gather(device, scope, method, data)
+	if not messages then
+		return nil, fault
+	end
+	return table.concat(messages), nil
 end
 
 -- Answers a method within a scope. The handler gets the call and its first message. Returns a way to stop.
@@ -2254,9 +2376,7 @@ function Client._on_call(self: Client, r: codec.Reader)
 	local data = codec.rest(r)
 	local live = self:_call(id, 1, device, method)
 	live.call.subject = subject
-	local w = codec.writer()
-	codec.put_varint(w, #data)
-	self:_flow(id, 1, F_CREDIT, codec.string(w))
+	self:_consume(id, live, #data) -- the first message is always taken
 	handler(live.call, data)
 end
 
@@ -2273,15 +2393,19 @@ function Client._on_flow(self: Client, r: codec.Reader)
 	local call = live.call
 	if kind == F_DATA then
 		local data = codec.rest(r)
-		local w = codec.writer()
-		codec.put_varint(w, #data)
-		self:_flow(id, live.side, F_CREDIT, codec.string(w))
+		local done = true
 		if call.on_data then
-			call.on_data(data)
+			done = call.on_data(data) ~= false
+		end
+		if done and set[id] == live then
+			self:_consume(id, live, #data)
 		end
 	elseif kind == F_CREDIT then
 		live.credit += codec.varint(r)
 		self:_drain(id, live)
+		if call.on_room and set[id] == live then
+			call.on_room()
+		end
 	elseif kind == F_END then
 		live.theirs_ended = true
 		if live.mine_ended then
@@ -2297,6 +2421,345 @@ function Client._on_flow(self: Client, r: codec.Reader)
 			call.on_fault(Faults[code] or "cancelled")
 		end
 	end
+end
+
+-- ---------------------------------------------------------------- services
+
+-- Calls a method a device's host serves, and yields until it is over: what followed the status, or nil, why not and
+-- the reason given.
+function Client._hosted(self: Client, device: string, scope: number, method: string, data: string): (string?, string, string)
+	local messages, fault = self:_gather(device, scope, method, data)
+	if not messages then
+		return nil, fault :: string, ""
+	end
+	local status, rest = services.status(table.concat(messages))
+	if status ~= "ok" then
+		return nil, status, rest
+	end
+	return rest, "ok", ""
+end
+
+-- This device, and a scope its client may call in, for what is asked of its own host.
+function Client._own(self: Client): (string?, number)
+	local me = self.authors[0]
+	local best: number? = nil
+	for scope in self.scopes do
+		if self:may(scope, "call") and (not best or scope < best) then
+			best = scope
+		end
+	end
+	if not me or not best then
+		return nil, 0
+	end
+	return me.id, best :: number
+end
+
+-- What a device lets this one do on it, in a scope: its terminals and commands, its shares of files, and the ports it
+-- offers. Yields; returns them, or nil, why not and the reason given.
+function Client.services(self: Client, device: string, scope: number): ({ Service }?, string?, string?)
+	local said, why, reason = self:_hosted(device, scope, "zsp.services", "")
+	if not said then
+		return nil, why, reason
+	end
+	local list = services.services(said)
+	if not list then
+		return nil, "malformed", ""
+	end
+	return list, nil, nil
+end
+
+-- What this device shares, as text: a line for each, as `shell <scope> [terminal] [commands]` or
+-- `files <scope> <name> read|write <path>`. Yields; returns it, or nil, why not and the reason given.
+function Client.shares(self: Client): (string?, string?, string?)
+	local device, scope = self:_own()
+	if not device then
+		return nil, if self.ready then "denied" else "unreachable", ""
+	end
+	local said, why, reason = self:_hosted(device, scope, "zsp.share", "")
+	if not said then
+		return nil, why, reason
+	end
+	return said, nil, nil
+end
+
+-- Puts new shares in place of this device's, as `shares` gives them: in force at once, and every call they no longer
+-- allow ended. Yields; returns true, or false, why not and the reason given.
+function Client.set_shares(self: Client, shares: string): (boolean, string?, string?)
+	local device, scope = self:_own()
+	if not device then
+		return false, if self.ready then "denied" else "unreachable", ""
+	end
+	-- What says nothing at all is still something to put in place, which no empty first message can be.
+	local said, why, reason = self:_hosted(device, scope, "zsp.share", if shares == "" then "\n" else shares)
+	if not said then
+		return false, why, reason
+	end
+	return true, nil, nil
+end
+
+-- A folder of a share of files ("" for the shares themselves). Yields; returns its entries, or nil, why not and the
+-- reason given.
+function Client.list(self: Client, device: string, scope: number, path: string): ({ Entry }?, string?, string?)
+	local said, why, reason = self:_hosted(device, scope, "zsp.list", services.list(path))
+	if not said then
+		return nil, why, reason
+	end
+	local entries = services.entries(said)
+	if not entries then
+		return nil, "malformed", ""
+	end
+	return entries, nil, nil
+end
+
+-- Fetches a file of a share: to a path, through the host's files, taking up where a fetch there before broke off; or,
+-- given no path, into memory, taking up from what one that broke off gave as its result's `resume`.
+function Client.get(self: Client, device: string, scope: number, path: string, to: (string | Resume)?): Transfer
+	return transfer.get(function(first: string): transfer.Call?
+		return self:call(device, scope, "zsp.get", first)
+	end, self.host.defer, self.host.files, path, to)
+end
+
+-- Sends a file to a share: from a path, through the host's files, or from a buffer. The other end takes it up where
+-- the same file sent before broke off.
+function Client.put(self: Client, device: string, scope: number, from: string | buffer, path: string, options: Put_Options?): Transfer
+	return transfer.put(function(first: string): transfer.Call?
+		return self:call(device, scope, "zsp.put", first)
+	end, self.host.defer, self.host.now() * 1000, self.host.files, from, path, options)
+end
+
+function Client._process(self: Client, device: string, scope: number, method: string, first: string): Process
+	local call = self:call(device, scope, method, first)
+	local begun, exited, failed = false, false, false
+	local function send(input: string)
+		for at = 1, #input, MESSAGE do
+			call.send(services.input(string.sub(input, at, at + MESSAGE - 1)))
+		end
+	end
+	local function signal(s: number | string)
+		local n = if type(s) == "number" then s else services.SIGNALS[s]
+		assert(n, "no such signal")
+		call.send(services.signal(n))
+	end
+	local p: Process = {
+		send = send,
+		write = send,
+		close_input = call.finish,
+		signal = signal,
+		kill = function()
+			signal(services.SIGNALS.kill)
+		end,
+		resize = function(rows: number, columns: number)
+			call.send(services.resize(rows, columns))
+		end,
+		close = function()
+			signal(services.SIGNALS.hangup)
+			call.finish()
+		end,
+		cancel = function()
+			failed = true -- nothing more is told
+			call.cancel()
+		end,
+		consumed = call.consumed,
+		room = call.room,
+		on_output = nil,
+		on_error = nil,
+		on_exit = nil,
+		on_fail = nil,
+		on_room = nil,
+		call = call,
+	}
+	local function fail(why: string, reason: string)
+		if not exited and not failed then
+			failed = true
+			if p.on_fail then
+				p.on_fail(why, reason)
+			end
+		end
+	end
+	call.on_data = function(message: string): ...boolean
+		if not begun then
+			begun = true
+			local status, reason = services.status(message)
+			if status ~= "ok" then
+				fail(status, reason)
+			end
+			return true
+		end
+		local tag = string.byte(message)
+		if tag == 1 or tag == 2 then
+			local f = if tag == 1 then p.on_output else p.on_error
+			if f and f(string.sub(message, 2)) == false then
+				call.consumed(1) -- its tag; what it tags, once the consumer says
+				return false
+			end
+		elseif tag == 3 then
+			local code, ended_by = services.exited(string.sub(message, 2))
+			if not code then
+				fail("malformed", "")
+			elseif not exited and not failed then
+				exited = true
+				if p.on_exit then
+					p.on_exit(code, ended_by)
+				end
+			end
+		end
+		return true
+	end
+	call.on_end = function()
+		fail("failed", "it ended with no exit")
+		call.finish() -- it is gone: there is no one to say more to
+	end
+	call.on_fault = function(fault: string)
+		fail(fault, "")
+	end
+	call.on_room = function()
+		if p.on_room then
+			p.on_room()
+		end
+	end
+	return p
+end
+
+-- Runs a command on a device, with pipes: argv is the program and its arguments, never through a shell.
+function Client.exec(self: Client, device: string, scope: number, argv: { string }, options: Exec_Options?): Process
+	local o: Exec_Options = options or {}
+	return self:_process(device, scope, "zsp.exec", services.exec(argv, o.env, o.folder))
+end
+
+-- Runs a command and yields until it has exited: its code, the signal that ended it (0 if none), and all it wrote to
+-- its stdout and stderr. If it could not be run, or its end is not known, the code is nil, and why and the reason given
+-- follow what it wrote.
+function Client.run(self: Client, device: string, scope: number, argv: { string }, options: Exec_Options?): (number?, number, string, string, string?, string?)
+	local thread = coroutine.running()
+	local out, err = {}, {}
+	local code: number?, ended_by = nil, 0
+	local why: string?, reason: string? = nil, nil
+	local waiting, settled = false, false
+	local function settle()
+		if not settled then
+			settled = true
+			if waiting then
+				coroutine.resume(thread)
+			end
+		end
+	end
+	local p = self:exec(device, scope, argv, options)
+	p.on_output = function(data: string)
+		table.insert(out, data)
+	end
+	p.on_error = function(data: string)
+		table.insert(err, data)
+	end
+	p.on_exit = function(c: number, s: number)
+		code, ended_by = c, s
+		settle()
+	end
+	p.on_fail = function(w: string, r: string)
+		why, reason = w, r
+		settle()
+	end
+	local input = options and options.input
+	if input and input ~= "" then
+		p.send(input)
+	end
+	p.close_input()
+	if not settled then
+		waiting = true
+		coroutine.yield()
+	end
+	return code, ended_by, table.concat(out), table.concat(err), why, reason
+end
+
+-- Opens a terminal on a device, running the user's shell.
+function Client.terminal(self: Client, device: string, scope: number, options: Terminal_Options?): Process
+	local o: Terminal_Options = options or {}
+	return self:_process(device, scope, "zsp.pty", services.pty(o.rows or 24, o.columns or 80, o.term or "xterm-256color", o.env, o.folder))
+end
+
+-- Opens a TCP connection, made by a device to a port of its own (host nil) or one it reaches, if it offers it.
+function Client.connect(self: Client, device: string, scope: number, port: number, host: string?): Stream
+	local call = self:call(device, scope, "zsp.tcp", services.tcp(port, host))
+	local begun, opened, mine, theirs, over = false, false, false, false, false
+	local closed: (why: string?, reason: string) -> ()
+	local s: Stream = {
+		send = function(data: string)
+			for at = 1, #data, MESSAGE do
+				call.send(string.sub(data, at, at + MESSAGE - 1))
+			end
+		end,
+		close = function()
+			if not mine then
+				mine = true
+				call.finish()
+				if theirs and opened then
+					closed(nil, "")
+				end
+			end
+		end,
+		reset = function()
+			over = true -- nothing more is told
+			call.cancel()
+		end,
+		consumed = call.consumed,
+		room = call.room,
+		on_open = nil,
+		on_data = nil,
+		on_end = nil,
+		on_close = nil,
+		on_room = nil,
+		call = call,
+	}
+	function closed(why: string?, reason: string)
+		if not over then
+			over = true
+			if s.on_close then
+				s.on_close(why, reason)
+			end
+		end
+	end
+	call.on_data = function(data: string): ...boolean
+		if not begun then
+			begun = true
+			local status, reason = services.status(data)
+			if status ~= "ok" then
+				closed(status, reason)
+				return true
+			end
+			opened = true
+			if s.on_open then
+				s.on_open()
+			end
+			return true
+		end
+		local f = s.on_data
+		if over or not f then
+			return true
+		end
+		return f(data)
+	end
+	call.on_end = function()
+		theirs = true
+		if not opened then
+			closed(if begun then "failed" else "malformed", "")
+			call.finish()
+			return
+		end
+		if s.on_end and not over then
+			s.on_end()
+		end
+		if mine then
+			closed(nil, "")
+		end
+	end
+	call.on_fault = function(fault: string)
+		closed(if fault == "cancelled" then "reset" else fault, "")
+	end
+	call.on_room = function()
+		if s.on_room then
+			s.on_room()
+		end
+	end
+	return s
 end
 
 return table.freeze({ connect = new_client, columns = columns })

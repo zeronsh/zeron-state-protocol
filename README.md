@@ -162,6 +162,11 @@ text.append(token) -- seen everywhere at once; durable a piece at a time
 
 client:serve(1, "run", function(call, data) ... end)
 local answer = client:request(device, 1, "run", data)
+
+local offered = client:services(device, 1) -- what a device shares with you: terminals, commands, files, ports
+local got = client:get(device, 1, "docs/report.pdf", "report.pdf").wait() -- taken up where it broke off; checked
+local code, signal, out, err = client:run(device, 1, { "git", "status" }, { folder = "/srv/app" })
+local shell = client:terminal(device, 1, { rows = 24, columns = 80 }) -- write, resize, on_output, on_exit
 ```
 
 In a browser or Node, the device is the node, and the client is the Luau one, in TypeScript ([docs/web.md](docs/web.md)):

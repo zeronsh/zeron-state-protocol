@@ -348,6 +348,28 @@ def timed_out(e):
     return AssertionError("timed out, having said:\n" + "\n".join(said)[-4000:])
 
 
+def test_luau_services():
+    _, (a, b) = space("sa", "sb")
+    zspd("admit", a.dir, zspd("key", a.dir), "1", "shell", "files")
+    assert zspd("scope", a.dir) == "2"  # where a may call b, and use nothing it shares
+    zspd("admit", a.dir, zspd("key", b.dir), "2")
+    folder = os.path.join(TMP, "shared")
+    os.makedirs(folder)
+    args = []
+    for d in (a, b):
+        with open(os.path.join(d.dir, "token")) as f:
+            args += [d.address, f.read()]
+    try:
+        p = subprocess.run(
+            ["lune", "run", os.path.join(ROOT, "luau", "tests", "live_services.luau"), *args, folder, sys.executable],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired as e:  # it waits on its sockets once something has gone wrong
+        raise timed_out(e) from None
+    sys.stdout.write(p.stdout.replace("ok\n", ""))
+    assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stdout[-2000:] + p.stderr
+
+
 def test_mirror():
     _, (a, b) = space("ma", "mb")
     args = []

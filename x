@@ -101,6 +101,7 @@ test)
 	node tests/vectors.mjs vectors/vectors.json
 	lune run luau/tests/vectors.luau vectors/vectors.json
 	lune run luau/tests/client.luau
+	lune run luau/tests/services.luau
 	# Structured state held to a model, with its shortcuts and without: side by side, as each is a minute or so.
 	lune run luau/tests/mirror_model.luau 300 & quick=$!
 	lune run luau/tests/mirror_model.luau 300 plain & long=$!
