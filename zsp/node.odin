@@ -31,6 +31,8 @@ Node :: struct {
 	host:        Host,
 	current:     ^Step, // the step under way, where storage may answer "not yet"
 	sweep:       Sweep, // what a roster has made unlawful, yet to be gone over
+	keep:        Keep, // of a partial replica: what it keeps of what it no longer watches, and for how long
+	retain:      Retain,
 }
 
 // Everything this package leaves to whoever embeds it. Any field may be nil.
@@ -129,6 +131,7 @@ node_destroy :: proc(n: ^Node) {
 	}
 	rpc_destroy(n)
 	sweep_reset(&n.sweep)
+	retain_reset(&n.retain)
 	for it in n.interests {
 		delete(it.reports)
 	}
@@ -541,6 +544,7 @@ node_commit :: proc(n: ^Node, cells: []Cell, from: ^Session) -> int {
 		for c in cells {
 			tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
 		}
+		used_written(n, cells)
 	}
 	return accepted
 }
@@ -551,7 +555,8 @@ node_sync :: proc(n: ^Node) -> bool {
 		return false
 	}
 	if store_wants_checkpoint(&n.store) {
-		return store_checkpoint(&n.store)
+		store_checkpoint(&n.store) or_return
+		retain_grown(n)
 	}
 	return true
 }
@@ -595,6 +600,9 @@ interest_add :: proc(s: ^Session, w: Watch, limit: u64, back: bool) -> ^Interest
 	n.next_watch += 1
 	append(&n.interests, Interest{id = INTEREST | n.next_watch, session = s.id, watch = w, limit = limit, back = back})
 	it := &n.interests[len(n.interests) - 1]
+	if w.data {
+		used_stamp(n, w.lo, w.hi)
+	}
 	for to in n.sessions {
 		if interest_concerns(n, s.id, to) {
 			interest_send(to, it)
@@ -632,6 +640,9 @@ interest_remove :: proc(n: ^Node, i: int) {
 	it := n.interests[i]
 	delete(it.reports)
 	unordered_remove(&n.interests, i)
+	if it.watch.data {
+		used_stamp(n, it.watch.lo, it.watch.hi)
+	}
 	for to in n.sessions {
 		if interest_concerns(n, it.session, to) {
 			send_unwatch(to, it.id)

@@ -24,6 +24,7 @@ Sim_Node :: struct {
 	missed: int, // reads it missed, before it last crashed
 	roster, roster_old, kept: []byte, // as persisted
 	skew:   i64, // of its clock, in milliseconds
+	ui:     ^Session, // of a partial replica: a client of its own, watching this and that
 	relayed: [dynamic]Sim_Relayed, // sessions for calls, carried through a relay
 }
 
@@ -226,6 +227,9 @@ sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 		}
 	}
 	x.node.now = sim_now(s, x)
+	if !x.full {
+		node_keep(&x.node, {age = 300, bytes = 3000}) // and so lets go of a great deal, often
+	}
 	if x.roster != nil {
 		assert(node_resume(&x.node, x.roster_old, x.roster) && !x.node.failed)
 	} else if !x.relay {
@@ -537,6 +541,11 @@ sim_settle :: proc(s: ^Sim) {
 				node_sync(&x.node)
 				busy = true
 			}
+			if x.ui != nil {
+				out := len(session_output(x.ui))
+				session_sent(x.ui, out)
+				busy |= out > 0
+			}
 		}
 		if !busy {
 			return
@@ -760,6 +769,31 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 			}
 		case r < 50 && rand.int_max(4) == 0:
 			sim_rotate(s)
+		case r >= 95 && rand.int_max(2) == 0:
+			// A partial replica's client looks at something, or no longer, and it lets go of what it may.
+			if x := rand.choice(s.nodes[:]); !x.full {
+				if x.ui == nil {
+					x.ui = sim_client(s, x)
+				}
+				id := u64(1 + rand.int_max(4))
+				if rand.int_max(3) == 0 {
+					f: [dynamic]byte
+					at := frame_begin(&f, .Unwatch)
+					write_varint(&f, id)
+					frame_end(&f, at)
+					session_input(x.ui, f[:])
+					delete(f)
+				} else {
+					scope := Scope(1 + rand.int_max(2))
+					list: List = {u64(scope) << 32 | u64(1 + rand.int_max(6)), 77}
+					limit := u64(rand.choice([]int{0, 3, 20}))
+					sim_watch(x.ui, id, list_lo(list), list_hi(list), limit, {data = true, live = true, back = rand.int_max(2) == 0})
+				}
+				session_sent(x.ui, len(session_output(x.ui)))
+				s.now += u64(rand.int_max(1000))
+				x.node.now = sim_now(s, x)
+				for node_retain(&x.node) {}
+			}
 		case r < 50:
 			// Power loss: the last synced state comes back, and nothing after it was acknowledged.
 			i := rand.int_max(n)
@@ -785,6 +819,7 @@ sim_chaos :: proc(s: ^Sim, steps: int) {
 				model_crash(&x.remote.host)
 			}
 			node_destroy(&x.node)
+			x.ui = nil // gone with it
 			if x.remote != nil {
 				x.missed += x.remote.remote.missed
 				remote_close(&x.remote.remote)
@@ -1193,6 +1228,137 @@ partial_after_full :: proc(t: ^testing.T) {
 	testing.expect_value(t, count(big), 36)
 }
 
+// A partial replica lets go of what it no longer watches: of a list nobody has watched for long enough, and, when it
+// holds more than it may, of the lists watched least lately first. Never of what it wrote and nobody else is known to
+// hold, nor of what is watched; and whatever it let go of comes again once it is watched again.
+@(test)
+partial_lets_go :: proc(t: ^testing.T) {
+	state := seeded(13)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, phone := s.nodes[0], s.nodes[1]
+	HOUR :: 3600 * 1000
+	node_keep(&phone.node, {age = 24 * HOUR, bytes = 0})
+	list :: proc(i: u64) -> List {
+		return {1 << 32 | 100 + i, i}
+	}
+	put :: proc(s: ^Sim, x: ^Sim_Node, l: List, order: u64, size: int) {
+		s.now += 3
+		x.node.now = sim_now(s, x)
+		place: [24]byte
+		put_u64(place[:], l[0])
+		put_u64(place[8:], l[1])
+		put_u64(place[16:], order)
+		body := make([]byte, size, context.temp_allocator)
+		row := node_id(&x.node, 1)
+		_ = node_write(&x.node, {{row, PLACE, .Place, node_stamp(&x.node), place[:]}, {row, DATA, .Value, node_stamp(&x.node), body}})
+		free_all(context.temp_allocator)
+	}
+	held :: proc(x: ^Sim_Node, l: List) -> int {
+		return store_range(&x.node.store, list_lo(l), list_hi(l)).count
+	}
+	retain :: proc(s: ^Sim, x: ^Sim_Node, after: u64) {
+		s.now += after
+		for y in s.nodes {
+			y.node.now = sim_now(s, y)
+		}
+		for _ in 0 ..< 10_000 {
+			if !node_retain(&x.node) {
+				break
+			}
+		}
+	}
+	for i in 0 ..< 300 {
+		for l in u64(0) ..< 3 {
+			put(&s, big, list(l), u64(i), 1000)
+		}
+	}
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	ui := sim_client(&s, phone)
+	defer session_close(ui)
+	look :: proc(s: ^Sim, ui: ^Session, id: u64, l: List, limit: u64) {
+		sim_watch(ui, id, list_lo(l), list_hi(l), limit, {data = true, live = true, back = true})
+		sim_settle(s)
+	}
+	unlook :: proc(s: ^Sim, ui: ^Session, id: u64) {
+		f: [dynamic]byte
+		defer delete(f)
+		at := frame_begin(&f, .Unwatch)
+		write_varint(&f, id)
+		frame_end(&f, at)
+		session_input(ui, f[:])
+		sim_settle(s)
+	}
+	// It reads all of list 0, then all of list 1, and keeps the end of list 2 open.
+	look(&s, ui, 1, list(0), 0)
+	unlook(&s, ui, 1)
+	retain(&s, phone, 6 * HOUR)
+	look(&s, ui, 2, list(1), 0)
+	unlook(&s, ui, 2)
+	look(&s, ui, 3, list(2), 20)
+	testing.expect_value(t, held(phone, list(0)), 300)
+	testing.expect_value(t, held(phone, list(1)), 300)
+	testing.expect_value(t, held(phone, list(2)), 20)
+	// It writes in list 3 while it reaches nobody.
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	for i in 0 ..< 5 {
+		put(&s, phone, list(3), u64(i), 100)
+	}
+	// A day after it last looked at list 0, that goes; list 1, looked at later, stays, and so does all the rest.
+	retain(&s, phone, 18 * HOUR + 1)
+	testing.expect_value(t, held(phone, list(0)), 0)
+	testing.expect_value(t, held(phone, list(1)), 300)
+	testing.expect_value(t, held(phone, list(2)), 20)
+	testing.expect_value(t, held(phone, list(3)), 5)
+	// And when it holds more than it may, the lists looked at least lately go first, and what is watched stays.
+	node_keep(&phone.node, {age = 24 * HOUR, bytes = u64(store_held(&phone.node.store)) / 2})
+	retain(&s, phone, 1)
+	testing.expect_value(t, held(phone, list(1)), 0)
+	testing.expect_value(t, held(phone, list(2)), 20)
+	testing.expect_value(t, held(phone, list(3)), 5)
+	// Days later, what it wrote is still there, for nobody has it yet; what is watched is there however long.
+	retain(&s, phone, 72 * HOUR)
+	testing.expect_value(t, held(phone, list(2)), 20)
+	testing.expect_value(t, held(phone, list(3)), 5)
+	// Once its writing is held elsewhere, that goes too, in its time; and what went comes back when it is looked at.
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect_value(t, held(big, list(3)), 5)
+	testing.expect_value(t, phone.node.outbox.root, 0)
+	retain(&s, phone, 25 * HOUR)
+	testing.expect_value(t, held(phone, list(3)), 0)
+	testing.expect_value(t, held(phone, list(2)), 20)
+	look(&s, ui, 4, list(0), 0)
+	testing.expect_value(t, held(phone, list(0)), 300)
+	sim_check(&s)
+	// It holds more than it may, all of it watched: once it has found that, it does not go over it again and again,
+	// at every checkpoint, but only once it has grown by much since.
+	grow :: proc(s: ^Sim, x: ^Sim_Node, rows: int) {
+		for i in 0 ..< rows {
+			put(s, x, list(2), u64(1000 + i), 10)
+		}
+		testing.expect(s.t, node_sync(&x.node) && store_checkpoint(&x.node.store))
+		retain_grown(&x.node)
+	}
+	grow(&s, phone, 1)
+	retain(&s, phone, 1)
+	testing.expect_value(t, held(phone, list(0)), 300)
+	grow(&s, phone, 5)
+	testing.expect(t, node_retain_due(&phone.node) > phone.node.now)
+	grow(&s, phone, 2000)
+	testing.expect_value(t, node_retain_due(&phone.node), phone.node.now)
+	retain(&s, phone, 1)
+	// It has nothing to do until the next list comes of age.
+	testing.expectf(t, node_retain_due(&phone.node) > phone.node.now, "due %v now %v running %v", node_retain_due(&phone.node), phone.node.now, phone.node.retain.running)
+}
+
 // Forgets what is in the outbox, as a store kept before full replicas kept one would never have had it.
 @(private)
 clear_map_outbox :: proc(n: ^Node) {
@@ -1223,6 +1389,7 @@ sim_restart :: proc(s: ^Sim, x: ^Sim_Node, full: bool, older := false) {
 	}
 	testing.expect(s.t, store_sync(&x.node.store) && store_checkpoint(&x.node.store))
 	node_destroy(&x.node)
+	x.ui = nil
 	if older {
 		for no in Page_No(0) ..< HEADER_PAGES {
 			if pg := x.disk.pages[no]; pg != nil {
