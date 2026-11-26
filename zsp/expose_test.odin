@@ -1,3 +1,4 @@
+#+build !js
 package zsp
 
 import "core:strings"
