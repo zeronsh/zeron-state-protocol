@@ -69,20 +69,21 @@ const { Client, columns } = await import(pathToFileURL(join(REPO, "web/src/clien
 const { MemoryVolume } = await import(pathToFileURL(join(REPO, "web/src/volume.ts")).href);
 const { loadModule } = await import(pathToFileURL(join(REPO, "web/src/wasm.ts")).href);
 
-const tmp = mkdtempSync(join(tmpdir(), "zsp-keep-"));
-try {
+// A relay, as one Durable Object in Node, and `count` web devices of a space at it, each watching one list.
+async function relayWith(count, env = {}) {
+  const tmp = mkdtempSync(join(tmpdir(), "zsp-keep-"));
   const spaceId = execFileSync(ZSPD, ["create", tmp], { encoding: "utf8" }).trim();
   const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
   const sql = new Sql(), sockets = new Set(), serverSockets = [];
-  const env = { RELAY_SECRET: relaySecret };
+  env = { RELAY_SECRET: relaySecret, ...env };
   const ctx = { storage: { sql, sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
-  let doSpace = new Space(ctx, env);
+  const r = { tmp, spaceId, ctx, env, sockets, serverSockets, doSpace: new Space(ctx, env), nodes: [], clients: [], states: [] };
 
   class BridgeWS {
     static OPEN = 1; static CLOSED = 3;
     constructor(url) {
       this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
-      doSpace.fetch(new Request(url.replace(/^ws/, "http")));
+      r.doSpace.fetch(new Request(url.replace(/^ws/, "http")));
       const { server, pair } = nextPair; this._s = server; serverSockets.push(server);
       pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
       pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
@@ -90,8 +91,8 @@ try {
     }
     _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
     addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
-    send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
-    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+    send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => r.doSpace.webSocketMessage(this._s, b)); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); r.doSpace.webSocketClose(this._s); } }
   }
 
   const mod = await loadModule();
@@ -99,50 +100,104 @@ try {
   const stA = await Store.open(volA, 16 << 20);
   stA.keep("device", readFileSync(join(tmp, "device.key")));
   await stA.close();
-  const nodeA = await Node.open({ volume: volA, module: mod, WebSocket: BridgeWS, log: () => {} });
-  const nodeB = await Node.open({ volume: new MemoryVolume(), module: mod, WebSocket: BridgeWS, log: () => {} });
+  r.nodes.push(await Node.open({ volume: volA, module: mod, WebSocket: BridgeWS, log: () => {} }));
+  for (let i = 1; i < count; i++) r.nodes.push(await Node.open({ volume: new MemoryVolume(), module: mod, WebSocket: BridgeWS, log: () => {} }));
   execFileSync(ZSPD, ["relay", tmp, relayPub, "ws://relay.local"]);
-  execFileSync(ZSPD, ["admit", tmp, nodeB.key, "1"]);
+  for (const n of r.nodes.slice(1)) execFileSync(ZSPD, ["admit", tmp, n.key, "1"]);
   const roster = readFileSync(join(tmp, spaceId, "roster"));
-  assert(nodeA.adopt(roster) && nodeB.adopt(roster));
+  for (const n of r.nodes) assert(n.adopt(roster));
+  for (const [i, n] of r.nodes.entries()) {
+    const c = new Client({ connect: n.connect.bind(n) });
+    r.clients.push(c);
+    r.states.push({ rows: [] });
+    if (i > 0) c.window({ scope: 1, list: "items", table: schema, size: 1000, from: "start" }, (st) => (r.states[i] = st));
+    await new Promise((go) => setTimeout(go, 100));
+  }
+  await new Promise((go) => setTimeout(go, 400));
+  r.close = async () => {
+    for (const c of r.clients) c.close();
+    for (const n of r.nodes) await n.close();
+    rmSync(tmp, { recursive: true, force: true });
+  };
+  return r;
+}
 
-  const schema = { body: columns.bytes(16) };
-  const clientA = new Client({ connect: nodeA.connect.bind(nodeA) });
-  const clientB = new Client({ connect: nodeB.connect.bind(nodeB) });
-  let stateB = { rows: [] };
-  clientB.window({ scope: 1, list: "items", table: schema, size: 1000, from: "start" }, (s) => (stateB = s));
-  await new Promise((r) => setTimeout(r, 500));
-  const [wsA, wsB] = serverSockets;
-  const kept = (ws) => ws.attachments.at(-1)?.state !== undefined;
-  assert(kept(wsA) && kept(wsB), "quiet before the burst, both are kept");
+const schema = { body: columns.bytes(16) };
+const kept = (ws) => ws.attachments.at(-1)?.state !== undefined;
+const until = async (f) => { for (let i = 0; i < 2000 && !f(); i++) await new Promise((go) => setImmediate(go)); return f(); };
 
-  // A burst: many messages each way, and only a few attachments for them.
-  const messagesBefore = wsA.sent.length + wsB.sent.length, attachmentsBefore = wsA.attachments.length + wsB.attachments.length;
-  const ROWS = 300;
-  // Right after any message, nothing is kept: whatever was is out of date. It is kept again only between messages.
-  const afterEach = [];
-  const handle = doSpace.webSocketMessage.bind(doSpace);
-  doSpace.webSocketMessage = (ws, m) => (handle(ws, m), afterEach.push(kept(wsA) || kept(wsB)));
-  const writes = [];
-  for (let i = 1; i <= ROWS; i++) writes.push(clientA.write(1, (ch) => ch.insert(schema, "items", i, { body: new Uint8Array(4000).fill(i & 0xff) })));
-  await Promise.all(writes);
-  for (let i = 0; i < 2000 && stateB.rows.length < ROWS; i++) await new Promise((r) => setImmediate(r));
-  assert.equal(stateB.rows.length, ROWS);
-  const messages = wsA.sent.length + wsB.sent.length - messagesBefore, attachments = wsA.attachments.length + wsB.attachments.length - attachmentsBefore;
-  assert(messages >= 20, `a burst of ${messages} messages only`);
-  assert(attachments <= messages / 4, `${attachments} attachments kept for ${messages} messages`);
-  assert(afterEach.length >= 10 && !afterEach.includes(true), "after a message, what was kept is let go of: waking then reconnects");
-  delete doSpace.webSocketMessage;
+{
+  const r = await relayWith(2);
+  try {
+    const [wsA, wsB] = r.serverSockets, [clientA] = r.clients;
+    assert(kept(wsA) && kept(wsB), "quiet before the burst, both are kept");
 
-  // Quiet again: all of it is kept, and an object woken from it resumes both connections without a word.
-  await new Promise((r) => setTimeout(r, 500));
-  assert(kept(wsA) && kept(wsB), "quiet after the burst, both are kept again");
-  const closed = [wsA.closed, wsB.closed];
-  doSpace = new Space(ctx, env); // as after hibernation: the sockets, their attachments and storage, and nothing else
-  assert.deepEqual([wsA.closed, wsB.closed], closed, "woken, it resumed both");
-  await clientA.write(1, (ch) => ch.insert(schema, "items", ROWS + 1, { body: new Uint8Array(64).fill(7) }));
-  for (let i = 0; i < 2000 && stateB.rows.length < ROWS + 1; i++) await new Promise((r) => setImmediate(r));
-  assert.equal(stateB.rows.length, ROWS + 1, "and what is said after waking reaches the other");
-  clientA.close(); clientB.close(); await nodeA.close(); await nodeB.close();
-  console.log(`ok   a relay keeps its connections for hibernation once a burst is over: ${attachments} attachments for ${messages} messages`);
-} finally { rmSync(tmp, { recursive: true, force: true }); }
+    // A burst: many messages each way, and only a few attachments for them.
+    const messagesBefore = wsA.sent.length + wsB.sent.length, attachmentsBefore = wsA.attachments.length + wsB.attachments.length;
+    const ROWS = 300;
+    // Right after any message, nothing is kept: whatever was is out of date. It is kept again only between messages.
+    const afterEach = [];
+    const handle = r.doSpace.webSocketMessage.bind(r.doSpace);
+    r.doSpace.webSocketMessage = (ws, m) => (handle(ws, m), afterEach.push(kept(wsA) || kept(wsB)));
+    const writes = [];
+    for (let i = 1; i <= ROWS; i++) writes.push(clientA.write(1, (ch) => ch.insert(schema, "items", i, { body: new Uint8Array(4000).fill(i & 0xff) })));
+    await Promise.all(writes);
+    assert(await until(() => r.states[1].rows.length === ROWS));
+    const messages = wsA.sent.length + wsB.sent.length - messagesBefore, attachments = wsA.attachments.length + wsB.attachments.length - attachmentsBefore;
+    assert(messages >= 20, `a burst of ${messages} messages only`);
+    assert(attachments <= messages / 4, `${attachments} attachments kept for ${messages} messages`);
+    assert(afterEach.length >= 10 && !afterEach.includes(true), "after a message, what was kept is let go of: waking then reconnects");
+    delete r.doSpace.webSocketMessage;
+
+    // Quiet again: all of it is kept, and an object woken from it resumes both connections without a word.
+    await new Promise((go) => setTimeout(go, 500));
+    assert(kept(wsA) && kept(wsB), "quiet after the burst, both are kept again");
+    const closed = [wsA.closed, wsB.closed];
+    r.doSpace = new Space(r.ctx, r.env); // as after hibernation: the sockets, their attachments and storage, and nothing else
+    assert.deepEqual([wsA.closed, wsB.closed], closed, "woken, it resumed both");
+    await clientA.write(1, (ch) => ch.insert(schema, "items", ROWS + 1, { body: new Uint8Array(64).fill(7) }));
+    assert(await until(() => r.states[1].rows.length === ROWS + 1), "and what is said after waking reaches the other");
+    console.log(`ok   a relay keeps its connections for hibernation once a burst is over: ${attachments} attachments for ${messages} messages`);
+  } finally { await r.close(); }
+}
+
+// Review, round 1. A connection whose socket throws, on send and on close, as one already broken may: what the
+// others were sent before it is still let go of from what was kept, else waking would resume one of them from a
+// count it has already sent under, and seal again under a nonce it had used. Nor does the throw escape.
+{
+  const r = await relayWith(3);
+  try {
+    const [wsA, wsB, wsC] = r.serverSockets, [clientA] = r.clients;
+    assert(kept(wsA) && kept(wsB) && kept(wsC), "all kept while quiet");
+    wsC.send = () => { throw new Error("socket already closed"); };
+    wsC.close = () => { throw new Error("socket already closed"); };
+    const thrown = [], after = [];
+    const handle = r.doSpace.webSocketMessage.bind(r.doSpace);
+    r.doSpace.webSocketMessage = (ws, m) => {
+      const sentB = wsB.sent.length;
+      try { handle(ws, m); } catch (e) { thrown.push(e.message); }
+      if (wsB.sent.length > sentB) after.push(kept(wsB));
+    };
+    await clientA.write(1, (ch) => ch.insert(schema, "items", 1, { body: new Uint8Array(64).fill(1) }));
+    assert(await until(() => r.states[1].rows.length === 1));
+    delete r.doSpace.webSocketMessage;
+    assert.deepEqual(thrown, [], "nothing thrown out of the object");
+    assert(after.length > 0 && !after.includes(true), "what B was sent outran nothing kept of it");
+    console.log("ok   a relay lets go of what was kept before anything is sent, though a socket throws");
+  } finally { await r.close(); }
+}
+
+// Review, round 1. Evicted while keeping is due, and woken at once: the object woken keeps its connections once quiet,
+// though the one before it had a timer still running.
+{
+  const r = await relayWith(2, { STATS: "1" });
+  try {
+    const [clientA] = r.clients;
+    await clientA.write(1, (ch) => ch.insert(schema, "items", 1, { body: new Uint8Array(64).fill(1) }));
+    await r.doSpace.fetch(new Request(`http://relay.local/${r.spaceId}?evict`));
+    await new Promise((go) => setTimeout(go, 400));
+    const live = r.ctx.getWebSockets();
+    assert(live.length === 2 && live.every(kept), `quiet after an eviction, ${live.filter(kept).length} of ${live.length} kept`);
+    console.log("ok   a relay evicted while keeping was due keeps its connections once quiet");
+  } finally { await r.close(); }
+}

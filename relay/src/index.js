@@ -69,7 +69,7 @@ export class Space extends DurableObject {
   #quiet; // a timer: once nothing has happened for QUIET_MS, a checkpoint if one is worth it
   #ending = new Set(); // connections whose input failed: let go of once what they have to hear is said, if anything is
   #kept = new Set(); // connections whose attachment holds what they are now, for waking after hibernation
-  #keeping = false; // keeping them again is due
+  #keeping = 0; // the epoch whose keeping them again is due, if any
 
   constructor(ctx, env) {
     super(ctx, env);
@@ -139,6 +139,7 @@ export class Space extends DurableObject {
     this.#done = (op, ok, absent, bytes, full) => {
       if (epoch !== this.#epoch || !this.#wasm) return; // an earlier node's, let go of
       if (full) return void this.#fail(); // to be kept here, and no room for it
+      this.#unkeep();
       const n = bytes?.length ?? 0;
       if (n > 0) this.#view(this.#wasm.buffer(n), n).set(bytes);
       this.#wasm.done(op.id, ok, absent, n);
@@ -174,7 +175,7 @@ export class Space extends DurableObject {
       this.#kept.add(id); // what it was kept as is what it is: out of date as soon as anything happens
       this.#next = Math.max(this.#next, id + 1);
     }
-    if (lost) exports.present(), this.#settle();
+    if (lost) this.#unkeep(), exports.present(), this.#settle();
   }
 
   #put(bytes, then) {
@@ -189,6 +190,7 @@ export class Space extends DurableObject {
     this.ctx.waitUntil(
       answer.then(Boolean, () => false).then((yes) => {
         if (!this.#sockets.has(id)) return;
+        this.#unkeep();
         this.#wasm.verdict(id, yes);
         this.#settle();
       }),
@@ -209,6 +211,7 @@ export class Space extends DurableObject {
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({ id, space: this.#space });
     this.#sockets.set(id, server);
+    this.#unkeep();
     this.#wasm.opened(id);
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -216,6 +219,7 @@ export class Space extends DurableObject {
   webSocketMessage(ws, message) {
     if (!this.#wasm) return void ws.close(1011, FULL); // what came before it was let go
     const { id } = ws.deserializeAttachment();
+    this.#unkeep();
     // Its last words, if any, are said by #settle, and only once what it came to is kept: else, nothing is said at all.
     if (typeof message === "string" || !this.#put(new Uint8Array(message), (n) => this.#wasm.received(id, n))) this.#ending.add(id);
     this.#settle();
@@ -233,6 +237,7 @@ export class Space extends DurableObject {
     const { id } = ws.deserializeAttachment();
     if (!this.#sockets.delete(id)) return;
     this.#kept.delete(id);
+    this.#unkeep();
     this.#wasm.closed(id);
     this.#settle();
   }
@@ -241,7 +246,9 @@ export class Space extends DurableObject {
     if (!this.#sockets.delete(id)) return;
     this.#kept.delete(id);
     this.#wasm.closed(id);
-    ws.close(1008, "");
+    try {
+      ws.close(1008, "");
+    } catch {} // already gone
   }
 
   #drain(id, ws) {
@@ -261,6 +268,7 @@ export class Space extends DurableObject {
   // After every event: make it durable, say what follows from it, start fetching what it wants, and be ready to sleep.
   #settle() {
     if (!this.#wasm) return;
+    this.#unkeep(); // as every event does before anything else: nothing is sent that what is kept has not let go of
     if (this.#broken) return void this.#fail(); // as where the roster could not be kept: nothing more is done
     const more = this.#wasm.settle();
     // What failed to be kept is said to nobody: not passed on, and no session saved as though it had been.
@@ -284,7 +292,6 @@ export class Space extends DurableObject {
       }
       this.#ending.clear();
     }
-    this.#unkeep();
     this.#wasm.ops(); // what taking output wanted, fetched now: not when something next happens
     this.#wasm.rest();
     if (this.#broken || this.#wasm.failed()) return void this.#fail();
@@ -308,18 +315,24 @@ export class Space extends DurableObject {
     }
   }
 
-  // What each connection was kept as is out of date now: let go of, once a burst, so that waking in its midst reconnects
-  // rather than resumes from it. Kept again once the burst is over, rather than after every message, which cost a fifth
-  // of what the object could pass on.
+  // What each connection was kept as is about to be out of date: let go of, once a burst and before anything in it is
+  // done, so that waking in its midst reconnects rather than resumes from it, and never seals again under a nonce it
+  // has used. Kept again once the burst is over, rather than after every message, which cost a fifth of what the
+  // object could pass on. A connection whose attachment cannot be let go of is let go of itself: nothing more is said
+  // to it.
   #unkeep() {
     for (const [id, ws] of this.#sockets) {
-      if (this.#kept.delete(id)) ws.serializeAttachment({ id, space: this.#space });
+      if (!this.#kept.delete(id)) continue;
+      try {
+        ws.serializeAttachment({ id, space: this.#space });
+      } catch {
+        this.#drop(id, ws);
+      }
     }
-    if (this.#keeping) return;
-    this.#keeping = true;
-    const epoch = this.#epoch;
+    if (this.#keeping === this.#epoch) return;
+    const epoch = (this.#keeping = this.#epoch);
     this.ctx.waitUntil(new Promise((go) => setTimeout(() => {
-      this.#keeping = false;
+      if (this.#keeping === epoch) this.#keeping = 0;
       if (epoch === this.#epoch) this.#keep();
       go();
     }, KEEP_AFTER)));
@@ -334,7 +347,9 @@ export class Space extends DurableObject {
         ws.serializeAttachment({ id, space: this.#space, state });
         if (state) this.#kept.add(id);
       } catch {
-        ws.serializeAttachment({ id, space: this.#space }); // too much to carry: after a sleep, it reconnects
+        try {
+          ws.serializeAttachment({ id, space: this.#space }); // too much to carry: after a sleep, it reconnects
+        } catch {} // gone
       }
     }
   }

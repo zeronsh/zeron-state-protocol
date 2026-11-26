@@ -637,9 +637,14 @@ node_post_link :: proc(n: ^Node, relay: u32, device: Key32, packet: []byte) -> b
 
 // Whether this device's own way to a relay has so much to send already that a packet of `size` handed to it now
 // would only be dropped: then better it waits, unsent. Not when there is no way there at all, as then nothing waits.
-node_link_backlogged :: proc(n: ^Node, relay: u32, size: int) -> bool {
+// With `flush`, what the session has is first put into the host's pipe, as far as it takes it; without, it is only
+// asked, as when the host works out how long it may wait.
+node_link_backlogged :: proc(n: ^Node, relay: u32, size: int, flush := true) -> bool {
 	s := node_session(n, relay)
-	return s != nil && s.ready && s.peer_relay && !s.closing && session_backlog_beyond(s, size, LINK_QUEUE)
+	if s == nil || !s.ready || !s.peer_relay || s.closing {
+		return false
+	}
+	return session_backlog_beyond(s, size, LINK_QUEUE) if flush else session_backlog(s) + size > LINK_QUEUE
 }
 
 // What a relay holds of signals for a device, beyond which it drops them: enough to keep a fast path full, little

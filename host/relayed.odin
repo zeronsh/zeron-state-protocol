@@ -282,13 +282,15 @@ relayed_deadline :: proc(sp: ^Space) -> (due: pipe.Time) {
 		return pipe.Time(time.tick_add(t, d)._nsec / 1000)
 	}
 	for r in sp.relayed {
-		// Held back by its own pipe, it can do nothing when its deadline comes: the pipe draining wakes the host.
-		if !zsp.node_link_backlogged(&sp.node, r.via, RELAY_PACKET) {
-			nearer(&due, pipe.link_deadline(r.link))
-		}
 		if r.link.state == .Dialling {
 			nearer(&due, at(r.next_knock, 0))
 		}
+		// Held back by its own pipe, it can send nothing when these come, and r.used stands still: the pipe draining
+		// wakes the host, which then sees to them.
+		if zsp.node_link_backlogged(&sp.node, r.via, RELAY_PACKET, flush = false) {
+			continue
+		}
+		nearer(&due, pipe.link_deadline(r.link))
 		if r.session != nil && zsp.node_calling(&sp.node, r.session) {
 			nearer(&due, at(r.used, CALL_ALIVE))
 		} else {
