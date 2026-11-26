@@ -23,11 +23,11 @@ export class Storage {
   #prefix = "";
   #made = false;
   #tail; // the log's last row, if it may grow: { off, bytes, len }
-  #cache = [new Map(), new Map()]; // kind -> key -> bytes, once read
   #cached = [0, 0]; // bytes
   #budget;
   #queue = []; // operations to start
   #running = 0;
+  #done; // who hears of what finishes: the node of the moment
   #failures = 0; // in a row, for backing off
   stats = { gets: 0, puts: 0, deletes: 0, got: 0, put: 0, rowsWritten: 0, rowsRead: 0, failures: 0 };
 
@@ -50,11 +50,11 @@ export class Storage {
   // Nothing is stored until someone admitted has something to store: merely knocking leaves no trace.
   make(space) {
     if (this.#made) return;
-    this.#made = true;
     this.#prefix = hex(space) + "/";
-    this.write("CREATE TABLE IF NOT EXISTS log (off INTEGER PRIMARY KEY, data BLOB) STRICT");
-    this.write("CREATE TABLE IF NOT EXISTS kept (name TEXT PRIMARY KEY, data BLOB) STRICT");
+    this.#sql.exec("CREATE TABLE IF NOT EXISTS log (off INTEGER PRIMARY KEY, data BLOB) STRICT");
+    this.#sql.exec("CREATE TABLE IF NOT EXISTS kept (name TEXT PRIMARY KEY, data BLOB) STRICT");
     this.#tables();
+    this.#made = true; // the tables are there, whatever comes of what follows
     this.keep("space", space);
   }
 
@@ -92,6 +92,13 @@ export class Storage {
     } catch (e) {
       throw /SQLITE_FULL|is full|exceeded|quota/i.test(String(e?.message ?? e)) ? new Full(String(e?.message ?? e)) : e;
     }
+  }
+
+  // Writes that leave less than there was: past any limit, which they are the way back under.
+  #shrink(query, ...args) {
+    const cursor = this.#sql.exec(query, ...args);
+    cursor.toArray();
+    this.stats.rowsWritten += cursor.rowsWritten;
   }
 
   #read(query, ...args) {
@@ -155,23 +162,24 @@ export class Storage {
     };
   }
 
+  // What is not kept is not remembered either: the tail row changes only once SQLite has it.
   #log_write(off, bytes) {
     const t = this.#tail;
     if (t && off === t.off + t.len && t.len + bytes.length <= LOG_ROW) {
-      t.bytes.set(bytes, t.len);
+      t.bytes.set(bytes, t.len); // past t.len, where nothing is believed until it is kept
+      this.#put_log_row(t.off, t.bytes.subarray(0, t.len + bytes.length));
       t.len += bytes.length;
-    } else {
-      for (let at = 0; at < bytes.length; at += LOG_ROW) {
-        const part = bytes.subarray(at, Math.min(bytes.length, at + LOG_ROW));
-        this.#tail = { off: off + at, bytes: grow(part, LOG_ROW), len: part.length };
-        if (at + LOG_ROW < bytes.length) this.#put_log_row(this.#tail);
-      }
+      return;
     }
-    this.#put_log_row(this.#tail);
+    for (let at = 0; at < bytes.length; at += LOG_ROW) {
+      const part = bytes.subarray(at, Math.min(bytes.length, at + LOG_ROW));
+      this.#put_log_row(off + at, part);
+      this.#tail = { off: off + at, bytes: grow(part, LOG_ROW), len: part.length };
+    }
   }
 
-  #put_log_row(t) {
-    this.write("INSERT INTO log VALUES (?, ?) ON CONFLICT (off) DO UPDATE SET data = excluded.data", t.off, t.bytes.subarray(0, t.len));
+  #put_log_row(off, bytes) {
+    this.write("INSERT INTO log VALUES (?, ?) ON CONFLICT (off) DO UPDATE SET data = excluded.data", off, bytes);
   }
 
   #log_read(off, into) {
@@ -192,19 +200,18 @@ export class Storage {
   }
 
   // Forgets lo <= offset < hi: the end of the log, or a stretch of it now in R2, or a segment dropped.
+  // In an order that loses nothing it keeps, wherever it stops: what lies past the cut is written anew before the row
+  // it was in is cut short or goes.
   #log_cut(lo, hi) {
     const rows = this.#read("SELECT off, length(data) AS n FROM log WHERE off < ? AND off + length(data) > ?", hi, lo);
     for (const { off, n } of rows) {
       const end = off + n;
-      if (off >= lo && end <= hi) {
-        this.write("DELETE FROM log WHERE off = ?", off);
-        continue;
+      if (end > hi) {
+        const [{ data }] = this.#read("SELECT data FROM log WHERE off = ?", off);
+        this.#shrink("INSERT INTO log VALUES (?, ?) ON CONFLICT (off) DO UPDATE SET data = excluded.data", hi, new Uint8Array(data).subarray(hi - off));
       }
-      const [{ data }] = this.#read("SELECT data FROM log WHERE off = ?", off);
-      const bytes = new Uint8Array(data);
-      this.write("DELETE FROM log WHERE off = ?", off);
-      if (off < lo) this.write("INSERT INTO log VALUES (?, ?)", off, bytes.subarray(0, lo - off));
-      if (end > hi) this.write("INSERT INTO log VALUES (?, ?)", hi, bytes.subarray(hi - off));
+      if (off < lo) this.#shrink("UPDATE log SET data = substr(data, 1, ?) WHERE off = ?", lo - off, off);
+      else this.#shrink("DELETE FROM log WHERE off = ?", off);
     }
     const t = this.#tail;
     if (t && t.off + t.len > lo && t.off < hi) {
@@ -232,7 +239,7 @@ export class Storage {
         const old = this.#read(`SELECT key, length(data) AS n FROM cache${kind} ORDER BY key LIMIT 16`);
         if (old.length === 0) break;
         for (const { key: k, n } of old) {
-          this.write(`DELETE FROM cache${kind} WHERE key = ?`, k);
+          this.#shrink(`DELETE FROM cache${kind} WHERE key = ?`, k);
           this.#cached[kind] -= n;
         }
       }
@@ -247,16 +254,23 @@ export class Storage {
   #cache_drop(kind, lo, hi) {
     const [row] = this.#read(`SELECT coalesce(sum(length(data)), 0) AS n FROM cache${kind} WHERE key >= ? AND key < ?`, lo, hi);
     if (row.n === 0) return;
-    this.write(`DELETE FROM cache${kind} WHERE key >= ? AND key < ?`, lo, hi);
+    this.#shrink(`DELETE FROM cache${kind} WHERE key >= ? AND key < ?`, lo, hi);
     this.#cached[kind] -= row.n;
   }
 
   // ---------------------------------------------------------------- R2
 
-  // Starts what the node asked for, as many at once as is reasonable. `done(op, ok, absent, bytes)` hears of each.
+  // Starts what the node asked for, as many at once as is reasonable. `done(op, ok, absent, bytes)` hears of each: the
+  // `done` given when it was started, of the node that asked, whatever has become of that node by the time it finishes.
   run(done) {
+    this.#done = done;
+    this.#start();
+  }
+
+  #start() {
     while (this.#queue.length > 0 && this.#running < MOST) {
       const op = this.#queue.shift();
+      const done = this.#done;
       this.#running++;
       const finished = this.#do(op).then(
         (r) => r,
@@ -273,7 +287,8 @@ export class Storage {
         }
         this.#running--;
         done(op, r.ok, r.absent ?? false, r.bytes);
-        this.run(done);
+        this.#start(); // for whoever asks now
+
       });
       this.#ctx.waitUntil(finished);
     }
@@ -289,7 +304,7 @@ export class Storage {
     this.cancel();
     if (!this.#made) return;
     for (const kind of [0, 1]) {
-      this.write(`DELETE FROM cache${kind}`);
+      this.#shrink(`DELETE FROM cache${kind}`);
       this.#cached[kind] = 0;
     }
   }

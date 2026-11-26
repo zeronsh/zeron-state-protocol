@@ -186,7 +186,8 @@ async function r2_finishes(seed) {
     s.run(done);
   });
   await finished;
-  for (const [id, r] of results) assert.ok(r.ok || id === 3 || !r.ok, id);
+  assert.equal(results.size, 3, "every operation started is heard of");
+  assert.ok(!results.get(3).ok || results.get(3).absent, "a page of a pack that is not there is not made up");
   // What did not land is asked for again by the node; here, by hand, until it lands.
   for (let tries = 0; !bucket.objects.has(Buffer.from(new Uint8Array(32).fill(seed & 255)).toString("hex") + "/p/5"); tries++) {
     assert.ok(tries < 50);
@@ -201,6 +202,90 @@ async function r2_finishes(seed) {
   });
   if (read.ok) assert.ok(read.bytes.length === 4096 && read.bytes.every((b) => b === 9));
   assert.ok(s.stats.puts >= 2 && s.stats.gets >= 1);
+}
+
+// An R2 that answers only when told to, to set operations of two nodes one after another.
+class Held {
+  constructor() {
+    this.objects = new Map();
+    this.pending = [];
+  }
+  #later(f) {
+    return new Promise((resolve, reject) => this.pending.push(async () => { try { resolve(await f()); } catch (e) { reject(e); } }));
+  }
+  async answer() {
+    while (this.pending.length > 0) {
+      await this.pending.shift()();
+      await new Promise((go) => setTimeout(go, 0));
+    }
+  }
+  put(key, body) { return this.#later(() => void this.objects.set(key, new Uint8Array(body))); }
+  get(key, { range }) {
+    return this.#later(() => {
+      const b = this.objects.get(key);
+      if (!b) return null;
+      const part = b.slice(range.offset, range.offset + range.length);
+      return { arrayBuffer: async () => part.buffer.slice(part.byteOffset, part.byteOffset + part.length) };
+    });
+  }
+  delete(keys) { return this.#later(() => { for (const k of keys) this.objects.delete(k); }); }
+}
+
+// A node let go of while its operations are under way, and the next: each hears of its own, and only of its own; what
+// the first had not started is never started, so that one of the same number as the next's is never taken for it.
+async function nodes_hear_their_own(seed) {
+  const sql = new Sql(), held = new Held(), waits = [];
+  const ctx = { storage: { sql, sync: async () => {} }, waitUntil: (p) => waits.push(p) };
+  const s = new Storage(ctx, { STORE: held });
+  const space = new Uint8Array(32).fill(seed & 255);
+  s.open(space);
+  const memory = new Uint8Array(1 << 16);
+  const host = s.imports((ptr, len) => memory.subarray(ptr, ptr + len), space);
+  host.log_write(0, 0, 1);
+  const heard = [[], []];
+  for (let i = 1; i <= 9; i++) host.start(i, 3, i, 0, 0, 0, 16); // more than are started at once
+  s.run((op, ok) => heard[0].push([op.id, ok]));
+  // Let go of: the ninth was never started, and is not.
+  s.cancel();
+  host.start(1, 3, 100, 0, 0, 0, 16); // the next node's first, of the same number as the first's
+  s.run((op, ok) => heard[1].push([op.id, ok, op.number]));
+  while (s.busy) {
+    await new Promise((go) => setTimeout(go, 1));
+    await held.answer();
+  }
+  await Promise.all(waits);
+  assert.equal(heard[0].length, 8, `the first node heard of ${heard[0].length} of its 8 started`);
+  assert.deepEqual(heard[1], [[1, true, 100]], `the next node heard ${JSON.stringify(heard[1])}`);
+  assert.ok(held.objects.has(Buffer.from(space).toString("hex") + "/p/100"), "and what it heard of is there");
+  assert.ok(!held.objects.has(Buffer.from(space).toString("hex") + "/p/9"), "what the first had not started never was");
+}
+
+// Full: what failed to be kept is not read back from memory as though it had been; what lessens what is kept is done
+// whatever the limit; and a store too full to keep its first write still has its tables.
+async function full_leaves_nothing_behind(seed) {
+  {
+    const { host, memory } = harness(seed, { STORAGE_LIMIT: String(60000) });
+    let off = 0, failed = -1;
+    for (let i = 0; i < 100 && failed < 0; i++) {
+      memory.fill(0x5a, 0, 4096);
+      if (host.log_write(off, 0, 4096) === 0) failed = off;
+      else off += 4096;
+    }
+    assert.ok(failed >= 0);
+    assert.equal(host.log_end(), failed);
+    assert.equal(host.log_read(failed, 1 << 16, 4096), 0, "what was not kept is not read back");
+    assert.equal(host.log_read(failed - 4096, 1 << 16, 4096), 1, "what was is");
+    host.log_cut(0, 4096); // past the limit: a delete is how to get back under it
+    host.log_cut(failed - 100, 2 ** 64);
+    assert.equal(host.log_end(), failed - 100);
+    host.cache_drop(0, 0, 2 ** 40);
+  }
+  {
+    const { host } = harness(seed, { STORAGE_LIMIT: "1" });
+    assert.equal(host.log_write(0, 0, 10), 0);
+    assert.equal(host.log_end(), 0, "its tables are there");
+    assert.equal(host.manifest_size(), -1);
+  }
 }
 
 // A node let go of: what it asked for and was not yet started is never started.
@@ -225,5 +310,7 @@ for (let seed = first; seed < first + seeds; seed++) {
   if (seed % 8 === 0) await full_fails_cleanly(seed);
   if (seed % 10 === 0) await r2_finishes(seed);
   if (seed === first) await cancelled_is_not_started(seed);
+  if (seed === first) await nodes_hear_their_own(seed);
+  if (seed % 5 === 0) await full_leaves_nothing_behind(seed);
 }
 console.log(`ok   relay storage held to its model over ${seeds} seeds`);
