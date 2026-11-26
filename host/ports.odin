@@ -159,8 +159,7 @@ ports_roster :: proc(sp: ^Space) {
 	if p == nil {
 		return
 	}
-	forwards_recheck(sp)
-	watchers_tell(p)
+	watchers_tell(p) // what it allowed is cut off already, by the host's own look at its forwards
 	p.reach = 0 // look again at everyone
 	for r in p.remotes {
 		r.unserved = false

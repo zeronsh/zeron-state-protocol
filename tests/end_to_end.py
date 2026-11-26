@@ -1049,6 +1049,11 @@ def test_ports():
     if direct:
         assert http_get(bee, port, host="bee.zsp.internal") == (200, b"bee's")
         assert http_get(bee, port) == (200, b"bee's")
+    # What a device offers is among the services it lists, to whoever it offers it.
+    listed = ca.call(bytes.fromhex(b.key), 1, "zsp.services")
+    data = b"".join(listed["data"])
+    assert listed["fault"] is None and data[0] == 0, listed
+    assert b"\x03" + struct.pack(">H", port) + b"\x00\x03web" in data, data
 
     # Two devices, one port: the other's is another machine's, offered from there.
     other = lan_address()

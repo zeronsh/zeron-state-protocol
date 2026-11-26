@@ -337,6 +337,18 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 			h.proxy_prelude = proc(sp: ^Space, from: Caller, port: u16, target: string) -> []byte {
 				return port_proxy_header(sp, from.device, port)
 			}
+			// What zsp.services lists: what is offered the caller, as zsp.ports says it.
+			h.ports_offered = proc(sp: ^Space, from: Caller, scope: zsp.Scope) -> []Port_Offer {
+				if sp.ports == nil || from.local != nil || from.relay {
+					return nil
+				}
+				list, _ := offered_to(sp.ports, from.device)
+				out := make([]Port_Offer, len(list), context.temp_allocator)
+				for e, i in list {
+					out[i] = {e.port, e.host, e.name}
+				}
+				return out
+			}
 		}
 		host_serve(h, "zsp.public", public_called)
 		host_serve(h, "zsp.expose", expose_called)
