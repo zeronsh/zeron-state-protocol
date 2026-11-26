@@ -700,3 +700,64 @@ remote_step_undone_puts_back_packs :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.cells.root, cells)
 	remote_store_settle(t, &x)
 }
+
+// A relay whose host holds a whole log and no manifest, as one kept wholly in its own storage did, makes its store
+// again from that log: checkpointing as it goes so as never to hold too much, and crashing on the way perhaps.
+// Its log then moves to object storage, an extent at a time.
+@(test)
+remote_store_made_from_a_whole_log :: proc(t: ^testing.T) {
+	state := seeded(77)
+	context.random_generator = rand.default_random_generator(&state)
+	// The old store: everything in one place.
+	m: Memory_Disk
+	defer memory_disk_destroy(&m)
+	q: Store
+	testing.expect(t, store_open(&q, memory_disk(&m)))
+	for _ in 0 ..< 15_000 {
+		cells: [4]Cell
+		for &c in cells {
+			c = random_cell(40_000, 1_000_000)
+		}
+		store_commit(&q, cells[:])
+		free_all(context.temp_allocator)
+	}
+	testing.expect(t, store_sync(&q))
+	want := census(&q)
+	x: Remote_Store
+	defer model_host_destroy(&x.host)
+	for seg, b in m.log {
+		memory_disk(&x.host.local).log_write(&x.host.local, seg * SEGMENT, b[:])
+	}
+	memory_disk(&x.host.local).log_sync(&x.host.local)
+	store_close(&q)
+	remote_store_open(t, &x, 64, 8)
+	checkpoints := 0
+	for round := 0; x.store.replaying; round += 1 {
+		testing.expect(t, len(x.store.dirty) <= CHECKPOINT_HARD + 64)
+		remote_store_turn(&x, rand.int_max(8))
+		if round % 97 == 96 {
+			// A crash on the way: it goes on from the last checkpoint.
+			model_crash(&x.host)
+			checkpoints += x.remote.stats.checkpoints
+			remote_store_close(&x)
+			remote_store_open(t, &x, 64, 8)
+		}
+		if round > 100_000 {
+			testing.fail_now(t, "never done replaying")
+		}
+	}
+	remote_store_settle(t, &x)
+	checkpoints += x.remote.stats.checkpoints
+	testing.expectf(t, checkpoints >= 2, "made again with %d checkpoints", checkpoints)
+	testing.expect_value(t, remote_census(t, &x), want)
+	// And the log goes to object storage.
+	for _ in 0 ..< 200 {
+		x.remote.want_checkpoint = true
+		remote_store_settle(t, &x)
+	}
+	testing.expectf(t, x.remote.uploaded >= store_tail(&x.store) / EXTENT * EXTENT, "uploaded %d of %d", x.remote.uploaded, store_tail(&x.store))
+	testing.expect(t, x.remote.local_from > 0)
+	testing.expect_value(t, remote_census(t, &x), want)
+	testing.expect(t, !x.store.failed)
+	remote_store_close(&x)
+}

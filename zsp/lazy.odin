@@ -206,8 +206,8 @@ frame_step :: proc(s: ^Session, frame: []byte) -> bool {
 		}
 		return true
 	}
-	if n.store.replaying {
-		return false
+	if n.store.replaying || remote_full(n.store.remote) {
+		return false // when the store has caught up
 	}
 	m := session_mark(s)
 	t := store_begin(&n.store)
@@ -264,6 +264,7 @@ node_retry :: proc(n: ^Node) -> (waiting: bool) {
 	if !store_lazy(&n.store) {
 		return false
 	}
+	n.store.more = false
 	if store_work(&n.store) || sweep_work(n) {
 		return true
 	}
@@ -600,6 +601,12 @@ replay_steps :: proc(s: ^Store) -> (waiting: bool) {
 				continue
 			}
 			at := s.replay_at + u64(pos)
+			if s.remote != nil && (len(s.dirty) > CHECKPOINT_HARD || (len(s.dirty) > CHECKPOINT_DIRTY && s.remote.inflight == nil)) {
+				// As much as a checkpoint should hold: the rest after one is under way, which remote_work begins.
+				s.replay_at = at
+				s.more = true
+				return true
+			}
 			t := store_begin(s)
 			replay_record(s, at, part[pos + RECORD_HEAD:][:n])
 			if store_missed(s, &t) {

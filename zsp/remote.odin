@@ -23,13 +23,14 @@ import "core:slice"
 
 PACK_SHIFT :: 20 // a pack holds at most 2^20 pages
 TEMP_PAGES :: Page_No(1) << 62 // numbers for pages not yet in any pack
-EXTENT :: SEGMENT / 4 // the log is put in object storage in pieces of this size
+EXTENT :: #config(ZSP_EXTENT, min(SEGMENT / 4, 1 << 20)) // the log is put in object storage in pieces of this size
+#assert(SEGMENT % EXTENT == 0 && EXTENT % LOG_BLOCK == 0)
 LOG_BLOCK :: min(64 << 10, EXTENT) // a read of the log fetches at least this much
 PAGE_RUN :: 16 // a read of a page fetches its neighbours in the pack too
 HINT_SIZE :: 48
 PACK_MAGIC :: 0x7a73_7070_6163_6b31 // "zsppack1", ending a pack
 MANIFEST_MAGIC :: [8]byte{'z', 's', 'p', '-', 'm', 'a', 'n', '1'}
-CHECKPOINT_HARD :: 8 * CHECKPOINT_DIRTY // changed pages past which writing waits for the checkpoint under way
+CHECKPOINT_HARD :: 4 * CHECKPOINT_DIRTY // changed pages past which writing waits for the checkpoint under way
 REDELETE_AFTER :: #config(ZSP_REDELETE_AFTER, 60 * 60 * 1000) // milliseconds after which what was deleted is deleted again
 
 Remote_Op_Kind :: enum u8 {
@@ -612,7 +613,17 @@ remote_delete :: proc(r: ^Remote, objects: []Remote_Object) {
 // waits for what is being fetched. Call after the store's own work, outside any step.
 remote_work :: proc(r: ^Remote) -> (waiting: bool) {
 	s := r.store
-	if s.replaying || s.failed {
+	if s.failed {
+		return false
+	}
+	if s.replaying {
+		// A long replay, as of a store made again from a whole log, is checkpointed as it goes, where it has got to.
+		if r.inflight == nil && len(s.dirty) > CHECKPOINT_DIRTY {
+			if remote_account_steps(r) {
+				return true
+			}
+			remote_begin(r)
+		}
 		return false
 	}
 	if r.inflight == nil && (r.want_checkpoint || store_wants_checkpoint(s) || len(r.dead) > 0) {
@@ -831,7 +842,7 @@ remote_begin :: proc(r: ^Remote) {
 	h := Header {
 		magic      = MAGIC,
 		generation = s.generation + 1,
-		log        = store_tail(s),
+		log        = s.replay_at if s.replaying else store_tail(s),
 		clock      = s.clock,
 		serial     = s.serial,
 		forgot     = s.forgot,

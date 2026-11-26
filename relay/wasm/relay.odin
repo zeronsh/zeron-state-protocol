@@ -1,6 +1,10 @@
 /*
 The relay as a WebAssembly module: package zsp, and nothing but, behind a handful of exports. The host
 gives it storage, a clock, entropy and an opinion on who may connect; it gives back bytes to send.
+
+Storage is two-tier (zsp/remote.odin): the host's own, synchronous, which holds the log's tail, a manifest and a
+cache; and object storage, asynchronous, which holds everything else. Operations on object storage are handed to
+the host with `start` and answered with `done`, whenever, in any order; after each, `settle` again.
 */
 package relay
 
@@ -12,14 +16,19 @@ foreign import host "host"
 
 @(default_calling_convention = "contextless")
 foreign host {
-	// Whether it was kept: storage may be full.
+	// The host's own storage. Whether it was kept: storage may be full.
 	log_write :: proc(off: f64, ptr: [^]byte, len: int) -> bool ---
 	log_read :: proc(off: f64, ptr: [^]byte, len: int) -> bool ---
 	log_end :: proc() -> f64 ---
-	log_drop :: proc(lo, hi: f64) ---
-	log_truncate :: proc(off: f64) ---
-	page_read :: proc(no: f64, ptr: rawptr) -> bool ---
-	page_write :: proc(no: f64, ptr: [^]byte, len: int) -> bool ---
+	log_cut :: proc(lo, hi: f64) ---
+	manifest_size :: proc() -> int --- // -1 for none
+	manifest_read :: proc(ptr: [^]byte) ---
+	manifest_write :: proc(ptr: [^]byte, len: int) -> bool ---
+	cache_get :: proc(kind: u8, key: f64, ptr: [^]byte, len: int) -> bool ---
+	cache_put :: proc(kind: u8, key: f64, ptr: [^]byte, len: int) ---
+	cache_drop :: proc(kind: u8, lo, hi: f64) ---
+	// Object storage: copy what `ptr` points at before returning (a pack's bytes, or Remote_Objects), and answer with `done`.
+	start :: proc(id: u32, kind: u8, number, off, len: f64, ptr: [^]byte, size: int) ---
 	save_roster :: proc(ptr: [^]byte, len: int) ---
 	// Answered by `verdict`, now or later.
 	authenticate :: proc(conn: u32, device: ^zsp.Key32, ptr: [^]byte, len: int) ---
@@ -27,7 +36,6 @@ foreign host {
 }
 
 CHECKPOINT_TAIL :: 256 << 10 // what waking may have to replay
-PAGES_KEPT :: 256
 MAX_PLAIN :: 60 << 10
 
 Conn :: struct {
@@ -40,16 +48,16 @@ Conn :: struct {
 }
 
 node: zsp.Node
+remote: zsp.Remote
 secret: zsp.Key32
 conns: map[u32]^Conn
-pages: map[zsp.Page_No]^zsp.Page
 message: [dynamic]byte // handed in and out
 
 @(export)
-init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len: int, roster: [^]byte, roster_len: int) -> bool {
+init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len: int, roster: [^]byte, roster_len: int, page_budget, block_budget: int) -> bool {
 	context = runtime.default_context()
 	secret = secret_ptr^
-	disk := zsp.Disk {
+	h := zsp.Remote_Host {
 		log_write = proc(_: rawptr, off: u64, bytes: []byte) -> bool {
 			return log_write(f64(off), raw_data(bytes), len(bytes))
 		},
@@ -57,36 +65,45 @@ init :: proc "c" (space_ptr, secret_ptr: ^zsp.Key32, before: [^]byte, before_len
 			return log_read(f64(off), raw_data(into), len(into))
 		},
 		log_end = proc(_: rawptr) -> u64 {return u64(log_end())},
-		log_drop = proc(_: rawptr, segment: u64) {
-			log_drop(f64(segment * zsp.SEGMENT), f64((segment + 1) * zsp.SEGMENT))
-		},
-		log_truncate = proc(_: rawptr, off: u64) {log_truncate(f64(off))},
-		// Storage here is synchronous, and what leaves is held back until it is durable.
+		log_cut = proc(_: rawptr, lo, hi: u64) {log_cut(f64(lo), f64(hi))},
+		// What is written is durable before anything leaves, and before any operation starts: the host sees to it.
 		log_sync = proc(_: rawptr) -> bool {return true},
-		page = proc(_: rawptr, no: zsp.Page_No) -> ^zsp.Page {
-			if pg, ok := pages[no]; ok {
-				return pg
-			}
-			pg := new(zsp.Page)
-			if !page_read(f64(no), pg) {
-				free(pg)
+		manifest_read = proc(_: rawptr) -> []byte {
+			n := manifest_size()
+			if n < 0 {
 				return nil
 			}
-			pages[no] = pg
-			return pg
+			b := make([]byte, n, context.temp_allocator)
+			manifest_read(raw_data(b))
+			return b
 		},
-		page_write = proc(_: rawptr, no: zsp.Page_No, bytes: []byte) -> bool {
-			if pg, ok := pages[no]; ok {
-				free(pg)
-				delete_key(&pages, no)
+		manifest_write = proc(_: rawptr, bytes: []byte) -> bool {
+			return manifest_write(raw_data(bytes), len(bytes))
+		},
+		cache_get = proc(_: rawptr, kind: zsp.Cached, key: u64, into: []byte) -> bool {
+			return cache_get(u8(kind), f64(key), raw_data(into), len(into))
+		},
+		cache_put = proc(_: rawptr, kind: zsp.Cached, key: u64, bytes: []byte) {
+			cache_put(u8(kind), f64(key), raw_data(bytes), len(bytes))
+		},
+		cache_drop = proc(_: rawptr, kind: zsp.Cached, lo, hi: u64) {
+			cache_drop(u8(kind), f64(lo), f64(hi))
+		},
+		start = proc(_: rawptr, op: ^zsp.Remote_Op) {
+			ptr, size := raw_data(op.body), len(op.body)
+			if op.kind == .Delete {
+				ptr, size = ([^]byte)(raw_data(op.objects)), len(op.objects) * size_of(zsp.Remote_Object)
 			}
-			return page_write(f64(no), raw_data(bytes), len(bytes))
+			start(op.id, u8(op.kind), f64(op.number), f64(op.off), f64(op.len), ptr, size)
 		},
-		page_sync = proc(_: rawptr) -> bool {return true},
-		close = proc(_: rawptr) {},
+		now = proc(_: rawptr) -> u64 {return u64(now())},
 	}
+	zsp.remote_open(&remote, h, page_budget, block_budget) or_return
+	node.store.remote = &remote
+	disk := zsp.remote_disk(&remote)
 	node.now = u64(now())
 	zsp.node_init(&node, disk, space_ptr^, nil, true) or_return
+	remote.store = &node.store
 	if roster_len > 0 {
 		zsp.node_resume(&node, before[:before_len], roster[:roster_len])
 	}
@@ -191,14 +208,43 @@ closed :: proc "c" (id: u32) {
 	free(c)
 }
 
-// Makes what has been accepted durable. Call once after each burst of input, before taking output.
+// Makes what has been accepted durable, goes on with whatever waited for what has come, and starts whatever is due.
+// Call after each burst of input and after each `done`, before taking output. 1 if there is more to do at once, and
+// it should be called again soon, rather than when something comes.
 @(export)
-settle :: proc "c" () {
+settle :: proc "c" () -> int {
 	context = runtime.default_context()
-	zsp.store_sync(&node.store)
-	if zsp.store_tail(&node.store) - node.checkpoint > CHECKPOINT_TAIL || zsp.store_wants_checkpoint(&node.store) {
-		zsp.store_checkpoint(&node.store)
+	defer free_all(context.temp_allocator)
+	if !node.store.replaying {
+		zsp.store_sync(&node.store)
 	}
+	zsp.node_retry(&node)
+	if !node.store.replaying && zsp.store_tail(&node.store) - node.checkpoint > CHECKPOINT_TAIL {
+		remote.want_checkpoint = true
+	}
+	zsp.remote_work(&remote)
+	zsp.remote_ops(&remote)
+	return 1 if node.store.more else 0
+}
+
+// An operation `start` began has finished; for a get, what it read lies in the buffer.
+@(export)
+done :: proc "c" (id: u32, ok, absent: bool, size: int) {
+	context = runtime.default_context()
+	zsp.remote_done(&remote, id, ok, absent, message[:size])
+	free_all(context.temp_allocator)
+}
+
+// What it has cost so far, into the buffer: eleven numbers.
+@(export)
+stats :: proc "c" () -> int {
+	context = runtime.default_context()
+	clear(&message)
+	st := remote.stats
+	for v in ([?]u64{u64(st.gets), u64(st.puts), u64(st.deletes), st.got, st.put, u64(st.checkpoints), u64(st.extents), u64(st.fetched_pages), u64(st.local_hits), u64(st.relocated), u64(len(node.store.dirty))}) {
+		zsp.write_u64(&message, v)
+	}
+	return len(message)
 }
 
 // Takes the next message for a connection into the buffer; its size, zero for none, -1 to close.
@@ -277,17 +323,12 @@ load :: proc "c" (id: u32, size: int) -> bool {
 	return true
 }
 
-// Between bursts: temporary memory, and pages worth no longer keeping.
+// Between bursts: temporary memory, and what is least lately used past the budget.
 @(export)
 rest :: proc "c" () {
 	context = runtime.default_context()
 	free_all(context.temp_allocator)
-	if len(pages) > PAGES_KEPT {
-		for _, pg in pages {
-			free(pg)
-		}
-		clear(&pages)
-	}
+	zsp.remote_rest(&remote)
 	if cap(message) > 64 << 10 {
 		delete(message)
 		message = {}

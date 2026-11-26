@@ -52,6 +52,7 @@ Store :: struct {
 	replaying:   bool,
 	step_missed: int, // reads that missed before the step under way began
 	remote:      ^Remote, // where it is kept in object storage: see remote.odin
+	more:        bool, // work was left off for want of room, not of anything fetched: call node_retry again soon
 	replay_at:   u64, // the next record, or where to look for it
 	replay_tail: u64, // the end of the last sound record
 	repair_at:   Key, // how far over the shelf repair_steps has gone

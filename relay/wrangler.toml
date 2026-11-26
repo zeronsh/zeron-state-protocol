@@ -13,5 +13,11 @@ class_name = "Space"
 tag = "v1"
 new_sqlite_classes = ["Space"]
 
+# Where a space is kept beyond what its object's own storage holds: without it, a space is kept in that storage alone
+# until it is full. `wrangler r2 bucket create zsp-relay` first.
+[[r2_buckets]]
+binding = "STORE"
+bucket_name = "zsp-relay"
+
 # wrangler secret put RELAY_SECRET    64 hex digits: openssl rand -hex 32
 # wrangler secret put ACCESS_TOKEN    optional

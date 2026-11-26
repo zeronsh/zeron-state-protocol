@@ -1,6 +1,6 @@
 """Real processes on real sockets: a relay, devices and clients. Run by `./x test`."""
 
-import os, re, shutil, socket, struct, subprocess, sys, tempfile, time, urllib.request
+import json, os, re, shutil, socket, struct, subprocess, sys, tempfile, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "clients", "python"))
@@ -675,8 +675,9 @@ def test_busy_node_takes_change():
 
 
 def test_relay_full():
-    """A relay that can keep no more of a space says so and lets go, and nothing anyone has is lost or garbled."""
-    cloud = Cloud().start(ACCESS_TOKEN="sesame", STORAGE_LIMIT="1500000", FULL_WAIT="3000")
+    """A relay that can keep no more of a space says so and lets go, and nothing anyone has is lost or garbled: as one
+    with nowhere to put what its object's own storage cannot hold, or whose object storage is down, comes to."""
+    cloud = Cloud().start(ACCESS_TOKEN="sesame", STORAGE_LIMIT="1500000", FULL_WAIT="3000", NO_R2="1")
     _, (a, b) = space("fa", "fb", relay=cloud, options=["--credential=" + cloud.token])
     ca, cb = a.client(), b.client()
     cb.watch(1, 1, "big")
@@ -708,6 +709,38 @@ def test_relay_full():
     assert len(ca.list(1, "big")) == 80, "nothing lost"
     # And after a while it lets devices in again, from what it kept.
     eventually("it lets devices in again", lambda: knock() == b"101", timeout=15)
+
+
+def test_relay_unbounded():
+    """With object storage behind it, a relay keeps far more of a space than its object's own storage may hold, and
+    each device comes to have all of it, whole."""
+    cloud = Cloud().start(ACCESS_TOKEN="sesame", STORAGE_LIMIT="3000000", CACHE_BYTES="400000", PAGES_KEPT="64", BLOCKS_KEPT="4")
+    _, (a, b) = space("ua", "ub", relay=cloud, options=["--credential=" + cloud.token])
+    ca, cb = a.client(), b.client()
+    cb.watch(1, 1, "big")
+    cb.until(lambda: 1 in cb.windows)
+    sent = {}
+    for i in range(240):  # fifteen megabytes, five times what may be kept there
+        sent[i] = bytes([i]) * 65536
+        ca.put(1, "big", i, [sent[i]])
+    cb.until(lambda: len(cb.list(1, "big")) == 240, timeout=120)
+    got = {order: values[16] for order, _, values in cb.list(1, "big")}
+    assert all(got[o] == sent[o] for o in sent), "nothing garbled"
+    stats = json.loads(urllib.request.urlopen(cloud.url.replace("ws", "http", 1) + "/" + zspd_space(a) + "?stats").read())
+    assert stats["sqlite"] < 3000000, stats
+    assert stats["node"]["extents"] >= 10 and stats["node"]["checkpoints"] > 0, stats
+    # A device that comes later is sent all of it, much of it from object storage.
+    c = Node("uc", "run", "--credential=" + cloud.token, "--no-udp")
+    zspd("admit", a.dir, zspd("key", c.dir), "1")
+    zspd("join", c.dir, zspd_space(a), cloud.key, cloud.url)
+    c.start()
+    eventually("it hears who belongs", lambda: os.path.exists(os.path.join(c.dir, zspd_space(a), "roster")))
+    cc = c.client()
+    cc.watch(1, 1, "big")
+    cc.until(lambda: len(cc.list(1, "big")) == 240, timeout=120)
+    assert all(values[16] == sent[order] for order, _, values in cc.list(1, "big")), "nothing garbled"
+    stats = json.loads(urllib.request.urlopen(cloud.url.replace("ws", "http", 1) + "/" + zspd_space(a) + "?stats").read())
+    assert stats["node"]["gets"] > 0, stats
 
 
 def slow_hibernation():

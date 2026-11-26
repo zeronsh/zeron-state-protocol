@@ -1,18 +1,15 @@
 // A Zeron State Protocol relay on Durable Objects: one object per space, asleep whenever nobody speaks.
 //
-// This file is plumbing. The protocol is ../wasm, compiled to relay.wasm; deciding who may use the relay
-// is yours: pass `authenticate` to `relay()`.
+// This file is plumbing. The protocol is ../wasm, compiled to relay.wasm; where a space is kept is ./storage.js, the
+// object's own SQLite before an R2 bucket bound as STORE; deciding who may use the relay is yours: pass
+// `authenticate` to `relay()`.
 
 import { DurableObject } from "cloudflare:workers";
 import module from "./relay.wasm";
+import { Storage, Full, hex } from "./storage.js";
 
-const CHUNK = 1 << 20; // storage takes no larger value than two of these
 const FULL = "this relay can keep no more of this space";
 
-// What SQLite throws when it can keep no more; and what is thrown here for STORAGE_LIMIT, the same way.
-class Full extends Error {}
-
-const hex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 const unhex = (s) => Uint8Array.from(s.match(/../g) ?? [], (b) => parseInt(b, 16));
 
 function instantiate(host) {
@@ -54,29 +51,29 @@ function derivePublicKey(secret) {
 }
 
 export class Space extends DurableObject {
-  #sql;
+  #storage;
   #wasm;
   #view;
   #sockets = new Map(); // connection number -> WebSocket
   #next = 1;
   #space;
-  #made = false; // the tables exist
   #sent = 0;
+  #epoch = 0; // of the node: what an earlier one started, it does not hear the end of
+  #soon = false; // a settle is due at once
   #full = 0; // when storage last could keep no more: for a while after, nobody is let in
   #broken = false; // storage failed where the node was not there to be told
 
   constructor(ctx, env) {
     super(ctx, env);
-    this.#sql = ctx.storage.sql;
     // A browser cannot send a WebSocket's own ping, so it says this, which is answered without waking anyone.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     // Nothing is stored until someone admitted has something to store: merely knocking leaves no trace. Until
     // then a sleeping object's sockets remember which space it is.
-    this.#made = this.#sql.exec("SELECT name FROM sqlite_master WHERE name = 'kept'").toArray().length > 0;
+    this.#storage = new Storage(ctx, env);
     const sockets = ctx.getWebSockets();
     for (const ws of sockets) this.#space ??= ws.deserializeAttachment()?.space;
-    this.#space ??= this.#kept("space");
-    if (this.#space) console.log("woke with", sockets.length, "sockets"), this.#begin();
+    this.#space ??= this.#storage.kept("space");
+    if (this.#space) console.log("woke with", sockets.length, "sockets"), this.#begin() && this.#settle();
   }
 
   // Wakes the node, unless storage can keep nothing: then everyone is told so and let go.
@@ -91,18 +88,6 @@ export class Space extends DurableObject {
     return true;
   }
 
-  // Writes, unless storage is full: a space may be kept up to STORAGE_LIMIT bytes, if that is given, as up to the
-  // platform's own limit, past which SQLite throws.
-  #write(query, ...args) {
-    const limit = Number(this.env.STORAGE_LIMIT ?? 0);
-    if (limit > 0 && this.#sql.databaseSize > limit) throw new Full(FULL);
-    try {
-      return this.#sql.exec(query, ...args);
-    } catch (e) {
-      throw /SQLITE_FULL|is full|exceeded|quota/i.test(String(e?.message ?? e)) ? new Full(String(e?.message ?? e)) : e;
-    }
-  }
-
   // Nothing more can be kept: what was not kept was not acknowledged, and every device still has it. Everyone here is
   // told and let go, the node with all it held in memory is let go too, and for a while nobody is let in.
   #fail() {
@@ -113,108 +98,50 @@ export class Space extends DurableObject {
     }
     this.#sockets.clear();
     this.#wasm = undefined;
+    this.#epoch++;
     this.#broken = false;
     this.#full = Date.now();
     console.log(FULL);
   }
 
-  #make() {
-    if (this.#made) return;
-    this.#made = true;
-    this.#write("CREATE TABLE log (off INTEGER PRIMARY KEY, data BLOB) STRICT");
-    this.#write("CREATE TABLE page (no INTEGER PRIMARY KEY, data BLOB) STRICT");
-    this.#write("CREATE TABLE kept (name TEXT PRIMARY KEY, data BLOB) STRICT");
-    this.#keep("space", this.#space);
-  }
-
-  #kept(name) {
-    if (!this.#made) return undefined;
-    const [row] = this.#sql.exec("SELECT data FROM kept WHERE name = ?", name).toArray();
-    return row && new Uint8Array(row.data);
-  }
-
-  #keep(name, bytes) {
-    this.#make();
-    this.#write("INSERT OR REPLACE INTO kept VALUES (?, ?)", name, bytes);
-  }
-
-  // Runs a write the node asked for, and says whether it was kept; one that fails where the node cannot be told
-  // breaks the store, which is then let go of.
-  #kept_if(f) {
-    try {
-      f();
-      return 1;
-    } catch (e) {
-      if (!(e instanceof Full)) throw e;
-      return 0;
-    }
-  }
-
   #wake(space) {
-    const sql = this.#sql;
+    const storage = this.#storage;
+    storage.open(space);
+    const epoch = ++this.#epoch;
     const { exports, view } = instantiate((view) => ({
-      log_write: (off, ptr, len) =>
-        this.#kept_if(() => {
-          this.#make();
-          for (let at = 0; at < len; at += CHUNK) {
-            this.#write("INSERT OR REPLACE INTO log VALUES (?, ?)", off + at, view(ptr + at, Math.min(CHUNK, len - at)).slice());
-          }
-        }),
-      log_read: (off, ptr, len) => {
-        if (!this.#made) return 0;
-        for (let got = 0; got < len; ) {
-          const [row] = sql.exec("SELECT off, data FROM log WHERE off <= ? ORDER BY off DESC LIMIT 1", off + got).toArray();
-          const from = row && off + got - row.off;
-          if (!row || from >= row.data.byteLength) return 0;
-          const part = new Uint8Array(row.data, from, Math.min(len - got, row.data.byteLength - from));
-          view(ptr + got, part.length).set(part);
-          got += part.length;
-        }
-        return 1;
-      },
-      log_end: () => {
-        if (!this.#made) return 0;
-        const [row] = sql.exec("SELECT off + length(data) AS end FROM log ORDER BY off DESC LIMIT 1").toArray();
-        return row?.end ?? 0;
-      },
-      log_drop: (lo, hi) => void (this.#made && sql.exec("DELETE FROM log WHERE off >= ? AND off < ?", lo, hi)),
-      log_truncate: (off) => {
-        if (!this.#made) return;
-        sql.exec("DELETE FROM log WHERE off >= ?", off);
-        sql.exec("UPDATE log SET data = substr(data, 1, ?1 - off) WHERE off < ?1 AND off + length(data) > ?1", off);
-      },
-      page_read: (no, ptr) => {
-        if (!this.#made) return 0;
-        const [row] = sql.exec("SELECT data FROM page WHERE no = ?", no).toArray();
-        if (!row) return 0;
-        view(ptr, row.data.byteLength).set(new Uint8Array(row.data));
-        return 1;
-      },
-      page_write: (no, ptr, len) =>
-        this.#kept_if(() => {
-          this.#make();
-          this.#write("INSERT OR REPLACE INTO page VALUES (?, ?)", no, view(ptr, len).slice());
-        }),
+      ...storage.imports(view, space),
       save_roster: (ptr, len) => {
-        const old = this.#kept("roster");
-        if (!this.#kept_if(() => {
-          if (old) this.#keep("roster.old", old);
-          this.#keep("roster", view(ptr, len).slice());
-        })) this.#broken = true;
+        try {
+          const old = storage.kept("roster");
+          storage.make(space);
+          if (old) storage.keep("roster.old", old);
+          storage.keep("roster", view(ptr, len).slice());
+        } catch (e) {
+          if (!(e instanceof Full)) throw e;
+          this.#broken = true;
+        }
       },
       authenticate: (id, device, ptr, len) => this.#judge(id, hex(view(device, 32)), view(ptr, len).slice()),
       now: () => Date.now(),
     }));
+    this.#done = (op, ok, absent, bytes) => {
+      if (epoch !== this.#epoch || !this.#wasm) return; // an earlier node's, let go of
+      const n = bytes?.length ?? 0;
+      if (n > 0) this.#view(this.#wasm.buffer(n), n).set(bytes);
+      this.#wasm.done(op.id, ok, absent, n);
+      this.#settle();
+    };
     this.#wasm = exports;
     this.#view = view;
-    const old = this.#kept("roster.old") ?? new Uint8Array();
-    const roster = this.#kept("roster") ?? new Uint8Array();
+    const old = storage.kept("roster.old") ?? new Uint8Array();
+    const roster = storage.kept("roster") ?? new Uint8Array();
     const ptr = exports.buffer(64 + old.length + roster.length);
     view(ptr, 32).set(space);
     view(ptr + 32, 32).set(unhex(this.env.RELAY_SECRET));
     view(ptr + 64, old.length).set(old);
     view(ptr + 64 + old.length, roster.length).set(roster);
-    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length)) {
+    const pages = Number(this.env.PAGES_KEPT ?? 2048), blocks = Number(this.env.BLOCKS_KEPT ?? 64);
+    if (!exports.init(ptr, ptr + 32, ptr + 64, old.length, ptr + 64 + old.length, roster.length, pages, blocks)) {
       throw exports.failed() ? new Full(FULL) : new Error("storage is damaged");
     }
     let lost = false;
@@ -250,7 +177,9 @@ export class Space extends DurableObject {
   }
 
   fetch(request) {
-    this.#space ??= unhex(new URL(request.url).pathname.slice(1));
+    const url = new URL(request.url);
+    this.#space ??= unhex(url.pathname.slice(1));
+    if (this.env.STATS === "1" && url.searchParams.has("stats")) return this.#stats();
     const wait = Number(this.env.FULL_WAIT ?? 60000);
     if (this.#full && Date.now() - this.#full < wait) return new Response(FULL + "\n", { status: 507 });
     if (!this.#wasm && !this.#begin()) return new Response(FULL + "\n", { status: 507 });
@@ -297,9 +226,12 @@ export class Space extends DurableObject {
     return n;
   }
 
-  // After every event: make it durable, say what follows from it, and be ready to sleep.
+  #done;
+
+  // After every event: make it durable, say what follows from it, start fetching what it wants, and be ready to sleep.
   #settle() {
-    this.#wasm.settle();
+    if (!this.#wasm) return;
+    const more = this.#wasm.settle();
     // One socket's end may give the others something to hear, so until nobody has anything.
     for (let said = true; said; ) {
       said = false;
@@ -324,7 +256,26 @@ export class Space extends DurableObject {
       }
     }
     this.#wasm.rest();
-    if (this.#broken || this.#wasm.failed()) this.#fail();
+    if (this.#broken || this.#wasm.failed()) return void this.#fail();
+    this.#storage.run(this.#done);
+    if (more && !this.#soon) {
+      // There is more it could do at once, as making a store again from a long log: after whatever else is waiting.
+      this.#soon = true;
+      this.ctx.waitUntil(new Promise((go) => setTimeout(() => (this.#soon = false, this.#settle(), go()), 0)));
+    }
+  }
+
+  // What keeping this space has cost so far, for whoever measures: only where STATS is set.
+  #stats() {
+    const out = { storage: this.#storage.stats, sqlite: this.ctx.storage.sql.databaseSize };
+    if (this.#wasm) {
+      const n = this.#wasm.stats();
+      const d = new DataView(this.#view(this.#wasm.data(), n).slice().buffer);
+      const names = ["gets", "puts", "deletes", "got", "put", "checkpoints", "extents", "fetched_pages", "local_hits", "relocated", "dirty"];
+      out.node = Object.fromEntries(names.map((k, i) => [k, Number(d.getBigUint64(i * 8, true))]));
+      out.memory = this.#wasm.memory.buffer.byteLength;
+    }
+    return new Response(JSON.stringify(out) + "\n", { headers: { "content-type": "application/json" } });
   }
 }
 
@@ -345,6 +296,7 @@ export function relay({ authenticate, admit } = {}) {
       const { pathname } = new URL(request.url);
       if (pathname === "/") return new Response(publicKey(env.RELAY_SECRET) + "\n");
       if (!/^\/[0-9a-f]{64}$/.test(pathname)) return new Response("no such space\n", { status: 404 });
+      if (env.STATS === "1" && new URL(request.url).searchParams.has("stats")) return env.SPACE.get(env.SPACE.idFromName(pathname.slice(1))).fetch(request);
       if (request.headers.get("Upgrade") !== "websocket") return new Response("expected a WebSocket\n", { status: 426 });
       if (admit && !(await admit({ request, space: pathname.slice(1), env }))) return new Response("not here\n", { status: 403 });
       return env.SPACE.get(env.SPACE.idFromName(pathname.slice(1))).fetch(request);

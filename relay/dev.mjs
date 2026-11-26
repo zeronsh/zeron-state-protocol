@@ -13,6 +13,7 @@ const mf = new Miniflare({
   modules: [
     { type: "ESModule", path: "worker.js", contents: text("worker.js") },
     { type: "ESModule", path: "index.js", contents: text("index.js") },
+    { type: "ESModule", path: "storage.js", contents: text("storage.js") },
     { type: "CompiledWasm", path: "relay.wasm", contents: readFileSync(at("relay.wasm")) },
   ],
   compatibilityDate: "2026-01-01",
@@ -21,7 +22,13 @@ const mf = new Miniflare({
     ...(process.env.ACCESS_TOKEN && { ACCESS_TOKEN: process.env.ACCESS_TOKEN }),
     ...(process.env.STORAGE_LIMIT && { STORAGE_LIMIT: process.env.STORAGE_LIMIT }),
     ...(process.env.FULL_WAIT && { FULL_WAIT: process.env.FULL_WAIT }),
+    ...(process.env.CACHE_BYTES && { CACHE_BYTES: process.env.CACHE_BYTES }),
+    ...(process.env.PAGES_KEPT && { PAGES_KEPT: process.env.PAGES_KEPT }),
+    ...(process.env.BLOCKS_KEPT && { BLOCKS_KEPT: process.env.BLOCKS_KEPT }),
+    STATS: "1",
   },
+  // A bucket for what the objects' own storage does not keep, unless NO_R2 says to see what happens without one.
+  ...(!process.env.NO_R2 && { r2Buckets: ["STORE"], r2Persist: process.env.PERSIST ?? false }),
   durableObjects: { SPACE: { className: "Space", useSQLite: true } },
   durableObjectsPersist: process.env.PERSIST ?? false,
 });
