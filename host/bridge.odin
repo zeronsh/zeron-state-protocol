@@ -401,11 +401,13 @@ bridge_finish :: proc(b: ^Bridge) {
 
 // Both ways are done with: the socket said all it would and heard all it will.
 @(private)
-bridge_check_over :: proc(b: ^Bridge) {
+bridge_check_over :: proc(b: ^Bridge) -> (finished: bool) {
 	if !b.over && b.eof && b.shut && host_call_find(b.sp, b.call) == nil {
 		b.status = .Closed
 		bridge_finish(b)
+		return true
 	}
+	return false
 }
 
 @(private)
@@ -645,9 +647,10 @@ bridge_send_held :: proc(b: ^Bridge) {
 }
 
 @(private)
-bridge_flush :: proc(b: ^Bridge) {
+// Writes what it can to the socket. False if that ended the bridge, which is then gone.
+bridge_flush :: proc(b: ^Bridge) -> (alive: bool) {
 	if b.over || !b.connected || b.send_op != nil {
-		return
+		return true
 	}
 	for len(b.prelude) > 0 || b.written < len(b.pending) {
 		prelude := len(b.prelude) > 0
@@ -670,11 +673,11 @@ bridge_flush :: proc(b: ^Bridge) {
 				}
 				bridge_flush(b)
 			})
-			return
+			return true
 		}
 		if err != nil {
 			bridge_abort(b, .Lost)
-			return
+			return false
 		}
 	}
 	clear(&b.pending)
@@ -685,8 +688,9 @@ bridge_flush :: proc(b: ^Bridge) {
 	if b.heard_end && !b.shut {
 		b.shut = true
 		net.shutdown(b.socket, .Send)
-		bridge_check_over(b)
+		return !bridge_check_over(b)
 	}
+	return true
 }
 
 @(private)

@@ -1355,6 +1355,39 @@ def test_expose():
     assert public_get(https, name.upper()) [:2] == (200, b"hello, public")
     assert http_get("127.0.0.1", plain, host=name) == (200, b"hello, public")
     assert http_get("127.0.0.1", plain, host="nobody.expose.test")[0] == 404
+    # A port that resets each connection as it accepts it: the public hears nothing from it, and the device and relay
+    # go on as before.
+    resets = socket.create_server(("127.0.0.1", free_port()))
+    resets.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # each accepted resets as it closes
+
+    def reset_each():
+        while True:
+            try:
+                c, _ = resets.accept()
+            except OSError:
+                return
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            c.close()
+
+    import threading
+
+    threading.Thread(target=reset_each, daemon=True).start()
+    rst = ca.expose(resets.getsockname()[1], name="rst", proxy=True)[-1]["label"] + ".expose.test"  # said first, to nobody
+    eventually("that one too", lambda: all(r["status"] == 0 for e in ca.exposures() for r in e["relays"]))
+    for _ in range(30):
+        http_get("127.0.0.1", plain, host=rst)
+    assert a.p.poll() is None and relay.p.poll() is None
+    assert http_get("127.0.0.1", plain, host=name) == (200, b"hello, public")
+    ca.unexpose(resets.getsockname()[1])
+    # A port nothing listens on: refused, and the device goes on.
+    nothing = free_port()
+    gone = ca.expose(nothing, name="gone")[-1]["label"] + ".expose.test"
+    eventually("and that", lambda: all(r["status"] == 0 for e in ca.exposures() for r in e["relays"]))
+    for _ in range(10):
+        assert http_get("127.0.0.1", plain, host=gone)[0] == 502
+    time.sleep(0.3)
+    assert a.p.poll() is None and http_get("127.0.0.1", plain, host=name) == (200, b"hello, public")
+    ca.unexpose(nothing)
 
     # Where each came from, if asked, before anything else.
     ca.expose(told, proxy=True)

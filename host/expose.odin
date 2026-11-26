@@ -348,14 +348,20 @@ public_dial :: proc(c: ^Public_In, six: bool) {
 		append(&prelude, ..c.prelude)
 		append(&prelude, ..c.early[:])
 		credit := len(c.early)
-		c.forward = bridge(c.sp, c.call, op.dial.socket, prelude[:])
-		// The bridge is the call's now, and says when it is over: until then this stays, to be cut off by.
-		c.forward.done, c.forward.done_data = public_in_bridged, c
-		call_consumed(c.sp, c.call, credit)
 		clear(&c.early)
-		if c.heard_end {
-			c.forward.handler.on_end(&c.forward.handler, c.call)
+		call_consumed(c.sp, c.call, credit)
+		// The bridge is the call's now, and says when it is over: until then this stays, to be cut off by. It is
+		// told so before it is joined to the socket, for that may end it at once (a port that resets as it
+		// accepts), and then it and this are gone: nothing of either is touched after.
+		b := bridge_new(c.sp, c.call)
+		if hc := host_call_find(c.sp, c.call); hc != nil {
+			hc.handler = &b.handler
+			b.heard_end = hc.heard_end
 		}
+		b.heard_end ||= c.heard_end
+		b.done, b.done_data = public_in_bridged, c
+		c.forward = b
+		bridge_attach(b, op.dial.socket, prelude[:])
 	}, timeout = 10 * time.Second)
 }
 
@@ -386,6 +392,10 @@ public_in_bridged :: proc(data: rawptr, status: Forward_Status) {
 
 @(private)
 public_in_drop :: proc(c: ^Public_In) {
+	// A call it answered (refused, say) may yet hear the other side's end or cancel: not here.
+	if hc := host_call_find(c.sp, c.call); hc != nil && hc.handler == &c.handler {
+		hc.handler = nil
+	}
 	p := c.sp.ports
 	if p != nil {
 		for x, i in p.public {

@@ -109,3 +109,44 @@ proxy_prelude_is_temporary :: proc(t: ^testing.T) {
 	testing.expect(t, len(header) > 16 && string(header[:12]) == "\r\n\r\n\x00\r\nQUIT\n")
 	testing.expect_value(t, len(track.allocation_map), 0)
 }
+
+// A space closes with a connection from the public joined to its port: let go once, by its bridge, and nothing of
+// it touched after.
+@(test)
+public_closed_with_its_space :: proc(t: ^testing.T) {
+	track: mem.Tracking_Allocator
+	mem.tracking_allocator_init(&track, context.allocator)
+	defer mem.tracking_allocator_destroy(&track)
+	context.allocator = mem.tracking_allocator(&track)
+	{
+		testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+		defer nbio.release_thread_event_loop()
+		ts: Test_Space
+		test_space(t, &ts)
+		defer test_space_destroy(&ts)
+		e: Echo
+		testing.expect(t, echo_start(&e))
+		defer echo_stop(&e)
+		ts.space.ports = new(Ports)
+		ts.space.ports.space = &ts.space
+		p := ts.space.ports
+		append(&p.exposures, Exposure{port = u16(e.port), label = strings.clone("closing")})
+		first := make([dynamic]byte, context.temp_allocator)
+		zsp.write_bytes(&first, transmute([]byte)string("closing"))
+		from := pipe.address_v4(192, 0, 2, 1, 4000)
+		append(&first, ..from.ip[:])
+		append(&first, 0x0f, 0xa0)
+		h, _ := public_called(&ts.space, 99, {relay = true}, 0, first[:])
+		c := (^Public_In)(h)
+		for i := 0; i < 200 && c.forward == nil; i += 1 {
+			nbio.tick(10 * time.Millisecond)
+		}
+		testing.expect(t, c.forward != nil)
+		ports_close(&ts.space) // as space_close does: ports, then bridges
+		bridges_close(&ts.space)
+		for _ in 0 ..< 5 {
+			nbio.tick(0)
+		}
+	}
+	testing.expectf(t, len(track.bad_free_array) == 0, "%d bad frees", len(track.bad_free_array))
+}

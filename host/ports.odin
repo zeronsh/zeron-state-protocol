@@ -90,7 +90,12 @@ ports_close :: proc(sp: ^Space) {
 		offer_destroy(&o)
 	}
 	for len(p.public) > 0 {
-		public_in_drop(p.public[0])
+		// One joined to its port is ended by its bridge, which says so to public_in_bridged, which lets it go.
+		if c := p.public[0]; c.forward != nil {
+			forward_close(c.forward)
+		} else {
+			public_in_drop(c)
+		}
 	}
 	for &e in p.exposures {
 		exposure_destroy(&e)
