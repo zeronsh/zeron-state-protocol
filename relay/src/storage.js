@@ -289,6 +289,29 @@ export class Storage {
     }
   }
 
+  // How long R2 takes from here: puts and gets of what the node puts and gets, timed, for measuring. Within a request,
+  // the clock moves with each answer.
+  async probe() {
+    const key = this.#prefix + "probe", times = {};
+    const median = (a) => a.sort((x, y) => x - y)[a.length >> 1];
+    const time = async (what, n, f) => {
+      const each = [];
+      for (let i = 0; i < n; i++) {
+        const began = Date.now();
+        await f();
+        each.push(Date.now() - began);
+      }
+      times[what] = median(each);
+    };
+    await time("put 1 MiB", 3, () => this.#bucket.put(key, new Uint8Array(1 << 20)));
+    await time("get 4 KiB", 7, async () => (await this.#bucket.get(key, { range: { offset: 4096, length: 4096 } })).arrayBuffer());
+    await time("get 64 KiB", 5, async () => (await this.#bucket.get(key, { range: { offset: 65536, length: 65536 } })).arrayBuffer());
+    await time("get 1 MiB", 3, async () => (await this.#bucket.get(key)).arrayBuffer());
+    await time("delete", 1, () => this.#bucket.delete(key));
+    await time("sqlite sync", 5, () => (this.#sql.exec("SELECT 1"), this.#ctx.storage.sync()));
+    return times;
+  }
+
   get busy() {
     return this.#running > 0 || this.#queue.length > 0;
   }

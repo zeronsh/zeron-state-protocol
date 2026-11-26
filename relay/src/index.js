@@ -181,6 +181,7 @@ export class Space extends DurableObject {
     this.#space ??= unhex(url.pathname.slice(1));
     if (this.env.STATS === "1" && url.searchParams.has("stats")) return this.#stats();
     if (this.env.STATS === "1" && url.searchParams.has("evict")) return this.#evict();
+    if (this.env.STATS === "1" && url.searchParams.has("probe")) return this.#storage.probe().then((t) => new Response(JSON.stringify(t) + "\n"));
     const wait = Number(this.env.FULL_WAIT ?? 60000);
     if (this.#full && Date.now() - this.#full < wait) return new Response(FULL + "\n", { status: 507 });
     if (!this.#wasm && !this.#begin()) return new Response(FULL + "\n", { status: 507 });
@@ -311,7 +312,7 @@ export function relay({ authenticate, admit } = {}) {
       const { pathname } = new URL(request.url);
       if (pathname === "/") return new Response(publicKey(env.RELAY_SECRET) + "\n");
       if (!/^\/[0-9a-f]{64}$/.test(pathname)) return new Response("no such space\n", { status: 404 });
-      if (env.STATS === "1" && /[?&](stats|evict)\b/.test(request.url)) return env.SPACE.get(env.SPACE.idFromName(pathname.slice(1))).fetch(request);
+      if (env.STATS === "1" && /[?&](stats|evict|probe)\b/.test(request.url)) return env.SPACE.get(env.SPACE.idFromName(pathname.slice(1))).fetch(request);
       if (request.headers.get("Upgrade") !== "websocket") return new Response("expected a WebSocket\n", { status: 426 });
       if (admit && !(await admit({ request, space: pathname.slice(1), env }))) return new Response("not here\n", { status: 403 });
       return env.SPACE.get(env.SPACE.idFromName(pathname.slice(1))).fetch(request);
