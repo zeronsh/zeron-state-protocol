@@ -603,6 +603,20 @@ def test_busy_node_takes_change():
         f.write("t")
     hung_up, heard = [], []
 
+    def whole(said):
+        # The request, and all of the one WebSocket message after it.
+        if b"\r\n\r\n" not in said:
+            return False
+        data = said[said.index(b"\r\n\r\n") + 4 :]
+        if len(data) < 2:
+            return False
+        n, at = data[1] & 127, 2
+        if n == 126:
+            n, at = (int.from_bytes(data[2:4], "big") if len(data) >= 4 else 1 << 30), 4
+        elif n == 127:
+            n, at = (int.from_bytes(data[2:10], "big") if len(data) >= 10 else 1 << 30), 10
+        return len(data) >= at + 4 + n
+
     def busy():
         # As a node that takes three seconds to answer: did whoever spoke wait for it?
         server.settimeout(30)
@@ -612,7 +626,7 @@ def test_busy_node_takes_change():
             except OSError:
                 return
             got = b""
-            while b"\r\n\r\n" not in got or len(got) < 60:
+            while not whole(got):  # however it comes, in pieces or at once
                 got += conn.recv(4096)
             heard.append(got)
             time.sleep(3)
@@ -632,7 +646,32 @@ def test_busy_node_takes_change():
     server.close()
     assert p.returncode == 0, p.stderr
     assert len(hung_up) == 2 and not any(hung_up), hung_up  # asked its clock, then handed the change, waiting each time
-    assert any(b"\x02" in h for h in heard)
+
+    def frames(said):
+        # The client's one WebSocket message, unmasked, as the protocol's frames: each a varint length, then its kind.
+        data = said[said.index(b"\r\n\r\n") + 4 :]
+        n, at = data[1] & 127, 2
+        if n == 126:
+            n, at = int.from_bytes(data[2:4], "big"), 4
+        elif n == 127:
+            n, at = int.from_bytes(data[2:10], "big"), 10
+        mask, at = data[at : at + 4], at + 4
+        body = bytes(b ^ mask[i % 4] for i, b in enumerate(data[at : at + n]))
+        kinds, r = [], 0
+        while r < len(body):
+            size, shift = 0, 0
+            while True:
+                byte = body[r]
+                r += 1
+                size |= (byte & 127) << shift
+                shift += 7
+                if byte < 128:
+                    break
+            kinds.append(body[r])
+            r += size
+        return kinds
+
+    assert frames(heard[0]) == [1] and frames(heard[1]) == [1, 2], [frames(h) for h in heard]  # a greeting; then with the roster
 
 
 def test_relay_full():
