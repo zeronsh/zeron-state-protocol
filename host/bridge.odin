@@ -774,4 +774,11 @@ bridge_dial :: proc(b: ^Bridge, at: net.Endpoint) {
 
 host_serve_builtin :: proc(h: ^Host) {
 	host_serve(h, "zsp.tcp", serve_tcp)
+	host_serve(h, "zsp.services", serve_services)
+	host_serve(h, "zsp.share", serve_shares)
+	host_serve(h, "zsp.list", serve_list)
+	host_serve(h, "zsp.get", serve_get)
+	host_serve(h, "zsp.put", serve_put)
+	host_serve(h, "zsp.exec", serve_exec)
+	host_serve(h, "zsp.pty", serve_pty)
 }

@@ -33,6 +33,8 @@ Config :: struct {
 	port_permitted: proc(sp: ^Space, caller: zsp.Key32, scope: zsp.Scope, port: u16, target: string) -> (ok: bool, proxy: bool),
 	// The bytes written to a port before anything else, when port_permitted asked for them (a PROXY header).
 	proxy_prelude:  proc(sp: ^Space, from: Caller, port: u16, target: string) -> []byte,
+	// The ports offered to a caller in a scope, for zsp.services to list (temporary memory).
+	ports_offered:  proc(sp: ^Space, from: Caller, scope: zsp.Scope) -> []Port_Offer,
 }
 
 Host :: struct {
@@ -64,6 +66,8 @@ Space :: struct {
 	calls: [dynamic]Host_Call, // whose end is the host
 	bridges: [dynamic]^Bridge, // of calls to TCP connections
 	relayed: [dynamic]^Relayed, // links through relays
+	shares: [dynamic]Share, // what this device lets others do on it
+	services: [dynamic]^Service_Call, // calls to them, which a change may end
 	audit: Audit_Log,
 }
 
@@ -172,6 +176,9 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 			}
 			save(file_in(s.dir, "roster"), bytes)
 			dialers_refresh(s.host)
+			// Rights may have gone: whatever they allowed ends.
+			services_recheck(s)
+			forwards_recheck(s)
 		},
 		signal       = links_signalled,
 		presence     = proc(data: rawptr, online: []zsp.Key32) {
@@ -185,6 +192,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 	}
 	if !h.relay {
 		s.node.host.questions = questions(s)
+		shares_load(s)
 	}
 	append(&h.spaces, s)
 	return s
@@ -208,6 +216,7 @@ space_close :: proc(s: ^Space) {
 	bridges_close(s)
 	calls_close(s)
 	relayed_close(s)
+	shares_close(s)
 	audit_close(s)
 	if !zsp.store_sync(&s.node.store) {
 		report(.Error, "could not sync the log")
