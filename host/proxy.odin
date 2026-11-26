@@ -218,9 +218,30 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 			entry = e
 		}
 	}
+	// A web request made through the proxy is held to what one made to the device's address is (http_verdict):
+	// what came with the request is judged here, being sent before anything could judge it there; what comes after
+	// it, by the forward's inspector. Until what came is enough to judge, more is waited for.
+	inspect: proc(data: rawptr, first: []byte) -> Inspection = proxied_guard
+	if len(early) > 0 {
+		verdict, reason := http_verdict(sp, device, early[:])
+		switch verdict {
+		case .Reject:
+			proxy_say_no(c, reason)
+			return
+		case .More:
+			if len(c.buf) >= PROXY_HEAD_MAX {
+				proxy_say_no(c, "too long a request")
+				return
+			}
+			proxy_client_wait(c) // read again from the start, with more
+			return
+		case .Pass:
+			inspect = nil
+		}
+	}
 	ports_wanted(sp, device)
 	pc := new(Proxied)
-	pc^ = {sp, device, rem, r.reply, c.socket}
+	pc^ = {sp, device, rem, r.reply, c.socket, nil}
 	// The forward has the socket now.
 	p := &h.proxy_server
 	for x, i in p.waiting {
@@ -233,7 +254,35 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 	delete(c.buf)
 	free(c)
 	rem.forwards += 1
-	forward(sp, device, remote_scope(rem), entry.port, entry.host, socket, proxied_done, pc, nil, early[:])
+	// Told how it went, maybe before forward returns, and then pc is gone: so it is kept only if it is a forward.
+	if f := forward(sp, device, entry.scope, entry.port, entry.host, socket, proxied_done, pc, inspect, early[:]); f != nil {
+		pc.forward = f
+	}
+}
+
+// A web request that may not pass: refused as the proxy refuses anything, and closed.
+@(private)
+proxy_say_no :: proc(c: ^Proxy_Client, reason: string) {
+	switch c.request.reply {
+	case .Socks:
+		no := pipe.socks_reply(2) // not allowed
+		net.send_tcp(c.socket, no[:])
+	case .Connect, .Absolute:
+		net.send_tcp(c.socket, http_forbidden(reason))
+	}
+	socket := c.socket
+	proxy_client_close(c, reset = false)
+	net.close(socket)
+}
+
+@(private)
+proxied_guard :: proc(data: rawptr, first: []byte) -> Inspection {
+	pc := (^Proxied)(data)
+	verdict, reason := http_verdict(pc.sp, pc.device, first)
+	if verdict == .Reject {
+		forward_reject(pc.forward, http_forbidden(reason))
+	}
+	return verdict
 }
 
 @(private)
@@ -252,6 +301,7 @@ Proxied :: struct {
 	remote: ^Remote,
 	reply:  type_of(pipe.Proxy_Request{}.reply),
 	socket: net.TCP_Socket,
+	forward: ^Forward,
 }
 
 // The device has connected, or would not: the application is told so, as its proxy would tell it.

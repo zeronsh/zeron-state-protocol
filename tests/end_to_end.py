@@ -1094,8 +1094,11 @@ def test_ports():
     if direct:
         s = socket.create_connection((bee, quiet), 3)
         assert s.recv(64) == b"SSH-2.0-zsp-test\r\n"
-        s.sendall(b"hello")
-        assert s.recv(64) == b"hello"
+        s.sendall(b"SSH-2.0-client\r\n")  # a line: what could begin a web request is held until it cannot
+        got = b""
+        while len(got) < 16:
+            got += s.recv(64)
+        assert got == b"SSH-2.0-client\r\n"
         s.shutdown(socket.SHUT_WR)
         got = b""
         while data := s.recv(64):
@@ -1122,6 +1125,21 @@ def test_ports():
         assert http_get(bee, port, host="attacker.example")[0] == 403
         assert http_get(bee, port, host="bee.zsp.internal", origin="https://attacker.example")[0] == 403
         assert http_get(bee, port, host="bee.zsp.internal", origin="http://bee.zsp.internal:%d" % port) == (200, b"bee's")
+        with socket.create_connection((bee, port), 5) as s:  # fetch sends a method as it is given
+            s.sendall(b"patch / HTTP/1.1\r\nHost: attacker.example\r\nOrigin: https://attacker.example\r\n\r\n")
+            assert s.recv(64).startswith(b"HTTP/1.1 403 ")
+    # Through the proxy alike: by name or address, after it has connected, or sent along with where to.
+    assert http_get("bee.zsp.internal", port, host="attacker.example", proxy=proxy)[0] == 403
+    assert http_get(bee, port, host="bee.zsp.internal", origin="https://attacker.example", proxy=proxy)[0] == 403
+    assert http_get(bee, port, host="bee.zsp.internal", proxy=proxy) == (200, b"bee's")
+    for request in (b"CONNECT bee.zsp.internal:%d HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\nHost: attacker.example\r\n\r\n" % port,
+                    b"GET http://bee.zsp.internal:%d/ HTTP/1.1\r\nHost: attacker.example\r\n\r\n" % port):
+        with socket.create_connection(proxy, 5) as s:
+            s.sendall(request)
+            got = b""
+            while data := s.recv(4096):
+                got += data
+            assert got.startswith(b"HTTP/1.1 403 "), (request, got)
     import json
 
     with open(os.path.join(b.dir, zspd_space(b), "audit.log")) as f:

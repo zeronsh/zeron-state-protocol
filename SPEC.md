@@ -665,9 +665,19 @@ and never otherwise. An offer marked so says who connects before anything else: 
 address on the callee's machine, with TLVs 0xE0, its device key, and 0xE1, its name.
 
 Whoever reaches another device's port through its address must be the user the node runs as, or the system: a host asks its system whose
-the connecting socket is, and refuses any other user's. And a connection whose first bytes are an HTTP request must name the device by
-`Host`, and if it has an `Origin`, be from one of the space's names or addresses; otherwise it is answered 403 and closed. So a web page
-elsewhere that has pointed a name of its own at one of these addresses (DNS rebinding) reaches nothing.
+the connecting socket is, and refuses any other user's. And a connection whose first bytes are an HTTP request, through the address or
+the proxy alike, must name the device by `Host`, and if it has an `Origin`, be from one of the space's names or addresses; otherwise it is
+answered 403 and closed. So a web page elsewhere that has pointed a name of its own at one of these addresses (DNS rebinding) reaches
+nothing. What a browser sends begins with a request line, `method SP target SP HTTP/d.d`, the method any token in any case, so:
+
+- empty lines before it are skipped, and a line may end in LF alone, as the most lenient server would read it;
+- bytes that cannot begin such a line pass at once, and are not HTTP; bytes that can are held until they cannot, or the head is whole;
+- the head must have exactly one `Host`, at most one `Origin`, and no folded or malformed header lines; a `Host` (and a target in absolute
+  form) is a name or address, then `:` and digits if anything, naming the device; an `Origin` is `http` or `https`, `://`, a name or
+  address of the space, then `:` and digits if anything, and nothing else (so not `null`);
+- only the first request of a connection is looked at: a browser keeps a connection for the one origin its first request named.
+
+A client that speaks first with a few letters and nothing after, waiting for an answer, waits until it says more.
 
 **Exposure.** A device may expose a port of its own machine to the public, through relays that will, one port at a time, under a
 **label**:

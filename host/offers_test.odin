@@ -143,9 +143,12 @@ web_pages_reach_only_their_own :: proc(t: ^testing.T) {
 	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nhost: DESK.zsp.internal.\r\n\r\n"), Inspection.Pass)
 	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: 127.77.0.3:8080\r\n\r\n"), Inspection.Pass)
 	testing.expect_value(t, verdict(sp, desk, cat("POST /x HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: http://", other, ":3000\r\n\r\nbody")), Inspection.Pass)
-	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.0\r\n\r\n"), Inspection.Pass) // no browser leaves out the name
+	testing.expect_value(t, verdict(sp, desk, "\r\nGET / HTTP/1.1\nHost: desk.zsp.internal\n\n"), Inspection.Pass)
+	testing.expect_value(t, verdict(sp, desk, "GET http://desk.zsp.internal:80/x HTTP/1.1\r\nHost: desk.zsp.internal\r\n\r\n"), Inspection.Pass)
 	// Not yet known.
 	testing.expect_value(t, verdict(sp, desk, "GE"), Inspection.More)
+	testing.expect_value(t, verdict(sp, desk, "\r\n"), Inspection.More)
+	testing.expect_value(t, verdict(sp, desk, "patch /x HTTP/1."), Inspection.More)
 	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk"), Inspection.More)
 	// Not HTTP at all: an SSH client, TLS.
 	testing.expect_value(t, verdict(sp, desk, "SSH-2.0-OpenSSH_9.6\r\n"), Inspection.Pass)
@@ -158,6 +161,21 @@ web_pages_reach_only_their_own :: proc(t: ^testing.T) {
 	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: null\r\n\r\n"), Inspection.Reject)
 	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nHost: attacker.example\r\n\r\n"), Inspection.Reject)
 	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal.attacker.example\r\n\r\n"), Inspection.Reject)
+	// However the request is written, by fetch or by hand, a server reads the same of it, or it is refused.
+	attacker := "Host: attacker.example\r\nOrigin: https://attacker.example\r\n\r\n"
+	testing.expect_value(t, verdict(sp, desk, cat("patch / HTTP/1.1\r\n", attacker)), Inspection.Reject) // fetch sends a method as given
+	testing.expect_value(t, verdict(sp, desk, cat(strings.repeat("A", 40, context.temp_allocator), " / HTTP/1.1\r\n", attacker)), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, cat("\r\n\r\nGET / HTTP/1.1\r\n", attacker)), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\nHost: attacker.example\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.0\r\n\r\n"), Inspection.Reject) // no browser leaves out the name
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: https://attacker.example\r\nOrigin: http://desk.zsp.internal\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal:80@attacker.example\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: https://desk.zsp.internal:80.attacker.example\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\nOrigin: https://desk.zsp.internal/x\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET http://attacker.example/ HTTP/1.1\r\nHost: desk.zsp.internal\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: desk.zsp.internal\r\n attacker.example\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost : attacker.example\r\nHost: desk.zsp.internal\r\n\r\n"), Inspection.Reject)
+	testing.expect_value(t, verdict(sp, desk, "GET / HTTP/1.1\r\nHost: [::1]:80\r\n\r\n"), Inspection.Reject)
 }
 
 @(private = "file")

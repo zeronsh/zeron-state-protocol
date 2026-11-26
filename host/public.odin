@@ -373,7 +373,7 @@ public_out_read :: proc(c: ^Public_Out) {
 			for line in strings.split_lines_iterator(&rest) {
 				name, colon, value := strings.partition(line, ":")
 				if colon != "" && strings.equal_fold(name, "host") {
-					host = strip_port(strings.trim_space(value))
+					host, _ = http_authority(strings.trim_space(value))
 				}
 			}
 			if !public_out_route(c, host) {

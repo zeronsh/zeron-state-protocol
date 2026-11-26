@@ -443,7 +443,10 @@ ports_accept :: proc(sp: ^Space, socket: net.TCP_Socket, local, from: net.Endpoi
 	c := new(Connection)
 	c.remote, c.device, c.sp = r, device, sp
 	r.forwards += 1
-	c.forward = forward(sp, device, remote_scope(r), entry.port, entry.host, socket, connection_done, c, http_guard)
+	// Told how it went, maybe before forward returns, and then c is gone: so it is kept only if it is a forward.
+	if f := forward(sp, device, entry.scope, entry.port, entry.host, socket, connection_done, c, http_guard); f != nil {
+		c.forward = f
+	}
 }
 
 @(private)
@@ -468,38 +471,99 @@ http_guard :: proc(data: rawptr, first: []byte) -> Inspection {
 	c := (^Connection)(data)
 	verdict, reason := http_verdict(c.sp, c.device, first)
 	if verdict == .Reject {
-		reply := fmt.tprintf("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: %d\r\n\r\n%s\n", len(reason) + 1, reason)
-		forward_reject(c.forward, transmute([]byte)reply)
+		forward_reject(c.forward, http_forbidden(reason))
 	}
 	return verdict
 }
 
 @(private)
+http_forbidden :: proc(reason: string) -> []byte {
+	return transmute([]byte)fmt.tprintf("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: %d\r\n\r\n%s\n", len(reason) + 1, reason)
+}
+
+// Whether the first bytes of a connection are a web request, and if so whether it may pass (SPEC §17). Whatever a
+// browser sends begins with a request line, `<method> <target> HTTP/<d>.<d>`, the method any token in any case (fetch
+// sends what it is given); so whatever cannot begin so is no browser's, and passes, and whatever can is waited for
+// until it is whole. The head is read as the most lenient server would read it (empty lines before it, lines that
+// end in LF alone), and anything a server could read two ways is refused: two Hosts or Origins, a folded line, a
+// line that is no header. Only the first request is looked at: a browser keeps a connection for one origin, the one
+// whose name the first request carries.
+@(private)
 http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte) -> (Inspection, string) {
-	// A method, a space: or it is not HTTP, and none of this applies.
-	method := 0
-	for method < len(first) && method < 16 && first[method] >= 'A' && first[method] <= 'Z' {
-		method += 1
+	b := first
+	for len(b) > 0 && (b[0] == '\r' || b[0] == '\n') {
+		b = b[1:]
 	}
-	if method == len(first) && method < 16 {
+	// The request line, as far as it has come: method SP target SP HTTP/d.d.
+	i := 0
+	for i < len(b) && tchar(b[i]) {
+		i += 1
+	}
+	if i == len(b) {
 		return .More, ""
 	}
-	if method == 0 || method >= 16 || first[method] != ' ' {
+	if i == 0 || b[i] != ' ' {
 		return .Pass, ""
 	}
-	end := strings.index(string(first), "\r\n\r\n")
-	if end < 0 {
+	i += 1
+	target_start := i
+	for i < len(b) && b[i] > ' ' && b[i] < 0x7f {
+		i += 1
+	}
+	if i == len(b) {
 		return .More, ""
 	}
-	head := string(first[:end])
-	_, _, rest := strings.partition(head, "\r\n")
-	host, origin: Maybe(string)
-	for line in strings.split_lines_iterator(&rest) {
-		name, colon, value := strings.partition(line, ":")
-		if colon == "" {
-			continue
+	if i == target_start || b[i] != ' ' {
+		return .Pass, ""
+	}
+	target := string(b[target_start:i])
+	i += 1
+	version := "HTTP/d.d"
+	for k in 0 ..< len(version) {
+		if i + k == len(b) {
+			return .More, ""
 		}
-		value = strings.trim_space(value)
+		c := b[i + k]
+		if version[k] == 'd' ? !(c >= '0' && c <= '9') : c != version[k] {
+			return .Pass, ""
+		}
+	}
+	i += len(version)
+	if i < len(b) && b[i] == '\r' {
+		i += 1
+	}
+	if i == len(b) {
+		return .More, ""
+	}
+	if b[i] != '\n' {
+		return .Pass, ""
+	}
+	// A web request: its head, whole, line by line.
+	rest := string(b[i + 1:])
+	host, origin: Maybe(string)
+	whole := false
+	for len(rest) > 0 {
+		lf := strings.index_byte(rest, '\n')
+		if lf < 0 {
+			break
+		}
+		line := strings.trim_suffix(rest[:lf], "\r")
+		rest = rest[lf + 1:]
+		if line == "" {
+			whole = true
+			break
+		}
+		colon := strings.index_byte(line, ':')
+		if line[0] == ' ' || line[0] == '\t' || colon <= 0 {
+			return .Reject, "a header that could be read two ways"
+		}
+		name := line[:colon]
+		for c in transmute([]byte)name {
+			if !tchar(c) {
+				return .Reject, "a header that could be read two ways"
+			}
+		}
+		value := strings.trim(line[colon + 1:], " \t")
 		switch {
 		case strings.equal_fold(name, "host"):
 			if host != nil {
@@ -507,27 +571,90 @@ http_verdict :: proc(sp: ^Space, device: zsp.Key32, first: []byte) -> (Inspectio
 			}
 			host = value
 		case strings.equal_fold(name, "origin"):
+			if origin != nil {
+				return .Reject, "two origins"
+			}
 			origin = value
 		}
 	}
-	if h, has := host.?; has && !names_device(sp, device, strip_port(h)) {
+	if !whole {
+		return .More, ""
+	}
+	h, has := host.?
+	if !has {
+		return .Reject, "a request must say which name it is for"
+	}
+	if name, ok := http_authority(h); !ok || !names_device(sp, device, name) {
 		return .Reject, "this is not that name"
 	}
-	if o, has := origin.?; has {
-		_, scheme, at := strings.partition(o, "://")
-		if scheme == "" || !names_space(sp, strip_port(at)) {
+	// A target in absolute form names its host too, and a server may take that over the Host.
+	if scheme_end := strings.index(target, "://"); scheme_end > 0 && target[0] != '/' {
+		authority := target[scheme_end + 3:]
+		if slash := strings.index_any(authority, "/?#"); slash >= 0 {
+			authority = authority[:slash]
+		}
+		if name, ok := http_authority(authority); !ok || !names_device(sp, device, name) {
+			return .Reject, "this is not that name"
+		}
+	}
+	if o, has_origin := origin.?; has_origin {
+		// As browsers write it: scheme://host[:port], and nothing more. "null", from a page that has no origin to
+		// say, is no page of this space.
+		scheme, sep, authority := strings.partition(o, "://")
+		name, ok := http_authority(authority)
+		if sep == "" || (scheme != "http" && scheme != "https") || !ok || !names_space(sp, name) {
 			return .Reject, "pages of other places may not reach this"
 		}
 	}
 	return .Pass, ""
 }
 
+// A request's host and port, as a Host header or an origin writes them: a name or IPv4 address, or an IPv6 one in
+// brackets, then a colon and digits, if anything. The host, if it is that and nothing else.
 @(private)
-strip_port :: proc(h: string) -> string {
-	if colon := strings.last_index_byte(h, ':'); colon >= 0 && !strings.contains(h[colon:], "]") {
-		return h[:colon]
+http_authority :: proc(a: string) -> (host: string, ok: bool) {
+	host = a
+	port := ""
+	if strings.has_prefix(a, "[") {
+		close := strings.index_byte(a, ']')
+		if close < 0 {
+			return "", false
+		}
+		host, port = a[:close + 1], a[close + 1:]
+	} else if colon := strings.index_byte(a, ':'); colon >= 0 {
+		host, port = a[:colon], a[colon:]
 	}
-	return h
+	if port != "" {
+		if len(port) < 2 || len(port) > 6 || port[0] != ':' {
+			return "", false
+		}
+		for c in transmute([]byte)port[1:] {
+			if c < '0' || c > '9' {
+				return "", false
+			}
+		}
+	}
+	if host == "" {
+		return "", false
+	}
+	if host[0] != '[' {
+		for c in transmute([]byte)host {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.') {
+				return "", false
+			}
+		}
+	}
+	return host, true
+}
+
+// A character of an HTTP token (RFC 9110 §5.6.2).
+@(private)
+tchar :: proc(c: byte) -> bool {
+	switch c {
+	case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return false
 }
 
 // Whether a name or address, as a web client writes it, is this device's.
