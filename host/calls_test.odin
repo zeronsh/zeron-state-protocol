@@ -1,6 +1,8 @@
 package host
 
+import "core:net"
 import "core:testing"
+import "core:time"
 import "../zsp"
 
 // What a handler does, said back to it.
@@ -120,4 +122,52 @@ handlers_may_speak_at_once :: proc(t: ^testing.T) {
 	testing.expect(t, len(a.calls) == 1 && a.calls[0].call == kc)
 	call_end(a, kc)
 	testing.expect(t, world_run(&w, proc(w: ^World, k: rawptr) -> bool {return (^Reentrant)(k).ended && nobody_left(w, nil)}, &keep))
+}
+
+// A call whose other side has said all it will before a socket is joined to it: the socket hears so at once, and
+// the bridge is over once the socket has said all it will too.
+@(test)
+bridge_after_the_end :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = true))
+	host_serve(&w.hosts[2], "zsp.said", proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, first: []byte) -> (^Call_Handler, zsp.Call_Fault) {
+		call_send(sp, call, transmute([]byte)string("all of it"))
+		call_end(sp, call)
+		@(static) quiet := Call_Handler{}
+		return &quiet, .Cancelled
+	})
+	a := world_space(&w, 1)
+	Waiting :: struct {
+		using handler: Call_Handler,
+		got: [dynamic]byte,
+	}
+	waiting: Waiting
+	defer delete(waiting.got)
+	waiting.data = &waiting
+	waiting.on_data = proc(h: ^Call_Handler, call: u64, bytes: []byte) -> bool {
+		append(&(^Waiting)(h.data).got, ..bytes)
+		return true
+	}
+	call := host_call(a, w.keys[2].device, 1, "zsp.said", nil, &waiting.handler)
+	testing.expect(t, call != 0)
+	testing.expect(t, world_run(&w, proc(w: ^World, call: rawptr) -> bool {
+		c := host_call_find(world_space(w, 1), (^u64)(call)^)
+		return c != nil && c.heard_end
+	}, &call))
+	// A socket's two ends: one for the bridge, one to see what it is told.
+	listener, _ := net.listen_tcp({net.IP4_Loopback, 0})
+	defer net.close(listener)
+	bound, _ := net.bound_endpoint(listener)
+	near, _ := net.dial_tcp(bound)
+	far, _, _ := net.accept_tcp(listener)
+	defer net.close(near)
+	bridge(a, call, far)
+	net.set_option(near, .Receive_Timeout, 5 * time.Second)
+	buf: [64]byte
+	n, err := net.recv_tcp(near, buf[:])
+	testing.expectf(t, err == nil && n == 0, "the socket was not told the other side had ended: %d, %v", n, err)
+	net.shutdown(near, .Send)
+	testing.expect(t, world_run(&w, nobody_left))
 }

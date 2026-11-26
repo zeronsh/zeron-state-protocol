@@ -96,6 +96,7 @@ bridge :: proc(sp: ^Space, call: u64, socket: net.TCP_Socket, prelude: []byte = 
 	b := bridge_new(sp, call)
 	if c := host_call_find(sp, call); c != nil {
 		c.handler = &b.handler
+		b.heard_end = c.heard_end // the other side may have said all it will already
 	}
 	bridge_attach(b, socket, prelude)
 	return b
@@ -104,7 +105,8 @@ bridge :: proc(sp: ^Space, call: u64, socket: net.TCP_Socket, prelude: []byte = 
 // Joins a connected socket, accepted here, to a port on a device: a zsp.tcp call in a scope. The forward owns the
 // socket, and closes it with a reset if the port cannot be reached. `done` is told how it ended, once.
 // `inspect`, if given, sees what the socket sends until it lets it through or rejects it; what comes back flows
-// from the start, for some protocols speak first.
+// from the start, for some protocols speak first. If the call cannot be made at all, `done` is told so before forward
+// returns, and forward returns nil.
 forward :: proc(
 	sp: ^Space,
 	device: zsp.Key32,

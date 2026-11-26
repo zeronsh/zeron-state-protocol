@@ -31,7 +31,8 @@ Config :: struct {
 	// Whether a caller may reach a TCP port through this device (zsp.tcp), and whether to tell the port who it
 	// is first, by what proxy_prelude says. Nil denies every port.
 	port_permitted: proc(sp: ^Space, caller: zsp.Key32, scope: zsp.Scope, port: u16, target: string) -> (ok: bool, proxy: bool),
-	// The bytes written to a port before anything else, when port_permitted asked for them (a PROXY header).
+	// The bytes written to a port before anything else, when port_permitted asked for them (a PROXY header), in
+	// temporary memory: they are copied.
 	proxy_prelude:  proc(sp: ^Space, from: Caller, port: u16, target: string) -> []byte,
 	// The ports offered to a caller in a scope, for zsp.services to list (temporary memory).
 	ports_offered:  proc(sp: ^Space, from: Caller, scope: zsp.Scope) -> []Port_Offer,
