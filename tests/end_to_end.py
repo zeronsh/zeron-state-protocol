@@ -1048,6 +1048,14 @@ def test_ports():
 
     # Nothing is offered unless it is.
     assert http_get("bee.zsp.internal", port, proxy=proxy) is None
+    # The proxy goes to the space's devices and nowhere else: refused plainly, and closed.
+    for target in (b"example.com:443", b"127.0.0.1:%d" % port):
+        with socket.create_connection(proxy, 3) as s:
+            s.sendall(b"CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" % (target, target))
+            got = b""
+            while data := s.recv(4096):
+                got += data
+            assert got.startswith(b"HTTP/1.1 403 "), (target, got)
     if direct:
         assert http_get(bee, port) is None
     assert cb.offers() == []
@@ -1484,6 +1492,45 @@ def test_expose_nowhere():
     port = free_port()
     ca.expose(port)
     eventually("the relay says it will not", lambda: [r["status"] for e in ca.exposures() for r in e["relays"]] == [1])
+
+
+def test_public_held_off():
+    """The public cannot keep the public out: what is not TLS, what fails its handshake, and what says nothing leave
+    nothing behind at the relay, and someone who has something to ask is still answered."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 8192), hard))
+    except (ImportError, ValueError, OSError):
+        pass
+    https = free_port()
+    relay = Node("ho-relay", "serve", "--no-udp", "--expose=expose.test", "--https=127.0.0.1:%d" % https,
+                 "--tls-cert=" + os.path.join(CERTS, "p256.pem"), "--tls-key=" + os.path.join(CERTS, "p256.key")).start()
+    _, (a,) = space("ho", relay=relay)
+    ca = a.client()
+    port = free_port()
+    Service("127.0.0.1", port, says=b"still here")
+    name = ca.expose(port)[0]["label"] + ".expose.test"
+    eventually("exposed", lambda: [r["status"] for e in ca.exposures() for r in e["relays"]] == [0])
+    assert public_get(https, name)[:2] == (200, b"still here")
+    fds = lambda: len(os.listdir("/proc/%d/fd" % relay.p.pid)) if os.path.isdir("/proc/self/fd") else 0
+    before = fds()
+
+    # More than the relay holds at once of what is not TLS, and of hellos for names nobody has: each is let go.
+    for junk in (b"\0\0\0\0\0", b"GET / HTTP/1.1\r\n\r\n"):
+        for _ in range(1100):
+            with socket.create_connection(("127.0.0.1", https), 5) as s:
+                s.sendall(junk)
+    eventually("the relay holds nothing of them", lambda: fds() <= before)
+    assert public_get(https, name)[:2] == (200, b"still here")
+
+    # More than it holds at once of connections that say nothing: the longest silent make room.
+    silent = [socket.create_connection(("127.0.0.1", https), 5) for _ in range(1100)]
+    assert public_get(https, name)[:2] == (200, b"still here")
+    for s in silent:
+        s.close()
+    eventually("and of them", lambda: fds() <= before)
 
 
 def varint_bytes(b):

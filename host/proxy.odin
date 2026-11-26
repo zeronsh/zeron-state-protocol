@@ -197,8 +197,9 @@ proxy_client_go :: proc(c: ^Proxy_Client) {
 		case .Connect, .Absolute:
 			net.send_tcp(c.socket, transmute([]byte)string("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		}
+		socket := c.socket // closed here, plainly: proxy_client_close frees c
 		proxy_client_close(c, reset = false)
-		net.close(c.socket)
+		net.close(socket)
 		return
 	}
 	// What came after the request, and for an absolute request the request itself, goes first.
