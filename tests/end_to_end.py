@@ -1034,17 +1034,24 @@ def test_names():
     query = struct.pack(">HHHHHH", 7, 0x0100, 1, 0, 0, 0) + name + struct.pack(">HH", 1, 1)
     asked = 60000
     with socket.create_connection((host, int(dport)), 5) as s:
+        import select
         import threading
 
+        # A timeout bounds all of a sendall, however it goes, and a slow machine takes more than that to ask all this:
+        # so what asks has none, and what reads waits so long at most for each answer to come.
+        s.settimeout(None)
         threading.Thread(target=lambda: s.sendall((struct.pack(">H", len(query)) + query) * asked), daemon=True).start()
-        got, answers = b"", 0
+        got, answers = bytearray(), 0
         while answers < asked:
+            assert select.select([s], [], [], 5)[0], "the name server stopped after %d answers" % answers
             data = s.recv(1 << 20)
             assert data, "the name server hung up after %d answers" % answers
             got += data
-            while len(got) >= 2 and len(got) >= 2 + struct.unpack(">H", got[:2])[0]:
-                got = got[2 + struct.unpack(">H", got[:2])[0]:]
+            at = 0  # counted where they lie, not cut off one by one: that is as slow as what is read is long
+            while len(got) - at >= 2 and len(got) - at >= 2 + struct.unpack_from(">H", got, at)[0]:
+                at += 2 + struct.unpack_from(">H", got, at)[0]
                 answers += 1
+            del got[:at]
     assert a.p.poll() is None
     # And however fast one asker asks and reads, the others are answered meanwhile.
     stop = threading.Event()
@@ -1066,6 +1073,8 @@ def test_names():
             while not stop.is_set():
                 try:
                     s.sendall(frames)
+                except TimeoutError:
+                    continue  # a slow machine's: asked on all the same
                 except OSError:
                     return
 
@@ -2182,12 +2191,33 @@ def test_public_outlives_its_device():
     reader.connect(("127.0.0.1", plain))
     reader.sendall(f"GET / HTTP/1.1\r\nHost: {name}\r\n\r\n".encode())
     reader.shutdown(socket.SHUT_WR)
+    # It reads, a little at a time, as one that is slow but there: one that read nothing for PUBLIC_STALL would be let go,
+    # and a slow machine can take that long to have all of it on its way.
+    got, slowly = 0, threading.Event()
+
+    def trickle():
+        nonlocal got
+        while not slowly.wait(0.3):
+            got += len(reader.recv(4096))
+
+    trickler = threading.Thread(target=trickle, daemon=True)
+    trickler.start()
     assert done.wait(10)
-    time.sleep(0.6)
+
+    def passed_on():  # all of it, the device's side of the call over: written down as it ends
+        try:
+            with open(os.path.join(a.dir, zspd_space(a), "audit.log")) as f:
+                return any('"event":"close"' in line and '"service":"public"' in line for line in f)
+        except OSError:
+            return False
+
+    eventually("the device passes all of it on", passed_on, 10)
+    time.sleep(0.5)  # and what it has said has left it, rather than ended in its hands
     a.p.kill()  # the space's only device, gone
     a.p.wait()
     time.sleep(0.6)
-    got = 0
+    slowly.set()
+    trickler.join()
     try:
         while data := reader.recv(1 << 16):
             got += len(data)
