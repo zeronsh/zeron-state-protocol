@@ -1,4 +1,4 @@
-// Names, ports and exposure, as the TypeScript client asks its zspd device's host (SPEC §18): the same as
+// Names, ports and exposure, as the TypeScript client asks its zspd device's host (SPEC §17): the same as
 // luau/tests/ports.luau and tests/end_to_end.py's, so that every client is held to the same. `node test/ports.ts`
 
 import { createServer } from "node:net";

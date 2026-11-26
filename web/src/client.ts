@@ -2061,7 +2061,7 @@ export class Client {
     });
   }
 
-  // ---------------------------------------------------------------- this device's host: names, ports, exposures (§18)
+  // ---------------------------------------------------------------- this device's host: names, ports, exposures (§17)
 
   /** Calls a zsp.* method of this device's own host, in the least scope this client may call in. */
   async #hostCall(method: string, data: Uint8Array): Promise<codec.Reader> {
@@ -2309,7 +2309,7 @@ export interface Port {
   readonly name: string;
 }
 
-/** A device of the space as this one reaches it (SPEC §18). */
+/** A device of the space as this one reaches it (SPEC §17). */
 export interface NodeInfo {
   readonly id: string;
   readonly name: string; // <name>.<suffix>, or <id>.id.<suffix>: what any application here reaches it by

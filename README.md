@@ -59,7 +59,7 @@ text of 8,000 pieces is at most some 200 cells to fetch, check and open, in thre
 the same for as long as the space lasts; whatever it offers is reached at it by any application, ssh or a browser, two devices on one port
 alike, with no VPN and nothing made in the kernel. Nothing is offered unless it is, nobody but its user may borrow a device's reach, and a
 page elsewhere led there by a name of its own reaches nothing. A port may be exposed to the public too, through a relay, under a name
-nobody else can be given ([SPEC §18](SPEC.md#18-names-ports-and-exposure)).
+nobody else can be given ([SPEC §17](SPEC.md#17-names-ports-and-exposure)).
 
 ## Measured
 
