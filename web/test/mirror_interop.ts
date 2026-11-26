@@ -40,7 +40,7 @@ const number = (slot: number) =>
       return new DataView(b.buffer, b.byteOffset, 8).getFloat64(0);
     },
   );
-const Board = board(number, false); // as web/test/mirror_interop.luau has it
+const Board = board(number); // as web/test/mirror_interop.luau has it
 
 // Strings and numbers as their bytes, maps by their keys' bytes, in order, and ids as hex, as the Luau side writes them
 // down. An empty string in a map is no value, as it is to a mirror; and an empty list is "{}", as is an empty map.
@@ -171,7 +171,7 @@ try {
         const before = p.out.length;
         let draft: unknown;
         void doc.update((d) => {
-          mutate(d, rng, false);
+          mutate(d, rng);
           draft = plain(d);
         });
         run(p);

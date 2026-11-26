@@ -148,7 +148,8 @@ local function number(slot: number): any
 	end)
 end
 
-local Task = m.map({ title = zsp.string(16), done = zsp.boolean(17), notes = zsp.text(18), tags = m.list(19, zsp.string(16)) })
+local Step = m.map({ name = zsp.string(16) })
+local Task = m.map({ title = zsp.string(16), done = zsp.boolean(17), notes = zsp.text(18), tags = m.list(19, zsp.string(16)), steps = m.list(20, Step), plan = m.map({ due = number(16) }) })
 local Person = m.map({ role = zsp.string(16), bio = zsp.text(17), pets = m.list(18, m.map({ name = zsp.string(16) })) })
 local Board = m.map({
 	title = zsp.string(16),
@@ -170,7 +171,7 @@ local function mutate(d: any)
 	for _ = 1, math.random(1, 5) do
 		local r = math.random(16)
 		if r == 1 then
-			table.insert(d.tasks, math.random(1, #d.tasks + 1), { title = word(), done = math.random(2) == 1, tags = { word() } })
+			table.insert(d.tasks, math.random(1, #d.tasks + 1), { title = word(), done = math.random(2) == 1, tags = { word() }, steps = { { name = word() } }, plan = { due = math.random(9) } })
 		elseif r == 2 and #d.tasks > 0 then
 			table.remove(d.tasks, math.random(#d.tasks))
 		elseif r == 3 and #d.tasks > 1 then
@@ -185,6 +186,16 @@ local function mutate(d: any)
 			table.insert(t.tags, math.random(1, #t.tags + 1), word())
 			if #t.tags > 2 and math.random(2) == 1 then
 				table.remove(t.tags, 1)
+			end
+			t.plan.due = if math.random(4) == 1 then nil else math.random(9)
+			if math.random(2) == 1 then
+				table.insert(t.steps, math.random(1, #t.steps + 1), { name = word() })
+			elseif #t.steps > 0 then
+				local x = table.remove(t.steps, math.random(#t.steps))
+				if math.random(2) == 1 then
+					x.name = word()
+					table.insert(t.steps, math.random(1, #t.steps + 1), x)
+				end
 			end
 		elseif r == 5 then
 			d.scores[word()] = if math.random(3) == 1 then nil else math.random(100)
@@ -271,7 +282,7 @@ local function mutate(d: any)
 					table.insert(keep, t)
 				end
 			end
-			table.insert(keep, { title = word(), tags = {} })
+			table.insert(keep, { title = word(), tags = {}, steps = {}, plan = {} })
 			d.tasks = keep
 		end
 	end
