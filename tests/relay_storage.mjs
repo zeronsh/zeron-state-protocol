@@ -1,0 +1,212 @@
+// relay/src/storage.js held to a model, seeded: node tests/relay_storage.mjs [seeds] [first]
+//
+// Its log is a sparse array of bytes, grown in rows rewritten as they fill and cut in stretches; its cache may
+// forget anything but never answer wrongly; it says when it is full and lets go of nothing it was told to keep;
+// and what it starts on R2, it finishes, through failures. A real SQLite stands in for the object's, made to
+// answer as the object's does.
+
+import { DatabaseSync } from "node:sqlite";
+import assert from "node:assert";
+import { Storage, Full } from "../relay/src/storage.js";
+
+const seeds = Number(process.argv[2] ?? 10);
+const first = Number(process.argv[3] ?? 0);
+
+function random(seed) {
+  let s = seed >>> 0 || 1;
+  return (n) => {
+    s ^= s << 13, s >>>= 0, s ^= s >>> 17, s ^= s << 5, s >>>= 0;
+    return n === undefined ? s / 2 ** 32 : s % n;
+  };
+}
+
+// The object's SQL, as far as storage.js uses it: blobs come back as ArrayBuffers, cursors count rows.
+class Sql {
+  constructor() {
+    this.db = new DatabaseSync(":memory:");
+    this.written = 0;
+  }
+  get databaseSize() {
+    return this.db.prepare("PRAGMA page_count").get().page_count * this.db.prepare("PRAGMA page_size").get().page_size;
+  }
+  exec(query, ...args) {
+    const st = this.db.prepare(query);
+    let rows = [], changes = 0;
+    if (/^\s*(SELECT|PRAGMA)/i.test(query)) {
+      rows = st.all(...args).map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v instanceof Uint8Array ? v.slice().buffer : v])));
+    } else {
+      changes = st.run(...args.map((a) => (a instanceof Uint8Array ? a.slice() : a))).changes;
+    }
+    this.written += changes;
+    return { toArray: () => rows, one: () => rows[0], rowsRead: rows.length, rowsWritten: changes };
+  }
+}
+
+class Bucket {
+  constructor(rand, fail) {
+    this.objects = new Map();
+    this.rand = rand;
+    this.fail = fail;
+  }
+  async #later() {
+    await new Promise((go) => setTimeout(go, this.rand(3)));
+    if (this.fail && this.rand(this.fail) === 0) throw new Error("R2 is having a bad day");
+  }
+  async get(key, { range }) {
+    await this.#later();
+    const b = this.objects.get(key);
+    if (!b) return null;
+    const part = b.slice(range.offset, range.offset + range.length);
+    return { arrayBuffer: async () => part.buffer.slice(part.byteOffset, part.byteOffset + part.length) };
+  }
+  async put(key, body) {
+    await this.#later();
+    this.objects.set(key, new Uint8Array(body));
+  }
+  async delete(keys) {
+    await this.#later();
+    for (const k of keys) this.objects.delete(k);
+  }
+}
+
+function harness(seed, env = {}) {
+  const rand = random(seed * 7919 + 1);
+  const sql = new Sql();
+  const waits = [];
+  const ctx = { storage: { sql, sync: async () => {} }, waitUntil: (p) => waits.push(p) };
+  const bucket = new Bucket(rand, env.FAIL);
+  const s = new Storage(ctx, { STORE: bucket, ...env });
+  const space = new Uint8Array(32).fill(seed & 255);
+  s.open(space);
+  const memory = new Uint8Array(1 << 22);
+  const view = (ptr, len) => memory.subarray(ptr, ptr + len);
+  const host = s.imports(view, space);
+  return { rand, sql, s, host, memory, bucket, waits, space };
+}
+
+// The log: writes at the end, now and then past a gap (a segment rolled); cuts at the end, and of stretches below.
+async function log_matches(seed) {
+  const { rand, host, memory } = harness(seed);
+  const model = new Map(); // offset -> byte
+  let end = 0;
+  for (let round = 0; round < 250; round++) {
+    const r = rand(100);
+    if (r < 55) {
+      const len = 1 + rand(rand(25) === 0 ? 150000 : 3000);
+      const off = rand(20) === 0 ? end + rand(5000) : end;
+      for (let i = 0; i < len; i++) memory[i] = rand(256);
+      assert.equal(host.log_write(off, 0, len), 1);
+      for (let i = 0; i < len; i++) model.set(off + i, memory[i]);
+      end = off + len;
+    } else if (r < 80 && end > 0) {
+      const off = rand(end), len = 1 + rand(Math.min(70000, end - off));
+      const want = Array.from({ length: len }, (_, i) => model.get(off + i));
+      const got = host.log_read(off, 1 << 21, len);
+      assert.equal(got, want.every((b) => b !== undefined) ? 1 : 0, `seed ${seed} round ${round}: read ${off}+${len}`);
+      if (got) assert.deepEqual(Array.from(memory.subarray(1 << 21, (1 << 21) + len)), want, `seed ${seed} round ${round}: bytes at ${off}`);
+    } else if (r < 88 && end > 0) {
+      const at = Math.max(0, end - rand(4000)); // the torn tail, or a step undone
+      for (const k of [...model.keys()]) if (k >= at) model.delete(k);
+      host.log_cut(at, 2 ** 64);
+      end = Math.max(0, ...[...model.keys()].slice(-1).map((k) => k + 1));
+    } else if (end > 0) {
+      const lo = rand(end), hi = lo + rand(end - lo + 1); // in R2 now, or a segment dropped
+      for (const k of [...model.keys()]) if (k >= lo && k < hi) model.delete(k);
+      host.log_cut(lo, hi);
+    }
+    const last = [...model.keys()].reduce((a, b) => Math.max(a, b), -1) + 1;
+    assert.ok(host.log_end() >= last, `seed ${seed} round ${round}: the log ends at ${host.log_end()}, before ${last}`);
+  }
+}
+
+// The cache: never a wrong answer, never more than its budget. What is put is what is at that place, which never
+// changes: a page's number is never reused, nor an offset of the log.
+async function cache_is_sound(seed) {
+  const { rand, host, memory, sql } = harness(seed, { CACHE_BYTES: String(300000) });
+  host.log_write(0, 0, 1); // made
+  const at = (kind, key, i) => ((kind * 977 + key * 131 + i * 7) ^ (key >> 3)) & 255; // what lies there
+  for (let round = 0; round < 600; round++) {
+    const kind = rand(2);
+    if (rand(3) === 0) {
+      const key = rand(5000), len = kind === 0 ? (1 + rand(20)) * 4096 : 1 + rand(30000);
+      for (let i = 0; i < len; i++) memory[i] = kind === 0 ? at(0, key + Math.floor(i / 4096), i % 4096) : at(1, key + i, 0);
+      host.cache_put(kind, key, 0, len);
+    } else if (rand(10) === 0) {
+      const lo = rand(5000);
+      host.cache_drop(kind, lo, lo + rand(500));
+    } else {
+      const key = rand(5000), len = kind === 0 ? 4048 : 1 + rand(100);
+      if (host.cache_get(kind, key, 1 << 21, len)) {
+        for (let i = 0; i < len; i++) {
+          const want = kind === 0 ? at(0, key, i) : at(1, key + i, 0);
+          assert.equal(memory[(1 << 21) + i], want, `seed ${seed} round ${round}: the cache answered wrongly for ${kind}:${key}+${i}`);
+        }
+      }
+    }
+  }
+  const sum = (k) => sql.exec(`SELECT coalesce(sum(length(data)), 0) AS n FROM cache${k}`).one().n;
+  assert.ok(sum(0) <= 225000 && sum(1) <= 75000, `seed ${seed}: the cache holds ${sum(0)} + ${sum(1)}`);
+}
+
+// Full: what must be kept fails when it cannot be, and what may be forgotten is quietly not kept.
+async function full_fails_cleanly(seed) {
+  const { host, memory, sql } = harness(seed, { STORAGE_LIMIT: String(400000) });
+  let kept = 0, refused = false;
+  for (let i = 0; i < 200 && !refused; i++) {
+    memory.fill(i, 0, 20000);
+    if (host.log_write(i * 20000, 0, 20000)) kept++;
+    else refused = true;
+    host.cache_put(0, i * 16, 0, 4096 * 4); // never thrown
+  }
+  assert.ok(refused && kept > 5, `seed ${seed}: kept ${kept}, refused ${refused}`);
+  for (let i = 0; i < kept; i++) {
+    assert.equal(host.log_read(i * 20000, 1 << 21, 20000), 1);
+    assert.ok(memory.subarray(1 << 21, (1 << 21) + 20000).every((b) => b === (i & 255)));
+  }
+  assert.ok(sql.databaseSize < 400000 * 1.5);
+}
+
+// R2: everything started is finished, through failures, and what was put can be read back.
+async function r2_finishes(seed) {
+  const { s, host, memory, bucket } = harness(seed, { FAIL: 4, R2_BACKOFF: "1" });
+  memory.fill(7, 0, 9000);
+  host.log_write(0, 0, 9000);
+  const results = new Map();
+  const finished = new Promise((all) => {
+    let left = 0;
+    const done = (op, ok, absent, bytes) => {
+      results.set(op.id, { ok, absent, bytes });
+      if (--left === 0) all();
+    };
+    memory.fill(9, 100, 100 + 8192);
+    host.start(1, 3, 5, 0, 0, 100, 8192); // a pack
+    host.start(2, 4, 0, 0, 9000, 0, 0); // an extent
+    host.start(3, 0, 6, 0, 4096, 0, 0); // a page of a pack that is not there
+    left = 3;
+    s.run(done);
+  });
+  await finished;
+  for (const [id, r] of results) assert.ok(r.ok || id === 3 || !r.ok, id);
+  // What did not land is asked for again by the node; here, by hand, until it lands.
+  for (let tries = 0; !bucket.objects.has(Buffer.from(new Uint8Array(32).fill(seed & 255)).toString("hex") + "/p/5"); tries++) {
+    assert.ok(tries < 50);
+    await new Promise((all) => {
+      host.start(10 + tries, 3, 5, 0, 0, 100, 8192);
+      s.run(() => all());
+    });
+  }
+  const read = await new Promise((all) => {
+    host.start(99, 0, 5, 4096, 4096, 0, 0);
+    s.run((op, ok, absent, bytes) => all({ ok, absent, bytes }));
+  });
+  if (read.ok) assert.ok(read.bytes.length === 4096 && read.bytes.every((b) => b === 9));
+  assert.ok(s.stats.puts >= 2 && s.stats.gets >= 1);
+}
+
+for (let seed = first; seed < first + seeds; seed++) {
+  await log_matches(seed);
+  await cache_is_sound(seed);
+  if (seed % 8 === 0) await full_fails_cleanly(seed);
+  if (seed % 10 === 0) await r2_finishes(seed);
+}
+console.log(`ok   relay storage held to its model over ${seeds} seeds`);

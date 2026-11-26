@@ -266,7 +266,8 @@ export class Storage {
           // Failing again and again: back off, up to a minute, before the node hears and asks again.
           this.stats.failures++;
           this.#failures++;
-          await new Promise((wake) => setTimeout(wake, Math.min(60000, 100 * 2 ** Math.min(this.#failures, 10))));
+          const base = Number(this.#env.R2_BACKOFF ?? 100);
+          await new Promise((wake) => setTimeout(wake, Math.min(600 * base, base * 2 ** Math.min(this.#failures, 10))));
         } else {
           this.#failures = 0;
         }
