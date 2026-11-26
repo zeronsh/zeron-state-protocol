@@ -62,7 +62,9 @@ export type Question = {
 };
 
 // What a total is, in the order they will be answered in, and how to read its values.
-export type Told = { readonly name: string; readonly facet: boolean; readonly read: (value: Uint8Array) => number | boolean | string };
+// What a total or a facet is read as: of a column of bytes, bytes.
+export type Read = number | boolean | string | Uint8Array;
+export type Told = { readonly name: string; readonly facet: boolean; readonly read: (value: Uint8Array) => Read };
 
 // A list's tag in a scope, 16 bytes as a binary string.
 export type Tag = (scope: number, list: string) => string;
@@ -332,7 +334,8 @@ function readId(v: Uint8Array): string {
   return codec.hex(v);
 }
 
-const READ: { readonly [kind: number]: (v: Uint8Array) => number | boolean | string } = {
+const READ: { readonly [kind: number]: (v: Uint8Array) => Read } = {
+  [BYTES]: (v) => v.slice(),
   [NUMBER]: readNumber,
   [CREATED]: readNumber,
   [MODIFIED]: readNumber,

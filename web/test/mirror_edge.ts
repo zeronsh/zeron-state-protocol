@@ -78,6 +78,47 @@ const share = (...peers: Peer[]) => {
   assert.deepEqual([...db.state.raw!], [9, 2, 3]);
 }
 
+// And so it is in lists and records of them: what is read in a draft is a copy, written if it was changed, and nothing is
+// written if nothing was, nor for what is put there anew that is what was there.
+{
+  const Doc = m.map({ metas: m.list(16, c.json<{ count: number; tags: string[] }>(16)), raws: m.list(17, c.bytes(16)), named: m.record(c.json<{ count: number }>(16)), blobs: m.record(c.bytes(16)) });
+  const a = peer(random, now), b = peer(random, now);
+  const da = m.open(a.client, { scope: 1, name: "jl", schema: Doc });
+  const db = m.open(b.client, { scope: 1, name: "jl", schema: Doc });
+  void da.set({ metas: [{ count: 1, tags: ["x"] }, { count: 7, tags: [] }], raws: [Uint8Array.of(1, 2), Uint8Array.of(3)], named: { k: { count: 1 } }, blobs: { k: Uint8Array.of(4, 5) } });
+  run(a);
+  share(a, b);
+  assert.throws(() => ((da.state.metas[0] as { count: number }).count = 5), TypeError, "what is shown changed in place");
+  assert.throws(() => ((da.state.named.k as { count: number }).count = 5), TypeError, "what is shown changed in place");
+  const before = a.out.length;
+  void da.update((d) => void [d.metas[0], d.raws[0], d.named.k, d.blobs.k]); // read, and nothing else
+  run(a);
+  assert.equal(a.out.length, before, "what was only read was written");
+  void da.update((d) => {
+    d.metas = d.metas.map((x) => ({ ...x }));
+    d.raws = d.raws.map((x) => x.slice());
+    d.named = { k: { count: 1 } };
+    d.blobs = { k: Uint8Array.of(4, 5) };
+  });
+  run(a);
+  assert.equal(a.out.length, before, "what is what was there was written again");
+  clock++;
+  void da.update((d) => {
+    d.metas[0].count = 2;
+    d.metas[0].tags.push("y");
+    d.raws[1][0] = 9;
+    d.named.k.count = 3;
+    d.blobs.k[1] = 6;
+  });
+  run(a);
+  share(a, b);
+  assert.deepEqual(db.state.metas, [{ count: 2, tags: ["x", "y"] }, { count: 7, tags: [] }]);
+  assert.deepEqual(db.state.raws.map((x) => [...x]), [[1, 2], [9]]);
+  assert.deepEqual({ ...db.state.named }, { k: { count: 3 } });
+  assert.deepEqual([...db.state.blobs.k], [4, 6]);
+  assert.deepEqual(da.state.metas, db.state.metas);
+}
+
 // ---------------------------------------------------------------- asking
 
 const Item = m.map({ n: c.number(16), label: c.string(17), more: m.map({ note: c.string(16) }), parts: m.list(18, m.map({ x: c.number(16) })) });

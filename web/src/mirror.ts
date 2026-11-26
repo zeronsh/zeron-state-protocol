@@ -1338,7 +1338,7 @@ function opened<S extends MapSchema<any>>(
       }
       const values: Record<string, unknown> = {};
       let some = false;
-      if (!Object.is(nv, old) || made) {
+      if (!sameValue(of, nv, old) || made) {
         if (nv === undefined) values.e = EMPTY;
         else values.v = nv;
         some = true;
@@ -1430,8 +1430,8 @@ function opened<S extends MapSchema<any>>(
         const vs = st && st.kind === "values" ? st : undefined;
         const frames = vs ? vs.frames : [];
         let a = 0, z = 0;
-        while (a < od.length && a < nw.length && Object.is(od[a], nw[a])) a++;
-        while (z < od.length - a && z < nw.length - a && Object.is(od[od.length - 1 - z], nw[nw.length - 1 - z])) z++;
+        while (a < od.length && a < nw.length && sameValue(b.of, od[a], nw[a])) a++;
+        while (z < od.length - a && z < nw.length - a && sameValue(b.of, od[od.length - 1 - z], nw[nw.length - 1 - z])) z++;
         change.edit(hex(owner), b.slot, (t, fresh) => {
           for (const id of vs ? vs.junk : NONE) text.remove(t, id, 1, fresh);
           for (let k = a; k < od.length - z; k++) {
@@ -2273,6 +2273,7 @@ interface ListDraftState {
   target: unknown[]; // once changed, what it is: what was there as it was, and whatever has been put in it
   copied: boolean;
   touched: Set<number> | undefined; // until then, the items read
+  was?: Set<unknown>; // of values, what it held that may be changed in place
 }
 
 interface RecordDraftState {
@@ -2551,16 +2552,36 @@ class Drafts {
   }
 
   listGet(st: ListDraftState, i: number): unknown {
+    if (!st.elem) {
+      // A value, JSON or bytes, that was there is handed out as a copy, as a map's are, for it may be changed in place:
+      // the list is then the list with that copy in it, and is written if what it comes to is other than what it was.
+      const x = st.copied ? st.target[i] : st.orig[i];
+      if (typeof x !== "object" || x === null || !this.#was(st).has(x)) return x;
+      const copy = structuredClone(x);
+      changed(st.target as unknown as Listy)[i] = copy;
+      return copy;
+    }
     if (st.copied) return this.item(st, st.target[i]);
     const x = st.orig[i];
-    if (st.elem && typeof x === "object" && x !== null) (st.touched ??= new Set()).add(i);
+    if (typeof x === "object" && x !== null) (st.touched ??= new Set()).add(i);
     return this.item(st, x);
+  }
+
+  // What a list of values held, of which whatever is read is a copy.
+  #was(st: ListDraftState): Set<unknown> {
+    return (st.was ??= new Set(st.orig.filter((x) => typeof x === "object" && x !== null)));
   }
 
   recordGet(st: RecordDraftState, key: string): unknown {
     const w = st.writes?.get(key);
     if (w !== undefined || st.writes?.has(key)) return w === DELETED ? undefined : w;
     const v = own(st.orig, key);
+    if (!isMap(st.of) && typeof v === "object" && v !== null) {
+      // As a map's: a copy, which counts as written, and is written if what it comes to is other than what it was.
+      const copy = structuredClone(v);
+      (st.writes ??= new Map()).set(key, copy);
+      return copy;
+    }
     if (!isMap(st.of) || typeof v !== "object" || v === null || !built.has(v)) return v;
     (st.touched ??= new Set()).add(key);
     let d = this.#of.get(v);

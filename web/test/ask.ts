@@ -310,7 +310,7 @@ for (let i = 0; i < FAULTY.length; i++) assert.equal(ours[i], "!", `faulty quest
     {
       scope: 1,
       table: tables.track,
-      totals: { n: ["min", "stars"], b: ["facet", "liked"], i: ["max", "album"], s: ["facet", "name"], t: ["max", "@created"], w: ["facet", "who"] },
+      totals: { n: ["min", "stars"], b: ["facet", "liked"], i: ["max", "album"], s: ["facet", "name"], t: ["max", "@created"], w: ["facet", "who"], r: ["facet", "raw"], j: ["min", "meta.r:bytes"] },
     },
     tag,
   );
@@ -324,6 +324,13 @@ for (let i = 0; i < FAULTY.length; i++) assert.equal(ours[i], "!", `faulty quest
   assert.equal(by.i(codec.unhex("00112233445566778899aabbccddeeff")), "00112233445566778899aabbccddeeff");
   assert.equal(by.s(utf8.encode("﻿ünï")), "﻿ünï");
   assert.equal(by.w(utf8.encode("ann")), "ann");
+  // Bytes as bytes, which no text can stand for: bytes that are not UTF-8 are not one another.
+  const fe = Uint8Array.of(0xfe, 1), ff = Uint8Array.of(0xff, 1);
+  for (const read of [by.r, by.j]) {
+    assert.deepEqual(read(fe), fe);
+    assert.deepEqual(read(ff), ff);
+    assert.notEqual(read(fe), fe, "and are a copy of their own");
+  }
 }
 
 console.log(`${questions.length} questions, ${faulty} faulty, alike: ask.ts ${(wrote - began).toFixed(0)} ms`);
