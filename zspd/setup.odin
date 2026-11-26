@@ -102,11 +102,6 @@ setup :: proc(args: []string) -> int {
 
 DNS_PORT :: 5053 when ODIN_OS == .Linux || ODIN_OS == .FreeBSD else 53
 
-usage :: proc() -> int {
-	os.write_string(os.stderr, USAGE)
-	return 2
-}
-
 // Says a step, and unless this is a dry run, takes it.
 @(private = "file")
 step :: proc(s: ^Setup, what: string, argv: ..string) -> bool {
