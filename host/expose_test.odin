@@ -47,3 +47,45 @@ public_end_before_connected :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, len(p.public), 0)
 }
+
+// A 40 Expose that is not sound throughout changes nothing at the relay: not what it held, not partly what was asked.
+@(test)
+expose_frame_whole_or_not_at_all :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts)
+	defer test_space_destroy(&ts)
+	ts.host.expose = "expose.test"
+	ts.host.public.have_http = true
+	defer {
+		for l in ts.host.public.labels {
+			delete(l.label)
+		}
+		delete(ts.host.public.labels)
+	}
+	s: zsp.Session
+	s.id, s.peer, s.node = 7, ts.keys[1].device, &ts.space.node
+	defer delete(s.out)
+	frame :: proc(prefixes: ..string) -> []byte {
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, u64(len(prefixes)))
+		for p, i in prefixes {
+			zsp.write_bytes(&w, transmute([]byte)p)
+			nonce: [zsp.EXPOSE_NONCE]byte
+			nonce[0] = byte(i + 1)
+			append(&w, ..nonce[:])
+		}
+		return w[:]
+	}
+	public_exposed(&ts.space, &s, frame("web"))
+	testing.expect_value(t, len(ts.host.public.labels), 1)
+	held := strings.clone(ts.host.public.labels[0].label, context.temp_allocator)
+	for bad in ([][]byte{frame("ok", "BAD"), frame("ok", strings.repeat("x", 21, context.temp_allocator))}) {
+		public_exposed(&ts.space, &s, bad)
+		testing.expectf(t, len(ts.host.public.labels) == 1 && ts.host.public.labels[0].label == held, "%d labels, the first %q", len(ts.host.public.labels), ts.host.public.labels[0].label if len(ts.host.public.labels) > 0 else "")
+	}
+	trailing := make([dynamic]byte, context.temp_allocator)
+	append(&trailing, ..frame("ok"))
+	append(&trailing, 0)
+	public_exposed(&ts.space, &s, trailing[:])
+	testing.expect(t, len(ts.host.public.labels) == 1 && ts.host.public.labels[0].label == held)
+}

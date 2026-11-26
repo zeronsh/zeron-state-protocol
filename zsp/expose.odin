@@ -63,3 +63,22 @@ base32_80 :: proc(ten: []byte) -> (out: [16]byte) {
 	}
 	return
 }
+
+// Whether a 40 Expose is sound throughout: at most `most` exposures, each a valid prefix and a nonce, and nothing after.
+// A relay takes all of one or none of it.
+@(require_results)
+expose_frame_sound :: proc(payload: []byte, most: int) -> bool {
+	r := Reader{buf = payload}
+	n := read_varint(&r)
+	if r.bad || n > u64(most) {
+		return false
+	}
+	for _ in 0 ..< n {
+		prefix := string(read_bytes(&r))
+		_ = read_take(&r, EXPOSE_NONCE)
+		if r.bad || !exposure_prefix_valid(prefix) {
+			return false
+		}
+	}
+	return read_done(&r)
+}

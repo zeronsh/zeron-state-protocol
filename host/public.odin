@@ -143,11 +143,11 @@ public_url :: proc(h: ^Host, label: string) -> string {
 public_exposed :: proc(sp: ^Space, s: ^zsp.Session, payload: []byte) {
 	h := sp.host
 	rp := &h.public
+	if !zsp.expose_frame_sound(payload, MAX_EXPOSURES) {
+		return // nothing of a frame that is not all sound is taken: it changes nothing
+	}
 	r := zsp.Reader{buf = payload}
 	n := zsp.read_varint(&r)
-	if r.bad || n > MAX_EXPOSURES {
-		return
-	}
 	#reverse for l, i in rp.labels {
 		if l.space == sp && l.session == s.id {
 			delete(l.label)
@@ -159,9 +159,6 @@ public_exposed :: proc(sp: ^Space, s: ^zsp.Session, payload: []byte) {
 	for _ in 0 ..< n {
 		prefix := string(zsp.read_bytes(&r))
 		nonce_bytes := zsp.read_take(&r, zsp.EXPOSE_NONCE)
-		if r.bad || !zsp.exposure_prefix_valid(prefix) {
-			return
-		}
 		nonce: [zsp.EXPOSE_NONCE]byte
 		copy(nonce[:], nonce_bytes)
 		label := zsp.exposure_label(sp.node.space, s.peer, prefix, nonce)

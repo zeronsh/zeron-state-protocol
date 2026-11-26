@@ -258,11 +258,11 @@ exposed :: proc(s: ^zsp.Session, payload: []byte) {
 			id = k
 		}
 	}
+	if id == 0 || !zsp.expose_frame_sound(payload, 16) {
+		return // nothing of a frame that is not all sound is taken: it changes nothing
+	}
 	r := zsp.Reader{buf = payload}
 	n := zsp.read_varint(&r)
-	if r.bad || n > 16 || id == 0 {
-		return
-	}
 	// What it no longer exposes is let go, and what is new is claimed: what it says again is left as it is, for a release
 	// and a claim of the same label could reach the label's own object either way round.
 	before := make([dynamic]string, context.temp_allocator)
@@ -278,9 +278,6 @@ exposed :: proc(s: ^zsp.Session, payload: []byte) {
 	for _ in 0 ..< n {
 		prefix := string(zsp.read_bytes(&r))
 		nonce_bytes := zsp.read_take(&r, zsp.EXPOSE_NONCE)
-		if r.bad || !zsp.exposure_prefix_valid(prefix) {
-			return
-		}
 		nonce: [zsp.EXPOSE_NONCE]byte
 		copy(nonce[:], nonce_bytes)
 		label := zsp.exposure_label(node.space, s.peer, prefix, nonce)

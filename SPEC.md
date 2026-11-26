@@ -701,8 +701,9 @@ zsp.public   relay → device, in scope 0: label bytes ‖ address (16) ‖ port
              then as zsp.tcp: the callee's first message 0, or a code ‖ reason; then the connection's bytes each way
 ```
 
-A relay works each label out itself, from the space, the device's proven key and what it said, and holds it only while the device is
-connected; it is reached at `<label>.<domain>` for a domain of the relay's, by TLS that it terminates (routed by the name asked for) or by
+A relay takes a 40 Expose whole or not at all: one with more exposures than it allows (16, here), a prefix that is not one, or anything
+after its last exposure changes nothing, and is not answered. A relay works each label out itself, from the space, the device's proven
+key and what it said, and holds it only while the device is connected; it is reached at `<label>.<domain>` for a domain of the relay's, by TLS that it terminates (routed by the name asked for) or by
 plain HTTP routed by `Host`, behind something else that does. A device takes `zsp.public` only from a session it dialled as a relay's, and
 only for a label it exposes; for an exposure marked so, it says first where each connection came from, by PROXY v2. Taking a port back
 cuts off whoever is using it. What is exposed is public, and the relay sees it, as any reverse proxy must that holds the certificate; what
