@@ -193,6 +193,9 @@ Echo :: struct {
 	giving_up: bool, // a send gives up now and then, to see whether the test is over: never where what it sends counts,
 	// for on Windows a send that gives up may have sent some of what it was given, and nobody can say how much
 	stop:     bool, // atomic
+	guard:    sync.Mutex,
+	current:  net.TCP_Socket, // the connection being echoed, if any; under guard
+	serving:  bool, // under guard
 }
 
 // Echoes whatever each connection says until it says no more, then says no more itself.
@@ -218,6 +221,9 @@ echo_start :: proc(e: ^Echo, stalled := false, giving_up := false) -> bool {
 				return
 			}
 			sync.atomic_add(&e.accepted, 1)
+			sync.mutex_lock(&e.guard)
+			e.current, e.serving = client, true
+			sync.mutex_unlock(&e.guard)
 			// A reset that comes while nothing can be sent may be heard late: so, where it may, a send gives up now
 			// and then, to see whether the test is over.
 			if e.giving_up {
@@ -227,7 +233,10 @@ echo_start :: proc(e: ^Echo, stalled := false, giving_up := false) -> bool {
 				for !sync.atomic_load(&e.stop) {
 					time.sleep(10 * time.Millisecond)
 				}
+				sync.mutex_lock(&e.guard)
+				e.serving = false
 				net.close(client)
+				sync.mutex_unlock(&e.guard)
 				return
 			}
 			buf: [32 << 10]byte
@@ -249,7 +258,10 @@ echo_start :: proc(e: ^Echo, stalled := false, giving_up := false) -> bool {
 				}
 			}
 			net.shutdown(client, .Send)
+			sync.mutex_lock(&e.guard)
+			e.serving = false
 			net.close(client)
+			sync.mutex_unlock(&e.guard)
 		}
 	})
 	return true
@@ -258,6 +270,13 @@ echo_start :: proc(e: ^Echo, stalled := false, giving_up := false) -> bool {
 @(private)
 echo_stop :: proc(e: ^Echo) {
 	sync.atomic_store(&e.stop, true)
+	// A connection still open at the end, as a test may leave one that it stopped in the midst of, would hold the
+	// echo in its read for ever, the world that would end it run no more: so it is ended here.
+	sync.mutex_lock(&e.guard)
+	if e.serving {
+		net.shutdown(e.current, .Both)
+	}
+	sync.mutex_unlock(&e.guard)
 	// Wake an accept that may still be waiting: closing the listener would not, everywhere.
 	if s, err := net.dial_tcp(net.Endpoint{net.IP4_Loopback, e.port}); err == nil {
 		net.close(s)
