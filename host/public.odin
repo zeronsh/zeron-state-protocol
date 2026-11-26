@@ -549,7 +549,7 @@ public_out_close :: proc(c: ^Public_Out, reset: bool) {
 	rp := &c.h.public
 	for x, i in rp.conns {
 		if x == c {
-			unordered_remove(&rp.conns, i)
+			ordered_remove(&rp.conns, i) // oldest first, kept so: the longest silent is the first to make room
 			break
 		}
 	}

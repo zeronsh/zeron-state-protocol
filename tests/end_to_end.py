@@ -1852,7 +1852,24 @@ def test_public_held_off():
     # More than it holds at once of connections that say nothing: the longest silent make room.
     silent = [socket.create_connection(("127.0.0.1", https), 5) for _ in range(1100)]
     assert public_get(https, name)[:2] == (200, b"still here")
-    for s in silent:
+    # Those that make room are the longest silent, not whoever came last: one that has just come stays while more come.
+    time.sleep(0.2)
+    newest = socket.create_connection(("127.0.0.1", https), 5)
+    time.sleep(0.2)
+    more = [socket.create_connection(("127.0.0.1", https), 5) for _ in range(2)]
+    time.sleep(0.3)
+
+    def let_go(s):
+        s.setblocking(False)
+        try:
+            return s.recv(1) == b""
+        except BlockingIOError:
+            return False
+        except OSError:
+            return True
+
+    assert not let_go(newest), "the newest was let go"
+    for s in silent + more + [newest]:
         s.close()
     eventually("and of them", lambda: fds() <= before)
 
