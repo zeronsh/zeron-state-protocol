@@ -31,7 +31,8 @@ interface Slot {
 interface Held {
   bytes: Uint8Array;
   length: number;
-  journaled: number; // how much of it the journal has
+  journaled: number; // how much of it the journal has, from the start: what is written there next is journaled from here
+  inJournal: boolean; // whether the journal says anything of it, so must say when it is held no longer
 }
 
 function segmentName(n: number): string {
@@ -178,7 +179,7 @@ export class Store {
   #hold(n: number, at: number, bytes: Uint8Array): void {
     Store.counts.held++;
     let h = this.#held.get(n);
-    if (!h) this.#held.set(n, (h = { bytes: new Uint8Array(Math.max(1 << 16, at + bytes.length)), length: 0, journaled: 0 }));
+    if (!h) this.#held.set(n, (h = { bytes: new Uint8Array(Math.max(1 << 16, at + bytes.length)), length: 0, journaled: 0, inJournal: false }));
     if (at + bytes.length > h.bytes.length) {
       const grown = new Uint8Array(Math.max(at + bytes.length, h.bytes.length * 2));
       grown.set(h.bytes.subarray(0, h.length));
@@ -197,8 +198,9 @@ export class Store {
   }
 
   #openSegment(n: number): void {
-    if (this.#segments.has(n) || this.#opening.has(n)) return;
+    // Wanted again: what was dropped while being opened is not, now, and what is opened is for this.
     this.#dropped.delete(n);
+    if (this.#segments.has(n) || this.#opening.has(n)) return;
     const opening = this.#after(async () => {
       const f = (await this.volume.open(segmentName(n), true))!;
       this.#opening.delete(n);
@@ -282,8 +284,8 @@ export class Store {
     const h = this.#held.get(last);
     if (h && h.length > off % this.segment) {
       h.length = off % this.segment;
-      if (h.journaled > h.length) {
-        h.journaled = h.length;
+      h.journaled = Math.min(h.journaled, h.length);
+      if (h.inJournal) {
         this.#record(TRUNCATED, last, h.length);
         this.#journal.flush();
       }
@@ -327,6 +329,7 @@ export class Store {
       this.#record(WRITTEN, n, h.journaled, h.bytes.subarray(h.journaled, h.length));
       Store.counts.journaled++;
       h.journaled = h.length;
+      h.inJournal = true;
     }
     this.#journal.flush();
   }
@@ -340,7 +343,7 @@ export class Store {
         this.#journal.flush();
         this.#journalEnd = 0;
       }
-    } else if (h.journaled > 0) {
+    } else if (h.inJournal) {
       this.#record(FORGOTTEN, n, 0);
       this.#journal.flush();
     }

@@ -97,4 +97,63 @@ async function crashed(volume: MemoryVolume, s: Store): Promise<Store> {
   assert.equal(read(s, 0), "a".repeat(10));
 }
 
+// Opening one file at a time, until what was held of a segment is in its file.
+async function settleOnce(volume: MemoryVolume, s: Store): Promise<void> {
+  let settled = false;
+  s.onSettled = () => (settled = true);
+  for (let i = 0; i < 50 && !settled; i++) volume.settle(), await turn();
+  assert(settled, "a segment settled");
+  s.onSettled = undefined;
+}
+
+// A segment cut to nothing, then opened while another is still held: the journal says it is held no longer, though it
+// had nothing in it when it went; and what is written to its file after is not wiped by a replay.
+{
+  const volume = new MemoryVolume({ slow: true });
+  let s = await opened(volume);
+  assert(s.logWrite(5 * SEGMENT, bytes("x", 100)));
+  assert(s.logWrite(4 * SEGMENT, bytes("w", 50))); // asked to open after the fifth
+  assert(s.logSync());
+  s.logTruncate(5 * SEGMENT);
+  await settleOnce(volume, s); // the fifth opens; the fourth is still held
+  assert(s.logWrite(5 * SEGMENT, bytes("n", 500)));
+  assert(s.logSync());
+  s = await crashed(volume, s);
+  assert.equal(read(s, 5), "n".repeat(500), "what was written after was wiped");
+}
+
+// Written over at its start before its file opens: the journal says it is held no longer, and old bytes do not come back
+// over new ones.
+{
+  const volume = new MemoryVolume({ slow: true });
+  let s = await opened(volume);
+  assert(s.logWrite(5 * SEGMENT, bytes("x", 100)));
+  assert(s.logWrite(4 * SEGMENT, bytes("w", 50)));
+  assert(s.logSync());
+  assert(s.logWrite(5 * SEGMENT, bytes("y", 20)));
+  await settleOnce(volume, s);
+  assert(s.logWrite(5 * SEGMENT + 100, bytes("z", 10)));
+  assert(s.logSync());
+  s = await crashed(volume, s);
+  assert.equal(read(s, 5), "y".repeat(20) + "x".repeat(80) + "z".repeat(10), "old bytes came back");
+}
+
+// Written, dropped, and written again, all while its file is being opened: what was written last is kept.
+{
+  const volume = new MemoryVolume({ slow: true });
+  let s = await opened(volume);
+  assert(s.logWrite(9 * SEGMENT, bytes("a", 30)));
+  s.logDrop(9);
+  assert(s.logWrite(9 * SEGMENT, bytes("b", 40)));
+  assert(s.logSync());
+  for (let i = 0; i < 50 && !s.settled; i++) volume.settle(), await turn();
+  assert(s.settled, "what was held never found its file");
+  assert.equal(read(s, 9), "b".repeat(40));
+  const settling = setInterval(() => volume.settle(), 1);
+  await s.close();
+  clearInterval(settling);
+  s = await opened(volume);
+  assert.equal(read(s, 9), "b".repeat(40), "and it was lost when the store closed");
+}
+
 console.log("ok");

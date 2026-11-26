@@ -1806,6 +1806,9 @@ export class Client {
       const existed = this.#rows.get(id);
       const row = existed ?? this.#row(id);
       if (!was) {
+        // What editors have open in it goes first, and stands, whatever becomes of this change: so what is put back is
+        // as it was with that, and nothing the node has heard is taken back here.
+        for (const [s, t] of row.texts) if (t.open) this.#seal(row, s);
         const slots = new Map<number, Map<string, Cell>>();
         for (const [k, cells] of row.slots) slots.set(k, new Map(cells));
         before.set(id, (was = { existed: existed !== undefined, slots, dead: row.dead, texts: new Set() }));
@@ -1819,9 +1822,9 @@ export class Client {
         if (!row) continue;
         row.slots = was.slots;
         row.dead = was.dead;
-        // What was made of the slots' texts is made again from their cells, when wanted. (An editor's own typing that
-        // was open is sealed before anything here is written over it, and stands.)
-        for (const slot of was.texts) if (!row.texts.get(slot)?.open) row.texts.delete(slot), row.lives.delete(slot);
+        // What was made of the slots' texts is made again from their cells, when wanted: whatever this change typed in
+        // them goes with it. (An editor's own typing that was open was sealed before this touched the row, and stands.)
+        for (const slot of was.texts) row.texts.delete(slot), row.lives.delete(slot);
         row.views.clear();
         if (!was.existed && row.pages === 0 && row.held.size === 0 && !this.#isPending(id)) this.#rows.delete(id);
       }
@@ -1873,9 +1876,7 @@ export class Client {
         edit: (id, slot, f) => {
           if (!Number.isInteger(slot) || slot < 16 || slot > 255) throw new RangeError("data slots are 16 to 255");
           const bin = idOf(id);
-          const open = this.#rows.get(bin);
-          if (open?.texts.get(slot)?.open) this.#seal(open, slot); // what an editor has open goes first, and stands
-          const row = touch(bin, slot);
+          const row = touch(bin, slot); // and what an editor has open in it goes first, and stands
           const t = this.#text(row, slot);
           f(t, () => codec.binary(this.#host.random(8)));
           const stamp = this.#stamp();

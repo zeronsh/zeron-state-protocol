@@ -306,6 +306,56 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   assert.equal(typos(1.5), typos(1));
 }
 
+// A change that throws in the middle of an edit leaves nothing of the edit to be sent later; and what an editor had typed
+// and not yet sealed, in a slot such a change touched, stands, here as at the node.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t", body: "start" })));
+  h.run();
+  h.tell(ACK, "\x01");
+  const pieces = () =>
+    h.self.said
+      .filter((x) => x.kind === CELLS)
+      .map((x) => x.body)
+      .join("");
+  assert.throws(
+    () =>
+      h.client.write(1, (change) =>
+        change.edit(id, Note.body.slot, (t, fresh) => {
+          text.insert(t, 0, "boom", fresh);
+          throw new Error("no");
+        }),
+      ),
+    /no/,
+  );
+  const editor = h.client.text(id, Note.body);
+  assert.equal(editor.read(), "start");
+  editor.append(" more");
+  editor.commit();
+  h.run();
+  assert(!pieces().includes("boom"), "what was undone was sent");
+  // Typing, not yet sealed; then a change that writes the slot over, and throws.
+  editor.append(" typed");
+  h.run();
+  assert.throws(
+    () =>
+      h.client.write(1, (change) => {
+        change.set(id, Note, { body: "over" });
+        throw new Error("no");
+      }),
+    /no/,
+  );
+  h.run();
+  assert.equal(editor.read(), "start more typed", "the editor's typing was lost here");
+  assert(pieces().includes(" typed"), "and said to the node");
+  editor.close();
+}
+
 // A client that is closed is not connected, says so, and what it was calling is lost.
 {
   const h = harness();
