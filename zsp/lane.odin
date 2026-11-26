@@ -160,6 +160,14 @@ session_lane_input :: proc(s: ^Session, id: u64, urgency: u8, bytes: []byte) -> 
 	if l.heard {
 		return true
 	}
+	if len(l.input) == 0 && s.ready && !s.busy {
+		// Taken where they lie, and only what is cut short kept for later.
+		used := lane_frames(s, l, bytes)
+		if !s.closing {
+			append(&l.input, ..bytes[used:])
+		}
+		return !s.closing
+	}
 	append(&l.input, ..bytes)
 	lane_take(s, l)
 	return !s.closing
@@ -168,17 +176,28 @@ session_lane_input :: proc(s: ^Session, id: u64, urgency: u8, bytes: []byte) -> 
 // Takes the whole frames that have come on a lane, once the session may act on them.
 @(private)
 lane_take :: proc(s: ^Session, l: ^Lane) {
-	if !s.ready || s.busy {
+	if !s.ready || s.busy || len(l.input) == 0 {
 		return // they wait, as frames on the session's own stream do
 	}
+	used := lane_frames(s, l, l.input[:])
+	if used > 0 {
+		remove_range(&l.input, 0, used)
+	}
+	if len(l.input) == 0 {
+		shrink(&l.input)
+	}
+}
+
+// Acts on the whole frames at the start of `bytes`; returns how many bytes they were.
+@(private)
+lane_frames :: proc(s: ^Session, l: ^Lane, bytes: []byte) -> (used: int) {
 	s.busy = true
 	defer s.busy = false
-	used := 0
 	for !s.closing {
-		r := Reader{buf = l.input[used:]}
+		r := Reader{buf = bytes[used:]}
 		n := read_varint(&r)
 		if r.bad {
-			if len(l.input) - used >= 10 {
+			if len(bytes) - used >= 10 {
 				session_fail(s, .Malformed)
 			}
 			break
@@ -206,12 +225,7 @@ lane_take :: proc(s: ^Session, l: ^Lane) {
 			session_fail(s, .Malformed)
 		}
 	}
-	if used > 0 {
-		remove_range(&l.input, 0, used)
-	}
-	if len(l.input) == 0 {
-		shrink(&l.input)
-	}
+	return
 }
 
 // Frames that waited on lanes for the session to be ready may be taken now.
