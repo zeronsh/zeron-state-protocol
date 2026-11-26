@@ -37,7 +37,6 @@ Ports :: struct {
 	exposures: [dynamic]Exposure,
 	exposed:   u64, // a count of changes to them
 	told:      map[u32]u64, // relay sessions, and the count they were last told
-	ever_told: map[u32]bool,
 	public:    [dynamic]^Public_In, // connections from the public, under way
 }
 
@@ -107,7 +106,6 @@ ports_close :: proc(sp: ^Space) {
 	delete(p.exposures)
 	delete(p.public)
 	delete(p.told)
-	delete(p.ever_told)
 	delete(p.remotes)
 	delete(p.watchers)
 	delete(p.offers)

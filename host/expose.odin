@@ -209,11 +209,9 @@ exposures_tell :: proc(p: ^Ports) {
 		if told, ok := p.told[s.id]; ok && told == p.exposed {
 			continue
 		}
+		// Said on every session, though it be nothing: what this device said on another, which the relay may not yet know
+		// to be gone, may be what it no longer exposes. A relay that knows nothing of exposure ignores it.
 		p.told[s.id] = p.exposed
-		if len(p.exposures) == 0 && !(s.id in p.ever_told) {
-			continue // nothing to say, nor to take back
-		}
-		p.ever_told[s.id] = true
 		w := make([dynamic]byte, context.temp_allocator)
 		zsp.write_varint(&w, u64(len(p.exposures)))
 		for &e in p.exposures {
@@ -229,7 +227,6 @@ exposures_tell :: proc(p: ^Ports) {
 		}
 		if !live {
 			delete_key(&p.told, id)
-			delete_key(&p.ever_told, id)
 		}
 	}
 	// What a relay said holds while this device is linked to it: one gone says nothing now.

@@ -340,3 +340,27 @@ public_exposed_by_a_device_come_back :: proc(t: ^testing.T) {
 		testing.expect_value(t, ts.host.public.labels[0].session, now.id)
 	}
 }
+
+// A relay is told what this device exposes on every session, though it be nothing: what was said on another, which the
+// relay may not know to be gone, may be what is exposed no longer.
+@(test)
+exposures_told_though_nothing :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts)
+	defer test_space_destroy(&ts)
+	ts.space.ports = new(Ports)
+	ts.space.ports.space = &ts.space
+	defer ports_close(&ts.space)
+	s := new(zsp.Session)
+	s.id, s.role, s.ready, s.peer_relay, s.node = 2, .Peer, true, true, &ts.space.node
+	append(&ts.space.node.sessions, s)
+	defer {
+		clear(&ts.space.node.sessions)
+		delete(s.out)
+		free(s)
+	}
+	exposures_tell(ts.space.ports)
+	r := zsp.Reader{buf = s.out[:]}
+	frame := zsp.read_take(&r, int(zsp.read_varint(&r)))
+	testing.expectf(t, !r.bad && len(frame) == 2 && frame[0] == zsp.EXPOSE && frame[1] == 0, "%v", s.out[:])
+}
