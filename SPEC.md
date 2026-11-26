@@ -657,7 +657,8 @@ zsp.ports    first message: lease varint (seconds, at most 600; 0 for once)
              each message back: entries, the whole of what the callee offers the caller; again whenever that differs,
              until the lease ends and the callee ends the call. Another lease varint from the caller asks for as long again.
              Asked once, the entries are said once even if the caller has already ended its side; a caller that ends its
-             side of a lease ends the lease.
+             side of a lease ends the lease. A callee may keep only so many leases at once, of all and of each caller,
+             and so many asked once apart from them (256 of all, 4 leases and 16 asked once of each, here): past that, *busy*.
 entries      n varint ‖ n × { port (2) ‖ scope varint ‖ host bytes (empty for the callee's own machine) ‖ name bytes }
 ```
 

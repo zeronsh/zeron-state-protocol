@@ -4,6 +4,7 @@ import "core:encoding/hex"
 import "core:fmt"
 import "core:strings"
 import "core:testing"
+import "core:time"
 import "../pipe"
 import "../zsp"
 
@@ -294,4 +295,44 @@ web_pages_reach_only_their_own :: proc(t: ^testing.T) {
 @(private = "file")
 cat :: proc(parts: ..string) -> string {
 	return strings.concatenate(parts, context.temp_allocator)
+}
+
+// Asking once and being kept up are counted apart, each within bounds: one device asking once without end keeps
+// nobody from being kept up, nor itself. One asked once that waits for room is woken by the room, not looked at
+// without end; and room that comes after a watch has lapsed says nothing more in it.
+@(test)
+watchers_bounded :: proc(t: ^testing.T) {
+	ts: Test_Space
+	test_space(t, &ts)
+	defer test_space_destroy(&ts)
+	sp := &ts.space
+	sp.ports = new(Ports)
+	sp.ports.space = sp
+	defer ports_close(sp)
+	p := sp.ports
+	a, b := Caller{device = ts.keys[1].device}, Caller{device = ts.keys[2].device}
+	once := 0
+	for i in 1 ..= 300 {
+		if h, _ := ports_called(sp, u64(i), a, 1, {0}); h != nil {
+			once += 1
+		}
+	}
+	testing.expectf(t, once == WATCHERS_EACH * ONCE_EACH, "%d asked once, at once", once)
+	ha, fa := ports_called(sp, 900, a, 1, {60})
+	hb, fb := ports_called(sp, 901, b, 1, {60})
+	testing.expectf(t, ha != nil && hb != nil, "kept up: %v %v", fa, fb)
+
+	// All owed, with no room to say it (there are no such calls): the next look is not now, over and over.
+	p.telling, p.scan_due, p.scanned = false, false, time.tick_now()
+	due, ok := offers_deadline(p)
+	testing.expectf(t, ok && time.tick_diff(time.tick_now(), due) > 0, "looked at again in %v", time.tick_diff(time.tick_now(), due))
+
+	w := (^Port_Watch)(hb)
+	w.until = time.tick_add(time.tick_now(), -time.Second) // its lease over, with something still owed it
+	offers_run(p, time.tick_now())
+	testing.expect(t, w.ended && w.owed)
+	_, w.said = offered_to(p, w.device) // what there would be to say, were anything said
+	w.on_room(&w.handler, w.call)
+	testing.expect(t, w.owed) // nothing was looked at again for it
+	free(w) // its call's, which there is none of here
 }

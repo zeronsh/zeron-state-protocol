@@ -25,6 +25,7 @@ import "../zsp"
 MAX_OFFERS :: 256
 MAX_WATCHERS :: 256 // devices kept up, at once
 WATCHERS_EACH :: 4
+ONCE_EACH :: 4 // times as many a device may ask once, at once, as it may be kept up
 MAX_LEASE :: 600 // seconds a device may be kept up without asking again
 SCAN_EVERY :: 2 * time.Second // while anyone is kept up
 MAX_LIST :: 60 << 10 // bytes of entries said at once
@@ -432,11 +433,15 @@ ports_called :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, firs
 	if !zsp.read_done(&r) {
 		return nil, .Denied
 	}
-	each := 0
+	// Those kept up, and those asking once, are counted apart: neither keeps the other out.
+	all, each := 0, 0
 	for w in p.watchers {
-		each += 1 if w.device == from.device else 0
+		if w.once == (lease == 0) {
+			all += 1
+			each += 1 if w.device == from.device else 0
+		}
 	}
-	if lease > 0 && (len(p.watchers) >= MAX_WATCHERS || each >= WATCHERS_EACH) {
+	if all >= MAX_WATCHERS || each >= WATCHERS_EACH * (ONCE_EACH if lease == 0 else 1) {
 		return nil, .Busy
 	}
 	w := new(Port_Watch)
@@ -475,7 +480,7 @@ ports_called :: proc(sp: ^Space, call: u64, from: Caller, scope: zsp.Scope, firs
 	}
 	w.on_room = proc(h: ^Call_Handler, call: u64) {
 		w := (^Port_Watch)(h)
-		if w.owed {
+		if w.owed && !w.ended {
 			watcher_tell(w)
 			if w.once && !w.owed {
 				w.ports.telling = true // said at last: over, as soon as the host next looks
@@ -593,6 +598,9 @@ offers_deadline :: proc(p: ^Ports) -> (due: time.Tick, ok: bool) {
 	}
 	due = time.tick_add(p.scanned, SCAN_EVERY)
 	for w in p.watchers {
+		if w.once && w.owed {
+			continue // waits for room, which wakes it: not for its lease, which is over
+		}
 		if w.until._nsec < due._nsec {
 			due = w.until
 		}
