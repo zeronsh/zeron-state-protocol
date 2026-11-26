@@ -27,10 +27,16 @@ execFileSync(process.execPath, [join(WEB, "build.ts"), "--test"], { stdio: "inhe
 // The test page, and what it loads, from this origin.
 const TYPES: Record<string, string> = { ".js": "text/javascript", ".wasm": "application/wasm", ".html": "text/html" };
 const held: (() => void)[] = []; // asked for held.wasm, which is not there: said so when let go
+let onceAsked = false;
 const site = http((req, res) => {
   const path = new URL(req.url!, "http://x").pathname;
   if (path === "/held.wasm") {
     held.push(() => res.writeHead(404).end());
+    return;
+  }
+  if (path === "/once.wasm" && !onceAsked) {
+    onceAsked = true; // not there the first time, and there after
+    res.writeHead(404).end();
     return;
   }
   if (path === "/") {
@@ -39,7 +45,7 @@ const site = http((req, res) => {
     return;
   }
   try {
-    const body = readFileSync(join(WEB, "dist", path.slice(1)));
+    const body = readFileSync(join(WEB, "dist", path === "/once.wasm" ? "node.wasm" : path.slice(1)));
     res.writeHead(200, { "content-type": TYPES[path.slice(path.lastIndexOf("."))] ?? "application/octet-stream" });
     res.end(body);
   } catch {
@@ -256,6 +262,22 @@ const tests: Record<string, () => Promise<void>> = {
     const third = await page();
     await call(third, "device", "fo");
     expectEqual(await call<string>(third, "scopeOrError", "fo"), "2"); // or 3, should what failed be done after all
+  },
+  // A tab whose worker could not start the node, once, is not left with a pipe to one that is gone: its client dials
+  // again, and so the worker tries again, and runs it.
+  async browser_start_fails_once() {
+    const first = await page();
+    await call(first, "device", "sf");
+    await call(first, "create", "sf");
+    const second = await page();
+    await call(second, "deviceWith", "sf", "/once.wasm");
+    await call(second, "put", "sf", "notes", ["one"]); // its client's pipe, carried to the first
+    await first.close();
+    pages.splice(pages.indexOf(first), 1);
+    await eventually("the second's worker could not start it", async () => (await call<string[]>(second, "failures")).length > 0);
+    const put = Promise.race([call(second, "put", "sf", "notes", ["two"]).then(() => "written"), new Promise<string>((done) => setTimeout(() => done("not written"), 8000))]);
+    expectEqual(await put, "written");
+    expectEqual((await call<string[]>(second, "titles", "sf", "notes", 2)).join(), "one,two");
   },
   // Whichever tab joins, makes or adopts a space, every tab's device says it is of it.
   async browser_space_told() {

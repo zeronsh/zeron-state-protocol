@@ -67,7 +67,8 @@ function open(o: Options): void {
 
 // Gets in line for the store. Whoever holds its lock runs the node, for as long as its tab lives; one whose node stopped,
 // or never started, gets in line again when it is next wanted, by its tab asking or dialling, and tries again then: so a
-// store whose storage failed is run again once it can be, and one that cannot be is not tried over and over meanwhile.
+// store whose storage failed is run again once it can be, and one that cannot be is tried no more often than its clients
+// dial, which they do less and less often while they cannot.
 function contend(): void {
   if (contending) return;
   contending = true;
@@ -102,6 +103,7 @@ function contend(): void {
 // Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
 function fail(message: string): void {
   failedAsks(message);
+  breakCarried(); // to one that is gone, or none: every client dials again, and so this worker is wanted, and tries again
   self.postMessage({ failed: message } satisfies Report);
   channel.postMessage({ failed: message } satisfies Shout);
 }
@@ -189,6 +191,7 @@ function shout(id: string, s: Shout): void {
 function heard(s: Shout): void {
   if ("failed" in s) {
     failedAsks(s.failed);
+    breakCarried();
     self.postMessage({ failed: s.failed } satisfies Report);
   } else if ("space" in s) {
     self.postMessage({ space: s.space } satisfies Report);

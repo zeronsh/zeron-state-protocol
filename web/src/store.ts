@@ -231,9 +231,10 @@ export class Store {
     this.#opening.set(n, opening);
   }
 
-  // Runs file operations one after another, so that a removal and a making of one name are done in the order asked.
+  // Runs file operations one after another, so that a removal and a making of one name are done in the order asked; and
+  // none at all once the store is let go of, for the files may be another's by then.
   #after(f: () => Promise<void>): Promise<void> {
-    const next = this.#chain.then(f).catch((e) => {
+    const next = this.#chain.then(() => (this.#abandoned ? undefined : f())).catch((e) => {
       this.failure ??= e;
     });
     this.#chain = next;

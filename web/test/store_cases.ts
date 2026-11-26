@@ -178,4 +178,40 @@ for (const volume of [new MemoryVolume(), new NodeVolume(mkdtempSync(join(tmpdir
   if (volume instanceof NodeVolume) rmSync(volume.path, { recursive: true, force: true });
 }
 
+// Let go of, as when storage fails, with files still being opened and removed: what was queued is not done after, when
+// another store has the files.
+{
+  class Gated extends MemoryVolume {
+    gate?: Promise<void>;
+    override async open(name: string, create: boolean) {
+      if (name === "00000004.log" && this.gate) await this.gate;
+      return super.open(name, create);
+    }
+  }
+  const volume = new Gated();
+  volume.openNow = undefined; // through open, which is gated
+  const a = await Store.open(volume, SEGMENT);
+  assert(a.logWrite(1 * SEGMENT, bytes("a", 30)));
+  assert(a.logSync());
+  for (let i = 0; i < 50 && !a.settled; i++) await turn();
+  let release!: () => void;
+  volume.gate = new Promise((done) => (release = done));
+  assert(a.logWrite(4 * SEGMENT, bytes("x", 10))); // whose file is held up, and those after it queued behind
+  a.logDrop(1); // and the removal of this one too
+  a.letGo();
+  const b = await Store.open(volume, SEGMENT);
+  assert(b.logWrite(1 * SEGMENT, bytes("b", 40)));
+  assert(b.logSync());
+  for (let i = 0; i < 50 && !b.settled; i++) await turn();
+  release();
+  for (let i = 0; i < 20; i++) await turn();
+  const names = await volume.list();
+  assert(names.includes("00000001.log"), "what another store wrote was removed by the one let go of");
+  assert(!names.includes("00000006.log"), "and files were opened by it after");
+  await b.close();
+  const c = await Store.open(volume, SEGMENT);
+  assert.equal(read(c, 1), "b".repeat(40));
+  await c.close();
+}
+
 console.log("ok");
