@@ -4,6 +4,7 @@ package find
 import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
+import "core:math"
 import "core:math/rand"
 import "core:mem"
 import "core:slice"
@@ -1221,5 +1222,79 @@ words_to_look_through_all_for_are_few :: proc(t: ^testing.T) {
 		}{{1, fuzzy, MAX_SCANS, true}, {1, fuzzy, MAX_SCANS + 1, false}, {MAX_SCANS + 1, fuzzy, 1, false}, {1, {inside = true}, MAX_SCANS + 1, false}, {1, {}, 600, true}, {2, {}, 400, false}}) {
 		_, ok := query_parse(question(c.matches, c.flags, words(c.n)))
 		testing.expectf(t, ok == c.ok, "%d of %d words, %v: %v", c.matches, c.n, c.flags, ok)
+	}
+}
+
+// What is not a number comes after every number, as its key does: every row was made before it, and none after, though
+// the rows are gone over by when they were made.
+@(test)
+made_before_what_is_not_a_number :: proc(t: ^testing.T) {
+	state := rand.create(14)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	for secs, i in ([]u64{1000, 2000}) {
+		w.node.now = secs * 1000
+		id := zsp.node_id(&w.node, 2)
+		testing.expect_value(t, u32(id[0]), u32(secs))
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(2, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		zsp.put_u64(b[16:], u64(i))
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+	}
+	number :: proc(w: ^[dynamic]byte, v: f64) {
+		b: [8]byte
+		zsp.put_u64(b[:], transmute(u64)v)
+		zsp.write_bytes(w, b[:])
+	}
+	nan, inf := math.nan_f64(), math.inf_f64(1)
+	Case :: struct {
+		op:     Op,
+		flags:  u8,
+		bounds: []f64,
+		rows:   int,
+	}
+	for c in ([]Case {
+			{.Range, 2 | 8, {nan}, 2}, // made no later than what is not a number
+			{.Range, 2, {nan}, 2}, // before it
+			{.Range, 1 | 4, {nan}, 0}, // no earlier than it
+			{.Range, 1, {nan}, 0}, // after it
+			{.Range, 1 | 2 | 4 | 8, {1500, nan}, 1},
+			{.Range, 1 | 2 | 4 | 8, {inf, nan}, 0},
+			{.Range, 2 | 8, {-inf}, 0},
+			{.Range, 1 | 4, {-inf}, 2},
+			{.In, 0, {1000, nan}, 1},
+			{.In, 0, {nan}, 0},
+		}) {
+		source := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&source, 2)
+		append(&source, u8(c.op), u8(Kind.Created))
+		if c.op == .Range {
+			append(&source, c.flags)
+		} else {
+			zsp.write_varint(&source, u64(len(c.bounds)))
+		}
+		for v in c.bounds {
+			number(&source, v)
+		}
+		append(&source, 0, 0, 0, 10, 0)
+		q, ok := query_parse(source[:])
+		testing.expect(t, ok)
+		index_follow(&w.x)
+		query_prepare(&w.x, &q)
+		index_finish(&w.x)
+		s := index_scope(&w.x, 2)
+		rows := pred_rows(s, &q.where_)
+		testing.expectf(t, rows.count == c.rows, "%v %v of %v: %d rows", c.op, c.flags, c.bounds, rows.count)
+		testing.expectf(t, pred_most(s, &q.where_) >= c.rows, "%v %v of %v: at most %d", c.op, c.flags, c.bounds, pred_most(s, &q.where_))
+		if c.op == .Range && c.flags & 1 != 0 && c.bounds[0] != c.bounds[0] {
+			lo, hi := created_span(&q.where_)
+			testing.expectf(t, !key_less(lo, hi), "%v of %v: rows from %v to %v are gone over", c.flags, c.bounds, lo, hi) // none
+		}
+		set_destroy(&rows)
 	}
 }
