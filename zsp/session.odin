@@ -654,6 +654,12 @@ session_authorize :: proc(s: ^Session) {
 	n := s.node
 	before := slice.clone(s.grants[:], context.temp_allocator)
 	if s.role != .Open {
+		// A device that does not belong has no peers, as on_roster says: neither a relay nor anyone. (One that knows no
+		// roster yet, as one that has only joined, is not judged so: its relay brings it one.)
+		if n.keys != nil && n.roster.serial != 0 && !node_member(n) {
+			session_fail(s, .Denied)
+			return
+		}
 		clear(&s.grants)
 		m := roster_member(&n.roster, s.peer)
 		switch {

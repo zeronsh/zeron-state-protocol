@@ -42,11 +42,11 @@ review_relay_without_roster_waits :: proc(t: ^testing.T) {
 }
 
 @(private = "file")
-hello_frame :: proc(space: Key32, serial: u64, calls := false) -> []byte {
+hello_frame :: proc(space: Key32, serial: u64, calls := false, relay := false) -> []byte {
 	w := make([dynamic]byte, context.temp_allocator)
 	at := frame_begin(&w, .Hello)
 	write_u8(&w, VERSION)
-	write_u8(&w, u8(Hello_Flags{full = !calls, calls = calls}))
+	write_u8(&w, u8(Hello_Flags{full = !calls, calls = calls, relay = relay}))
 	space := space
 	append(&w, ..space[:])
 	write_varint(&w, serial)
@@ -182,4 +182,40 @@ review_device_waits_for_its_peers_roster :: proc(t: ^testing.T) {
 	testing.expect(t, !node_member(&n))
 	testing.expectf(t, !peer.ready, "a peer's session was taken for ready on a device no longer a member")
 	testing.expectf(t, !calls.ready, "a session for calls was taken for ready on a device no longer a member")
+}
+
+// A device the roster no longer admits has no peers: not one it was with when it heard so, which is told the roster
+// and let go of, nor a relay it dials after, which never needs to tell it, having the same roster.
+@(test)
+review_device_no_longer_a_member_has_no_peers :: proc(t: ^testing.T) {
+	x: Three
+	three_init(&x)
+	defer three_destroy(&x)
+	r1, _ := roster_parse(x.r1, x.space)
+	defer roster_destroy(&r1)
+	disk: Memory_Disk
+	defer memory_disk_destroy(&disk)
+	n: Node
+	testing.expect(t, node_init(&n, memory_disk(&disk), x.space, &x.keys[1], true))
+	defer node_destroy(&n)
+	n.now = 3000
+	testing.expect(t, node_adopt(&n, x.r1) && node_member(&n))
+	peer := session_open(&n, .Peer, false, x.keys[2].device)
+	testing.expect(t, session_input(peer, hello_frame(x.space, r1.serial)))
+	testing.expect(t, peer.ready, "a member's session with a member was not ready")
+	session_sent(peer, len(session_output(peer)))
+
+	_ = node_adopt(&n, x.r2_b) // which revokes this device
+	testing.expect(t, !node_member(&n))
+	testing.expectf(t, !peer.ready || peer.closing, "a session went on with a device no longer a member")
+	testing.expectf(t, peer.fault == .Denied, "and ended %v", peer.fault)
+	said := session_output(peer)
+	testing.expect(t, len(said) > len(x.r2_b), "the peer was not told the roster that ended it")
+
+	relay_key := Key32{1 = 9}
+	relay := session_open(&n, .Peer, true, x25519_public(relay_key), relay = true)
+	session_sent(relay, len(session_output(relay)))
+	_ = session_input(relay, hello_frame(x.space, n.roster.serial, relay = true))
+	testing.expectf(t, !relay.ready || relay.closing, "a device no longer a member was ready with a relay")
+	testing.expectf(t, relay.fault == .Denied, "and ended %v", relay.fault)
 }
