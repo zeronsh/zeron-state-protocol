@@ -115,6 +115,13 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   const hidden = () => away();
   const shown = (e: PageTransitionEvent) => e.persisted && back();
   const listening = typeof document !== "undefined" && typeof addEventListener === "function";
+  const unlisten = () => {
+    if (!listening) return;
+    document.removeEventListener("freeze", hidden);
+    document.removeEventListener("resume", back);
+    removeEventListener("pagehide", hidden);
+    removeEventListener("pageshow", shown);
+  };
   if (listening) {
     document.addEventListener("freeze", hidden);
     document.addEventListener("resume", back);
@@ -122,7 +129,17 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     addEventListener("pageshow", shown);
   }
   start();
-  const identity = await ask<{ id: string; key: string; space?: string }>("identity");
+  let identity: { id: string; key: string; space?: string };
+  try {
+    identity = await ask("identity");
+  } catch (e) {
+    // Nobody has a device to close: the worker, and with it any lock or file it holds, is let go of here.
+    unlisten();
+    state = "closed";
+    worker?.terminate();
+    worker = undefined;
+    throw e;
+  }
   space ??= identity.space;
 
   // Timers kept by the worker, which a browser does not hold back while the tab is hidden as it holds back the tab's own:
@@ -217,12 +234,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     // Once, however often asked: its node stopped as it should be, and then its worker let go of.
     close: () =>
       (closing ??= (async () => {
-        if (listening) {
-          document.removeEventListener("freeze", hidden);
-          document.removeEventListener("resume", back);
-          removeEventListener("pagehide", hidden);
-          removeEventListener("pageshow", shown);
-        }
+        unlisten();
         const w = worker;
         if (w && state === "running") await ask<void>("close").catch(() => {});
         state = "closed";

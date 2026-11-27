@@ -23,9 +23,15 @@ let compiled: Promise<WebAssembly.Module> | undefined;
 
 /** Opens the device kept in a directory, making it if there is none. */
 export async function open(options: OpenOptions): Promise<Device & { readonly node: Node }> {
-  compiled ??= loadModule();
+  // Compiled once; and should that fail, tried again next time rather than failing for ever.
+  const compiling = (compiled ??= loadModule().catch((e) => {
+    compiled = undefined;
+    throw e;
+  }));
+  const module = await compiling;
+  // Bound only once all else it needs is had: the node owns it from then on, and lets go of it however opening goes.
   const datagrams = options.udp === false ? undefined : await nodeDatagrams(options.udp ?? {});
-  const node = await Node.open({ ...options, volume: new NodeVolume(options.dir), module: await compiled, datagrams });
+  const node = await Node.open({ ...options, volume: new NodeVolume(options.dir), module, datagrams });
   return {
     node,
     id: node.id,

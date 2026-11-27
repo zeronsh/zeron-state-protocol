@@ -213,7 +213,22 @@ export class Node {
 
   /** Opens the device kept in a volume, making it if there is none; and its node, if it belongs to a space. */
   static async open(options: NodeOptions): Promise<Node> {
-    const d = new Node(options);
+    let d: Node | undefined;
+    try {
+      d = new Node(options);
+      return await d.#begin();
+    } catch (e) {
+      // What it was given to own, and what it opened, are let go of: a file left open would hold the store against the next
+      // to open it, as a browser's are held.
+      if (d) d.#channel?.port1.close(), (d.#store as Store | undefined)?.letGo();
+      options.datagrams?.close();
+      throw e;
+    }
+  }
+
+  async #begin(): Promise<Node> {
+    const d = this as Node;
+    const options = this.#options;
     const wasm = d.#wasm!;
     const store = (d.#store = await Store.open(options.volume, wasm.segment()));
     let secret = store.kept("device").latest;
@@ -760,18 +775,22 @@ export class Node {
     // browser holds back in a hidden tab, to the minute once set from one another often enough.
     if (wait === 0) this.#soon();
     else if (wait > 0) this.#timer = setTimeout(() => this.#kick(), Math.min(wait, LONGEST));
-    // Said only now, so that no client is told anything while the node is in the middle of something.
+    // Said only now, so that no client is told anything while the node is in the middle of something. Each is told what is
+    // for it whatever another does with what is for it: what one throws is thrown once all are told, and counted as dealt with.
+    let thrown: { error: unknown } | undefined;
     for (const [c, data] of this.#deliveries.splice(0)) {
-      if (data.length === 0) {
-        c.closed();
-        continue;
+      try {
+        if (data.length === 0) c.closed();
+        else c.receive(data);
+      } catch (error) {
+        thrown ??= { error };
       }
-      c.receive(data);
-      if (c.far) continue; // it says when it has dealt with it
+      if (data.length === 0 || c.far) continue; // a far one says when it has dealt with it
       c.inflight -= data.length;
       if (c.open && c.inflight + data.length > HIGH / 2) this.#soon(); // it was waiting for room: let others have a turn first
     }
     if (!this.#scheduled && !this.#later) for (const done of this.#waiting.splice(0)) done();
+    if (thrown) throw thrown.error;
   }
 
   // Again, but after whatever else is waiting to happen, rather than before. Anything that happens meanwhile is heard of

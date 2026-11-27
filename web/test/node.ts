@@ -113,6 +113,34 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   client.close();
 }
 
+// A change to the space whose keys could not be kept is not done at all: not kept, roster and all, to be found done at the
+// next start though it was said to have failed.
+{
+  let failing = false;
+  class Failing extends MemoryVolume {
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f || !/^keys\./.test(name)) return f;
+      const write = f.write.bind(f);
+      f.write = (b, at) => {
+        if (failing) throw new Error("the disk is full");
+        return write(b, at);
+      };
+      return f;
+    }
+  }
+  const volume = new Failing();
+  volume.openNow = undefined;
+  const node = await Node.open({ volume, module, log: () => {} });
+  node.create();
+  failing = true;
+  assert.throws(() => node.scope(), /storage has failed/);
+  failing = false;
+  const again = await Node.open({ volume, module, log: () => {} });
+  assert.equal(again.scope(), 2, "the scope said not to have been made was made, its keys never kept");
+  await again.close();
+}
+
 // And it says so at once, though files are still being opened, which a full disk may keep from ever being done: it lets
 // go of what it has open, and what is opened after is let go of as it comes.
 {
@@ -341,6 +369,112 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   assert.throws(() => node.setCredential("later"), /closed/);
 }
 
+// What it keeps is said in days and bytes, of none or more.
+for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinity }, { days: 1e15 }, { bytes: 2 ** 60 }]) {
+  await assert.rejects(Node.open({ volume: new MemoryVolume(), module, full: false, keep, log: () => {} }), RangeError);
+}
+
+// A browser's device, closed twice, or twice at once, is closed once: its node stopped before its worker goes, and neither
+// close waits for ever. (With a worker of nothing but what the device says to it.)
+{
+  let terminated = false, closes = 0, release!: () => void;
+  const finished = new Promise<void>((done) => (release = done));
+  let closed = false;
+  class FakeWorker {
+    onmessage: ((e: { data: unknown }) => void) | null = null;
+    onerror: unknown = null;
+    postMessage(msg: { ask?: number; op?: string }) {
+      if (terminated || msg.ask === undefined) return;
+      const answer = (value?: unknown) => queueMicrotask(() => terminated || this.onmessage?.({ data: { answer: msg.ask, value } }));
+      if (msg.op === "identity") answer({ id: "a", key: "b" });
+      else if (msg.op === "close") {
+        closes++;
+        void finished.then(() => ((closed = true), answer()));
+      }
+    }
+    terminate() {
+      assert(closed, "the worker went before its node was stopped");
+      terminated = true;
+    }
+  }
+  const was = (globalThis as { Worker?: unknown }).Worker;
+  (globalThis as { Worker?: unknown }).Worker = FakeWorker;
+  try {
+    const { open } = await import("../src/browser.ts");
+    const device = await open();
+    const both = Promise.all([device.close(), device.close()]);
+    release();
+    const over = await Promise.race([both.then(() => "closed"), new Promise((done) => setTimeout(() => done("waiting"), 500))]);
+    assert.equal(over, "closed");
+    assert.equal(await Promise.race([device.close().then(() => "closed"), new Promise((done) => setTimeout(() => done("waiting"), 500))]), "closed");
+    assert.equal(closes, 1);
+  } finally {
+    (globalThis as { Worker?: unknown }).Worker = was;
+  }
+}
+
+// A node that cannot be opened lets go of what it opened, and of the UDP it was given: a file left open would hold the
+// store against the next to open it, as a browser's are held.
+{
+  let opened = 0, closed = 0, udpClosed = false;
+  class Full extends MemoryVolume {
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f) return f;
+      opened++;
+      const close = f.close.bind(f);
+      f.close = () => (closed++, close());
+      if (name.startsWith("device.")) f.write = () => { throw new Error("the disk is full"); };
+      return f;
+    }
+  }
+  const datagrams = { port: 1, listen() {}, send() {}, interfaces: () => [], close: () => (udpClosed = true) };
+  await assert.rejects(Node.open({ volume: new Full(), module, datagrams, log: () => {} }), /full/);
+  assert(opened > 0);
+  assert.equal(closed, opened, "files it opened were left open");
+  assert(udpClosed, "the UDP it was given was left open");
+  udpClosed = false;
+  await assert.rejects(Node.open({ volume: new MemoryVolume(), module, datagrams, keep: { days: -1 } }), RangeError);
+  assert(udpClosed, "the UDP it was given was left open, though it refused what it was told to keep");
+}
+
+// One client that throws at what it is told does not keep the node's clients from being told the rest of theirs, itself
+// included; and what it threw is thrown, once all are told.
+{
+  const node = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  node.create();
+  let throwing = false;
+  const thrown: unknown[] = [];
+  const catching = (e: unknown) => thrown.push(e);
+  process.on("uncaughtException", catching);
+  const Note = { title: columns.string(16), more: columns.bytes(18) };
+  const fail = (): never => {
+    throw new Error("the application's own");
+  };
+  // It throws once, at the first piece of a row bigger than the node sends at once: the rest is sent it in the same turn.
+  const first = new Client({ connect: (receive, closed) => node.connect((data) => (receive(data), throwing && data.length > 32 << 10 && ((throwing = false), fail())), closed) });
+  const second = new Client({ connect: node.connect });
+  const writer = new Client({ connect: node.connect });
+  const seen = [0, 0];
+  const windows = [first, second].map((c, k) => c.window({ scope: 1, list: "n", table: Note }, (st) => (seen[k] = st.rows.length)));
+  while (!writer.may(1, "write") || !first.ready || !second.ready) await new Promise((done) => setTimeout(done, 1));
+  await new Promise((done) => setTimeout(done, 50));
+  let lost = 0;
+  for (const c of [first, second]) c.on("status", (ready) => !ready && lost++);
+  throwing = true;
+  let written = false;
+  void writer.write(1, (change) => change.insert(Note, "n", 1, { title: "one", more: new Uint8Array(200 << 10).fill(1) })).then(() => (written = true));
+  for (let i = 0; i < 400 && !(written && seen.join() === "1,1"); i++) await new Promise((done) => setTimeout(done, 5));
+  process.off("uncaughtException", catching);
+  assert(written, "the writer was never told its write was durable, another client having thrown");
+  assert.deepEqual(seen, [1, 1], "a client was never told the rest, one having thrown");
+  assert.equal(lost, 0, "what was for a client was dropped, one having thrown, and its pipe broke on what it was told after");
+  assert.equal(thrown.length, 1, "what it threw was not thrown");
+  windows.forEach((w) => w.stop());
+  first.close(), second.close(), writer.close();
+  await node.close();
+}
+
 // What a link straight to another device has to say once what it acknowledges is durable is said then: not when something
 // else next happens, which may be never.
 {
@@ -383,45 +517,45 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await b.close();
 }
 
-// What it keeps is said in days and bytes, of none or more.
-for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinity }, { days: 1e15 }, { bytes: 2 ** 60 }]) {
-  await assert.rejects(Node.open({ volume: new MemoryVolume(), module, full: false, keep, log: () => {} }), RangeError);
+// A device in Node whose node could not be compiled tries again the next time, rather than failing for ever; and one that
+// cannot be opened leaves no socket open.
+{
+  const { open: openDevice } = await import("../src/nodejs.ts");
+  const udp = () => process.getActiveResourcesInfo().filter((r) => r === "UDPWrap").length;
+  const compile = WebAssembly.compile;
+  WebAssembly.compile = () => Promise.reject(new Error("out of memory"));
+  try {
+    await assert.rejects(openDevice({ dir: join(TMP, "nodejs-a"), udp: false }), /out of memory/);
+  } finally {
+    WebAssembly.compile = compile;
+  }
+  const d = await openDevice({ dir: join(TMP, "nodejs-a"), udp: false });
+  await d.close();
+  const sockets = udp();
+  await assert.rejects(openDevice({ dir: join(TMP, "nodejs-b"), keep: { days: -1 } }), RangeError);
+  await new Promise((done) => setTimeout(done, 50));
+  assert.equal(udp(), sockets, "a device that could not be opened left its sockets open");
 }
 
-// A browser's device, closed twice, or twice at once, is closed once: its node stopped before its worker goes, and neither
-// close waits for ever. (With a worker of nothing but what the device says to it.)
+// A browser's device whose worker cannot open it lets go of the worker, which would hold whatever it had of the store.
 {
-  let terminated = false, closes = 0, release!: () => void;
-  const finished = new Promise<void>((done) => (release = done));
-  let closed = false;
-  class FakeWorker {
+  let terminated = false;
+  class Failing {
     onmessage: ((e: { data: unknown }) => void) | null = null;
     onerror: unknown = null;
-    postMessage(msg: { ask?: number; op?: string }) {
-      if (terminated || msg.ask === undefined) return;
-      const answer = (value?: unknown) => queueMicrotask(() => terminated || this.onmessage?.({ data: { answer: msg.ask, value } }));
-      if (msg.op === "identity") answer({ id: "a", key: "b" });
-      else if (msg.op === "close") {
-        closes++;
-        void finished.then(() => ((closed = true), answer()));
-      }
+    postMessage(msg: { ask?: number }) {
+      if (msg.ask !== undefined) queueMicrotask(() => this.onmessage?.({ data: { failed: "the origin's file system is not there" } }));
     }
     terminate() {
-      assert(closed, "the worker went before its node was stopped");
       terminated = true;
     }
   }
   const was = (globalThis as { Worker?: unknown }).Worker;
-  (globalThis as { Worker?: unknown }).Worker = FakeWorker;
+  (globalThis as { Worker?: unknown }).Worker = Failing;
   try {
     const { open } = await import("../src/browser.ts");
-    const device = await open();
-    const both = Promise.all([device.close(), device.close()]);
-    release();
-    const over = await Promise.race([both.then(() => "closed"), new Promise((done) => setTimeout(() => done("waiting"), 500))]);
-    assert.equal(over, "closed");
-    assert.equal(await Promise.race([device.close().then(() => "closed"), new Promise((done) => setTimeout(() => done("waiting"), 500))]), "closed");
-    assert.equal(closes, 1);
+    await assert.rejects(open(), /file system/);
+    assert(terminated, "the worker was left running");
   } finally {
     (globalThis as { Worker?: unknown }).Worker = was;
   }

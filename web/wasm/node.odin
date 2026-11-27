@@ -285,6 +285,11 @@ start :: proc "c" (full: bool, age, bytes: f64) -> bool {
 			}
 		},
 		roster = proc(_: rawptr, bytes: []byte) {
+			// Kept after the keys it needs: should they not have been, nor is it, so that a change said to have failed is not
+			// found done at the next start, under a roster whose keys were never kept.
+			if failed {
+				return
+			}
 			if !keep(1, raw_data(bytes), len(bytes)) {
 				report(.Error, "could not keep the roster; stopping rather than going on with what may be lost")
 				failed = true
