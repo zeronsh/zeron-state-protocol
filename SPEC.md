@@ -647,7 +647,8 @@ A question has at most 8 orders, 64 totals, none of kind 6, sums only of kind 3,
 serve it, and it needs Read where others need Call, in every scope the question is about. The first message is the question. Each message back is an Answer without its id, and with
 each row's key, as in a Watch, in place of its id, any key of it. The partial replica watches those
 places, data and live, and answers its client once it holds the rows. It believes nothing else that would not be an answer to what it asked. A device that will not answer faults *unserved*, and another is asked; until one
-does, and when none can be reached, the answer is of what is held. A Fetch waits for the other, if one can be reached, and for its rows to be confirmed.
+does, and when none can be reached, the answer is of what is held. A Fetch waits for the other, if one can be reached, and for its rows to be confirmed: an answer
+that names a row where a full replica confirms there is none is no answer to it, and another is asked. A question that stays waits for the next answer.
 
 With none to ask that can read, but a full replica that may be sent the scope and holds what it cannot, as a relay, a partial replica watches, data and
 live, a list the question's rows must all be in, if it names one at its top and joins no others, and answers as it would were it full; the answer is
