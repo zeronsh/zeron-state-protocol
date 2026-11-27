@@ -43,7 +43,7 @@ type Piece = {
 export type Text = {
 	spans: { Span },
 	visible: number, -- bytes that are there
-	before: { number }, -- visible bytes before each span, as far as known: to `known`, and not past what changed since
+	before: { number }?, -- visible bytes before each span, as far as known: to `known`, and not past what changed since
 	known: number,
 	pieces: { [string]: Piece },
 	waiting: { { piece: string, rest: string, at: number } },
@@ -68,7 +68,7 @@ function text.new(): Text
 	return {
 		spans = {},
 		visible = 0,
-		before = {},
+		before = nil,
 		known = 0,
 		pieces = {},
 		waiting = {},
@@ -118,7 +118,9 @@ end
 -- is known of how much is visible before each, and counting only what changed since. So typing in one place, or at the
 -- end, counts a span or two, however long the text.
 local function seek(t: Text, pos: number): number
-	local spans, before = t.spans, t.before
+	local spans = t.spans
+	local before = t.before or {} -- made when first a place is looked for
+	t.before = before
 	local n = #spans
 	local known = t.known
 	if known == 0 then
@@ -248,7 +250,9 @@ local function split(t: Text, i: number, n: number)
 	table.insert(t.spans, i + 1, tail)
 	s.parts = { string.sub(body, 1, n) }
 	s.len = n
-	changed(t, i)
+	if i <= t.known then
+		t.known = i
+	end
 	label(t, i + 1)
 	local p = piece_of(t, s.piece)
 	local _, at = span_of(p, s.offset)
@@ -447,7 +451,9 @@ local function insert_run(t: Text, id: string, bytes: string, lpiece: string, lo
 			table.insert(b.parts, bytes)
 			b.len += #bytes
 			t.visible += #bytes
-			changed(t, at - 1)
+			if at - 1 <= t.known then
+				t.known = at - 1
+			end
 			t.hint = at - 1
 			return
 		end
@@ -455,7 +461,9 @@ local function insert_run(t: Text, id: string, bytes: string, lpiece: string, lo
 	local made: Span = { piece = id, offset = offset, len = #bytes, parts = { bytes }, dead = false, label = 0 }
 	table.insert(spans, at, made)
 	t.visible += #bytes
-	changed(t, at)
+	if at <= t.known then
+		t.known = at
+	end
 	label(t, at)
 	table.insert(p.spans, made) -- the newest of its piece, so the last
 	t.hint = at
@@ -763,7 +771,7 @@ function text.insert(t: Text, pos: number, bytes: string, fresh: () -> string)
 		-- The span the byte before it is in; past the end, it is put between the start and the end.
 		i = seek(t, pos)
 		if i <= #t.spans then
-			split(t, i, pos - t.before[i])
+			split(t, i, pos - (t.before :: { number })[i])
 			local s = t.spans[i]
 			lp, lo = s.piece, s.offset + s.len - 1
 			i += 1
@@ -797,7 +805,7 @@ function text.delete(t: Text, pos: number, count: number, fresh: () -> string)
 	-- From the span the first byte is in.
 	local i = seek(t, pos + 1)
 	if i <= #t.spans then
-		pos -= t.before[i]
+		pos -= (t.before :: { number })[i]
 	end
 	while i <= #t.spans and count > 0 do
 		local s = t.spans[i]

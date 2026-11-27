@@ -34,8 +34,9 @@ function codec.u8(r: Reader): number
 	if pos >= r.len then
 		short()
 	end
+	local v = buffer.readu8(r.buf, pos)
 	r.pos = pos + 1
-	return buffer.readu8(r.buf, pos)
+	return v
 end
 
 -- Exact to 2^53, as TypeScript's: a varint of more than ten bytes, or beyond 2^53 - 1, is refused rather than come out
@@ -73,11 +74,12 @@ end
 
 function codec.take(r: Reader, n: number): string
 	local at = r.pos
-	if not (n >= 0 and at + n <= r.len) then
+	if at + n > r.len or n < 0 then
 		short()
 	end
+	local s = buffer.readstring(r.buf, at, n)
 	r.pos = at + n
-	return buffer.readstring(r.buf, at, n)
+	return s
 end
 
 function codec.bytes(r: Reader): string

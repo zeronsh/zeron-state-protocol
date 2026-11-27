@@ -1281,12 +1281,12 @@ end
 -- Whether a cell is one a node could have sent: what the merge rule and placing read of it is there. One that is not, as
 -- a bundle that says it holds more stamps than it does, is nonsense, and not to be looked through.
 local function sound(kind: number, slot: number, body: string): boolean
-	if kind == GRAVE then
-		return slot == 0
+	if kind == VALUE or kind == PIECE then
+		return slot >= 16
 	elseif kind == PLACE then
 		return slot >= 1 and slot <= 15 and #body >= 24
-	elseif kind == VALUE or kind == PIECE then
-		return slot >= 16
+	elseif kind == GRAVE then
+		return slot == 0
 	elseif kind == BUNDLE then
 		return slot >= 16 and #body >= 4 and 4 + (string.unpack(">I4", body) :: any) * 16 <= #body
 	end
@@ -2106,10 +2106,12 @@ function Client._heard(self: Client, stamp: string)
 end
 
 -- A stamp for a cell of a row: no earlier than the row was made, for no cell is older than its row.
-function Client._stamp(self: Client, row: string): string
-	local born = (string.unpack(">I4", row, 5) :: any) * 1000
-	if born > self.clock_ms then
-		self.clock_ms, self.clock_n = born, 0
+function Client._stamp(self: Client, row: string?): string
+	if row then
+		local born = (string.unpack(">I4", row, 5) :: any) * 1000
+		if born > self.clock_ms then
+			self.clock_ms, self.clock_n = born, 0
+		end
 	end
 	local ms = math.floor(self.host.now() * 1000)
 	if ms > self.clock_ms then
@@ -2127,14 +2129,16 @@ type Written = { row: string, slot: number, kind: number, stamp: string, body: s
 
 -- A row this client may write in now, as far as it knows: what a node refuses, it refuses for good, ending the pipe and
 -- this client with it. One made later than a stamp of this client's may be ahead of the clock is never written.
-function Client._may_write(self: Client, id: string, scope: number)
+function Client._may_write(self: Client, id: string, scope: number, may: boolean?)
 	if type(id) ~= "string" or #id ~= 16 then
 		error("a row's id is 16 bytes", 3)
-	elseif string.unpack(">I4", id) ~= scope then
+	end
+	local of, born = string.unpack(">I4I4", id)
+	if of ~= scope then
 		error("that row is of another scope", 3)
-	elseif self.ready and not self:may(scope, "write") then
+	elseif not may and self.ready and not self:may(scope, "write") then
 		error("this client may not write there", 3)
-	elseif (string.unpack(">I4", id, 5) :: any) > self.host.now() + LEAP_SECONDS then
+	elseif (born :: number) * 1000 > self.clock_ms and (born :: number) > self.host.now() + LEAP_SECONDS then
 		error("that row was made later than any clock may yet say", 3)
 	end
 end
@@ -2211,37 +2215,40 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	local cells: { Written } = {}
 	local fresh: { [string]: boolean } = {} -- rows made here
 	local rows: { [string]: boolean } = {}
-	-- Each row as it was before this change touched it, to be put back if the change is not made after all.
-	local saved: { [string]: { existed: boolean, dead: boolean, slots: { [number]: { [string]: Cell } }, touched: { [number]: boolean } } } = {}
+	-- Each row as it was before this change touched it, to be put back if the change is not made after all: false for
+	-- one that was not held, which is put back as empty.
+	local saved: { [string]: any } = {}
 	local function keep(id: string, slot: number): Stored
 		local was = saved[id]
-		local existed = self.rows[id]
-		local row = existed or self:_row(id)
-		if not was then
-			-- What editors have open in the row is their own writing, sent whatever becomes of this change: first, then,
-			-- so that undoing the change cannot take it back, and what the change writes over it is later.
-			for k, t in row.texts do
-				if t.open ~= "" then
-					self:_seal(row, k)
+		local row = self.rows[id]
+		if was == nil then
+			if row then
+				-- What editors have open in the row is their own writing, sent whatever becomes of this change: first, then,
+				-- so that undoing the change cannot take it back, and what the change writes over it is later.
+				for k, t in row.texts do
+					if t.open ~= "" then
+						self:_seal(row, k)
+					end
 				end
+				local slots = {}
+				for k, cs in row.slots do
+					slots[k] = table.clone(cs)
+				end
+				was = { dead = row.dead, slots = slots, touched = {} }
+			else
+				was = false
 			end
-			local slots = {}
-			for k, cs in row.slots do
-				slots[k] = table.clone(cs)
-			end
-			was = { existed = existed ~= nil, dead = row.dead, slots = slots, touched = {} }
 			saved[id] = was
 		end
-		was.touched[slot] = true
-		return row
+		if was then
+			was.touched[slot] = true
+		end
+		return row or self:_row(id)
 	end
 	local function put(row: string, slot: number, kind: number, body: string)
 		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 192 bytes")
-		if not sound(kind, slot, body) then
-			error(`no cell of kind {kind} goes in slot {slot}`, 0) -- as a column made by hand may say
-		end
 		local stored = keep(row, slot)
-		local stamp = self:_stamp(row)
+		local stamp = self:_stamp(if fresh[row] then nil else row) -- one made here is no older than the clock
 		rows[row] = true
 		table.insert(cells, { row = row, slot = slot, kind = kind, stamp = stamp, body = body })
 		self:_accept(stored, slot, kind, stamp, body, self:_mine(scope))
@@ -2250,6 +2257,9 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		for name, value in values do
 			local c = schema[name]
 			assert(c and not c.who, `no column {name} to write`)
+			if not (c.slot >= 16 and c.slot <= 255) then
+				error(`no value goes in slot {c.slot}`, 0) -- as a column made by hand may say
+			end
 			-- Empty text is what a text is before anything is written: it need only be said to clear one.
 			local row = self.rows[id]
 			if value ~= "" or not c.text or (row and row.slots[c.slot]) or not fresh[id] then
@@ -2258,16 +2268,16 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		end
 	end
 	local function place(id: string, list: string, order: number, slot: number?)
-		if type(order) ~= "number" or order < 0 or order > 9007199254740991 or order ~= math.floor(order) then
+		if not (type(order) == "number" and order >= 0 and order <= 9007199254740991 and order % 1 == 0) then
 			error("an order is a whole number from 0 to 2^53", 0)
-		elseif slot ~= nil and (type(slot) ~= "number" or slot < 1 or slot > 15 or slot ~= math.floor(slot)) then
+		elseif slot ~= nil and not (type(slot) == "number" and slot >= 1 and slot <= 15 and slot % 1 == 0) then
 			error("a row is placed in slots 1 to 15", 0)
 		end
 		put(id, slot or 1, PLACE, self:_tag(scope, list) .. codec.u64(order))
 	end
 	-- A row of this scope: what a change does to a row of another is refused, and the whole change with it, by any node.
 	local function writable(id: string): string
-		self:_may_write(id, scope)
+		self:_may_write(id, scope, true) -- as was asked of the scope, above
 		return id
 	end
 	local change: Change = {
@@ -2316,7 +2326,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		-- All or nothing: whatever was done here is undone, and nothing is said.
 		for id, was in saved do
 			local row = self.rows[id]
-			if row then
+			if row and was then
 				row.dead = was.dead
 				row.slots = was.slots
 				for slot in was.touched do
@@ -2324,7 +2334,11 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 					row.lives[slot] = nil
 				end
 				unview(row)
-				if not was.existed and row.pages == 0 and next(row.held) == nil and not self:_pending(id) then
+			elseif row then
+				-- Nothing of it was held before, and nothing of this change is.
+				row.dead, row.slots, row.texts, row.lives = false, {}, {}, {}
+				unview(row)
+				if row.pages == 0 and next(row.held) == nil and not self:_pending(id) then
 					self.rows[id] = nil
 				end
 			end

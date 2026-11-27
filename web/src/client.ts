@@ -403,13 +403,13 @@ function bundleHas(body: Uint8Array, stamp: string): boolean {
 // a bundle that says it holds more stamps than it does, is nonsense, and not to be looked through.
 function sound(kind: number, slot: number, body: Uint8Array): boolean {
   switch (kind) {
-    case GRAVE:
-      return slot === 0;
-    case PLACE:
-      return slot >= 1 && slot <= 15 && body.length >= 24;
     case VALUE:
     case PIECE:
       return slot >= 16;
+    case PLACE:
+      return slot >= 1 && slot <= 15 && body.length >= 24;
+    case GRAVE:
+      return slot === 0;
     case BUNDLE:
       return slot >= 16 && body.length >= 4 && 4 + (((body[0] << 24) | (body[1] << 16) | (body[2] << 8) | body[3]) >>> 0) * 16 <= body.length;
   }
@@ -1892,10 +1892,11 @@ export class Client {
 
   // A row this client may write in now, as far as it knows: what a node refuses, it refuses for good, ending the pipe and
   // this client with it. One made later than a stamp of this client's may be ahead of the clock is never written.
-  #mayWrite(bin: string, scope: number): void {
+  #mayWrite(bin: string, scope: number, may = false): void {
     if (codec.u32Of(bin) !== scope) throw new RangeError("that row is of another scope");
-    if (this.#ready && !this.may(scope, "write")) throw new Error("this client may not write there");
-    if (codec.u32Of(bin, 4) * 1000 > Math.floor(this.#host.now()) + LEAP_MS) throw new RangeError("that row was made later than any clock may yet say");
+    if (!may && this.#ready && !this.may(scope, "write")) throw new Error("this client may not write there");
+    const born = codec.u32Of(bin, 4) * 1000;
+    if (born > this.#clockMs && born > Math.floor(this.#host.now()) + LEAP_MS) throw new RangeError("that row was made later than any clock may yet say");
   }
 
   #sendCells(cells: Written[], done?: () => void): void {
@@ -1990,7 +1991,6 @@ export class Client {
     };
     const put = (row: string, slot: number, kind: number, body: Uint8Array) => {
       if (body.length > MAX_OPEN) throw new RangeError("a value may be 1 MiB at most, less 192 bytes");
-      if (!sound(kind, slot, body)) throw new RangeError(`no cell of kind ${kind} goes in slot ${slot}`); // as a column made by hand may say
       const stored = touch(row, slot);
       const stamp = this.#stamp(row);
       rows.add(row);
@@ -2002,6 +2002,7 @@ export class Client {
         const value = values[name];
         const c = schema[name];
         if (!c || c.who) throw new Error(`no column ${name} to write`);
+        if (!(c.slot >= 16 && c.slot <= 255)) throw new RangeError(`no value goes in slot ${c.slot}`); // as a column made by hand may say
         if (value === undefined) continue;
         // Empty text is what a text is before anything is written: it need only be said to clear one.
         const row = this.#rows.get(bin);
@@ -2017,7 +2018,7 @@ export class Client {
     // A row of this scope: what a change does to a row of another is refused, and the whole change with it, by any node.
     const idOf = (id: string): string => {
       const bin = rowId(id);
-      this.#mayWrite(bin, scope);
+      this.#mayWrite(bin, scope, true); // as was asked of the scope, above
       return bin;
     };
     // Done here, so that what is refused throws here; and should it throw, as if it had never been.
