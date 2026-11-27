@@ -4,6 +4,7 @@ foreign import kernel32 "system:Kernel32.lib"
 
 import win32 "core:sys/windows"
 import "core:os"
+import "core:path/filepath"
 import "core:time"
 
 // On Windows a file another has open, without having let it be deleted, cannot be replaced; and one being replaced
@@ -225,13 +226,19 @@ dir_lock :: proc(path: string) -> (lock: Dir_Lock, held: Hold) {
 	handle := win32.INVALID_HANDLE_VALUE
 	start := time.tick_now()
 	for {
-		handle = win32.CreateFileW(name, win32.GENERIC_READ | win32.GENERIC_WRITE, win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE, nil, win32.OPEN_ALWAYS, win32.FILE_ATTRIBUTE_NORMAL, nil)
+		// The link itself, should it be one, which is then refused: never followed to wherever it leads.
+		handle = win32.CreateFileW(name, win32.GENERIC_READ | win32.GENERIC_WRITE, win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE, nil, win32.OPEN_ALWAYS, win32.FILE_ATTRIBUTE_NORMAL | win32.FILE_FLAG_OPEN_REPARSE_POINT, nil)
 		if handle != win32.INVALID_HANDLE_VALUE || !file_busy(win32.GetLastError()) || time.tick_since(start) >= FILE_BUSY_WAIT {
 			break
 		}
 		win32.Sleep(1)
 	}
 	if handle == win32.INVALID_HANDLE_VALUE {
+		return lock, .Failed
+	}
+	info: win32.BY_HANDLE_FILE_INFORMATION
+	if !win32.GetFileInformationByHandle(handle, &info) || info.dwFileAttributes & (win32.FILE_ATTRIBUTE_REPARSE_POINT | win32.FILE_ATTRIBUTE_DIRECTORY) != 0 {
+		win32.CloseHandle(handle)
 		return lock, .Failed
 	}
 	over := win32.OVERLAPPED {
@@ -256,6 +263,13 @@ path_remote :: proc(path: string) -> (remote: bool, kind: string, found: bool) {
 	}
 	defer win32.CloseHandle(handle)
 	return file_remote(name, handle), "a network share", true
+}
+
+// Where a directory is, as the system takes its path: where `..` is only ever taken as written, as it is by the system
+// (GetFullPathNameW). For this turn.
+dir_real :: proc(dir: string) -> (real: string, ok: bool) {
+	whole, err := filepath.abs(dir, context.temp_allocator)
+	return whole, err == nil
 }
 
 // The names in a directory, for this turn: as the system lists them, with nothing more asked of each.

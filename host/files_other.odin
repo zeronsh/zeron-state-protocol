@@ -12,16 +12,16 @@ when ODIN_OS == .Darwin {
 	foreign import libc "system:c"
 }
 
-@(default_calling_convention = "c", private = "file")
+@(default_calling_convention = "c", private)
 foreign libc {
 	// Not POSIX, but in every system's C library here: a lock held by an open file, not by a process, so that two in one
-	// process exclude each other, and let go of when that is closed.
+	// process exclude each other, and let go of when that is closed, and not when another file of the process on it is.
 	flock :: proc(fd: posix.FD, operation: i32) -> i32 ---
 }
 
-@(private = "file")
+@(private)
 LOCK_EX :: 2
-@(private = "file")
+@(private)
 LOCK_NB :: 4
 
 // The whole of a file, or false if there is none.
@@ -121,7 +121,7 @@ open_file :: proc(name: cstring, flags: posix.O_Flags) -> (fd: posix.FD) {
 	}
 }
 
-@(private = "file")
+@(private)
 lock_file :: proc(fd: posix.FD, operation: i32) -> bool {
 	for {
 		if flock(fd, operation) == 0 {
@@ -160,21 +160,21 @@ sync_file :: proc(fd: posix.FD) -> bool {
 	}
 }
 
-// Holds a file's lock against every other process that takes it, until let go of: blocking until it is free.
+// Holds a file's lock against every other that takes it, in another process or in another thread of this one, until let
+// go of: blocking until it is free. flock's, an open file's, which neither lets another thread of the process through,
+// as a process's own lock (lockf) would, nor is let go of when another file of the process on it is closed.
 File_Lock :: distinct posix.FD
 
 @(private)
 file_lock :: proc(path: string) -> (lock: File_Lock, ok: bool) {
 	name := strings.clone_to_cstring(path, context.temp_allocator)
-	fd := open_file(name, {.RDWR, .CREAT, .CLOEXEC})
+	fd := open_file(name, {.RDWR, .CREAT, .CLOEXEC, .NOFOLLOW}) // never a link, followed to wherever it leads
 	if fd < 0 {
 		return
 	}
-	for posix.lockf(fd, .LOCK, 0) != .OK {
-		if posix.errno() != .EINTR {
-			posix.close(fd)
-			return
-		}
+	if !lock_file(fd, LOCK_EX) {
+		posix.close(fd)
+		return
 	}
 	return File_Lock(fd), true
 }
@@ -196,11 +196,52 @@ dir_lock :: proc(path: string) -> (lock: Dir_Lock, held: Hold) {
 	if fd < 0 {
 		return Dir_Lock(-1), .Failed
 	}
+	st: posix.stat_t
+	if posix.fstat(fd, &st) != .OK || !posix.S_ISREG(st.st_mode) {
+		posix.close(fd) // nor anything but a file
+		return Dir_Lock(-1), .Failed
+	}
+	if st.st_mode & {.IRGRP, .IWGRP, .IXGRP, .IROTH, .IWOTH, .IXOTH} != {} {
+		posix.fchmod(fd, {.IRUSR, .IWUSR}) // as made by another, readable by others, as it is kept from now on
+	}
 	if held = lock_held(fd); held != .Held {
 		posix.close(fd)
 		return Dir_Lock(-1), held
 	}
 	return Dir_Lock(fd), .Held
+}
+
+// Where a directory is, as the system takes its path: the longest part of it there is resolved as the system resolves
+// it, links and `..` and all (realpath), and the rest, which is to be made and so is no link, as written, `..` taking
+// one of its parts away. For this turn.
+dir_real :: proc(dir: string) -> (real: string, ok: bool) {
+	parts := strings.split(dir, "/", context.temp_allocator)
+	for n := len(parts); n >= 0; n -= 1 {
+		prefix := strings.join(parts[:n], "/", context.temp_allocator)
+		if prefix == "" {
+			prefix = "/" if strings.has_prefix(dir, "/") else "."
+		}
+		resolved := posix.realpath(strings.clone_to_cstring(prefix, context.temp_allocator))
+		if resolved == nil {
+			if posix.errno() == .ENOENT {
+				continue
+			}
+			return
+		}
+		real = strings.clone(string(resolved), context.temp_allocator)
+		posix.free(rawptr(resolved))
+		for part in parts[n:] {
+			switch part {
+			case "", ".":
+			case "..":
+				real = filepath.dir(real)
+			case:
+				real = file_in(real, part)
+			}
+		}
+		return real, true
+	}
+	return
 }
 
 // The names in a directory, for this turn, as cheaply as they can be had: without asking anything of what each is.

@@ -83,7 +83,13 @@ run :: proc() -> int {
 			say(os.stderr, text, "\n")
 		},
 	}
-	dir := args[1]
+	// Where the directory is as the system takes it: what is made, judged and held is that, and all is kept in it.
+	real, found := host.dir_real(args[1])
+	if !found {
+		say(os.stderr, "could not find ", args[1], "\n")
+		return 1
+	}
+	dir := strings.clone(real)
 	rest := args[2:]
 	ok := false
 	switch args[0] {
@@ -100,7 +106,7 @@ run :: proc() -> int {
 				}
 			}
 			buf: [10]byte
-			say(os.stdout, strconv.write_uint(buf[:], u64(id), 10), "\n")
+			a.said = strings.concatenate({strconv.write_uint(buf[:], u64(id), 10), "\n"}, context.temp_allocator) // once it is done
 			return true
 		})
 	case "admit":
@@ -193,6 +199,7 @@ Admin :: struct {
 	roster: zsp.Roster,
 	draft:  zsp.Draft,
 	space:  string,
+	said:   string, // to standard output, once the change is made
 }
 
 // An admin or owner draws up rosters, and so must hold every scope's keys: to read, write and call in each, beside
@@ -305,9 +312,8 @@ create :: proc(dir: string) -> bool {
 	zsp.draft_grant(&d, k.device, k.signer, home, {.Read, .Write, .Call}).owner = true
 	bytes := zsp.roster_sign(&k, root, &d, context.temp_allocator) or_return
 	name := to_hex(space[:])
-	if err := os.make_directory_all(in_dir(dir, name)); err != nil {
-		return false
-	}
+	store := host.dir_hold(in_dir(dir, name)) or_return // which makes it
+	defer host.dir_unlock(store)
 	host.save(in_dir(in_dir(dir, name), "roster"), bytes) or_return
 	host.save(in_dir(dir, "space"), transmute([]byte)name) or_return
 	say(os.stdout, name, "\n")
@@ -365,12 +371,11 @@ read_space :: proc(dir: string) -> (space: zsp.Key32, name: string, ok: bool) {
 // nothing, and nothing is changed: kept here beside it, a roster would be taken only at its next start, and roster.old
 // would by then not be the one it followed.
 amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []string) -> bool) -> bool {
-	space, name := read_space(dir) or_return
 	start := host.dir_starting(dir) or_return
 	lock, held, kind := host.dir_try(dir)
 	running := held == .In_Use
 	if running {
-		host.dir_started(start) // and so it has said where it listens
+		host.dir_started(start) // and so it has said where it listens, and nothing changes which space it is of
 	}
 	defer if !running {
 		host.dir_started(start) // once the roster is kept, which a node starting meanwhile waits for
@@ -382,11 +387,22 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 		host.hold_report(dir, held, kind)
 		return false
 	}
+	// Which space this is, read only now: a command that changes it holds the directory meanwhile.
+	space, name := read_space(dir) or_return
+	space_dir := in_dir(dir, name)
+	// With no node running, the space's own directory is held too, as whoever keeps a store there would hold it, a Node
+	// device pointed at it among them: its store is looked at, and its roster kept, only by one at a time.
+	store: host.Dir_Lock
+	if !running {
+		store = host.dir_hold(space_dir) or_return
+	}
+	defer if !running {
+		host.dir_unlock(store)
+	}
 	secret := host.device_secret(dir, held == .Held) or_return
 	a: Admin
 	a.space = name
 	zsp.keyring_init(&a.keys, secret)
-	space_dir := in_dir(dir, name)
 	data, read := host.read_file(in_dir(space_dir, "roster"), context.temp_allocator)
 	if read {
 		a.roster, read = zsp.roster_parse(data, space)
@@ -425,6 +441,8 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 			say(os.stderr, "could not keep the roster\n")
 		} else if !kept {
 			say(os.stderr, "the roster kept here was changed meanwhile, as by another command: nothing was changed\n")
+		} else {
+			say(os.stdout, a.said)
 		}
 		return kept
 	}
@@ -433,6 +451,7 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 	answered, _ := announce(dir, bytes)
 	switch {
 	case taken(space_dir, bytes):
+		say(os.stdout, a.said)
 		return true
 	case answered:
 		say(os.stderr, "the node running here would not take it: it has a later roster, or one this does not follow from; nothing was changed\n")
@@ -593,9 +612,8 @@ join_from_roster :: proc(dir, file: string) -> bool {
 	roster := zsp.roster_parse(data, space) or_return
 	zsp.roster_destroy(&roster)
 	name := to_hex(space[:])
-	if merr := os.make_directory_all(in_dir(dir, name)); merr != nil && !os.is_dir(in_dir(dir, name)) {
-		return false
-	}
+	store := host.dir_hold(in_dir(dir, name)) or_return // which makes it; and as whoever keeps a store there holds it
+	defer host.dir_unlock(store)
 	// As any roster is kept: never one older than is kept here, which would undo what was done since.
 	if kept, ok := host.roster_keep(in_dir(dir, name), space, data); !ok {
 		return false

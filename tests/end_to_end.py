@@ -974,7 +974,7 @@ def starting(path):
     else:
         import fcntl
 
-        fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     return f
 
 
@@ -1012,6 +1012,21 @@ def test_key_made_once():
     waited, (out, err) = waits(["key", d], made)
     assert waited, "a key was made while another was being made: " + out + err
     assert out.strip() == zspd("key", d)
+
+    # And one made by a node starting, which holds the directory still once it has: read, not refused for its holding.
+    d = os.path.join(TMP, "key-started")
+    os.makedirs(d)
+    s, lock = starting(d), hold(d)
+
+    def started():
+        with open(os.path.join(d, "device.key"), "wb") as f:
+            f.write(key)
+        s.close()
+
+    waited, (out, err) = waits(["key", d], started)
+    held = zspd("key", d)
+    lock.close()
+    assert waited and out.strip() == held, (waited, out, err)
 
 
 def test_space_made_once():
@@ -1072,7 +1087,38 @@ def test_change_waits_for_a_starting_node():
     lock.close()
     assert waited, "a change was made while a node was starting: " + out + err
     assert "did not answer" in err and read_kept(os.path.join(d, sid, "roster")) == before, err
+    assert out == "", "a change that was not made was said to be: " + out
     assert not os.path.exists(os.path.join(d, sid, "tree")), "a running node's store was opened beside it"
+
+
+def test_change_waits_for_the_space():
+    """Which space a directory is of is read by a change only once no command is changing it: one that read it before
+    would fail while a space was being made, and change the roster of the space a directory was of before it joined
+    another."""
+    d = os.path.join(TMP, "space-changing")
+    os.makedirs(d)
+    s = starting(d)  # as a command making a space, which it has not said yet
+    waited, (out, err) = waits(["scope", d], s.close)
+    assert waited, "a change did not wait for a space being made: " + out + err
+
+    d, first = made("space-joining")
+    other, second = made("space-joined")
+    zspd("admit", other, zspd("key", d), "1")
+    zspd("admin", other, zspd("key", d))
+    before = read_kept(os.path.join(d, first, "roster"))
+    s = starting(d)  # as `join` or `peer` making it a device of another space
+
+    def joined():
+        os.makedirs(os.path.join(d, second))
+        shutil.copy(os.path.join(other, second, "roster"), os.path.join(d, second, "roster"))
+        with open(os.path.join(d, "space"), "w") as f:
+            f.write(second)
+        s.close()
+
+    waited, (out, err) = waits(["scope", d], joined)
+    assert waited, out + err
+    assert read_kept(os.path.join(d, first, "roster")) == before, "the space the directory was of before was changed"
+    assert out.strip() == "2" and " 2:rwc" in zspd("members", d), (out, err)
 
 
 def test_node_waits_for_a_command():

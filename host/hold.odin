@@ -24,10 +24,17 @@ import "core:path/filepath"
 // be lost while it is held, when the server or the network is slow. So a store on one is refused, where that can be told,
 // before anything is made there.
 //
+// The lock file is only ever a file, never a link followed to wherever it leads, and readable by its owner alone, as one
+// anyone could read anyone could hold. What is in it is nothing: nothing writes it.
+//
+// A directory is judged, made and held where the system takes its path to be (dir_real): `<a disk>/none/../<a share>` is
+// the share, judged by it, and `none` is never made.
+//
 // zspd's commands beside a node tell whether one runs by the lock too, not by whether anything answers where one said it
 // listens, which another may by then. A node starting holds START_FILE's lock, waiting for it, from before it holds the
 // directory until it has said where it listens (see zspd/main.odin); and so does every command that holds the directory
-// a while, so that neither takes the other for a node that is running, nor is kept from the directory by the other.
+// a while, so that neither takes the other for a node that is running, nor is kept from the directory by the other. Its
+// lock is flock's (file_lock), held against another thread of the process as against another process.
 
 LOCK_FILE :: "lock"
 LOCK_AT :: 1 << 30 // SQLite's PENDING_BYTE: bytes nothing is ever written to, there or here
@@ -56,37 +63,49 @@ dir_hold :: proc(dir: string) -> (lock: Dir_Lock, ok: bool) {
 // The same, saying nothing.
 @(require_results)
 dir_try :: proc(dir: string) -> (lock: Dir_Lock, held: Hold, kind: string) {
-	remote, there: bool
-	if remote, kind, there = dir_shared(dir); remote {
+	at: string
+	remote, there, real: bool
+	if at, remote, kind, there, real = dir_judged(dir); !real {
+		held = .Failed
+		return
+	}
+	if remote {
 		held = .Remote
 		return
 	}
 	if !there {
-		if err := os.make_directory_all(dir); err != nil && !os.is_dir(dir) {
+		if err := os.make_directory_all(at); err != nil && !os.is_dir(at) {
 			held = .Failed
 			return
 		}
 	}
-	lock, held = dir_lock(file_in(dir, LOCK_FILE))
+	lock, held = dir_lock(file_in(at, LOCK_FILE))
 	return
 }
 
-// Whether a directory is on a file system shared with other machines, and what kind, and whether it is there: asked of
-// what there is of it, before anything is made there.
+// Where a directory is, judged as the system will take it, and whether it is on a file system shared with other machines,
+// and what kind, and whether it is there: all before anything is made. A directory there is is asked of itself, links
+// and all. One that is not is asked of what there is of it: of the longest part of its path that there is, as the system
+// resolves it (realpath, links and all), and what is to be made after it, taken as written, which is no link; so that
+// `<a disk>/none/../<a share>`, judged by the disk and made where the share is, is judged by the share. What to make, and
+// hold, is the directory so found.
 @(private)
-dir_shared :: proc(dir: string) -> (remote: bool, kind: string, there: bool) {
-	at := dir
+dir_judged :: proc(dir: string) -> (at: string, remote: bool, kind: string, there: bool, ok: bool) {
+	found: bool
+	if remote, kind, found = path_remote(dir); found {
+		return dir, remote, kind, true, true
+	}
+	at = dir_real(dir) or_return
+	up := at
 	for {
-		found: bool
-		remote, kind, found = path_remote(at)
-		if found {
-			return remote, kind, at == dir
+		if remote, kind, found = path_remote(up); found {
+			return at, remote, kind, up == at, true
 		}
-		up := filepath.dir(at)
-		if up == at || up == "" {
-			return
+		next := filepath.dir(up)
+		if next == up || next == "" {
+			return at, false, "", false, true
 		}
-		at = up
+		up = next
 	}
 }
 
@@ -107,15 +126,22 @@ hold_report :: proc(dir: string, held: Hold, kind: string) {
 // let go of by dir_started.
 @(require_results)
 dir_starting :: proc(dir: string) -> (lock: File_Lock, ok: bool) {
-	if remote, kind, _ := dir_shared(dir); remote {
+	at, remote, kind, there, real := dir_judged(dir)
+	if !real {
+		report(.Error, "could not find ", dir)
+		return
+	}
+	if remote {
 		hold_report(dir, .Remote, kind)
 		return
 	}
-	if err := os.make_directory_all(dir); err != nil && !os.is_dir(dir) {
-		report(.Error, "could not make ", dir)
-		return
+	if !there {
+		if err := os.make_directory_all(at); err != nil && !os.is_dir(at) {
+			report(.Error, "could not make ", dir)
+			return
+		}
 	}
-	lock, ok = file_lock(file_in(dir, START_FILE))
+	lock, ok = file_lock(file_in(at, START_FILE))
 	if !ok {
 		report(.Error, "could not lock ", dir)
 	}

@@ -10,17 +10,10 @@ when ODIN_OS == .Darwin {
 	foreign import libc "system:c"
 }
 
-@(default_calling_convention = "c", private = "file")
-foreign libc {
-	flock :: proc(fd: posix.FD, operation: i32) -> i32 ---
-}
-
 // flock's lock, which an open file holds: against another opening of the file in this process as in any other's, and
 // let go of when the file is closed or the process ends. It is what Node's O_EXLOCK takes, as it opens the file.
 @(private)
 lock_held :: proc(fd: posix.FD) -> Hold {
-	LOCK_EX :: 2
-	LOCK_NB :: 4
 	for {
 		if flock(fd, LOCK_EX | LOCK_NB) == 0 {
 			return .Held

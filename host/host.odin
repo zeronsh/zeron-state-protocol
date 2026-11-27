@@ -5,6 +5,7 @@ import "core:encoding/hex"
 import "core:fmt"
 import "core:net"
 import "core:path/filepath"
+import "core:strings"
 import "core:sync"
 import "core:time"
 import "../pipe"
@@ -91,9 +92,14 @@ device_secret :: proc(dir: string, held := false) -> (secret: zsp.Key32, ok: boo
 	if !held {
 		start := dir_starting(dir) or_return
 		defer dir_started(start)
+		// Made, it may be, by whoever was starting meanwhile, which may hold the directory still, as a node does.
+		if data, read := read_file(path, context.temp_allocator); read {
+			copy(secret[:], data)
+			return secret, len(data) == 32
+		}
 		lock := dir_hold(dir) or_return
 		defer dir_unlock(lock)
-		return device_secret(dir, true) // made, it may be, by another meanwhile
+		return device_secret(dir, true)
 	}
 	crypto.rand_bytes(secret[:])
 	return secret, save(path, secret[:])
@@ -274,9 +280,22 @@ now_us :: proc() -> pipe.Time {
 // second to a directory is told it is in use, and touches nothing there.
 host_init :: proc(h: ^Host, config: Config) -> (started: bool) {
 	h.config = config
-	h.lock = dir_hold(h.dir) or_return
+	// Where the directory is as the system takes it, which is what is made and held, and all is kept in from then on.
+	real, found := dir_real(config.dir)
+	if !found {
+		report(.Error, "could not find ", config.dir)
+		return false
+	}
+	h.dir = strings.clone(real)
+	lock, held := dir_hold(h.dir)
+	if !held {
+		delete(h.dir)
+		return false
+	}
+	h.lock = lock
 	defer if !started {
 		dir_unlock(h.lock)
+		delete(h.dir)
 	}
 	h.secret = device_secret(h.dir, true) or_return
 	h.device = zsp.x25519_public(h.secret)
@@ -377,6 +396,7 @@ host_destroy :: proc(h: ^Host) {
 	waker_destroy(h)
 	nbio.release_thread_event_loop()
 	dir_unlock(h.lock) // last, once all it kept is written and let go of
+	delete(h.dir)
 }
 
 @(private)

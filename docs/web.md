@@ -215,7 +215,17 @@ takes on its own (host/hold.odin): so a second device there, or a zspd, is told 
 by it. The kernel lets go of the lock when the process ends, however it ends. Node has no file lock of its own to take: on Linux and
 Windows it is taken through the SQLite Node is built with (`node:sqlite`, which says nothing of itself from Node 24.15 on), on the
 bytes where SQLite keeps its locks, and elsewhere by opening the file with `O_EXLOCK`. A directory on a file system shared with other
-machines, where a lock may not hold, is refused, as zspd refuses it.
+machines, where a lock may not hold, is refused, as zspd refuses it. The lock file is only ever a file, never a link, readable by its
+owner alone, and what is in it is nothing.
+
+**On Linux, nothing else in a device's process may open its lock file while it runs.** SQLite's lock there is a POSIX record lock,
+which the kernel holds for the process, not for the file opened: should anything else in the process open `<dir>/lock` and close it
+again, as `fs.cp` of the device's directory would, or anything that reads every file in it, the kernel lets go of the lock while
+the device runs, another process may then open the store beside it, and nothing says so. Nothing in zsp opens it but SQLite, which
+keeps its own files open while it holds locks for just this reason, and another device of the same process on the directory goes
+through SQLite too, and is refused. Node offers no other lock (no `flock`, no lock of an open file description, nothing held by a
+handle) and no way to see that a lock was let go of, so this is beyond Node without native code. Copy a device's directory only once
+it is closed. On Windows the lock is the handle's, and on macOS the open file's, and they hold whatever else is opened.
 
 ## Links
 

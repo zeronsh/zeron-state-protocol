@@ -1,7 +1,8 @@
 // A directory on a disk, for Node.
 
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, linkSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, rmSync, statfsSync, statSync, writeSync } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, rmSync, statfsSync, statSync, truncateSync, writeSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { File, Volume } from "./volume.ts";
 
 /**
@@ -12,27 +13,38 @@ import type { File, Volume } from "./volume.ts";
  */
 export class NodeVolume implements Volume {
   readonly path: string;
+  #at: string; // where the directory is as the system takes it, once held: what is made and held, and kept in
   #release?: () => void; // while the directory is held
   #closed = false;
 
   constructor(path: string) {
-    this.path = path;
+    this.path = this.#at = path;
   }
 
   #hold(opening = false): void {
     if (this.#release) return;
     if (this.#closed && !opening) throw new Error(`the store's directory was let go of: ${this.path}`);
-    this.#release = holdDirectory(this.path);
+    [this.#at, this.#release] = holdDirectory(this.path);
     this.#closed = false;
   }
 
   async list(): Promise<string[]> {
     this.#hold(true);
+    let names: string[];
     try {
-      return readdirSync(this.path);
+      names = readdirSync(this.#at);
     } catch {
       return [];
     }
+    // What a lock file was made from, left by a process that ended in the moment it was being made: long done with.
+    for (const name of names) {
+      if (!ASIDE.test(name)) continue;
+      const path = join(this.#at, name);
+      try {
+        if (Date.now() - statSync(path).mtimeMs > 60_000) rmSync(path, { force: true });
+      } catch {}
+    }
+    return names;
   }
 
   async open(name: string, create: boolean): Promise<File | undefined> {
@@ -41,7 +53,7 @@ export class NodeVolume implements Volume {
 
   openNow(name: string, create: boolean): File | undefined {
     this.#hold(); // which makes the directory
-    const path = join(this.path, name);
+    const path = join(this.#at, name);
     const made = create && !existsSync(path);
     let fd: number;
     try {
@@ -53,7 +65,7 @@ export class NodeVolume implements Volume {
     }
     if (made && process.platform !== "win32") {
       // The name is the directory's to remember.
-      const dir = openSync(this.path, "r");
+      const dir = openSync(this.#at, "r");
       fsyncSync(dir);
       closeSync(dir);
     }
@@ -62,7 +74,7 @@ export class NodeVolume implements Volume {
 
   async remove(name: string): Promise<void> {
     this.#hold();
-    rmSync(join(this.path, name), { force: true });
+    rmSync(join(this.#at, name), { force: true });
   }
 
   /** Lets go of the directory, its files being closed already: for this volume to hold again, or another. */
@@ -74,6 +86,18 @@ export class NodeVolume implements Volume {
   }
 }
 
+/**
+ * Where zspd and Node take flock's lock on a store's lock file, and not a lock on its bytes: as host/hold_bsd.odin is
+ * built for, which web/test/hold.ts holds this to.
+ */
+export const FLOCK = new Set<string>(["darwin", "freebsd", "openbsd", "netbsd"]);
+
+/**
+ * What a lock file is made from is named so: as no save's staging file is (host/staging.odin), so that zspd, which removes
+ * those it finds held by nobody, never removes one, which Node cannot hold as a save does.
+ */
+export const ASIDE = /^lock\.[0-9a-f]{32}\.making$/;
+
 // A store's directory is one node's at a time, as host/hold.odin says: two writing one log at once each write over what
 // the other wrote, and each acknowledges what is lost. So it is held, by a lock on its file "lock" that the kernel lets go
 // of when the process ends, however it ends: the lock zspd takes, so that each keeps the other out too. Node has no way
@@ -81,17 +105,41 @@ export class NodeVolume implements Volume {
 // the very bytes zspd locks there: its pending, reserved and shared bytes, at 2^30. Where zspd takes flock's lock, it is
 // taken as the file is opened, by O_EXLOCK.
 //
+// On Linux that lock is SQLite's POSIX record lock, which the kernel holds for the process, not for the file opened: should
+// anything else in this process open the store's lock file and close it again (fs.cp of the store's directory, say, or
+// anything that reads every file in it), the kernel lets go of the lock while the device runs, and another process may
+// then open the store beside it, and nothing says so. Nothing here ever opens the lock file but SQLite, which keeps its own
+// files open while it holds locks for that reason; another device of this process on the directory goes through SQLite
+// too, and is refused. Node has no other lock (no flock, no open file description's lock, no LockFileEx-like handle lock),
+// nor any way to see that one was let go of: that is beyond Node without native code. So, on Linux, nothing else in the
+// process may open a running device's lock file: copy a device's directory only once it is closed. Windows' locks are the
+// handle's and macOS' are the open file's, so there they hold whatever else is opened.
+//
 // A lock on a file system shared with other machines may not hold, and a store on one is refused, where that can be
-// told. Returns what lets go of the directory.
-function holdDirectory(dir: string): () => void {
-  // Asked of what there is of it, before anything is made there.
-  let there = resolve(dir);
-  while (!existsSync(there) && dirname(there) !== there) there = dirname(there);
-  const kind = shared(there);
+// told, before anything is made there. Returns where the directory is, as held, and what lets go of it.
+function holdDirectory(dir: string): [string, () => void] {
+  // Judged as the system will take it: itself if it is there, links and all; if not, the longest part of its path that
+  // is, as the system resolves it, and the rest, to be made, as written.
+  const there = existsSync(dir);
+  const at = there ? realpathSync.native(dir) : resolved(dir);
+  let judged = at;
+  while (!existsSync(judged) && dirname(judged) !== judged) judged = dirname(judged);
+  const kind = shared(judged);
   if (kind) throw new Error(`${dir} is on a file system shared with other machines (${kind}), where its lock may not hold: keep the store on a disk of this machine's own`);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, "lock");
+  if (!there) mkdirSync(at, { recursive: true, mode: 0o700 });
+  const path = join(at, "lock");
   const inUse = () => new Error(`this store is in use by another process: ${dir}`);
+  const notFile = () => new Error(`${path} is not a file: a store's lock file is never a link, nor anything but a file`);
+  // Nothing but a file, never a link followed to wherever it leads, readable by its owner alone, as zspd holds it to: one
+  // anyone could read anyone could hold too, and so keep every node from the store. Only asked of by its name, never
+  // opened, which on Linux would let go of what this process holds there.
+  const st = lstatSync(path, { throwIfNoEntry: false });
+  if (st && !st.isFile()) throw notFile();
+  if (st && process.platform !== "win32" && st.mode & 0o077) {
+    try {
+      chmodSync(path, st.mode & 0o600);
+    } catch {}
+  }
   if (FLOCK.has(process.platform)) {
     const O_EXLOCK = 0x20; // as Darwin and the BSDs have it, and Node does not name it
     let fd: number;
@@ -100,58 +148,92 @@ function holdDirectory(dir: string): () => void {
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       if (code === "EAGAIN" || code === "EWOULDBLOCK") throw inUse();
+      if (code === "ELOOP") throw notFile();
       throw e;
     }
-    return () => closeSync(fd);
+    if (!fstatSync(fd).isFile()) {
+      closeSync(fd);
+      throw notFile();
+    }
+    return [at, () => closeSync(fd)];
   }
-  if (process.platform !== "win32") ownLockFile(path);
   const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
-  const db = new DatabaseSync(path, { timeout: 0 });
+  const take = (): (() => void) => {
+    // Made, if it is not there, as zspd makes it, readable by its owner alone, where SQLite would make it readable by
+    // everyone: as another file made so is (modeof), made aside first, never in its place.
+    let aside: string | undefined;
+    let name: string | URL = path;
+    if (process.platform !== "win32" && !existsSync(path)) {
+      for (;;) {
+        aside = join(at, `lock.${Array.from({ length: 4 }, () => ((Math.random() * 2 ** 32) >>> 0).toString(16).padStart(8, "0")).join("")}.making`);
+        try {
+          closeSync(openSync(aside, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600));
+          break;
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        }
+      }
+      name = pathToFileURL(path);
+      name.searchParams.set("modeof", aside);
+    }
+    let db: InstanceType<typeof DatabaseSync> | undefined;
+    try {
+      db = new DatabaseSync(name, { timeout: 0 });
+      // Its shared lock and its reserved one, which only one holds at a time, by a write begun and never ended: which
+      // writes nothing, nor any journal, kept in memory.
+      db.exec("PRAGMA journal_mode = MEMORY; BEGIN IMMEDIATE");
+      const held = db;
+      return () => held.close();
+    } catch (e) {
+      db?.close();
+      throw e;
+    } finally {
+      if (aside) rmSync(aside, { force: true });
+    }
+  };
+  const code = (e: unknown) => ((e as { errcode?: number }).errcode ?? 0) & 0xff;
   try {
-    // Its shared lock and its reserved one, which only one holds at a time, by a write begun and never ended: which
-    // writes nothing, nor any journal, kept in memory.
-    db.exec("PRAGMA journal_mode = MEMORY; BEGIN IMMEDIATE");
+    return [at, take()];
   } catch (e) {
-    db.close();
-    const code = (e as { errcode?: number }).errcode ?? 0;
-    if ((code & 0xff) === 5 || (code & 0xff) === 6) throw inUse(); // SQLITE_BUSY, by another; SQLITE_LOCKED, by this one
+    if (code(e) === 5 || code(e) === 6) throw inUse(); // SQLITE_BUSY, by another; SQLITE_LOCKED, by this one
+    if (code(e) !== 26) throw e;
+  }
+  // SQLITE_NOTADB: something is in it, which nothing writes, and which zspd pays no heed to. Nobody holds it, in this
+  // process or another, for SQLite takes its lock before it reads, so that would have been said first: so it is emptied,
+  // as it may then be opened, and taken again.
+  truncateSync(path, 0);
+  try {
+    return [at, take()];
+  } catch (e) {
+    if (code(e) === 5 || code(e) === 6) throw inUse();
     throw e;
   }
-  return () => db.close();
 }
 
-const FLOCK = new Set(["darwin", "freebsd", "openbsd"]);
-
-// Makes the lock file readable and writable by this user alone, as zspd makes it, before SQLite makes it as it makes a
-// database, readable by everyone: anyone who can read it can hold it, and so keep every node from the store. It is made
-// aside and linked into place, never opened where it is: a file of this process's on it, closed, would let go of every
-// lock this process holds there, SQLite's among them, as a process's own locks are let go of.
-function ownLockFile(path: string): void {
-  if (existsSync(path)) return;
-  // Named as a save's staging file is (host/staging.odin), which zspd removes should one be left behind: drawn to be
-  // another's than any other's, and made only if it is, but kept from nobody, so drawn as cheaply as can be.
-  let aside: string;
-  for (;;) {
-    aside = `${path}.${Array.from({ length: 4 }, () => ((Math.random() * 2 ** 32) >>> 0).toString(16).padStart(8, "0")).join("")}.new`;
+// Where a directory that is not there would be, as the system takes its path: the longest part of it there is resolved
+// as the system resolves it (realpath), links and `..` and all, and the rest, which is to be made and so is no link, as
+// written, `..` taking one of its parts away. Windows takes `..` only as written.
+function resolved(dir: string): string {
+  if (process.platform === "win32") return resolve(dir);
+  const parts = (isAbsolute(dir) ? dir : process.cwd() + "/" + dir).split("/");
+  for (let n = parts.length; n >= 1; n--) {
+    let real: string;
     try {
-      closeSync(openSync(aside, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600));
-      break;
+      real = realpathSync.native(parts.slice(0, n).join("/") || "/");
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw e;
     }
+    for (const part of parts.slice(n)) {
+      if (part === "" || part === ".") continue;
+      real = part === ".." ? dirname(real) : join(real, part);
+    }
+    return real;
   }
-  try {
-    linkSync(aside, path);
-  } catch (e) {
-    // There already, made by another meanwhile; or on a file system with no links, nor modes to keep anyone out.
-    const code = (e as NodeJS.ErrnoException).code;
-    if (code !== "EEXIST" && code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "ENOENT") throw e;
-  } finally {
-    rmSync(aside, { force: true });
-  }
+  return resolve(dir);
 }
 
-// The kind of file system shared with other machines a directory is on, if it is on one, as host/ finds it.
+// The kind of file system shared with other machines a directory there is is on, if it is on one, as host/ finds it.
 function shared(dir: string): string | undefined {
   if (process.platform === "win32") {
     // The path the system has for it, through every link and mapped drive, is a share's for one of another machine's,
@@ -190,16 +272,22 @@ const REMOTE_MAGIC = new Map<number, string>([
 ]);
 
 // Whether the system calls a directory's file system other than local, as zspd asks it (MNT_LOCAL), which Node cannot:
-// by what mount(8) says of it. Asked only of a kind of file system other than the root's, which is local; and once for
-// each, as a device's number is one file system's for as long as it is mounted.
+// by what mount(8) says of it. A directory on a file system of the root's kind, as most are, is as the root is, which is
+// asked once, as it is the same file system for as long as the machine runs; any other, each time, as what is mounted
+// where may change, and a device's number with it.
 function notLocal(dir: string): string | undefined {
-  if (statfsSync(dir).type === statfsSync("/").type) return undefined;
+  const type = statfsSync(dir).type;
+  if (type === statfsSync("/").type) return (rootKind ??= [mountKind("/")])[0];
+  return mountKind(dir);
+}
+
+let rootKind: [string | undefined] | undefined;
+
+function mountKind(dir: string): string | undefined {
   const dev = statSync(dir).dev;
-  if (mounts.has(dev)) return mounts.get(dev);
   const real = realpathSync(dir);
   const { execFileSync } = process.getBuiltinModule("node:child_process") as typeof import("node:child_process");
-  let kind: string | undefined;
-  found: for (const line of execFileSync("/sbin/mount", { encoding: "utf8" }).split("\n")) {
+  for (const line of execFileSync("/sbin/mount", { encoding: "utf8" }).split("\n")) {
     // "<from> on <where> (<kind>, <option>, ...)", or "<from> on <where> type <kind> (<option>, ...)": where " on " may
     // be in <from> too, each place it is is tried.
     for (let at = line.indexOf(" on "); at >= 0; at = line.indexOf(" on ", at + 1)) {
@@ -213,15 +301,11 @@ function notLocal(dir: string): string | undefined {
       } catch {}
       if (!same) continue;
       const said = options.split(",").map((o) => o.trim());
-      kind = said.includes("local") ? undefined : (typed ?? said[0]);
-      break found;
+      return said.includes("local") ? undefined : (typed ?? said[0]);
     }
   }
-  mounts.set(dev, kind);
-  return kind;
+  return undefined;
 }
-
-const mounts = new Map<number, string | undefined>();
 
 class NodeFile implements File {
   #fd: number;

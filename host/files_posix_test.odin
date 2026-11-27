@@ -51,7 +51,7 @@ files_lock_waits_through_signals :: proc(t: ^testing.T) {
 			}
 		}
 		fd := posix.open(lock, {.RDWR, .CREAT, .CLOEXEC}, posix.mode_t{.IRUSR, .IWUSR})
-		if fd < 0 || posix.lockf(fd, .LOCK, 0) != .OK {
+		if fd < 0 || flock(fd, LOCK_EX) != 0 {
 			posix._exit(1)
 		}
 		b := byte(1)
