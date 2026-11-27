@@ -1723,7 +1723,7 @@ export class Client {
   #seal(row: Stored, slot: number): void {
     const t = row.texts.get(slot);
     if (!t || t.open === "") return;
-    const stamp = this.#stamp(row.id);
+    const stamp = this.#stamp();
     const body = text.close(t, stamp);
     if (body) {
       merge(row, slot, PIECE, stamp, body, this.#mine(codec.u32Of(row.id)));
@@ -1882,10 +1882,7 @@ export class Client {
     if (ms > this.#clockMs || (ms === this.#clockMs && n > this.#clockN)) (this.#clockMs = ms), (this.#clockN = n);
   }
 
-  // A stamp for a cell of a row: no earlier than the row was made, for no cell is older than its row.
-  #stamp(row: string): string {
-    const born = codec.u32Of(row, 4) * 1000;
-    if (born > this.#clockMs) (this.#clockMs = born), (this.#clockN = 0);
+  #stamp(): string {
     const ms = Math.floor(this.#host.now());
     if (ms > this.#clockMs) (this.#clockMs = ms), (this.#clockN = 0);
     else if (this.#clockN < 65535) this.#clockN++;
@@ -1894,12 +1891,16 @@ export class Client {
   }
 
   // A row this client may write in now, as far as it knows: what a node refuses, it refuses for good, ending the pipe and
-  // this client with it. One made later than a stamp of this client's may be ahead of the clock is never written.
+  // this client with it. One made later than a stamp of this client's may be ahead of the clock is never written; one made
+  // a little ahead of this client's clock sets it on, as no cell is older than its row.
   #mayWrite(bin: string, scope: number, may = false): void {
     if (codec.u32Of(bin) !== scope) throw new RangeError("that row is of another scope");
     if (!may && this.#ready && !this.may(scope, "write")) throw new Error("this client may not write there");
     const born = codec.u32Of(bin, 4) * 1000;
-    if (born > this.#clockMs && born > Math.floor(this.#host.now()) + LEAP_MS) throw new RangeError("that row was made later than any clock may yet say");
+    if (born > this.#clockMs) {
+      if (born > Math.floor(this.#host.now()) + LEAP_MS) throw new RangeError("that row was made later than any clock may yet say");
+      (this.#clockMs = born), (this.#clockN = 0);
+    }
   }
 
   #sendCells(cells: Written[], done?: () => void): void {
@@ -1964,8 +1965,11 @@ export class Client {
     const rows = new Set<string>();
     // How each row was before this touched it, so that a change that throws leaves nothing behind.
     const before = new Map<string, { existed: boolean; slots: Map<number, Map<string, Cell>>; dead: boolean; texts: Set<number> }>();
+    const mine = this.#mine(scope); // whose what this change writes is, the same throughout
     const touch = (id: string, slot: number): Stored => {
       let was = before.get(id);
+      // First touched: what is done to a row of another scope is refused, and the whole change with it, by any node.
+      if (!was && !fresh.has(id)) this.#mayWrite(id, scope, true); // as was asked of the scope, above
       const existed = this.#rows.get(id);
       const row = existed ?? this.#row(id);
       if (!was) {
@@ -1995,10 +1999,10 @@ export class Client {
     const put = (row: string, slot: number, kind: number, body: Uint8Array) => {
       if (body.length > MAX_OPEN) throw new RangeError("a value may be 1 MiB at most, less 192 bytes");
       const stored = touch(row, slot);
-      const stamp = this.#stamp(row);
+      const stamp = this.#stamp();
       rows.add(row);
       cells.push({ row, slot, kind, stamp, body });
-      this.#accept(stored, slot, kind, stamp, body, this.#mine(scope));
+      this.#accept(stored, slot, kind, stamp, body, mine);
     };
     const set = (bin: string, schema: Table, values: Record<string, unknown>) => {
       for (const name in values) {
@@ -2018,12 +2022,7 @@ export class Client {
       const tag = this.tag(scope, list);
       put(bin, slot ?? 1, PLACE, codec.bytesOf(tag + codec.u64(order)));
     };
-    // A row of this scope: what a change does to a row of another is refused, and the whole change with it, by any node.
-    const idOf = (id: string): string => {
-      const bin = rowId(id);
-      this.#mayWrite(bin, scope, true); // as was asked of the scope, above
-      return bin;
-    };
+    const idOf = rowId;
     // Done here, so that what is refused throws here; and should it throw, as if it had never been.
     let resolve!: () => void;
     const result = new Promise<void>((done) => (resolve = done));
@@ -2048,13 +2047,13 @@ export class Client {
           const row = touch(bin, slot); // and what an editor has open in it goes first, and stands
           const t = this.#text(row, slot);
           f(t, () => codec.binary(this.#host.random(8)));
-          const stamp = this.#stamp(bin);
+          const stamp = this.#stamp();
           const body = text.close(t, stamp);
           if (body) {
             if (body.length > MAX_OPEN) throw new RangeError("an edit may be 1 MiB at most, less 192 bytes");
             rows.add(bin);
             cells.push({ row: bin, slot, kind: PIECE, stamp, body });
-            merge(row, slot, PIECE, stamp, body, this.#mine(scope));
+            merge(row, slot, PIECE, stamp, body, mine);
             row.views.clear();
           }
         },

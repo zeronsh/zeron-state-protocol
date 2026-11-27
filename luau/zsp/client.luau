@@ -22,6 +22,7 @@ local WINDOW_MOST = 16 * CALL_WINDOW -- what a receiver may credit ahead
 local WINDOW_QUICK = 0.25 -- seconds: a window used up within this grows
 local MAX_OPEN = 1048576 - 192
 local ZERO32 = string.rep("\0", 32)
+local NONE = table.freeze({}) :: { any }
 
 local PIECE_BYTES = 4096 -- a piece is sealed at this size,
 local PIECE_SECONDS = 1 -- or this long after it began,
@@ -86,7 +87,7 @@ type Asked = {
 }
 export type Device = { read id: string, read subject: string }
 
-type Cell = { kind: number, stamp: string, body: string, author: Device? }
+type Cell = { kind: number, stamp: string, body: string, author: Device?, key: string? } -- key: of a placement, where it puts the row
 type Stored = {
 	id: string,
 	slots: { [number]: { [string]: Cell } }, -- by stamp
@@ -252,6 +253,7 @@ local function new_client(host: Host)
 		input = "",
 		clock_ms = 0,
 		clock_n = 0,
+		heard = "", -- the latest stamp heard
 		scopes = {} :: { [number]: { rights: number, key: string } },
 		authors = {} :: { [number]: Device }, -- by what this pipe calls them: 0 is this client
 		devices = {} :: { Device },
@@ -276,7 +278,7 @@ local function new_client(host: Host)
 		handlers = {} :: { [string]: (Call, string) -> () },
 		followers = {} :: { [(string) -> ()]: boolean },
 		typing = {} :: { [Stored]: boolean }, -- rows with live text to send
-		tags = {} :: { [string]: string }, -- of lists, by their scope, its key and their name
+		tags = {} :: { [number]: { key: string, lists: { [string]: string } } }, -- of lists, by their scope, while its key is the same
 		bulk = nil :: { [Window]: { { key: string, row: Stored } } }?, -- rows to add to windows, all at once
 		timers = {} :: { [() -> ()]: boolean }, -- what is to be done later, by the ways to cancel each
 	}, Client)
@@ -695,11 +697,15 @@ end
 function Client._tag(self: Client, scope: number, list: string): string
 	local s = self.scopes[scope]
 	assert(s, "no such scope")
-	local k = string.pack(">I4", scope) .. s.key .. list
-	local tag = self.tags[k]
+	local of = self.tags[scope]
+	if not of or of.key ~= s.key then
+		of = { key = s.key, lists = {} }
+		self.tags[scope] = of
+	end
+	local tag = of.lists[list]
 	if not tag then
-		tag = string.sub(k, 1, 4) .. string.sub(sha256(s.key .. list), 1, 12)
-		self.tags[k] = tag
+		tag = string.pack(">I4", scope) .. string.sub(sha256(s.key .. list), 1, 12)
+		of.lists[list] = tag
 	end
 	return tag
 end
@@ -938,7 +944,7 @@ function Client._unplace(self: Client, row: Stored, lo: string, hi: string)
 		local cells = row.slots[slot]
 		if cells then
 			for stamp, c in cells do
-				local key = string.sub(c.body, 1, 24) .. row.id
+				local key = c.key :: string
 				if key >= lo and key < hi then
 					cells[stamp] = nil
 				end
@@ -1339,7 +1345,7 @@ local function merge(row: Stored, slot: number, kind: number, stamp: string, bod
 			end
 		end
 	end
-	cells[stamp] = { kind = kind, stamp = stamp, body = body, author = author }
+	cells[stamp] = { kind = kind, stamp = stamp, body = body, author = author, key = if kind == PLACE then string.sub(body, 1, 24) .. row.id else nil }
 	return true
 end
 
@@ -1411,6 +1417,9 @@ function Client._accept(self: Client, row: Stored, slot: number, kind: number, s
 		end
 		if cell and cell.body ~= body then
 			cell.body = body -- less of it, since its author may no longer have written the rest
+			if cell.key then
+				cell.key = string.sub(body, 1, 24) .. row.id
+			end
 			self:_rebuild(row, slot)
 		end
 		return false
@@ -1466,13 +1475,20 @@ function Client._place(self: Client, row: Stored, told: boolean?)
 			f(row.id)
 		end
 	end
-	local keys = {}
+	-- Where its placements put it: most often in one place, which needs no table of them.
+	local first: string? = nil
+	local more: { string }? = nil
 	if not row.dead then
-		for slot = 1, 15 do
-			local cells = row.slots[slot]
-			if cells then
+		for slot, cells in row.slots do
+			if slot <= 15 then
 				for _, c in cells do
-					keys[string.sub(c.body, 1, 24) .. row.id] = true
+					if not first then
+						first = c.key
+					elseif more then
+						table.insert(more, c.key :: string)
+					else
+						more = { c.key :: string }
+					end
 				end
 			end
 		end
@@ -1481,7 +1497,10 @@ function Client._place(self: Client, row: Stored, told: boolean?)
 		if #window.pages > 0 then
 			local lo, hi = window.pages[1].lo, window.pages[#window.pages].hi
 			local want: string? = nil
-			for key in keys do
+			if first and first >= lo and first < hi then
+				want = first
+			end
+			for _, key in more or NONE do
 				if key >= lo and key < hi and (not want or key < want) then
 					want = key
 				end
@@ -1835,7 +1854,7 @@ function Client._answer(self: Client, a: Asked): Answer
 				local cells = row.slots[slot]
 				local _, c = next(cells or {} :: { [string]: Cell })
 				if c then
-					key = string.sub(c.body, 1, 24) .. id
+					key = c.key :: string
 					break
 				end
 			end
@@ -1935,7 +1954,7 @@ function Client._seal(self: Client, row: Stored, slot: number)
 	if not t or t.open == "" then
 		return
 	end
-	local stamp = self:_stamp(row.id)
+	local stamp = self:_stamp()
 	local body = text.close(t, stamp)
 	if body then
 		merge(row, slot, PIECE, stamp, body, self:_mine(string.unpack(">I4", row.id) :: any))
@@ -2117,20 +2136,17 @@ end
 -- ---------------------------------------------------------------- writing
 
 function Client._heard(self: Client, stamp: string)
+	if stamp <= self.heard then
+		return -- no later than one heard already, which the clock is as late as
+	end
+	self.heard = stamp
 	local ms, n = codec.clock(stamp)
 	if ms > self.clock_ms or (ms == self.clock_ms and n > self.clock_n) then
 		self.clock_ms, self.clock_n = ms, n
 	end
 end
 
--- A stamp for a cell of a row: no earlier than the row was made, for no cell is older than its row.
-function Client._stamp(self: Client, row: string?): string
-	if row then
-		local born = (string.unpack(">I4", row, 5) :: any) * 1000
-		if born > self.clock_ms then
-			self.clock_ms, self.clock_n = born, 0
-		end
-	end
+function Client._stamp(self: Client): string
 	local ms = math.floor(self.host.now() * 1000)
 	if ms > self.clock_ms then
 		self.clock_ms, self.clock_n = ms, 0
@@ -2146,7 +2162,8 @@ end
 type Written = { row: string, slot: number, kind: number, stamp: string, body: string }
 
 -- A row this client may write in now, as far as it knows: what a node refuses, it refuses for good, ending the pipe and
--- this client with it. One made later than a stamp of this client's may be ahead of the clock is never written.
+-- this client with it. One made later than a stamp of this client's may be ahead of the clock is never written; one made
+-- a little ahead of this client's clock sets it on, as no cell is older than its row.
 function Client._may_write(self: Client, id: string, scope: number, may: boolean?)
 	if type(id) ~= "string" or #id ~= 16 then
 		error("a row's id is 16 bytes", 3)
@@ -2156,8 +2173,11 @@ function Client._may_write(self: Client, id: string, scope: number, may: boolean
 		error("that row is of another scope", 3)
 	elseif not may and self.ready and not self:may(scope, "write") then
 		error("this client may not write there", 3)
-	elseif (born :: number) * 1000 > self.clock_ms and (born :: number) > self.host.now() + LEAP_SECONDS then
-		error("that row was made later than any clock may yet say", 3)
+	elseif (born :: number) * 1000 > self.clock_ms then
+		if (born :: number) > self.host.now() + LEAP_SECONDS then
+			error("that row was made later than any clock may yet say", 3)
+		end
+		self.clock_ms, self.clock_n = (born :: number) * 1000, 0
 	end
 end
 
@@ -2236,10 +2256,15 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	-- Each row as it was before this change touched it, to be put back if the change is not made after all: false for
 	-- one that was not held, which is put back as empty.
 	local saved: { [string]: any } = {}
+	local mine = self:_mine(scope) -- whose what this change writes is, the same throughout
 	local function keep(id: string, slot: number): Stored
 		local was = saved[id]
 		local row = self.rows[id]
 		if was == nil then
+			-- First touched: what is done to a row of another scope is refused, and the whole change with it, by any node.
+			if not fresh[id] then
+				self:_may_write(id, scope, true) -- as was asked of the scope, above
+			end
 			if row then
 				-- What editors have open in the row is their own writing, sent whatever becomes of this change: first, then,
 				-- so that undoing the change cannot take it back, and what the change writes over it is later.
@@ -2266,10 +2291,10 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	local function put(row: string, slot: number, kind: number, body: string)
 		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 192 bytes")
 		local stored = keep(row, slot)
-		local stamp = self:_stamp(if fresh[row] then nil else row) -- one made here is no older than the clock
+		local stamp = self:_stamp()
 		rows[row] = true
 		table.insert(cells, { row = row, slot = slot, kind = kind, stamp = stamp, body = body })
-		self:_accept(stored, slot, kind, stamp, body, self:_mine(scope))
+		self:_accept(stored, slot, kind, stamp, body, mine)
 	end
 	local function set(id: string, schema: Table, values: { [string]: any })
 		for name, value in values do
@@ -2293,11 +2318,6 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		end
 		put(id, slot or 1, PLACE, self:_tag(scope, list) .. codec.u64(order))
 	end
-	-- A row of this scope: what a change does to a row of another is refused, and the whole change with it, by any node.
-	local function writable(id: string): string
-		self:_may_write(id, scope, true) -- as was asked of the scope, above
-		return id
-	end
 	local change: Change = {
 		insert = function(schema, list, order, values)
 			-- As late as anything heard of: later, then, than any right that is known to have ended.
@@ -2311,30 +2331,25 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			set(id, schema, values)
 			return id
 		end,
-		set = function(id, schema, values)
-			set(writable(id), schema, values)
-		end,
-		place = function(id, list, order, slot)
-			place(writable(id), list, order, slot)
-		end,
+		set = set,
+		place = place,
 		delete = function(id)
-			put(writable(id), 0, GRAVE, "")
+			put(id, 0, GRAVE, "")
 		end,
 		edit = function(id, slot, f)
 			assert(slot >= 16 and slot <= 255, "data slots are 16 to 255")
-			writable(id)
 			local row = keep(id, slot) -- and what an editor has open in it goes first, and stands
 			local t = self:_text(row, slot)
 			f(t, function(): string
 				return self.host.random(8)
 			end)
-			local stamp = self:_stamp(id)
+			local stamp = self:_stamp()
 			local body = text.close(t, stamp)
 			if body then
 				assert(#body <= MAX_OPEN, "an edit may be 1 MiB at most, less 192 bytes")
 				rows[id] = true
 				table.insert(cells, { row = id, slot = slot, kind = PIECE, stamp = stamp, body = body })
-				merge(row, slot, PIECE, stamp, body, self:_mine(scope))
+				merge(row, slot, PIECE, stamp, body, mine)
 				unview(row)
 			end
 		end,
