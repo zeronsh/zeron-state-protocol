@@ -90,6 +90,7 @@ interface Exports {
   create(): number;
   govern(op: number, size: number): number;
   members(): number;
+  held_bytes(): number;
   links_open(port: number, size: number): void;
   links_announce(): void;
   packet(size: number): void;
@@ -265,6 +266,15 @@ export class Node {
   /** Bytes of memory the node has, all of which it may be using. */
   get memory(): number {
     return this.#wasm?.memory.buffer.byteLength ?? 0;
+  }
+
+  /**
+   * Bytes of that memory the node is using now, but for the pages it keeps of what it read, which it lets go of as it
+   * needs: what the most it ever used, which is all `memory` says, does not. Counted when asked, from the allocator's
+   * books.
+   */
+  get heap(): number {
+    return this.#wasm?.held_bytes() ?? 0;
   }
 
   /** How much it holds, about, in bytes: of cells, and what each costs to keep. What `keep.bytes` bounds. */

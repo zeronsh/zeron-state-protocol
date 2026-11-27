@@ -198,6 +198,17 @@ data :: proc "c" () -> [^]byte {
 	return raw_data(message)
 }
 
+// What the node holds of its memory, in bytes, but for the pages it keeps read from the host, which it lets go of as it
+// needs: what something taking and not giving back would add to. Counted only when asked, from the allocator's own
+// books, so costing nothing meanwhile.
+@(export)
+held_bytes :: proc "c" () -> f64 {
+	context = ctx()
+	used := runtime.wasm_allocator_size() - runtime.wasm_allocator_free_space()
+	pages := uint(len(tree_pages.hot) + len(tree_pages.cold) + len(find_pages.hot) + len(find_pages.cold)) * zsp.PAGE_SIZE
+	return f64(used - min(used, pages))
+}
+
 // How long a segment of the log is: the host's files must agree.
 @(export)
 segment :: proc "c" () -> f64 {

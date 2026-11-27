@@ -1,5 +1,7 @@
 // Asking about column after column makes an index of each, in bulk: what that takes is given back, in WebAssembly too,
-// where there is no arena to put it in and it comes from the heap. `node test/find_memory.ts`
+// where there is no arena to put it in and it comes from the heap. Judged by what the node is using after, from its
+// allocator's books, not by how much memory it has: that is the most it ever used at once, which depends on how the
+// work fell into turns, and on a slow machine falls otherwise. `node test/find_memory.ts`
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -22,7 +24,7 @@ node.adopt(readFileSync(join(owner, space, "roster")));
 const client = new Client({ connect: node.connect });
 while (!client.may(1, "write")) await new Promise((done) => setTimeout(done, 1));
 
-const COLUMNS = 40, ROWS = 4000;
+const COLUMNS = 70, ROWS = 4000;
 const table: Record<string, Column<number>> = {};
 for (let k = 0; k < COLUMNS; k++) table["c" + k] = columns.number(16 + k);
 for (let i = 0; i < ROWS; i += 500) {
@@ -35,13 +37,16 @@ for (let i = 0; i < ROWS; i += 500) {
   });
 }
 const ask = (k: number) => client.fetch({ scope: 1, table, where: where.over("c" + k, 500), order: ["c" + k], limit: 10 });
-// Some first, that whatever is kept of indexes is kept; then the rest, which should cost no more memory than that.
-for (let k = 0; k < 10; k++) assert.equal((await ask(k)).rows.length, 10);
-const before = node.memory;
-for (let k = 10; k < COLUMNS; k++) assert.equal((await ask(k)).rows.length, 10);
-const grown = (node.memory - before) / 1048576;
-console.log(`${COLUMNS - 10} more columns made an index of: the node grew by ${grown.toFixed(1)} MB`);
-assert(grown < 2, `${grown.toFixed(1)} MB more: what making an index takes is not given back`);
+// Some first, until whatever is kept of indexes, as pages kept to be written, is as much as it is kept to; then the
+// rest, which should keep no more than each index's own few hundred bytes. Something taken in making each and not given
+// back would add kilobytes for each.
+const FIRST = 40;
+for (let k = 0; k < FIRST; k++) assert.equal((await ask(k)).rows.length, 10);
+const before = node.heap;
+for (let k = FIRST; k < COLUMNS; k++) assert.equal((await ask(k)).rows.length, 10);
+const grown = (node.heap - before) / 1024;
+console.log(`${COLUMNS - FIRST} more columns made an index of: the node uses ${grown.toFixed(0)} KiB more, in ${(node.memory / 1048576).toFixed(1)} MB`);
+assert(grown < 64, `${grown.toFixed(0)} KiB more: what making an index takes is not given back`);
 client.close();
 await node.close();
 rmSync(TMP, { recursive: true, force: true });
