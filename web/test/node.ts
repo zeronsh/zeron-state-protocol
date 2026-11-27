@@ -597,6 +597,53 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   await b.close();
 }
 
+// A UDP send that throws, as Node's does for a port of 0 that a peer may say it is at, is a packet lost: not a node stopped,
+// nor one left in the midst of a tick, never settled again. And UDP refuses what it is told that is no address, before it
+// binds anything.
+{
+  const loopback = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1);
+  const peers = new Map<number, (ip: Uint8Array, port: number, data: Uint8Array) => void>();
+  let thrown = 0;
+  const datagrams = (port: number, throwing: boolean) => ({
+    port,
+    listen: (f: (ip: Uint8Array, port: number, data: Uint8Array) => void) => void peers.set(port, f),
+    send: (_ip: Uint8Array, to: number, data: Uint8Array) => {
+      if (throwing) {
+        thrown++;
+        throw new RangeError("ERR_SOCKET_BAD_PORT");
+      }
+      if (to === 9083) for (const [p, g] of peers) if (p !== port) queueMicrotask(() => g(loopback, port, data));
+    },
+    interfaces: () => [{ ip: loopback, broadcast: Uint8Array.of(127, 0, 0, 1) }],
+    close: () => void peers.delete(port),
+  });
+  const a = await Node.open({ module, volume: new MemoryVolume(), datagrams: datagrams(40021, false), log: () => {} });
+  const b = await Node.open({ module, volume: new MemoryVolume(), datagrams: datagrams(40022, true), log: () => {} });
+  let failed: Error | undefined;
+  b.onFailure = (e) => (failed = e);
+  a.create();
+  a.admit(b.key, 1);
+  assert(b.adopt(a.store.kept("roster").latest!));
+  const cb = new Client({ connect: b.connect });
+  while (!cb.may(1, "write")) await new Promise((done) => setTimeout(done, 1));
+  await new Promise((done) => setTimeout(done, 300)); // beacons heard, and answered, by a send that throws
+  assert(thrown > 0, "b never sent");
+  assert.equal(failed, undefined, "a send that threw stopped the node");
+  await cb.write(1, (change) => change.insert({}, "x", 1, {}));
+  const settled = await Promise.race([b.settled().then(() => "settled"), new Promise((done) => setTimeout(() => done("waiting"), 1000))]);
+  assert.equal(settled, "settled", "a send that threw left the node never settled");
+  cb.close();
+  await a.close();
+  await b.close();
+  const { nodeDatagrams } = await import("../src/udp-node.ts");
+  const udp = () => process.getActiveResourcesInfo().filter((r) => r === "UDPWrap").length;
+  const before = udp();
+  for (const stun of ["127.0.0.1:0", "127.0.0.1:abc", "127.0.0.1:70000", "nowhere"]) await assert.rejects(nodeDatagrams({ stun }), RangeError, stun);
+  await assert.rejects(nodeDatagrams({ port: -1 }), RangeError);
+  await new Promise((done) => setTimeout(done, 50));
+  assert.equal(udp(), before, "UDP that refused what it was told left sockets bound");
+}
+
 // A device in Node whose node could not be compiled tries again the next time, rather than failing for ever; and one that
 // cannot be opened leaves no socket open.
 {

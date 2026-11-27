@@ -25,6 +25,8 @@ function bytesOf(address: string): Uint8Array {
   return out;
 }
 
+const isPort = (n: number) => Number.isInteger(n) && n > 0 && n <= 65535;
+
 function stringOf(ip: Uint8Array): { address: string; v4: boolean } {
   const v4 = ip.subarray(0, 10).every((b) => b === 0) && ip[10] === 0xff && ip[11] === 0xff;
   if (v4) return { address: `${ip[12]}.${ip[13]}.${ip[14]}.${ip[15]}`, v4 };
@@ -42,6 +44,17 @@ export interface UdpOptions {
 
 /** Sockets for links, in Node. */
 export async function nodeDatagrams(options: UdpOptions = {}): Promise<Datagrams> {
+  // What it is told is looked at before anything is bound, so that nothing is left bound when it is refused.
+  let stunAt: { host: string; port: number } | undefined;
+  if (options.stun !== undefined) {
+    const at = options.stun.lastIndexOf(":");
+    const port = Number(options.stun.slice(at + 1));
+    if (at <= 0 || !isPort(port)) throw new RangeError(`a STUN server is host:port, its port of 1 to 65535: not ${options.stun}`);
+    stunAt = { host: options.stun.slice(0, at), port };
+  }
+  if (options.port !== undefined && !(Number.isInteger(options.port) && options.port >= 0 && options.port <= 65535)) {
+    throw new RangeError(`a UDP port is of 0 to 65535: not ${options.port}`);
+  }
   let receive: (ip: Uint8Array, port: number, data: Uint8Array) => void = () => {};
   const hear = (msg: Buffer, from: { address: string; port: number }) => receive(bytesOf(from.address), from.port, new Uint8Array(msg));
   // A socket's error is a packet that did not go, or a network that went: links notice what that means, and the process
@@ -53,7 +66,10 @@ export async function nodeDatagrams(options: UdpOptions = {}): Promise<Datagrams
       s.bind({ port, address, exclusive: false }, () => done(true));
     });
   const v4 = createSocket({ type: "udp4" });
-  if (!(await bind(v4, options.port ?? 0))) throw new Error("could not bind a UDP port");
+  if (!(await bind(v4, options.port ?? 0))) {
+    v4.close();
+    throw new Error("could not bind a UDP port");
+  }
   v4.setBroadcast(true);
   v4.on("message", hear);
   const port = v4.address().port;
@@ -65,12 +81,11 @@ export async function nodeDatagrams(options: UdpOptions = {}): Promise<Datagrams
   if (await bind(beacon, BEACON_PORT)) beacon.on("message", hear);
   else beacon.close(), (beacon = undefined);
   let stun: { ip: Uint8Array; port: number } | undefined;
-  if (options.stun) {
-    const at = options.stun.lastIndexOf(":");
+  if (stunAt) {
     try {
       // Resolved once, up front; a host without a name server still has its local addresses.
-      const { address } = await lookup(options.stun.slice(0, at), { family: 4 });
-      stun = { ip: bytesOf(address), port: Number(options.stun.slice(at + 1)) };
+      const { address } = await lookup(stunAt.host, { family: 4 });
+      stun = { ip: bytesOf(address), port: stunAt.port };
     } catch {
       stun = undefined;
     }
@@ -80,9 +95,15 @@ export async function nodeDatagrams(options: UdpOptions = {}): Promise<Datagrams
     stun,
     listen: (f) => (receive = f),
     send: (ip, to, data) => {
+      // Nowhere, as a peer may say it is, is not sent to: a packet that cannot go is the link's to notice, as one lost is.
+      if (!isPort(to)) return;
       const { address, v4: four } = stringOf(ip);
       const s = four ? v4 : v6;
-      s?.send(data, to, address, () => {}); // an unreachable peer is the link's to notice
+      try {
+        s?.send(data, to, address, () => {}); // an unreachable peer is the link's to notice
+      } catch {
+        // as unreachable
+      }
     },
     interfaces: () => {
       const out: { ip: Uint8Array; broadcast?: Uint8Array }[] = [];

@@ -632,7 +632,7 @@ export class Node {
         if (c?.kind === "socket") c.ws.close();
         else if (c?.kind === "client" && c.open) (c.open = false), this.#deliveries.push([c, new Uint8Array(0)]);
       },
-      udp_send: (ip: number, port: number, ptr: number, len: number) => this.#options.datagrams?.send(view(ip, 16).slice(), port, view(ptr, len).slice()),
+      udp_send: (ip: number, port: number, ptr: number, len: number) => guard(() => this.#options.datagrams?.send(view(ip, 16).slice(), port, view(ptr, len).slice()), undefined),
       udp_interfaces: (into: number, most: number) => {
         const list = (this.#options.datagrams?.interfaces() ?? []).slice(0, most);
         const b = view(into, 20 * list.length);
@@ -797,7 +797,15 @@ export class Node {
     if (this.#stopped || !this.#wasm || this.#space === undefined) return;
     this.#ticking = true;
     clearTimeout(this.#timer);
-    const wait = this.#wasm.tick();
+    let wait: number;
+    try {
+      wait = this.#wasm.tick();
+    } catch (e) {
+      // Thrown through the node, which was in the midst of something, and so is in no state to go on in.
+      this.#ticking = false;
+      this.#fail(new Error(`the node stopped, as what it was given threw: ${e instanceof Error ? e.message : e}`));
+      return;
+    }
     this.#ticking = false;
     if (wait === -2) {
       this.#fail(new Error("storage failed: the node has stopped rather than lose what it said was durable"));
