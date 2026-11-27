@@ -36,6 +36,7 @@ foreign host {
 }
 
 MAX_PLAIN :: 60 << 10
+NOISE_MOST :: 65535 // the longest a Noise message may be: over WebSocket, a message is one (SPEC §7)
 
 // What `save` gives begins with this. Anything else was kept by another relay than this one, and is not resumed: one that
 // carried exposures began with how many, at most 16.
@@ -158,11 +159,22 @@ opened :: proc "c" (id: u32) {
 	conns[id] = c
 }
 
+// The longest the next message from a connection may be: the handshake's, until it is done, then a Noise message.
+// The host takes in nothing longer, for what is put in the buffer grows memory that never shrinks.
+@(export)
+most :: proc "contextless" (id: u32) -> int {
+	c, ok := conns[id]
+	return 0 if !ok else NOISE_MOST if c.open else zsp.HANDSHAKE_1
+}
+
 // A message from a connection lies in the buffer. False means close it.
 @(export)
 received :: proc "c" (id: u32, size: int) -> bool {
 	context = runtime.default_context()
 	c := conns[id] or_return
+	if size > (NOISE_MOST if c.open else zsp.HANDSHAKE_1) {
+		return false
+	}
 	node.now = u64(now())
 	bytes := message[:size]
 	if !c.open {

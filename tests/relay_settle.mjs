@@ -308,3 +308,67 @@ try {
   }
   console.log("ok   a relay lets a WebSocket through however RFC 6455 lets it be asked for");
 }
+
+// Bug hunt. A message longer than a Noise message may be (SPEC §7: the handshake's 104 bytes first, then at most 65535)
+// is not taken in, before the handshake or after it: else one, from anyone, would grow the node's memory for good,
+// which never shrinks. The connection that sent it is let go of.
+{
+  const sockets = new Set();
+  const ctx = { storage: { sql: new Sql(), sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+  const doSpace = new Space(ctx, { RELAY_SECRET: "11".repeat(32), STATS: "1" });
+  const at = `http://relay.local/${"ab".repeat(32)}`;
+  const memory = async () => JSON.parse(await (await doSpace.fetch(new Request(at + "?stats"))).text()).memory;
+  doSpace.fetch(new Request(at));
+  const { server } = nextPair;
+  server._onSend = server._onClose = () => {};
+  const before = await memory();
+  doSpace.webSocketMessage(server, new Uint8Array(16 << 20).buffer); // before any handshake
+  const after = await memory();
+  assert.equal(server.closed?.code, 1008, "the connection that sent it was not let go of");
+  assert.ok(after - before < 1 << 20, `one message, before any handshake, grew the node's memory from ${before} to ${after}`);
+  console.log("ok   a relay takes in no message longer than the handshake before it");
+}
+// And after it: nothing longer than a Noise message, from a device that has done the handshake.
+const tmp5 = mkdtempSync(join(tmpdir(), "zsp-r2-"));
+try {
+  const spaceId = execFileSync(ZSPD, ["create", tmp5], { encoding: "utf8" }).trim();
+  const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
+  const sockets = new Set(), serverSockets = [];
+  const ctx = { storage: { sql: new Sql(), sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+  const doSpace = new Space(ctx, { RELAY_SECRET: relaySecret, STATS: "1" });
+  class BridgeWS {
+    static OPEN = 1; static CLOSED = 3;
+    constructor(url) {
+      this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
+      doSpace.fetch(new Request(url.replace(/^ws/, "http")));
+      const { server, pair } = nextPair; this._s = server; serverSockets.push(server);
+      pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
+      pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
+      queueMicrotask(() => { this.readyState = 1; this._emit("open", {}); });
+    }
+    _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
+    addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
+    send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+  }
+  const mod = await loadModule();
+  const vol = new MemoryVolume();
+  const st = await Store.open(vol, 16 << 20);
+  st.keep("device", readFileSync(join(tmp5, "device.key")));
+  await st.close();
+  const node = await Node.open({ volume: vol, module: mod, WebSocket: BridgeWS, log: () => {} });
+  execFileSync(ZSPD, ["relay", tmp5, relayPub, "ws://relay.local"]);
+  assert(node.adopt(readFileSync(join(tmp5, spaceId, "roster"))));
+  const memory = async () => JSON.parse(await (await doSpace.fetch(new Request(`http://relay.local/${spaceId}?stats`))).text()).memory;
+  for (let i = 0; i < 100 && !serverSockets[0]?.attachments.at(-1)?.state; i++) await new Promise((r) => setTimeout(r, 20)); // handshake done, kept
+  const [ws] = serverSockets;
+  assert(ws?.attachments.at(-1)?.state, "the device never connected");
+  const before = await memory();
+  ws._onClose = () => {}; // its device does not hear of it, and reconnect, while this is measured
+  doSpace.webSocketMessage(ws, new Uint8Array(16 << 20).buffer);
+  const after = await memory();
+  await node.close();
+  assert.equal(ws.closed?.code, 1008, "the connection that sent it was not let go of");
+  assert.ok(after - before < 1 << 20, `one message, after the handshake, grew the node's memory from ${before} to ${after}`);
+  console.log("ok   a relay takes in no message longer than a Noise message after it");
+} finally { rmSync(tmp5, { recursive: true, force: true }); }

@@ -234,7 +234,10 @@ export class Space extends DurableObject {
     if (id === undefined) return; // let go of, and still being heard from: nothing it says is anyone's
     this.#unkeep();
     // Its last words, if any, are said by #settle, and only once what it came to is kept: else, nothing is said at all.
-    if (typeof message === "string" || !this.#put(new Uint8Array(message), (n) => this.#wasm.received(id, n))) this.#ending.add(id);
+    // Nothing longer than the node says it may be is put where the node reads it: else one message, from anyone, before
+    // any handshake, would grow the node's memory for good.
+    const fits = typeof message !== "string" && message.byteLength <= this.#wasm.most(id);
+    if (!fits || !this.#put(new Uint8Array(message), (n) => this.#wasm.received(id, n))) this.#ending.add(id);
     this.#settle();
   }
 
