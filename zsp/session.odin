@@ -173,9 +173,11 @@ Task :: struct {
 	denied:  bool,
 	// Of a Fill, whose it is, and which rows it sends. Owed to the peer's watch `watch`, what is said of which is queued
 	// after it; or to nothing of the peer's, as one of this end's own watch is. Every row of the range, or, to a
-	// partial peer, those it watches when they are sent.
+	// partial peer, those it watches when they are sent. What it has still to reach is from `lo` on: a row begun, and
+	// left off for want of room, lies before that, its cells from `at` on still to be sent.
 	owed:    bool,
 	watched: bool,
+	at:      Key,
 	row:     Id,
 	watch:   u64,
 	lo, hi:  Key,
@@ -2012,6 +2014,25 @@ emit_row :: proc(s: ^Session, row: Id) {
 	typing_owed(s, row)
 }
 
+// Sends a row's cells from `from`, or its first, to before `last`, as many as there is room for; and if it left off
+// for want of room, where to go on from.
+@(private)
+emit_run :: proc(s: ^Session, row: Id, from, last: Key) -> (next: Key, more: bool) {
+	first := Key{row[0], row[1], 0, 0, 0}
+	scan := tree_scan(s.node, s.node.cells, from if key_less(first, from) else first, last)
+	for leaf in tree_next(&scan) {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		c, at := cell_unkey(leaf)
+		c.body = log_bytes(&s.node.store, at.off, at.len)
+		emit_cell(s, &c)
+		if len(s.out) - s.sent >= OUT_HIGH {
+			next = key_next(leaf.key)
+			return next, next != last
+		}
+	}
+	return
+}
+
 // Now that it holds the row, what is being typed in it, where it watches.
 @(private)
 typing_owed :: proc(s: ^Session, row: Id) {
@@ -3048,30 +3069,28 @@ run_task :: proc(s: ^Session, t: ^Task) {
 	switch task.kind {
 	case .Row, .Cell:
 		// Of a row, all of it, or a run of its cells; as much at a time as there is room for, and the rest after.
-		first, last := Key{task.row[0], task.row[1], 0, 0, 0}, Key{task.row[0], task.row[1], 256 << 8, 0, 0}
+		last := Key{task.row[0], task.row[1], 256 << 8, 0, 0}
 		if task.kind == .Cell {
 			last = key_next(task.hi)
 		}
-		scan := tree_scan(n, n.cells, task.lo if key_less(first, task.lo) else first, last)
-		for {
-			leaf, ok := tree_next(&scan)
-			if !ok {
-				task_done(s)
-				if task.kind == .Row {
-					typing_owed(s, task.row)
-				}
-				return
-			}
-			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-			c, at := cell_unkey(leaf)
-			c.body = log_bytes(&n.store, at.off, at.len)
-			emit_cell(s, &c)
-			if len(s.out) - s.sent >= OUT_HIGH {
-				t.lo = key_next(leaf.key)
-				return
-			}
+		if next, more := emit_run(s, task.row, task.lo, last); more {
+			t.lo = next
+			return
+		}
+		task_done(s)
+		if task.kind == .Row {
+			typing_owed(s, task.row)
 		}
 	case .Fill:
+		// A row, too, as far as there is room for, and the rest after.
+		if task.at != {} {
+			if next, more := emit_run(s, task.row, task.at, {task.row[0], task.row[1], 256 << 8, 0, 0}); more {
+				t.at = next
+				return
+			}
+			t.at = {}
+			typing_owed(s, task.row)
+		}
 		scan := tree_scan(n, n.shelf, task.lo, task.hi)
 		for {
 			leaf, ok := tree_next(&scan)
@@ -3079,11 +3098,16 @@ run_task :: proc(s: ^Session, t: ^Task) {
 				task_done(s)
 				return
 			}
+			t.lo = key_next(leaf.key)
 			if !task.watched || watched(s, leaf.key) {
-				emit_row(s, key_row(leaf.key))
+				row := key_row(leaf.key)
+				if next, more := emit_run(s, row, {}, {row[0], row[1], 256 << 8, 0, 0}); more {
+					t.row, t.at = row, next
+					return
+				}
+				typing_owed(s, row)
 			}
 			if len(s.out) - s.sent >= OUT_HIGH {
-				t.lo = key_next(leaf.key)
 				return
 			}
 		}

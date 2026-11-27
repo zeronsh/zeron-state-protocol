@@ -2005,6 +2005,12 @@ asking_queues_no_more_than_was_said :: proc(t: ^testing.T) {
 		session_sent(at_a, len(out))
 		sim_settle(&s)
 	}
+	// And so is a range it lacks, a row of it at a time and within a row as there is room.
+	testing.expect(t, session_input(at_a, list[:]))
+	out := session_output(at_a)
+	testing.expectf(t, len(out) <= OUT_HIGH + 3 * len(value), "%d bytes waiting at once, of a range with a row of %d", len(out), 120 * len(value))
+	session_sent(at_a, len(out))
+	sim_settle(&s)
 }
 
 // A relay that starts again with its cells held against a roster it no longer has drops what is in no scope there is:
