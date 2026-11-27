@@ -326,6 +326,7 @@ export class Space extends DurableObject {
       }
       this.#ending.clear();
     }
+    this.#overdue(false); // timed from what is left, now that what was let go of is gone
     this.#wasm.ops(); // what taking output wanted, fetched now: not when something next happens
     this.#wasm.rest();
     if (this.#broken || this.#wasm.failed()) return void this.#fail();
@@ -365,12 +366,13 @@ export class Space extends DurableObject {
   // HANDSHAKE_WAIT: its handshake stalled, its Hello or the roster it promised never came, or it waits on a policy
   // that never answers. Else anyone could hold sockets, and the node's memory for them, as long as the object stays
   // awake. (Asleep, such a connection is not kept, and is let go of on waking.) One timer, for the soonest.
-  #overdue() {
+  // `drop`: let go of those whose time is up, or only time what is left, as once nothing more is to be said this time.
+  #overdue(drop = true) {
     const now = Date.now();
     let soonest = 0;
     for (const [id, due] of this.#unready) {
       if (this.#wasm.ready(id)) this.#ready(id);
-      else if (due <= now) this.#drop(id, this.#sockets.get(id));
+      else if (drop && due <= now) this.#drop(id, this.#sockets.get(id));
       else if (!soonest || due < soonest) soonest = due;
     }
     if (soonest === this.#handshakeAt) return;
@@ -384,7 +386,7 @@ export class Space extends DurableObject {
       if (epoch !== this.#epoch || !this.#wasm) return;
       this.#unkeep(); // an event like any other: what was kept is let go of before anything is done
       this.#settle();
-    }, soonest - now);
+    }, Math.max(0, soonest - now));
   }
 
   // What each connection was kept as is about to be out of date: let go of, once a burst and before anything in it is

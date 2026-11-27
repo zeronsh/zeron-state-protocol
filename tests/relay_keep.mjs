@@ -92,7 +92,7 @@ async function relayWith(count, env = {}) {
     _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
     addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
     send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => r.doSpace.webSocketMessage(this._s, b)); } }
-    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); r.doSpace.webSocketClose(this._s); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; queueMicrotask(() => { sockets.delete(this._s); r.doSpace.webSocketClose(this._s); }); } } // after what was sent before it, as a WebSocket's close comes
   }
 
   const mod = await loadModule();
