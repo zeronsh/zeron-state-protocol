@@ -1128,7 +1128,9 @@ text_bundle :: proc(cells: []Cell, allocator := context.allocator) -> (out: Cell
 		#partial switch c.kind {
 		case .Piece:
 			append(&names, c.stamp)
-			append(&inner, Inner{c.stamp, get_u64(c.body), c.body[8:]})
+			if len(c.body) >= 8 { // else it is no piece of any text, and is gone with nothing in its place
+				append(&inner, Inner{c.stamp, get_u64(c.body), c.body[8:]})
+			}
 		case .Bundle:
 			append(&names, c.stamp)
 			for i in 0 ..< int(get_u32(c.body)) {

@@ -365,6 +365,25 @@ text_is_written_as_it_should_be :: proc(t: ^testing.T) {
 	}
 }
 
+// A piece too short to name itself is no piece of the text, and is bundled away with nothing in its place.
+@(test)
+short_pieces_are_bundled_away :: proc(t: ^testing.T) {
+	row := Id{1 << 32, 1}
+	x: Text
+	defer text_destroy(&x)
+	text_insert(&x, 0, transmute([]byte)string("hello"), 7)
+	body, _ := text_close(&x, {2 << 16, 2})
+	cells := []Cell{{row, DATA, .Piece, {1 << 16, 1}, nil}, {row, DATA, .Piece, {2 << 16, 2}, body}, {row, DATA, .Piece, {3 << 16, 3}, {1, 2, 3}}}
+	b := text_bundle(cells)
+	defer delete(b.body)
+	testing.expect_value(t, get_u32(b.body), 3)
+	y: Text
+	defer text_destroy(&y)
+	b.stamp = {4 << 16, 4}
+	testing.expect(t, cell_valid(&b) && text_apply(&y, &b) == .Changed)
+	testing.expect_value(t, text_string(&y), "hello")
+}
+
 // What is no operation at all, or one that refers to what its own piece has yet to make, waits for nothing: it is never
 // to be, and is neither kept nor gone over again at every edit. What refers to another piece waits for it.
 @(test)
