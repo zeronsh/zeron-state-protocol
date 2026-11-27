@@ -186,14 +186,17 @@ def held_back(port, stalled):
 def unused():
     """A port nothing listens at, and that no socket asking for any port is given meanwhile, as the forward's own
     listeners are: one below where every system's ephemeral ports begin (32768 on Linux, 49152 on macOS and Windows)."""
-    while True:
+    why = None
+    for _ in range(200):
         port = random.randrange(20000, 32000)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(("127.0.0.1", port))
-            except OSError:
+            except OSError as e:
+                why = e
                 continue
         return port
+    raise RuntimeError(f"no port from 20000 to 32000 could be bound, in 200 tries: the last refused with {why}")
 
 
 def refused(port):
