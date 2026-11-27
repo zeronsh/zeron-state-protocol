@@ -600,6 +600,7 @@ def test_durable_object():
 
     answering = threading.Thread(target=answer)
     answering.start()
+    held = None
     try:
         ca.until(lambda: len(ca.devices) == 2)
         held = threading.Thread(target=pause, args=(b.p, 1.5))
@@ -608,8 +609,9 @@ def test_durable_object():
         ca.send(zsp.CALL, zsp.varint(9) + ca.devices[1][0] + zsp.varint(1) + zsp.varint(3) + b"add\0" + bytes([zsp.URGENCY]) + b"hi")
         ca.calls[9] = {"data": [], "ended": False, "fault": None}
         ca.until(lambda: ca.calls[9]["data"] == [b"hi!"])
-        held.join()
     finally:
+        if held:
+            held.join()  # let go on before anything stops it, whatever failed
         stop.set()
         answering.join()
 
