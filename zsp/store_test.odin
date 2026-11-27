@@ -27,22 +27,22 @@ tree_runs_fill_their_pages :: proc(t: ^testing.T) {
 	testing.expect(t, store_open(&s, memory_disk(&m)))
 	defer store_close(&s)
 	tr: Tree
-	for i in 10_000 ..< 10_050 {
+	N :: 100_000
+	for i in N ..< N + 50 {
 		tree_put(&s, &tr, Key{u64(i), 0, 0, 0, 0}, {})
 	}
-	for i in 0 ..< 10_000 {
+	for i in 0 ..< N {
 		tree_put(&s, &tr, Key{u64(i), 0, 0, 0, 0}, {})
 	}
-	leaves :: proc(p: ^Pager, no: Page_No) -> int {
+	// Pages of each level, the leaves first.
+	pages :: proc(p: ^Pager, no: Page_No, count: ^[8]int) {
 		pg := page(p, no)
-		if pg.level == 0 {
-			return 1
+		count[pg.level] += 1
+		if pg.level > 0 {
+			for b in pg.branch[:pg.count] {
+				pages(p, b.child, count)
+			}
 		}
-		n := 0
-		for b in pg.branch[:pg.count] {
-			n += leaves(p, b.child)
-		}
-		return n
 	}
 	scan := tree_scan(&s, tr, KEY_MIN, KEY_MAX)
 	want := u64(0)
@@ -50,9 +50,13 @@ tree_runs_fill_their_pages :: proc(t: ^testing.T) {
 		testing.expect_value(t, leaf.key[0], want)
 		want += 1
 	}
-	testing.expect_value(t, want, 10_050)
-	least := (10_050 + LEAF_CAP - 1) / LEAF_CAP
-	testing.expectf(t, leaves(&s, tr.root) <= least + 2, "%d leaves, where %d would hold them", leaves(&s, tr.root), least)
+	testing.expect_value(t, want, N + 50)
+	count: [8]int
+	pages(&s, tr.root, &count)
+	least := (N + 50 + LEAF_CAP - 1) / LEAF_CAP
+	testing.expectf(t, count[0] <= least + 2, "%d leaves, where %d would hold them", count[0], least)
+	above := (count[0] + BRANCH_CAP - 1) / BRANCH_CAP
+	testing.expectf(t, count[1] <= above + 2, "%d branches above the leaves, where %d would hold them", count[1], above)
 }
 
 @(test)

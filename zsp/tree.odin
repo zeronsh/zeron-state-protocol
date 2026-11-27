@@ -242,13 +242,14 @@ put :: proc(p: ^Pager, no: Page_No, key: ^Key, val: Print, last: Key) -> (left: 
 			pg.count += 1
 			return
 		}
-		run = i > 0 && i < n && pg.leaf[i - 1].key == last
+		// A run, though at the right edge: so that the branches above it, before what comes after, fill too.
+		run = i > 0 && pg.leaf[i - 1].key == last
 		at := n if i == n else i if run else n / 2
 		r_no, r := page_new(p, 0)
 		r.count = u16(copy(r.leaf[:], pg.leaf[at:n]))
 		pg.count = u16(at)
 		into, j := pg, i
-		if i >= at && !run {
+		if i >= at && (i > at || at == n) {
 			into, j = r, i - at
 		}
 		m := int(into.count)
@@ -275,7 +276,7 @@ put :: proc(p: ^Pager, no: Page_No, key: ^Key, val: Print, last: Key) -> (left: 
 		pg.count += 1
 		return
 	}
-	run = child_run && i < n
+	run = child_run
 	at := n if i == n else i if run else n / 2
 	r_no, r := page_new(p, pg.level)
 	r.count = u16(copy(r.branch[:], pg.branch[at:n]))
