@@ -378,6 +378,23 @@ const tests: Record<string, () => Promise<void>> = {
     await again("third");
     await call(e, "put", "cc", "notes", ["four"]);
     await eventually(() => titles.split(",").includes("four"), "a tab whose clock is behind presents the newest given, given ahead of it", 20000);
+    // A tab whose clock is ahead gives one, and then one whose clock is behind another: its worker gives that again as newer,
+    // and tells its tab, which gives it so to the next it starts. All put away and back, every worker begun again, it is
+    // the newest still, though the first was said to be given later by its tab's clock.
+    const g = await page();
+    await g.evaluate("(() => { const was = Date.now; Date.now = () => was() + 300000; return 1; })()");
+    await call(g, "device", "cc", "first");
+    const f = await page();
+    await call(f, "device", "cc", "fourth");
+    await again("fourth");
+    await call(e, "put", "cc", "notes", ["five"]);
+    await eventually(() => titles.split(",").includes("five"), "a credential a tab opened with, given behind another, is given as newer", 20000);
+    for (const p of [e, f, g]) await p.cdp("Page.setWebLifecycleState", { state: "frozen" });
+    for (const p of [e, f, g]) await p.cdp("Page.setWebLifecycleState", { state: "active" });
+    for (const p of [e, f, g]) await call(p, "member", "cc");
+    await again("fourth");
+    await call(e, "put", "cc", "notes", ["six"]);
+    await eventually(() => titles.split(",").includes("six"), "and still once all are put away and back", 20000);
     watching?.close();
   },
   // A tab that closes its device, its node run by another tab's worker, tells its clients their pipes are gone.

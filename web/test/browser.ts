@@ -84,6 +84,7 @@ const zsp = {
   async setCredentialAndFreeze(name: string, credential: string): Promise<void> {
     const given = devices.get(name)!.setCredential(credential);
     document.dispatchEvent(new Event("freeze"));
+    await new Promise((done) => setTimeout(done, 10)); // a turn or more while away, as there is
     document.dispatchEvent(new Event("resume"));
     await given;
   },

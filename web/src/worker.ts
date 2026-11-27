@@ -60,7 +60,12 @@ export type Op =
  * What a worker tells its tab: an answer; that the node has stopped, its storage having failed; the space it is of; or
  * that a time asked for is up. Never a credential: the tab that gave one has it, and no other tab is given it.
  */
-export type Report = { answer: number; value?: unknown; error?: string } | { failed: string } | { space: string | undefined } | { due: number };
+export type Report =
+  | { answer: number; value?: unknown; error?: string }
+  | { failed: string }
+  | { space: string | undefined }
+  | { due: number }
+  | { credentialAt: number }; // when what the tab gave is said to have been given: anew, or again as newer, never what it is
 
 // Between workers, on the store's channel.
 type Shout =
@@ -137,6 +142,7 @@ function give(credential: string | Uint8Array, at: number, anew: boolean): numbe
   mine = anew ? given : undefined;
   present();
   channel.postMessage(given satisfies Shout);
+  if (anew) self.postMessage({ credentialAt: given.at } satisfies Report); // for its tab to give again, as of then, should it start another worker
   return given.at;
 }
 
@@ -158,7 +164,9 @@ function present(): void {
 // do as it likes with it anyway; but what is not a credential is not taken as one, nor one said to have been given further
 // ahead of any this worker knows of, or of its time, than any clock could be: what is given after it would be later still,
 // and at last too late to be counted. Judged by what it knows as much as by its clock, which may have been set back since
-// the others gave what they did: what is given here after it is given later anyway.
+// the others gave what they did: what is given here after it is given later anyway. (A script of the origin that said one
+// further ahead again, eight thousand times over, could count them out at last: as it could give a credential itself, or
+// open the device and do as it likes with it. The origin is what a browser trusts its device to.)
 function heardGiven(g: Given): void {
   if (!(typeof g.credential === "string" || g.credential instanceof Uint8Array) || typeof g.at !== "number" || typeof g.by !== "string") return;
   if (!(g.at > 0 && g.at <= Math.max(Date.now(), newest?.at ?? 0) + AHEAD) || !newer(g)) return;

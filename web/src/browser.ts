@@ -69,6 +69,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       const r = e.data;
       if ("failed" in r) return fail(new Error(r.failed));
       if ("space" in r) return void (space = r.space);
+      if ("credentialAt" in r) return void (taken && (credentialAt = r.credentialAt)); // what this tab gave, given again as newer
       if ("due" in r) {
         const t = timers.get(r.due);
         timers.delete(r.due);
@@ -100,7 +101,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     worker = undefined;
     for (const [id, a] of answers) {
       if (a.op === "close") answers.delete(id), a.resolve(undefined); // stopped, as a closed tab's is
-      else if (a.op === "credential") answers.delete(id), a.resolve(credentialAt); // given anew by the next worker, not taken by this
+      else if (a.op === "credential") answers.delete(id), a.resolve(undefined); // given anew by the next worker, not taken by this
       else if (!again.has(a.op)) answers.delete(id), a.reject(new Error("the tab was put away as this was asked, which may or may not have been done"));
     }
     for (const breakOff of [...pipes]) breakOff(); // every client here dials again, once the tab is back
@@ -208,8 +209,8 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       credential = c; // for whichever worker this tab starts next
       credentialAt = Date.now();
       taken = false;
-      const at = await ask<number>("credential", c, credentialAt);
-      if (credential === c) (credentialAt = at), (taken = true); // as given: no earlier than any it knew of
+      const at = await ask<number | undefined>("credential", c, credentialAt);
+      if (at !== undefined && credential === c) (credentialAt = at), (taken = true); // as given: no earlier than any it knew of
     },
     connect,
     client: (host = {}) => new Client({ after, ...host, connect }),
