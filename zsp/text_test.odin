@@ -3,6 +3,7 @@ package zsp
 
 import "core:math/rand"
 import "core:slice"
+import "core:strings"
 import "core:testing"
 
 @(private)
@@ -362,4 +363,58 @@ text_is_written_as_it_should_be :: proc(t: ^testing.T) {
 		plain_text_destroy(&plain)
 		free_all(context.temp_allocator)
 	}
+}
+
+// What is no operation at all, or one that refers to what its own piece has yet to make, waits for nothing: it is never
+// to be, and is neither kept nor gone over again at every edit. What refers to another piece waits for it.
+@(test)
+nonsense_does_not_wait :: proc(t: ^testing.T) {
+	x: Text
+	defer text_destroy(&x)
+	insert :: proc(w: ^[dynamic]byte, left: []byte, s: string) {
+		append(w, 1)
+		append(w, ..left)
+		append(w, 0)
+		write_bytes(w, transmute([]byte)s)
+	}
+	piece :: proc(x: ^Text, id: u64, ops: []byte) -> Text_Result {
+		body := make([dynamic]byte, context.temp_allocator)
+		write_u64(&body, id)
+		append(&body, ..ops)
+		c := Cell{{1 << 32, 1}, DATA, .Piece, {id << 16, id}, body[:]}
+		return text_apply(x, &c)
+	}
+	ops := make([dynamic]byte, context.temp_allocator)
+	insert(&ops, {0}, "hello")
+	testing.expect_value(t, piece(&x, 1, ops[:]), Text_Result.Changed)
+	for i in 0 ..< 50 {
+		clear(&ops)
+		insert(&ops, {0}, "a")
+		switch i % 4 {
+		case 0:
+			append(&ops, 9, 9, 9) // no such operation
+		case 1:
+			append(&ops, 1, 0, 0, 0xff) // a length that does not end
+		case 2:
+			insert(&ops, {1, 5}, "b") // after what this piece never made
+		case 3:
+			append(&ops, 3, 1, 9, 1) // and the deletion of it
+		}
+		testing.expect_value(t, piece(&x, u64(i) + 2, ops[:]), Text_Result.Changed)
+	}
+	testing.expect_value(t, len(x.waiting), 0)
+	// But one that refers to a piece not yet here waits for it, and goes on once it is.
+	clear(&ops)
+	ref := make([dynamic]byte, context.temp_allocator)
+	append(&ref, 2)
+	write_u64(&ref, 99)
+	append(&ref, 0)
+	insert(&ops, ref[:], "!")
+	testing.expect_value(t, piece(&x, 98, ops[:]), Text_Result.Waiting)
+	testing.expect_value(t, len(x.waiting), 1)
+	clear(&ops)
+	insert(&ops, {0}, "?")
+	testing.expect_value(t, piece(&x, 99, ops[:]), Text_Result.Changed)
+	testing.expect_value(t, len(x.waiting), 0)
+	testing.expect_value(t, strings.count(text_string(&x), "!"), 1)
 }
