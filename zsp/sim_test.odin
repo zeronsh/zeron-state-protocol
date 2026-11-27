@@ -2484,6 +2484,238 @@ window_goes_before_the_rest :: proc(t: ^testing.T) {
 	testing.expect_value(t, store_range(&fresh.node.store, w.lo, w.hi).count, 50)
 }
 
+// A row of a list, `tag`, with a value of so many bytes.
+@(private)
+sim_put_big :: proc(s: ^Sim, x: ^Sim_Node, tag, order: u64, size: int) {
+	s.now += 3
+	x.node.now = sim_now(s, x)
+	place: [24]byte
+	put_u64(place[:], 1 << 32 | tag)
+	put_u64(place[8:], tag)
+	put_u64(place[16:], order)
+	value := make([]byte, size)
+	defer delete(value)
+	id := node_id(&x.node, 1)
+	_ = node_write(&x.node, {{id, PLACE, .Place, node_stamp(&x.node), place[:]}, {id, DATA, .Value, node_stamp(&x.node), value}})
+	free_all(context.temp_allocator)
+}
+
+// Draws all a client is said, until it is said nothing more.
+@(private)
+sim_drain :: proc(ui: ^Session) {
+	for len(session_output(ui)) > 0 {
+		session_sent(ui, len(session_output(ui)))
+	}
+}
+
+// What answers a window hurried goes first, but in its own order: the rows it found the watcher lacked go before what
+// says the window is level, however many of them there are, and however the comparing of it went.
+@(test)
+review6_hurried_window_settles_after_its_rows :: proc(t: ^testing.T) {
+	state := seeded(95)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	owner, phone := s.nodes[0], s.nodes[1]
+	list := List{1 << 32 | 5, 5}
+	sim_put_big(&s, phone, 5, 0, 20_000)
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	for i in 1 ..= 20 {
+		sim_put_big(&s, owner, 5, u64(i), 20_000)
+	}
+	ui := sim_client(&s, phone)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true})
+	held_when_settled := -1
+	for round := 0; round < 10_000; round += 1 {
+		busy := false
+		for l in s.links {
+			busy |= sim_pass(&s, l.a, l.b)
+			busy |= sim_pass(&s, l.b, l.a)
+		}
+		sim_drain(ui)
+		if held_when_settled < 0 && ui.watches[0].settled {
+			held_when_settled = store_range(&phone.node.store, list_lo(list), list_hi(list)).count
+		}
+		if !busy {
+			break
+		}
+	}
+	testing.expect_value(t, held_when_settled, 21)
+}
+
+// A watch replaced is not hurried for the one it was: what replaces it, however large, waits its turn.
+@(test)
+review6_replaced_watch_is_not_hurried :: proc(t: ^testing.T) {
+	state := seeded(96)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	owner := s.nodes[0]
+	for i in 0 ..< 100 {
+		sim_put_big(&s, owner, 5, u64(i), 20_000)
+		sim_put_big(&s, owner, 6, u64(i), 100)
+	}
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	at := s.links[0].b // the owner's end
+	a, b := List{1 << 32 | 5, 5}, List{1 << 32 | 6, 6}
+	sim_watch(at, 10, list_lo(a), list_hi(a), 200, {data = true})
+	testing.expect(t, slice.contains(at.hurried[:], 10))
+	_ = session_output(at) // some of it, not all
+	sim_watch(at, 10, list_lo(b), list_hi(b), 0, {data = true, known = true})
+	_ = session_output(at)
+	testing.expect(t, !slice.contains(at.hurried[:], 10), "a watch replaced stayed hurried for what replaced it")
+}
+
+// A full replica alone says a window is settled: it is all there is. Once it asks another, it says so no longer until
+// that one answers; and a window that its client has gone on from with a page before it is not cut short there, before
+// the answer or after, or what lay between the two would be in neither.
+@(test)
+review6_window_gone_on_from_is_not_cut :: proc(t: ^testing.T) {
+	state := seeded(97)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	owner := s.nodes[0]
+	list := List{1 << 32 | 5, 5}
+	for i in 0 ..< 100 {
+		sim_put(&s, owner, u64(100 + i))
+	}
+	ui := sim_client(&s, owner)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true, counts = true})
+	sim_drain(ui)
+	testing.expect(t, ui.watches[0].settled)
+	// The page before it, as a client asks for it when it is scrolled to.
+	page := ui.watches[0]
+	sim_watch(ui, 2, list_lo(list), page.lo, 50, {data = true, live = true, back = true, counts = true})
+	sim_drain(ui)
+	// And more, after.
+	for i in 200 ..< 300 {
+		sim_put(&s, owner, u64(i))
+	}
+	sim_drain(ui)
+	find :: proc(ui: ^Session, id: u64) -> Watch {
+		for w in ui.watches {
+			if w.id == id {
+				return w
+			}
+		}
+		return {}
+	}
+	testing.expect(t, find(ui, 1).lo == page.lo)
+	sim_link(&s, 0, 1)
+	up := s.links[0]
+	for !up.a.ready || !up.b.ready {
+		sim_pass(&s, up.a, up.b)
+		sim_pass(&s, up.b, up.a)
+	}
+	sim_put(&s, owner, 300)
+	sim_drain(ui)
+	testing.expect(t, !find(ui, 1).settled, "a full replica said its window was settled while it waited for another")
+	testing.expect(t, find(ui, 1).lo == page.lo, "a window gone on from was cut short before the answer")
+	sim_settle(&s)
+	sim_drain(ui)
+	testing.expect(t, find(ui, 1).settled)
+	testing.expect(t, find(ui, 1).lo == find(ui, 2).hi, "a window gone on from was cut short by the answer")
+}
+
+// A relay hushed, as one is once every other device it carries is reached directly, owes nothing more: what it was
+// asked and never answered is not waited for for ever.
+@(test)
+review6_hushed_relay_owes_nothing :: proc(t: ^testing.T) {
+	state := seeded(98)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	a := s.nodes[0]
+	list := List{1 << 32 | 5, 5}
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	sim_put(&s, a, 1)
+	ui := sim_client(&s, a)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true})
+	// Asked of the relay; and, before it answers, the other is reached directly, and the relay hushed.
+	to_relay: ^Session
+	for l in s.links {
+		if l.an == 0 && l.bn == 2 {
+			to_relay = l.a
+		}
+	}
+	testing.expect(t, len(to_relay.owed) == 1)
+	sim_link(&s, 0, 1)
+	direct := s.links[len(s.links) - 1]
+	for round := 0; round < 1000 && !to_relay.paused; round += 1 {
+		sim_pass(&s, direct.a, direct.b)
+		sim_pass(&s, direct.b, direct.a)
+	}
+	testing.expect(t, to_relay.paused, "the relay was not hushed")
+	sim_settle(&s)
+	sim_drain(ui)
+	testing.expect(t, ui.watches[0].settled, "a window stayed waiting for a relay hushed")
+	testing.expect(t, !to_relay.paused || len(to_relay.owed) == 0, "a relay hushed was still owed")
+}
+
+// A new roster asks again of whoever can answer; of a full replica alone, nobody: its windows stay settled.
+@(test)
+review6_roster_leaves_alone_settled :: proc(t: ^testing.T) {
+	state := seeded(99)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256) // the relay is never reached
+	defer sim_destroy(&s)
+	owner := s.nodes[0]
+	list := List{1 << 32 | 5, 5}
+	for i in 0 ..< 10 {
+		sim_put(&s, owner, u64(i))
+	}
+	ui := sim_client(&s, owner)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true})
+	sim_drain(ui)
+	testing.expect(t, ui.watches[0].settled)
+	sim_rotate(&s, restore = true)
+	sim_drain(ui)
+	testing.expect(t, ui.watches[0].settled, "a new roster unsettled a full replica's window, with nobody to settle it again")
+}
+
+// A row offered again, once all that was to be sent of it has been, is offered then: not when something else is next
+// to be said.
+@(test)
+review6_reoffer_goes_at_once :: proc(t: ^testing.T) {
+	state := seeded(100)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	phone := s.nodes[1]
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	phone.node.now = sim_now(&s, phone)
+	id := node_id(&phone.node, 1)
+	place: [24]byte
+	put_u64(place[:], 1 << 32 | 5)
+	put_u64(place[8:], 5)
+	_ = node_write(&phone.node, {{id, PLACE, .Place, node_stamp(&phone.node), place[:]}})
+	sim_settle(&s)
+	ps := s.links[0].a
+	testing.expect(t, len(session_output(ps)) == 0)
+	// As though it had been acknowledged while a cell of it, killed since, was still to be sent.
+	tree_put(&phone.node, &phone.node.outbox, {id[0], id[1], 0, 0, 0}, {})
+	append(&ps.tasks, Task{kind = .Cell, row = id, lo = {id[0], id[1], u64(DATA) << 8, 0, 1}})
+	append(&ps.reoffer, id)
+	testing.expect(t, len(session_output(ps)) > 0, "a row to offer again waited for something else to be said")
+	free_all(context.temp_allocator)
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)

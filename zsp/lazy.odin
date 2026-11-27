@@ -144,8 +144,8 @@ store_end :: proc(s: ^Store, t: ^Step, keep: bool) {
 // What a step may change of its session, to be put back should the step be undone.
 @(private)
 Session_Mark :: struct {
-	out, tasks, task_head, refused, unacked, first, hurried: int,
-	head:                                     Task,
+	out, tasks, task_head, refused, unacked, first, first_head, hurried: int,
+	head, first_task:                         Task,
 	cells:                                    Cells_Frame,
 	seq_out, cursor, whole_to, seq_in, ack_at: u64,
 	whole:                                    Id,
@@ -160,6 +160,7 @@ session_mark :: proc(s: ^Session) -> (m: Session_Mark) {
 		tasks     = len(s.tasks),
 		task_head = s.task_head,
 		first     = len(s.first),
+		first_head = s.first_head,
 		hurried   = len(s.hurried),
 		refused   = len(s.refused),
 		unacked   = len(s.unacked),
@@ -179,6 +180,9 @@ session_mark :: proc(s: ^Session) -> (m: Session_Mark) {
 	if s.task_head < len(s.tasks) {
 		m.head = s.tasks[s.task_head]
 	}
+	if s.first_head < len(s.first) {
+		m.first_task = s.first[s.first_head]
+	}
 	return
 }
 
@@ -188,6 +192,10 @@ session_restore :: proc(s: ^Session, m: ^Session_Mark) {
 	resize(&s.tasks, m.tasks)
 	s.task_head = m.task_head
 	resize(&s.first, m.first)
+	s.first_head = m.first_head
+	if s.first_head < len(s.first) {
+		s.first[s.first_head] = m.first_task
+	}
 	resize(&s.hurried, m.hurried)
 	if s.task_head < len(s.tasks) {
 		s.tasks[s.task_head] = m.head

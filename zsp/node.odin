@@ -628,8 +628,8 @@ interest_add :: proc(s: ^Session, w: Watch, limit: u64, back: bool) -> ^Interest
 		used_stamp(n, w.lo, w.hi)
 	}
 	for to in n.sessions {
-		if interest_concerns(n, s.id, to) {
-			interest_send(to, it)
+		if interest_concerns(n, s.id, to) && !to.paused {
+			interest_send(to, it, tell = false) // what is said of it follows this
 		}
 	}
 	return it
@@ -653,7 +653,7 @@ interests_afresh :: proc(n: ^Node) {
 			}
 			if interest_concerns(n, it.session, to) && !to.paused {
 				send_unwatch(to, old)
-				interest_send(to, &it)
+				interest_send(to, &it, tell = false) // what is said of it follows
 			}
 		}
 		// What confirmed it may not stand under this roster: settled again once a full replica says so anew.
@@ -661,7 +661,7 @@ interests_afresh :: proc(n: ^Node) {
 			if to := node_session(n, it.session); to != nil {
 				for w in to.watches {
 					if w.id == it.watch.id && w.data {
-						append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi})
+						append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = interest_sure(n, &it)})
 					}
 				}
 			}
@@ -688,7 +688,7 @@ interest_remove :: proc(n: ^Node, i: int) {
 
 // Announces an interest. Data comes from full peers; live frames come from anyone.
 @(private)
-interest_send :: proc(to: ^Session, it: ^Interest) {
+interest_send :: proc(to: ^Session, it: ^Interest, tell := true) {
 	data := it.watch.data && to.peer_full
 	if .Read not_in session_rights(to, key_scope(it.watch.lo)) {
 		return
@@ -699,6 +699,18 @@ interest_send :: proc(to: ^Session, it: ^Interest) {
 	if data && !slice.contains(to.owed[:], it.id) {
 		it.waiting += 1
 		append(&to.owed, it.id)
+		// A full replica that was all there was is all there is no longer: what it shows is no more than what it holds,
+		// until the one it asks answers, as it is for a partial one.
+		// (Said after whatever it has said or is to say of it, which may be that it was settled.)
+		if tell && it.waiting == 1 && len(it.reports) == 0 && to.node.full {
+			if from := node_session(to.node, it.session); from != nil {
+				for w in from.watches {
+					if w.id == it.watch.id && w.data {
+						append(&from.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi})
+					}
+				}
+			}
+		}
 	}
 	send_watch(to, it.id, it.watch.lo, it.watch.hi, {live = it.watch.live, data = data, back = it.back, counts = data && it.watch.counts}, it.limit)
 }
