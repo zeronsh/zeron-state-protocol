@@ -422,6 +422,9 @@ edit_place :: proc(p: ^Pager, t: ^Tree, e: ^Edit) -> bool {
 		up, over := page_own(p, step.no)
 		c := &children(over)[step.at]
 		c.child, c.count = no, u32(int(c.count) + delta)
+		if !e.gone && entry_less(e.key, e.sub, c.key, c.sub) {
+			c.key, c.sub = e.key, e.sub // what is found by its first key is found by this too: it comes first now
+		}
 		if t.sums {
 			c.sum = sum
 			sum = 0

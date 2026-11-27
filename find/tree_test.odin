@@ -142,6 +142,22 @@ tree_matches_model :: proc(t: ^testing.T) {
 					s.at += 1
 				})
 				testing.expect(t, s.ok && s.at == len(all))
+				// And up to it, from the first.
+				s = Seen{all[:], 0, true}
+				tree_each(&p, tr, KEY_MIN, probe.key, &s, proc(data: rawptr, e: ^Entry) {
+					s := (^Seen)(data)
+					s.ok &&= s.at < len(s.all) && s.all[s.at] == e^
+					s.at += 1
+				})
+				testing.expect(t, s.ok && s.at == first)
+				subs: Set
+				tree_subs(&p, tr, KEY_MIN, probe.key, &subs)
+				unlike := make(map[u32]bool, context.temp_allocator)
+				for e in all[:first] {
+					unlike[e.sub] = true
+				}
+				testing.expect_value(t, subs.count, len(unlike))
+				set_destroy(&subs)
 			}
 			cursor_destroy(&c)
 		}
@@ -149,6 +165,38 @@ tree_matches_model :: proc(t: ^testing.T) {
 		tree_clear(&p, &tr)
 		testing.expect_value(t, len(p.free) + len(p.pending) + HEADERS, int(p.next))
 	}
+}
+
+// What comes before all there was, put in one edit at a time, is found by what it is, as by any other.
+@(test)
+a_new_first_is_found :: proc(t: ^testing.T) {
+	m: Memory_Disk
+	defer memory_disk_destroy(&m)
+	p: Pager
+	key: zsp.Key32
+	pager_open(&p, memory_disk(&m), key)
+	defer pager_close(&p)
+	tr: Tree
+	edits := make([dynamic]Edit, context.temp_allocator)
+	for i in 0 ..< 3000 {
+		append(&edits, Edit{entry = {key = number_key(f64(1000 + i)), sub = u32(i)}})
+	}
+	tree_apply(&p, &tr, edits[:])
+	testing.expect(t, page_get(&p, tr.root).level > 0)
+	for i in 0 ..< 3 {
+		first := Edit{entry = {key = number_key(f64(10 - i)), sub = u32(5000 + i)}}
+		tree_apply(&p, &tr, {first})
+		subs: Set
+		defer set_destroy(&subs)
+		tree_subs(&p, tr, KEY_MIN, number_key(500), &subs)
+		testing.expect_value(t, subs.count, i + 1)
+		found := 0
+		tree_each(&p, tr, number_key(f64(10 - i)), number_key(f64(11 - i)), &found, proc(data: rawptr, e: ^Entry) {
+			(^int)(data)^ += 1
+		})
+		testing.expect_value(t, found, 1)
+	}
+	tree_clear(&p, &tr)
 }
 
 @(test)
