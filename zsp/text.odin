@@ -1140,7 +1140,11 @@ text_bundle :: proc(cells: []Cell, allocator := context.allocator) -> (out: Cell
 			for r.pos < len(r.buf) {
 				stamp := read_stamp(&r)
 				id := read_u64(&r)
-				append(&inner, Inner{stamp, id, read_bytes(&r)})
+				ops := read_bytes(&r)
+				if r.bad {
+					break // what cannot be read was nothing of the text, nor will be
+				}
+				append(&inner, Inner{stamp, id, ops})
 			}
 		}
 		out.row, out.slot = c.row, c.slot
