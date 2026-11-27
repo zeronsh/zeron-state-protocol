@@ -367,6 +367,7 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 			append(&w.plans, p)
 		}
 	}
+	sweep_trim(w, &n.roster)
 	if len(w.plans) == 0 {
 		return
 	}
@@ -398,6 +399,44 @@ Sweep :: struct {
 	started: bool,
 	swept:   bool, // something was dropped or sealed again
 	serial:  u64, // of the roster swept to
+}
+
+// No scope the roster has is gone, whatever one before it lacked: what is held there may have been held under one that
+// was dropped, and is looked at from the first, as after a fork; what is gone is cut around it.
+@(private)
+sweep_trim :: proc(w: ^Sweep, r: ^Roster) {
+	out := make([dynamic]Sweep_Plan, 0, len(w.plans))
+	put :: proc(out: ^[dynamic]Sweep_Plan, p: Sweep_Plan) {
+		for &q in out {
+			if q.scope == p.scope && !q.gone && !p.gone {
+				q.from = min(q.from, p.from)
+				return
+			}
+		}
+		append(out, p)
+	}
+	for p in w.plans {
+		if !p.gone {
+			put(&out, p)
+			continue
+		}
+		next, last := p.scope, max(p.scope, p.last)
+		for info in r.scopes {
+			if info.id < next || info.id > last {
+				continue
+			}
+			if info.id > next {
+				put(&out, {scope = next, last = info.id - 1, gone = true})
+			}
+			put(&out, {scope = info.id})
+			next = info.id + 1
+		}
+		if next <= last {
+			put(&out, {scope = next, last = last, gone = true})
+		}
+	}
+	delete(w.plans)
+	w.plans = out
 }
 
 @(private)

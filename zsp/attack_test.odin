@@ -2007,6 +2007,194 @@ asking_queues_no_more_than_was_said :: proc(t: ^testing.T) {
 	}
 }
 
+// A relay that starts again with its cells held against a roster it no longer has drops what is in no scope there is:
+// and keeps what is in one, however soon the rosters after it say so, for a scope that is there is never gone.
+@(test)
+a_scope_that_is_there_is_never_gone :: proc(t: ^testing.T) {
+	root, space := test_root()
+	admin, bob := test_keyring(), test_keyring()
+	defer keyring_destroy(&admin)
+	defer keyring_destroy(&bob)
+	now := u64(1_700_000_000_000)
+	none: Roster
+	d := draft_from(&none, now << 16)
+	one := draft_scope(&d)
+	m := draft_grant(&d, admin.device, admin.signer, one, {.Write})
+	m.owner = true
+	draft_grant(&d, bob.device, bob.signer, one, {.Write})
+	r1, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	w_disk: Memory_Disk
+	defer memory_disk_destroy(&w_disk)
+	writer: Node
+	testing.expect(t, node_init(&writer, memory_disk(&w_disk), space, &admin, true))
+	defer node_destroy(&writer)
+	writer.now = now
+	testing.expect(t, node_adopt(&writer, r1))
+	d = draft_from(&writer.roster, (now + 1000) << 16)
+	draft_revoke(&d, bob.device, one) // a sweep, a job where storage may answer "not yet"
+	r2, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	testing.expect(t, node_adopt(&writer, r2))
+	d = draft_from(&writer.roster, (now + 2000) << 16)
+	two := draft_scope(&d)
+	r3, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	testing.expect(t, node_adopt(&writer, r3))
+	writer.now = now + 3000
+	for scope in ([]Scope{one, two}) {
+		row := node_id(&writer, scope)
+		place: [24]byte
+		put_u64(place[:], u64(scope) << 32 | 1)
+		put_u64(place[8:], 1)
+		testing.expect(t, node_write(&writer, {{row, PLACE, .Place, node_stamp(&writer), place[:]}}))
+	}
+	relay_disk: Memory_Disk
+	defer memory_disk_destroy(&relay_disk)
+	lazy :: proc(m: ^Memory_Disk) -> Disk {
+		d := memory_disk(m)
+		d.missed = proc(_: rawptr) -> int {return 0}
+		return d
+	}
+	in_two :: proc(n: ^Node, scope: Scope) -> int {
+		return store_range(&n.store, scope_lo(scope), scope_hi(scope)).count
+	}
+	{
+		relay: Node
+		testing.expect(t, node_init(&relay, lazy(&relay_disk), space, nil, true))
+		defer node_destroy(&relay)
+		relay.now = writer.now
+		testing.expect(t, node_adopt(&relay, r1))
+		for node_retry(&relay) {}
+		testing.expect(t, store_checkpoint(&relay.store))
+		held, _ := roster_claims(r1, space)
+		testing.expect(t, node_adopt(&relay, r2) && node_adopt(&relay, r3) && relay.serial == held) // its sweep is yet to be done
+		accept :: proc(_: rawptr, s: ^Session, _: []byte) {session_accept(s)}
+		writer.host.authenticate, relay.host.authenticate = accept, accept
+		sw := session_open(&writer, .Peer, true, {0 = 9}, nil, true) // a relay, as dialled
+		sr := session_open(&relay, .Peer, false, admin.device)
+		for _ in 0 ..< 50 {
+			out := session_output(sw)
+			testing.expect(t, session_input(sr, out))
+			session_sent(sw, len(out))
+			back := session_output(sr)
+			testing.expect(t, session_input(sw, back))
+			session_sent(sr, len(back))
+			if len(out) == 0 && len(back) == 0 {
+				break
+			}
+		}
+		testing.expect(t, store_checkpoint(&relay.store))
+		testing.expect_value(t, in_two(&relay, two), 1)
+		session_close(sw)
+	}
+	relay: Node
+	testing.expect(t, node_init(&relay, lazy(&relay_disk), space, nil, true))
+	defer node_destroy(&relay)
+	relay.now = writer.now
+	testing.expect(t, node_resume(&relay, r2, r3))
+	for node_retry(&relay) {}
+	testing.expect_value(t, in_two(&relay, two), 1)
+}
+
+// A scope of a roster that lost to another drawn up at once is gone, and what was held in it: but a scope of that number
+// the roster after it makes is a scope as any other, though the sweep of the one that went was not done when it came.
+// What was written in it is kept, and what was written in the one that went is not.
+@(test)
+a_scope_made_again_is_not_the_one_that_went :: proc(t: ^testing.T) {
+	root, space := test_root()
+	admin := test_keyring()
+	defer keyring_destroy(&admin)
+	now := u64(1_700_000_000_000)
+	none: Roster
+	d := draft_from(&none, now << 16)
+	one := draft_scope(&d)
+	m := draft_grant(&d, admin.device, admin.signer, one, {.Write})
+	m.owner = true
+	r1, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	w_disk: Memory_Disk
+	defer memory_disk_destroy(&w_disk)
+	writer: Node
+	testing.expect(t, node_init(&writer, memory_disk(&w_disk), space, &admin, true))
+	defer node_destroy(&writer)
+	writer.now = now
+	testing.expect(t, node_adopt(&writer, r1))
+	// Two drawn up at once from the first: one with a second scope, and the other, which wins, without.
+	d = draft_from(&writer.roster, (now + 1000) << 16)
+	testing.expect_value(t, draft_scope(&d), 2)
+	lost, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	won: []byte
+	for {
+		d = draft_from(&writer.roster, (now + 1000) << 16)
+		d.scopes[0].rotate = true
+		won, _ = roster_sign(&admin, root, &d, context.temp_allocator)
+		a, _ := roster_claims(lost, space)
+		b, _ := roster_claims(won, space)
+		if b > a {
+			break
+		}
+	}
+	place :: proc(n: ^Node, scope: Scope) -> Id {
+		row := node_id(n, scope)
+		body: [24]byte
+		put_u64(body[:], u64(scope) << 32 | 1)
+		put_u64(body[8:], 1)
+		assert(node_write(n, {{row, PLACE, .Place, node_stamp(n), body[:]}}))
+		return row
+	}
+	testing.expect(t, node_adopt(&writer, lost))
+	writer.now = now + 2000
+	gone := place(&writer, 2)
+	relay_disk: Memory_Disk
+	defer memory_disk_destroy(&relay_disk)
+	lazy := memory_disk(&relay_disk)
+	lazy.missed = proc(_: rawptr) -> int {return 0}
+	relay: Node
+	testing.expect(t, node_init(&relay, lazy, space, nil, true))
+	defer node_destroy(&relay)
+	relay.now = writer.now
+	testing.expect(t, node_adopt(&relay, r1))
+	for node_retry(&relay) {}
+	testing.expect(t, node_adopt(&relay, lost))
+	for node_retry(&relay) {}
+	accept :: proc(_: rawptr, s: ^Session, _: []byte) {session_accept(s)}
+	writer.host.authenticate, relay.host.authenticate = accept, accept
+	sync :: proc(t: ^testing.T, writer, relay: ^Node, admin: Key32) {
+		sw := session_open(writer, .Peer, true, {0 = 9}, nil, true) // a relay, as dialled
+		sr := session_open(relay, .Peer, false, admin)
+		for _ in 0 ..< 50 {
+			out := session_output(sw)
+			testing.expect(t, session_input(sr, out))
+			session_sent(sw, len(out))
+			back := session_output(sr)
+			testing.expect(t, session_input(sw, back))
+			session_sent(sr, len(back))
+			if len(out) == 0 && len(back) == 0 {
+				break
+			}
+		}
+		session_close(sw)
+		session_close(sr)
+	}
+	sync(t, &writer, &relay, admin.device)
+	testing.expect(t, row_places(&relay.store, gone).count > 0)
+	// The one that won comes, and with it the sweep of the scope that went, a job; and before it is done, the roster
+	// after it, which makes a second scope again.
+	testing.expect(t, node_adopt(&writer, won))
+	d = draft_from(&writer.roster, (now + 3000) << 16)
+	testing.expect_value(t, draft_scope(&d), 2)
+	r3, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	testing.expect(t, node_adopt(&writer, r3))
+	writer.now = now + 4000
+	kept := place(&writer, 2)
+	testing.expect(t, node_adopt(&relay, won) && len(relay.sweep.plans) > 0)
+	testing.expect(t, node_adopt(&relay, r3) && len(relay.sweep.plans) > 0)
+	sync(t, &writer, &relay, admin.device)
+	testing.expect(t, row_places(&relay.store, kept).count > 0)
+	for node_retry(&relay) {}
+	testing.expect(t, len(relay.sweep.plans) == 0)
+	testing.expect(t, row_places(&relay.store, kept).count > 0)
+	testing.expect_value(t, row_places(&relay.store, gone).count, 0)
+	testing.expect_value(t, store_range(&relay.store, scope_lo(2), scope_hi(2)).count, 1)
+}
+
 @(private, thread_local)
 signalled: [dynamic]Key32
 
