@@ -16,6 +16,7 @@ local LIVE, SYNCED, PRESENCE, ERROR, SERVE, CALL, FLOW, AUTHOR = 9, 10, 12, 13, 
 local GRAVE, PLACE, VALUE, PIECE, BUNDLE = 1, 2, 3, 4, 5
 local W_DATA, W_LIVE, W_BACK, W_ADOPT, W_COUNTS = 1, 2, 4, 8, 32
 local MESSAGE_MOST = 1048576 -- bytes sent down the pipe at a time
+local MAX_FRAME = 4 * 1048576 -- the most a node reads as one frame
 local F_DATA, F_END, F_FAULT, F_CANCEL, F_CREDIT = 0, 1, 2, 3, 4
 local CALL_WINDOW = 262144
 local WINDOW_MOST = 16 * CALL_WINDOW -- what a receiver may credit ahead
@@ -25,6 +26,8 @@ local ZERO32 = string.rep("\0", 32)
 local NONE = table.freeze({}) :: { any }
 
 local PIECE_BYTES = 4096 -- a piece is sealed at this size,
+local PIECE_MOST = 65536 - 128 -- and is never more, as no live frame a node carries is;
+local INSERT_MOST = 1 + 2 * (1 + 8 + 5) + 5 -- what an insertion's operation is besides its bytes, at most
 local PIECE_SECONDS = 1 -- or this long after it began,
 local LIVE_SECONDS = 10 -- and live text unconfirmed for this long is dropped
 local LEAP_SECONDS = 15 * 60 -- a node refuses a stamp further ahead of its clock than this
@@ -172,10 +175,17 @@ type Live_Call = {
 
 local Faults = { "denied", "unreachable", "unserved", "lost", "overrun", "busy" }
 
+-- A scope's number, as one is: else it is refused here, rather than said, and refused for good, later.
+local function whole(scope: number)
+	if type(scope) ~= "number" or scope < 0 or scope > 4294967295 or scope % 1 ~= 0 then
+		error("a scope is a whole number below 2^32", 3)
+	end
+end
+
 -- ---------------------------------------------------------------- columns
 
 local function column(slot: number, is: string, encode: (any) -> string, decode: (string) -> any, who: ("last" | "all")?): Column
-	assert(slot >= 16 and slot <= 255, "data slots are 16 to 255")
+	assert(slot >= 16 and slot <= 255 and slot % 1 == 0, "data slots are 16 to 255")
 	return table.freeze({ slot = slot, text = is == "text", is = is, encode = encode, decode = decode, who = who })
 end
 
@@ -729,7 +739,12 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 		shape = self.next_shape
 		self.shapes[query.table] = shape
 	end
-	local key = `{query.scope}/{from}/{query.size or 50}/{shape}/{query.list}/{query.bare == true}`
+	local size = query.size or 50
+	if type(size) ~= "number" or size < 0 or size % 1 ~= 0 or size > 9007199254740991 then
+		error("a page's size is a whole number", 2)
+	end
+	whole(query.scope)
+	local key = `{query.scope}/{from}/{size}/{shape}/{query.list}/{query.bare == true}`
 	local window = self.windows[key]
 	if not window then
 		local made: Window = {
@@ -1969,10 +1984,11 @@ function Client.text(self: Client, id: string, col: Column)
 	assert(col.text, "not a text column")
 	assert(type(id) == "string" and #id == 16, "a row's id is 16 bytes")
 	local slot = col.slot
+	assert(slot >= 16 and slot <= 255 and slot % 1 == 0, "data slots are 16 to 255") -- as a column made by hand may say
 	local scope: number = string.unpack(">I4", id) :: any
 	-- What is done before there is a row to do it to: none is held, or another editor of it waits for it still.
 	local was = self.rows[id]
-	local early: { () -> () }? = if was == nil or #was.awaited > 0 then {} else nil
+	local early: { () -> () }? = if was == nil or was.pages == 0 or #was.awaited > 0 then {} else nil
 	local row = self:_row(id)
 	row.held[slot] = (row.held[slot] or 0) + 1
 	local closed, ended = false, false
@@ -2063,6 +2079,19 @@ function Client.text(self: Client, id: string, col: Column)
 			error(NOWHERE, 3)
 		end
 	end
+	-- Types bytes in as many pieces as they need, each sealed once full: a live frame says the whole of what an open piece
+	-- says, and a node passes over one longer than it carries.
+	local function type_in(t: text.Text, from: number, s: string)
+		local k = 0
+		while k < #s do
+			if t.size + INSERT_MOST >= PIECE_MOST then
+				self:_seal(row, slot)
+			end
+			local n = math.min(#s - k, PIECE_MOST - INSERT_MOST - t.size)
+			text.insert(t, from + k, if k == 0 and n == #s then s else string.sub(s, k + 1, k + n), fresh)
+			k += n
+		end
+	end
 	local function within(t: text.Text, n: number)
 		if n > text.len(t) then
 			error(NOWHERE, 0)
@@ -2078,13 +2107,13 @@ function Client.text(self: Client, id: string, col: Column)
 			assert(type(s) == "string", "what is typed is a string")
 			edit(function(t)
 				within(t, pos)
-				text.insert(t, pos, s, fresh)
+				type_in(t, pos, s)
 			end)
 		end,
 		append = function(s: string)
 			assert(type(s) == "string", "what is typed is a string")
 			edit(function(t)
-				text.insert(t, text.len(t), s, fresh)
+				type_in(t, text.len(t), s)
 			end)
 		end,
 		delete = function(pos: number, count: number)
@@ -2092,7 +2121,14 @@ function Client.text(self: Client, id: string, col: Column)
 			place(count)
 			edit(function(t)
 				within(t, pos + count)
-				text.delete(t, pos, count, fresh)
+				local left = count
+				while true do
+					left = text.delete(t, pos, left, fresh, PIECE_MOST)
+					if left == 0 then
+						break
+					end
+					self:_seal(row, slot)
+				end
 			end)
 		end,
 		-- Makes what has been written durable now rather than shortly.
@@ -2300,7 +2336,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		for name, value in values do
 			local c = schema[name]
 			assert(c and not c.who, `no column {name} to write`)
-			if not (c.slot >= 16 and c.slot <= 255) then
+			if not (c.slot >= 16 and c.slot <= 255 and c.slot % 1 == 0) then
 				error(`no value goes in slot {c.slot}`, 0) -- as a column made by hand may say
 			end
 			-- Empty text is what a text is before anything is written: it need only be said to clear one.
@@ -2337,7 +2373,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			put(id, 0, GRAVE, "")
 		end,
 		edit = function(id, slot, f)
-			assert(slot >= 16 and slot <= 255, "data slots are 16 to 255")
+			assert(slot >= 16 and slot <= 255 and slot % 1 == 0, "data slots are 16 to 255")
 			local row = keep(id, slot) -- and what an editor has open in it goes first, and stands
 			local t = self:_text(row, slot)
 			f(t, function(): string
@@ -2354,7 +2390,18 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			end
 		end,
 	}
-	local ok, why = pcall(f, change)
+	local ok, why = pcall(function()
+		f(change)
+		-- A change is said in one frame, which a node applies whole or not at all: one bigger than a node reads is refused
+		-- here.
+		local size = 1 + 10
+		for _, c in cells do
+			size += 1 + 16 + 1 + 16 + 5 + #c.body
+		end
+		if size > MAX_FRAME then
+			error("a change may be 4 MiB at most, as it is said", 0)
+		end
+	end)
 	if not ok then
 		-- All or nothing: whatever was done here is undone, and nothing is said.
 		for id, was in saved do
@@ -2521,6 +2568,10 @@ end
 -- Calls a method on a device. Set on_data, on_end and on_fault on the result before yielding.
 function Client.call(self: Client, device: string, scope: number, method: string, data: string, options: Call_Options?): Call
 	local urgency = urgency_of(options)
+	if type(device) ~= "string" or #device ~= 32 then
+		error("a device's id is 32 bytes", 2)
+	end
+	whole(scope)
 	self.next_call += 1
 	local id = self.next_call
 	local live = self:_call(id, 0, device, method)
@@ -2585,6 +2636,11 @@ end
 
 -- Answers a method within a scope. The handler gets the call and its first message. Returns a way to stop.
 function Client.serve(self: Client, scope: number, method: string, handler: (Call, string) -> ()): () -> ()
+	whole(scope)
+	-- A node refuses a method of no name, or of a longer one, for good: so here, at once.
+	if type(method) ~= "string" or #method == 0 or #method > 255 then
+		error("a method's name is 1 to 255 bytes", 2)
+	end
 	local key = `{scope}/{method}`
 	self.handlers[key] = handler
 	if self.ready then

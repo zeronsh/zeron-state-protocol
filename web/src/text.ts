@@ -879,6 +879,8 @@ function recordInsert(t: Text, bytes: Uint8Array | string, lp: string, lo: numbe
   return w.buf.subarray(w.pos - n, w.pos);
 }
 
+const DELETE_MOST = 1 + 1 + 8 + 5 + 5; // bytes of a deletion's operation, at most
+
 function recordDelete(t: Text, s: Span): void {
   const w = t.ops;
   const from = w.pos;
@@ -917,8 +919,10 @@ export function insert(t: Text, pos: number, bytes: Uint8Array | string, fresh: 
   insertRun(t, t.open, held, lp, lo, rp, ro);
 }
 
-export function erase(t: Text, pos: number, count: number, fresh: () => string): void {
-  if (count <= 0) return;
+// Deletes visible bytes from `pos` (zero-based); short of `most` bytes of the open piece's operations, if said, when it
+// stops there and says how many it has yet to delete.
+export function erase(t: Text, pos: number, count: number, fresh: () => string, most = Infinity): number {
+  if (count <= 0) return 0;
   begin(t, fresh);
   touch(t);
   // From the span the first byte is in.
@@ -938,6 +942,7 @@ export function erase(t: Text, pos: number, count: number, fresh: () => string):
       pos = 0;
       i++;
     } else {
+      if (t.size + DELETE_MOST > most) return count;
       split(t, i, count, s);
       s.dead = true;
       t.visible -= s.len;
@@ -947,6 +952,7 @@ export function erase(t: Text, pos: number, count: number, fresh: () => string):
       i++;
     }
   }
+  return 0;
 }
 
 // ---------------------------------------------------------------- elements by name

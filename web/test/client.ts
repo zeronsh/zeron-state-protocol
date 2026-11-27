@@ -424,6 +424,100 @@ for (const what of ["move", "delete"]) {
   one.close(), two.close();
 }
 
+// What a node refuses for good is refused here, at once, and nothing is said of it: a change bigger than one frame of a
+// node's, a text in a slot no text goes in, a value in a slot that is not a whole one, a page of a size that is none, a
+// scope that is none, a method of no name or of one too long.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  const said = h.self.said.length;
+  const big = { v: c.bytes(20) };
+  assert.throws(
+    () =>
+      h.client.write(1, (change) => {
+        for (let i = 0; i < 5; i++) change.insert(big, "big", i, { v: new Uint8Array(900_000) });
+      }),
+    /4 MiB/,
+  );
+  assert.throws(() => h.client.text(id, { ...Note.body, slot: 1 }), RangeError);
+  assert.throws(() => h.client.write(1, (change) => change.set(id, { odd: { ...c.string(16), slot: 16.5 } }, { odd: "x" })), /slot 16.5/);
+  assert.throws(() => h.client.write(1, (change) => change.edit(id, 17.5, () => {})), RangeError);
+  assert.throws(() => h.client.window({ scope: 1, list: "a", table: Note, size: 1.5 }, () => {}), RangeError);
+  assert.throws(() => h.client.window({ scope: -1, list: "a", table: Note }, () => {}), RangeError);
+  assert.throws(() => h.client.call(codec.hex(rep("d", 32)), 1.5, "m"), RangeError);
+  assert.throws(() => h.client.serve(1, "", () => {}), RangeError);
+  assert.throws(() => h.client.serve(1, "m".repeat(256), () => {}), RangeError);
+  assert.throws(() => h.client.serve(2 ** 32, "m", () => {}), RangeError);
+  h.run();
+  assert.equal(h.self.said.length, said, "and something was said");
+  assert.equal(Client.internals(h.client).rows.size, 1, "and is held");
+}
+
+// An editor's pieces are no longer than a live frame a node carries, however much is typed or deleted at once: they are
+// sealed as they fill, and what is typed is all there, as typed.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  const editor = h.client.text(id, Note.body);
+  for (let i = 0; i < 4000; i++) editor.insert(i % 2 === 0 ? 0 : i >> 1, "ab"[i % 2]), editor.commit(); // spans, many
+  editor.append("x".repeat(1 << 20));
+  h.run();
+  editor.delete(0, 4000 + (1 << 19));
+  editor.close();
+  h.run();
+  assert.equal(editor.read(), "x".repeat(1 << 19));
+  let pieces = 0;
+  for (const x of h.self.said) {
+    if (x.kind === 9) assert(x.body.length - 16 - 1 - 8 - 16 - 3 <= 65536 - 128, `a live frame of ${x.body.length} bytes`);
+    if (x.kind !== CELLS) continue;
+    const r = codec.reader(b(x.body));
+    codec.varint(r);
+    while (r.pos < r.len) {
+      const tag = codec.u8(r);
+      if (tag < 128) codec.take(r, 16);
+      codec.take(r, 17);
+      const body = codec.bytes(r);
+      if ((tag & 63) === 4) pieces++, assert(body.length - 8 <= 65536 - 128, `a piece of ${body.length} bytes`);
+    }
+  }
+  assert(pieces > 4000 + 16, "it was said in too few pieces");
+}
+
+// An editor of a row held for nothing but what this client wrote in another of its columns waits, as for one not held at
+// all, for the row: what it does is done to the text the row has.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const id = "00000001" + "6b49d200" + "0102030405060a0b", bin = codec.binaryFromHex(id);
+  void h.client.write(1, (change) => change.set(id, Note, { title: "t" }));
+  h.run();
+  const editor = h.client.text(id, Note.body);
+  h.run();
+  editor.delete(0, 5);
+  editor.insert(0, "HELLO!");
+  const fetched = codec.varint(codec.reader(b(h.last(FETCH)!.body)));
+  h.tell(CELLS, "\0" + cellOf(bin, 3, 17, 2, "hello"));
+  const w = codec.writer();
+  codec.putVarint(w, fetched);
+  codec.putBinary(w, "\x01\x01\0\x01" + bin + "\0");
+  h.tell(ANSWER, s(codec.written(w)));
+  await tick();
+  h.run();
+  assert.equal(editor.read(), "HELLO!");
+  editor.close();
+}
+
 // Writing nothing is still done; clearing a text says so.
 {
   const h = harness();

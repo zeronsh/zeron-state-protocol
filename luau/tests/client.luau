@@ -549,6 +549,138 @@ do
 	two.close()
 end
 
+-- What a node refuses for good is refused here, at once, and nothing is said of it: a change bigger than one frame of a
+-- node's, a text in a slot no text goes in, a value or an edit in a slot that is not a whole one, a page of a size that is
+-- none, a scope that is none, a device that is none, a method of no name or of one too long.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	local said = #h.self.said
+	local big = { v = zsp.string(20) }
+	local function refused(f: () -> ())
+		assert(not pcall(f), "it was not refused")
+	end
+	refused(function()
+		h.client:write(1, function(change)
+			for i = 1, 5 do
+				change.insert(big, "big", i, { v = string.rep("\0", 900000) })
+			end
+		end)
+	end)
+	refused(function()
+		h.client:text(id, table.freeze({ slot = 1, text = true, is = "text", encode = tostring, decode = tostring }) :: any)
+	end)
+	refused(function()
+		h.client:write(1, function(change)
+			change.set(id, { odd = table.freeze({ slot = 16.5, text = false, is = "string", encode = tostring, decode = tostring }) } :: any, { odd = "x" })
+		end)
+	end)
+	refused(function()
+		h.client:write(1, function(change)
+			change.edit(id, 17.5, function() end)
+		end)
+	end)
+	refused(function()
+		h.client:window({ scope = 1, list = "a", table = Note, size = 1.5 }, function() end)
+	end)
+	refused(function()
+		h.client:window({ scope = -1, list = "a", table = Note }, function() end)
+	end)
+	refused(function()
+		h.client:call(string.rep("d", 31), 1, "m", "")
+	end)
+	refused(function()
+		h.client:call(string.rep("d", 32), 1.5, "m", "")
+	end)
+	refused(function()
+		h.client:serve(1, "", function() end)
+	end)
+	refused(function()
+		h.client:serve(1, string.rep("m", 256), function() end)
+	end)
+	refused(function()
+		h.client:serve(2 ^ 32, "m", function() end)
+	end)
+	h.run()
+	assert(#h.self.said == said, "and something was said")
+end
+
+-- An editor's pieces are no longer than a live frame a node carries, however much is typed or deleted at once: they are
+-- sealed as they fill, and what is typed is all there, as typed.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	h.client:window({ scope = 1, list = "a", table = Note }, function() end)
+	h.run()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	local editor = h.client:text(id, Note.body)
+	for i = 0, 3999 do
+		editor.insert(if i % 2 == 0 then 0 else i // 2, if i % 2 == 0 then "a" else "b") -- spans, many
+		editor.commit()
+	end
+	editor.append(string.rep("x", 1048576))
+	h.run()
+	editor.delete(0, 4000 + 524288)
+	editor.close()
+	h.run()
+	assert(editor.read() == string.rep("x", 524288), "what was typed is not there")
+	local pieces = 0
+	for _, x in h.self.said do
+		if x.kind == 9 then
+			assert(#x.body - 16 - 1 - 8 - 16 - 3 <= 65536 - 128, `a live frame of {#x.body} bytes`)
+		elseif x.kind == CELLS then
+			local r = codec.reader(x.body)
+			codec.varint(r)
+			while r.pos < r.len do
+				local tag = codec.u8(r)
+				if tag < 128 then
+					codec.take(r, 16)
+				end
+				codec.take(r, 17)
+				local body = codec.bytes(r)
+				if tag % 64 == 4 then
+					pieces += 1
+					assert(#body - 8 <= 65536 - 128, `a piece of {#body} bytes`)
+				end
+			end
+		end
+	end
+	assert(pieces > 4000 + 16, "it was said in too few pieces")
+end
+
+-- An editor of a row held for nothing but what this client wrote in another of its columns waits, as for one not held at
+-- all, for the row: what it does is done to the text the row has.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local id = "\0\0\0\1" .. string.pack(">I4", 1800000000) .. "\1\2\3\4\5\6\10\11"
+	h.client:write(1, function(change)
+		change.set(id, Note, { title = "t" })
+	end)
+	h.run()
+	local editor = h.client:text(id, Note.body)
+	h.run()
+	editor.delete(0, 5)
+	editor.insert(0, "HELLO!")
+	h.tell(CELLS, "\0" .. cell_of(id, 3, 17, 2, "hello"))
+	answer_fetch(h, id)
+	h.run()
+	assert(editor.read() == "HELLO!", editor.read())
+	editor.close()
+end
+
 -- Writing nothing is still done; clearing a text says so.
 do
 	local h = harness()

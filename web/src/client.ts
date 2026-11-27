@@ -17,6 +17,7 @@ const LIVE = 9, SYNCED = 10, PRESENCE = 12, ERROR = 13, SERVE = 14, CALL = 15, F
 const GRAVE = 1, PLACE = 2, VALUE = 3, PIECE = 4, BUNDLE = 5;
 const W_DATA = 1, W_LIVE = 2, W_BACK = 4, W_ADOPT = 8, W_COUNTS = 32;
 const MESSAGE_MOST = 1 << 20; // bytes sent down the pipe at a time
+const MAX_FRAME = 4 << 20; // the most a node reads as one frame
 const F_DATA = 0, F_END = 1, F_FAULT = 2, F_CANCEL = 3, F_CREDIT = 4;
 const CALL_WINDOW = 262144;
 const WINDOW_MOST = 16 * CALL_WINDOW; // what the protocol lets a receiver credit ahead
@@ -27,6 +28,8 @@ const ZERO24 = "\0".repeat(24);
 const ZERO40 = "\0".repeat(40);
 
 const PIECE_BYTES = 4096; // a piece is sealed at this size,
+const PIECE_MOST = 65536 - 128; // and is never more, as no live frame a node carries is;
+const INSERT_MOST = 1 + 2 * (1 + 8 + 5) + 5; // what an insertion's operation is besides its bytes, at most
 const PIECE_MS = 1000; // or this long after it began,
 const LIVE_MS = 10000; // and live text unconfirmed for this long is dropped
 const LEAP_MS = 15 * 60 * 1000; // a node refuses a stamp further ahead of its clock than this
@@ -41,6 +44,11 @@ function rowId(id: string): string {
   return codec.binary(codec.unhex(id));
 }
 const toBytes = (data: Uint8Array | string): Uint8Array => (typeof data === "string" ? utf8.encode(data) : data);
+
+// A scope's number, as one is: else it is refused here, rather than said, and refused for good, later.
+function whole(scope: number): void {
+  if (!Number.isInteger(scope) || scope < 0 || scope > 0xffffffff) throw new RangeError("a scope is a whole number below 2^32");
+}
 
 // ---------------------------------------------------------------- what the host lends
 
@@ -872,6 +880,8 @@ export class Client {
     let shape = this.#shapes.get(query.table);
     if (shape === undefined) this.#shapes.set(query.table, (shape = ++this.#nextShape));
     const size = query.size ?? 50;
+    if (!Number.isSafeInteger(size) || size < 0) throw new RangeError("a page's size is a whole number");
+    whole(query.scope);
     const key = `${query.scope}/${from}/${size}/${shape}/${query.bare === true}/${query.list}`;
     let window = this.#windows.get(key);
     if (!window) {
@@ -1736,11 +1746,13 @@ export class Client {
   text(id: string, col: Column<string>): Editor {
     if (!col.text) throw new Error("not a text column");
     const slot = col.slot;
+    if (!Number.isInteger(slot) || slot < 16 || slot > 255) throw new RangeError("data slots are 16 to 255"); // as a column made by hand may say
     const bin = rowId(id);
     const scope = codec.u32Of(bin);
-    // What is done before there is a row to do it to: none is held, or another editor of it waits for it still.
+    // What is done before there is a row to do it to: none is held as the node has it, in a window or an answer, or another
+    // editor of it waits for it still. A row held for nothing but what this client wrote to it may have more to it.
     const was = this.#rows.get(bin);
-    let early: (() => void)[] | undefined = was === undefined || was.awaited.length > 0 ? [] : undefined;
+    let early: (() => void)[] | undefined = was === undefined || was.pages === 0 || was.awaited.length > 0 ? [] : undefined;
     const row = this.#row(bin);
     row.held.set(slot, (row.held.get(slot) ?? 0) + 1);
     let closed = false, ended = false;
@@ -1816,24 +1828,30 @@ export class Client {
     const place = (n: number) => {
       if (!Number.isSafeInteger(n) || n < 0) throw new RangeError("no such position");
     };
+    // Types bytes in as many pieces as they need, each sealed once full: a live frame says the whole of what an open piece
+    // says, and a node passes over one longer than it carries.
+    const type = (t: text.Text, from: number, bytes: Uint8Array) => {
+      for (let k = 0; k < bytes.length; ) {
+        if (t.size + INSERT_MOST >= PIECE_MOST) this.#seal(row, slot);
+        const n = Math.min(bytes.length - k, PIECE_MOST - INSERT_MOST - t.size);
+        text.insert(t, from + k, bytes.subarray(k, k + n), fresh);
+        k += n;
+      }
+    };
     return Object.freeze({
       read: () => text.read(this.#text(row, slot)),
       insert: (index: number, s: string) => {
         place(index);
-        edit((t) => {
-          text.insert(t, at(t, index), utf8.encode(s), fresh);
-        });
+        edit((t) => type(t, at(t, index), utf8.encode(s)));
       },
-      append: (s: string) =>
-        edit((t) => {
-          text.insert(t, text.len(t), utf8.encode(s), fresh);
-        }),
+      append: (s: string) => edit((t) => type(t, text.len(t), utf8.encode(s))),
       delete: (index: number, count: number) => {
         place(index);
         place(count);
         edit((t) => {
           const from = at(t, index);
-          text.erase(t, from, at(t, index + count) - from, fresh);
+          let left = at(t, index + count) - from;
+          while ((left = text.erase(t, from, left, fresh, PIECE_MOST)) > 0) this.#seal(row, slot);
         });
       },
       commit: () => this.#seal(row, slot),
@@ -2009,7 +2027,7 @@ export class Client {
         const value = values[name];
         const c = schema[name];
         if (!c || c.who) throw new Error(`no column ${name} to write`);
-        if (!(c.slot >= 16 && c.slot <= 255)) throw new RangeError(`no value goes in slot ${c.slot}`); // as a column made by hand may say
+        if (!(Number.isInteger(c.slot) && c.slot >= 16 && c.slot <= 255)) throw new RangeError(`no value goes in slot ${c.slot}`); // as a column made by hand may say
         if (value === undefined) continue;
         // Empty text is what a text is before anything is written: it need only be said to clear one.
         const row = this.#rows.get(bin);
@@ -2058,6 +2076,10 @@ export class Client {
           }
         },
       });
+      // A change is said in one frame, which a node applies whole or not at all: one bigger than a node reads is refused here.
+      let size = 1 + 10;
+      for (const c of cells) size += 1 + 16 + 1 + 16 + 5 + c.body.length;
+      if (size > MAX_FRAME) throw new RangeError("a change may be 4 MiB at most, as it is said");
     } catch (e) {
       undo();
       throw e;
@@ -2175,6 +2197,7 @@ export class Client {
     if (!DEVICE_ID.test(device)) throw new RangeError("a device's id is 64 hex digits");
     const urgency = options.urgency ?? 3;
     if (!Number.isInteger(urgency) || urgency < 0 || urgency > 7) throw new RangeError("an urgency is a whole number from 0 to 7");
+    whole(scope);
     const id = ++this.#nextCall;
     const live = this.#call(id, 0, device, method);
     const first = toBytes(data);
@@ -2211,6 +2234,10 @@ export class Client {
 
   /** Answers a method within a scope. The handler gets the call and its first message. Returns a way to stop. */
   serve(scope: number, method: string, handler: (call: Call, data: Uint8Array) => void): () => void {
+    whole(scope);
+    // A node refuses a method of no name, or of a longer one, for good: so here, at once.
+    const n = codec.utf8Length(method);
+    if (n === 0 || n > 255) throw new RangeError("a method's name is 1 to 255 bytes");
     const key = `${scope}/${method}`;
     this.#handlers.set(key, handler);
     if (this.#ready) this.#serve(key, true);

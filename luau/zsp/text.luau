@@ -943,9 +943,12 @@ function text.insert(t: Text, pos: number, bytes: string, fresh: () -> string)
 	typed(t, bytes, lp, lo, rp, ro)
 end
 
-function text.delete(t: Text, pos: number, count: number, fresh: () -> string)
+-- Deletes visible bytes from `pos` (zero-based); short of `most` bytes of the open piece's operations, if said, when it
+-- stops there and says how many it has yet to delete.
+local DELETE_MOST = 1 + 1 + 8 + 5 + 5 -- bytes of a deletion's operation, at most
+function text.delete(t: Text, pos: number, count: number, fresh: () -> string, most: number?): number
 	if count <= 0 then
-		return
+		return 0
 	end
 	begin(t, fresh)
 	t.cache = nil
@@ -968,6 +971,9 @@ function text.delete(t: Text, pos: number, count: number, fresh: () -> string)
 			pos = 0
 			i += 1
 		else
+			if most and t.size + DELETE_MOST > most then
+				return count
+			end
 			split(t, i, count, s)
 			s.dead = true
 			t.visible -= s.len
@@ -977,6 +983,7 @@ function text.delete(t: Text, pos: number, count: number, fresh: () -> string)
 			i += 1
 		end
 	end
+	return 0
 end
 
 -- ---------------------------------------------------------------- elements by name
