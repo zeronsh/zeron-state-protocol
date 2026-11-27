@@ -623,6 +623,36 @@ function piecesOf(h: ReturnType<typeof harness>, slot: number): [stamp: string, 
   spoilt.stop(), early.stop(), later.stop();
 }
 
+// A row an editor has open that moves within its window, or from one window to another, is never without one to show
+// it: no question is asked for it, as one would be once nothing shows it.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  h.client.window({ scope: 1, list: "b", table: Note }, () => {});
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 10, { title: "t" })));
+  h.run();
+  const editor = h.client.text(id, Note.body);
+  h.run();
+  const from = h.self.said.length;
+  void h.client.write(1, (change) => change.place(id, "a", 20));
+  h.run();
+  void h.client.write(1, (change) => change.place(id, "b", 1));
+  h.run();
+  for (const x of h.self.said.slice(from)) assert(x.kind !== ASK && x.kind !== FETCH, `said ${x.kind}`);
+  assert.equal(Client.internals(h.client).asked.size, 0);
+  // And one that goes from every window is asked for, while it is open.
+  void h.client.write(1, (change) => change.place(id, "c", 1));
+  h.run();
+  assert(h.last(ASK) && Client.internals(h.client).asked.size === 1);
+  editor.close();
+  h.run();
+  assert(h.last(UNASK));
+}
+
 // An editor of a row held for nothing but what this client wrote in another of its columns waits, as for one not held at
 // all, for the row: what it does is done to the text the row has.
 {

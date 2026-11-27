@@ -1389,6 +1389,7 @@ export class Client {
         if (cells) for (const c of cells.values()) keys.push(placeKey(c, row.id));
       }
     }
+    let left = false; // some window it was in, which is let go of only once where it now is is known
     for (const window of this.#windows.values()) {
       if (window.pages.length === 0) continue;
       const lo = window.pages[0].lo, hi = window.pages[window.pages.length - 1].hi;
@@ -1402,7 +1403,7 @@ export class Client {
         entries.splice(have, 1);
         window.at.delete(row);
         row.pages--;
-        if (row.pages === 0 && !row.asking && !row.dead) this.#keep(row);
+        left = true;
         this.#touch(window);
         have = undefined;
       }
@@ -1423,6 +1424,8 @@ export class Client {
         this.#touch(window);
       }
     }
+    // A row moved within a window, or from one to another, never left what shows it: an editor of it needs no question.
+    if (left && row.pages === 0 && !row.asking && !row.dead) this.#keep(row);
     this.#touchAsked(row);
     if (row.pages <= 0 && row.held.size === 0 && (row.dead || !this.#isPending(row.id))) {
       if (this.#asked.size > 0 && !row.dead) this.#loose.add(row.id);

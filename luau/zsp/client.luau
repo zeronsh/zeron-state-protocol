@@ -1522,6 +1522,7 @@ function Client._place(self: Client, row: Stored, told: boolean?)
 			end
 		end
 	end
+	local left = false -- some window it was in, which is let go of only once where it now is is known
 	for _, window in self.windows do
 		if #window.pages > 0 then
 			local lo, hi = window.pages[1].lo, window.pages[#window.pages].hi
@@ -1542,9 +1543,7 @@ function Client._place(self: Client, row: Stored, told: boolean?)
 				table.remove(entries, have)
 				window.at[row] = nil
 				row.pages -= 1
-				if row.pages == 0 and not row.asking and not row.dead then
-					self:_keep(row)
-				end
+				left = true
 				self:_touch(window)
 				have = nil
 			end
@@ -1564,6 +1563,10 @@ function Client._place(self: Client, row: Stored, told: boolean?)
 				self:_touch(window)
 			end
 		end
+	end
+	-- A row moved within a window, or from one to another, never left what shows it: an editor of it needs no question.
+	if left and row.pages == 0 and not row.asking and not row.dead then
+		self:_keep(row)
 	end
 	self:_touch_asked(row)
 	if row.pages <= 0 and next(row.held) == nil and (row.dead or not self:_pending(row.id)) then

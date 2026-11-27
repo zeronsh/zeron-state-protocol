@@ -832,6 +832,48 @@ do
 	later.stop()
 end
 
+-- A row an editor has open that moves within its window, or from one window to another, is never without one to show
+-- it: no question is asked for it, as one would be once nothing shows it.
+do
+	local ASK, UNASK = 32, 33
+	local h = harness()
+	h.run()
+	h.greet()
+	h.client:window({ scope = 1, list = "a", table = Note }, function() end)
+	h.client:window({ scope = 1, list = "b", table = Note }, function() end)
+	h.run()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 10, { title = "t" })
+	end)
+	h.run()
+	local editor = h.client:text(id, Note.body)
+	h.run()
+	local from = #h.self.said
+	h.client:write(1, function(change)
+		change.place(id, "a", 20)
+	end)
+	h.run()
+	h.client:write(1, function(change)
+		change.place(id, "b", 1)
+	end)
+	h.run()
+	for i = from + 1, #h.self.said do
+		local kind = h.self.said[i].kind
+		assert(kind ~= ASK and kind ~= FETCH, `said {kind}`)
+	end
+	assert(next(h.client.asked) == nil)
+	-- And one that goes from every window is asked for, while it is open.
+	h.client:write(1, function(change)
+		change.place(id, "c", 1)
+	end)
+	h.run()
+	assert(h.last(ASK) and next(h.client.asked) ~= nil)
+	editor.close()
+	h.run()
+	assert(h.last(UNASK))
+end
+
 -- An editor of a row held for nothing but what this client wrote in another of its columns waits, as for one not held at
 -- all, for the row: what it does is done to the text the row has.
 do
