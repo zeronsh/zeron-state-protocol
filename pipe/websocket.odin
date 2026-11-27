@@ -24,6 +24,7 @@ Ws_Result :: enum {
 }
 
 MAX_MESSAGE :: 8 << 20
+CONTROL_MAX :: 125 // a control frame's payload, at most (RFC 6455 5.5)
 
 @(private)
 ws_key :: proc() -> string {
@@ -112,13 +113,20 @@ http_path :: proc(h: ^Http) -> (path: string, ok: bool) {
 	return parts[1], true
 }
 
-// Takes one frame off the front of a buffer, unmasking it in place.
+// Takes one frame off the front of a buffer, unmasking it in place. One whose payload would be larger than `most` is
+// broken, known so from its head alone, before any of it need be held.
 @(require_results)
-ws_take :: proc(buf: []byte) -> (op: Opcode, payload: []byte, used: int, fin: bool, result: Ws_Result) {
+ws_take :: proc(buf: []byte, most := MAX_MESSAGE) -> (op: Opcode, payload: []byte, used: int, fin: bool, result: Ws_Result) {
 	if len(buf) < 2 {
 		return
 	}
 	op = Opcode(buf[0] & 15)
+	switch op {
+	case .Continue, .Text, .Binary, .Close, .Ping, .Pong:
+	case:
+		result = .Broken // reserved, for extensions never negotiated
+		return
+	}
 	masked := buf[1] & 0x80 != 0
 	n := int(buf[1] & 0x7f)
 	at := 2
@@ -133,7 +141,7 @@ ws_take :: proc(buf: []byte) -> (op: Opcode, payload: []byte, used: int, fin: bo
 			return
 		}
 		long := endian.unchecked_get_u64be(buf[2:])
-		if long > MAX_MESSAGE {
+		if long > u64(most) {
 			result = .Broken
 			return
 		}
@@ -141,8 +149,8 @@ ws_take :: proc(buf: []byte) -> (op: Opcode, payload: []byte, used: int, fin: bo
 		at = 10
 	}
 	fin = buf[0] & 0x80 != 0
-	// Reserved bits are never negotiated, and control frames never in pieces.
-	if n > MAX_MESSAGE || buf[0] & 0x70 != 0 || (!fin && op >= .Close) {
+	// Reserved bits are never negotiated, and control frames are never in pieces, nor long.
+	if n > most || buf[0] & 0x70 != 0 || (op >= .Close && (!fin || n > CONTROL_MAX)) {
 		result = .Broken
 		return
 	}

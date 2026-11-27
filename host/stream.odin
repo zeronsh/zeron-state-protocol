@@ -40,6 +40,11 @@ Stream :: struct {
 	dead:      bool, // and is not waited for
 	out:       [dynamic]byte,
 	sent:      int,
+	// Answers to the peer's pings, owed while what went before them waits for the socket: only the latest of each kind,
+	// so that one that pings and does not read is owed one answer, not one for every ping.
+	pong:      []byte, // owned
+	pong_owed: bool,
+	text_owed: bool,
 	recv_op:   ^nbio.Operation,
 	send_op:   ^nbio.Operation,
 	quiet_at:  time.Tick, // last heard from
@@ -117,6 +122,7 @@ stream_close :: proc(s: ^Stream) {
 	delete(s.in_buf)
 	delete(s.pieces)
 	delete(s.out)
+	delete(s.pong)
 	free(s)
 }
 
@@ -178,8 +184,10 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 		stream_greeted(s, &head) or_return
 		used += head.size
 	}
+	// Before a session, nothing larger than a handshake's message is said; nor held, however long a frame says it is.
+	most := pipe.MAX_MESSAGE if s.phase == .Open else pipe.CONTROL_MAX
 	for {
-		op, payload, n, fin, result := pipe.ws_take(s.in_buf[used:])
+		op, payload, n, fin, result := pipe.ws_take(s.in_buf[used:], most)
 		switch result {
 		case .More:
 			return true
@@ -190,7 +198,7 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 		used += n
 		#partial switch op {
 		case .Binary, .Continue:
-			if (op == .Continue) != s.fragmented || len(s.pieces) + len(payload) > pipe.MAX_MESSAGE {
+			if (op == .Continue) != s.fragmented || len(s.pieces) + len(payload) > most {
 				return false
 			}
 			if fin && op == .Binary {
@@ -210,9 +218,24 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 			if !fin || s.fragmented || string(payload) != "ping" {
 				return false
 			}
-			stream_put(s, .Text, transmute([]byte)string("pong"))
+			if len(s.out) == s.sent {
+				stream_put(s, .Text, transmute([]byte)string("pong"))
+			} else {
+				s.text_owed = true
+			}
 		case .Ping:
-			stream_put(s, .Pong, payload)
+			if len(s.out) == s.sent {
+				stream_put(s, .Pong, payload)
+			} else {
+				// Of pings not yet answered, only the latest need be (RFC 6455 5.5.3).
+				delete(s.pong)
+				s.pong = nil
+				if len(payload) > 0 {
+					s.pong = make([]byte, len(payload))
+					copy(s.pong, payload)
+				}
+				s.pong_owed = true
+			}
 		case .Close:
 			return false
 		}
@@ -346,6 +369,7 @@ stream_flush :: proc(s: ^Stream) {
 		return
 	}
 	for s.send_op == nil {
+		stream_answer(s)
 		stream_fill(s, true)
 		if len(s.out) == s.sent {
 			break
@@ -357,6 +381,24 @@ stream_flush :: proc(s: ^Stream) {
 	}
 	if s.closing && s.send_op == nil && len(s.out) == s.sent {
 		stream_close(s)
+	}
+}
+
+// What is owed the peer's pings, once all before it has gone.
+@(private)
+stream_answer :: proc(s: ^Stream) {
+	if len(s.out) != s.sent {
+		return
+	}
+	if s.pong_owed {
+		s.pong_owed = false
+		stream_put(s, .Pong, s.pong)
+		delete(s.pong)
+		s.pong = nil
+	}
+	if s.text_owed {
+		s.text_owed = false
+		stream_put(s, .Text, transmute([]byte)string("pong"))
 	}
 }
 

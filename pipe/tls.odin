@@ -23,6 +23,7 @@ Tls :: struct {
 	send, recv: Tls_Key,
 	input:      [dynamic]byte, // an incomplete record
 	messages:   [dynamic]byte, // an incomplete handshake message
+	update_due: bool, // the server asked for a key update: one is sent before what is next written
 }
 
 Tls_State :: enum {
@@ -160,6 +161,12 @@ tls_input :: proc(t: ^Tls, bytes: []byte, plain, w: ^[dynamic]byte) -> bool {
 // Appends plaintext as records.
 tls_write :: proc(t: ^Tls, plain: []byte, w: ^[dynamic]byte) {
 	plain := plain
+	if t.update_due && len(plain) > 0 {
+		t.update_due = false
+		tls_seal(&t.send, 22, {24, 0, 0, 1, 0}, w)
+		t.client_app = tls_expand(t.client_app, "traffic upd", nil)
+		tls_key(&t.send, t.client_app)
+	}
 	for len(plain) > 0 {
 		n := min(len(plain), TLS_RECORD)
 		tls_seal(&t.send, 23, plain[:n], w)
@@ -207,11 +214,9 @@ tls_messages :: proc(t: ^Tls, w: ^[dynamic]byte) -> bool {
 			if m[0] == 24 && n == 1 { // key_update
 				t.server_app = tls_expand(t.server_app, "traffic upd", nil)
 				tls_key(&t.recv, t.server_app)
-				if m[4] == 1 {
-					tls_seal(&t.send, 22, {24, 0, 0, 1, 0}, w)
-					t.client_app = tls_expand(t.client_app, "traffic upd", nil)
-					tls_key(&t.send, t.client_app)
-				}
+				// Answered once, before what is next written (RFC 8446 4.6.3), however often asked meanwhile: so that a
+				// server that asks and does not read is owed one record, not one for every asking.
+				t.update_due ||= m[4] == 1
 			} // else a session ticket, not wanted
 		case .Closed:
 			return false

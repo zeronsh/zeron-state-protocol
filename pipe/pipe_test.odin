@@ -1,6 +1,7 @@
 #+build !js
 package pipe
 
+import "core:crypto"
 import "core:math/rand"
 import "core:testing"
 
@@ -110,4 +111,66 @@ parsers_survive_noise :: proc(t: ^testing.T) {
 		link_destroy(&l)
 		free_all(context.temp_allocator)
 	}
+}
+
+// A control frame is short (RFC 6455 5.5), and an opcode nobody negotiated is no frame: either is broken from its head
+// alone, as is any frame longer than its reader takes, before any of its payload need be held.
+@(test)
+websocket_frames_are_bounded :: proc(t: ^testing.T) {
+	head :: proc(op: byte, n: u64) -> [10]byte {
+		b: [10]byte
+		b[0] = 0x80 | op
+		b[1] = 127
+		for i in 0 ..< 8 {
+			b[2 + i] = byte(n >> uint(56 - 8 * i))
+		}
+		return b
+	}
+	for op in ([]Opcode{.Close, .Ping, .Pong}) {
+		for size in ([]int{CONTROL_MAX, CONTROL_MAX + 1}) {
+			w := make([dynamic]byte, context.temp_allocator)
+			ws_put(&w, op, make([]byte, size, context.temp_allocator), true)
+			_, _, _, _, result := ws_take(w[:])
+			testing.expectf(t, result == (.Message if size <= CONTROL_MAX else .Broken), "%v of %d: %v", op, size, result)
+		}
+		big := head(u8(op), 1 << 20)
+		_, _, _, _, result := ws_take(big[:])
+		testing.expectf(t, result == .Broken, "%v of a mebibyte, by its head: %v", op, result)
+	}
+	for op in ([]byte{3, 7, 11, 15}) {
+		b := [2]byte{0x80 | op, 0}
+		_, _, _, _, result := ws_take(b[:])
+		testing.expectf(t, result == .Broken, "opcode %d: %v", op, result)
+	}
+	long := head(u8(Opcode.Binary), 200)
+	_, _, _, _, result := ws_take(long[:], most = 125)
+	testing.expect_value(t, result, Ws_Result.Broken)
+}
+
+// A server that asks again and again for a key update, and reads nothing, is owed one update, sent before what is next
+// written: not one record for every asking.
+@(test)
+tls_key_updates_are_answered_once :: proc(t: ^testing.T) {
+	tls: Tls
+	defer tls_destroy(&tls)
+	crypto.rand_bytes(tls.client_app[:])
+	crypto.rand_bytes(tls.server_app[:])
+	tls_key(&tls.send, tls.client_app)
+	tls_key(&tls.recv, tls.server_app)
+	tls.state = .Open
+	server, server_app := tls.recv, tls.server_app
+	wire := make([dynamic]byte, context.temp_allocator)
+	for _ in 0 ..< 1000 {
+		tls_seal(&server, 22, {24, 0, 0, 1, 1}, &wire)
+		server_app = tls_expand(server_app, "traffic upd", nil)
+		tls_key(&server, server_app)
+	}
+	plain, w: [dynamic]byte
+	defer delete(plain)
+	defer delete(w)
+	testing.expect(t, tls_input(&tls, wire[:], &plain, &w))
+	testing.expectf(t, len(w) == 0, "%d bytes said before anything was written", len(w))
+	tls_write(&tls, transmute([]byte)string("x"), &w)
+	update := 5 + 5 + 1 + 16
+	testing.expectf(t, len(w) == update + 5 + 1 + 1 + 16, "%d bytes for one update and one byte", len(w))
 }

@@ -111,3 +111,44 @@ review_knocks_open_one_link_at_a_time :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, len(b.relayed) <= 2, "%d links for one device", len(b.relayed))
 }
+
+// A peer that pings, and reads nothing, is owed one answer however often it pings: only the latest ping's, sent once all
+// before it has gone. And before a session nothing longer than a handshake's message is taken, nor held while it comes.
+@(test)
+review_pings_owe_one_answer :: proc(t: ^testing.T) {
+	s: Stream
+	s.phase = .Noise
+	defer {
+		delete(s.in_buf)
+		delete(s.pieces)
+		delete(s.out)
+		delete(s.pong)
+	}
+	wire := make([dynamic]byte, context.temp_allocator)
+	payload: [pipe.CONTROL_MAX]byte
+	for i in 0 ..< 1000 {
+		payload[0] = byte(i)
+		pipe.ws_put(&wire, .Ping, payload[:], true)
+		if i % 10 == 0 {
+			pipe.ws_put(&wire, .Text, transmute([]byte)string("ping"), true)
+		}
+	}
+	testing.expect(t, stream_input(&s, wire[:]))
+	testing.expectf(t, len(s.out) == 2 + pipe.CONTROL_MAX, "%d bytes owed for 1000 pings", len(s.out))
+	s.sent = len(s.out) // as though the socket took it
+	stream_answer(&s)
+	first := 2 + pipe.CONTROL_MAX
+	testing.expect_value(t, len(s.out), first + 2 + pipe.CONTROL_MAX + 2 + 4)
+	if len(s.out) == first + 2 + pipe.CONTROL_MAX + 2 + 4 {
+		testing.expect_value(t, s.out[first + 2], byte(999 % 256)) // the latest
+		testing.expect_value(t, string(s.out[len(s.out) - 4:]), "pong")
+	}
+
+	// A message said to be a mebibyte long, before any session: refused at its head.
+	big: [10]byte
+	big[0], big[1], big[7] = 0x82, 127, 0x10
+	quiet: Stream
+	quiet.phase = .Noise
+	defer delete(quiet.in_buf)
+	testing.expect(t, !stream_input(&quiet, big[:]), "a mebibyte is waited for before any session")
+}
