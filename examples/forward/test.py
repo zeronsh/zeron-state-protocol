@@ -29,16 +29,30 @@ class Thread(threading.Thread):
         super().__init__(*args, **kwargs)
         self.failed = None
 
+    failures = []  # of threads not yet joined: what the test fails of at its end, though it never joins them
+
     def run(self):
         try:
             super().run()
         except BaseException as e:
+            import traceback
+
+            traceback.print_exc()  # said at once, as Python says it of any thread
             self.failed = e
+            Thread.failures.append(e)
 
     def join(self, timeout=None):
         super().join(timeout)
         if self.failed is not None:
+            if self.failed in Thread.failures:
+                Thread.failures.remove(self.failed)
             raise self.failed
+
+    @staticmethod
+    def check():
+        """Raises what any thread raised that was never joined, as the end of a test that ran it."""
+        if Thread.failures:
+            raise Thread.failures[0]
 
 
 FORWARD = os.path.join(ROOT, "build", "forward" + (".exe" if os.name == "nt" else ""))
@@ -250,6 +264,7 @@ if __name__ == "__main__":
         root = tempfile.mkdtemp(prefix="zsp-forward-")
         try:
             sent = main(root, direct)
+            Thread.check()  # what the servers' threads raised, which nothing joins
             print(f"ok   forward, {'direct' if direct else 'through the relay'}: a reader that never reads held {sent >> 20} MiB")
         finally:
             shutil.rmtree(root, ignore_errors=True)

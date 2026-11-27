@@ -490,7 +490,10 @@ async function main(): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const limit = new Promise<never>((_, fail) => (timer = setTimeout(() => fail(new Error("not done in three minutes")), 180000)));
+      chrome!.uncaught.length = 0;
       await Promise.race([(tests[name] ?? held[name])(), limit]);
+      // What a page threw that nothing caught fails the test, though nothing it looked at went wrong.
+      if (chrome!.uncaught.length > 0) throw new Error("uncaught in a page: " + chrome!.uncaught.join("; "));
       console.log(`ok   ${name} ${((performance.now() - start) / 1000).toFixed(2)}s`);
     } catch (e) {
       failed++;

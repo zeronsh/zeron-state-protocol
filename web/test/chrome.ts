@@ -47,6 +47,8 @@ export class Chrome {
   #next = 0;
   #waiting = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
   #sessions = new Map<string, (method: string, params: any) => void>();
+  /** What pages and their workers threw that nothing caught, since this was last emptied: each a failure of the test. */
+  readonly uncaught: string[] = [];
 
   private constructor(p: ChildProcess, ws: WebSocket, profile: string) {
     this.#p = p;
@@ -117,7 +119,11 @@ export class Chrome {
     const listen = (session: string, who: string) => {
       this.#sessions.set(session, (method, params) => {
         if (method === "Runtime.consoleAPICalled") say(who + params.args.map((a: any) => a.value ?? a.description ?? "").join(" "));
-        else if (method === "Runtime.exceptionThrown") say(who + "uncaught: " + (params.exceptionDetails.exception?.description ?? params.exceptionDetails.text));
+        else if (method === "Runtime.exceptionThrown") {
+          const what = who + (params.exceptionDetails.exception?.description ?? params.exceptionDetails.text);
+          this.uncaught.push(what);
+          say("uncaught: " + what);
+        }
         else if (method === "Target.attachedToTarget") {
           if (params.targetInfo.type === "worker") workers.push(params.sessionId);
           listen(params.sessionId, "(" + params.targetInfo.type + ") ");

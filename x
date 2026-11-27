@@ -183,13 +183,15 @@ selftest) # that ./x test says every kind of test that fails: with one made to f
 		echo "FAIL ./x test passed with a failure put in each kind of test: see build/selftest.log"
 		exit 1
 	fi
-	for name in zsp web-client web-text luau-client relay_settle forward end_to_end web-tabs; do
-		if ! grep -qx "$name" build/failed; then
-			echo "FAIL ./x test did not say $name failed: see build/selftest.log"
-			exit 1
-		fi
-	done
-	echo "ok   ./x test says every failure put in it"
+	# Exactly those: each kind, and nothing that did not fail. mirror_model runs beside the rest, so that what waits for
+	# such a job is held to it too.
+	expected="end_to_end forward luau-client mirror_model mirror_model-plain relay_settle web-client web-tabs web-text zsp"
+	said=$(LC_ALL=C sort -u build/failed | tr '\n' ' ' | sed 's/ $//')
+	if [ "$said" != "$expected" ]; then
+		echo "FAIL ./x test said '$said' failed, not '$expected': see build/selftest.log"
+		exit 1
+	fi
+	echo "ok   ./x test says every failure put in it, and nothing else"
 	;;
 build)
 	# Whole-program optimisation, in parallel where the linker speaks the compiler's own LLVM.

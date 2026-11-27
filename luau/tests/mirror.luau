@@ -20,6 +20,19 @@ end
 math.randomseed(os.time())
 local sockets: { any } = {}
 
+-- What the client is given to run later, or as sockets say things, run so that an error in it is a failure of the
+-- test: Lune says such an error and goes on, and this test ends with process.exit(0), which would let it pass.
+local failures = 0
+local function guarded(f: any): any
+	return function(...)
+		local ok, why = xpcall(f, debug.traceback :: any, ...)
+		if not ok then
+			failures += 1
+			print("error: " .. tostring(why))
+		end
+	end
+end
+
 local function host(address: string, token: string)
 	return {
 		credential = token,
@@ -29,10 +42,10 @@ local function host(address: string, token: string)
 		end,
 		random = random,
 		defer = function(f: () -> ())
-			task.defer(f)
+			task.defer(guarded(f))
 		end,
 		after = function(seconds: number, f: () -> ())
-			local thread = task.delay(seconds, f)
+			local thread = task.delay(seconds, guarded(f))
 			return function()
 				pcall(task.cancel, thread)
 			end
@@ -43,7 +56,7 @@ local function host(address: string, token: string)
 				return nil
 			end
 			table.insert(sockets, socket)
-			task.spawn(function()
+			task.spawn(guarded(function()
 				while true do
 					local message = socket:next()
 					if message == nil then
@@ -52,7 +65,7 @@ local function host(address: string, token: string)
 					end
 					receive(message)
 				end
-			end)
+			end))
 			return {
 				send = function(data: buffer)
 					pcall(socket.send, socket, data, true)
@@ -472,6 +485,10 @@ print(string.format("     2000 rows made in %.0f ms; one change among them, writ
 
 for _, d in { a, b, big, other } do
 	d.stop()
+end
+if failures > 0 then
+	print(`{failures} error(s) in what ran later`)
+	process.exit(1)
 end
 print("ok")
 process.exit(0)

@@ -626,7 +626,10 @@ async function main(): Promise<void> {
     try {
       // However a page fails to answer, the test fails, by name, rather than waiting for ever.
       const limit = new Promise<never>((_, fail) => (timer = setTimeout(() => fail(new Error("not done in three minutes")), name === "partial" ? 3600000 : 180000)));
+      chrome.uncaught.length = 0;
       await Promise.race([tests[name](), limit]);
+      // What a page threw that nothing caught fails the test, though nothing it looked at went wrong.
+      if (chrome.uncaught.length > 0) throw new Error("uncaught in a page: " + chrome.uncaught.join("; "));
       console.log(`ok   ${name} ${((performance.now() - start) / 1000).toFixed(2)}s`);
     } catch (e) {
       failed++;

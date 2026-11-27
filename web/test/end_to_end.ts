@@ -530,7 +530,7 @@ async function main(): Promise<void> {
         let out = "";
         p.stdout.on("data", (d) => (out += d));
         p.stderr.on("data", (d) => (out += d));
-        p.on("exit", (code) => done([out, code ?? 1]));
+        p.on("close", (code) => done([out, code ?? 1])); // once all it said is read, not only once it has ended
       });
     const results: Promise<[string, number]>[] = [];
     const running = new Set<Promise<unknown>>();

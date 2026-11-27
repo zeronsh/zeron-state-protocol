@@ -98,7 +98,7 @@ function misplaced(client: Client): string | undefined {
 }
 
 // The Luau client, which says what came of each thing it is told.
-function luau(): { ask: (line: string) => Promise<string>; done: () => void } {
+function luau(): { ask: (line: string) => Promise<string>; done: () => Promise<void> } {
   let path = join(root, "luau/zsp");
   let dir: string | undefined;
   if (!existsSync(join(path, "mirror.luau"))) {
@@ -116,9 +116,13 @@ function luau(): { ask: (line: string) => Promise<string>; done: () => void } {
       if (r.done) throw new Error(`the Luau side ended, told: ${line.slice(0, 80)}`);
       return r.value;
     },
-    done: () => {
+    // Ends the Luau side, and fails if it did not end well: what it said wrong after its last answer is a failure too.
+    done: async () => {
+      const ended = new Promise<number | null>((go) => p.on("close", go));
       p.stdin.end("quit\n");
+      const code = p.exitCode ?? (await ended);
       if (dir) rmSync(dir, { recursive: true, force: true });
+      if (code !== 0) throw new Error(`the Luau side ended with ${code}`);
     },
   };
 }
@@ -192,7 +196,7 @@ try {
     doc.close();
   }
 } finally {
-  side.done();
+  await side.done();
 }
 console.log(`${SEEDS} seeds, ${cells} writes between Luau and TypeScript, ${compared} times the same: ${((performance.now() - began) / 1000).toFixed(2)} s`);
 console.log("ok");

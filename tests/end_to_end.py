@@ -15,16 +15,30 @@ class Thread(threading.Thread):
         super().__init__(*args, **kwargs)
         self.failed = None
 
+    failures = []  # of threads not yet joined: what the test fails of at its end, though it never joins them
+
     def run(self):
         try:
             super().run()
         except BaseException as e:
+            import traceback
+
+            traceback.print_exc()  # said at once, as Python says it of any thread
             self.failed = e
+            Thread.failures.append(e)
 
     def join(self, timeout=None):
         super().join(timeout)
         if self.failed is not None:
+            if self.failed in Thread.failures:
+                Thread.failures.remove(self.failed)
             raise self.failed
+
+    @staticmethod
+    def check():
+        """Raises what any thread raised that was never joined, as the end of a test that ran it."""
+        if Thread.failures:
+            raise Thread.failures[0]
 
 
 BIN = os.environ.get("ZSPD", os.path.join(ROOT, "build", "zspd.exe" if os.name == "nt" else "zspd"))
@@ -1047,6 +1061,7 @@ def one(name, tests, file):
     start = time.monotonic()
     try:
         tests[name]()
+        Thread.check()
         print(f"ok   {name} {time.monotonic() - start:.2f}s")
         return 0
     except BaseException as e:

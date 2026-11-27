@@ -9,6 +9,11 @@ local text = require("../zsp/text")
 local zsp = require("../zsp")
 local m = zsp.mirror
 
+-- `./x selftest` sets ZSP_FAIL, to see that ./x test says this failed: run beside the rest, by what it waits for.
+if require("@lune/process").env.ZSP_FAIL then
+	error("failing, as ZSP_FAIL asks")
+end
+
 local CELLS, ROSTER, ASK, UNASK, ANSWER, FETCH = 7, 2, 32, 33, 34, 35
 local KEY = string.rep("k", 32)
 
