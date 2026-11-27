@@ -1183,6 +1183,81 @@ what_cannot_be_watched_is_not_waited_for :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(p.node.interests), held)
 }
 
+@(private, thread_local)
+far_called: u64
+
+// An answer from afar that names a row where a full replica says there is none is no answer: what is here is.
+@(test)
+rows_said_to_be_where_none_is_are_not_waited_for :: proc(t: ^testing.T) {
+	state := rand.create(113)
+	context.random_generator = rand.default_random_generator(&state)
+	w, p: World
+	world_make(t, &w, &p)
+	defer world_destroy(&w)
+	defer world_destroy(&p)
+	g: Finder
+	pages: Memory_Disk
+	finder_open(&g, &p.node, memory_disk(&pages), p.secret)
+	c := client_open(&p, &g)
+	for x in ([]^World{&w, &p}) {
+		x.node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+			zsp.session_accept(s, nil if s.role == .Peer else {{0, {.Read, .Write}, 0}})
+		}
+	}
+	// It answers, at once, with a row that is nowhere.
+	w.node.host.questions = {
+		data = &w.node,
+		called = proc(data: rawptr, call: u64, _: zsp.Key32, _: zsp.Scope, _: []byte) {
+			far_called = call
+			out := make([dynamic]byte, context.temp_allocator)
+			append(&out, 1)
+			zsp.write_varint(&out, 1)
+			zsp.write_varint(&out, 0)
+			zsp.write_varint(&out, 1)
+			zsp.write_key(&out, {1 << 32 | 9, 1, 42, 1 << 32 | 99, 777})
+			zsp.write_varint(&out, 0)
+			zsp.node_flow((^zsp.Node)(data), call, .Data, out[:])
+		},
+	}
+	link := link_make(&p, &w)
+	defer {
+		zsp.session_close(link[0])
+		zsp.session_close(link[1])
+		zsp.session_close(c.session)
+		finder_close(&g)
+		client_free(&c)
+		memory_disk_destroy(&pages)
+	}
+	for _ in 0 ..< 20 {
+		link_pass(t, link, max(int))
+		finder_run(&g)
+	}
+	client_ask(t, &c, 1, []byte{1, 0, 0, 0, 0, 50, 0}, FETCH)
+	for _ in 0 ..< 100 {
+		link_pass(t, link, max(int))
+		finder_run(&g)
+	}
+	client_hear_out(t, &c, &g)
+	testing.expectf(t, 1 in c.answers && c.answers[1].flags & 1 == 0, "%v", c.answers[1] if 1 in c.answers else Told{})
+	// One that stays is put right by the next answer, which is taken: what is here is said meanwhile.
+	client_ask(t, &c, 2, []byte{1, 0, 0, 0, 0, 50, 0})
+	for _ in 0 ..< 100 {
+		link_pass(t, link, max(int))
+		finder_run(&g)
+	}
+	client_hear_out(t, &c, &g)
+	testing.expectf(t, 2 in c.answers && c.answers[2].flags & 1 == 0, "%v", c.answers[2] if 2 in c.answers else Told{})
+	right := make([dynamic]byte, context.temp_allocator)
+	append(&right, 1, 0, 0, 0, 0)
+	zsp.node_flow(&w.node, far_called, .Data, right[:])
+	for _ in 0 ..< 100 {
+		link_pass(t, link, max(int))
+		finder_run(&g)
+	}
+	client_hear_out(t, &c, &g)
+	testing.expectf(t, 2 in c.answers && c.answers[2].flags & 1 != 0 && c.answers[2].total == 0, "%v", c.answers[2] if 2 in c.answers else Told{})
+}
+
 // Pages that are not what was last written are known not to be, and the answers are right all the same.
 @(test)
 pages_are_believed_only_if_they_are :: proc(t: ^testing.T) {

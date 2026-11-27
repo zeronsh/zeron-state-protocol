@@ -1038,10 +1038,32 @@ far_run :: proc(l: ^Live) {
 			far.due = true
 		}
 	}
+	if far.due && l.once && far_missing(l) {
+		// It named a row where a full replica says there is none: it will not come there, and the answer is not one. (An
+		// answer that stays is put right by the next, as what is here is said meanwhile: it is waited for.)
+		zsp.node_flow(f.n, far.call, .Cancel)
+		far.call = 0
+		append(&far.tried, far.device)
+		far_drop(l)
+	}
 	if far.due && far_whole(l) {
 		far.due, far.have = false, true
 		far_say(l)
 	}
+}
+
+// Whether a row of an answer from afar is not where it was said to be, as a full replica has confirmed.
+@(private)
+far_missing :: proc(l: ^Live) -> bool {
+	for k in l.far.keys {
+		if zsp.is_graveyard(zsp.key_list(k)) || zsp.row_places(&l.f.n.store, zsp.key_row(k)).count > 0 {
+			continue
+		}
+		if _, sure, _ := zsp.session_wanted(l.session, k, zsp.key_next(k)); sure {
+			return true
+		}
+	}
+	return false
 }
 
 // Nobody to ask can read, but what it is about may be had from one that holds everything, as a relay does: the lists
