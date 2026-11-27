@@ -1592,6 +1592,37 @@ review_settled_roster :: proc(t: ^testing.T) {
 	testing.expectf(t, last == false, "last said of the window: settled %v", last)
 }
 
+// A device becoming partial is not level with one that cannot read a scope it holds keys for, though it may no longer
+// write there: it may have before. (Review 1, 9A.)
+@(test)
+review_level_in_every_scope :: proc(t: ^testing.T) {
+	state := seeded(50)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 3, partial = 0, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	owner, laptop, other := s.nodes[0], s.nodes[1], s.nodes[2]
+	owner.node.now = sim_now(&s, owner)
+	d := draft_from(&owner.node.roster, max(owner.node.clock, owner.node.now << 16))
+	d.random = sim_random
+	draft_revoke(&d, other.keys.device, 2)
+	draft_grant(&d, laptop.keys.device, laptop.keys.signer, 2, {.Read})
+	bytes, ok := roster_sign(&owner.keys, s.root, &d)
+	defer delete(bytes)
+	testing.expect(t, ok)
+	for x in s.nodes {
+		testing.expect(t, node_adopt(&x.node, bytes))
+	}
+	sim_restart(&s, laptop, full = false, older = true)
+	testing.expect(t, laptop.node.becoming)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect(t, !laptop.node.whole, "level with one that cannot read all it may hold")
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	testing.expect(t, laptop.node.whole)
+}
+
 // An Ack of more than was sent makes no sense, and the session ends: it is not believed. (Review 1, 9B.)
 @(test)
 review_ack_beyond :: proc(t: ^testing.T) {
