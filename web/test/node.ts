@@ -189,13 +189,32 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   volume.openNow = undefined;
   const node = await Node.open({ volume, module, log: () => {} });
   failing = true;
-  assert.throws(() => node.create());
+  assert.throws(() => node.create(), /storage failed/);
+  assert.equal(node.space, undefined, "it says it is of a space it never kept, though only until it stops");
+  const settled = await Promise.race([node.settled().then(() => "settled"), new Promise((done) => setTimeout(() => done("waiting"), 500))]);
+  assert.equal(settled, "settled", "a node that has stopped is never settled");
   failing = false;
   const again = await Node.open({ volume, module, log: () => {} });
   assert.equal(again.space, undefined, "the device is of a space whose roster it never kept");
   assert.match(again.create(), /^[0-9a-f]{64}$/);
   assert(again.member);
   await again.close();
+  // And so for a space adopted by its roster alone.
+  const owner = join(TMP, "unkept-owner");
+  const sid = execFileSync(BIN, ["create", owner], { encoding: "utf8" }).trim();
+  const fresh = new Failing();
+  fresh.openNow = undefined;
+  const adopting = await Node.open({ volume: fresh, module, log: () => {} });
+  execFileSync(BIN, ["admit", owner, adopting.key, "1"]);
+  failing = true;
+  assert.equal(adopting.adopt(readFileSync(join(owner, sid, "roster"))), false);
+  assert.equal(adopting.space, undefined, "it says it is of a space whose roster it never kept");
+  failing = false;
+  const later = await Node.open({ volume: fresh, module, log: () => {} });
+  assert.equal(later.space, undefined);
+  assert(later.adopt(readFileSync(join(owner, sid, "roster"))));
+  assert.equal(later.space, sid);
+  await later.close();
 }
 
 // And it says so at once, though files are still being opened, which a full disk may keep from ever being done: it lets

@@ -332,10 +332,17 @@ export class Node {
     try {
       this.store.keep("space", space);
     } catch (e) {
-      const error = new Error(`storage failed: the node has stopped rather than lose what it said was durable (${e instanceof Error ? e.message : e})`);
-      this.#fail(error);
-      throw error;
+      throw this.#unkept(`the space could not be kept: ${e instanceof Error ? e.message : e}`);
     }
+  }
+
+  // A space this device was becoming one of, and is not, for what makes it so could not be kept: the node stops at once,
+  // as of no space, and is of none at the next start either.
+  #unkept(why: string): Error {
+    const error = new Error(`storage failed: the node has stopped rather than be of a space it did not keep (${why})`);
+    this.#space = undefined;
+    this.#fail(error);
+    return error;
   }
 
   /** Becomes a device of a space by its roster alone, as `zspd peer` does; for there is no relay, or none yet. */
@@ -347,9 +354,9 @@ export class Node {
       this.#bytes(wasm.buffer(roster.length), roster.length).set(roster);
       if (roster.length < 38 || !wasm.genuine(roster.length)) return false;
       this.#start(roster.slice(6, 38));
-      const taken = this.#adopt(roster);
-      if (taken) this.#keepSpace(roster.slice(6, 38));
-      return taken;
+      if (!this.#adopt(roster)) return this.#unkept("its first roster could not be kept"), false;
+      this.#keepSpace(roster.slice(6, 38));
+      return true;
     }
     return this.#adopt(roster);
   }
@@ -373,7 +380,7 @@ export class Node {
     if (n < 32) throw new Error("could not make a space");
     const made = this.#bytes(wasm.data(), n).slice();
     this.#start(made.subarray(0, 32));
-    if (!this.#adopt(made.subarray(32))) throw new Error("could not take the space's first roster");
+    if (!this.#adopt(made.subarray(32))) throw this.#unkept("could not take the space's first roster");
     this.#keepSpace(made.subarray(0, 32));
     return this.#space!;
   }
@@ -527,9 +534,9 @@ export class Node {
     };
   }
 
-  /** Resolves once the node is idle: everything said, everything durable, nothing waiting for a file. */
+  /** Resolves once the node is idle: everything said, everything durable, nothing waiting for a file; or it has stopped. */
   async settled(): Promise<void> {
-    while (this.#scheduled || this.#later || this.#ticking || !this.store.settled || this.#deliveries.length > 0) {
+    while (!this.#stopped && (this.#scheduled || this.#later || this.#ticking || !this.store.settled || this.#deliveries.length > 0)) {
       await new Promise<void>((done) => this.#waiting.push(done));
     }
   }
@@ -544,6 +551,7 @@ export class Node {
     this.#conns.clear();
     this.#channel?.port1.close();
     this.#store.abandon();
+    for (const done of this.#waiting.splice(0)) done();
   }
 
   /** Stops the node, makes what it was given durable, and closes the store. */
@@ -568,6 +576,7 @@ export class Node {
     this.#wasm?.stop();
     this.#options.datagrams?.close();
     this.#channel?.port1.close();
+    for (const done of this.#waiting.splice(0)) done(); // idle for good
   }
 
   // ---------------------------------------------------------------- the module
