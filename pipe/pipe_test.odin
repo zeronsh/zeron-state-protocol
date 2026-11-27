@@ -40,6 +40,35 @@ urls :: proc(t: ^testing.T) {
 	testing.expect(t, ok && !u.secure && u.port == 8787 && u.name == "127.0.0.1" && u.host == "127.0.0.1:8787" && u.path == "/")
 	_, ok = url_parse("http://x/")
 	testing.expect(t, !ok)
+	// An IPv6 address is named without its brackets, which are only the URL's, and kept in the Host header.
+	u, ok = url_parse("ws://[::1]:8787/abc")
+	testing.expect(t, ok && u.name == "::1" && u.port == 8787 && u.host == "[::1]:8787" && u.path == "/abc")
+	u, ok = url_parse("wss://[2001:db8::1]")
+	testing.expect(t, ok && u.name == "2001:db8::1" && u.port == 443 && u.path == "/")
+	u, ok = url_parse("ws://example.com:65535/x?y")
+	testing.expect(t, ok && u.port == 65535 && u.path == "/x?y")
+	for bad in ([]string{
+		"ws://example.com:18446744073709551696/abc", // 2^64 + 80, which wrapped to 80
+		"ws://example.com:65536/",
+		"ws://example.com:/",
+		"ws://example.com:80:80/",
+		"ws://::1:8787/",
+		"ws://[::1/",
+		"ws://[::1]8787/",
+		"ws://[example.com]/",
+		"ws://[]/",
+		"ws://example.com/a\r\nX-Injected: 1",
+		"ws://example.com\r\nX: 1/",
+		"ws://example.com/a b",
+		"ws://exa\x00mple.com/",
+		"ws://example.com/\x7f",
+		"ws://user@example.com/",
+		"ws://example.com?x",
+		"ws:///path",
+	}) {
+		_, ok = url_parse(bad)
+		testing.expectf(t, !ok, "%q was taken", bad)
+	}
 }
 
 @(test)
@@ -173,4 +202,25 @@ tls_key_updates_are_answered_once :: proc(t: ^testing.T) {
 	tls_write(&tls, transmute([]byte)string("x"), &w)
 	update := 5 + 5 + 1 + 16
 	testing.expectf(t, len(w) == update + 5 + 1 + 1 + 16, "%d bytes for one update and one byte", len(w))
+}
+
+// A server reached by its address is not named in the hello: a name may not be an address (RFC 6066 3).
+@(test)
+tls_names_no_address :: proc(t: ^testing.T) {
+	named, unnamed: Tls
+	w, v: [dynamic]byte
+	defer {
+		tls_destroy(&named)
+		tls_destroy(&unnamed)
+		delete(w)
+		delete(v)
+	}
+	tls_start(&named, "example.com", &w)
+	tls_start(&unnamed, "", &v)
+	testing.expect_value(t, len(w) - len(v), 9 + len("example.com"))
+	// Each still says how long it is, as a record and as a message, rightly.
+	for b in ([][dynamic]byte{w, v}) {
+		testing.expect_value(t, int(b[3]) << 8 | int(b[4]), len(b) - 5)
+		testing.expect_value(t, int(b[6]) << 16 | int(b[7]) << 8 | int(b[8]), len(b) - 9)
+	}
 }

@@ -232,9 +232,15 @@ Url :: struct {
 	path:   string,
 }
 
-// ws://host[:port]/path and wss://
+// ws://host[:port]/path and wss://, the host a name or an address, an IPv6 one in brackets. Nothing in it may be a
+// space or a control character, which would end the request line or a header it is put in.
 @(require_results)
 url_parse :: proc(url: string) -> (u: Url, ok: bool) {
+	for c in transmute([]byte)url {
+		if c <= ' ' || c == 0x7f {
+			return
+		}
+	}
 	rest := url
 	switch {
 	case strings.has_prefix(url, "wss://"):
@@ -253,16 +259,44 @@ url_parse :: proc(url: string) -> (u: Url, ok: bool) {
 	if slash >= 0 {
 		u.host, u.path = rest[:slash], rest[slash:]
 	}
+	if strings.index_any(u.host, "?#@") >= 0 {
+		return // a query or a fragment with no path before it, or a user: none is a host
+	}
 	u.name = u.host
-	if colon := strings.last_index_byte(u.host, ':'); colon >= 0 && !strings.has_suffix(u.host, "]") {
-		u.name = u.host[:colon]
+	port := ""
+	has_port := false
+	if strings.has_prefix(u.host, "[") {
+		end := strings.index_byte(u.host, ']')
+		if end < 0 {
+			return
+		}
+		u.name = u.host[1:end]
+		if after := u.host[end + 1:]; after != "" {
+			if after[0] != ':' {
+				return
+			}
+			port, has_port = after[1:], true
+		}
+		if strings.index_any(u.name, "[]") >= 0 || strings.index_byte(u.name, ':') < 0 {
+			return
+		}
+	} else if colon := strings.index_byte(u.host, ':'); colon >= 0 {
+		u.name, port, has_port = u.host[:colon], u.host[colon + 1:], true
+		if strings.index_any(u.host, "[]") >= 0 || strings.index_byte(port, ':') >= 0 {
+			return // an IPv6 address, which only brackets would tell from a port
+		}
+	}
+	if has_port {
 		u.port = 0
-		for c in u.host[colon + 1:] {
+		for c in port {
 			if c < '0' || c > '9' {
 				return
 			}
 			u.port = u.port * 10 + int(c - '0')
+			if u.port > 65535 {
+				return // and so before it can wrap
+			}
 		}
 	}
-	return u, len(u.name) > 0 && u.port > 0 && u.port < 65536
+	return u, len(u.name) > 0 && u.port > 0
 }

@@ -167,6 +167,7 @@ run :: proc() -> int {
 			r: zsp.Relay
 			copy(r.key[:], key)
 			r.url = space_url(args[1], a.space)
+			relay_url(r.url) or_return
 			append(&a.draft.relays, r)
 			return true
 		})
@@ -439,11 +440,21 @@ join :: proc(dir, space, relay_key, url: string) -> bool {
 	_ = host.device_secret(dir) or_return
 	_ = parse_hex(space, 32) or_return
 	_ = parse_hex(relay_key, 32) or_return
+	relay_url(space_url(url, space)) or_return
 	if err := os.make_directory_all(in_dir(dir, space)); err != nil && !os.is_dir(in_dir(dir, space)) {
 		return false
 	}
 	host.save(in_dir(dir, "space"), transmute([]byte)space) or_return
 	return host.save(in_dir(dir, "relay"), transmute([]byte)strings.concatenate({relay_key, " ", space_url(url, space)}, context.temp_allocator))
+}
+
+// Whether a relay's address is one a device can dial: said now, rather than by every device that cannot.
+relay_url :: proc(url: string) -> bool {
+	if _, ok := pipe.url_parse(url); !ok {
+		say(os.stderr, "a relay's address is ws://host[:port][/path] or wss://, an IPv6 address in brackets, and nothing in it a space\n")
+		return false
+	}
+	return true
 }
 
 // Where a relay keeps a space. A query the relay's proxy wants stays at the end.

@@ -51,7 +51,7 @@ tls_destroy :: proc(t: ^Tls) {
 @(private)
 hello_head := [?]byte{0x03, 0x03}
 
-// Appends the client's hello.
+// Appends the client's hello, naming the server unless the name is empty: an address is never named (RFC 6066 3).
 tls_start :: proc(t: ^Tls, name: string, w: ^[dynamic]byte) {
 	crypto.rand_bytes(t.secret[:])
 	public := zsp.x25519_public(t.secret)
@@ -70,10 +70,10 @@ tls_start :: proc(t: ^Tls, name: string, w: ^[dynamic]byte) {
 	append(&m, 1, 0)
 	ext := len(m)
 	append(&m, 0, 0)
-	// server_name
-	n := len(name)
-	append(&m, 0, 0, byte((n + 5) >> 8), byte(n + 5), byte((n + 3) >> 8), byte(n + 3), 0, byte(n >> 8), byte(n))
-	append(&m, name)
+	if n := len(name); n > 0 { // server_name
+		append(&m, 0, 0, byte((n + 5) >> 8), byte(n + 5), byte((n + 3) >> 8), byte(n + 3), 0, byte(n >> 8), byte(n))
+		append(&m, name)
+	}
 	append(&m, 0, 10, 0, 4, 0, 2, 0, 29) // supported_groups: x25519
 	append(&m, 0, 13, 0, 14, 0, 12, 4, 3, 8, 4, 8, 5, 8, 7, 4, 1, 5, 3) // signature_algorithms
 	append(&m, 0, 16, 0, 11, 0, 9, 8) // ALPN

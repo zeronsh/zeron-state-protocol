@@ -674,7 +674,7 @@ dialer_resolved :: proc(d: ^Dialer) {
 		d.state = .Up
 		if d.url.secure {
 			s.tls = new(pipe.Tls)
-			pipe.tls_start(s.tls, d.url.name, &s.out)
+			pipe.tls_start(s.tls, d.url.name if net.parse_address(d.url.name) == nil else "", &s.out)
 		} else {
 			stream_request(s)
 		}
