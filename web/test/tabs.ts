@@ -318,6 +318,59 @@ const tests: Record<string, () => Promise<void>> = {
     expectEqual(said.filter((l) => /uncaught/i.test(l)), [], "nonsense on the channel was thrown at");
     watching?.close();
   },
+  // Tabs whose clocks are ahead of a tab opened after, as all are after the machine's clock is set back: the new one presents
+  // what they gave, and what it gives is taken as newer by the one running the device, which presents it.
+  async tab_credential_clock() {
+    let r = await relay("first");
+    const port = Number(r.address.split(":").pop());
+    const via = { key: r.key, url: r.url };
+    const owner = join(TMP, "cc-owner");
+    const sid = zspd("create", owner);
+    zspd("relay", owner, via.key, via.url);
+    let o = await node("run", owner, "--credential=first");
+    let watching: Client | undefined;
+    let titles = "";
+    const watch = () => {
+      watching?.close();
+      watching = new Client({ connect: zspdConnect(o.address), credential: token(owner) });
+      watching.window({ scope: 1, list: "notes", table: { title: columns.string(16) } }, (st) => (titles = st.rows.map((x) => x.title).join()));
+    };
+    watch();
+    const again = async (t: string) => {
+      watching?.close();
+      await stop(o.p);
+      await stop(r.p);
+      r = await relay(t, port);
+      o = await node("run", owner, `--credential=${t}`);
+      watch();
+    };
+    const a = await page();
+    await a.evaluate("(() => { const was = Date.now; Date.now = () => was() + 300000; return 1; })()"); // five minutes ahead
+    const { key } = await call<{ key: string }>(a, "device", "cc", "first");
+    zspd("admit", owner, key, "1");
+    await call(a, "join", "cc", sid, via);
+    await call(a, "put", "cc", "notes", ["one"]);
+    await eventually(() => titles === "one", "the relay lets in what presents the credential it was opened with", 20000);
+    const d = await page(); // its clock five minutes behind what a gave by
+    await call(d, "device", "cc");
+    await again("second");
+    await call(d, "setCredential", "cc", "second");
+    await call(d, "put", "cc", "notes", ["two"]);
+    await eventually(() => titles.split(",").includes("two"), "what a tab whose clock is behind gives is taken as newer", 20000);
+    await gone(a); // d runs it now, presenting what it gave
+    await again("second");
+    await call(d, "put", "cc", "notes", ["three"]);
+    await eventually(() => titles.split(",").includes("three"), "and it is presented by the tab whose clock is behind, running it", 20000);
+    // And a tab opened after with none of its own presents the newest given, however far ahead of its clock.
+    const e = await page();
+    await e.evaluate("(() => { const was = Date.now; Date.now = () => was() - 600000; return 1; })()");
+    await call(e, "device", "cc");
+    await gone(d);
+    await again("second");
+    await call(e, "put", "cc", "notes", ["four"]);
+    await eventually(() => titles.split(",").includes("four"), "a tab whose clock is behind presents the newest given, given ahead of it", 20000);
+    watching?.close();
+  },
   // A tab that closes its device, its node run by another tab's worker, tells its clients their pipes are gone.
   async tab_close_follower() {
     const leader = await page();

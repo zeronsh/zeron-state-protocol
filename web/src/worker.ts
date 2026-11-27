@@ -155,11 +155,12 @@ function present(): void {
 
 // Another tab's: taken if it is newer than any this worker knows of, unless it was given before what this worker's own tab
 // gave anew, which is then given again as newer. Anything on the channel is of this origin, which may open the device and
-// do as it likes with it anyway; but what is not a credential is not taken as one, nor one said to have been given so far
-// ahead of any other that nothing given after it could be newer.
+// do as it likes with it anyway; but what is not a credential is not taken as one, nor one said to have been given so late
+// that what is given after it could not be counted later still. Not judged by this worker's clock, which may have been set
+// back since others' gave what they did, by however much: what is given here after it is given later anyway.
 function heardGiven(g: Given): void {
   if (!(typeof g.credential === "string" || g.credential instanceof Uint8Array) || typeof g.at !== "number" || typeof g.by !== "string") return;
-  if (!(g.at > 0 && g.at <= Math.max(Date.now(), newest?.at ?? 0) + AHEAD) || !newer(g)) return;
+  if (!(g.at > 0 && g.at <= LATEST) || !newer(g)) return;
   if (g.old === true && mine && mine === newest) {
     give(mine.credential, g.at + 1, true); // what this tab gave since stays the newest
     return;
@@ -169,7 +170,7 @@ function heardGiven(g: Given): void {
   present();
 }
 
-const AHEAD = 60_000; // ms what is given may be ahead of the newest a worker knows of, as clocks and what they heard differ
+const LATEST = 2 ** 52; // past this, a millisecond more is not counted exactly, and so nothing given after could be newer
 
 // Gets in line for the store. Whoever holds its lock runs the node, for as long as its tab lives; one whose node stopped,
 // or never started, gets in line again when it is next wanted, by its tab asking or dialling, and tries again then: so a
