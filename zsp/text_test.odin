@@ -382,6 +382,18 @@ short_pieces_are_bundled_away :: proc(t: ^testing.T) {
 	b.stamp = {4 << 16, 4}
 	testing.expect(t, cell_valid(&b) && text_apply(&y, &b) == .Changed)
 	testing.expect_value(t, text_string(&y), "hello")
+	// And what a bundle holds that cannot be read is passed over, however short it falls.
+	short := make([dynamic]byte, context.temp_allocator)
+	append(&short, ..b.body)
+	append(&short, 1)
+	broken := Cell{row, DATA, .Bundle, {5 << 16, 5}, short[:]}
+	again := text_bundle({broken})
+	defer delete(again.body)
+	z: Text
+	defer text_destroy(&z)
+	again.stamp = {6 << 16, 6}
+	testing.expect(t, cell_valid(&again) && text_apply(&z, &again) == .Changed)
+	testing.expect_value(t, text_string(&z), "hello")
 }
 
 // What is no operation at all, or one that refers to what its own piece has yet to make, waits for nothing: it is never
