@@ -156,11 +156,11 @@ model_land :: proc(h: ^Model_Host, op: ^Remote_Op) {
 	switch op.kind {
 	case .Put_Pack:
 		h.class_a += 1
-		h.objects[{op.number, true}] = slice.clone(op.body)
+		model_put(h, {op.number, true}, op.body)
 	case .Put_Extent:
 		h.class_a += 1
 		if op.body != nil {
-			h.objects[{op.number, false}] = slice.clone(op.body)
+			model_put(h, {op.number, false}, op.body)
 		}
 	case .Delete:
 		for o in op.objects {
@@ -172,6 +172,15 @@ model_land :: proc(h: ^Model_Host, op: ^Remote_Op) {
 	case .Get_Pages, .Get_Log, .Get_Hints:
 		h.class_b += 1
 	}
+}
+
+// An object put again, as a put from before a crash may land after the one that took its place: the last wins.
+@(private)
+model_put :: proc(h: ^Model_Host, key: Remote_Object, body: []byte) {
+	if old, ok := h.objects[key]; ok {
+		delete(old)
+	}
+	h.objects[key] = slice.clone(body)
 }
 
 @(private)
