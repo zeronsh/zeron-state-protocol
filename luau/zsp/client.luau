@@ -1216,6 +1216,21 @@ local function bundle_has(body: string, stamp: string): boolean
 	return false
 end
 
+-- Whether a cell is one a node could have sent: what the merge rule and placing read of it is there. One that is not, as
+-- a bundle that says it holds more stamps than it does, is nonsense, and not to be looked through.
+local function sound(kind: number, slot: number, body: string): boolean
+	if kind == GRAVE then
+		return slot == 0
+	elseif kind == PLACE then
+		return slot >= 1 and slot <= 15 and #body >= 24
+	elseif kind == VALUE or kind == PIECE then
+		return slot >= 16
+	elseif kind == BUNDLE then
+		return slot >= 16 and #body >= 4 and 4 + (string.unpack(">I4", body) :: any) * 16 <= #body
+	end
+	return false
+end
+
 -- The merge rule. Returns whether the cell was news.
 local function merge(row: Stored, slot: number, kind: number, stamp: string, body: string, author: Device?): boolean
 	if row.dead then
@@ -1258,18 +1273,27 @@ local function merge(row: Stored, slot: number, kind: number, stamp: string, bod
 	return true
 end
 
-function Client._on_cells(self: Client, r: codec.Reader)
+local function cells_of(self: Client, r: codec.Reader, touched: { [Stored]: boolean })
 	codec.varint(r)
 	local id = ""
-	local touched: { [Stored]: boolean } = {}
 	while r.pos < r.len do
 		local tag = codec.u8(r)
 		if tag < 128 then
 			id = codec.take(r, 16)
 		end
+		if id == "" then
+			error(codec.Malformed, 0)
+		end
 		local slot = codec.u8(r)
 		local stamp = codec.take(r, 16)
 		local body = codec.bytes(r)
+		local author: Device? = nil
+		if bit32.btest(tag, 64) then
+			author = self.authors[codec.varint(r)]
+		end
+		if not sound(tag % 64, slot, body) then
+			error(codec.Malformed, 0)
+		end
 		self:_heard(stamp)
 		local row = self:_row(id)
 		touched[row] = true
@@ -1285,13 +1309,17 @@ function Client._on_cells(self: Client, r: codec.Reader)
 				said[stamp] = true
 			end
 		end
-		local author: Device? = nil
-		if bit32.btest(tag, 64) then
-			author = self.authors[codec.varint(r)]
-		end
 		self:_accept(row, slot, tag % 64, stamp, body, author)
 	end
-	self:_place_all(touched)
+end
+
+function Client._on_cells(self: Client, r: codec.Reader)
+	local touched: { [Stored]: boolean } = {}
+	local fine, why = pcall(cells_of, self, r, touched)
+	self:_place_all(touched) -- what came before any nonsense is shown, as it is held
+	if not fine then
+		error(why, 0)
+	end
 end
 
 function Client._accept(self: Client, row: Stored, slot: number, kind: number, stamp: string, body: string, author: Device?): boolean

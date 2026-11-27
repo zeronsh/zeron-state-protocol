@@ -448,6 +448,45 @@ do
 	assert(not h.client.ready, "connected by what was said after it was closed")
 end
 
+-- A cell no node could have sent is nonsense, and ends the pipe rather than be looked through: a bundle that says it holds
+-- more stamps than it has, or is too short to say how many; a placement too short to say where; a value where only
+-- placements go. What came before it is shown, as it is held.
+do
+	local function cell(row: string, kind: number, slot: number, n: number, body: string): string
+		local w = codec.writer()
+		codec.put(w, string.char(kind) .. row .. string.char(slot) .. string.rep("\0", 15) .. string.char(n))
+		codec.put_bytes(w, body)
+		return codec.string(w)
+	end
+	for _, bad in {
+		function(row: string): string
+			return cell(row, 4, 17, 2, string.rep("p", 8)) .. cell("", 5 + 128, 17, 3, "\128\0\0\0")
+		end,
+		function(row: string): string
+			return cell(row, 5, 17, 3, "ab")
+		end,
+		function(row: string): string
+			return cell(row, 2, 1, 3, string.rep("t", 10))
+		end,
+		function(row: string): string
+			return cell(row, 3, 3, 3, "x")
+		end,
+	} do
+		local h = harness()
+		h.run()
+		h.greet()
+		local seen: any
+		h.client:window({ scope = 1, list = "a", table = Note }, function(st)
+			seen = st
+		end)
+		h.run()
+		local one, two = "\0\0\0\1" .. string.rep("1", 12), "\0\0\0\1" .. string.rep("2", 12)
+		h.tell(CELLS, "\0" .. cell(one, 2, 1, 1, h.client:_tag(1, "a") .. codec.u64(1)) .. bad(two))
+		assert(h.self.closes == 1, "the pipe was not let go of")
+		assert(#seen.rows == 1, "what came before it was not shown")
+	end
+end
+
 -- What is sent for an answer waits for it, and what another answer shows outlives the one that stops.
 do
 	local ASK, UNASK, ANSWER = 32, 33, 34

@@ -396,6 +396,23 @@ function bundleHas(body: Uint8Array, stamp: string): boolean {
   return false;
 }
 
+// Whether a cell is one a node could have sent: what the merge rule and placing read of it is there. One that is not, as
+// a bundle that says it holds more stamps than it does, is nonsense, and not to be looked through.
+function sound(kind: number, slot: number, body: Uint8Array): boolean {
+  switch (kind) {
+    case GRAVE:
+      return slot === 0;
+    case PLACE:
+      return slot >= 1 && slot <= 15 && body.length >= 24;
+    case VALUE:
+    case PIECE:
+      return slot >= 16;
+    case BUNDLE:
+      return slot >= 16 && body.length >= 4 && 4 + (((body[0] << 24) | (body[1] << 16) | (body[2] << 8) | body[3]) >>> 0) * 16 <= body.length;
+  }
+  return false;
+}
+
 // The merge rule. Returns whether the cell was news.
 function merge(row: Stored, slot: number, kind: number, stamp: string, body: Uint8Array, author?: Device): boolean {
   if (row.dead) return false;
@@ -1236,22 +1253,26 @@ export class Client {
     codec.varint(r);
     let id = "";
     const touched = new Set<Stored>();
-    while (r.pos < r.len) {
-      const tag = codec.u8(r);
-      if (tag < 128) id = codec.takeBinary(r, 16);
-      if (id === "") throw new codec.Malformed();
-      const slot = codec.u8(r);
-      const stamp = codec.takeBinary(r, 16);
-      const body = codec.bytes(r).slice();
-      this.#heard(stamp);
-      const row = this.#row(id);
-      touched.add(row);
-      for (const page of this.#pages.values()) page.stale?.get(id)?.add(stamp);
-      for (const a of this.#asked.values()) a.said?.get(id)?.add(stamp);
-      const author = tag & 64 ? this.#authors.get(codec.varint(r)) : undefined;
-      this.#accept(row, slot, tag % 64, stamp, body, author);
+    try {
+      while (r.pos < r.len) {
+        const tag = codec.u8(r);
+        if (tag < 128) id = codec.takeBinary(r, 16);
+        if (id === "") throw new codec.Malformed();
+        const slot = codec.u8(r);
+        const stamp = codec.takeBinary(r, 16);
+        const body = codec.bytes(r).slice();
+        const author = tag & 64 ? this.#authors.get(codec.varint(r)) : undefined;
+        if (!sound(tag % 64, slot, body)) throw new codec.Malformed();
+        this.#heard(stamp);
+        const row = this.#row(id);
+        touched.add(row);
+        for (const page of this.#pages.values()) page.stale?.get(id)?.add(stamp);
+        for (const a of this.#asked.values()) a.said?.get(id)?.add(stamp);
+        this.#accept(row, slot, tag % 64, stamp, body, author);
+      }
+    } finally {
+      this.#placeAll(touched); // what came before any nonsense is shown, as it is held
     }
-    this.#placeAll(touched);
   }
 
   #accept(row: Stored, slot: number, kind: number, stamp: string, body: Uint8Array, author?: Device): boolean {

@@ -116,6 +116,14 @@ function synced(h: ReturnType<typeof harness>, id: number, flags: number, lo: st
 
 const tick = () => new Promise<void>((done) => setTimeout(done, 0));
 
+// A cell as a node sends it: of a row first named, or of the row before it if that is "".
+function cellOf(row: string, kind: number, slot: number, n: number, body: string): string {
+  const w = codec.writer();
+  codec.putBinary(w, ch(kind) + row + ch(slot) + rep("\0", 15) + ch(n));
+  codec.putBytes(w, b(body));
+  return s(codec.written(w));
+}
+
 // A pipe that breaks while a page is still owed is asked for the same page, not for everything.
 {
   const h = harness();
@@ -375,6 +383,27 @@ for (const nonsense of [rep("\x80", 310) + "\0", "\0", "\x03\x02\0\0", "\x0c\x08
   assert.equal(first.body, "a");
   assert.equal(second.meta, undefined);
   assert.equal(second.title, "also");
+}
+
+// A cell no node could have sent is nonsense, and ends the pipe rather than be looked through: a bundle that says it holds
+// more stamps than it has, or is too short to say how many; a placement too short to say where; a value where only
+// placements go. What came before it is shown, as it is held.
+for (const bad of [
+  (row: string) => cellOf(row, 4, 17, 2, rep("p", 8)) + cellOf("", 5 + 128, 17, 3, "\x80\0\0\0"),
+  (row: string) => cellOf(row, 5, 17, 3, "ab"),
+  (row: string) => cellOf(row, 2, 1, 3, rep("t", 10)),
+  (row: string) => cellOf(row, 3, 3, 3, "x"),
+]) {
+  const h = harness();
+  h.run();
+  h.greet();
+  let seen!: State<typeof Note>;
+  h.client.window({ scope: 1, list: "a", table: Note }, (x) => (seen = x));
+  h.run();
+  const one = "\0\0\0\x01" + rep("1", 12), two = "\0\0\0\x01" + rep("2", 12);
+  h.tell(CELLS, "\0" + cellOf(one, 2, 1, 1, h.client.tag(1, "a") + codec.u64(1)) + bad(two));
+  assert.equal(h.self.closes, 1, "the pipe was not let go of");
+  assert.equal((seen as State<typeof Note>).rows.length, 1, "what came before it was not shown");
 }
 
 // Positions in a text are where they are shown, whatever its bytes: one that is not UTF-8 shows as one character.
