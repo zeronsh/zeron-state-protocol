@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|streams|aead]|nat|slow]
+# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|partial|streams|aead]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -165,6 +165,11 @@ bench)
 		node web/build.ts
 		node --expose-gc web/test/bench.ts ${3:-100000}
 		node web/test/browsers.ts bench
+	elif [ "${2:-}" = partial ]; then # a partial web device against a full one, in Node and Chrome, good network and poor: ./x bench partial [rows]
+		odin build zspd -out:build/zspd-speed$EXE -o:speed $STRICT
+		! stale web/src/node.wasm || web_wasm
+		web_deps
+		ZSPD=build/zspd-speed$EXE node web/test/browsers.ts partial ${3:-100000}
 	elif [ "${2:-}" = mirror ]; then # what structured state costs a client: ./x bench mirror [rows]
 		lune run luau/tests/mirror_bench.luau ${3:-2000}
 	elif [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]

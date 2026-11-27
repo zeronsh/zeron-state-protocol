@@ -407,7 +407,8 @@ const bench = async () => {
   console.log(`a streamed token, to another browser device through zspd's relay  ${ms(r.across)}`);
 };
 
-// Not a test, and not run unless named: `node test/browsers.ts partial [rows]`. A partial device against a full one, in
+// Not a test, and not run unless named: `./x bench partial [rows]`, which runs zspd as a relay is built, optimised: a
+// relay built for debugging is busy long after a big sync, and what connects then waits. A partial device against a full one, in
 // Node and in Chrome, on a big space (so many rows, and large texts), over a good network and a poor one: how soon the
 // end of a list is shown, how soon a large text is, and what each comes to hold, in memory and in storage.
 const partialBench = async () => {
@@ -424,7 +425,7 @@ const partialBench = async () => {
     { name: "good", slow: undefined },
     { name: "poor: 1.6 Mbit/s, 300 ms round trip", slow: { bytesPerSecond: 200_000, latency: 150 } },
   ];
-  for (const net of networks) {
+  for (const net of networks.filter((n) => !process.env.NET || n.name.startsWith(process.env.NET))) {
     const relay = await node("serve", join(TMP, `pb-${results.length}-relay`));
     const through = await proxy(relay.url, net.slow);
     const via = { key: relay.key, url: through.url };
