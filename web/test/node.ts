@@ -341,6 +341,48 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   assert.throws(() => node.setCredential("later"), /closed/);
 }
 
+// What a link straight to another device has to say once what it acknowledges is durable is said then: not when something
+// else next happens, which may be never.
+{
+  const loopback = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1);
+  const peers = new Map<number, (ip: Uint8Array, port: number, data: Uint8Array) => void>();
+  const datagrams = (port: number, out?: Uint8Array[]) => ({
+    port,
+    listen: (f: (ip: Uint8Array, port: number, data: Uint8Array) => void) => void peers.set(port, f),
+    send: (_ip: Uint8Array, to: number, data: Uint8Array) => {
+      out?.push(data);
+      const f = peers.get(to);
+      if (f) queueMicrotask(() => f(loopback, port, data));
+      else if (to === 9083) for (const [p, g] of peers) if (p !== port) queueMicrotask(() => g(loopback, port, data)); // a beacon
+    },
+    interfaces: () => [{ ip: loopback, broadcast: Uint8Array.of(127, 0, 0, 1) }],
+    close: () => void peers.delete(port),
+  });
+  const fromB: Uint8Array[] = [];
+  const a = await Node.open({ module, volume: new MemoryVolume(), datagrams: datagrams(40011), log: () => {} });
+  const b = await Node.open({ module, volume: new MemoryVolume(), datagrams: datagrams(40012, fromB), log: () => {} });
+  a.create();
+  a.admit(b.key, 1);
+  assert(b.adopt(a.store.kept("roster").latest!));
+  const ca = new Client({ connect: a.connect }), cb = new Client({ connect: b.connect });
+  const T = { v: columns.string(16) };
+  let got = 0;
+  const w = cb.window({ scope: 1, list: "udp", table: T, size: 10 }, (st) => (got = st.rows.length));
+  while (!ca.may(1, "write") || !cb.ready) await new Promise((done) => setTimeout(done, 1));
+  await new Promise((done) => setTimeout(done, 300)); // linked
+  await ca.write(1, (change) => change.insert(T, "udp", 1, { v: "x".repeat(3000) })); // more than a packet
+  for (let i = 0; i < 200 && got === 0; i++) await new Promise((done) => setTimeout(done, 5));
+  assert.equal(got, 1, "not had over the link");
+  await new Promise((done) => setTimeout(done, 400));
+  const before = fromB.length;
+  b.connect(() => {}, () => {})!.close(); // something else happens on b, which says nothing over the link of itself
+  await new Promise((done) => setTimeout(done, 100));
+  assert.equal(fromB.length, before, `${fromB.length - before} packets were waiting to be said until something else happened`);
+  w.stop(), ca.close(), cb.close();
+  await a.close();
+  await b.close();
+}
+
 // What it keeps is said in days and bytes, of none or more.
 for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinity }, { days: 1e15 }, { bytes: 2 ** 60 }]) {
   await assert.rejects(Node.open({ volume: new MemoryVolume(), module, full: false, keep, log: () => {} }), RangeError);

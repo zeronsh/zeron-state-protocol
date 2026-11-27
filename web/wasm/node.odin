@@ -794,6 +794,24 @@ sync :: proc() -> bool {
 	return synced
 }
 
+// What links have to say, over UDP and through relays; and then what every connection has to say, that included.
+@(private)
+flush_links :: proc(ids: []u32) {
+	links_flush()
+	#reverse for r, i in relayed {
+		relayed_flush(r)
+		if r.link.state == .Closed {
+			ordered_remove(&relayed, i) // given up, or closed, as it sent: let go now, not when next looked at
+			relayed_drop(r)
+		}
+	}
+	for id in ids {
+		if c := conns[id] or_else nil; c != nil {
+			conn_flush(c)
+		}
+	}
+}
+
 // Everything that follows from what has happened since the last call, once. Returns how many milliseconds until
 // there is something to do even if nothing happens; -1 for never, -2 if storage has failed and the node must stop.
 @(export)
@@ -827,20 +845,7 @@ tick :: proc "c" () -> f64 {
 			conn_flush(c) // which may let go of it
 		}
 	}
-	links_flush()
-	#reverse for r, i in relayed {
-		relayed_flush(r)
-		if r.link.state == .Closed {
-			ordered_remove(&relayed, i) // given up, or closed, as it sent: let go now, not when next looked at
-			relayed_drop(r)
-		}
-	}
-	// What links had to say through relays goes out at once.
-	for id in ids {
-		if c := conns[id] or_else nil; c != nil {
-			conn_flush(c)
-		}
-	}
+	flush_links(ids[:])
 	zsp.store_flush(&node.store)
 	if zsp.store_unsynced(&node.store) && sync_due == nil {
 		// At once, unless syncing would then be busy more than half the time: so one writer waits for one sync, and many
@@ -851,12 +856,9 @@ tick :: proc "c" () -> f64 {
 		if !sync() {
 			return -2
 		}
-		// What was waiting for it may now be said.
-		for id in ids {
-			if c := conns[id] or_else nil; c != nil {
-				conn_flush(c)
-			}
-		}
+		// What was waiting for it may now be said: to clients and relays, and over links, direct or through relays, whose
+		// acknowledgments wait for what they acknowledge to be durable as any do.
+		flush_links(ids[:])
 	}
 	pages_rest(&tree_pages)
 	pages_rest(&find_pages)
