@@ -2,7 +2,6 @@ package host
 
 import "core:crypto"
 import "core:encoding/hex"
-import "core:os"
 import "core:strings"
 
 // A save is written whole to a file of its own, its staging file, before it takes the place of what it saves. Its name
@@ -52,13 +51,10 @@ staging_named :: proc(name: string) -> bool {
 // Removes the staging files in a directory that a process left behind, ending mid-save: never one a save is writing,
 // here or in another process, which holds it until it has its place.
 staging_clear :: proc(dir: string) {
-	files, err := os.read_all_directory_by_path(dir, context.temp_allocator)
-	if err != nil {
-		return
-	}
-	for f in files {
-		if f.type == .Regular && staging_named(f.name) {
-			staging_remove_unheld(f.fullpath)
+	// By name alone, as most names are none: what is no regular file is not removed, as it cannot be held.
+	for name in dir_names(dir) {
+		if staging_named(name) {
+			staging_remove_unheld(file_in(dir, name))
 		}
 	}
 }

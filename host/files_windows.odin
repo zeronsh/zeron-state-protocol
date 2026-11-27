@@ -1,6 +1,9 @@
 package host
 
+foreign import kernel32 "system:Kernel32.lib"
+
 import win32 "core:sys/windows"
+import "core:os"
 import "core:time"
 
 // On Windows a file another has open, without having let it be deleted, cannot be replaced; and one being replaced
@@ -191,7 +194,6 @@ rename_file :: proc(handle: win32.HANDLE, to: []u16) -> bool {
 	}
 }
 
-@(private)
 File_Lock :: distinct win32.HANDLE
 
 // Holds a file's lock against every other process that takes it, until let go of: blocking until it is free.
@@ -208,6 +210,115 @@ file_lock :: proc(path: string) -> (lock: File_Lock, ok: bool) {
 		return
 	}
 	return File_Lock(handle), true
+}
+
+// A store's directory held: see hold.odin.
+Dir_Lock :: distinct win32.HANDLE
+
+// Holds the lock file of a store's directory, made if there is none, without waiting; or says why not.
+@(private)
+dir_lock :: proc(path: string) -> (lock: Dir_Lock, held: Hold) {
+	lock = Dir_Lock(win32.INVALID_HANDLE_VALUE)
+	name := win32.utf8_to_wstring(path, context.temp_allocator)
+	// Shared for reading and writing, as SQLite opens it, but never for deleting: a lock file removed while held, and made
+	// again, would be held again by another. One someone else has open otherwise, as a scanner may, is waited for a while.
+	handle := win32.INVALID_HANDLE_VALUE
+	start := time.tick_now()
+	for {
+		handle = win32.CreateFileW(name, win32.GENERIC_READ | win32.GENERIC_WRITE, win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE, nil, win32.OPEN_ALWAYS, win32.FILE_ATTRIBUTE_NORMAL, nil)
+		if handle != win32.INVALID_HANDLE_VALUE || !file_busy(win32.GetLastError()) || time.tick_since(start) >= FILE_BUSY_WAIT {
+			break
+		}
+		win32.Sleep(1)
+	}
+	if handle == win32.INVALID_HANDLE_VALUE {
+		return lock, .Failed
+	}
+	over := win32.OVERLAPPED {
+		Offset = LOCK_AT,
+	}
+	if !win32.LockFileEx(handle, win32.LOCKFILE_EXCLUSIVE_LOCK | win32.LOCKFILE_FAIL_IMMEDIATELY, 0, LOCK_SIZE, 0, &over) {
+		err := win32.GetLastError()
+		win32.CloseHandle(handle)
+		return lock, .In_Use if err == win32.ERROR_LOCK_VIOLATION else .Failed
+	}
+	return Dir_Lock(handle), .Held
+}
+
+// Whether what is at a path is on a file system shared with other machines, and what kind; and whether there is
+// anything there to ask of.
+@(private)
+path_remote :: proc(path: string) -> (remote: bool, kind: string, found: bool) {
+	name := win32.utf8_to_wstring(path, context.temp_allocator)
+	handle := win32.CreateFileW(name, win32.FILE_READ_ATTRIBUTES, win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE, nil, win32.OPEN_EXISTING, win32.FILE_FLAG_BACKUP_SEMANTICS, nil)
+	if handle == win32.INVALID_HANDLE_VALUE {
+		return
+	}
+	defer win32.CloseHandle(handle)
+	return file_remote(name, handle), "a network share", true
+}
+
+// The names in a directory, for this turn: as the system lists them, with nothing more asked of each.
+@(private)
+dir_names :: proc(dir: string) -> []string {
+	files, err := os.read_all_directory_by_path(dir, context.temp_allocator)
+	if err != nil {
+		return nil
+	}
+	names := make([]string, len(files), context.temp_allocator)
+	for f, i in files {
+		names[i] = f.name
+	}
+	return names
+}
+
+// Lets go of a store's directory, its files being closed already.
+dir_unlock :: proc(lock: Dir_Lock) {
+	over := win32.OVERLAPPED {
+		Offset = LOCK_AT,
+	}
+	win32.UnlockFileEx(win32.HANDLE(lock), 0, LOCK_SIZE, 0, &over)
+	win32.CloseHandle(win32.HANDLE(lock))
+}
+
+// Whether a file is of another machine's: as the system says of the drive its path is on, a mapped one or a share; or as
+// Node's fs.realpathSync.native finds it, by the path the system has for what was opened, through every link, which is a
+// share's (\\?\UNC\server\share\...) for a file of another machine's.
+@(private)
+file_remote :: proc(name: cstring16, handle: win32.HANDLE) -> bool {
+	DRIVE_REMOTE :: 4
+	VOLUME_NAME_DOS :: 0
+	n := win32.GetFinalPathNameByHandleW(handle, nil, 0, VOLUME_NAME_DOS)
+	if n > 0 {
+		final := make([]u16, n, context.temp_allocator)
+		got := win32.GetFinalPathNameByHandleW(handle, cstring16(raw_data(final)), n, VOLUME_NAME_DOS)
+		if got > 0 && got < n && unc(final[:got]) {
+			return true
+		}
+	}
+	room: [win32.MAX_PATH + 1]u16
+	return bool(GetVolumePathNameW(name, cstring16(raw_data(room[:])), len(room))) && GetDriveTypeW(cstring16(raw_data(room[:]))) == DRIVE_REMOTE
+}
+
+@(private = "file")
+unc :: proc(path: []u16) -> bool {
+	UNC :: `\\?\UNC\`
+	if len(path) < len(UNC) {
+		return false
+	}
+	for c, i in transmute([]u8)string(UNC) {
+		upper := path[i] - 32 if path[i] >= 'a' && path[i] <= 'z' else path[i]
+		if upper != u16(c) {
+			return false
+		}
+	}
+	return true
+}
+
+@(default_calling_convention = "system", private = "file")
+foreign kernel32 {
+	GetVolumePathNameW :: proc(lpszFileName: cstring16, lpszVolumePathName: cstring16, cchBufferLength: win32.DWORD) -> win32.BOOL ---
+	GetDriveTypeW :: proc(lpRootPathName: cstring16) -> win32.UINT ---
 }
 
 @(private)

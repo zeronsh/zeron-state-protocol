@@ -4,7 +4,6 @@ import "core:crypto"
 import "core:encoding/hex"
 import "core:fmt"
 import "core:net"
-import "core:os"
 import "core:path/filepath"
 import "core:sync"
 import "core:time"
@@ -53,6 +52,7 @@ Host :: struct {
 	waker:        Waker, // what host_stop wakes the loop by
 	methods:      map[string]Host_Method, // that the host answers itself, in-process: see host_serve
 	accepting:    ^nbio.Operation,
+	lock:         Dir_Lock, // of dir, held from host_init until host_destroy: see hold.odin
 }
 
 Space :: struct {
@@ -77,17 +77,23 @@ file_in :: proc(dir, name: string) -> string {
 	return path
 }
 
-// This machine's secret, created on first use.
+// This machine's secret, created on first use: by whoever holds the directory (see hold.odin), as `held` says the caller
+// does, or else holds it for the while, as a node starting does. Two making it at once would each go on with its own,
+// and only one would be kept.
 @(require_results)
-device_secret :: proc(dir: string) -> (secret: zsp.Key32, ok: bool) {
+device_secret :: proc(dir: string, held := false) -> (secret: zsp.Key32, ok: bool) {
 	path := file_in(dir, "device.key")
 	staging_clear(dir) // whatever a process that ended mid-save left there, as of zspd's files beside this one
 	if data, read := read_file(path, context.temp_allocator); read {
 		copy(secret[:], data)
 		return secret, len(data) == 32
 	}
-	if err := os.make_directory_all(dir); err != nil && !os.is_dir(dir) {
-		return
+	if !held {
+		start := dir_starting(dir) or_return
+		defer dir_started(start)
+		lock := dir_hold(dir) or_return
+		defer dir_unlock(lock)
+		return device_secret(dir, true) // made, it may be, by another meanwhile
 	}
 	crypto.rand_bytes(secret[:])
 	return secret, save(path, secret[:])
@@ -105,7 +111,8 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 	s.host = h
 	name := string(hex.encode(id[:], context.temp_allocator))
 	s.dir, _ = filepath.join({h.dir, name})
-	if !file_disk_open(&s.disk, s.dir) {
+	if !file_disk_open(&s.disk, s.dir, true) {
+		delete(s.dir)
 		free(s)
 		return nil
 	}
@@ -120,6 +127,9 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 	}
 	s.node.now = now_ms()
 	if !zsp.node_init(&s.node, file_disk(&s.disk), id, keys, h.full || h.relay) {
+		file_disk_close(&s.disk) // and with it the directory, which a later try would find held
+		zsp.keyring_destroy(&s.keys)
+		delete(s.dir)
 		free(s)
 		return nil
 	}
@@ -260,9 +270,15 @@ now_us :: proc() -> pipe.Time {
 	return pipe.Time(time.tick_now()._nsec / 1000)
 }
 
-host_init :: proc(h: ^Host, config: Config) -> bool {
+// Holds the directory before anything in it is read or written, and lets go of it should anything fail: whoever comes
+// second to a directory is told it is in use, and touches nothing there.
+host_init :: proc(h: ^Host, config: Config) -> (started: bool) {
 	h.config = config
-	h.secret = device_secret(h.dir) or_return
+	h.lock = dir_hold(h.dir) or_return
+	defer if !started {
+		dir_unlock(h.lock)
+	}
+	h.secret = device_secret(h.dir, true) or_return
 	h.device = zsp.x25519_public(h.secret)
 	h.shared = make([]byte, SHARED_BUFFER)
 	// The event loop's first failure is its last, for the thread: so whether it can be made is found out first. Where it
@@ -360,6 +376,7 @@ host_destroy :: proc(h: ^Host) {
 	delete(h.methods)
 	waker_destroy(h)
 	nbio.release_thread_event_loop()
+	dir_unlock(h.lock) // last, once all it kept is written and let go of
 }
 
 @(private)

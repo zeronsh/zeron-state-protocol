@@ -4,6 +4,9 @@
   "description": "A Zeron State Protocol device in a browser or Node: the node compiled to WebAssembly, and a client in TypeScript",
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=24.15"
+  },
   "exports": {
     ".": {
       "node": "./src/nodejs.ts",

@@ -22,25 +22,48 @@ File_Disk :: struct {
 	reading: ^os.File, // the segment last read, if another
 	read_no: u64,
 	dirty:   bool,
+	hold:    bool, // the directory, from before anything in it is read or written: see hold.odin
+	lock:    Maybe(Dir_Lock),
+	look:    bool, // only: nothing is made, nor opened to be written
 }
 
-// Nothing is created until there is something to keep: merely asking about a space leaves no trace.
-file_disk_open :: proc(d: ^File_Disk, dir: string) -> bool {
+// Nothing is created until there is something to keep: merely asking about a space leaves no trace. With `hold`, the
+// directory is held from then on, until the disk is closed, as by whoever keeps a store there; without, as by a command
+// that only looks, it is not. What was opened of it is let go of should opening fail.
+file_disk_open :: proc(d: ^File_Disk, dir: string, hold := false) -> bool {
 	d.dir = strings.clone(dir)
 	d.number = max(u64)
 	d.read_no = max(u64)
-	return !os.exists(dir) || file_disk_make(d)
+	d.hold = hold
+	if os.exists(dir) && !file_disk_make(d) {
+		file_disk_close(d)
+		return false
+	}
+	return true
 }
 
 file_disk_make :: proc(d: ^File_Disk) -> bool {
 	if d.tree != nil {
 		return true
 	}
-	if err := os.make_directory_all(d.dir); err != nil && !os.is_dir(d.dir) {
-		return false
-	}
 	path, _ := filepath.join({d.dir, "tree"}, context.temp_allocator)
 	err: os.Error
+	if d.look {
+		if !os.exists(path) {
+			return true // no pages, and perhaps a log
+		}
+		d.tree, err = os.open(path, {.Read})
+		if err != nil {
+			d.tree = nil
+			return false
+		}
+		return file_remap(d)
+	}
+	if d.hold && d.lock == nil {
+		d.lock = dir_hold(d.dir) or_return // which makes it
+	} else if err = os.make_directory_all(d.dir); err != nil && !os.is_dir(d.dir) {
+		return false
+	}
 	d.tree, err = os.open(path, {.Read, .Write, .Create}, os.Permissions{.Read_User, .Write_User})
 	if err != nil {
 		d.tree = nil
@@ -235,24 +258,32 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			return err == nil && (int(size) == len(d.mapped) || file_remap(d))
 		},
 		close = proc(data: rawptr) {
-			d := (^File_Disk)(data)
-			if d.mapped != nil {
-				virtual.unmap_file(d.mapped)
-			}
-			for f in ([]^os.File{d.tree, d.active, d.reading}) {
-				if f != nil {
-					os.close(f)
-				}
-			}
-			delete(d.dir)
-			d^ = {}
+			file_disk_close((^File_Disk)(data))
 		},
 	}
 }
 
-// The latest stamp time a closed store has seen, as of its last checkpoint.
+// Lets go of all a disk has open, and last of its directory, if held.
+file_disk_close :: proc(d: ^File_Disk) {
+	if d.mapped != nil {
+		virtual.unmap_file(d.mapped)
+	}
+	for f in ([]^os.File{d.tree, d.active, d.reading}) {
+		if f != nil {
+			os.close(f)
+		}
+	}
+	if lock, held := d.lock.?; held {
+		dir_unlock(lock)
+	}
+	delete(d.dir)
+	d^ = {}
+}
+
+// The latest stamp time a store nobody is running has seen, as its pages and log say: only looked at, nothing made.
 clock_of :: proc(dir: string) -> u64 {
 	d: File_Disk
+	d.look = true
 	if !os.exists(dir) || !file_disk_open(&d, dir) {
 		return 0
 	}

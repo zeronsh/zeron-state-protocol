@@ -71,7 +71,7 @@ web_test() {
 	cd web
 	# Each said failed should it fail: web_test runs as part of `... || echo web`, where sh ignores set -e, so a test
 	# that failed and was not said so would pass.
-	for t in client node worker "vectors ../vectors/vectors.json" streams ask utf8 store_cases mirror_edge package udp find_memory; do
+	for t in client node worker "vectors ../vectors/vectors.json" streams ask utf8 store_cases mirror_edge package udp find_memory hold; do
 		set -- $t
 		node "test/$1.ts" ${2:+"$2"} || echo "web-$1" >>../build/failed
 	done

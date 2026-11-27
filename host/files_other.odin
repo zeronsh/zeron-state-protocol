@@ -161,7 +161,6 @@ sync_file :: proc(fd: posix.FD) -> bool {
 }
 
 // Holds a file's lock against every other process that takes it, until let go of: blocking until it is free.
-@(private)
 File_Lock :: distinct posix.FD
 
 @(private)
@@ -182,5 +181,47 @@ file_lock :: proc(path: string) -> (lock: File_Lock, ok: bool) {
 
 @(private)
 file_unlock :: proc(lock: File_Lock) {
+	posix.close(posix.FD(lock)) // which lets go of the lock
+}
+
+// A store's directory held: see hold.odin.
+Dir_Lock :: distinct posix.FD
+
+// Holds the lock file of a store's directory, made if there is none, without waiting; or says why not.
+@(private)
+dir_lock :: proc(path: string) -> (lock: Dir_Lock, held: Hold) {
+	// Readable by nobody else, who could otherwise hold it too and so keep every node from the store. Never a link,
+	// followed to wherever it leads.
+	fd := open_file(strings.clone_to_cstring(path, context.temp_allocator), {.RDWR, .CREAT, .CLOEXEC, .NOFOLLOW})
+	if fd < 0 {
+		return Dir_Lock(-1), .Failed
+	}
+	if held = lock_held(fd); held != .Held {
+		posix.close(fd)
+		return Dir_Lock(-1), held
+	}
+	return Dir_Lock(fd), .Held
+}
+
+// The names in a directory, for this turn, as cheaply as they can be had: without asking anything of what each is.
+@(private)
+dir_names :: proc(dir: string) -> []string {
+	d := posix.opendir(strings.clone_to_cstring(dir, context.temp_allocator))
+	if d == nil {
+		return nil
+	}
+	defer posix.closedir(d)
+	names := make([dynamic]string, context.temp_allocator)
+	for {
+		e := posix.readdir(d)
+		if e == nil {
+			return names[:]
+		}
+		append(&names, strings.clone(string(cstring(raw_data(e.d_name[:]))), context.temp_allocator))
+	}
+}
+
+// Lets go of a store's directory, its files being closed already.
+dir_unlock :: proc(lock: Dir_Lock) {
 	posix.close(posix.FD(lock)) // which lets go of the lock
 }

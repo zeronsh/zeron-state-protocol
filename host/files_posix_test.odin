@@ -39,8 +39,17 @@ files_lock_waits_through_signals :: proc(t: ^testing.T) {
 	lock := strings.clone_to_cstring(file_in(dir, "roster.lock"), context.temp_allocator)
 	ready: [2]posix.FD
 	testing.expect(t, posix.pipe(&ready) == .OK)
+	limit: posix.rlimit
+	posix.getrlimit(.NOFILE, &limit)
 	child := posix.fork()
 	if child == 0 {
+		// None of the files of the tests beside this one: a store's directory another holds (see hold.odin) would be
+		// held by this child too, until it ended.
+		for fd in 3 ..< posix.FD(min(limit.rlim_cur, 1 << 20)) {
+			if fd != ready[1] {
+				posix.close(fd)
+			}
+		}
 		fd := posix.open(lock, {.RDWR, .CREAT, .CLOEXEC}, posix.mode_t{.IRUSR, .IWUSR})
 		if fd < 0 || posix.lockf(fd, .LOCK, 0) != .OK {
 			posix._exit(1)

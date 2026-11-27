@@ -209,6 +209,14 @@ answers with `pong`, and the Durable Object answers without waking (SPEC.md §7)
 **A device governs its space as zspd does.** `create`, `scope`, `admit`, `revoke`, `subject`, `admin`, `owner` and `relay` sign a new
 roster, adopt it and say it to everyone.
 
+**In Node, a device's directory is its own.** As a browser's store is held by its Web Lock, a Node device holds its directory
+from its first use until it is closed, against every other process and every other device of its own process, by the very lock zspd
+takes on its own (host/hold.odin): so a second device there, or a zspd, is told the store is in use and touches nothing, as zspd is
+by it. The kernel lets go of the lock when the process ends, however it ends. Node has no file lock of its own to take: on Linux and
+Windows it is taken through the SQLite Node is built with (`node:sqlite`, which says nothing of itself from Node 24.15 on), on the
+bytes where SQLite keeps its locks, and elsewhere by opening the file with `O_EXLOCK`. A directory on a file system shared with other
+machines, where a lock may not hold, is refused, as zspd refuses it.
+
 ## Links
 
 In Node, a device links straight to others over UDP, as zspd does (SPEC.md §14): those that share a relay swap addresses through
@@ -230,6 +238,7 @@ builds `web/dist` (zsp.js, worker.js and node.wasm, side by side: each finds the
 | `test/mirror_model.ts` | structured state to its model, and what is asked about to what a node finds, as `luau/tests/mirror_model.luau` |
 | `test/store.ts` | what is said to be durable, through crashes at any moment, small segments, and files that open late |
 | `test/node.ts` | a device on its own |
+| `test/hold.ts` | a device's directory held against another device in this process and in another, and against zspd and zspd against it; let go of when its holder is killed; and refused on a file system other machines share |
 | `test/end_to_end.ts` | `test/live.ts`, which is `luau/tests/live.luau`, over every way devices meet: the client of zspd; partial and full web devices with zspd devices through zspd's relay and the Durable Object; two partial web devices; structured state, with and without a full replica that can read; a space a web device governs; keepalive; direct links, and beacons with no relay; and a partial device's windows, offline life, keeping and letting go, and questions with nobody to ask |
 | `test/browsers.ts` | headless Chrome: the live suite against a zspd device and between browser devices through the Durable Object, partial as browsers' are; tabs sharing a device and handing it on; a device the same after a restart, with no relay; a partial device's first window, offline life and restart, and its store opened full and partial again |
 | `test/worker.ts` | `src/worker.ts` and the store in Node, with the origin's file system, Web Locks and BroadcastChannel as a browser has them: a file held by another waited for, two seconds on end and afresh each time, and the store said to be locked, as it is when whatever holds its lock answers nothing, or is stuck, to asks and pipes alike, asked once by many, and one that holds it again saying it is there when first asked; the lock let go of, and nothing more said there, whatever stopping a node, or closing it, throws; the lock let go of only once no file is open or being opened, whether the node fails as it opens or in its first turn, or is closed as it opens; a file that cannot be closed keeping none other open; one store however its name is written; a place in line given up; every file closed at once as the worker is put away; a worker closed or put away waiting on nobody, and telling nobody anything, though it held the store as a pipe it carried went unanswered, waited on a holder that answers nothing, had timers set, or was put away before its node's first turn, which then failed; a tab closing its device telling no client a time is up; a pipe carried as a failed node lets go waited on as asks are; a pipe broken off unanswered waited on only until the holder is heard from after; every way the holder changes (the one before saying nothing, or that it failed, and the next another worker or the one waiting) ending all of waiting on the one before, and the next asked whether it is there afresh; a new leader that then answers nothing given up on as soon as any holder is, though what the one before may have done is said to have failed as it is heard of; and a credential refused, and a pipe broken, by a worker whose store's name names none |

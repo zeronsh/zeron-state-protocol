@@ -296,6 +296,12 @@ device it no longer allows gives up its keys.
 13 Error   code (1): 1 malformed, 2 denied, 3 version, 4 failed, 5 clock.  The sender closes.
 ```
 
+**Durable** is said of what a replica's own store keeps, and a store is one writer's: two processes writing one store at once each
+overwrite what the other wrote and acknowledge what is lost. An implementation therefore holds its store against every other process,
+and every other part of its own, for as long as it runs a node on it, and one that finds it held refuses it rather than open it. A
+lock taken on a file system shared with other machines may not be seen by them, or may be lost while held, so a store is kept on a
+disk of the machine's own, and an implementation refuses a store it can tell is not.
+
 A peer that is a full replica is sent everything its dialler commits. Otherwise a session is sent what it watches. A partial replica keeps owing a row
 named in an Ack.
 
