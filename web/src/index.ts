@@ -54,6 +54,12 @@ export interface Device {
   members(): Promise<Member[]>;
   /** What it costs: how much it holds, about, in bytes, which a partial replica's `keep.bytes` bounds; and the memory its node has. */
   usage(): Promise<{ held: number; memory: number }>;
+  /**
+   * Presents this to relays from now on, rather than the credential it was opened with: as when that has expired. In a
+   * browser, whichever tab's worker runs the device takes it, and so does any that runs it later, until a newer one is
+   * given; a tab opening the device with a credential gives it too. It is kept in memory only, and said to no other tab.
+   */
+  setCredential(credential: string | Uint8Array): Promise<void>;
   /** Opens a pipe to the node, for a client of your own making. */
   readonly connect: Connect;
   /** A client of the node. */

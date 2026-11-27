@@ -65,19 +65,20 @@ export class Chrome {
     };
   }
 
-  static async launch(): Promise<Chrome> {
+  /** With `throttled`, hidden tabs are held back as Chrome holds them back for anyone, and `flags` are added. */
+  static async launch(options: { throttled?: boolean; flags?: string[] } = {}): Promise<Chrome> {
     const bin = findChrome();
     if (!bin) throw new Error("no Chrome here: set CHROME to where it is");
     try {
-      return await Chrome.#launch(bin, []);
+      return await Chrome.#launch(bin, options.flags ?? [], options.throttled === true);
     } catch (e) {
       // A machine may not give a browser what its sandbox is made of; nothing but the tests' own page is loaded here.
       if (!/sandbox/i.test(String(e))) throw e;
-      return await Chrome.#launch(bin, ["--no-sandbox"]);
+      return await Chrome.#launch(bin, [...(options.flags ?? []), "--no-sandbox"], options.throttled === true);
     }
   }
 
-  static async #launch(bin: string, more: string[]): Promise<Chrome> {
+  static async #launch(bin: string, more: string[], throttled: boolean): Promise<Chrome> {
     const profile = mkdtempSync(join(tmpdir(), "zsp-chrome-"));
     // Every page here is a tab of one window, so all but the last opened are hidden; and the first, hidden as soon as a
     // second opens, is most often the one whose worker runs the node. A hidden tab's timers are held back, and on macOS
@@ -85,7 +86,7 @@ export class Chrome {
     // in milliseconds took tens of seconds (browser_tabs 5 to 30 s, against 1.5 to 5 s with these, on CI's macOS):
     // which is Chrome's scheduling of tabs nobody is looking at, not what these tests are of.
     const background = ["--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"];
-    const flags = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-gpu", ...background, ...more];
+    const flags = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-gpu", ...(throttled ? [] : background), ...more];
     const p = spawn(bin, [...flags, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
     const url = await new Promise<string>((resolve, reject) => {
       let err = "";

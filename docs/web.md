@@ -120,6 +120,28 @@ rather than go on with what may be lost, every tab is told, and what was asked o
 whose node stopped, or could not start, breaks the pipes it carried, and gets in line for the store again when its tab next wants
 the device, as its clients dialling again do: so the device runs again once it can, and is tried no more often than they dial.
 
+**A tab that is frozen, or put away in the back/forward cache, lets go of the device.** A browser freezes a tab hidden for long,
+and keeps one left for another page to go back to, and a frozen worker answers nothing while it holds the store's lock and its
+files: every other tab of the origin would wait for it to come back, which it may never do. It cannot let go of them itself, for
+a worker is frozen the moment its tab is, in the midst of whatever it was doing; so as its tab freezes, or is left, the tab stops
+it, which lets go of the store as a closed tab does, losing nothing, and breaks the tab's pipes; and starts another once it is
+back, which its clients dial again. A question asked of the device as it went, if it may have been done, is said to have failed
+rather than done twice. And a pipe carried to the leader that hears nothing from it in three seconds is broken off, and its
+client dials again, so that nothing is waited for for ever, whatever went astray.
+
+**Timers are kept by the worker.** A browser holds back a hidden tab's timers, to the second, and when it has used up its
+wake-ups to the minute; a worker's it does not. So the clients `device.client()` makes keep time by their device's worker: a
+hidden tab seals what it types when it should, and dials again when it should. The node itself waits for nothing by a timer
+but what it has to wait for: a pipe waiting for room is given its turn by a message, never by a timer, and nothing waits behind it.
+
+**A credential can be changed as it expires.** `device.setCredential(credential)` presents another to relays from now on, as an
+application does when the one it opened the device with, a JWT of hours, is about to expire; a tab that opens the device with a
+credential gives it too. The worker running the node takes it, and dials again at once any relay that has not let the device
+in, or that it is waiting to try again; a session already let in goes on, and presents the new one when it is next dialled. Every
+worker hears of every credential given, so whichever runs the node next presents the newest any tab gave. It is kept in memory
+only, never written down, and said to no tab: only to the workers of the origin, which may open the device and do as they like
+with it anyway, as anything of the origin may.
+
 **Files open in their own time in a browser, but the store writes when it writes.** So segments of the log are opened two ahead of
 need. Should writing outrun that, what is written to a segment not yet open is held in memory; should it have to be durable before
 its file is open, it goes into the journal, a file always open, and is written where it belongs when its file is; the journal is
@@ -161,5 +183,6 @@ builds `web/dist` (zsp.js, worker.js and node.wasm, side by side: each finds the
 | `test/node.ts` | a device on its own |
 | `test/end_to_end.ts` | `test/live.ts`, which is `luau/tests/live.luau`, over every way devices meet: the client of zspd; partial and full web devices with zspd devices through zspd's relay and the Durable Object; two partial web devices; structured state, with and without a full replica that can read; a space a web device governs; keepalive; direct links, and beacons with no relay; and a partial device's windows, offline life, keeping and letting go, and questions with nobody to ask |
 | `test/browsers.ts` | headless Chrome: the live suite against a zspd device and between browser devices through the Durable Object, partial as browsers' are; tabs sharing a device and handing it on; a device the same after a restart, with no relay; a partial device's first window, offline life and restart, and its store opened full and partial again |
+| `test/tabs.ts` | headless Chrome, with tabs as browsers treat them: the tab running the device frozen, put in the back/forward cache, or next in line while frozen; a pipe the leader never heard of; credentials changed by any tab, through a hand-over and after; a tab whose timers are held back sealing what it types; and a node in a hidden page answering at once |
 
-Chrome is found where the platform keeps it, or at `$CHROME`; without it, `test/browsers.ts` says so and passes, but in CI it fails.
+Chrome is found where the platform keeps it, or at `$CHROME`; without it, `test/browsers.ts` and `test/tabs.ts` say so and pass, but in CI they fail.

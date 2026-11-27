@@ -22,14 +22,41 @@ export interface Options {
   wasm?: string;
 }
 
-/** What a tab tells its worker. */
-export type Command = { open: Options } | { connect: MessagePort } | { ask: number; op: Op; args: unknown[] };
+/**
+ * What a tab tells its worker: to open the store, a pipe, a question; and to say when so many milliseconds are up, or no
+ * longer, for a tab's timers are held back while it is hidden and a worker's are not.
+ */
+export type Command =
+  | { open: Options }
+  | { connect: MessagePort }
+  | { ask: number; op: Op; args: unknown[] }
+  | { after: number; ms: number }
+  | { cancel: number };
 
 /** What a device can be asked to do, by whichever tab. */
-export type Op = "identity" | "join" | "adopt" | "member" | "create" | "scope" | "admit" | "revoke" | "subject" | "admin" | "owner" | "relay" | "members" | "usage" | "close";
+export type Op =
+  | "identity"
+  | "join"
+  | "adopt"
+  | "member"
+  | "create"
+  | "scope"
+  | "admit"
+  | "revoke"
+  | "subject"
+  | "admin"
+  | "owner"
+  | "relay"
+  | "members"
+  | "usage"
+  | "credential"
+  | "close";
 
-/** What a worker tells its tab: an answer; that the node has stopped, its storage having failed; or the space it is of. */
-export type Report = { answer: number; value?: unknown; error?: string } | { failed: string } | { space: string | undefined };
+/**
+ * What a worker tells its tab: an answer; that the node has stopped, its storage having failed; the space it is of; or
+ * that a time asked for is up. Never a credential: the tab that gave one has it, and no other tab is given it.
+ */
+export type Report = { answer: number; value?: unknown; error?: string } | { failed: string } | { space: string | undefined } | { due: number };
 
 // Between workers, on the store's channel.
 type Shout =
@@ -38,7 +65,18 @@ type Shout =
   | { space: string | undefined } // the space the device is of, now
   | { open: string } // a pipe, on the channel of that name
   | { ask: string; op: Op; args: unknown[] }
-  | { answer: string; value?: unknown; error?: string };
+  | { answer: string; value?: unknown; error?: string }
+  | Given; // a credential a tab has given, for whichever worker runs the node now and later
+
+// The credential to present to relays: whichever a tab gave last, of those this worker has heard of. Every worker hears
+// of every one given while it lives, and is given its own tab's as it starts, which is newer than any given before: so
+// whichever runs the node next has the newest there is. `at` orders them, a clock no worker's is behind; `by` breaks ties.
+type Given = { credential: string | Uint8Array; at: number; by: string };
+let newest: Given | undefined;
+const me = crypto.randomUUID();
+
+/** How long a pipe carried to the leader waits to hear from it, before it is broken off and its client dials again. */
+const HEARD_WITHIN = 3000;
 
 /** On a pipe: from its client's end, data and credit; from the node's, data. Either may close it. */
 export type Say = { data: Uint8Array } | { credit: number } | { close: true };
@@ -49,10 +87,16 @@ const carried = new Set<() => void>(); // pipes carried to the leader: how to br
 const waiting = new Map<string, (answer: { value?: unknown; error?: string }) => void>();
 const unheard = new Map<string, Shout>(); // said to the leader, and not yet answered
 
+const timers = new Map<number, ReturnType<typeof setTimeout>>(); // the tab's
+
 self.onmessage = async (e: MessageEvent<Command>) => {
   const c = e.data;
   if ("open" in c) open(c.open);
   else if ("connect" in c) connect(c.connect);
+  else if ("after" in c) {
+    const id = c.after;
+    timers.set(id, setTimeout(() => (timers.delete(id), self.postMessage({ due: id } satisfies Report)), c.ms));
+  } else if ("cancel" in c) clearTimeout(timers.get(c.cancel)), timers.delete(c.cancel);
   else if ("ask" in c) self.postMessage({ answer: c.ask, ...(await ask(c.op, c.args)) } satisfies Report);
 };
 
@@ -63,7 +107,34 @@ function open(o: Options): void {
   options = o;
   channel = new BroadcastChannel("zsp:" + o.name);
   channel.onmessage = (e: MessageEvent<Shout>) => heard(e.data);
+  if (o.credential !== undefined) give(o.credential);
   contend();
+}
+
+// This tab's credential, newer than any given before: to the node, if it runs here, and to every other worker.
+function give(credential: string | Uint8Array): void {
+  const given: Given = { credential, at: Math.max(Date.now(), (newest?.at ?? 0) + 1), by: me };
+  newest = given;
+  present();
+  channel.postMessage(given satisfies Shout);
+}
+
+// To the node running here, if it is: one that has stopped presents nothing, and the next is opened with the newest.
+function present(): void {
+  try {
+    device?.setCredential(newest!.credential);
+  } catch {
+    // stopped, and so about to be let go of
+  }
+}
+
+// Another tab's: taken if it is newer than any this worker knows of. Anything on the channel is of this origin, which may
+// open the device and do as it likes with it anyway; but what is not a credential is not taken as one.
+function heardGiven(g: Given): void {
+  if (!(typeof g.credential === "string" || g.credential instanceof Uint8Array) || !Number.isFinite(g.at) || typeof g.by !== "string") return;
+  if (newest && (g.at < newest.at || (g.at === newest.at && g.by <= newest.by))) return;
+  newest = g;
+  present();
 }
 
 // Gets in line for the store. Whoever holds its lock runs the node, for as long as its tab lives; one whose node stopped,
@@ -80,8 +151,10 @@ function contend(): void {
       const volume = await OpfsVolume.at("zsp/" + o.name);
       const module = await loadModule(o.wasm ? new URL(o.wasm, self.location.href) : undefined);
       // Partial unless told otherwise: a browser holds what its tabs watch and ask about, not the whole space.
-      const node = await Node.open({ volume, module, full: o.full === true, keep: o.keep, credential: o.credential });
+      const given = newest;
+      const node = await Node.open({ volume, module, full: o.full === true, keep: o.keep, credential: given?.credential });
       failed = new Promise((done) => (node.onFailure = done));
+      if (newest !== given) node.setCredential(newest!.credential); // given while it opened
       device = node;
     } catch (error) {
       contending = false;
@@ -124,6 +197,12 @@ function breakCarried(): void {
 // ---------------------------------------------------------------- the device, for any tab
 
 async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: string }> {
+  if (op === "credential") {
+    const c = args[0];
+    if (!(typeof c === "string" || c instanceof Uint8Array)) return { error: "a credential is a string or bytes" };
+    give(c);
+    return {};
+  }
   if (op === "close") {
     // This tab's device goes: if this worker runs the node, it is stopped as it should be, what it holds written down,
     // before the worker goes with the lock and another takes it. Another's node is not this tab's to stop.
@@ -184,6 +263,7 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
       case "usage":
         return { value: { held: d.held, memory: d.memory } };
       case "close":
+      case "credential":
         return {}; // see ask
     }
   } catch (e) {
@@ -214,6 +294,8 @@ function heard(s: Shout): void {
   } else if ("leader" in s) {
     breakCarried(); // to one that is gone
     for (const u of unheard.values()) if (!("open" in u)) channel.postMessage(u);
+  } else if ("by" in s) {
+    heardGiven(s);
   } else if ("answer" in s) {
     const done = waiting.get(s.answer);
     unheard.delete(s.answer);
@@ -243,12 +325,16 @@ function connect(port: MessagePort): void {
   let heardBack = false;
   const early: Say[] = [];
   let open = true;
+  // Should the leader not hear of it, or not answer, as one opening the store, closing it or frozen does not, the client
+  // is told it is broken: it dials again, and this worker, in line for the store, may by then have it.
+  let unanswered: ReturnType<typeof setTimeout> | undefined;
   // Held for as long as the pipe is: the leader waits for it, and so learns when this end has gone, tab and all.
   let letGo!: () => void;
   const held = new Promise<void>((done) => (letGo = done));
   const breakOff = () => {
     if (!open) return;
     open = false;
+    clearTimeout(unanswered);
     carried.delete(breakOff);
     unheard.delete(name);
     far.postMessage({ close: true } satisfies Say);
@@ -268,6 +354,7 @@ function connect(port: MessagePort): void {
     const say = e.data;
     if (!heardBack) {
       heardBack = true;
+      clearTimeout(unanswered);
       unheard.delete(name);
       for (const s of early.splice(0)) far.postMessage(s);
     }
@@ -275,7 +362,10 @@ function connect(port: MessagePort): void {
     else if ("data" in say) toTab(say);
   };
   void navigator.locks.request(name, () => {
-    if (open) shout(name, { open: name });
+    if (open) {
+      shout(name, { open: name });
+      unanswered = setTimeout(breakOff, HEARD_WITHIN);
+    }
     return held;
   });
 }

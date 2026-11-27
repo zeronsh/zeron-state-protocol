@@ -62,13 +62,13 @@ web_test() {
 	node test/package.ts
 	node test/udp.ts
 	node test/find_memory.ts
-	for t in text mirror_model mirror_interop store end_to_end browsers; do
+	for t in text mirror_model mirror_interop store end_to_end browsers tabs; do
 		args=
 		[ $t = store ] && args=../build/node-small.wasm
 		(node test/$t.ts $args >../build/web-$t.log 2>&1 || echo web-$t >>../build/failed) &
 	done
 	wait
-	for t in text mirror_model mirror_interop store end_to_end browsers; do
+	for t in text mirror_model mirror_interop store end_to_end browsers tabs; do
 		cat ../build/web-$t.log
 	done
 }

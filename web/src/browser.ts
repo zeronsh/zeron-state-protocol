@@ -32,60 +32,129 @@ export interface OpenOptions {
 
 /** Opens this origin's device of that name, making it if there is none. */
 export async function open(options: OpenOptions = {}): Promise<Device> {
-  const worker = new Worker(options.worker ?? new URL("./worker.js", import.meta.url), { type: "module", name: "zsp" });
+  const name = options.name ?? "default";
+  let credential = options.credential; // the newest this tab has given
+  // The worker: none while the tab is frozen or put away in the back/forward cache, for a frozen worker holds the store,
+  // and every tab of the origin would wait for this one to come back. It is stopped as the tab is, for it cannot stop
+  // itself in time, and that lets go of the store as a closed tab does; and it is started again when the tab is back.
+  let worker: Worker | undefined;
+  let state: "running" | "away" | "closed" = "running";
   let asked = 0;
-  const answers = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  const answers = new Map<number, { op: Op; args: unknown[]; resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  const pipes = new Set<() => void>(); // how to break each of this tab's pipes
+  const ports: MessagePort[] = []; // pipes asked for while away
+  let ticks = 0;
+  const timers = new Map<number, { f: () => void; due: number }>(); // the tab's clients', kept by the worker
+  let space: string | undefined;
+  let closing: Promise<void> | undefined;
+
   const fail = (error: Error) => {
     for (const a of answers.values()) a.reject(error);
     answers.clear();
     options.onFailure?.(error);
   };
-  worker.onerror = (e) => fail(new Error(e.message || "the worker could not be started"));
-  worker.onmessage = (e: MessageEvent<Report>) => {
-    const r = e.data;
-    if ("failed" in r) {
-      fail(new Error(r.failed));
-      return;
-    }
-    if ("space" in r) {
-      space = r.space;
-      return;
-    }
-    const a = answers.get(r.answer);
-    answers.delete(r.answer);
-    if (r.error !== undefined) a?.reject(new Error(r.error));
-    else a?.resolve(r.value);
+  const start = () => {
+    const w = (worker = new Worker(options.worker ?? new URL("./worker.js", import.meta.url), { type: "module", name: "zsp" }));
+    w.onerror = (e) => w === worker && fail(new Error(e.message || "the worker could not be started"));
+    w.onmessage = (e: MessageEvent<Report>) => {
+      if (w !== worker) return; // one stopped as the tab went away: what was on its way from it is not so now
+      const r = e.data;
+      if ("failed" in r) return fail(new Error(r.failed));
+      if ("space" in r) return void (space = r.space);
+      if ("due" in r) {
+        const t = timers.get(r.due);
+        timers.delete(r.due);
+        return t?.f();
+      }
+      const a = answers.get(r.answer);
+      answers.delete(r.answer);
+      if (r.error !== undefined) a?.reject(new Error(r.error));
+      else a?.resolve(r.value);
+    };
+    w.postMessage({ open: { name, full: options.full, keep: options.keep, credential, wasm: options.wasm?.toString() } } satisfies Command);
+    for (const [id, a] of answers) w.postMessage({ ask: id, op: a.op, args: a.args } satisfies Command);
+    for (const port of ports.splice(0)) w.postMessage({ connect: port } satisfies Command, [port]);
+    for (const [id, t] of timers) w.postMessage({ after: id, ms: Math.max(0, t.due - Date.now()) } satisfies Command);
   };
   const ask = <T>(op: Op, ...args: unknown[]): Promise<T> =>
     new Promise((resolve, reject) => {
-      answers.set(++asked, { resolve: resolve as (v: unknown) => void, reject });
-      worker.postMessage({ ask: asked, op, args } satisfies Command);
+      if (state === "closed") return reject(new Error("the device is closed"));
+      answers.set(++asked, { op, args, resolve: resolve as (v: unknown) => void, reject });
+      worker?.postMessage({ ask: asked, op, args } satisfies Command); // or once it is started again
     });
-  const command: Command = {
-    open: { name: options.name ?? "default", full: options.full, keep: options.keep, credential: options.credential, wasm: options.wasm?.toString() },
+  // What may be asked again of the next worker, as having been done or not it is the same; anything else may have been
+  // done, and is not done twice.
+  const again = new Set<Op>(["identity", "member", "members", "usage", "credential"]);
+  const away = () => {
+    if (state !== "running") return;
+    state = "away";
+    worker?.terminate();
+    worker = undefined;
+    for (const [id, a] of answers) {
+      if (a.op === "close") answers.delete(id), a.resolve(undefined); // stopped, as a closed tab's is
+      else if (!again.has(a.op)) answers.delete(id), a.reject(new Error("the tab was put away as this was asked, which may or may not have been done"));
+    }
+    for (const breakOff of [...pipes]) breakOff(); // every client here dials again, once the tab is back
   };
-  worker.postMessage(command);
-  let space: string | undefined;
-  let closing: Promise<void> | undefined;
+  const back = () => {
+    if (state !== "away") return;
+    state = "running";
+    start();
+    void ask<{ space?: string }>("identity").then((i) => (space = i.space), () => {}); // what it may have become meanwhile
+  };
+  const hidden = () => away();
+  const shown = (e: PageTransitionEvent) => e.persisted && back();
+  const listening = typeof document !== "undefined" && typeof addEventListener === "function";
+  if (listening) {
+    document.addEventListener("freeze", hidden);
+    document.addEventListener("resume", back);
+    addEventListener("pagehide", hidden);
+    addEventListener("pageshow", shown);
+  }
+  start();
   const identity = await ask<{ id: string; key: string; space?: string }>("identity");
   space ??= identity.space;
 
+  // Timers kept by the worker, which a browser does not hold back while the tab is hidden as it holds back the tab's own:
+  // a client here that seals what it types, or dials again, does so when it should though nobody is looking.
+  const after = (ms: number, f: () => void): (() => void) => {
+    const id = ++ticks;
+    timers.set(id, { f, due: Date.now() + ms });
+    worker?.postMessage({ after: id, ms } satisfies Command);
+    return () => {
+      if (timers.delete(id)) worker?.postMessage({ cancel: id } satisfies Command);
+    };
+  };
+
   const connect: Connect = (receive, closed) => {
+    if (state === "closed") return undefined;
     const { port1, port2 } = new MessageChannel();
     let open = true;
+    const end = () => {
+      open = false;
+      pipes.delete(breakOff);
+      port1.close();
+    };
+    const breakOff = () => {
+      if (!open) return;
+      end();
+      closed();
+    };
+    pipes.add(breakOff);
     port1.onmessage = (e: MessageEvent<Say>) => {
       const say = e.data;
       if (!open) return;
-      if ("close" in say) {
-        open = false;
-        port1.close();
-        closed();
-      } else if ("data" in say) {
-        receive(say.data);
-        port1.postMessage({ credit: say.data.length } satisfies Say); // dealt with
+      if ("close" in say) breakOff();
+      else if ("data" in say) {
+        try {
+          receive(say.data);
+        } finally {
+          port1.postMessage({ credit: say.data.length } satisfies Say); // dealt with, however it went
+        }
       }
     };
-    worker.postMessage({ connect: port2 } satisfies Command, [port2]);
+    if (worker) worker.postMessage({ connect: port2 } satisfies Command, [port2]);
+    else ports.push(port2);
     return {
       send: (data) => {
         // A copy, of its own, is handed over: what was given may be a view of something its giver goes on using.
@@ -95,9 +164,8 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       },
       close: () => {
         if (!open) return;
-        open = false;
         port1.postMessage({ close: true } satisfies Say);
-        port1.close();
+        end();
       },
     };
   };
@@ -127,12 +195,29 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     relay: (key: string, url: string) => ask<void>("relay", key, url),
     members: () => ask<Member[]>("members"),
     usage: () => ask<{ held: number; memory: number }>("usage"),
+    setCredential: async (c: string | Uint8Array) => {
+      credential = c; // for whichever worker this tab starts next
+      await ask<void>("credential", c);
+    },
     connect,
-    client: (host = {}) => new Client({ ...host, connect }),
+    client: (host = {}) => new Client({ after, ...host, connect }),
     // Once, however often asked: its node stopped as it should be, and then its worker let go of.
-    close: () => (closing ??= ask<void>("close").then(
-      () => worker.terminate(),
-      () => worker.terminate(),
-    )),
+    close: () =>
+      (closing ??= (async () => {
+        if (listening) {
+          document.removeEventListener("freeze", hidden);
+          document.removeEventListener("resume", back);
+          removeEventListener("pagehide", hidden);
+          removeEventListener("pageshow", shown);
+        }
+        const w = worker;
+        if (w && state === "running") await ask<void>("close").catch(() => {});
+        state = "closed";
+        w?.terminate();
+        worker = undefined;
+        for (const a of answers.values()) a.reject(new Error("the device is closed"));
+        answers.clear();
+        timers.clear();
+      })()),
   };
 }

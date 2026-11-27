@@ -46,6 +46,7 @@ export async function open(options: OpenOptions): Promise<Device & { readonly no
     relay: async (key: string, url: string) => node.relay(key, url),
     members: async () => node.members(),
     usage: async () => ({ held: node.held, memory: node.memory }),
+    setCredential: async (credential: string | Uint8Array) => node.setCredential(credential),
     connect: node.connect,
     client: (host = {}) => new Client({ ...host, connect: node.connect }),
     close: () => node.close(),

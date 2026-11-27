@@ -175,6 +175,14 @@ pages_destroy :: proc(p: ^Pages) {
 
 // ---------------------------------------------------------------- starting
 
+// What the buffer held of a secret, once it is copied where it is kept.
+@(private)
+wipe :: proc(size: int) {
+	if n := min(size, len(message)); n > 0 {
+		crypto.zero_explicit(raw_data(message), n)
+	}
+}
+
 // Where the host should put bytes for the next call.
 @(export)
 buffer :: proc "c" (size: int) -> [^]byte {
@@ -212,6 +220,7 @@ identity :: proc "c" (secret: ^zsp.Key32, into: [^]byte) {
 @(export)
 start :: proc "c" (full: bool, age, bytes: f64) -> bool {
 	context = ctx()
+	defer wipe(len(message)) // the secret and the credential, copied to where they are kept
 	r := zsp.Reader{buf = message[:]}
 	secret, space: zsp.Key32
 	copy(secret[:], zsp.read_take(&r, 32))
@@ -350,6 +359,36 @@ relay :: proc "c" (size: int) {
 	dial_relay(key, string(message[32:size]), true)
 }
 
+// The credential to present to relays from now on, in the buffer, which is wiped: one given by the host as the old one
+// expires. A relay that has not admitted this device yet, or is waiting to be tried again, is dialled again at once
+// with it; a session it has admitted already goes on as it is, and presents this one when it is next dialled.
+@(export)
+credential_set :: proc "c" (size: int) {
+	context = ctx()
+	defer wipe(size)
+	if !started {
+		return // the host gives it at the start
+	}
+	given := message[:size]
+	if len(credential) > 0 {
+		crypto.zero_explicit(raw_data(credential), len(credential))
+	}
+	delete(credential)
+	credential = make([]byte, size)
+	copy(credential, given)
+	t := now()
+	for d in dialers {
+		if c := d.conn; c != nil {
+			if c.session != nil && c.session.ready {
+				continue
+			}
+			conn_drop(c) // presenting the old one, or about to
+		}
+		d.failures = 0
+		d.due = t
+	}
+}
+
 // How long a connection to a relay may be quiet before it is pinged, and how long it then has to answer.
 @(export)
 keepalive :: proc "c" (idle, wait: f64) {
@@ -383,6 +422,11 @@ stop :: proc "c" () {
 	}
 	zsp.node_destroy(&node)
 	zsp.keyring_destroy(&keys)
+	if len(credential) > 0 {
+		crypto.zero_explicit(raw_data(credential), len(credential))
+	}
+	delete(credential)
+	credential = nil
 	for d in dialers {
 		delete(d.url)
 		free(d)

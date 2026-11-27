@@ -266,6 +266,81 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await node.close();
 }
 
+// A pipe waiting for room is given its turn after whatever else is waiting, and that holds nothing else back: not when
+// a timer would take a minute to go off, as a browser makes one take in a tab hidden for long, nor four milliseconds, as
+// it makes one set from another take. A client that comes meanwhile is answered at once.
+{
+  const node = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  node.create();
+  const writer = new Client({ connect: node.connect });
+  while (!writer.may(1, "write")) await new Promise((done) => setTimeout(done, 1));
+  await writer.write(1, (change) => {
+    for (let i = 0; i < 400; i++) change.insert({ more: columns.string(18) }, "big", i, { more: "x".repeat(2048) });
+  });
+  const set = globalThis.setTimeout;
+  let held = 0;
+  globalThis.setTimeout = ((f: () => void, ms?: number) => (ms ? set(f, ms) : (held++, set(f, 60000)))) as typeof setTimeout;
+  let answered = -1;
+  const reader = new Client({ connect: node.connect, after: (ms, f) => ((t) => () => clearTimeout(t))(set(f, ms)) });
+  let late: Client | undefined;
+  const asked = performance.now();
+  const w = reader.window({ scope: 1, list: "big", table: { more: columns.string(18) }, size: 400 }, (state) => {
+    // More than a pipe takes at once is on its way to the reader, which waits its turn for the rest: another comes now.
+    if (state.rows.length > 0 && !late) {
+      late = new Client({ connect: node.connect, after: (ms, f) => ((t) => () => clearTimeout(t))(set(f, ms)) });
+      late.on("status", (ready) => ready && answered < 0 && (answered = performance.now() - asked));
+    }
+  });
+  try {
+    for (const t = performance.now(); answered < 0 && performance.now() - t < 5000; ) await new Promise((done) => set(done, 5));
+  } finally {
+    globalThis.setTimeout = set;
+  }
+  assert(late, "the reader was sent nothing");
+  assert(answered >= 0 && answered < 1000, `a client that came while another waited for room was answered ${answered < 0 ? "not at all" : `after ${answered.toFixed(0)} ms`}`);
+  assert.equal(held, 0, "a turn was waited for by a timer");
+  w.stop();
+  reader.close();
+  late.close();
+  writer.close();
+  await node.close();
+}
+
+// A credential given as the old one expires is presented to a relay not yet letting the device in, which is dialled
+// again for it at once, however long it would otherwise have waited to try again.
+{
+  const dialled: number[] = [];
+  class Silent extends EventTarget {
+    binaryType = "arraybuffer";
+    readyState = 0;
+    bufferedAmount = 0;
+    onopen: (() => void) | null = null;
+    onmessage: ((e: { data: unknown }) => void) | null = null;
+    onclose: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor() {
+      super();
+      dialled.push(performance.now());
+      setTimeout(() => ((this.readyState = 1), this.onopen?.()), 1); // and then says nothing, as one judging a credential
+    }
+    send() {}
+    close() {
+      this.readyState = 3;
+    }
+  }
+  const node = await Node.open({ volume: new MemoryVolume(), module, log: () => {}, credential: "old", WebSocket: Silent as unknown as typeof WebSocket });
+  node.join("ab".repeat(32), { key: "cd".repeat(32), url: "ws://127.0.0.1:1" });
+  await new Promise((done) => setTimeout(done, 100));
+  assert.equal(dialled.length, 1);
+  const given = performance.now();
+  node.setCredential("new");
+  await new Promise((done) => setTimeout(done, 100));
+  assert.equal(dialled.length, 2, "not dialled again for the new credential");
+  assert(dialled[1] - given < 50, `dialled again ${(dialled[1] - given).toFixed(0)} ms after`);
+  await node.close();
+  assert.throws(() => node.setCredential("later"), /closed/);
+}
+
 // What it keeps is said in days and bytes, of none or more.
 for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinity }, { days: 1e15 }, { bytes: 2 ** 60 }]) {
   await assert.rejects(Node.open({ volume: new MemoryVolume(), module, full: false, keep, log: () => {} }), RangeError);

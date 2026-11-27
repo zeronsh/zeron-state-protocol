@@ -1,7 +1,9 @@
 // What a test page has, for test/browsers.ts to drive: devices of this origin, and the live suite.
 
-import { open, Client, columns, type Device, type State } from "../src/browser.ts";
-import type { Connect, Wire } from "../src/node.ts";
+import { open, Client, columns, type Device, type Editor, type State } from "../src/browser.ts";
+import { Node, type Connect, type Wire } from "../src/node.ts";
+import { MemoryVolume } from "../src/volume.ts";
+import { loadModule } from "../src/wasm.ts";
 import { live } from "./live.ts";
 
 const devices = new Map<string, Device>();
@@ -50,11 +52,18 @@ const Note = { title: columns.string(16) };
 const clients = new Map<string, Client>();
 const clientOf = (name: string) => {
   let c = clients.get(name);
-  if (!c) clients.set(name, (c = new Client({ connect: devices.get(name)!.connect, linger: 200 })));
+  if (!c) clients.set(name, (c = devices.get(name)!.client({ linger: 200 })));
   return c;
 };
 const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 const windows = new Map<string, { state?: State<typeof Note>; stop: () => void }>();
+
+const Doc = { body: columns.text(17) };
+const Big = { more: columns.string(18) };
+const editors: Editor[] = [];
+let shownText = "", textDropped = false;
+let pageNodeOf: Node | undefined;
+let pageNodeRows = 0;
 
 const zsp = {
   /** Opens this origin's device of a name; says its key. */
@@ -69,6 +78,10 @@ const zsp = {
   },
   async join(name: string, space: string, relay: { key: string; url: string }): Promise<void> {
     await devices.get(name)!.join(space, relay);
+  },
+  /** Presents this to relays from now on. */
+  async setCredential(name: string, credential: string): Promise<void> {
+    await devices.get(name)!.setCredential(credential);
   },
   async member(name: string): Promise<boolean> {
     return devices.get(name)!.member();
@@ -283,6 +296,61 @@ const zsp = {
     editor.close();
     reader.close();
     return { write: median(writes), bulk, page: median(pages), token: median(tokens), across: far ? median(across) : NaN };
+  },
+  /**
+   * From now on this page's timers go off a minute late, as Chrome makes those of a tab hidden for long go off, to the
+   * minute, when the tab has used up its wake-ups: its clients' timers, kept by its device's worker, are not.
+   */
+  async holdTimers(): Promise<void> {
+    const set = globalThis.setTimeout;
+    globalThis.setTimeout = ((f: () => void, ms?: number) => set(f, (ms ?? 0) + 60000)) as typeof setTimeout;
+  },
+  /** Starts a text in a new row of a list, and types into it; and leaves it open. */
+  async type(name: string, list: string, words: string[]): Promise<void> {
+    const c = clientOf(name);
+    let id = "";
+    await c.write(1, (change) => (id = change.insert(Doc, list, 1, {})));
+    const editor = c.text(id, Doc.body);
+    editors.push(editor);
+    for (const w of words) editor.append(w);
+  },
+  /** Watches the first text of a list: what it has shown, and whether it ever stopped showing it once it had. */
+  async watchText(name: string, list: string): Promise<void> {
+    clientOf(name).window({ scope: 1, list, table: Doc, size: 1 }, (st) => {
+      const body = st.rows[0]?.body ?? "";
+      if (shownText && !body) textDropped = true;
+      shownText = body || shownText;
+    });
+  },
+  async textSeen(): Promise<{ shown: string; dropped: boolean }> {
+    return { shown: shownText, dropped: textDropped };
+  },
+  /** A node in this very page, rather than a worker: with a list of big rows, so many that it waits for room to send them. */
+  async pageNode(rows: number): Promise<void> {
+    const node = await Node.open({ volume: new MemoryVolume(), module: await loadModule(new URL("/node.wasm", location.href)), log: () => {} });
+    node.create();
+    pageNodeOf = node;
+    const writer = new Client({ connect: node.connect });
+    while (!writer.may(1, "write")) await sleep(1);
+    for (let i = 0; i < rows; i += 100)
+      await writer.write(1, (change) => {
+        for (let k = i; k < i + 100; k++) change.insert(Big, "big", k, { more: "x".repeat(2048) });
+      });
+    writer.close();
+  },
+  /** A client of that node reads the whole list: it is sent more than a pipe takes at once, and waits its turn for the rest. */
+  async pageNodeRead(): Promise<void> {
+    const reader = new Client({ connect: pageNodeOf!.connect });
+    reader.window({ scope: 1, list: "big", table: Big, size: 100000 }, (st) => (pageNodeRows = st.rows.length));
+  },
+  /** How many rows that reader has; and how long a new client of the node takes to be answered, in milliseconds. */
+  async pageNodeAnswers(): Promise<{ rows: number; ms: number }> {
+    const rows = pageNodeRows;
+    const t = performance.now();
+    const late = new Client({ connect: pageNodeOf!.connect });
+    while (!late.ready && performance.now() - t < 120000) await new Promise<void>((done) => { const ch = new MessageChannel(); ch.port1.onmessage = () => done(); ch.port2.postMessage(0); });
+    late.close();
+    return { rows, ms: performance.now() - t };
   },
   /** Runs the live suite with a and b as said. */
   async live(a: Side, b: Side): Promise<string> {

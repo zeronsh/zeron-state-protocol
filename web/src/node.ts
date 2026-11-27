@@ -84,6 +84,7 @@ interface Exports {
   closed(id: number): void;
   tick(): number;
   keepalive(idle: number, wait: number): void;
+  credential_set(size: number): void;
   segment(): number;
   genuine(size: number): number;
   create(): number;
@@ -164,7 +165,11 @@ export class Node {
   #instance?: WebAssembly.Instance;
   #conns = new Map<number, Conn>();
   #space?: string;
-  #scheduled = false;
+  #scheduled = false; // a tick, once the current work is done
+  #later = false; // a tick, once whatever else is waiting has had its turn
+  #turn: () => void; // asks for that turn
+  #channel?: MessageChannel;
+  #credential: Uint8Array;
   #timer?: ReturnType<typeof setTimeout>;
   #draining?: ReturnType<typeof setTimeout>;
   #deliveries: [Conn & { kind: "client" }, Uint8Array][] = [];
@@ -185,6 +190,25 @@ export class Node {
     }
     const wasm = this.#instantiate();
     if (options.keepalive) wasm.keepalive(options.keepalive.idle, options.keepalive.wait);
+    this.#credential = Node.#credentialBytes(options.credential);
+    // A turn after everything already waiting: never a timer, which a browser holds back in a tab nobody looks at, by as
+    // much as a minute, and which is made to wait four milliseconds when set from another; nor a microtask, which
+    // would run before what is waiting rather than after.
+    const go = () => {
+      if (!this.#later) return; // had already
+      this.#later = false;
+      this.#tick();
+    };
+    if (typeof setImmediate === "function") this.#turn = () => setImmediate(go);
+    else {
+      const channel = (this.#channel = new MessageChannel());
+      channel.port1.onmessage = go;
+      this.#turn = () => channel.port2.postMessage(null);
+    }
+  }
+
+  static #credentialBytes(credential: string | Uint8Array | undefined): Uint8Array {
+    return typeof credential === "string" ? utf8.encode(credential) : (credential?.slice() ?? new Uint8Array());
   }
 
   /** Opens the device kept in a volume, making it if there is none; and its node, if it belongs to a space. */
@@ -244,6 +268,20 @@ export class Node {
   #working(): void {
     if (this.#failure) throw this.#failure;
     if (this.#stopped) throw new Error("the node is closed");
+  }
+
+  /**
+   * Presents this to relays from now on, rather than what it was opened with: as when that has expired. A relay that has
+   * not let this device in yet, or that it is waiting to try again, is dialled again at once; one that has is not.
+   */
+  setCredential(credential: string | Uint8Array): void {
+    this.#working();
+    const bytes = (this.#credential = Node.#credentialBytes(credential));
+    if (this.#space === undefined) return; // given it as it starts
+    const wasm = this.#wasm!;
+    this.#bytes(wasm.buffer(bytes.length), bytes.length).set(bytes);
+    wasm.credential_set(bytes.length);
+    this.#kick();
   }
 
   /** Whether the roster it holds lets it do anything at all. */
@@ -453,7 +491,7 @@ export class Node {
 
   /** Resolves once the node is idle: everything said, everything durable, nothing waiting for a file. */
   async settled(): Promise<void> {
-    while (this.#scheduled || this.#ticking || !this.store.settled || this.#deliveries.length > 0) {
+    while (this.#scheduled || this.#later || this.#ticking || !this.store.settled || this.#deliveries.length > 0) {
       await new Promise<void>((done) => this.#waiting.push(done));
     }
   }
@@ -466,6 +504,7 @@ export class Node {
     clearTimeout(this.#draining);
     for (const [, c] of this.#conns) if (c.kind === "socket") (c.ws.onclose = c.ws.onerror = c.ws.onmessage = null), c.ws.close();
     this.#conns.clear();
+    this.#channel?.port1.close();
     this.#store.abandon();
   }
 
@@ -490,6 +529,7 @@ export class Node {
     this.#conns.clear();
     this.#wasm?.stop();
     this.#options.datagrams?.close();
+    this.#channel?.port1.close();
   }
 
   // ---------------------------------------------------------------- the module
@@ -568,8 +608,7 @@ export class Node {
 
   #start(space: Uint8Array): void {
     const wasm = this.#wasm!;
-    const credential =
-      typeof this.#options.credential === "string" ? utf8.encode(this.#options.credential) : (this.#options.credential ?? new Uint8Array());
+    const credential = this.#credential;
     const keys = this.store.kept("keys").latest ?? new Uint8Array();
     const { latest: roster = new Uint8Array(), before = new Uint8Array() } = this.store.kept("roster");
     const parts = [credential, keys, roster, before];
@@ -707,6 +746,7 @@ export class Node {
 
   #tick(): void {
     this.#scheduled = false;
+    this.#later = false; // what it was to do is done now
     if (this.#stopped || !this.#wasm || this.#space === undefined) return;
     this.#ticking = true;
     clearTimeout(this.#timer);
@@ -728,14 +768,15 @@ export class Node {
       c.inflight -= data.length;
       if (c.open && c.inflight + data.length > HIGH / 2) this.#soon(); // it was waiting for room: let others have a turn first
     }
-    if (!this.#scheduled) for (const done of this.#waiting.splice(0)) done();
+    if (!this.#scheduled && !this.#later) for (const done of this.#waiting.splice(0)) done();
   }
 
-  // Again, but after whatever else is waiting to happen, rather than before.
+  // Again, but after whatever else is waiting to happen, rather than before. Anything that happens meanwhile is heard of
+  // at once, as ever: waiting for a turn holds nothing back.
   #soon(): void {
-    if (this.#scheduled || this.#stopped) return;
-    this.#scheduled = true;
-    setTimeout(() => this.#tick(), 0);
+    if (this.#later || this.#scheduled || this.#stopped) return;
+    this.#later = true;
+    this.#turn();
   }
 
   // Said once its files are let go of, so that whoever is told may open them; at once, for nothing more is made durable,
