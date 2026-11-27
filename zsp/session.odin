@@ -76,6 +76,9 @@ Session :: struct {
 	sent:      int,
 	tasks:     [dynamic]Task, // bulk work, done as the pipe drains
 	task_head: int,
+	first:     [dynamic]Task, // to go before all of it, once what is being done is between steps (see `queue`)
+	hurried:   [dynamic]u64, // watches whose tasks go first, as the comparing of them goes on
+	hurrying:  bool, // within on_recon, of one of them
 	cells:     Cells_Frame,
 	cursor:    u64, // into the event ring
 	whole:     Id, // a row lately sent whole, covering its events before whole_to
@@ -269,6 +272,8 @@ session_close :: proc(s: ^Session) {
 	delete(s.watches)
 	delete(s.unacked)
 	delete(s.reoffer)
+	delete(s.first)
+	delete(s.hurried)
 	delete(s.refused)
 	for &it in n.interests {
 		for r, i in it.reports {
@@ -830,7 +835,22 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 	if store_misses(&n.store) != missed {
 		return
 	}
+	// A window of limited size goes before whatever else is queued, as a whole scope may be, being sent to one brought
+	// level: it is small, and someone is waiting to see it. Not one that replaces another, whose tasks must go first.
+	first := limit > 0 && limit <= HURRY_LIMIT && flags.data && len(s.hurried) < 64
+	for w in s.watches {
+		first &&= w.id != id
+	}
+	for t in s.tasks[s.task_head:] {
+		first &&= t.kind != .Synced || t.watch != id
+	}
+	for t in s.first {
+		first &&= t.kind != .Synced || t.watch != id
+	}
 	on_unwatch(s, id)
+	if first {
+		append(&s.hurried, id)
+	}
 	if !s.initiator && id < INTEREST {
 		s.settled = false
 	}
@@ -865,13 +885,28 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 	}
 	switch {
 	case same:
-		append(&s.tasks, Task{kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
+		queue(s, first, {kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
 	case !flags.known || (theirs.count == 0 && s.role == .Open):
-		append(&s.tasks, Task{kind = .Fill, lo = lo, hi = hi})
-		append(&s.tasks, Task{kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
+		queue(s, first, {kind = .Fill, lo = lo, hi = hi}, {kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
 	case:
 		recon_finish(&recon, lo, hi, theirs)
 	}
+}
+
+// The most a window may be limited to, and be hurried: what a client shows at once is no more.
+HURRY_LIMIT :: 1024
+
+// Queues tasks after all others; or, of a watch hurried, before them, and before the rest of one under way, which goes
+// on after. They wait in `first` until pump moves them there, between steps: a step undone takes back only what it
+// appended, and so must append.
+@(private)
+queue :: proc(s: ^Session, first: bool, tasks: ..Task) {
+	append(&s.first if first else &s.tasks, ..tasks)
+}
+
+@(private)
+hurried :: proc(s: ^Session, id: u64) -> bool {
+	return slice.contains(s.hurried[:], id)
 }
 
 @(private)
@@ -1022,6 +1057,51 @@ watch_beyond :: proc(n: ^Node, w: ^Watch) -> (before, after: int) {
 	return store_range(&n.store, list_lo(list), w.lo).count, store_range(&n.store, w.hi, list_hi(list)).count
 }
 
+// A local client's window of limited size, while a full replica asked to bound it has yet to answer, is what is held:
+// and what is held may be growing fast, as while this replica is brought level, and would carry the window, and all
+// that the client is sent, far past its size. So, once per burst, one twice its size is bounded again, as when it was
+// asked for, and the client told, as it is when a full replica answers. Not otherwise: one that has an answer, or
+// waits for none, grows with its list.
+@(private)
+bound_windows :: proc(s: ^Session) {
+	n := s.node
+	if s.role != .Open {
+		return
+	}
+	missed := store_misses(&n.store)
+	bounds := make([][2]Key, len(s.watches), context.temp_allocator)
+	moved := make([]bool, len(s.watches), context.temp_allocator)
+	for &it in n.interests {
+		if it.session != s.id || !it.watch.data || it.limit == 0 || it.waiting == 0 || len(it.reports) > 0 {
+			continue
+		}
+		for &w, i in s.watches {
+			if w.id != it.watch.id || !w.data || !w.level {
+				continue
+			}
+			from, to := tree_prefix(n, n.shelf, w.lo).count, tree_prefix(n, n.shelf, w.hi).count
+			if u64(to - from) > 2 * it.limit {
+				bounds[i] = {w.lo, w.hi}
+				if it.back {
+					bounds[i][0], moved[i] = tree_select(n, n.shelf, to - int(it.limit))
+				} else {
+					bounds[i][1], moved[i] = tree_select(n, n.shelf, from + int(it.limit))
+				}
+			}
+			break
+		}
+	}
+	if store_misses(&n.store) != missed {
+		return // read before anything is done: to be done again
+	}
+	for &w, i in s.watches {
+		if moved[i] && key_less(bounds[i][0], bounds[i][1]) {
+			w.lo, w.hi = bounds[i][0], bounds[i][1]
+			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = w.settled})
+		}
+	}
+}
+
 // Once per burst of changes, however many there were.
 @(private)
 tell_counts :: proc(s: ^Session) {
@@ -1135,6 +1215,8 @@ Part :: enum u8 {
 @(private)
 Recon_Writer :: struct {
 	s:     ^Session,
+	id:    u64,
+	owner: bool, // this end answers the watch
 	buf:   [dynamic]byte, // temporary
 	skip:  Key, // pending skip, up to here
 	skips: bool,
@@ -1142,7 +1224,7 @@ Recon_Writer :: struct {
 
 @(private)
 recon_begin :: proc(s: ^Session, id: u64, owner: bool, lo: Key) -> (w: Recon_Writer) {
-	w.s = s
+	w.s, w.id, w.owner = s, id, owner
 	w.buf = make([dynamic]byte, context.temp_allocator)
 	write_varint(&w.buf, id << 1 | (1 if owner else 0))
 	write_key(&w.buf, lo)
@@ -1229,7 +1311,7 @@ recon_prepare :: proc(s: ^Session, id: u64, lo, hi: Key, theirs: Sum, mine: Sum)
 recon_finish :: proc(w: ^Recon_Writer, lo, hi: Key, theirs: Sum) {
 	if theirs.count == 0 {
 		// Nothing to compare, only to send.
-		append(&w.s.tasks, Task{kind = .Fill, lo = lo, hi = hi})
+		queue(w.s, w.owner && hurried(w.s, w.id), {kind = .Fill, lo = lo, hi = hi})
 	}
 	recon_end(w)
 }
@@ -1245,11 +1327,14 @@ on_recon :: proc(s: ^Session, r: ^Reader) {
 	if r.bad || .Read not_in session_rights(s, scope) {
 		return
 	}
+	// What answers a watch hurried goes first, as all it asked for did.
+	s.hurrying = !owner_sent && hurried(s, id)
+	defer s.hurrying = false
 	if r.pos == len(r.buf) && !owner_sent {
 		// The watcher agrees with everything: all it asked for is queued before this.
 		for w in s.watches {
 			if w.id == id {
-				append(&s.tasks, Task{kind = .Synced, watch = id, lo = w.lo, hi = w.hi, settled = true})
+				queue(s, s.hurrying, {kind = .Synced, watch = id, lo = w.lo, hi = w.hi, settled = true})
 			}
 		}
 		return
@@ -1353,14 +1438,14 @@ recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, scope: Scope, lo, 
 @(private)
 push_row :: proc(s: ^Session, key: Key) {
 	if s.peer_full || watched(s, key) {
-		append(&s.tasks, Task{kind = .Row, row = key_row(key)})
+		queue(s, s.hurrying, {kind = .Row, row = key_row(key)})
 	}
 }
 
 @(private)
 push_range :: proc(s: ^Session, lo, hi: Key) {
 	if s.peer_full {
-		append(&s.tasks, Task{kind = .Fill, lo = lo, hi = hi})
+		queue(s, s.hurrying, {kind = .Fill, lo = lo, hi = hi})
 		return
 	}
 	scan := tree_scan(s.node, s.node.shelf, lo, hi)
@@ -1815,6 +1900,11 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 	}
 	tasked := make(map[Id]bool, context.temp_allocator)
 	for t in s.tasks[s.task_head:] {
+		if t.kind == .Row || t.kind == .Cell {
+			tasked[t.row] = true
+		}
+	}
+	for t in s.first {
 		if t.kind == .Row || t.kind == .Cell {
 			tasked[t.row] = true
 		}
@@ -2475,12 +2565,29 @@ node_balance :: proc(n: ^Node) {
 pump :: proc(s: ^Session) {
 	n := s.node
 	go := true
+	// Between steps: what goes first goes before what is under way, which goes on after it.
+	if len(s.first) > 0 {
+		inject_at(&s.tasks, s.task_head, ..s.first[:])
+		clear(&s.first)
+	}
+	// And a watch is hurried only until it is level.
+	for i := len(s.hurried) - 1; i >= 0; i -= 1 {
+		keep := false
+		for w in s.watches {
+			keep ||= w.id == s.hurried[i] && !w.level
+		}
+		if !keep {
+			unordered_remove(&s.hurried, i)
+		}
+	}
 	if s.recompare {
 		go = unit_step(s, proc(s: ^Session, _: ^Task) {session_recompare(s)})
 		s.recompare &&= !go
 	}
 	if go && (s.cursor != n.events.next || s.counts_due) {
-		go = flush_changes(s, OUT_HIGH) && unit_step(s, proc(s: ^Session, _: ^Task) {tell_counts(s)})
+		// Bounded before what has changed is sent, so that what falls outside is not.
+		go = unit_step(s, proc(s: ^Session, _: ^Task) {bound_windows(s)})
+		go = go && flush_changes(s, OUT_HIGH) && unit_step(s, proc(s: ^Session, _: ^Task) {tell_counts(s)})
 		s.counts_due &&= !go
 	}
 	for go && len(s.out) - s.sent < OUT_HIGH && s.task_head < len(s.tasks) {

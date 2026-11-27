@@ -514,12 +514,19 @@ const partialBench = async () => {
       // In Chrome.
       const p = m.page!, store = m.store;
       const before = await call<number>(p, "estimate");
+      const profiled = process.env.PROFILE && full ? p.workers[p.workers.length - 1] : undefined;
+      if (profiled) {
+        await p.cdp("Profiler.enable", {}, profiled);
+        await p.cdp("Profiler.setSamplingInterval", { interval: 200 }, profiled);
+        await p.cdp("Profiler.start", {}, profiled);
+      }
       const t2 = performance.now();
       await call(p, "join", store, s.sid, via);
       const ctail = await call<number>(p, "timeTail", store, "big", 50, `note ${ROWS - 1}`, WAIT);
       const ctailAll = ctail < 0 ? -1 : performance.now() - t2;
       const ctext = await call<number>(p, "timeText", store, "docs", TEXT, WAIT);
       const cwhole = await settle(full, () => call<{ held: number }>(p, "usage", store).then((u) => u.held), t2);
+      if (profiled) await summarise((await p.cdp<{ profile: any }>("Profiler.stop", {}, profiled)).profile);
       const cu = await call<{ held: number; memory: number }>(p, "usage", store);
       const after = await call<number>(p, "estimate");
       results.push([net.name, "Chrome", full ? "full" : "partial", ms(ctailAll), ms(ctext), cwhole, mb(cu.held), mb(cu.memory), mb(after - before)]);
@@ -563,6 +570,7 @@ const profileSync = async () => {
   const t = performance.now();
   await call(p, "join", "pf", s.sid, relay);
   if (process.env.WINDOW) await call(p, "watch", "pf", "big", 50); // as an application would, at once
+  const text = process.env.TEXT ? call<number>(p, "timeText", "pf", "docs", TEXT, 300000) : undefined;
   let held = 0;
   for (let last = -1; ; await new Promise((done) => setTimeout(done, 500))) {
     held = (await call<{ held: number }>(p, "usage", "pf")).held;
@@ -570,10 +578,18 @@ const profileSync = async () => {
     last = held;
   }
   const took = performance.now() - t;
+  if (text) console.log(`     the text, after ${((await text) / 1000).toFixed(1)} s`);
   const { profile } = await p.cdp<{ profile: any }>("Profiler.stop", {}, worker);
+  const shown = process.env.WINDOW ? await call<{ titles: string[] }>(p, "seen", "pf", "big") : undefined;
+  console.log(`     a full replica took in ${(held / 2 ** 20).toFixed(1)} MB in ${(took / 1000).toFixed(1)} s${shown ? `, its window holding ${shown.titles.length} rows` : ""}:`);
+  await summarise(profile);
+  writer.close();
+};
+
+// Where a profile's time went: self time by function, the most first; and the profile, kept in build/worker.cpuprofile.
+async function summarise(profile: any): Promise<void> {
   const { writeFileSync } = await import("node:fs");
   writeFileSync(join(ROOT, "build", "worker.cpuprofile"), JSON.stringify(profile));
-  // Self time by function, and by where it is.
   const self = new Map<number, number>();
   const dt = profile.timeDeltas as number[];
   (profile.samples as number[]).forEach((id, i) => self.set(id, (self.get(id) ?? 0) + (dt[i] ?? 0)));
@@ -586,11 +602,9 @@ const profileSync = async () => {
     const name = `${f.functionName || "(anonymous)"} ${(f.url as string).split("/").pop()}:${f.lineNumber}`;
     byName.set(name, (byName.get(name) ?? 0) + us);
   }
-  const shown = process.env.WINDOW ? await call<{ titles: string[] }>(p, "seen", "pf", "big") : undefined;
-  console.log(`     a full replica took in ${(held / 2 ** 20).toFixed(1)} MB in ${(took / 1000).toFixed(1)} s${shown ? `, its window holding ${shown.titles.length} rows` : ""}; of the worker's ${(total / 1e6).toFixed(1)} s sampled:`);
+  console.log(`     of the worker's ${(total / 1e6).toFixed(1)} s sampled:`);
   for (const [name, us] of [...byName].sort((a, b) => b[1] - a[1]).slice(0, 30)) console.log(`     ${((us / total) * 100).toFixed(1).padStart(5)}%  ${(us / 1e6).toFixed(2).padStart(6)} s  ${name}`);
-  writer.close();
-};
+}
 
 async function main(): Promise<void> {
   const names = process.argv.slice(2).length > 0 ? process.argv.slice(2) : Object.keys(tests);

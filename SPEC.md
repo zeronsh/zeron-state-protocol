@@ -326,7 +326,12 @@ row's first place become visible with it, and the row is then sent whole to ever
 An owner that cannot keep up may drop what it owes a watch and instead reconcile it afresh; to a local client it says Synced with *restart*, resends
 the range, and says Synced again: rows not mentioned between are gone. *settled* says that a full replica has confirmed the range, and that none
 has gone since: a partial replica that can reach none says Synced without it, of what it holds, and with it once one has confirmed the range; and when
-the last that had goes, it says Synced without it again. Before honouring Unwatch, an owner sends what it committed while the watch stood. When a grant
+the last that had goes, it says Synced without it again. A full replica, which may be short of all there is while it is brought level, asks a full
+replica it reaches for its local clients' windows of limited size as a partial one does, and is settled, and bounds them, by what that one says; one that
+reaches none for the scope is all there is, and says settled at once. Until one it asked has answered, what it holds may be growing fast, as while it is
+brought level, and would carry the window far past its size: so, once per burst of changes, a replica bounds such a window again, as when it was asked
+for, if it has come to span more than twice its limit, and says Synced of it. An owner answers a watch of limited size, newly asked for, before whatever
+else it has yet to send, such as all of a scope to one it is bringing level, and after what is under way: it is small, and someone is waiting for it. Before honouring Unwatch, an owner sends what it committed while the watch stood. When a grant
 ends, its watches end with Synced *denied*; to a local client, a new Roster comes first.
 
 A **full replica** watches, on each session it dials, every scope it can read, whole. A **partial replica** watches what its local clients watch, and
@@ -342,7 +347,7 @@ lacked, it says so: Synced with id 0, settled, empty keys and zero counts (and s
 roster changes, all of these are asked for afresh: either end may have dropped one under a roster the other never heard.
 
 With *counts* the owner says Synced again whenever, after a burst of changes, how much lies before or after differs from what it last said. A
-partial replica relays to its client the bounds and counts a full replica gives it, closing the window to those bounds, for what it holds
+replica that asked relays to its client the bounds and counts a full replica gives it, closing the window to those bounds, for what it holds
 beyond them may have gaps. A client whose window so closes on what it showed asks for what lay beyond again.
 
 **Keeping.** A partial replica may let go of what it holds, as though it had never come, but not of what it has yet to see acknowledged, of a row any

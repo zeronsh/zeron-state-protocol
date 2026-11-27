@@ -2389,6 +2389,101 @@ full_window_while_catching_up :: proc(t: ^testing.T) {
 	testing.expect(t, w.settled)
 }
 
+// A window of limited size that waits for a full replica to bound it is, meanwhile, what is held: as rows come, from
+// wherever, it is bounded again, and stays about its size, rather than growing with all that comes, all of it sent to
+// the client (again, whole, whenever the client falls behind), as in a browser being brought level it did.
+@(test)
+waiting_window_stays_its_size :: proc(t: ^testing.T) {
+	state := seeded(93)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	device := s.nodes[0]
+	list := List{1 << 32 | 5, 5}
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	ui := sim_client(&s, device)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true, counts = true})
+	session_sent(ui, len(session_output(ui)))
+	// The relay is asked, and its answer does not come: nothing passes between them until they settle.
+	widest := 0
+	for i in 0 ..< 2000 {
+		sim_put(&s, device, u64(i))
+		if i % 40 == 39 {
+			session_sent(ui, len(session_output(ui)))
+			w := ui.watches[0]
+			widest = max(widest, store_range(&device.node.store, w.lo, w.hi).count)
+		}
+	}
+	testing.expectf(t, widest <= 2 * 50 + 40, "a window of 50 came to span %d rows", widest)
+	w := ui.watches[0]
+	testing.expect(t, !w.settled)
+	// Once answered, it is as the answer says, and grows with its list from then on.
+	sim_settle(&s)
+	for len(session_output(ui)) > 0 {
+		session_sent(ui, len(session_output(ui)))
+	}
+	w = ui.watches[0]
+	testing.expect(t, w.settled)
+	for i in 2000 ..< 2200 {
+		sim_put(&s, device, u64(i))
+	}
+	sim_settle(&s)
+	for len(session_output(ui)) > 0 {
+		session_sent(ui, len(session_output(ui)))
+	}
+	w = ui.watches[0]
+	testing.expect(t, store_range(&device.node.store, w.lo, w.hi).count > 200, "an answered window stopped growing with its list")
+}
+
+// A full replica being brought level by another that holds much, asked meanwhile for the end of a list, has it at
+// once, before the rest: what the other answers a window of limited size with goes before the rest of what it sends.
+@(test)
+window_goes_before_the_rest :: proc(t: ^testing.T) {
+	state := seeded(94)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, fresh := s.nodes[0], s.nodes[1]
+	list := List{1 << 32 | 5, 5}
+	for i in 0 ..< 5000 {
+		sim_put(&s, big, u64(i))
+	}
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	ui := sim_client(&s, fresh)
+	defer session_close(ui)
+	sim_link(&s, 1, 2)
+	up := s.links[1]
+	for !up.a.ready || !up.b.ready {
+		sim_pass(&s, up.a, up.b)
+		sim_pass(&s, up.b, up.a)
+	}
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true})
+	held_when_settled := -1
+	for round := 0; round < 10_000; round += 1 {
+		busy := false
+		for l in s.links {
+			busy |= sim_pass(&s, l.a, l.b)
+			busy |= sim_pass(&s, l.b, l.a)
+		}
+		session_sent(ui, len(session_output(ui)))
+		if held_when_settled < 0 && len(ui.watches) > 0 && ui.watches[0].settled {
+			held_when_settled = store_range(&fresh.node.store, list_lo(list), list_hi(list)).count
+		}
+		if !busy {
+			break
+		}
+	}
+	testing.expect_value(t, store_range(&fresh.node.store, list_lo(list), list_hi(list)).count, 5000)
+	testing.expectf(t, held_when_settled >= 0 && held_when_settled < 2500, "the end of the list was had once %d rows of 5000 were", held_when_settled)
+	w := ui.watches[0]
+	testing.expect_value(t, store_range(&fresh.node.store, w.lo, w.hi).count, 50)
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)

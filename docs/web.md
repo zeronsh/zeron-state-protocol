@@ -66,17 +66,24 @@ const kept = await open({ name: "notes", keep: { days: 7, bytes: 64 << 20 } }); 
 it holds straight away, with the status `"stale"`; once a full replica (a relay is one, and pages a list as any is) has said what
 the window spans and how much lies beyond it, `"ready"`. A window that a full replica says ends sooner than it was first shown
 to, as one answered from a cache with gaps does, asks for what lay beyond again, as scrolling there would. `"ready"` means kept
-up by a full replica now: when the last one goes, the window is `"stale"` again, and `"ready"` once one is back.
+up by a full replica now: when the last one goes, the window is `"stale"` again, and `"ready"` once one is back. A full
+device's windows are bounded the same way where it reaches another full replica, as it may hold only some of the space yet,
+while it is being brought level: a window of the last 50 rows is 50 rows, not every row that came before the last did, and
+`"ready"` once that one has said so, which it says before it sends the rest. A full device that reaches no other is all
+there is, and its windows are `"ready"` at once.
 
 **A question is answered by a full replica that can read, when one is reachable**: a zspd device, or a browser's opened with
 `full: true`. The partial device holds the rows of the answer, and keeps them up. When none can read, but a relay holds the
 space, the list a question names (`where.inList`, as every question of `mirror.ask` does) is fetched whole from the relay,
 and the question is answered as a full replica would answer it, `"ready"` once the relay has confirmed it all. A question
 that names no list, or that joins rows of others (`refers`, `referred`), is about more than one list, and is answered from
-what is held, `"stale"`, for that is all it can be.
+what is held, `"stale"`, for that is all it can be: in a space with nobody who can read but partial devices, such a question
+stays `"stale"` for as long as nobody who can read is reachable, however long that is, and is `"ready"` only once one is.
+Answering it whole would mean fetching whole scopes, which is what a partial device is not.
 
 **What a partial device keeps, and for how long.** Whatever is watched or asked about, and whatever it wrote that no full
-replica is yet known to hold, it keeps, however long. Of the rest it keeps a list for 30 days after it was last watched or
+replica is yet known to hold, it keeps, however long; after a crash too, for its log says which of what it replays its own
+clients wrote, and what others did it may let go of as ever. Of the rest it keeps a list for 30 days after it was last watched or
 written in, and no more than about 256 MiB of everything, letting go of the lists watched least lately first, and of what lies
 outside watched ranges last of all; `keep: { days, bytes }` says otherwise, and `keep: false` keeps everything. It looks once
 it has opened, when a checkpoint leaves it holding much more than it may, and when a list comes of age, and does so a step
@@ -91,8 +98,9 @@ on a plane before you board.
 **A device may be either, from one start to the next, and loses nothing.** One that was partial and is now full fetches the
 rest. One that was full, and so has said it holds what others then forgot, goes on as a full replica, though opened partial,
 until it is level with another full replica, which then holds all it held that it lacked; and it is partial from its next
-start. So is a store kept before there were partial browsers: its first session after is a full replica's, as every one of
-its sessions was before. The tabs of an origin share one device, and whichever runs it opens it as
+start. So is a store kept before there were partial browsers: a browser that held a full replica before it updated is a full
+replica for its first session after, as every one of its sessions was before, fetching what it lacks, until it is level, and
+partial from its next start. That is deliberate: it is what makes the switch lose nothing. The tabs of an origin share one device, and whichever runs it opens it as
 it says: give them all the same options.
 
 ## How it is put together
