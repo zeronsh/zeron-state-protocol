@@ -1,6 +1,7 @@
 #+build !js
 package zsp
 
+import "base:runtime"
 import "core:slice"
 import "core:testing"
 
@@ -352,4 +353,97 @@ review_waited_only_for_a_roster_neither_has :: proc(t: ^testing.T) {
 	session_sent(other, len(session_output(other)))
 	testing.expect(t, session_input(other, hello_frame(x.space, 42, relay = true)))
 	testing.expect(t, !other.ready && !session_waited(other), "waiting for the relay's own roster taken for waiting for one neither has")
+}
+
+@(private = "file")
+Victim :: struct {
+	victim: ^Session,
+	closed: bool,
+}
+
+// What is done for one session made ready by a roster may let go of another made ready with it, as a method its call
+// came to may close it: that other is passed over, not read after it is gone.
+@(test)
+review_a_woken_session_let_go_of_meanwhile_is_passed_over :: proc(t: ^testing.T) {
+	// From the heap itself, rather than the test's own allocator, which keeps what is let go of: so that under
+	// AddressSanitizer, as ./x test runs this, what is read after it is let go of is caught.
+	context.allocator = runtime.heap_allocator()
+	x: Three
+	three_init(&x)
+	defer three_destroy(&x)
+	disk: Memory_Disk
+	defer memory_disk_destroy(&disk)
+	n: Node
+	testing.expect(t, node_init(&n, memory_disk(&disk), x.space, &x.keys[0], true))
+	defer node_destroy(&n)
+	n.now = 3000
+	first := session_open(&n, .Peer, false, x.keys[1].device)
+	second := session_open(&n, .Peer, false, x.keys[2].device)
+	testing.expect(t, session_input(first, hello_frame(x.space, 0)) && session_input(second, hello_frame(x.space, 0)))
+	testing.expect(t, session_lane_input(first, 1, 3, call_frame(1, x.keys[0].device, 1, "close_other", "hi")))
+	v := Victim{victim = second}
+	n.host.data = &v
+	n.host.method = proc(data: rawptr, _: u64, _: Caller_Info, _: Scope, _: string, _: []byte) -> Maybe(Call_Fault) {
+		v := (^Victim)(data)
+		if !v.closed {
+			v.closed = true
+			session_close(v.victim)
+		}
+		return nil
+	}
+	testing.expect(t, node_adopt(&n, x.r1))
+	testing.expect(t, v.closed, "the call held on the first's lane was never taken")
+	testing.expect(t, len(n.sessions) == 1 && n.sessions[0] == first, "the one let go of is still there")
+}
+
+// A relay tells the others a device has gone as soon as its session fails, not when its host lets it go: by then it is
+// no longer ready, and told nobody. Whether it failed as it was made ready, or was ready and the roster ended it.
+@(test)
+review_presence_told_as_a_session_fails :: proc(t: ^testing.T) {
+	x: Three
+	three_init(&x)
+	defer three_destroy(&x)
+	relay_key := Key32{1 = 99}
+	for revoked in ([2]bool{false, true}) {
+		dr, da, db: Memory_Disk
+		defer memory_disk_destroy(&dr)
+		defer memory_disk_destroy(&da)
+		defer memory_disk_destroy(&db)
+		r, a, b: Node
+		testing.expect(t, node_init(&r, memory_disk(&dr), x.space, nil, true))
+		testing.expect(t, node_init(&a, memory_disk(&da), x.space, &x.keys[0], true))
+		testing.expect(t, node_init(&b, memory_disk(&db), x.space, &x.keys[1], true))
+		defer node_destroy(&r)
+		defer node_destroy(&a)
+		defer node_destroy(&b)
+		r.now, a.now, b.now = 3000, 3000, 3000
+		if revoked {
+			testing.expect(t, node_adopt(&r, x.r1) && node_adopt(&a, x.r1) && node_adopt(&b, x.r1))
+		}
+		to_a := session_open(&r, .Peer, false, x.keys[0].device)
+		at_a := session_open(&a, .Peer, true, relay_key, relay = true)
+		to_b := session_open(&r, .Peer, false, x.keys[1].device)
+		at_b := session_open(&b, .Peer, true, relay_key, relay = true)
+		pump(to_a, at_a)
+		pump(to_b, at_b)
+		pump(to_a, at_a)
+		if revoked {
+			testing.expect(t, slice.contains(at_a.online[:], x.keys[1].device), "a was not told b is there")
+			testing.expect(t, node_adopt(&a, x.r2_b)) // which revokes b, and goes to the relay
+			pump(to_a, at_a)
+			testing.expectf(t, to_b.closing && to_b.fault == .Denied, "b's session at the relay: %v", to_b.fault)
+		} else {
+			// b waits at a relay with no roster, with a call on a lane its rights will not allow: made ready by the
+			// roster, it fails at once.
+			testing.expect(t, session_lane_input(to_b, 1, 3, call_frame(1, x.keys[0].device, 1, "ping", "")))
+			testing.expect(t, node_adopt(&r, x.r1))
+			testing.expectf(t, to_b.closing && !to_b.ready, "b's session at the relay did not fail: %v", to_b.fault)
+		}
+		pump(to_a, at_a)
+		testing.expectf(t, !slice.contains(at_a.online[:], x.keys[1].device), "revoked %v: a still sees b there, before b is let go of", revoked)
+		pump(to_b, at_b)
+		session_close(to_b)
+		pump(to_a, at_a)
+		testing.expectf(t, !slice.contains(at_a.online[:], x.keys[1].device), "revoked %v: a still sees b there", revoked)
+	}
 }

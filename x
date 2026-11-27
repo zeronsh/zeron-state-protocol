@@ -164,6 +164,8 @@ test)
 	if [ "$(uname)" = Linux ]; then
 		# Calls and links again, under AddressSanitizer: what glibc forgives, it does not.
 		step zspd-asan odin build zspd -out:build/zspd-asan -debug -sanitize:address $STRICT $TESTING
+		# And what reads what it let go of, which only a sanitizer sees: see the test.
+		step zsp-asan odin test zsp -out:build/zsp-asan-test -debug -sanitize:address $STRICT $SMALL -define:ODIN_TEST_NAMES=zsp.review_a_woken_session_let_go_of_meanwhile_is_passed_over
 		step end_to_end-asan env ZSPD=build/zspd-asan $PYTHON tests/end_to_end.py test_calls test_direct_links test_sync_through_relay test_call_outlasts_a_pause
 	fi
 	joined build/failed $web:web # one killed says nothing of itself

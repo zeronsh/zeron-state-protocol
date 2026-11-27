@@ -336,11 +336,20 @@ session_fail :: proc(s: ^Session, f: Fault) {
 	}
 	s.fault = f
 	s.closing = true
+	was := s.ready
 	s.ready = false
 	cells_close(s)
 	at := frame_begin(&s.out, .Error)
 	write_u8(&s.out, u8(f))
 	frame_end(&s.out, at)
+	if was {
+		// It is gone for the others now, not once its host has said why and let it go, which may be later, and at a
+		// relay, by then no longer ready, would tell nobody (session_close).
+		if s.node.keys == nil {
+			presence_send(s.node)
+		}
+		reach_tell(s.node)
+	}
 }
 
 // Feeds bytes from the pipe, in any fragmentation. False means close the pipe.
