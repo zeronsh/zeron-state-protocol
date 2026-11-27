@@ -167,13 +167,15 @@ File_Lock :: distinct posix.FD
 @(private)
 file_lock :: proc(path: string) -> (lock: File_Lock, ok: bool) {
 	name := strings.clone_to_cstring(path, context.temp_allocator)
-	fd := posix.open(name, {.RDWR, .CREAT, .CLOEXEC}, posix.mode_t{.IRUSR, .IWUSR})
+	fd := open_file(name, {.RDWR, .CREAT, .CLOEXEC})
 	if fd < 0 {
 		return
 	}
-	if posix.lockf(fd, .LOCK, 0) != .OK {
-		posix.close(fd)
-		return
+	for posix.lockf(fd, .LOCK, 0) != .OK {
+		if posix.errno() != .EINTR {
+			posix.close(fd)
+			return
+		}
 	}
 	return File_Lock(fd), true
 }

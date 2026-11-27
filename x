@@ -107,7 +107,7 @@ test)
 	# build/failed and the rest goes on, so that one run says all that fails; and the run fails if anything did.
 	rm -f build/failed
 	pids=
-	for p in zsp pipe find host; do
+	for p in zsp pipe find host zspd; do
 		# Host tests each run whole hosts, each with an event loop of its own. On Windows core:nbio has those loops share
 		# one completion port, and hands what one finds of another's to it, which may have let that go meanwhile: so
 		# there they run one at a time, as zspd's one loop always does.

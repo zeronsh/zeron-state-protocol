@@ -466,6 +466,9 @@ speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool, reached: bo
 	used := 0
 	for {
 		n, rerr := net.recv_tcp(socket, buf[:])
+		if rerr == .Interrupted {
+			continue // by a signal, not an answer: as a stop and a start again (Ctrl+Z, fg) does a wait with a timeout on Linux
+		}
 		if n <= 0 || rerr != nil {
 			return
 		}
