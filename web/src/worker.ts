@@ -198,6 +198,8 @@ function contend(): void {
   if (contending || leaving) return;
   contending = true;
   const o = options;
+  // Nothing of the store is let go of, lock and all, while any of its files is open or being opened: the next to have the
+  // lock would find it held. Node.open, failing, has let go of every one; and `close` says when they are.
   void navigator.locks.request("zsp:" + o.name, async () => {
     if (leaving) return;
     let node: Node;
@@ -226,7 +228,7 @@ function contend(): void {
       for (const [id, s] of unheard) if ("ask" in s) heard({ answer: id, ...(gone(id, s.op) ?? answer(s.op, s.args)) });
     }
     // Held until the worker is gone with its tab, or the node is closed or put away; or until it stops of itself: then
-    // every tab is told, and another worker may have the store, and try.
+    // every tab is told, at once, and another worker may have the store, and try, once its files are let go of.
     const error = await ended;
     letGo = undefined;
     if (device === node) device = undefined;
@@ -234,12 +236,13 @@ function contend(): void {
       contending = false;
       fail(failure(error));
     }
+    await node.close();
   });
 }
 
 // Its tab is about to stop it, as the tab is frozen or left: the node is stopped, what it holds made durable, and every file
-// closed, at once, for nothing after this is sure to be run; and the lock let go of, unless the worker is stopped first,
-// which lets go of it anyway. Chrome runs what was sent a worker before it stops it, and so this.
+// closed, at once, for nothing after this is sure to be run; and the lock is let go of once nothing is being opened, unless
+// the worker is stopped first, which lets go of it anyway. Chrome runs what was sent a worker before it stops it, and so this.
 function away(): void {
   leaving = true;
   const d = device;

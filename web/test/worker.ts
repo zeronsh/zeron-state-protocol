@@ -3,10 +3,13 @@
 // fails, is closed and is put away; what it says; and when it lets go of the lock. `node test/worker.ts`
 
 import assert from "node:assert/strict";
+import { Node } from "../src/node.ts";
 import { HELD_WITHIN, OpfsVolume, take } from "../src/volume-opfs.ts";
 import { StoreLocked } from "../src/volume.ts";
+import { loadModule } from "../src/wasm.ts";
 import type { Report } from "../src/worker.ts";
 
+const module = await loadModule();
 const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 const HELD = "Access Handles cannot be created if there is another open Access Handle or Writable stream associated with the same file.";
 
@@ -15,6 +18,8 @@ const HELD = "Access Handles cannot be created if there is another open Access H
 // Every file is held by one handle at most, which is had in its own time, a turn later: as a browser's are.
 const open = new Set<Handle>(); // every handle not closed
 let refused = 0; // how often a handle was asked for and the file was held
+let failFlush: string | undefined; // the name of a file whose flush throws, as a full disk's may
+const pauses = new Map<string, { reached: () => void; release: Promise<void> }>(); // by path: a file's next handle, held as it is had
 
 class Handle {
   readonly file: Entry;
@@ -52,6 +57,7 @@ class Handle {
   }
   flush(): void {
     this.#check();
+    if (failFlush === this.file.name) throw new DOMException("the disk is full", "QuotaExceededError");
   }
   close(): void {
     open.delete(this);
@@ -75,7 +81,10 @@ class Entry {
       refused++;
       throw new DOMException(HELD, "NoModificationAllowedError");
     }
-    return (this.handle = new Handle(this));
+    const h = (this.handle = new Handle(this));
+    const pause = pauses.get(this.path);
+    if (pause) pauses.delete(this.path), pause.reached(), await pause.release;
+    return h;
   }
 }
 
@@ -106,6 +115,14 @@ class Dir {
   }
 }
 const root = new Dir("");
+
+/** The next handle of a store's file is held, once had, until `release`. */
+function pause(store: string, name: string): { reached: Promise<void>; release: () => void } {
+  let reached!: () => void, release!: () => void;
+  const was = new Promise<void>((done) => (reached = done));
+  pauses.set(`/zsp/${store}/${name}`, { reached, release: new Promise<void>((done) => (release = done)) });
+  return { reached: was, release };
+}
 
 /** The handles open in a store's directory. */
 const held = (store: string) => [...open].filter((h) => h.file.path.startsWith(`/zsp/${store}/`)).length;
@@ -240,6 +257,27 @@ async function until(what: string, f: () => boolean, ms = 5000): Promise<void> {
   assert(w.said.some((r) => "failed" in r && r.name === "StoreLocked"), "its tab was not told the store is locked");
   assert(!locks.has("zsp:locked"));
   other.close();
+}
+
+// ---------------------------------------------------------------- the store
+
+// A node that cannot be opened, its store opened and a segment of it still being opened, lets go of it only once that
+// segment is had and closed: until then the next to open the store would find it held. And then nothing is open.
+{
+  const volume = await OpfsVolume.at("zsp/inflight");
+  failFlush = "device.1"; // keeping its key, as a new device does once its store is open
+  const segment = pause("inflight", "00000000.log");
+  let failed: unknown;
+  const opening = Node.open({ volume, module }).catch((e) => (failed = e));
+  await segment.reached;
+  await sleep(20);
+  assert.equal(failed, undefined, "said to have failed with a segment still being opened");
+  assert(held("inflight") > 0);
+  segment.release();
+  const e = (await opening) as unknown;
+  assert(e instanceof DOMException && e.name === "QuotaExceededError", String(e));
+  assert.equal(held("inflight"), 0, "a file of a store that could not be opened was left open");
+  failFlush = undefined;
 }
 
 // ---------------------------------------------------------------- the worker

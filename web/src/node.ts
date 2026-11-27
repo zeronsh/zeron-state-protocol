@@ -222,12 +222,13 @@ export class Node {
       return await d.#begin();
     } catch (e) {
       // What it was given to own, and what it opened, are let go of: a file left open would hold the store against the next
-      // to open it, as a browser's are held.
+      // to open it, as a browser's are held. And what was being opened, which is closed as it comes, is waited for: until
+      // then a file of the store may be held, and whoever is told this failed may well open it next.
       if (d) d.#channel?.port1.close();
-      const store = d && (d.#store as Store | undefined);
-      if (store) store.letGo(); // and with it the volume
-      else options.volume.close?.();
       options.datagrams?.close();
+      const store = d && (d.#store as Store | undefined);
+      if (store) await store.letGo(); // and with it the volume
+      else options.volume.close?.();
       throw e;
     }
   }
@@ -574,19 +575,23 @@ export class Node {
     for (const done of this.#waiting.splice(0)) done();
   }
 
-  /** Stops the node, makes what it was given durable, and closes the store. */
+  /**
+   * Stops the node, makes what it was given durable, and closes the store. Resolves once every file is closed and none is
+   * being opened, as it does whenever the node has stopped, however it did: only then may another open the store.
+   */
   close(): Promise<void> {
     return (this.#closing ??= this.#close());
   }
 
   /**
    * Stops the node and closes the store at once, making durable what it was given, as a worker about to be stopped must,
-   * for it cannot wait: what is being opened is closed as it comes.
+   * for it cannot wait: what is being opened is closed as it comes. Resolves as `close` does.
    */
-  closeNow(): void {
+  closeNow(): Promise<void> {
     if (!this.#closing) this.#stop();
-    this.#store.closeNow();
-    this.#closing ??= Promise.resolve();
+    const shut = this.#store.closeNow();
+    this.#closing ??= shut;
+    return shut;
   }
 
   async #close(): Promise<void> {
@@ -888,15 +893,14 @@ export class Node {
     this.#turn();
   }
 
-  // Said once its files are let go of, so that whoever is told may open them; at once, for nothing more is made durable,
-  // and so nothing being opened is waited for.
+  // Said once the files it has open are let go of, and at once, for nothing more is made durable: so whoever is told need
+  // not wait for what is being opened, which `close` waits for, as whoever would open the store next must.
   #fail(error: Error): void {
     if (this.#failure) return;
     this.#failure = error;
     if (!this.#closing) {
       this.#stop();
-      this.store.letGo();
-      this.#closing = Promise.resolve();
+      this.#closing = this.store.letGo();
     }
     this.onFailure?.(error);
   }

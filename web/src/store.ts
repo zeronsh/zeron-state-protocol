@@ -491,20 +491,22 @@ export class Store {
   }
 
   /**
-   * Closes every file it has open now, making nothing more durable, for storage has failed: what is being opened is
-   * closed as it comes, and so is waited for by nothing, which a full disk may keep from ever being done.
+   * Closes every file it has open now, making nothing more durable, for storage has failed: what is being opened is closed
+   * as it comes, and nothing more is opened or removed. Resolves once nothing is being opened or removed either, and so no
+   * file of the store is held: only then may another open it, though whoever is to be told it failed may be told at once.
    */
-  letGo(): void {
+  letGo(): Promise<void> {
     this.#abandoned = true;
     this.#closed = true;
     this.#shut();
+    return this.#chain;
   }
 
   /**
    * Makes durable what was written, and closes every file at once, as a worker about to be stopped must, for it cannot
-   * wait: what is being opened is closed as it comes, and nothing more is opened or removed.
+   * wait: what is being opened is closed as it comes, and nothing more is opened or removed. Resolves as `letGo` does.
    */
-  closeNow(): void {
+  closeNow(): Promise<void> {
     if (!this.#abandoned) {
       // What fails here fails as it would at the next sync: nothing said to be durable depends on it, and every file is
       // closed whatever it does.
@@ -512,7 +514,7 @@ export class Store {
       if (this.#pagesDirty) this.pageSync();
       if (this.#findDirty) this.findSync();
     }
-    this.letGo();
+    return this.letGo();
   }
 
   /** Closes every file, once whatever was being opened or removed is done. */

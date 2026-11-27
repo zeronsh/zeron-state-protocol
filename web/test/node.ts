@@ -268,6 +268,15 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   assert.throws(() => node.scope(true), /storage has failed/);
   await new Promise((done) => setTimeout(done, 100));
   assert(failure, "it waited for files being opened to say it had stopped");
+  // But whoever would open the store next must wait for them, or find them held: it is closed, as its worker waits for
+  // before it lets go of the store's lock, only once they are had, and closed as they come.
+  let closed = false;
+  void node.close().then(() => (closed = true));
+  await new Promise((done) => setTimeout(done, 20));
+  assert(!closed, "said to be closed with files still being opened");
+  while (volume.waiting > 0) volume.settle(), await new Promise((done) => setTimeout(done, 1));
+  await new Promise((done) => setTimeout(done, 0));
+  assert(closed, "not closed once nothing was being opened");
 }
 
 // Closed twice, it is closed once, and the second waits for the first: for what is being opened to be, and its files to be

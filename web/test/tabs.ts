@@ -81,13 +81,16 @@ function expectEqual<T>(got: T, want: T, what = ""): void {
 // What a worker evaluates before its own script, by Page.preamble: it says of every file of the origin's file system it
 // opens, closes and finds held by another, as `who`, on a channel every tab of the test page listens to. And it may make the
 // platform misbehave as it may: hold every file for `lag` ms from the first opened, as Chromium has been seen to after the
-// worker that had them was gone, which with `lag` of Infinity it has been seen to do until the browser is restarted.
-function files(o: { who: string; lag?: number }): string {
+// worker that had them was gone, which with `lag` of Infinity it has been seen to do until the browser is restarted; take so
+// many ms more to hand over a file, `slow`, or a segment of the log, `slowLog`, holding it meanwhile; or refuse to cut a file
+// short, as a full disk may, `failCut`.
+function files(o: { who: string; lag?: number; slow?: number; slowLog?: number; failCut?: boolean }): string {
   return `(() => {
     const o = ${JSON.stringify({ ...o, lag: o.lag === Infinity ? 1e12 : (o.lag ?? 0) })};
     const said = { who: o.who, worker: crypto.randomUUID(), opened: 0, closed: 0, held: 0 };
     const channel = new BroadcastChannel("zsp-files");
     const say = () => channel.postMessage(said);
+    const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
     let first;
     const create = FileSystemFileHandle.prototype.createSyncAccessHandle;
     FileSystemFileHandle.prototype.createSyncAccessHandle = async function () {
@@ -110,8 +113,11 @@ function files(o: { who: string; lag?: number }): string {
         if (open) (open = false), said.closed++, say();
         return close.call(this);
       };
+      const slow = this.name.endsWith(".log") ? o.slowLog : o.slow;
+      if (slow) await sleep(slow);
       return h;
     };
+    if (o.failCut) FileSystemSyncAccessHandle.prototype.truncate = () => { throw new DOMException("the disk is full", "QuotaExceededError"); };
   })()`;
 }
 const filesSaid = async (p: Page, who: string) => (await call<{ who: string; opened: number; closed: number; held: number }[]>(p, "files")).filter((f) => f.who === who);
@@ -292,6 +298,33 @@ const tests: Record<string, () => Promise<void>> = {
     await p.preamble(undefined);
     expectEqual(await call<string>(p, "deviceOrError", "kw"), "ok", "opened once its files are let go of");
     expectEqual((await call<string[]>(p, "titles", "kw", "notes", 2)).join(), "one,two");
+  },
+  // A worker that has the store's lock fails to open the node after it has opened the store, its segments still being
+  // opened: it lets go of the lock only once it has let go of every file, so the next in line never finds one held.
+  async tab_open_fails() {
+    const a = await page();
+    await a.preamble(files({ who: "failing", slow: 100, slowLog: 2000, failCut: true }));
+    const b = await page();
+    await b.preamble(files({ who: "next" }));
+    const failing = call<string>(a, "deviceOrError", "of");
+    // a's worker has the lock once it has opened a file of the store, and opens the rest slowly.
+    await eventually(async () => (await filesSaid(b, "failing")).some((f) => f.opened > 0), "the first has the store");
+    const next = call<string>(b, "deviceOrError", "of"); // in line
+    const failed = await failing;
+    if (!/the disk is full/.test(failed)) throw new Error(`opened as it was made to fail: ${failed}`);
+    // Told at once that the node it waited for could not be opened, as what is asked of one that never comes to be is: and
+    // so it opens the store again, at once, while a's segment is still being opened.
+    const first = await next;
+    if (first !== "ok") expectEqual(await call<string>(b, "deviceOrError", "of"), "ok", "the next in line opened the store");
+    const [f] = await filesSaid(b, "failing");
+    const n = await filesSaid(b, "next");
+    if (n.length === 0) throw new Error("the next in line opened no file");
+    expectEqual(n.reduce((k, x) => k + x.held, 0), 0, "the next in line found a file held: the lock was let go of with a file open or being opened");
+    // Eleven files, and the segment being opened as it failed, which it waited for, and closed: before it said it failed,
+    // which is when its tab stops it.
+    if (!f || f.opened !== 12 || f.closed !== f.opened) throw new Error(`the failing worker closed ${f?.closed} of ${f?.opened} files, of 12: it let go of the store with one being opened`);
+    await call(b, "create", "of");
+    await call(b, "put", "of", "notes", ["one"]);
   },
   // A tab's worker carries its pipe to the leader's, which never hears of it: the pipe is broken off, and the client
   // dials again, rather than waiting for ever.
