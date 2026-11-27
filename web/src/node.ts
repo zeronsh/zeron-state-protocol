@@ -756,7 +756,10 @@ export class Node {
       this.#fail(new Error("storage failed: the node has stopped rather than lose what it said was durable"));
       return;
     }
-    if (wait >= 0) this.#timer = setTimeout(() => this.#kick(), Math.min(wait, LONGEST));
+    // More to do at once, but others first: the same turn as a pipe waiting for room, never a timer of no time, which a
+    // browser holds back in a hidden tab, to the minute once set from one another often enough.
+    if (wait === 0) this.#soon();
+    else if (wait > 0) this.#timer = setTimeout(() => this.#kick(), Math.min(wait, LONGEST));
     // Said only now, so that no client is told anything while the node is in the middle of something.
     for (const [c, data] of this.#deliveries.splice(0)) {
       if (data.length === 0) {

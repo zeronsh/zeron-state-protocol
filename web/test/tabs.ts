@@ -46,10 +46,11 @@ await new Promise<void>((done) => site.listen(0, "127.0.0.1", done));
 const origin = `http://127.0.0.1:${(site.address() as AddressInfo).port}/`;
 
 let chrome: Chrome | undefined;
+const said: string[] = []; // what pages and their workers said
 const pages: Page[] = [];
 async function page(): Promise<Page> {
   const t = performance.now();
-  const p = await chrome!.open(origin, (line) => console.log("     page: " + line));
+  const p = await chrome!.open(origin, (line) => (said.push(line), console.log("     page: " + line)));
   if (process.env.TRACE) console.log("     opened in", performance.now() - t);
   await p.evaluate("new Promise((done) => { const go = () => window.zsp ? done() : setTimeout(go, 10); go(); })");
   pages.push(p);
@@ -242,11 +243,122 @@ const tests: Record<string, () => Promise<void>> = {
     const seen = await call<{ shown: string; dropped: boolean }>(reader, "textSeen");
     expectEqual(seen, { shown: "typed while held back", dropped: false }, "what a tab typed with its timers held back, after a while");
   },
+  // A tab that opens the device after a credential was given, and gives none, presents the newest given though it heard
+  // of none being given; a tab that comes back from being frozen does not present what it gave as newer than what was
+  // given while it was away; and nothing said on the channel, nonsense or a credential said to be from the future, is
+  // thrown at, or keeps a credential given later from being presented.
+  async tab_credential_later() {
+    let r = await relay("first");
+    const port = Number(r.address.split(":").pop());
+    const via = { key: r.key, url: r.url };
+    const owner = join(TMP, "cl-owner");
+    const sid = zspd("create", owner);
+    zspd("relay", owner, via.key, via.url);
+    let o = await node("run", owner, "--credential=first");
+    let watching: Client | undefined;
+    let titles = "";
+    const watch = () => {
+      watching?.close();
+      watching = new Client({ connect: zspdConnect(o.address), credential: token(owner) });
+      watching.window({ scope: 1, list: "notes", table: { title: columns.string(16) } }, (st) => (titles = st.rows.map((x) => x.title).join()));
+    };
+    watch();
+    const again = async (t: string) => {
+      watching?.close();
+      await stop(o.p);
+      await stop(r.p);
+      r = await relay(t, port);
+      o = await node("run", owner, `--credential=${t}`);
+      watch();
+    };
+    const a = await page();
+    const { key } = await call<{ key: string }>(a, "device", "cl", "first");
+    zspd("admit", owner, key, "1");
+    await call(a, "join", "cl", sid, via);
+    await call(a, "put", "cl", "notes", ["one"]);
+    await eventually(() => titles === "one", "the relay lets in what presents the credential it was opened with", 20000);
+    const b = await page();
+    await call(b, "device", "cl"); // after "first" was given, and given none
+    await gone(a); // b runs it now
+    await again("first"); // and so dials again, presenting what it has
+    await call(b, "put", "cl", "notes", ["two"]);
+    await eventually(() => titles === "one,two", "a tab opened after a credential was given presents it", 20000);
+    // Nonsense on the channel, and credentials from the future.
+    said.length = 0;
+    await call(b, "shout", "cl", null);
+    await call(b, "shout", "cl", 7);
+    await call(b, "shout", "cl", { failed: 5 });
+    await call(b, "shout", "cl", { credential: "poison", at: Number.MAX_VALUE, by: "z" });
+    await call(b, "shout", "cl", { credential: "poison", at: Date.now() + 3600000, by: "z" });
+    const c = await page();
+    await call(c, "device", "cl", "first"); // given now, and so newest, until b gives another
+    await again("second");
+    await call(b, "setCredential", "cl", "second");
+    await call(b, "put", "cl", "notes", ["three"]);
+    await eventually(() => titles === "one,two,three", "a credential given after nonsense was said is presented", 20000);
+    // c, which gave "first", is frozen and comes back: it does not give "first" as newer than "second".
+    await c.cdp("Page.setWebLifecycleState", { state: "frozen" });
+    await c.cdp("Page.setWebLifecycleState", { state: "active" });
+    await call(c, "member", "cl"); // its worker started again, and has said what it gave
+    await again("second"); // b dials again, presenting the newest
+    await call(b, "put", "cl", "notes", ["four"]);
+    await eventually(() => titles === "one,two,three,four", "what a tab back from being frozen gave before is not taken as newer", 20000);
+    expectEqual(said.filter((l) => /uncaught/i.test(l)), [], "nonsense on the channel was thrown at");
+    watching?.close();
+  },
+  // A tab that closes its device, its node run by another tab's worker, tells its clients their pipes are gone.
+  async tab_close_follower() {
+    const leader = await page();
+    await call(leader, "device", "cf");
+    await call(leader, "create", "cf");
+    const follower = await page();
+    await call(follower, "device", "cf");
+    await call(follower, "put", "cf", "notes", ["one"]);
+    expectEqual(await call<boolean>(follower, "closeDevice", "cf"), true, "a client of a closed device was not told");
+  },
+  // What a tab asked of another's node, which went as it did it, is said to have failed, for it may have been done: it is
+  // not done again by the next to run the device.
+  async tab_gone_asking() {
+    const leader = await page();
+    await call(leader, "device", "ga");
+    await call(leader, "create", "ga");
+    const follower = await page();
+    await call(follower, "device", "ga");
+    expectEqual(await call<string>(follower, "scopeOrError", "ga"), "2");
+    // The leader does what it is asked, and goes before its answer is had.
+    const worker = leader.workers[leader.workers.length - 1];
+    await leader.cdp(
+      "Runtime.evaluate",
+      {
+        expression: `(() => { const post = BroadcastChannel.prototype.postMessage;
+          BroadcastChannel.prototype.postMessage = function (m) { if (m && typeof m === "object" && "answer" in m) return; return post.call(this, m); };
+          return 1; })()`,
+      },
+      worker,
+    );
+    await call(follower, "scopeLater", "ga");
+    await sleep(500); // done there, and not answered
+    await gone(leader);
+    await eventually(async () => (await call<string[]>(follower, "asked")).length > 0, "what was asked is answered");
+    const answer = (await call<string[]>(follower, "asked"))[0];
+    expectEqual(answer.startsWith("error"), true, `asked as the leader went, it was answered ${answer}: done again`);
+    expectEqual(await call<string>(follower, "scopeOrError", "ga"), "4", "what was done as the leader went was not done, or done twice");
+  },
 };
 
 // In a Chrome that holds back hidden tabs as it does for anyone, and after three seconds rather than five minutes.
 const GRACE = 3;
 const held: Record<string, () => Promise<void>> = {
+  // A node in a hidden page, rather than a worker, finding an answer a step at a time: it is not held back between steps.
+  async tab_hidden_ask() {
+    const p = await page();
+    await call(p, "pageNode", 12000, 16);
+    await page(); // and so the first is hidden
+    await sleep(GRACE * 1000 + 1000);
+    const ms = await call<number>(p, "pageNodeAsk", 8000);
+    console.log(`     a question of 12000 rows answered in ${ms.toFixed(0)} ms in a hidden page`);
+    if (ms < 0 || ms > 2000) throw new Error(`a question of a node in a hidden page was answered ${ms < 0 ? "not in 8 s" : `after ${ms.toFixed(0)} ms`}`);
+  },
   // A node in a hidden page, rather than a worker, whose client waits for room: another client is answered at once.
   async tab_hidden_node() {
     const p = await page();

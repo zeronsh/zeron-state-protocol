@@ -33,7 +33,11 @@ export interface OpenOptions {
 /** Opens this origin's device of that name, making it if there is none. */
 export async function open(options: OpenOptions = {}): Promise<Device> {
   const name = options.name ?? "default";
-  let credential = options.credential; // the newest this tab has given
+  // The newest credential this tab has given, and when, which a worker it starts again is told: so that what it gave is
+  // never taken for newer than what another tab gave since.
+  const now = () => performance.timeOrigin + performance.now();
+  let credential = options.credential;
+  let credentialAt = now();
   // The worker: none while the tab is frozen or put away in the back/forward cache, for a frozen worker holds the store,
   // and every tab of the origin would wait for this one to come back. It is stopped as the tab is, for it cannot stop
   // itself in time, and that lets go of the store as a closed tab does; and it is started again when the tab is back.
@@ -71,7 +75,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       if (r.error !== undefined) a?.reject(new Error(r.error));
       else a?.resolve(r.value);
     };
-    w.postMessage({ open: { name, full: options.full, keep: options.keep, credential, wasm: options.wasm?.toString() } } satisfies Command);
+    w.postMessage({ open: { name, full: options.full, keep: options.keep, credential, credentialAt, wasm: options.wasm?.toString() } } satisfies Command);
     for (const [id, a] of answers) w.postMessage({ ask: id, op: a.op, args: a.args } satisfies Command);
     for (const port of ports.splice(0)) w.postMessage({ connect: port } satisfies Command, [port]);
     for (const [id, t] of timers) w.postMessage({ after: id, ms: Math.max(0, t.due - Date.now()) } satisfies Command);
@@ -197,7 +201,8 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     usage: () => ask<{ held: number; memory: number }>("usage"),
     setCredential: async (c: string | Uint8Array) => {
       credential = c; // for whichever worker this tab starts next
-      await ask<void>("credential", c);
+      credentialAt = now();
+      await ask<void>("credential", c, credentialAt);
     },
     connect,
     client: (host = {}) => new Client({ after, ...host, connect }),
@@ -215,6 +220,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
         state = "closed";
         w?.terminate();
         worker = undefined;
+        for (const breakOff of [...pipes]) breakOff(); // its clients told, as the worker that carried their pipes is gone
         for (const a of answers.values()) a.reject(new Error("the device is closed"));
         answers.clear();
         timers.clear();

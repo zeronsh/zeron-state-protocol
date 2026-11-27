@@ -5,6 +5,7 @@ import { Node, type Connect, type Wire } from "../src/node.ts";
 import { MemoryVolume } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
 import { live } from "./live.ts";
+import { where } from "../src/ask.ts";
 
 const devices = new Map<string, Device>();
 const failures: string[] = []; // what this tab was told of nodes that stopped
@@ -326,7 +327,7 @@ const zsp = {
     return { shown: shownText, dropped: textDropped };
   },
   /** A node in this very page, rather than a worker: with a list of big rows, so many that it waits for room to send them. */
-  async pageNode(rows: number): Promise<void> {
+  async pageNode(rows: number, size = 2048): Promise<void> {
     const node = await Node.open({ volume: new MemoryVolume(), module: await loadModule(new URL("/node.wasm", location.href)), log: () => {} });
     node.create();
     pageNodeOf = node;
@@ -334,7 +335,7 @@ const zsp = {
     while (!writer.may(1, "write")) await sleep(1);
     for (let i = 0; i < rows; i += 100)
       await writer.write(1, (change) => {
-        for (let k = i; k < i + 100; k++) change.insert(Big, "big", k, { more: "x".repeat(2048) });
+        for (let k = i; k < i + 100; k++) change.insert(Big, "big", k, { more: "x".repeat(size) });
       });
     writer.close();
   },
@@ -351,6 +352,40 @@ const zsp = {
     while (!late.ready && performance.now() - t < 120000) await new Promise<void>((done) => { const ch = new MessageChannel(); ch.port1.onmessage = () => done(); ch.port2.postMessage(0); });
     late.close();
     return { rows, ms: performance.now() - t };
+  },
+  /**
+   * How long a question of every row of that node's list takes to be answered, its node finding the answer a step at a
+   * time, others' turns between; or -1, if not in so long, by a worker's timer, which a hidden tab does not hold back.
+   */
+  async pageNodeAsk(ms: number): Promise<number> {
+    const c = new Client({ connect: pageNodeOf!.connect });
+    const t = performance.now();
+    const answered = await new Promise<boolean>((done) => {
+      const h = c.ask({ scope: 1, table: Big, where: where.inList("big"), limit: 10 }, (a) => a.status === "ready" && (h?.stop(), done(true)));
+      const w = new Worker(URL.createObjectURL(new Blob([`setTimeout(() => postMessage(0), ${ms})`])));
+      w.onmessage = () => (w.terminate(), done(false));
+    });
+    c.close();
+    return answered ? performance.now() - t : -1;
+  },
+  /** Closes a device, but not its client first: whether the client was told its pipe is gone. */
+  async closeDevice(name: string): Promise<boolean> {
+    const c = clientOf(name);
+    let lost = false;
+    c.on("status", (ready) => !ready && (lost = true));
+    await devices.get(name)!.close();
+    devices.delete(name);
+    for (let i = 0; i < 100 && !lost; i++) await sleep(10);
+    const told = lost; // before closing it here, which tells it so too
+    clients.delete(name);
+    c.close();
+    return told;
+  },
+  /** Says something on a device's channel, as anything of the origin may. */
+  async shout(name: string, what: unknown): Promise<void> {
+    const c = new BroadcastChannel("zsp:" + name);
+    c.postMessage(what);
+    c.close();
   },
   /** Runs the live suite with a and b as said. */
   async live(a: Side, b: Side): Promise<string> {

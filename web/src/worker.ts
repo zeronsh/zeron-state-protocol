@@ -18,6 +18,8 @@ export interface Options {
   full?: boolean;
   keep?: { days?: number; bytes?: number } | false;
   credential?: string | Uint8Array;
+  /** When the tab gave it, in milliseconds since 1970: what a tab gave later is presented rather than what it gave before. */
+  credentialAt?: number;
   /** Where node.wasm is, if not beside this script. */
   wasm?: string;
 }
@@ -65,12 +67,19 @@ type Shout =
   | { space: string | undefined } // the space the device is of, now
   | { open: string } // a pipe, on the channel of that name
   | { ask: string; op: Op; args: unknown[] }
+  | { taking: string } // an ask the leader is doing now, which it may have done should it go before it answers
   | { answer: string; value?: unknown; error?: string }
-  | Given; // a credential a tab has given, for whichever worker runs the node now and later
+  | Given // a credential a tab has given, for whichever worker runs the node now and later
+  | { credentials: true }; // a worker that has just begun, asking to be told the newest given before it
+
+// What may be asked again of the next leader, as having been done or not it is the same: anything else, asked of one that
+// went as it did it, may have been done, and is said to have failed rather than be done twice.
+const AGAIN = new Set<Op>(["identity", "member", "members", "usage"]);
 
 // The credential to present to relays: whichever a tab gave last, of those this worker has heard of. Every worker hears
-// of every one given while it lives, and is given its own tab's as it starts, which is newer than any given before: so
-// whichever runs the node next has the newest there is. `at` orders them, a clock no worker's is behind; `by` breaks ties.
+// of every one given while it lives, and asks those there before it for the newest they know as it begins: so whichever
+// runs the node next has the newest there is. `at` is when its tab gave it, by the one clock every context of a machine
+// shares; `by` breaks ties. A tab that starts its worker again gives what it gave as it gave it, then: not as newer.
 type Given = { credential: string | Uint8Array; at: number; by: string };
 let newest: Given | undefined;
 const me = crypto.randomUUID();
@@ -87,6 +96,7 @@ const carried = new Set<() => void>(); // pipes carried to the leader: how to br
 const waiting = new Map<string, (answer: { value?: unknown; error?: string }) => void>();
 const unheard = new Map<string, Shout>(); // said to the leader, and not yet answered
 
+const taken = new Set<string>(); // asks of this worker's that the leader said it was doing
 const timers = new Map<number, ReturnType<typeof setTimeout>>(); // the tab's
 
 self.onmessage = async (e: MessageEvent<Command>) => {
@@ -107,16 +117,22 @@ function open(o: Options): void {
   options = o;
   channel = new BroadcastChannel("zsp:" + o.name);
   channel.onmessage = (e: MessageEvent<Shout>) => heard(e.data);
-  if (o.credential !== undefined) give(o.credential);
+  channel.postMessage({ credentials: true } satisfies Shout);
+  if (o.credential !== undefined) give(o.credential, o.credentialAt ?? Date.now());
   contend();
 }
 
-// This tab's credential, newer than any given before: to the node, if it runs here, and to every other worker.
-function give(credential: string | Uint8Array): void {
-  const given: Given = { credential, at: Math.max(Date.now(), (newest?.at ?? 0) + 1), by: me };
+// This tab's credential, as its tab gave it: to the node, if it runs here, and to every other worker, if it is the newest.
+function give(credential: string | Uint8Array, at: number): void {
+  const given: Given = { credential, at, by: me };
+  if (!newer(given)) return;
   newest = given;
   present();
   channel.postMessage(given satisfies Shout);
+}
+
+function newer(g: Given): boolean {
+  return !newest || g.at > newest.at || (g.at === newest.at && g.by > newest.by);
 }
 
 // To the node running here, if it is: one that has stopped presents nothing, and the next is opened with the newest.
@@ -130,12 +146,15 @@ function present(): void {
 
 // Another tab's: taken if it is newer than any this worker knows of. Anything on the channel is of this origin, which may
 // open the device and do as it likes with it anyway; but what is not a credential is not taken as one.
+// Nor is one said to have been given later than now, which would be presented for good, whatever was given after it.
 function heardGiven(g: Given): void {
-  if (!(typeof g.credential === "string" || g.credential instanceof Uint8Array) || !Number.isFinite(g.at) || typeof g.by !== "string") return;
-  if (newest && (g.at < newest.at || (g.at === newest.at && g.by <= newest.by))) return;
-  newest = g;
+  if (!(typeof g.credential === "string" || g.credential instanceof Uint8Array) || typeof g.at !== "number" || typeof g.by !== "string") return;
+  if (!(g.at > 0 && g.at <= Date.now() + SKEW) || !newer(g)) return;
+  newest = { credential: g.credential, at: g.at, by: g.by };
   present();
 }
+
+const SKEW = 1000; // ms one context's clock may be ahead of another's on one machine, as their reckoning of a moment differs
 
 // Gets in line for the store. Whoever holds its lock runs the node, for as long as its tab lives; one whose node stopped,
 // or never started, gets in line again when it is next wanted, by its tab asking or dialling, and tries again then: so a
@@ -164,8 +183,9 @@ function contend(): void {
     breakCarried();
     channel.postMessage({ leader: true } satisfies Shout);
     tellSpace();
-    // What this worker itself was waiting to hear, it now answers.
-    for (const [id, s] of unheard) if ("ask" in s) heard({ answer: id, ...answer(s.op, s.args) });
+    // What this worker itself was waiting to hear, it now answers: but what the one before may have done already, it says
+    // may have been.
+    for (const [id, s] of unheard) if ("ask" in s) heard({ answer: id, ...(gone(id, s.op) ?? answer(s.op, s.args)) });
     // Held until the worker is gone with its tab, or until the node stops of itself: then every tab is told, and another
     // worker may have the store, and try.
     const error = await failed;
@@ -199,8 +219,9 @@ function breakCarried(): void {
 async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: string }> {
   if (op === "credential") {
     const c = args[0];
-    if (!(typeof c === "string" || c instanceof Uint8Array)) return { error: "a credential is a string or bytes" };
-    give(c);
+    const at = args[1];
+    if (!(typeof c === "string" || c instanceof Uint8Array) || typeof at !== "number") return { error: "a credential is a string or bytes" };
+    give(c, at);
     return {};
   }
   if (op === "close") {
@@ -274,8 +295,15 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
 // Whatever was asked of a node that stopped, or of one that never came to be, and not answered, was not done, and the tab
 // is told it failed: it is not to be done by the next, either.
 function failedAsks(message: string): void {
-  for (const [id, done] of waiting) unheard.delete(id), done({ error: message });
+  for (const [id, done] of waiting) unheard.delete(id), taken.delete(id), done({ error: message });
   waiting.clear();
+}
+
+// What a leader that has gone was doing as it went, and may have done: unless it may be done again, it is said to have
+// failed, rather than be done twice.
+function gone(id: string, op: Op): { error: string } | undefined {
+  if (!taken.delete(id) || AGAIN.has(op)) return undefined;
+  return { error: "the tab running the device went as it did this, which may or may not have been done" };
 }
 
 // Says something to the leader, and again to every new one until it is answered: one opening its store hears nothing.
@@ -284,26 +312,45 @@ function shout(id: string, s: Shout): void {
   channel.postMessage(s);
 }
 
+// Anything on the channel is of this origin; but what is not as a worker says it is ignored, rather than thrown at.
 function heard(s: Shout): void {
+  if (typeof s !== "object" || s === null) return;
   if ("failed" in s) {
+    if (typeof s.failed !== "string") return;
     failedAsks(s.failed);
     breakCarried();
     self.postMessage({ failed: s.failed } satisfies Report);
   } else if ("space" in s) {
+    if (s.space !== undefined && typeof s.space !== "string") return;
     self.postMessage({ space: s.space } satisfies Report);
   } else if ("leader" in s) {
     breakCarried(); // to one that is gone
-    for (const u of unheard.values()) if (!("open" in u)) channel.postMessage(u);
+    for (const [id, u] of [...unheard]) {
+      if ("open" in u) continue;
+      const lost = "ask" in u ? gone(id, u.op) : undefined;
+      if (lost) heard({ answer: id, ...lost });
+      else channel.postMessage(u);
+    }
   } else if ("by" in s) {
     heardGiven(s);
+  } else if ("credentials" in s) {
+    if (newest) channel.postMessage(newest satisfies Shout); // to one that has just begun, and so to all, who know it or not
+  } else if ("taking" in s) {
+    if (typeof s.taking === "string" && waiting.has(s.taking)) taken.add(s.taking);
   } else if ("answer" in s) {
+    if (typeof s.answer !== "string") return;
     const done = waiting.get(s.answer);
     unheard.delete(s.answer);
     waiting.delete(s.answer);
+    taken.delete(s.answer);
     done?.({ value: s.value, error: s.error });
   } else if (device && "ask" in s) {
+    if (typeof s.ask !== "string" || typeof s.op !== "string" || !Array.isArray(s.args)) return;
+    // Said before it is done, so that should this worker go as it does it, the asker knows it may have been.
+    if (!AGAIN.has(s.op)) channel.postMessage({ taking: s.ask } satisfies Shout);
     channel.postMessage({ answer: s.ask, ...answer(s.op, s.args) } satisfies Shout);
   } else if (device && "open" in s) {
+    if (typeof s.open !== "string" || !s.open.startsWith(channel.name + ":")) return;
     serve(new BroadcastChannel(s.open));
   }
 }
