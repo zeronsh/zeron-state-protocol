@@ -303,6 +303,14 @@ const tests: Record<string, () => Promise<void>> = {
     await again("second"); // b dials again, presenting the newest
     await call(b, "put", "cl", "notes", ["four"]);
     await eventually(() => titles === "one,two,three,four", "what a tab back from being frozen gave before is not taken as newer", 20000);
+    // The clock is set back an hour, in c and its worker, as a machine's may be: what c gives now is still newest.
+    const back = "(() => { const was = Date.now; Date.now = () => was() - 3600000; return 1; })()";
+    await c.evaluate(back);
+    await c.cdp("Runtime.evaluate", { expression: back }, c.workers[c.workers.length - 1]);
+    await again("third");
+    await call(c, "setCredential", "cl", "third");
+    await call(b, "put", "cl", "notes", ["five"]); // by b, whose clock, and so the order it puts notes in, is as it was
+    await eventually(() => titles === "one,two,three,four,five", "what is given after the clock was set back is presented", 20000);
     expectEqual(said.filter((l) => /uncaught/i.test(l)), [], "nonsense on the channel was thrown at");
     watching?.close();
   },

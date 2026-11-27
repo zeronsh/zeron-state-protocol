@@ -18,7 +18,7 @@ export interface Options {
   full?: boolean;
   keep?: { days?: number; bytes?: number } | false;
   credential?: string | Uint8Array;
-  /** When the tab gave it, in milliseconds since 1970: what a tab gave later is presented rather than what it gave before. */
+  /** When the tab gave it, by Date.now(): what a tab gave later is presented rather than what it gave before. */
   credentialAt?: number;
   /** Where node.wasm is, if not beside this script. */
   wasm?: string;
@@ -79,7 +79,8 @@ const AGAIN = new Set<Op>(["identity", "member", "members", "usage"]);
 // The credential to present to relays: whichever a tab gave last, of those this worker has heard of. Every worker hears
 // of every one given while it lives, and asks those there before it for the newest they know as it begins: so whichever
 // runs the node next has the newest there is. `at` is when its tab gave it, by the one clock every context of a machine
-// shares; `by` breaks ties. A tab that starts its worker again gives what it gave as it gave it, then: not as newer.
+// shares; `by` breaks ties. A tab that starts its worker again gives what it gave as it gave it, then: not as newer; one
+// given anew is given as newer than any its worker knows of.
 type Given = { credential: string | Uint8Array; at: number; by: string };
 let newest: Given | undefined;
 const me = crypto.randomUUID();
@@ -221,8 +222,10 @@ async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: 
     const c = args[0];
     const at = args[1];
     if (!(typeof c === "string" || c instanceof Uint8Array) || typeof at !== "number") return { error: "a credential is a string or bytes" };
-    give(c, at);
-    return {};
+    // Given now, and so after any given before that this worker knows of, though the clock was set back since.
+    const given = Math.max(at, (newest?.at ?? 0) + 1);
+    give(c, given);
+    return { value: given };
   }
   if (op === "close") {
     // This tab's device goes: if this worker runs the node, it is stopped as it should be, what it holds written down,

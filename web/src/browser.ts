@@ -34,10 +34,9 @@ export interface OpenOptions {
 export async function open(options: OpenOptions = {}): Promise<Device> {
   const name = options.name ?? "default";
   // The newest credential this tab has given, and when, which a worker it starts again is told: so that what it gave is
-  // never taken for newer than what another tab gave since.
-  const now = () => performance.timeOrigin + performance.now();
+  // never taken for newer than what another tab gave since. By the clock workers judge it by.
   let credential = options.credential;
-  let credentialAt = now();
+  let credentialAt = Date.now();
   // The worker: none while the tab is frozen or put away in the back/forward cache, for a frozen worker holds the store,
   // and every tab of the origin would wait for this one to come back. It is stopped as the tab is, for it cannot stop
   // itself in time, and that lets go of the store as a closed tab does; and it is started again when the tab is back.
@@ -88,7 +87,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     });
   // What may be asked again of the next worker, as having been done or not it is the same; anything else may have been
   // done, and is not done twice.
-  const again = new Set<Op>(["identity", "member", "members", "usage", "credential"]);
+  const again = new Set<Op>(["identity", "member", "members", "usage"]);
   const away = () => {
     if (state !== "running") return;
     state = "away";
@@ -96,6 +95,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     worker = undefined;
     for (const [id, a] of answers) {
       if (a.op === "close") answers.delete(id), a.resolve(undefined); // stopped, as a closed tab's is
+      else if (a.op === "credential") answers.delete(id), a.resolve(credentialAt); // given by the next worker, as it was given
       else if (!again.has(a.op)) answers.delete(id), a.reject(new Error("the tab was put away as this was asked, which may or may not have been done"));
     }
     for (const breakOff of [...pipes]) breakOff(); // every client here dials again, once the tab is back
@@ -201,8 +201,8 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     usage: () => ask<{ held: number; memory: number }>("usage"),
     setCredential: async (c: string | Uint8Array) => {
       credential = c; // for whichever worker this tab starts next
-      credentialAt = now();
-      await ask<void>("credential", c, credentialAt);
+      credentialAt = Date.now();
+      credentialAt = await ask<number>("credential", c, credentialAt); // as given: no earlier than any it knew of
     },
     connect,
     client: (host = {}) => new Client({ after, ...host, connect }),
