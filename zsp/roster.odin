@@ -665,25 +665,28 @@ draft_signed :: proc(d: ^Draft, scope: Scope) -> bool {
 	return false
 }
 
-// Ends a device's rights in a scope, or everywhere, and rotates what it could read. An owner's do not end.
+// Ends a device's rights in a scope, or everywhere, and rotates what it could read. An owner's do not end; and an admin
+// whose rights end anywhere is one no longer, for whoever draws up rosters must hold every scope's keys.
 draft_revoke :: proc(d: ^Draft, device: Key32, scope: Scope = 0) {
 	for &m in d.members {
 		if m.device != device || m.owner {
 			continue
 		}
-		if scope == 0 {
-			m.admin = false
-		}
+		ended := false
 		for &g in m.grants {
 			if g.until != 0 || (scope != 0 && g.scope != scope) {
 				continue
 			}
 			g.until = d.now
+			ended = true
 			for &s in d.scopes {
 				if s.id == g.scope {
 					s.rotate = true
 				}
 			}
+		}
+		if scope == 0 || ended {
+			m.admin = false
 		}
 	}
 }

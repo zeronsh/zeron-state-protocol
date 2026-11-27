@@ -95,6 +95,22 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await node.close();
 }
 
+// One made an admin, or an owner, may do everywhere what it could, and read and write too.
+{
+  const node = await Node.open({ volume: new MemoryVolume(), module });
+  const other = await Node.open({ volume: new MemoryVolume(), module });
+  node.create();
+  const signed = node.scope(true);
+  for (const scope of [1, signed]) node.admit(other.key, scope, { write: true, vouch: true });
+  for (const make of [() => node.admin(other.key), () => node.owner(other.key)]) {
+    make();
+    const grants = node.members().find((m) => m.key === other.key)!.grants;
+    for (const scope of [1, signed]) assert.deepEqual(grants.get(scope), { read: true, write: true, call: true, vouch: true }, `in scope ${scope}`);
+  }
+  await other.close();
+  await node.close();
+}
+
 // What it cannot keep of the space, it does not go on without: keys it could not keep would be lost at the next start, and
 // with them everything sealed under them, so the change is refused, the node stops, and nothing more is said durable.
 {
