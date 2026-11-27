@@ -51,17 +51,12 @@ end_to_end() {
 # each saying what it has to say at its end.
 web_test() {
 	cd web
-	node test/client.ts
-	node test/node.ts
-	node test/vectors.ts ../vectors/vectors.json
-	node test/streams.ts
-	node test/ask.ts
-	node test/utf8.ts
-	node test/store_cases.ts
-	node test/mirror_edge.ts
-	node test/package.ts
-	node test/udp.ts
-	node test/find_memory.ts
+	# Each said failed should it fail: web_test runs as part of `... || echo web`, where sh ignores set -e, so a test
+	# that failed and was not said so would pass.
+	for t in client node "vectors ../vectors/vectors.json" streams ask utf8 store_cases mirror_edge package udp find_memory; do
+		set -- $t
+		node "test/$1.ts" ${2:+"$2"} || echo "web-$1" >>../build/failed
+	done
 	for t in text mirror_model mirror_interop store end_to_end browsers; do
 		args=
 		[ $t = store ] && args=../build/node-small.wasm
@@ -75,13 +70,17 @@ web_test() {
 
 case "${1:-test}" in
 check) # every platform, no code generated
+	# Each failure said, and the whole failed by any: sh ignores set -e in all of an `a && b` but its last.
+	failed=
+	said() { if [ "$1" = 0 ]; then echo "ok   $2"; else echo "FAIL $2"; failed=1; fi; }
 	for t in linux_amd64 linux_arm64 darwin_arm64 windows_amd64 freebsd_amd64; do
-		odin check zspd -target:$t $STRICT && odin check examples/forward -target:$t $STRICT && echo "ok   $t"
+		r=0; odin check zspd -target:$t $STRICT && odin check examples/forward -target:$t $STRICT || r=1; said $r $t
 	done
-	odin check relay/wasm -target:js_wasm32 -no-entry-point $STRICT && echo "ok   js_wasm32"
-	odin check web/wasm -target:js_wasm32 -no-entry-point $STRICT && echo "ok   js_wasm32 web"
-	luau-analyze luau/zsp/init.luau examples/luau/workspace.luau && echo "ok   luau"
-	web_deps && (cd web && npx tsc -p .) && echo "ok   typescript"
+	r=0; odin check relay/wasm -target:js_wasm32 -no-entry-point $STRICT || r=1; said $r js_wasm32
+	r=0; odin check web/wasm -target:js_wasm32 -no-entry-point $STRICT || r=1; said $r "js_wasm32 web"
+	r=0; luau-analyze luau/zsp/init.luau examples/luau/workspace.luau || r=1; said $r luau
+	r=0; web_deps && (cd web && npx tsc -p .) || r=1; said $r typescript
+	[ -z "$failed" ]
 	;;
 test)
 	# Side by side, since none needs another; each says what it has to say at its end.
@@ -119,7 +118,8 @@ test)
 	mfail=; wait $quick || mfail=1; wait $long || mfail=1; [ -z "$mfail" ]
 	node examples/relay/test.mjs
 	node tests/relay_storage.mjs
-	node tests/relay_settle.mjs && node tests/relay_checkpoints.mjs
+	node tests/relay_settle.mjs
+	node tests/relay_checkpoints.mjs
 	node tests/relay_keep.mjs
 	node bench/aead_wasm/run.mjs simd check # zsp's ChaCha20-Poly1305 held to core's in WebAssembly, as the relay runs it
 	$PYTHON examples/apps/test.py
