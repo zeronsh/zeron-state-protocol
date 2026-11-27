@@ -250,3 +250,18 @@ failed_sessions_end :: proc(t: ^testing.T) {
 		testing.expectf(t, ended && zsp.node_session(&a.node, id) == nil, "direct %v: the call faulted %v, its session there %v", direct, p.faulted, zsp.node_session(&a.node, id) != nil)
 	}
 }
+
+// A device the relay turns away is told why, and asks again ever less often: not every quarter of a second, for as long
+// as the relay says no, as one revoked would be told for good.
+@(test)
+turned_away_backs_off :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	w.hosts[0].authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {zsp.session_refuse(s)}
+	world_run(&w, proc(_: ^World, _: rawptr) -> bool {return false}, nil, 3 * time.Second)
+	for i in 1 ..= 2 {
+		d := w.hosts[i].dialers[0]
+		testing.expectf(t, d.failures >= 3, "host %d: %d failures counted in three seconds of being turned away", i, d.failures)
+	}
+}

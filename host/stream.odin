@@ -125,6 +125,7 @@ stream_close :: proc(s: ^Stream) {
 	if s.send_op != nil {
 		nbio.remove(s.send_op)
 	}
+	fault := s.session.fault if s.session != nil else .None
 	if s.session != nil {
 		session_end(s.session)
 	}
@@ -132,7 +133,7 @@ stream_close :: proc(s: ^Stream) {
 		h.handshaking -= 1
 	}
 	if s.dialer != nil {
-		dialer_lost(s.dialer)
+		dialer_lost(s.dialer, fault)
 	}
 	if s.tls != nil {
 		pipe.tls_destroy(s.tls)
@@ -630,7 +631,6 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 			}
 		case .Up:
 			if d.stream.session != nil && d.stream.session.ready && !d.admitted {
-				d.failures = 0 // admitted, not merely answered
 				d.admitted = true
 				report(.Debug, "admitted by the relay at ", d.source)
 			}
@@ -721,9 +721,15 @@ dialer_failed :: proc(d: ^Dialer) {
 	}
 }
 
+// A session the relay was ready for and that ended of nothing but the connection going is no failure: dialled again
+// soon. One that ended for a reason, the relay's or this end's, as a device the relay turns away has, is: the relay is
+// asked again ever less often, not every quarter of a second for as long as it says no.
 @(private)
-dialer_lost :: proc(d: ^Dialer) {
+dialer_lost :: proc(d: ^Dialer, fault: zsp.Fault) {
 	report(.Debug, "no longer connected to the relay at ", d.source)
 	d.stream = nil
+	if d.admitted && fault == .None {
+		d.failures = 0
+	}
 	dialer_failed(d)
 }
