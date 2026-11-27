@@ -543,7 +543,8 @@ links_run :: proc() {
 			peer_drop(p)
 		}
 		if p.session != nil {
-			if p.session.closing && len(zsp.session_output(p.session)) == 0 && pipe.link_quiet(p.link) {
+			// Its last word heard, a session that has ended is done with, and what its calls still had on their way.
+			if p.session.closing && len(zsp.session_output(p.session)) == 0 && pipe.link_said(p.link) {
 				pipe.link_close(p.link)
 			}
 			if time.tick_diff(p.used, now) >= CALL_ALIVE && zsp.node_calling(&node, p.session) {

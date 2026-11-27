@@ -288,12 +288,15 @@ relayed_close :: proc() {
 relayed_run :: proc(now: time.Tick) {
 	for i := len(relayed) - 1; i >= 0; i -= 1 {
 		r := relayed[i]
-		over := r.link.state == .Closed || r.session == nil || (r.session.closing && len(zsp.session_output(r.session)) == 0 && pipe.link_quiet(r.link))
+		over := r.link.state == .Closed || r.session == nil
 		if r.link.state == .Dialling && r.knocks == 0 && time.tick_diff(r.next_knock, now) >= 0 {
 			over = true // nobody answered
 		}
 		calling := r.session != nil && zsp.node_calling(&node, r.session)
-		if !over && !calling && time.tick_diff(r.used, now) >= RELAY_IDLE {
+		// A session that has ended, as one that failed has, is done with once its last word is heard: what its calls still
+		// had on their way goes with them. And the other end is told, rather than left to find the link dead.
+		ended := !over && r.session.closing && len(zsp.session_output(r.session)) == 0 && pipe.link_said(r.link)
+		if ended || (!over && !calling && time.tick_diff(r.used, now) >= RELAY_IDLE) {
 			pipe.link_close(r.link) // said once, below, and then let go
 			relayed_flush(r)
 			over = true
@@ -326,8 +329,8 @@ relayed_flush :: proc(r: ^Relayed) {
 	buf: [RELAY_PACKET]byte
 	now := now_us()
 	for {
-		if r.session != nil && !r.session.closing {
-			link_feed(r.session, r.link)
+		if r.session != nil {
+			link_feed(r.session, r.link) // closing too: it ends once it has said why, and its calls with it
 		}
 		packet := pipe.link_output(r.link, buf[:], now)
 		if packet == nil {

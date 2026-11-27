@@ -494,6 +494,14 @@ link_quiet :: proc(l: ^Link) -> bool {
 	return true
 }
 
+// Whether all that was written to a stream has arrived: a session's own, by default, whose last word is then heard,
+// whatever its calls still have on their way.
+@(require_results)
+link_said :: proc(l: ^Link, id: u64 = 0) -> bool {
+	s := stream_find(l, id)
+	return s == nil || len(s.out) == s.out_head
+}
+
 // Says something that must be answered, so that a link to nobody is found out.
 link_poke :: proc(l: ^Link) {
 	if l.in_flight == 0 {

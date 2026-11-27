@@ -216,3 +216,37 @@ relayed_closed_by_the_peer_let_go_at_once :: proc(t: ^testing.T) {
 	testing.expect(t, heard)
 	testing.expectf(t, zsp.node_session(&a.node, id) == nil && len(a.relayed) == 0, "its session still there, told it was closed")
 }
+
+// A session that fails, as one that hears something malformed or refused does, says why, and ends, with the calls on it:
+// not when what its calls had on their way has arrived, which a bulk call never stops having, nor when the link dies,
+// but once its last word is heard. On a link a relay carries, and on a direct one.
+@(test)
+failed_sessions_end :: proc(t: ^testing.T) {
+	for direct in ([]bool{false, true}) {
+		w: World
+		testing.expect(t, world_init(t, &w, udp = direct))
+		defer world_destroy(&w)
+		testing.expect(t, world_ready(&w, direct = direct))
+		echo_serve(&w.hosts[2])
+		p: Pump
+		testing.expect(t, pump_start(&p, &w, 1 << 30)) // more than goes in the time
+		testing.expect(t, world_run(&w, proc(w: ^World, data: rawptr) -> bool {return (^Pump)(data).got > 0}, &p))
+		a := world_space(&w, 1)
+		session: ^zsp.Session
+		if direct {
+			for x in w.hosts[1].udp.links {
+				session = x.session if x.session != nil else session
+			}
+		} else if len(a.relayed) == 1 {
+			session = a.relayed[0].session
+		}
+		testing.expect(t, session != nil)
+		if session == nil {
+			continue
+		}
+		id := session.id
+		zsp.session_refuse(session) // fails it, as anything it would not go on with does
+		ended := world_run(&w, proc(w: ^World, data: rawptr) -> bool {return (^Pump)(data).faulted}, &p, 5 * time.Second)
+		testing.expectf(t, ended && zsp.node_session(&a.node, id) == nil, "direct %v: the call faulted %v, its session there %v", direct, p.faulted, zsp.node_session(&a.node, id) != nil)
+	}
+}
