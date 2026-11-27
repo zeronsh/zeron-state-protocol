@@ -672,7 +672,13 @@ def test_limits():
         c.seq += 1
         graves = b"".join(bytes([zsp.GRAVE]) + c.new_id(1) + b"\0" + c.stamp() + b"\0" for _ in range(100000))
         c.send(zsp.CELLS, zsp.varint(c.seq) + graves[: (1 << 22) - 100])
-        time.sleep(0.5)
+        # Until its node is done with them, as it is once it acknowledges them or sends them away: it seals every cell a
+        # client writes, some hundred thousand here, which on a busy machine, built for debugging, takes longer than the
+        # next client waits to be let in.
+        try:
+            c.until(lambda: c.acked >= c.seq, timeout=120)
+        except (PermissionError, ConnectionError):
+            pass
     assert a.p.poll() is None
     # Whoever is sent away hears why, after all that was being said.
     c = a.client()
