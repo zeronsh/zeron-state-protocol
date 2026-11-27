@@ -931,6 +931,15 @@ network_converges_through_remote_relays :: proc(t: ^testing.T) {
 	sim_worlds(t, .Remote)
 }
 
+// Worlds in which a relay started again with more than one roster still to look over, the one it held its cells against
+// being neither of the two its host kept: and so not known to have been drawn up at once with another that won. Cells
+// sealed under a key only that one had were kept.
+@(test)
+network_converges_seeds_3136_and_3951 :: proc(t: ^testing.T) {
+	sim_worlds(t, .Slow, 3136, 1)
+	sim_worlds(t, .Remote, 3951, 1)
+}
+
 @(private)
 sim_worlds :: proc(t: ^testing.T, lazy: Sim_Storage, first := #config(ZSP_FIRST_SEED, 0), seeds := #config(ZSP_SEEDS, 6)) {
 	missed, writes, reads := 0, 0, 0

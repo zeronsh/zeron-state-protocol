@@ -188,7 +188,7 @@ it ends. In an unsigned scope, one that is no longer acceptable is sealed again,
 time, by a replica that can open it, since someone may merely not have heard; in a signed scope, by its author alone, for a void key, or for a bundle that names more than its author may still kill, which it puts together again, with
 the same stamp, of only what it may name and had the right to write; otherwise it is dropped.
 A roster that does not extend the one held (a prefix of whose members, grants, keys and times it keeps, the grants with all their rights but Call, and
-Vouch where a scope is not signed) won over it: then everything held is looked at. A partial replica that may have written there offers again
+Vouch where a scope is not signed) won over it: then everything held is looked at, and so it is by one that starts with its cells held against a roster it no longer has to compare with. A partial replica that may have written there offers again
 all it holds in that scope, for who took it may be gone. Then, whatever the roster changed, each device watches afresh, partial ones under new ids. A device's clock moves past
 the end of everything that has ended, but for what is too far ahead. Where a cell is
 held already, another body for the same identity is ignored.
