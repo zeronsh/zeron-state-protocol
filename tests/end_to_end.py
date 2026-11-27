@@ -84,6 +84,25 @@ class Node:
             return f.read()
 
 
+# What starts a process in a group of its own, so that it and all it starts can be ended at once (end).
+GROUP = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+
+
+def end(p):
+    """Ends a process, and with it everything it started if it was started in a group of its own."""
+    if getattr(p, "group", False) and p.poll() is None:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+        else:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    elif p.poll() is None:
+        p.kill()
+    p.wait()
+
+
 class Cloud:
     """The same relay as a Durable Object: under workerd here or, given ZSP_CLOUD=https://... and
     ZSP_CLOUD_TOKEN, wherever it is deployed."""
@@ -96,10 +115,12 @@ class Cloud:
             self.key = urllib.request.urlopen(request).read().decode().strip()
             self.url, self.token, self.p = live.replace("http", "ws", 1), os.environ["ZSP_CLOUD_TOKEN"], None
             return self
+        # A group of its own, ended whole: node starts workerd, which ending node alone leaves running for ever.
         self.p = subprocess.Popen(
             ["node", os.path.join(ROOT, "relay", "dev.mjs")], stdout=subprocess.PIPE, text=True, env={**os.environ, **env},
-            stderr=open(os.path.join(TMP, "cloud.log"), "a"),
+            stderr=open(os.path.join(TMP, "cloud.log"), "a"), **GROUP,
         )
+        self.p.group = True
         procs.append(self.p)
         self.key, self.address = re.match(r"(\w{64}) listening on ws://(\S+)", self.p.stdout.readline()).groups()
         self.url = "ws://" + self.address
@@ -1075,8 +1096,7 @@ def one(name, tests, file):
         return 1
     finally:
         for p in procs:
-            p.kill()
-            p.wait()
+            end(p)
 
 
 def main(tests=globals(), file=__file__):
