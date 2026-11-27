@@ -175,8 +175,12 @@ finder_asked :: proc(f: ^Finder, s: ^zsp.Session, type: u8, payload: []byte) -> 
 			// The client holds what was shown until it is answered anew.
 			l.shown, old.shown = old.shown, nil
 			l.lives, old.lives = old.lives, nil
-			l.far.keys, old.far.keys = old.far.keys, nil
-			l.far.before, old.far.call = old.far.call, 0
+			if l.far.source != nil {
+				// And what was watched of the answer from afar, until the next replaces it. (Asked of nobody, it is let
+				// go of with the question it was of.)
+				l.far.keys, old.far.keys = old.far.keys, nil
+				l.far.before, old.far.call = old.far.call, 0
+			}
 			l.moved = true
 		}
 		if old != nil {
@@ -1006,6 +1010,9 @@ far_run :: proc(l: ^Live) {
 				break
 			}
 		}
+	}
+	if far.call == 0 && !far.have && len(far.keys) > 0 {
+		far_drop(l) // what was watched of an answer from afar that nobody is now asked to put right
 	}
 	if far.have {
 		near_drop(l) // another answers, and what was fetched for the question is held no longer than anything

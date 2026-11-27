@@ -1183,6 +1183,81 @@ what_cannot_be_watched_is_not_waited_for :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(p.node.interests), held)
 }
 
+// A question asked again, as when it is moved, holds what was watched of its answer from afar only while another is
+// asked to put it right: with nobody to ask, or nobody to be asked now that this holds everything, it is let go of.
+@(test)
+moved_questions_let_go_of_what_nobody_answers :: proc(t: ^testing.T) {
+	for round in 0 ..< 2 {
+		state := rand.create(114)
+		context.random_generator = rand.default_random_generator(&state)
+		w, p: World
+		world_make(t, &w, &p)
+		defer world_destroy(&w)
+		defer world_destroy(&p)
+		f, g: Finder
+		pages: [2]Memory_Disk
+		finder_open(&f, &w.node, memory_disk(&pages[0]), w.secret)
+		finder_open(&g, &p.node, memory_disk(&pages[1]), p.secret)
+		f.settled = true
+		elsewhere := client_open(&w, &f)
+		c := client_open(&p, &g)
+		for x in ([]^World{&w, &p}) {
+			x.node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+				zsp.session_accept(s, nil if s.role == .Peer else {{0, {.Read, .Write}, 0}})
+			}
+		}
+		for _ in 0 ..< 40 {
+			world_write(t, &w)
+		}
+		link := link_make(&p, &w)
+		defer {
+			zsp.session_close(c.session)
+			zsp.session_close(elsewhere.session)
+			finder_close(&f)
+			finder_close(&g)
+			client_free(&c)
+			client_free(&elsewhere)
+			for &d in pages {
+				memory_disk_destroy(&d)
+			}
+		}
+		testing.expect(t, link_settle(t, link, &f, &g))
+		client_ask(t, &c, 1, []byte{1, 0, 1, 2, 1, 0, 0, 5, 0}) // the newest five
+		testing.expect(t, link_settle(t, link, &f, &g))
+		client_hear_out(t, &c, &g)
+		testing.expectf(t, 1 in c.answers && c.answers[1].flags & 1 != 0 && len(c.answers[1].ids) > 0, "%v", c.answers[1] if 1 in c.answers else Told{})
+		shown := len(c.answers[1].ids)
+		watched :: proc(p: ^World, c: ^Client) -> (n: int) {
+			for it in p.node.interests {
+				n += 1 if it.session == c.session.id && it.watch.id == max(u64) && it.watch.data else 0 // in what an answer shows
+			}
+			return
+		}
+		testing.expect_value(t, watched(&p, &c), shown) // each of them, until it is held
+		if round == 0 {
+			zsp.session_close(link[0]) // nobody is left to ask
+			zsp.session_close(link[1])
+		} else {
+			g.settled = true // nor need anyone be
+		}
+		client_ask(t, &c, 1, []byte{1, 0, 1, 2, 1, 0, 100, 5, 0}) // moved past them all
+		for _ in 0 ..< 10 {
+			if round == 1 {
+				link_pass(t, link, max(int))
+				finder_run(&f)
+			}
+			finder_run(&g)
+		}
+		client_hear_out(t, &c, &g)
+		testing.expectf(t, watched(&p, &c) == 0, "round %d: %d watched still", round, watched(&p, &c))
+		if round == 1 {
+			testing.expect_value(t, len(p.node.calls), 0) // and the call that answered it is over
+			zsp.session_close(link[0])
+			zsp.session_close(link[1])
+		}
+	}
+}
+
 @(private, thread_local)
 far_called: u64
 
