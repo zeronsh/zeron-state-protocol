@@ -419,6 +419,9 @@ function kill(t: Text, piece: string, offset: number, count: number): void {
   }
 }
 
+// No offset or count is so large: what says one is nonsense, as zsp/text.odin has it.
+const MOST = 2 ** 30;
+
 // A reference: its piece, and refOffset its offset.
 let refOffset = 0;
 function readRef(r: codec.Reader, id: string): string {
@@ -426,18 +429,17 @@ function readRef(r: codec.Reader, id: string): string {
   if (tag === 0) {
     refOffset = 0;
     return "";
-  } else if (tag === 1) {
-    refOffset = codec.varint(r);
-    return id;
-  } else if (tag === 2) {
-    const piece = codec.takeBinary(r, 8);
-    refOffset = codec.varint(r);
-    return piece;
   }
-  throw new codec.Malformed("bad reference");
+  let piece = id;
+  if (tag === 2) piece = codec.takeBinary(r, 8);
+  else if (tag !== 1) throw new codec.Malformed("bad reference");
+  refOffset = codec.varint(r);
+  if (piece === NOBODY || refOffset > MOST) throw new codec.Malformed("bad reference");
+  return piece;
 }
 
-// One operation: the reader is left after it, or false is returned if it refers to what is not here.
+// One operation: the reader is left after it, or false is returned if it refers to what is not here. What is not an
+// operation at all throws Malformed.
 function applyOp(t: Text, id: string, r: codec.Reader): boolean {
   const op = codec.u8(r);
   if (op === INSERT) {
@@ -451,30 +453,37 @@ function applyOp(t: Text, id: string, r: codec.Reader): boolean {
   } else if (op === EXTEND) {
     const bytes = codec.bytes(r);
     const p = pieceOf(t, id);
-    if (p.count === 0) return false;
+    if (p.count === 0) throw new codec.Malformed("nothing to extend"); // what it would extend comes before it, or never
     if (bytes.length > 0) insertRun(t, id, bytes, id, p.count - 1, p.rpiece, p.roffset);
   } else if (op === DELETE) {
     const fp = readRef(r, id);
     const fo = refOffset;
     const count = codec.varint(r);
-    if (fp === "" || !present(t, fp, fo, count)) return false;
+    if (fp === "" || count > MOST) throw new codec.Malformed("bad deletion");
+    if (!present(t, fp, fo, count)) return false;
     kill(t, fp, fo, count);
   } else {
-    return false;
+    throw new codec.Malformed("no such operation");
   }
   return true;
 }
 
+// Whether the last applyOps stopped at what does not read as an operation: the rest of its piece is nothing, and waits
+// for nothing, since nothing that comes could make it read.
+let malformed = false;
+
 function applyOps(t: Text, id: string, ops: Uint8Array): number {
   const r = codec.reader(ops);
   let done = 0;
+  malformed = false;
   while (r.pos < r.len) {
     let applied: boolean;
     try {
       applied = applyOp(t, id, r);
     } catch (e) {
-      if (e instanceof codec.Malformed) break;
-      throw e;
+      if (!(e instanceof codec.Malformed)) throw e;
+      malformed = true;
+      break;
     }
     if (!applied) break;
     const p = pieceOf(t, id);
@@ -491,8 +500,10 @@ function retry(t: Text): void {
     const w = t.waiting[i];
     const n = applyOps(t, w.piece, w.rest.subarray(w.at));
     w.at += n;
-    if (w.at === w.rest.length) t.waiting.splice(i, 1);
-    i = n > 0 ? 0 : i + 1;
+    // Done, or the rest is nothing: what was after it is looked at next, rather than passed over until the next time.
+    if (w.at === w.rest.length || malformed) t.waiting.splice(i, 1);
+    else if (n === 0) i++;
+    if (n > 0) i = 0;
   }
 }
 
@@ -521,7 +532,7 @@ function applyPiece(t: Text, name: string, stamp: string, ops: Uint8Array): Resu
   piece.shown = [];
   piece.stamp = stamp;
   const at = piece.fed + applyOps(t, id, ops.subarray(piece.fed));
-  if (at < ops.length) t.waiting.push({ piece: id, rest: ops.subarray(at), at: 0 });
+  if (at < ops.length && !malformed) t.waiting.push({ piece: id, rest: ops.subarray(at), at: 0 }); // only what refers to what is not here waits
   retry(t);
   for (const w of t.waiting) if (w.piece === id) return "waiting";
   return "changed";

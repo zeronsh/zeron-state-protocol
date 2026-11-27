@@ -390,20 +390,33 @@ local function kill(t: Text, piece: string, offset: number, count: number)
 	end
 end
 
+-- No offset or count is so large: what says one is nonsense, as zsp/text.odin has it.
+local MOST = 2 ^ 30
+
+local function malformed()
+	error(codec.Malformed, 0)
+end
+
 local function read_ref(r: codec.Reader, id: string): (string, number)
 	local tag = codec.u8(r)
 	if tag == 0 then
 		return "", 0
-	elseif tag == 1 then
-		return id, codec.varint(r)
-	elseif tag == 2 then
-		local piece = codec.take(r, 8)
-		return piece, codec.varint(r)
 	end
-	error("bad reference")
+	local piece = id
+	if tag == 2 then
+		piece = codec.take(r, 8)
+	elseif tag ~= 1 then
+		malformed()
+	end
+	local offset = codec.varint(r)
+	if piece == NOBODY or offset > MOST then
+		malformed()
+	end
+	return piece, offset
 end
 
--- One operation: the reader is left after it, or false is returned if it refers to what is not here.
+-- One operation: the reader is left after it, or false is returned if it refers to what is not here. What is not an
+-- operation at all raises codec.Malformed.
 local function apply_op(t: Text, id: string, r: codec.Reader): boolean
 	local op = codec.u8(r)
 	if op == INSERT then
@@ -420,7 +433,7 @@ local function apply_op(t: Text, id: string, r: codec.Reader): boolean
 		local bytes = codec.bytes(r)
 		local p = piece_of(t, id)
 		if p.count == 0 then
-			return false
+			malformed() -- what it would extend comes before it, or never
 		end
 		if #bytes > 0 then
 			insert_run(t, id, bytes, id, p.count - 1, p.rpiece, p.roffset)
@@ -428,22 +441,33 @@ local function apply_op(t: Text, id: string, r: codec.Reader): boolean
 	elseif op == DELETE then
 		local fp, fo = read_ref(r, id)
 		local count = codec.varint(r)
-		if fp == "" or not has(t, fp, fo, count) then
+		if fp == "" or count > MOST then
+			malformed()
+		end
+		if not has(t, fp, fo, count) then
 			return false
 		end
 		kill(t, fp, fo, count)
 	else
-		return false
+		malformed() -- no such operation
 	end
 	return true
 end
 
-local function apply_ops(t: Text, id: string, ops: string): number
+-- Applies operations in order until one refers to what is not here. Returns the bytes consumed, and whether it stopped at
+-- what does not read as an operation: then the rest of its piece is nothing, and waits for nothing, since nothing that
+-- comes could make it read.
+local function apply_ops(t: Text, id: string, ops: string): (number, boolean)
 	local r = codec.reader(ops)
 	local done = 0
 	while r.pos < r.len do
-		local ok, applied = pcall(apply_op, t, id, r)
-		if not ok or not applied then
+		local ok, applied: any = pcall(apply_op, t, id, r)
+		if not ok then
+			if applied ~= codec.Malformed then
+				error(applied, 0)
+			end
+			return done, true
+		elseif not applied then
 			break
 		end
 		local p = piece_of(t, id)
@@ -453,19 +477,24 @@ local function apply_ops(t: Text, id: string, ops: string): number
 		p.fed += r.pos - done
 		done = r.pos
 	end
-	return done
+	return done, false
 end
 
 local function retry(t: Text)
 	local i = 1
 	while i <= #t.waiting do
 		local w = t.waiting[i]
-		local n = apply_ops(t, w.piece, string.sub(w.rest, w.at + 1))
+		local n, bad = apply_ops(t, w.piece, string.sub(w.rest, w.at + 1))
 		w.at += n
-		if w.at == #w.rest then
+		-- Done, or the rest is nothing: what was after it is looked at next, rather than passed over until the next time.
+		if w.at == #w.rest or bad then
 			table.remove(t.waiting, i)
+		elseif n == 0 then
+			i += 1
 		end
-		i = if n > 0 then 1 else i + 1
+		if n > 0 then
+			i = 1
+		end
 	end
 end
 
@@ -493,8 +522,10 @@ local function apply_piece(t: Text, name: string, stamp: string, ops: string): R
 	end
 	piece.shown = ""
 	piece.stamp = stamp
-	local at = piece.fed + apply_ops(t, id, string.sub(ops, piece.fed + 1))
-	if at < #ops then
+	local fed = piece.fed
+	local n, bad = apply_ops(t, id, string.sub(ops, fed + 1))
+	local at = fed + n
+	if at < #ops and not bad then -- only what refers to what is not here waits
 		table.insert(t.waiting, { piece = id, rest = string.sub(ops, at + 1), at = 0 })
 	end
 	retry(t)

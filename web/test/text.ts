@@ -219,6 +219,21 @@ function generate(r: Random): { ops: Op[]; world: World } {
         }
         op = { o: "cell", w, kind: 5, stamp: codec.hex(stamp()), body: codec.hex(codec.written(b)) };
       }
+    } else if (pick === 99) {
+      // A piece as no writer makes one, as a forger may: more after its operations, or one of their bytes changed.
+      const pieces = world.cells.filter((c) => c.kind === 4 && c.body.length > 8);
+      if (pieces.length > 0) {
+        const body = pieces[r.int(0, pieces.length - 1)].body.slice();
+        let bad = body;
+        if (r.int(1, 2) === 1) {
+          bad = new Uint8Array(body.length + r.int(1, 6));
+          bad.set(body);
+          for (let k = body.length; k < bad.length; k++) bad[k] = r.int(0, 255);
+        } else {
+          body[r.int(8, body.length - 1)] = r.int(0, 255);
+        }
+        op = { o: "cell", w, kind: 4, stamp: codec.hex(stamp()), body: codec.hex(bad) };
+      }
     } else {
       op = { o: "cell", w, kind: 3, stamp: codec.hex(stamp()), body: typed(8).bytes };
     }
@@ -253,6 +268,38 @@ const seeds: { seed: number; ops: Op[]; out: string[] }[] = [];
 for (let seed = FIRST; seed < FIRST + SEEDS; seed++) {
   const { ops, world } = generate(random(seed));
   seeds.push({ seed, ops, out: world.out });
+}
+// What does not read as operations is nothing, and waits for nothing, since nothing that comes could make it read: an
+// operation there is none of, a reference of no kind, a deletion from the start, an extension of nothing. What refers to
+// what is not here waits for it, and once that has come is done as far as it reads. Held to text.luau as every seed is.
+{
+  const world = new World();
+  const ops: Op[] = [];
+  const waits: number[] = [];
+  const ref = (piece: string) => "\x02" + piece + "\0";
+  const insert = (left: string, bytes: string) => "\x01" + left + "\0" + String.fromCharCode(bytes.length) + bytes;
+  const bodies = [
+    "a".repeat(8) + "\x07",
+    "b".repeat(8) + insert("\0", "ab") + "\x01\x05",
+    "c".repeat(8) + insert(ref("d".repeat(8)), "x"),
+    "e".repeat(8) + insert(ref("d".repeat(8)), "y") + "\x03\0\x01",
+    "f".repeat(8) + "\x02\x01z",
+    "d".repeat(8) + insert("\0", "d"),
+  ];
+  bodies.forEach((body, k) => {
+    for (const op of [
+      { o: "cell", w: 0, kind: 4, stamp: codec.hex(codec.u64((k + 1) * 65536) + "salt" + String.fromCharCode(k) + "..."), body: codec.hex(codec.bytesOf(body)) },
+      { o: "apply", w: 0, c: k },
+    ] as Op[]) {
+      ops.push(op);
+      world.step(op);
+    }
+    waits.push(world.writers[0].waiting.length);
+  });
+  world.end();
+  assert.deepEqual(waits, [0, 0, 1, 2, 2, 0], "what waits");
+  assert.equal(text.read(world.writers[0]).length, 5);
+  seeds.push({ seed: 0, ops, out: world.out });
 }
 const ran = performance.now();
 
