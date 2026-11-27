@@ -20,6 +20,7 @@ SHARED_BUFFER :: 64 << 10
 Config :: struct {
 	dir:          string,
 	full:         bool, // replicate everything
+	keep:         zsp.Keep, // if not, what to keep of what local clients no longer watch: see zsp/retain.odin
 	relay:        bool, // hold no keys and serve any space the authenticator lets in
 	listen:       Maybe(net.Endpoint), // WebSockets
 	udp_port:     Maybe(int), // links, on this port or any if zero
@@ -56,6 +57,7 @@ Space :: struct {
 	seen: u64, // events already noticed by links_poke
 	warned: bool, // of a clock
 	found: ^Found, // while anyone is asking anything
+	retaining: bool, // has more to let go of at once
 	calls: [dynamic]Host_Call, // whose end is the host
 	relayed: [dynamic]^Relayed, // links through relays
 	knocked: map[zsp.Key32]u64, // the newest knock heard from each device through relays: its dialler's stamp time
@@ -142,6 +144,10 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		free(s)
 		return nil
 	}
+	if s.node.becoming {
+		report(.Info, "this store was a full replica's: it is one until it is level with another, and partial from then on")
+	}
+	zsp.node_keep(&s.node, h.keep)
 	if bytes, err := os.read_entire_file(file_in(s.dir, "roster"), context.temp_allocator); err == nil {
 		before, _ := os.read_entire_file(file_in(s.dir, "roster.old"), context.temp_allocator)
 		if !zsp.node_resume(&s.node, before, bytes) {
@@ -209,7 +215,7 @@ space_close :: proc(s: ^Space) {
 		report(.Error, "could not sync the log")
 	}
 	// Leaving a short tail to replay is cheaper than writing pages for it.
-	if zsp.store_tail(&s.node.store) - s.node.checkpoint > 1 << 20 {
+	if zsp.store_tail(&s.node.store) - s.node.checkpoint > 1 << 20 || s.node.whole != s.node.whole_kept {
 		zsp.store_checkpoint(&s.node.store)
 	}
 	zsp.node_destroy(&s.node)
@@ -349,6 +355,10 @@ host_settle :: proc(h: ^Host) {
 	links_run(h)
 	for s in h.spaces {
 		s.node.now = ms
+		s.retaining = false
+		if due := zsp.node_retain_due(&s.node); due != 0 && due <= ms {
+			s.retaining = zsp.node_retain(&s.node) // a step at a time, others' turns between
+		}
 		found_run(s, now)
 		relayed_run(s, now)
 	}
@@ -407,6 +417,12 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 	for s in h.spaces {
 		if t, set := found_deadline(s, time.tick_now()); set {
 			earliest(&due, &ok, t)
+		}
+		if s.retaining {
+			earliest(&due, &ok, time.tick_now())
+		} else if at := zsp.node_retain_due(&s.node); at != 0 {
+			ms := now_ms()
+			earliest(&due, &ok, time.tick_add(time.tick_now(), time.Duration(at - min(at, ms)) * time.Millisecond))
 		}
 	}
 	if t := links_deadline(h); t != 0 {

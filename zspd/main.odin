@@ -44,6 +44,8 @@ USAGE :: `zspd - Zeron State Protocol node
   --no-udp               make no direct links
   --stun=<host:port>     learn this machine's outside address here
   --partial              replicate only what local clients watch
+  --keep=<days>[,<MiB>]  of what they no longer watch, keep no longer than so many days, 30, and, of all, no more
+                         than about so many MiB, 1024; 0 for no bound
   --credential=<text>    present this to relays
   --allow=<space,...>    serve only these spaces
   --verbose
@@ -505,6 +507,7 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	config := host.Config {
 		dir          = dir,
 		full         = true,
+		keep         = {30 * 24 * 3600 * 1000, 1 << 30},
 		relay        = relay,
 		udp_port     = 0,
 		data         = &policy,
@@ -533,6 +536,18 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 			config.stun = value
 		case "--partial":
 			config.full = false
+		case "--keep":
+			days, _, mib := strings.partition(value, ",")
+			d, dok := strconv.parse_f64(days)
+			m, mok := f64(1024), true
+			if mib != "" {
+				m, mok = strconv.parse_f64(mib)
+			}
+			if !dok || !mok || !(d >= 0 && d <= 1e6) || !(m >= 0 && m <= 1e9) {
+				os.write_string(os.stderr, USAGE)
+				return 2
+			}
+			config.keep = {u64(d * 24 * 3600 * 1000), u64(m * (1 << 20))}
 		case "--credential":
 			config.credential = value
 		case "--allow":

@@ -288,6 +288,32 @@ def test_partial():
     ca.until(lambda: any(v.get(16) == b"mine" for _, _, v in ca.list(1, "feed")))
 
 
+def test_partial_keeps():
+    """A partial replica lets go of what nobody has watched for long enough, says that what it shows while it reaches
+    nobody is only what it holds, and has what it let go of again once it is watched."""
+    relay, (a, b) = space("pk", "pl")
+    b.stop()
+    b.options += ["--partial", "--keep=0.00002"]  # about 1.7 seconds
+    b.start()
+    ca = a.client()
+    for i in range(50):
+        ca.put(1, "old", i, [b"x" * 100])
+    ca.until(lambda: ca.acked == ca.seq)
+    time.sleep(0.3)
+    cb = b.client()
+    cb.watch(1, 1, "old")
+    cb.until(lambda: cb.windows.get(1, {}).get("settled") and len(cb.list(1, "old")) == 50)
+    cb.sock.close()  # and so watches it no longer
+    relay.stop()
+    time.sleep(3)
+    cc = b.client()
+    cc.watch(1, 1, "old")
+    cc.until(lambda: 1 in cc.windows)
+    assert len(cc.list(1, "old")) == 0 and not cc.windows[1]["settled"], (len(cc.list(1, "old")), cc.windows[1])
+    relay.start()
+    cc.until(lambda: cc.windows[1]["settled"] and len(cc.list(1, "old")) == 50, 30)
+
+
 def test_calls():
     import threading
 
