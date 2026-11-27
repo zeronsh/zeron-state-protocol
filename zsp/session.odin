@@ -1780,10 +1780,10 @@ on_want :: proc(s: ^Session, r: ^Reader) {
 	// What is asked for while a window is hurried may be what it is owed, which goes before it is said to be level:
 	// and so first, which nothing is the worse for.
 	first := len(s.hurried) > 0
-	rows := read_count(r)
+	rows := read_count(r, 17)
 	for _ in 0 ..< rows {
 		row := read_pair(r, Id)
-		held := make([]Held, read_count(r), context.temp_allocator)
+		held := make([]Held, read_count(r, 18), context.temp_allocator) // each a kind, a slot and a stamp
 		for &h in held {
 			h.kind = Kind(read_u8(r))
 			h.slot = Slot(read_u8(r))

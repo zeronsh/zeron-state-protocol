@@ -190,11 +190,12 @@ read_varint :: proc(r: ^Reader) -> (v: u64) {
 	return 0
 }
 
-// A varint bounded by the bytes that remain, for counts and lengths.
+// A varint bounded by the bytes that remain, for counts and lengths: of things that each take at least so many of them,
+// so that nothing made for so many is more than a few times the size of what said there were.
 @(require_results)
-read_count :: proc(r: ^Reader) -> int {
+read_count :: proc(r: ^Reader, each := 1) -> int {
 	v := read_varint(r)
-	if v > u64(len(r.buf) - r.pos) {
+	if v > u64((len(r.buf) - r.pos) / each) {
 		r.bad = true
 		return 0
 	}

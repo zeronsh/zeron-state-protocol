@@ -5,6 +5,7 @@ import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:math/rand"
+import "core:mem"
 import "core:slice"
 import "core:strings"
 import "core:testing"
@@ -1090,4 +1091,60 @@ answers_match_the_cells :: proc(t: ^testing.T) {
 		index_finish(&w.x)
 		check_index(t, &w)
 	}
+}
+
+// Each of a set a value may be one of is a condition, and no question has more than so many, however short each is; so
+// what is made of a question is not much larger than it, whatever it says.
+@(test)
+sets_are_conditions :: proc(t: ^testing.T) {
+	Largest :: struct {
+		backing: mem.Allocator,
+		most:    int,
+	}
+	among :: proc(n: int, claimed := -1) -> []byte {
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, 1)
+		append(&w, u8(Op.In), u8(Kind.Bytes), 16)
+		zsp.write_bytes(&w, nil)
+		zsp.write_varint(&w, u64(claimed if claimed >= 0 else n))
+		for _ in 0 ..< n {
+			zsp.write_bytes(&w, nil)
+		}
+		append(&w, 0, 0, 0, 10, 0) // no order, from the start, the first ten, no totals
+		return w[:]
+	}
+	parse :: proc(source: []byte) -> (ok: bool, most: int) {
+		l := Largest{backing = context.allocator}
+		allocator := mem.Allocator {
+			proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+				l := (^Largest)(data)
+				l.most = max(l.most, size)
+				return l.backing.procedure(l.backing.data, mode, size, alignment, old, old_size, loc)
+			},
+			&l,
+		}
+		arena: mem.Dynamic_Arena
+		mem.dynamic_arena_init(&arena, allocator, allocator)
+		defer mem.dynamic_arena_destroy(&arena)
+		_, ok = query_parse(source, mem.dynamic_arena_allocator(&arena))
+		return ok, l.most
+	}
+	ok, _ := parse(among(MAX_PREDS - 1))
+	testing.expect(t, ok)
+	big := among(60_000)
+	most: int
+	ok, most = parse(big)
+	testing.expect(t, !ok)
+	testing.expectf(t, most <= 2 * len(big) + 64 * 1024, "made %d bytes at once of a question of %d", most, len(big))
+	// And rows: so many as there are bytes for.
+	w := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&w, 1)
+	append(&w, u8(Op.Ids))
+	zsp.write_varint(&w, 1000)
+	for _ in 0 ..< 999 * 16 {
+		append(&w, 0)
+	}
+	append(&w, 0, 0, 0, 10, 0)
+	ok, _ = parse(w[:])
+	testing.expect(t, !ok)
 }

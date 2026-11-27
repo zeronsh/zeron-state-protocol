@@ -634,7 +634,7 @@ The flags of a match: 1, the last word may be only begun; 2, words may be parts 
 five letters at most one. A word is a run of letters and digits, without case or marks, the first 64 bytes of which count; an apostrophe between letters is
 passed over; scripts that write no spaces are taken in overlapping pairs. How well a row answers is Okapi BM25 (k₁ 1.2, b 0.75), its sole use being an order.
 
-A question has at most 8 orders, 64 totals, none of kind 6, sums only of kind 3, 4096 conditions 32 deep, and 4096 bytes of text to match, or it is *faulty*. A limit or a `top` above 1000 is taken for
+A question has at most 8 orders, 64 totals, none of kind 6, sums only of kind 3, 4096 conditions 32 deep (each value of a 5 counting as one), and 4096 bytes of text to match, or it is *faulty*. A limit or a `top` above 1000 is taken for
 1000. An answer is at most 256 KiB: a question whose answer is longer is *faulty*, and is asked no longer. A session has at most 1024 questions.
 
 **Passing on.** A partial replica has a full one answer. It calls (§12) the device by the method with no name, which is for nodes themselves: no client may call or

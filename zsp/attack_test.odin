@@ -1856,3 +1856,31 @@ a_bundle_names_nothing_later_than_its_right :: proc(t: ^testing.T) {
 	_, subject, vouched, known = cell_author(&a.node.roster, &again, by)
 	testing.expect(t, known && vouched && string(subject) == "ceo")
 }
+
+// What a peer says it holds of a row is made no larger than a little more than what it says.
+@(test)
+wants_cost_little :: proc(t: ^testing.T) {
+	state := seeded(86)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Want)
+	write_u8(&w, 0)
+	write_varint(&w, 1)
+	write_u64(&w, 1 << 32)
+	write_u64(&w, 1)
+	write_varint(&w, 200_000) // as many as there are bytes, not as many as there is room for
+	resize(&w, len(w) + 200_000)
+	frame_end(&w, at)
+	l := Largest{backing = context.temp_allocator}
+	{
+		context.temp_allocator = largest_allocator(&l)
+		_ = session_input(s.links[0].a, w[:])
+	}
+	testing.expectf(t, l.most <= 2 * len(w), "made %d bytes at once of a frame of %d", l.most, len(w))
+}
