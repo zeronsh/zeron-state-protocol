@@ -2210,6 +2210,120 @@ a_scope_made_again_is_not_the_one_that_went :: proc(t: ^testing.T) {
 	testing.expect_value(t, store_range(&relay.store, scope_lo(2), scope_hi(2)).count, 1)
 }
 
+// What a relay holds that it had not yet said it held against any roster, as while its first sweep was a job, or
+// before its log was first written down, is looked at as what was held against a roster not there to compare with:
+// so what is in a scope the roster it starts again with has not is dropped, though nothing it compares with says so.
+@(test)
+what_was_held_against_no_roster_is_looked_at :: proc(t: ^testing.T) {
+	root, space := test_root()
+	admin := test_keyring()
+	defer keyring_destroy(&admin)
+	now := u64(1_700_000_000_000)
+	none: Roster
+	d := draft_from(&none, now << 16)
+	one := draft_scope(&d)
+	m := draft_grant(&d, admin.device, admin.signer, one, {.Write})
+	m.owner = true
+	r0, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	w_disk: Memory_Disk
+	defer memory_disk_destroy(&w_disk)
+	writer: Node
+	testing.expect(t, node_init(&writer, memory_disk(&w_disk), space, &admin, true))
+	defer node_destroy(&writer)
+	writer.now = now
+	testing.expect(t, node_adopt(&writer, r0))
+	accept :: proc(_: rawptr, s: ^Session, _: []byte) {session_accept(s)}
+	writer.host.authenticate = accept
+	for trigger in 0 ..< 2 {
+		// Two drawn up at once: one with a second scope, with the first's key renewed in the first round, so that the
+		// relay's first sweep is a job; and one that wins, without it. Then one after that.
+		d = draft_from(&writer.roster, (now + 1000 + 10_000 * u64(trigger)) << 16)
+		d.scopes[0].rotate = trigger == 0
+		testing.expect_value(t, draft_scope(&d), Scope(2))
+		lost, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+		won: []byte
+		for {
+			d = draft_from(&writer.roster, (now + 1000 + 10_000 * u64(trigger)) << 16)
+			d.scopes[0].rotate = true
+			won, _ = roster_sign(&admin, root, &d, context.temp_allocator)
+			a, _ := roster_claims(lost, space)
+			b, _ := roster_claims(won, space)
+			if b > a {
+				break
+			}
+		}
+		parsed, _ := roster_parse(won, space)
+		d = draft_from(&parsed, (now + 2000 + 10_000 * u64(trigger)) << 16)
+		after, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+		roster_destroy(&parsed)
+		// What the writer writes in the second scope, as the one that lost has it.
+		w2_disk: Memory_Disk
+		defer memory_disk_destroy(&w2_disk)
+		w2: Node
+		testing.expect(t, node_init(&w2, memory_disk(&w2_disk), space, &admin, true))
+		defer node_destroy(&w2)
+		w2.host.authenticate = accept
+		w2.now = writer.now
+		testing.expect(t, node_adopt(&w2, writer.roster.bytes) && node_adopt(&w2, lost))
+		w2.now += 3000
+		row := node_id(&w2, 2)
+		body: [24]byte
+		put_u64(body[:], 2 << 32 | 1)
+		put_u64(body[8:], 1)
+		testing.expect(t, node_write(&w2, {{row, PLACE, .Place, node_stamp(&w2), body[:]}}))
+		relay_disk: Memory_Disk
+		defer memory_disk_destroy(&relay_disk)
+		lazy := memory_disk(&relay_disk)
+		lazy.missed = proc(_: rawptr) -> int {return 0}
+		{
+			relay: Node
+			testing.expect(t, node_init(&relay, lazy, space, nil, true))
+			defer node_destroy(&relay)
+			relay.host.authenticate = accept
+			relay.now = w2.now
+			for node_retry(&relay) {}
+			testing.expect(t, node_adopt(&relay, lost))
+			testing.expect(t, trigger == 1 || relay.serial == 0) // its first sweep is yet to be done
+			sw := session_open(&w2, .Peer, true, {0 = 9}, nil, true)
+			sr := session_open(&relay, .Peer, false, admin.device)
+			for _ in 0 ..< 50 {
+				out := session_output(sw)
+				testing.expect(t, session_input(sr, out))
+				session_sent(sw, len(out))
+				back := session_output(sr)
+				testing.expect(t, session_input(sw, back))
+				session_sent(sr, len(back))
+				if len(out) == 0 && len(back) == 0 {
+					break
+				}
+			}
+			session_close(sw)
+			session_close(sr)
+			testing.expect(t, row_places(&relay.store, row).count > 0)
+			if trigger == 0 {
+				testing.expect(t, store_checkpoint(&relay.store)) // held against no roster, it says
+				testing.expect(t, node_adopt(&relay, won) && node_adopt(&relay, after))
+			} else {
+				testing.expect(t, store_sync(&relay.store)) // in its log alone
+			}
+		}
+		relay: Node
+		testing.expect(t, node_init(&relay, lazy, space, nil, true))
+		defer node_destroy(&relay)
+		relay.now = w2.now
+		if trigger == 0 {
+			for node_retry(&relay) {}
+		}
+		testing.expect_value(t, relay.serial, 0)
+		testing.expect(t, node_resume(&relay, won, after)) // in the second round, as its log is still to be read again
+		for node_retry(&relay) {}
+		serial, _ := roster_claims(after, space)
+		testing.expect_value(t, relay.serial, serial)
+		testing.expectf(t, row_places(&relay.store, row).count == 0, "round %d: what is in a scope there is not was kept", trigger)
+		testing.expect_value(t, store_range(&relay.store, scope_lo(2), scope_hi(2)).count, 0)
+	}
+}
+
 // Of two rosters drawn up at once, what was sealed under a key only the one that lost had is dropped wherever it was
 // held, by a node that sweeps as it takes a roster as by one whose sweep is a job: that made at the first moment there
 // is too.

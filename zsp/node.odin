@@ -300,8 +300,10 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 	}
 	// Of two rosters drawn up at once, one is dropped: what was held by it is held to nothing. And what was held against a
 	// roster that is not here to compare with, as after a start when more than the last change was still to be looked
-	// over, may have been held against one that was dropped.
-	unknown := old.serial == 0 && n.serial != 0
+	// over, may have been held against one that was dropped: as may what a store holds that it has not yet said it holds
+	// against any, as when its first sweep was still a job, or its log was not yet written down. A store may hold some
+	// while it has any, or has a log still to read again.
+	unknown := old.serial == 0 && (n.serial != 0 || n.cells.root != 0 || n.replaying)
 	fork := unknown || (old.serial != 0 && !roster_extends(old, &n.roster))
 	plans := make([dynamic]Sweep_Plan, context.temp_allocator)
 	for &info in n.roster.scopes {
