@@ -115,9 +115,13 @@ eventually("everything reaches b", function()
 end)
 all.stop()
 task.wait(0.3)
+local shown: (() -> ())? = nil -- looks at what is shown, as it is
 local window = b:window({ scope = 1, list = "chat", table = Message, size = 50 }, function(s)
 	state = s
 	told += 1
+	if shown then
+		shown()
+	end
 end)
 eventually("the tail arrives", function()
 	return state.status == "ready" and #state.rows == 50 and state.before == 250
@@ -192,12 +196,25 @@ for i = 1, 100 do
 	said ..= token
 	editor.append(token)
 	if i == 10 then
+		-- By live frames, before the piece is sealed, a second after it began: what is first shown of them is live yet. (A
+		-- piece is sealed after it is said live, and both come the same way, in order; so however slow the machine, it is.)
 		local clock = os.clock()
-		while state.rows[#state.rows].body ~= said and os.clock() - clock < 5 do
+		local live: boolean? = nil
+		local want = said
+		shown = function()
+			if live == nil and state.rows[#state.rows].body == want then
+				local t = b.rows[id] and b.rows[id].texts[Message.body.slot]
+				live = t ~= nil and zsp.Text.provisional(t)
+			end
+		end
+		shown()
+		while live == nil and os.clock() - clock < 5 do
 			task.wait()
 		end
 		started = os.clock() - clock
-		assert(started < 0.1, string.format("tokens are seen at once, not %.1f ms after", started * 1000))
+		shown = nil
+		assert(live ~= nil, "tokens are never seen")
+		assert(live, "tokens are seen once sealed, not as they are typed")
 	end
 	if i % 10 == 0 then
 		task.wait(0.005)
