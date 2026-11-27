@@ -237,6 +237,7 @@ node_take :: proc(n: ^Node, r: Roster) -> bool {
 	}
 	// Where storage may answer "not yet", checkpoints are the host's to make, and store_wants_checkpoint says so.
 	ok := n.serial == n.serial_kept || store_lazy(&n.store) || store_checkpoint(&n.store)
+	woken := make([dynamic]^Session, context.temp_allocator)
 	for s in n.sessions {
 		if s.greeted && s.accepted {
 			send_roster(s) // and to one whose own, older, is still on its way
@@ -244,8 +245,12 @@ node_take :: proc(n: ^Node, r: Roster) -> bool {
 		if !s.ready {
 			// One that waits for a roster, as where this end knew none, has it now, whoever brought it, if it is as new as
 			// the one the peer said it has: judged by it, both the peer and, at a device, whether this one still belongs.
-			if s.greeted && s.accepted && !s.closing && s.role == .Peer && s.promised <= n.roster.serial {
+			// Calls' sessions as peers': each end of one is ready as the other is.
+			if s.greeted && s.accepted && !s.closing && s.role != .Open && s.promised <= n.roster.serial {
 				session_authorize(s)
+				if s.ready {
+					append(&woken, s)
+				}
 			}
 			continue
 		}
@@ -263,6 +268,13 @@ node_take :: proc(n: ^Node, r: Roster) -> bool {
 	node_balance(n) // there may be scopes a hushed relay was never asked about
 	rpc_roster_changed(n)
 	reach_tell(n)
+	// What came on a lane of one that waited, as a call, held until it was ready, is taken now: not when it next hears
+	// something, which may be never. (Not within the loop above: taking it may say anything, a roster included.)
+	for s in woken {
+		if !s.busy && !s.closing {
+			session_input(s, nil)
+		}
+	}
 	return ok
 }
 

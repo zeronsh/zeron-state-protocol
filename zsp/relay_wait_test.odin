@@ -207,6 +207,9 @@ review_device_waits_for_its_peers_roster :: proc(t: ^testing.T) {
 	testing.expect(t, !node_member(&n))
 	testing.expectf(t, !peer.ready, "a peer's session was taken for ready on a device no longer a member")
 	testing.expectf(t, !calls.ready, "a session for calls was taken for ready on a device no longer a member")
+	// And each is let go of, the session for calls as the peer's: none waits on for a roster that has come.
+	testing.expectf(t, peer.closing && peer.fault == .Denied, "a peer's session waits on: %v", peer.fault)
+	testing.expectf(t, calls.closing && calls.fault == .Denied, "a session for calls waits on: %v", calls.fault)
 }
 
 // A device the roster no longer admits has no peers: not one it was with when it heard so, which is told the roster
@@ -243,4 +246,110 @@ review_device_no_longer_a_member_has_no_peers :: proc(t: ^testing.T) {
 	_ = session_input(relay, hello_frame(x.space, n.roster.serial, relay = true))
 	testing.expectf(t, !relay.ready || relay.closing, "a device no longer a member was ready with a relay")
 	testing.expectf(t, relay.fault == .Denied, "and ended %v", relay.fault)
+}
+
+@(private = "file")
+call_frame :: proc(call: u64, to: Key32, scope: Scope, method: string, body: string) -> []byte {
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Call)
+	write_varint(&w, call)
+	to := to
+	append(&w, ..to[:])
+	write_varint(&w, u64(scope))
+	write_bytes(&w, transmute([]byte)method)
+	write_bytes(&w, nil) // whose
+	append(&w, body)
+	frame_end(&w, at)
+	return w[:]
+}
+
+@(private = "file")
+pump :: proc(a, b: ^Session) {
+	for moved := true; moved; {
+		moved = false
+		for pair in ([2][2]^Session{{a, b}, {b, a}}) {
+			if out := session_output(pair[0]); len(out) > 0 {
+				bytes := slice.clone(out, context.temp_allocator)
+				session_sent(pair[0], len(out))
+				_ = session_input(pair[1], bytes)
+				moved = true
+			}
+		}
+	}
+}
+
+// A session for calls between two devices that know no roster yet waits at both ends, as a peers' does, and is ready
+// at both once either has a roster: a call from either end is then taken.
+@(test)
+review_calls_wait_for_a_roster_as_peers_do :: proc(t: ^testing.T) {
+	x: Three
+	three_init(&x)
+	defer three_destroy(&x)
+	da, db: Memory_Disk
+	defer memory_disk_destroy(&da)
+	defer memory_disk_destroy(&db)
+	a, b: Node
+	testing.expect(t, node_init(&a, memory_disk(&da), x.space, &x.keys[0], true))
+	testing.expect(t, node_init(&b, memory_disk(&db), x.space, &x.keys[1], true))
+	defer node_destroy(&a)
+	defer node_destroy(&b)
+	a.now, b.now = 3000, 3000
+	to_b := session_open(&a, .Calls, true, x.keys[1].device)
+	to_a := session_open(&b, .Calls, false, x.keys[0].device)
+	pump(to_b, to_a)
+	testing.expect(t, !to_b.ready && !to_a.ready && to_b.fault == .None && to_a.fault == .None, "ready with no roster")
+	testing.expect(t, node_adopt(&a, x.r1))
+	pump(to_b, to_a)
+	testing.expectf(t, to_b.ready && to_a.ready, "ready: a's end %v, b's %v", to_b.ready, to_a.ready)
+	testing.expect(t, session_input(to_b, call_frame(1, x.keys[0].device, 1, "", "hi")), "b's call refused at a")
+	testing.expectf(t, to_b.fault == .None && !to_b.closing, "a's end failed: %v", to_b.fault)
+}
+
+// What came on a lane of a session waiting for a roster, as a call, is taken once the roster comes, whoever brings it:
+// not left until the session next hears something, which may be never.
+@(test)
+review_lane_held_while_waiting_is_taken :: proc(t: ^testing.T) {
+	x: Three
+	three_init(&x)
+	defer three_destroy(&x)
+	disk: Memory_Disk
+	defer memory_disk_destroy(&disk)
+	n: Node
+	testing.expect(t, node_init(&n, memory_disk(&disk), x.space, &x.keys[0], true))
+	defer node_destroy(&n)
+	n.now = 3000
+	called := 0
+	n.host.questions.data = &called
+	n.host.questions.called = proc(data: rawptr, _: u64, _: Key32, _: Scope, _: []byte) {(^int)(data)^ += 1}
+	s := session_open(&n, .Peer, false, x.keys[1].device)
+	testing.expect(t, session_input(s, hello_frame(x.space, 0)))
+	testing.expect(t, s.greeted && s.accepted && !s.ready, "not waiting for a roster")
+	testing.expect(t, session_lane_input(s, 1, 0, call_frame(1, x.keys[0].device, 1, "", "world")))
+	testing.expect(t, called == 0, "a call taken before the session was ready")
+	testing.expect(t, node_adopt(&n, x.r1)) // the roster comes, not from this peer
+	testing.expect(t, s.ready, "not ready once the roster came")
+	testing.expectf(t, called == 1, "the call held on a lane was taken %d times, once the session was ready", called)
+}
+
+// Waiting is for a roster neither end has: a device with none, at one that said it has one, waits only for that one
+// to send it, and if let go of meanwhile, failed as anyone the other end lets go of without a word.
+@(test)
+review_waited_only_for_a_roster_neither_has :: proc(t: ^testing.T) {
+	x: Three
+	three_init(&x)
+	defer three_destroy(&x)
+	disk: Memory_Disk
+	defer memory_disk_destroy(&disk)
+	n: Node
+	testing.expect(t, node_init(&n, memory_disk(&disk), x.space, &x.keys[1], true))
+	defer node_destroy(&n)
+	n.now = 3000
+	neither := session_open(&n, .Peer, true, Key32{1 = 9}, relay = true)
+	session_sent(neither, len(session_output(neither)))
+	testing.expect(t, session_input(neither, hello_frame(x.space, 0, relay = true)))
+	testing.expect(t, session_waited(neither), "waiting at a relay with no roster either is not waiting")
+	other := session_open(&n, .Peer, true, Key32{1 = 10}, relay = true)
+	session_sent(other, len(session_output(other)))
+	testing.expect(t, session_input(other, hello_frame(x.space, 42, relay = true)))
+	testing.expect(t, !other.ready && !session_waited(other), "waiting for the relay's own roster taken for waiting for one neither has")
 }

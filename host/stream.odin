@@ -130,6 +130,7 @@ stream_close :: proc(s: ^Stream) {
 	}
 	fault := s.session.fault if s.session != nil else .None
 	waited := s.session != nil && zsp.session_waited(s.session)
+	ready := s.session != nil && s.session.ready // though the dialers have not run since
 	if s.session != nil {
 		session_end(s.session)
 	}
@@ -137,7 +138,7 @@ stream_close :: proc(s: ^Stream) {
 		h.handshaking -= 1
 	}
 	if s.dialer != nil {
-		dialer_lost(s.dialer, fault, waited)
+		dialer_lost(s.dialer, fault, waited, ready)
 	}
 	if s.tls != nil {
 		pipe.tls_destroy(s.tls)
@@ -735,11 +736,12 @@ dialer_failed :: proc(d: ^Dialer, waited := false) {
 // roster neither end had, as long as the relay let it, is neither: dialled again in WAITED_REDIAL, so that the roster
 // is heard of soon after it comes, whatever went before, and never in a storm, however soon a relay lets it go.
 @(private)
-dialer_lost :: proc(d: ^Dialer, fault: zsp.Fault, waited := false) {
+dialer_lost :: proc(d: ^Dialer, fault: zsp.Fault, waited := false, ready := false) {
 	report(.Debug, "no longer connected to the relay at ", d.source)
 	d.stream = nil
-	if d.admitted && fault == .None {
+	admitted := d.admitted || ready
+	if admitted && fault == .None {
 		d.failures = 0
 	}
-	dialer_failed(d, waited && !d.admitted && fault == .None)
+	dialer_failed(d, waited && !admitted && fault == .None)
 }

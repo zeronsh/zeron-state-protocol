@@ -579,7 +579,7 @@ session_settle_membership :: proc(s: ^Session) {
 // Whether a session waited, or waits, for a roster that neither end had: the peer has said hello, and been let in,
 // and nothing could be judged of it yet. A dialler let go of by a relay only for waiting so long has failed at nothing.
 session_waited :: proc(s: ^Session) -> bool {
-	return s.greeted && s.accepted && !s.ready && s.node.roster.serial == 0
+	return s.greeted && s.accepted && !s.ready && s.node.roster.serial == 0 && s.promised == 0
 }
 
 // Peers get the roster; open sessions get what it means for them.
