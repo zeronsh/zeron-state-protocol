@@ -587,13 +587,31 @@ def test_durable_object():
     row = cb.list(1, "chat")[-1][1]
     ca.live(row, 17, b"pieceone", 0, b"hello")
     cb.until(lambda: cb.lives)
+    import threading
+
+    # The call is answered whenever it comes, as test_calls answers: not only within a second, which a busy machine
+    # may take to carry it, as it does here, the answering device held up.
     cb.serve(1, "add", lambda device, body: body + b"!")
-    cb.drain(0.1)
-    ca.until(lambda: len(ca.devices) == 2)
-    ca.send(zsp.CALL, zsp.varint(9) + ca.devices[1][0] + zsp.varint(1) + zsp.varint(3) + b"add\0" + bytes([zsp.URGENCY]) + b"hi")
-    ca.calls[9] = {"data": [], "ended": False, "fault": None}
-    cb.drain(1)
-    ca.until(lambda: ca.calls[9]["data"] == [b"hi!"])
+    stop = threading.Event()
+
+    def answer():
+        while not stop.is_set():
+            cb.drain(0.05)
+
+    answering = threading.Thread(target=answer)
+    answering.start()
+    try:
+        ca.until(lambda: len(ca.devices) == 2)
+        held = threading.Thread(target=pause, args=(b.p, 1.5))
+        held.start()
+        time.sleep(0.1)
+        ca.send(zsp.CALL, zsp.varint(9) + ca.devices[1][0] + zsp.varint(1) + zsp.varint(3) + b"add\0" + bytes([zsp.URGENCY]) + b"hi")
+        ca.calls[9] = {"data": [], "ended": False, "fault": None}
+        ca.until(lambda: ca.calls[9]["data"] == [b"hi!"])
+        held.join()
+    finally:
+        stop.set()
+        answering.join()
 
     # A device that was away while everything happened, with nobody else online.
     a.stop(), b.stop()
