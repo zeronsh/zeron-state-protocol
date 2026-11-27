@@ -142,6 +142,21 @@ do
 	assert(limit == 50 and bit32.btest(flags, 4), `asked for {limit}`)
 end
 
+-- A window begins at the end unless it is said to begin at the start, whatever its list is called.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	h.client:window({ scope = 1, list = "a/start/b", table = Note }, function() end)
+	h.run()
+	local _, flags = watch_of(h.last(WATCH))
+	assert(bit32.btest(flags, 4), "it began at the start")
+	h.client:window({ scope = 1, list = "a/end/b", table = Note, from = "start" }, function() end)
+	h.run()
+	_, flags = watch_of(h.last(WATCH))
+	assert(not bit32.btest(flags, 4), "it began at the end")
+end
+
 -- A range said over again without a row takes it from that window and no other, and spares what is typed.
 do
 	local h = harness()

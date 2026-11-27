@@ -320,6 +320,7 @@ interface Win {
   list: string;
   schema: Table;
   size: number;
+  back: boolean; // it begins at the end
   pages: Page[];
   entries: Entry[]; // in order
   at: Map<Stored, string>; // where each of them is among them
@@ -841,6 +842,7 @@ export class Client {
         list: query.list,
         schema: query.table,
         size,
+        back: from !== "start",
         pages: [],
         entries: [],
         at: new Map(),
@@ -892,7 +894,7 @@ export class Client {
     const tag = this.tag(window.scope, window.list);
     const page = this.#page(window, tag + ZERO24, codec.after(tag));
     window.pages.push(page);
-    this.#watch(page, window.size, !window.key.includes("/start/"));
+    this.#watch(page, window.size, window.back);
   }
 
   #page(window: Win, lo: string, hi: string): Page {

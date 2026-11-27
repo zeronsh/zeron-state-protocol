@@ -118,6 +118,7 @@ export type Window = {
 	list: string,
 	schema: Table,
 	size: number,
+	back: boolean, -- it begins at the end
 	pages: { Page },
 	entries: { { key: string, row: Stored } }, -- in order
 	at: { [Stored]: string }, -- where each of them is among them
@@ -668,6 +669,7 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 			list = query.list,
 			schema = query.table,
 			size = query.size or 50,
+			back = from ~= "start",
 			pages = {},
 			entries = {},
 			at = {},
@@ -737,7 +739,7 @@ function Client._open(self: Client, window: Window)
 	local tag = self:_tag(window.scope, window.list)
 	local page = self:_page(window, tag .. string.rep("\0", 24), codec.after(tag))
 	table.insert(window.pages, page)
-	self:_watch(page, window.size, not string.find(window.key, "/start/", 1, true))
+	self:_watch(page, window.size, window.back)
 end
 
 function Client._page(self: Client, window: Window, lo: string, hi: string): Page

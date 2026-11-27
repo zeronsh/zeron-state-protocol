@@ -142,6 +142,19 @@ function cellOf(row: string, kind: number, slot: number, n: number, body: string
   assert(limit === 50 && flags & 4, `asked for ${limit}`);
 }
 
+// A window begins at the end unless it is said to begin at the start, whatever its list is called.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.window({ scope: 1, list: "a/start/b", table: Note }, () => {});
+  h.run();
+  assert(watchOf(h.last(WATCH)!)[1] & 4, "it began at the start");
+  h.client.window({ scope: 1, list: "a/end/b", table: Note, from: "start" }, () => {});
+  h.run();
+  assert(!(watchOf(h.last(WATCH)!)[1] & 4), "it began at the end");
+}
+
 // A range said over again without a row takes it from that window and no other, and spares what is typed.
 {
   const h = harness();
