@@ -591,6 +591,16 @@ def test_appointed_keep_their_rights():
         assert " 1:rwcv " in line, (appoint[0], line)
 
 
+def test_unkept_address_stops_the_node():
+    """A node that cannot keep where it listens, by which admin commands find it, does not run: they would keep rosters
+    beside it that it never took."""
+    n = Node("unkept")
+    zspd("create", n.dir)
+    os.mkdir(os.path.join(n.dir, "address"))  # which no file is renamed onto: as a full disk, a save that fails
+    p = subprocess.run([BIN, "run", n.dir, "--listen=127.0.0.1:0", "--no-udp"], capture_output=True, text=True, timeout=30)
+    assert p.returncode == 1 and "could not keep" in p.stderr, (p.returncode, p.stderr)
+
+
 def test_limits():
     relay, (a, b) = space("aa", "ab")
     ca, cb = a.client(), b.client()

@@ -355,15 +355,19 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 	space_dir := in_dir(dir, name)
 	switch {
 	case !reached:
-		return host.roster_keep(space_dir, space, bytes) // for the node to read when it starts
+		kept, _ := host.roster_keep(space_dir, space, bytes) // for the node to read when it starts
+		return kept
 	case taken(space_dir, bytes):
 		return true
 	case answered:
 		say(os.stderr, "the node running here would not take it: it has a later roster, or one this does not follow from; nothing was changed\n")
 		return false
 	}
-	host.roster_keep(space_dir, space, bytes)
-	say(os.stderr, "the node running here did not say it has the change: it takes it when it next starts\n")
+	if kept, _ := host.roster_keep(space_dir, space, bytes); kept {
+		say(os.stderr, "the node running here did not say it has the change: it takes it when it next starts\n")
+	} else {
+		say(os.stderr, "the node running here did not say it has the change, nor could it be kept here: nothing was changed\n")
+	}
 	return false
 }
 
@@ -660,8 +664,10 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	}
 	bound, _ := net.bound_endpoint(h.listener)
 	address := net.endpoint_to_string(bound, context.temp_allocator)
-	if !relay {
-		host.save(in_dir(dir, "address"), transmute([]byte)address)
+	if !relay && (policy.token == "" || !host.save(in_dir(dir, "address"), transmute([]byte)address)) {
+		// Without them, an admin command could not find this node, and would keep a roster beside it it never took.
+		say(os.stderr, "could not keep this node's address and token\n")
+		return 1
 	}
 	say(os.stdout, to_hex(h.device[:]), " listening on ws://", address, "\n")
 	host.links_announce(&h)
@@ -676,6 +682,9 @@ local_token :: proc(dir: string) -> string {
 	b: [24]byte
 	crypto.rand_bytes(b[:])
 	token := strings.clone(to_hex(b[:]))
-	host.save(path, transmute([]byte)token)
+	if !host.save(path, transmute([]byte)token) {
+		delete(token)
+		return "" // which no client presents: none is let in that could not find it again
+	}
 	return token
 }

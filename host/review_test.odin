@@ -1,5 +1,7 @@
 package host
 
+import "core:encoding/hex"
+import "core:log"
 import "core:nbio"
 import "core:net"
 import "core:os"
@@ -261,5 +263,60 @@ review_relay_opens_nothing_for_strangers :: proc(t: ^testing.T) {
 		h.streams[0].due = time.tick_now() // as though HANDSHAKE_WAIT had passed
 		host_settle(&h)
 		testing.expectf(t, len(h.streams) == 0 && h.handshaking == 0, "%d streams, %d handshaking, after HANDSHAKE_WAIT", len(h.streams), h.handshaking)
+	}
+}
+
+// Keys a node could not keep are storage failed: it keeps no roster that needs them, writes no checkpoint, and its host
+// stops before anything more is said. A roster it could not keep is the same.
+@(test)
+review_unkept_keys_stop_the_host :: proc(t: ^testing.T) {
+	for what in ([]string{"keys", "roster"}) {
+		base, _ := os.temp_directory(context.temp_allocator)
+		dir, err := os.make_directory_temp(base, "zsp-unkept-*", context.temp_allocator)
+		testing.expect(t, err == nil)
+		defer os.remove_all(dir)
+		h: Host
+		testing.expect(t, host_init(&h, {dir = dir, full = true}))
+		defer host_destroy(&h)
+		root: zsp.Key32
+		root[0] = 7
+		ours: zsp.Keyring
+		zsp.keyring_init(&ours, h.secret)
+		defer zsp.keyring_destroy(&ours)
+		none: zsp.Roster
+		d := zsp.draft_from(&none, now_ms() << 16)
+		home := zsp.draft_scope(&d)
+		zsp.draft_grant(&d, ours.device, ours.signer, home, {.Read, .Write, .Call}).owner = true
+		first, signed := zsp.roster_sign(&ours, root, &d, context.temp_allocator)
+		testing.expect(t, signed)
+		space := zsp.ed25519_public(root)
+		sdir, _ := filepath.join({dir, string(hex.encode(space[:], context.temp_allocator))}, context.temp_allocator)
+		os.make_directory_all(sdir)
+		testing.expect(t, save(file_in(sdir, "roster"), first))
+		s := space_open(&h, space)
+		testing.expect(t, s != nil)
+		if s == nil {
+			return
+		}
+		// Where it is to be kept, a directory, which no file is renamed onto: as a full disk, a save that fails.
+		os.remove(file_in(sdir, what))
+		testing.expect(t, os.make_directory(file_in(sdir, what)) == nil)
+		more := zsp.draft_from(&s.node.roster, (now_ms() + 1) << 16)
+		zsp.draft_scope(&more)
+		second, again := zsp.roster_sign(&s.keys, root, &more, context.temp_allocator)
+		testing.expect(t, again)
+		checkpoint := s.node.serial_kept
+		logger := context.logger
+		context.logger = log.nil_logger() // what the host says of it is meant, and the test's own is said after
+		_ = zsp.node_adopt(&s.node, second)
+		host_settle(&h)
+		context.logger = logger
+		testing.expectf(t, s.node.failed, "%s not kept, and the node goes on", what)
+		testing.expectf(t, s.node.serial_kept == checkpoint, "%s not kept, and a checkpoint says the roster was taken", what)
+		if what == "keys" {
+			kept, _ := os.read_entire_file(file_in(sdir, "roster"), context.temp_allocator)
+			testing.expect(t, string(kept) == string(first), "a roster kept whose keys were not")
+		}
+		testing.expectf(t, h.stopping, "%s not kept, and the host goes on", what)
 	}
 }

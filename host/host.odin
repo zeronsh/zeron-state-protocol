@@ -165,14 +165,26 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		data         = s,
 		authenticate = space_authenticate,
 		keep         = proc(data: rawptr, bytes: []byte) {
+			// Keys learnt and not kept are lost at the next start, and with them all sealed under them: storage has
+			// failed, as the node is told, so that it writes no checkpoint and the host stops before anything more is
+			// said, an acknowledgement least of all.
 			s := (^Space)(data)
-			file_disk_make(&s.disk)
-			save(file_in(s.dir, "keys"), bytes)
+			if !file_disk_make(&s.disk) || !save(file_in(s.dir, "keys"), bytes) {
+				report(.Error, "could not keep the keys; stopping rather than going on with what may be lost")
+				s.node.failed = true
+			}
 		},
 		roster       = proc(data: rawptr, bytes: []byte) {
 			s := (^Space)(data)
-			file_disk_make(&s.disk)
-			roster_keep(s.dir, s.node.space, bytes)
+			if s.node.failed {
+				return // nor a roster whose keys were not kept, which would be held to at the next start without them
+			}
+			made := file_disk_make(&s.disk)
+			if _, ok := roster_keep(s.dir, s.node.space, bytes); !made || !ok {
+				report(.Error, "could not keep the roster; stopping rather than going on with what may be lost")
+				s.node.failed = true
+				return
+			}
 			if serial, ok := zsp.roster_claims(bytes, s.node.space); ok && debugging() {
 				report(.Debug, "roster ", fmt.tprintf("%x", serial), " taken and kept")
 			}
@@ -198,17 +210,19 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 
 // Keeps a space's roster in its directory, and the one it follows as roster.old, unless what is kept there is it already,
 // or later: as when whoever handed it over kept it first, or a later one is on its way to the node. Never the other way,
-// which would make roster.old the newer, or keep one older than is had. Whether the roster kept is this one.
-roster_keep :: proc(dir: string, space: zsp.Key32, bytes: []byte) -> bool {
+// which would make roster.old the newer, or keep one older than is had. Whether the roster kept is this one, and false
+// for `ok` if what was to be written could not be.
+roster_keep :: proc(dir: string, space: zsp.Key32, bytes: []byte) -> (this, ok: bool) {
 	serial := zsp.roster_claims(bytes, space) or_return
 	path := file_in(dir, "roster")
 	if old, err := os.read_entire_file(path, context.temp_allocator); err == nil {
-		if kept, ok := zsp.roster_claims(old, space); ok && kept >= serial {
-			return string(old) == string(bytes)
+		if kept, sound := zsp.roster_claims(old, space); sound && kept >= serial {
+			return string(old) == string(bytes), true
 		}
 		save(file_in(dir, "roster.old"), old) or_return
 	}
-	return save(path, bytes)
+	this = save(path, bytes)
+	return this, this
 }
 
 @(private)
@@ -228,6 +242,14 @@ space_close :: proc(s: ^Space) {
 	found_close(s)
 	calls_close(s)
 	relayed_close(s)
+	if s.node.failed {
+		// Its last checkpoint stands, and what it has kept: nothing is written to say more was.
+		zsp.node_destroy(&s.node)
+		zsp.keyring_destroy(&s.keys)
+		delete(s.dir)
+		free(s)
+		return
+	}
 	if !zsp.store_sync(&s.node.store) {
 		report(.Error, "could not sync the log")
 	}
@@ -354,19 +376,23 @@ session_end :: proc(session: ^zsp.Session) {
 host_settle :: proc(h: ^Host) {
 	now := time.tick_now()
 	ms := now_ms()
+	// First, and then nothing more: whatever has failed may have let the store count as durable what is not, and what
+	// would be said of it is not said.
+	for s in h.spaces {
+		if s.node.failed {
+			report(.Error, "storage failed; stopping rather than going on with what may be lost")
+			h.stopping = true
+			return
+		}
+	}
 	if h.syncing && time.tick_diff(h.sync_due, now) >= 0 {
 		h.syncing = false
 		for s in h.spaces {
 			if !zsp.node_sync(&s.node) {
 				report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
 				h.stopping = true
+				return
 			}
-		}
-	}
-	for s in h.spaces {
-		if s.node.failed {
-			report(.Error, "storage failed; stopping rather than going on with what may be lost")
-			h.stopping = true
 		}
 	}
 	dialers_run(h, now)
