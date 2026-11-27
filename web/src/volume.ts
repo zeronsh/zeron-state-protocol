@@ -1,6 +1,15 @@
 // Where a device keeps what it holds: a directory of files that are read and written synchronously, as the node
 // needs, though they may only be opened, made and removed in their own time, as a browser's are.
 
+/**
+ * The store's files are held by something else, which did not let go of them in time: in a browser, another tab of the
+ * origin that ought not to hold them, or the browser itself, which has been known to go on holding a file after whatever
+ * held it has gone, until it is restarted. Nothing was opened, and nothing is lost; opening the device again tries again.
+ */
+export class StoreLocked extends Error {
+  override name = "StoreLocked";
+}
+
 /** A file open for reading and writing. Every call is synchronous; failures throw. */
 export interface File {
   /** Reads into `into` from `at`; returns how many bytes there were. */
@@ -21,7 +30,7 @@ export interface Volume {
   /** The same, at once, where the platform can; a browser cannot. */
   openNow?(name: string, create: boolean): File | undefined;
   remove(name: string): Promise<void>;
-  /** Lets go of the directory, its files being closed already. */
+  /** Lets go of the directory, its files being closed already: whatever is being opened gives up waiting for its file. */
   close?(): void;
 }
 

@@ -78,6 +78,51 @@ function expectEqual<T>(got: T, want: T, what = ""): void {
   if (JSON.stringify(got) !== JSON.stringify(want)) throw new Error(`${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
 }
 
+// What a worker evaluates before its own script, by Page.preamble: it says of every file of the origin's file system it
+// opens, closes and finds held by another, as `who`, on a channel every tab of the test page listens to. And it may make the
+// platform misbehave as it may: hold every file for `lag` ms from the first opened, as Chromium has been seen to after the
+// worker that had them was gone, which with `lag` of Infinity it has been seen to do until the browser is restarted.
+function files(o: { who: string; lag?: number }): string {
+  return `(() => {
+    const o = ${JSON.stringify({ ...o, lag: o.lag === Infinity ? 1e12 : (o.lag ?? 0) })};
+    const said = { who: o.who, worker: crypto.randomUUID(), opened: 0, closed: 0, held: 0 };
+    const channel = new BroadcastChannel("zsp-files");
+    const say = () => channel.postMessage(said);
+    let first;
+    const create = FileSystemFileHandle.prototype.createSyncAccessHandle;
+    FileSystemFileHandle.prototype.createSyncAccessHandle = async function () {
+      first ??= performance.now();
+      if (performance.now() - first < o.lag) {
+        said.held++, say();
+        throw new DOMException("Access Handles cannot be created if there is another open Access Handle or Writable stream associated with the same file.", "NoModificationAllowedError");
+      }
+      let h;
+      try {
+        h = await create.call(this);
+      } catch (e) {
+        if (e.name === "NoModificationAllowedError" || e.name === "InvalidStateError") said.held++, say();
+        throw e;
+      }
+      said.opened++, say();
+      const close = h.close;
+      let open = true;
+      h.close = function () {
+        if (open) (open = false), said.closed++, say();
+        return close.call(this);
+      };
+      return h;
+    };
+  })()`;
+}
+const filesSaid = async (p: Page, who: string) => (await call<{ who: string; opened: number; closed: number; held: number }[]>(p, "files")).filter((f) => f.who === who);
+
+// Loads a page again, and waits for it to be the test page anew.
+async function reload(p: Page): Promise<void> {
+  await p.evaluate("window.__old = 1, 1");
+  await p.cdp("Page.reload");
+  await eventually(async () => (await p.evaluate("typeof window.zsp === 'object' && window.__old === undefined").catch(() => false)) === true, "loaded again");
+}
+
 // A relay of the Durable Object's, under workerd, that lets in only what presents `token`: started again on the same port,
 // with the same key, as a relay whose host has rotated what it accepts.
 const RELAY_SECRET = randomBytes(32).toString("hex");
@@ -161,6 +206,61 @@ const tests: Record<string, () => Promise<void>> = {
     expectEqual(await within(10000, call(last, "put", "fn", "notes", ["two"]).then(() => "written")), "written", "written with the next in line frozen");
     await frozen.cdp("Page.setWebLifecycleState", { state: "active" });
     expectEqual((await call<string[]>(frozen, "titles", "fn", "notes", 2)).join(), "one,two", "and the frozen one has it all, thawed");
+  },
+  // A tab loaded again and again, at times before its device has opened: every time, the worker it had is stopped with its
+  // files held, and the next is opened as soon as it has the store's lock, as Chrome hands it over. As it is here, and as
+  // it has been seen to be, the files still held a while after the lock is had.
+  async tab_reload_storm() {
+    const p = await page();
+    const watcher = await page(); // which hears what each worker of the other says of its files
+    await call(p, "device", "rs");
+    await call(p, "create", "rs");
+    const put: string[] = [];
+    for (const lag of [0, 150]) {
+      await p.preamble(files({ who: `lag ${lag}`, lag }));
+      for (let i = 0; i < 8; i++) {
+        await reload(p);
+        if (i % 2 === 1) {
+          void call(p, "device", "rs").catch(() => {}); // loaded again as it opens
+          continue;
+        }
+        expectEqual(await call<string>(p, "deviceOrError", "rs"), "ok", `opened, loaded again ${i + 1} times, held ${lag} ms`);
+        await call(p, "put", "rs", "notes", [`${lag}/${i}`]);
+        put.push(`${lag}/${i}`);
+      }
+      const said = await filesSaid(watcher, `lag ${lag}`);
+      const held = said.reduce((n, f) => n + f.held, 0);
+      console.log(`     held ${lag} ms: ${said.length} workers opened ${said.reduce((n, f) => n + f.opened, 0)} files, finding one held ${held} times`);
+      if (lag > 0 && held === 0) throw new Error("no file was held, as the test meant it to be");
+    }
+    await reload(p);
+    expectEqual(await call<string>(p, "deviceOrError", "rs"), "ok");
+    expectEqual((await call<string[]>(p, "titles", "rs", "notes", put.length)).join(), put.join(), "everything written in the storm");
+  },
+  // A tab's worker is stopped without a word, as a crash stops it, and the device opened again at once: the files are let go
+  // of as the browser stops it, and its next worker opens them, though they are held a while after it has the lock. Held
+  // for ever, as Chromium has been seen to hold them until it is restarted, the store is said to be locked, in time, and is
+  // opened once they are let go of.
+  async tab_killed_worker() {
+    const p = await page();
+    await call(p, "device", "kw");
+    await call(p, "create", "kw");
+    await call(p, "put", "kw", "notes", ["one"]);
+    await p.preamble(files({ who: "held", lag: 150 }));
+    await call(p, "killWorker", "kw");
+    expectEqual(await call<string>(p, "deviceOrError", "kw"), "ok", "opened again after its worker was killed");
+    await call(p, "put", "kw", "notes", ["two"]);
+    await call(p, "killWorker", "kw");
+    await p.preamble(files({ who: "held for ever", lag: Infinity }));
+    const t = performance.now();
+    const said = await within(15000, call<string>(p, "deviceOrError", "kw"));
+    const took = performance.now() - t;
+    if (!said.startsWith("StoreLocked (StoreLocked): ")) throw new Error(`a store whose files are held for ever: ${said}`);
+    console.log(`     said to be locked in ${took.toFixed(0)} ms: ${said}`);
+    if (took > 6000) throw new Error(`said to be locked only after ${took.toFixed(0)} ms`);
+    await p.preamble(undefined);
+    expectEqual(await call<string>(p, "deviceOrError", "kw"), "ok", "opened once its files are let go of");
+    expectEqual((await call<string[]>(p, "titles", "kw", "notes", 2)).join(), "one,two");
   },
   // A tab's worker carries its pipe to the leader's, which never hears of it: the pipe is broken off, and the client
   // dials again, rather than waiting for ever.

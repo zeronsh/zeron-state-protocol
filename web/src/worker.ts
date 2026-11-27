@@ -61,8 +61,8 @@ export type Op =
  * that a time asked for is up. Never a credential: the tab that gave one has it, and no other tab is given it.
  */
 export type Report =
-  | { answer: number; value?: unknown; error?: string }
-  | { failed: string }
+  | { answer: number; value?: unknown; error?: string; name?: string }
+  | { failed: string; name?: string }
   | { space: string | undefined }
   | { due: number }
   | { credentialAt: number }; // when what the tab gave is said to have been given: anew, or again as newer, never what it is
@@ -70,12 +70,12 @@ export type Report =
 // Between workers, on the store's channel.
 type Shout =
   | { leader: true } // a worker has opened the store: whatever was carried to another is broken
-  | { failed: string } // its storage has failed: it has stopped, and lets another try
+  | { failed: string; name?: string } // its storage has failed, or could not be opened: it has stopped, and lets another try
   | { space: string | undefined } // the space the device is of, now
   | { open: string } // a pipe, on the channel of that name
   | { ask: string; op: Op; args: unknown[] }
   | { taking: string } // an ask the leader is doing now, which it may have done should it go before it answers
-  | { answer: string; value?: unknown; error?: string }
+  | { answer: string; value?: unknown; error?: string; name?: string }
   | Given // a credential a tab has given, for whichever worker runs the node now and later
   | { credentials: true }; // a worker that has just begun, asking to be told the newest given before it
 
@@ -104,7 +104,7 @@ export type Say = { data: Uint8Array } | { credit: number } | { close: true };
 let device: Node | undefined;
 let channel: BroadcastChannel;
 const carried = new Set<() => void>(); // pipes carried to the leader: how to break each
-const waiting = new Map<string, (answer: { value?: unknown; error?: string }) => void>();
+const waiting = new Map<string, (answer: { value?: unknown; error?: string; name?: string }) => void>();
 const unheard = new Map<string, Shout>(); // said to the leader, and not yet answered
 
 const taken = new Set<string>(); // asks of this worker's that the leader said it was doing
@@ -123,6 +123,11 @@ self.onmessage = async (e: MessageEvent<Command>) => {
 
 let options: Options;
 let contending = false; // in line for the store, or running it
+
+/** What went wrong, as a tab is told it: the error's name too, where it is one an application may tell apart. */
+export type Failure = { message: string; name?: string };
+const failure = (e: unknown): Failure =>
+  e instanceof Error ? { message: e.message, ...(e.name === "StoreLocked" ? { name: e.name } : {}) } : { message: String(e) };
 
 function open(o: Options): void {
   options = o;
@@ -202,7 +207,7 @@ function contend(): void {
       device = node;
     } catch (error) {
       contending = false;
-      fail(error instanceof Error ? error.message : String(error));
+      fail(failure(error));
       return;
     }
     breakCarried();
@@ -216,16 +221,16 @@ function contend(): void {
     const error = await failed;
     device = undefined;
     contending = false;
-    fail(error.message);
+    fail(failure(error));
   });
 }
 
 // Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
-function fail(message: string): void {
-  failedAsks(message);
+function fail(f: Failure): void {
+  failedAsks(f);
   breakCarried(); // to one that is gone, or none: every client dials again, and so this worker is wanted, and tries again
-  self.postMessage({ failed: message } satisfies Report);
-  channel.postMessage({ failed: message } satisfies Shout);
+  self.postMessage({ failed: f.message, name: f.name } satisfies Report);
+  channel.postMessage({ failed: f.message, name: f.name } satisfies Shout);
 }
 
 // Every tab hears what space the device is of, whichever tab changed it.
@@ -241,7 +246,7 @@ function breakCarried(): void {
 
 // ---------------------------------------------------------------- the device, for any tab
 
-async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: string }> {
+async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: string; name?: string }> {
   if (op === "credential") {
     const c = args[0];
     const at = args[1];
@@ -318,8 +323,8 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
 
 // Whatever was asked of a node that stopped, or of one that never came to be, and not answered, was not done, and the tab
 // is told it failed: it is not to be done by the next, either.
-function failedAsks(message: string): void {
-  for (const [id, done] of waiting) unheard.delete(id), taken.delete(id), done({ error: message });
+function failedAsks(f: Failure): void {
+  for (const [id, done] of waiting) unheard.delete(id), taken.delete(id), done({ error: f.message, name: f.name });
   waiting.clear();
 }
 
@@ -341,9 +346,10 @@ function heard(s: Shout): void {
   if (typeof s !== "object" || s === null) return;
   if ("failed" in s) {
     if (typeof s.failed !== "string") return;
-    failedAsks(s.failed);
+    const f: Failure = { message: s.failed, ...(s.name === "StoreLocked" ? { name: s.name } : {}) };
+    failedAsks(f);
     breakCarried();
-    self.postMessage({ failed: s.failed } satisfies Report);
+    self.postMessage({ failed: f.message, name: f.name } satisfies Report);
   } else if ("space" in s) {
     if (s.space !== undefined && typeof s.space !== "string") return;
     self.postMessage({ space: s.space } satisfies Report);
@@ -367,7 +373,7 @@ function heard(s: Shout): void {
     unheard.delete(s.answer);
     waiting.delete(s.answer);
     taken.delete(s.answer);
-    done?.({ value: s.value, error: s.error });
+    done?.({ value: s.value, error: s.error, name: s.name === "StoreLocked" ? s.name : undefined });
   } else if (device && "ask" in s) {
     if (typeof s.ask !== "string" || typeof s.op !== "string" || !Array.isArray(s.args)) return;
     // Said before it is done, so that should this worker go as it does it, the asker knows it may have been.

@@ -1,6 +1,6 @@
 // What a test page has, for test/browsers.ts to drive: devices of this origin, and the live suite.
 
-import { open, Client, columns, type Device, type Editor, type State } from "../src/browser.ts";
+import { open, Client, columns, StoreLocked, type Device, type Editor, type State } from "../src/browser.ts";
 import { Node, type Connect, type Wire } from "../src/node.ts";
 import { MemoryVolume } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
@@ -8,6 +8,20 @@ import { live } from "./live.ts";
 import { where } from "../src/ask.ts";
 
 const devices = new Map<string, Device>();
+
+// Every worker this page starts, so that a test may stop one as a crash would: without a word.
+const started: Worker[] = [];
+const PageWorker = Worker;
+globalThis.Worker = class extends PageWorker {
+  constructor(url: string | URL, options?: WorkerOptions) {
+    super(url, options);
+    started.push(this);
+  }
+};
+
+// What the workers of any tab that test/tabs.ts watches say of the files they open and close, by worker.
+const files = new Map<string, { who: string; opened: number; closed: number; held: number }>();
+new BroadcastChannel("zsp-files").onmessage = (e) => files.set(e.data.worker, e.data);
 const failures: string[] = []; // what this tab was told of nodes that stopped
 const asked: string[] = []; // what came of what was asked and not waited for
 
@@ -72,6 +86,26 @@ const zsp = {
     const d = await open({ name, credential, full, keep, onFailure: (e) => failures.push(e.message) });
     devices.set(name, d);
     return { id: d.id, key: d.key, space: d.space };
+  },
+  /** Opens the device again, as `device` does: "ok", or what it was refused with, by name, and whether it is a StoreLocked. */
+  async deviceOrError(name: string): Promise<string> {
+    clients.delete(name);
+    try {
+      await zsp.device(name);
+      return "ok";
+    } catch (e) {
+      return `${(e as Error).name}${e instanceof StoreLocked ? " (StoreLocked)" : ""}: ${(e as Error).message}`;
+    }
+  },
+  /** Stops this tab's worker as a crash would, telling it nothing; and so the device it carried is had no more. */
+  async killWorker(name: string): Promise<void> {
+    started[started.length - 1]?.terminate();
+    clients.delete(name);
+    devices.delete(name);
+  },
+  /** What watched workers have said of the files they opened, closed and found held. */
+  async files(): Promise<{ who: string; opened: number; closed: number; held: number }[]> {
+    return [...files.values()];
   },
   /** The same, with its node found at that URL, should this tab's worker come to run it. */
   async deviceWith(name: string, wasm: string): Promise<void> {

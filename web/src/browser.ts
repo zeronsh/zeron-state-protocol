@@ -4,9 +4,13 @@
 import { Client } from "./client.ts";
 import type { Device, Relay } from "./index.ts";
 import type { Connect, Member, Rights } from "./node.ts";
+import { StoreLocked } from "./volume.ts";
 import type { Command, Op, Report, Say } from "./worker.ts";
 
 export * from "./index.ts";
+
+// What the worker said went wrong, as the error it was.
+const errorOf = (message: string, name?: string): Error => (name === "StoreLocked" ? new StoreLocked(message) : new Error(message));
 
 export interface OpenOptions {
   /** Which store: one device each, shared by the origin's tabs. "default" unless said. */
@@ -67,7 +71,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       // Anything it says, it says having been opened, and so having taken what it was given, if it is the tab's still.
       if (!heard) (heard = true), giving !== undefined && credential === giving && (taken = true);
       const r = e.data;
-      if ("failed" in r) return fail(new Error(r.failed));
+      if ("failed" in r) return fail(errorOf(r.failed, r.name));
       if ("space" in r) return void (space = r.space);
       if ("credentialAt" in r) return void (taken && (credentialAt = r.credentialAt)); // what this tab gave, given again as newer
       if ("due" in r) {
@@ -77,7 +81,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       }
       const a = answers.get(r.answer);
       answers.delete(r.answer);
-      if (r.error !== undefined) a?.reject(new Error(r.error));
+      if (r.error !== undefined) a?.reject(errorOf(r.error, r.name));
       else a?.resolve(r.value);
     };
     w.postMessage({ open: { name, full: options.full, keep: options.keep, credential, credentialAt, credentialAgain: taken, wasm: options.wasm?.toString() } } satisfies Command);

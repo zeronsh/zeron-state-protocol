@@ -36,6 +36,11 @@ export interface Page {
   quota(bytes?: number): Promise<void>;
   /** The DevTools sessions of the page's workers, as they were attached, and a way to ask anything of one. */
   readonly workers: string[];
+  /**
+   * Has every worker the page starts from now on, until said otherwise, evaluate this before its own script runs: so that
+   * a test may make the platform under it misbehave as it may, or watch what it does.
+   */
+  preamble(script: string | undefined): Promise<void>;
   cdp<T = any>(method: string, params?: object, session?: string): Promise<T>;
   close(): Promise<void>;
 }
@@ -116,6 +121,8 @@ export class Chrome {
     const { sessionId } = await this.#send<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true });
     // What a page or any of its workers says is said.
     const workers: string[] = [];
+    let preamble: string | undefined;
+    const onPause = new Map<string, () => Promise<void>>(); // a worker's, paused to be given its preamble
     const listen = (session: string, who: string) => {
       this.#sessions.set(session, (method, params) => {
         if (method === "Runtime.consoleAPICalled") say(who + params.args.map((a: any) => a.value ?? a.description ?? "").join(" "));
@@ -123,12 +130,34 @@ export class Chrome {
           const what = who + (params.exceptionDetails.exception?.description ?? params.exceptionDetails.text);
           this.uncaught.push(what);
           say("uncaught: " + what);
-        }
-        else if (method === "Target.attachedToTarget") {
-          if (params.targetInfo.type === "worker") workers.push(params.sessionId);
-          listen(params.sessionId, "(" + params.targetInfo.type + ") ");
-          void this.#send("Runtime.enable", {}, params.sessionId);
-          void this.#send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, params.sessionId);
+        } else if (method === "Debugger.paused") {
+          const go = onPause.get(session);
+          onPause.delete(session);
+          void go?.().catch(() => {});
+        } else if (method === "Target.attachedToTarget") {
+          const child = params.sessionId;
+          if (params.targetInfo.type === "worker") workers.push(child);
+          listen(child, "(" + params.targetInfo.type + ") ");
+          void this.#send("Runtime.enable", {}, child).catch(() => {}); // or gone already
+          void this.#send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, child).catch(() => {});
+          if (params.waitingForDebugger) {
+            // Paused as it starts: and, with a preamble, again just before its script runs, which is when its global
+            // scope is there to evaluate the preamble in.
+            const script = params.targetInfo.type === "worker" ? preamble : undefined;
+            void (async () => {
+              if (script !== undefined) {
+                onPause.set(child, async () => {
+                  const r = await this.#send("Runtime.evaluate", { expression: script, returnByValue: true }, child);
+                  if (r.exceptionDetails) say(`(worker) preamble threw: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text}`);
+                  await this.#send("Debugger.disable", {}, child);
+                  await this.#send("Debugger.resume", {}, child).catch(() => {});
+                });
+                await this.#send("Debugger.enable", {}, child);
+                await this.#send("Debugger.setInstrumentationBreakpoint", { instrumentation: "beforeScriptExecution" }, child);
+              }
+              await this.#send("Runtime.runIfWaitingForDebugger", {}, child);
+            })().catch(() => {}); // gone already, as a page loaded again takes its workers with it
+          }
         }
       });
     };
@@ -153,6 +182,10 @@ export class Chrome {
         return r.result.value as T;
       },
       workers,
+      preamble: async (script) => {
+        preamble = script;
+        await this.#send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: script !== undefined, flatten: true }, sessionId);
+      },
       cdp: (method: string, params: object = {}, session?: string) => this.#send(method, params, session ?? sessionId),
       quota: async (bytes?: number) => {
         const origin = new URL(url).origin;
