@@ -138,7 +138,10 @@ but what it has to wait for: a pipe waiting for room is given its turn by a mess
 application does when the one it opened the device with, a JWT of hours, is about to expire; a tab that opens the device with a
 credential gives it too. The worker running the node takes it, and dials again at once any relay that has not let the device
 in, or that it is waiting to try again; a session already let in goes on, and presents the new one when it is next dialled. Every
-worker hears of every credential given, so whichever runs the node next presents the newest any tab gave. It is kept in memory
+worker hears of every credential given, and one that begins asks the others for the newest they know, so whichever runs the
+node next presents the newest any tab gave. Newest by a clock of the machine's own and of what was given: what is given anew is
+counted later than anything its worker has heard of, though the machine's clock was set back since; what a tab gave before,
+given again as it starts another worker, is counted as it was. It is kept in memory
 only, never written down, and said to no tab: only to the workers of the origin, which may open the device and do as they like
 with it anyway, as anything of the origin may.
 
