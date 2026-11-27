@@ -127,7 +127,7 @@ const tests: Record<string, () => Promise<void>> = {
     await call(follower, "device", "bf");
     await call(follower, "put", "bf", "notes", ["one"]);
     await leader.evaluate(`addEventListener('pagehide', (e) => localStorage.setItem('cached', String(e.persisted)));
-      addEventListener('pageshow', (e) => e.persisted && localStorage.setItem('restored', 'true'));
+      window.__cached = 1; // on this very page, which a page loaded again has not
       location.href = '/elsewhere', 1`);
     await eventually(async () => (await follower.evaluate("localStorage.getItem('cached')")) !== null);
     expectEqual(await follower.evaluate("localStorage.getItem('cached')"), "true", "the leader was put in the back/forward cache");
@@ -137,7 +137,7 @@ const tests: Record<string, () => Promise<void>> = {
     await leader.evaluate("history.back(), 1");
     // Taken from the cache, as most often; or, as a browser may let go of what it cached whenever it likes, loaded again.
     await eventually(async () => (await leader.evaluate("typeof window.zsp === 'object' && window.__left === undefined").catch(() => false)) === true, "it is back");
-    const restored = (await follower.evaluate("localStorage.getItem('restored')")) === "true";
+    const restored = (await leader.evaluate("window.__cached === 1")) === true;
     console.log(`     back ${restored ? "from the back/forward cache" : "loaded again, the browser having let go of what it cached"}`);
     if (!restored) await call(leader, "device", "bf");
     await call(leader, "put", "bf", "notes", ["three"]);
