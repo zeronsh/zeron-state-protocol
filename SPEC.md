@@ -123,7 +123,9 @@ change is to be made again. An admin carries the charter over untouched, and mus
 trusted: who is who, who may do what, and when that ended.
 
 But no admin can shut an owner out. A roster is invalid unless every owner in its charter is a member, with the charter's signer, and Read and Write in force
-in every scope. No two members share a device or a signer. A key that does not match its commitment is as good as none; a device keeps, sealed for itself, the keys it
+in every scope. No two members share a device or a signer. No key that a secret is shared with, the charter's ephemeral key, the roster's, or a
+device, is one of small order (0, 1, −1, p, p + 1 or either point of order 8, whatever its top bit), with which nothing can be wrapped: a roster with
+one is invalid. A key that does not match its commitment is as good as none; a device keeps, sealed for itself, the keys it
 has learnt, so that nothing garbled later takes them away; and an owner signs although a key was kept from it, declaring that epoch **void** by
 closing it no later than the one before (the first, at 0), with 32 zero bytes for its key in `history`. Nothing sealed under a void epoch is acceptable; what honest
 members sealed under it they seal again.

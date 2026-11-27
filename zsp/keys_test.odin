@@ -298,3 +298,64 @@ rosters_fit_in_a_frame :: proc(t: ^testing.T) {
 	_, sound = roster_parse(make([]byte, MAX_ROSTER + 1, context.temp_allocator), ed25519_public(root))
 	testing.expect(t, !sound)
 }
+
+// Points of small order share nothing with any secret, whichever their top bit; and no roster names one where a secret
+// is to be shared, as its ephemeral key or a device, for nothing could be wrapped for it, nor any roster signed again.
+@(test)
+small_order_keys_share_nothing :: proc(t: ^testing.T) {
+	near: [3]Key32 // p - 1, p and p + 1
+	for &k, i in near {
+		k[0] = 0xec + byte(i)
+		slice.fill(k[1:31], 0xff)
+		k[31] = 0x7f
+	}
+	small := [?]Key32 {
+		{},
+		{0 = 1},
+		near[0],
+		near[1],
+		near[2],
+		{0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00},
+		{0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57},
+	}
+	secrets := [3]Keyring{test_keyring(), test_keyring(), test_keyring()}
+	defer for &k in secrets {
+		keyring_destroy(&k)
+	}
+	for k in small {
+		for top in ([]byte{0, 0x80}) {
+			k := k
+			k[31] |= top
+			testing.expect(t, !x25519_sound(k))
+			for &s in secrets {
+				_, shared := x25519_shared(s.secret, k)
+				testing.expect(t, !shared)
+			}
+		}
+	}
+	// And whatever else is of one byte, or one short of these, shares something.
+	for first in 0 ..< 256 {
+		for k in ([]Key32{{}, near[0]}) {
+			k := k
+			k[0] = byte(first)
+			_, shared := x25519_shared(secrets[0].secret, k)
+			testing.expect_value(t, x25519_sound(k), shared)
+		}
+	}
+	for &s in secrets {
+		testing.expect(t, x25519_sound(s.device))
+	}
+
+	root, space := test_root()
+	a := test_keyring()
+	defer keyring_destroy(&a)
+	none: Roster
+	d := draft_from(&none, 100)
+	home := draft_scope(&d)
+	draft_grant(&d, a.device, a.signer, home, {.Write}).owner = true
+	// One with no grant has nothing wrapped for it, and so the roster can be signed.
+	append(&d.members, Member{device = {}, signer = secrets[0].signer})
+	bytes, signed := roster_sign(&a, root, &d, context.temp_allocator)
+	_, sound := roster_parse(bytes, space)
+	testing.expect(t, signed && !sound)
+}
