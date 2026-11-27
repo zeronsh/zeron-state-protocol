@@ -259,6 +259,10 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 	for &m, i in r.members {
 		m.device = read_key32(&rd)
 		m.signer = read_key32(&rd)
+		// Nothing could be wrapped for it, and no roster be signed again.
+		if !x25519_sound(m.device) {
+			return
+		}
 		for other in r.members[:i] {
 			if other.device == m.device || other.signer == m.signer {
 				return
@@ -312,7 +316,11 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 		l.key = read_key32(&rd)
 		l.url = string(read_bytes(&rd))
 	}
+	// One of small order shares nothing with anyone: no wrap could be made under it, nor opened.
 	r.eph = read_key32(&rd)
+	if !x25519_sound(r.eph) {
+		return
+	}
 	r.wraps = read_take(&rd, 48 * wraps)
 	r.history = read_take(&rd, 48 * history)
 	by := read_varint(&rd)
@@ -335,18 +343,19 @@ charter_parse :: proc(r: ^Roster, bytes: []byte, proven: bool) -> bool {
 	rd := Reader{buf = body}
 	r.charter = bytes
 	r.term = read_varint(&rd)
-	_ = read_take(&rd, 32)
+	sound := x25519_sound(read_key32(&rd))
 	r.owners = make([]Owner, read_count(&rd))
 	for &o in r.owners {
 		o.device = read_key32(&rd)
 		o.signer = read_key32(&rd)
 		o.wrap = read_take(&rd, 48)
+		sound &&= x25519_sound(o.device)
 	}
 	r.admins = make([]Key32, read_count(&rd))
 	for &a in r.admins {
 		a = read_key32(&rd)
 	}
-	return read_done(&rd) && r.term > 0
+	return read_done(&rd) && r.term > 0 && sound
 }
 
 @(private)
@@ -864,15 +873,18 @@ roster_unwrap :: proc(k: ^Keyring, r: ^Roster) -> bool {
 			rd := Reader{buf = r.charter}
 			_ = read_varint(&rd)
 			eph := read_key32(&rd)
-			wrap := wrap_key(k.secret, eph, eph, k.device) or_return
-			k.root = open_key(wrap, 0, o.wrap) or_return
+			wrap, _ := wrap_key(k.secret, eph, eph, k.device)
+			if root, opened := open_key(wrap, 0, o.wrap); opened {
+				k.root = root
+			}
 		}
 	}
 	me := roster_member(r, k.device)
 	if me == nil || !member_active(me) {
 		return false
 	}
-	wrap := wrap_key(k.secret, r.eph, r.eph, k.device) or_return
+	// A wrap that cannot be made, like one that does not open, is garbled, and takes nothing away.
+	wrap, _ := wrap_key(k.secret, r.eph, r.eph, k.device)
 	at := 0
 	for &m in r.members {
 		if &m == me {

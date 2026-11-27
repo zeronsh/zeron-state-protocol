@@ -1700,3 +1700,46 @@ echoes_are_not_owed :: proc(t: ^testing.T) {
 	sim_settle(&s)
 	testing.expect_value(t, phone.node.outbox.root, 0)
 }
+
+// ---------------------------------------------------------------- the bug hunt
+
+// An admin gone bad cannot take the keys others have learnt with an ephemeral key no wrap can be made under: such a
+// roster is none, and a wrap that cannot be made, like one that does not open, takes nothing away.
+@(test)
+a_garbled_ephemeral_takes_no_keys :: proc(t: ^testing.T) {
+	state := seeded(83)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	owner, admin := s.nodes[0], s.nodes[1]
+	held := keyring_scope(&owner.keys, 1).epochs[0]
+	d := draft_from(&admin.node.roster, max(admin.node.clock, admin.node.now << 16))
+	bytes, ok := roster_sign(&admin.keys, nil, &d, context.temp_allocator)
+	r, sound := roster_parse(bytes, s.space)
+	testing.expect(t, ok && sound)
+	defer roster_destroy(&r)
+	at := int(uintptr(raw_data(r.wraps)) - uintptr(raw_data(r.bytes))) - 32
+	testing.expect(t, r.eph == (^Key32)(&bytes[at])^)
+	p_plus_1: Key32 // which is 1, and the top bit is no part of it either
+	p_plus_1[0] = 0xee
+	slice.fill(p_plus_1[1:], 0xff)
+	for low in ([]Key32{{}, {0 = 1}, p_plus_1}) {
+		evil := slice.clone(bytes, context.temp_allocator)
+		(^Key32)(&evil[at])^ = low
+		testing.expect(t, !node_adopt(&owner.node, resign(evil, admin.keys.seed)))
+		testing.expect(t, !node_adopt(&s.nodes[1].node, evil))
+		mine := keyring_scope(&owner.keys, 1)
+		testing.expect(t, mine != nil && mine.epochs[0] == held)
+	}
+	// However it comes to be unwrapped, what was learnt stays.
+	k: Keyring
+	keyring_init(&k, owner.secret)
+	defer keyring_destroy(&k)
+	testing.expect(t, roster_unwrap(&k, &r) && keyring_scope(&k, 1).epochs[0] == held)
+	r.eph = {}
+	testing.expect(t, roster_unwrap(&k, &r))
+	mine := keyring_scope(&k, 1)
+	testing.expect(t, mine != nil && mine.epochs[0] == held)
+}
