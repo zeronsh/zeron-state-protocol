@@ -446,7 +446,9 @@ review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
 			free_all(context.temp_allocator)
 		}
 	})
-	// As another process reads, or a scanner: opened as the system opens a file by default, held a moment.
+	// As another process reads, or a scanner: opened as the system opens a file by default, not letting it be deleted,
+	// held a moment, and let be a moment. One that let it be no longer than it takes to open it again would keep any
+	// replacement out on Windows, which nothing could wait for the moment between without spinning.
 	theirs := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
 		context = runtime.default_context()
 		for !sync.atomic_load(&sh.done) {
@@ -456,6 +458,7 @@ review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
 				time.sleep(time.Millisecond)
 				os.close(f)
 			}
+			time.sleep(time.Millisecond)
 		}
 	})
 	other := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {

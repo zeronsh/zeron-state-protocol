@@ -2,6 +2,7 @@ package host
 
 import "base:runtime"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -85,4 +86,56 @@ files_read_whole :: proc(t: ^testing.T) {
 	thread.join(writer)
 	thread.destroy(writer)
 	testing.expectf(t, failed == 0 && wrong == 0, "of %d reads while it changed, %d failed and %d were not what it held", reads, failed, wrong)
+}
+
+@(private = "file", thread_local)
+drawn: byte
+
+// What a process that ended mid-save left behind is no hindrance to a save, whatever process left it: not even a staging
+// file at the very name a save draws, as a process with this one's number, as every process in a container has, would
+// leave at the name it drew. And it is removed when the directory is next opened, while a staging file a save is still
+// writing, here or in another process, is not.
+@(test)
+files_left_behind :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-left-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer delete(dir)
+	defer os.remove_all(dir)
+	path := file_in(dir, "roster")
+
+	// Names drawn in turn, all zero bytes and then all ones, and so on, the first of which is taken.
+	drawn = 0
+	staging_random = proc(into: []byte) {
+		for &b in into {
+			b = drawn
+		}
+		drawn += 1
+	}
+	taken := staging_name(path)
+	drawn = 0
+	testing.expect(t, os.write_entire_file(taken, transmute([]byte)string("left")) == nil)
+	testing.expect(t, save(path, transmute([]byte)string("kept")), "a save fails for a file left at its name")
+	staging_random = nil
+	kept, _ := read_file(path, context.temp_allocator)
+	testing.expect(t, string(kept) == "kept")
+
+	writing, held := staging_make(path) // as another save, in this process or another, has made and is writing
+	testing.expect(t, held)
+	other := strings.concatenate({path, ".1234.0.new"}, context.temp_allocator) // no staging file's name
+	testing.expect(t, os.write_entire_file(other, nil) == nil)
+	for _ in 0 ..< 3 {
+		testing.expect(t, os.write_entire_file(staging_name(path), transmute([]byte)string("left")) == nil)
+	}
+	_, _ = device_secret(dir) // which opens the directory zspd keeps its files in
+	files, _ := os.read_all_directory_by_path(dir, context.temp_allocator)
+	left := 0
+	for f in files {
+		left += 1 if staging_named(f.name) else 0
+	}
+	testing.expectf(t, left == 1, "%d staging files are left, of the one being written and four left behind", left)
+	testing.expect(t, os.exists(other), "a file that is no staging file was removed")
+	if held {
+		staging_drop(writing)
+	}
 }

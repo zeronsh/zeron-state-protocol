@@ -80,6 +80,7 @@ file_in :: proc(dir, name: string) -> string {
 @(require_results)
 device_secret :: proc(dir: string) -> (secret: zsp.Key32, ok: bool) {
 	path := file_in(dir, "device.key")
+	staging_clear(dir) // whatever a process that ended mid-save left there, as of zspd's files beside this one
 	if data, read := read_file(path, context.temp_allocator); read {
 		copy(secret[:], data)
 		return secret, len(data) == 32
@@ -89,34 +90,6 @@ device_secret :: proc(dir: string) -> (secret: zsp.Key32, ok: bool) {
 	}
 	crypto.rand_bytes(secret[:])
 	return secret, save(path, secret[:])
-}
-
-@(private)
-saves: u64 // atomic: made by this process, each written to a file of its own first
-
-save :: proc(path: string, bytes: []byte) -> bool {
-	// Whole or not at all; and by a name of its own, so that a save beside it, by another process or this one, is
-	// neither written into nor taken for it.
-	partial := file_staging(path, sync.atomic_add(&saves, 1))
-	f, err := os.open(partial, {.Write, .Create, .Excl}, os.Permissions{.Read_User, .Write_User})
-	if err != nil {
-		return false
-	}
-	_, werr := os.write(f, bytes)
-	serr := os.sync(f)
-	os.close(f)
-	if werr != nil || serr != nil || !replace_file(partial, path) {
-		os.remove(partial)
-		return false
-	}
-	when ODIN_OS != .Windows {
-		// The name is the directory's to remember.
-		if dir, derr := os.open(filepath.dir(path), {.Read}); derr == nil {
-			os.sync(dir)
-			os.close(dir)
-		}
-	}
-	return true
 }
 
 // Opens a space held by this machine. On a relay, any space may be opened by name.
@@ -135,6 +108,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		free(s)
 		return nil
 	}
+	staging_clear(s.dir)
 	keys: ^zsp.Keyring
 	if !h.relay {
 		zsp.keyring_init(&s.keys, h.secret)
