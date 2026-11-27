@@ -1957,7 +1957,47 @@ asking_queues_no_more_than_was_said :: proc(t: ^testing.T) {
 		testing.expect(t, session_input(at_a, recon[:]))
 	}
 	testing.expectf(t, tasks(at_a) - before <= 50, "%d tasks of 50 asked", tasks(at_a) - before)
+	// Nor when it lists what it holds, listing nothing: what it lacks between what it named is one range.
+	list := make([dynamic]byte, context.temp_allocator)
+	at = frame_begin(&list, .Recon)
+	write_varint(&list, 0)
+	write_key(&list, scope_lo(1))
+	write_key(&list, scope_hi(1))
+	append(&list, u8(Part.List))
+	write_varint(&list, 0)
+	frame_end(&list, at)
+	before = tasks(at_a)
+	testing.expect(t, session_input(at_a, list[:]))
+	testing.expectf(t, tasks(at_a) - before <= 1, "%d tasks of a list of nothing", tasks(at_a) - before)
 	sim_settle(&s)
+
+	// And what is queued is sent as there is room for it, however much a row holds.
+	big := node_id(&a.node, 1)
+	testing.expect(t, node_write(&a.node, {{big, PLACE, .Place, node_stamp(&a.node), body[:]}}))
+	value := make([]byte, 4096, context.temp_allocator)
+	for i in 0 ..< 120 {
+		testing.expect(t, node_write(&a.node, {{big, DATA + Slot(i), .Value, node_stamp(&a.node), value}}))
+	}
+	sim_settle(&s)
+	for held in 0 ..< 2 {
+		clear(&w)
+		at = frame_begin(&w, .Want)
+		write_u8(&w, 1)
+		write_varint(&w, 1)
+		write_u64(&w, big[0])
+		write_u64(&w, big[1])
+		write_varint(&w, u64(held))
+		if held > 0 {
+			append(&w, 0, 0)
+			write_stamp(&w, {999, 999})
+		}
+		frame_end(&w, at)
+		testing.expect(t, session_input(at_a, w[:]))
+		out := session_output(at_a)
+		testing.expectf(t, len(out) <= OUT_HIGH + 3 * len(value), "%d bytes waiting at once, of a row of %d", len(out), 120 * len(value))
+		session_sent(at_a, len(out))
+		sim_settle(&s)
+	}
 }
 
 @(private, thread_local)

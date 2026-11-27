@@ -1018,25 +1018,34 @@ recon_unfilled :: proc(s: ^Session, w: ^Watch) {
 	}
 }
 
-// Whether what is queued will send this row, as it is when it is sent, whoever asked: then it is not queued again, as
-// comparing a range over and over, while what was found to be lacking is still on its way, would have it queued
-// over and over. Of what goes first, only what goes first counts: what goes after it would come after what says a
-// window is level.
+// Whether a Row task still to come will send this row whole, as it is when it is sent, whoever asked: then it is not
+// queued again, as being asked for it over and over, while it is still on its way, would have it queued over and over.
+// One begun has sent some of it as it was then, and is not counted on for the rest. Of what goes first, only what goes
+// first counts: what goes after it would come after what says a window is level. (What a Fill still to come will send
+// is a range: see fill_queued.)
 @(private)
-row_queued :: proc(s: ^Session, row: Id, place: Maybe(Key), first: bool) -> bool {
+row_queued :: proc(s: ^Session, row: Id, first: bool) -> bool {
 	if q, ok := s.queued[row]; ok && (q.first || !first) {
-		if t := queued_task(s, q); t != nil && t.kind == .Row && t.row == row {
+		if t := queued_task(s, q); t != nil && t.kind == .Row && t.row == row && t.lo == {} {
 			return true
 		}
 	}
-	key := place.? or_return
-	return fill_queued(s, key, key_next(key), first, !s.peer_full) // a Fill still to reach it
+	return false
+}
+
+// Sends a row the peer asked for whole, unless a Row task still to come will.
+@(private)
+push_row :: proc(s: ^Session, row: Id, first: bool) {
+	if !row_queued(s, row, first) {
+		queue(s, first, {kind = .Row, row = row})
+	}
 }
 
 // Whether a Fill still to come will send all of a range, as it is when it is sent: then no other is queued for it, as
-// comparing a range over and over, or being asked for it over and over, would queue one over and over. One that sends
-// only what the peer then watches counts only for what would send no more. Of what goes first, only what goes first
-// counts, as for a row.
+// comparing a range over and over, while what was found to be lacking is still on its way, would queue it over and
+// over. What a Fill still has to reach is what is left of its range, from `lo` (a row it has begun lies before that).
+// One that sends only what the peer then watches counts only for one that would send no more. Of what goes first, only
+// what goes first counts, as for a row.
 @(private)
 fill_queued :: proc(s: ^Session, lo, hi: Key, first: bool, watched: bool) -> bool {
 	for which in ([]bool{true, false} if !first else []bool{true}) {
@@ -1612,7 +1621,7 @@ on_recon :: proc(s: ^Session, r: ^Reader) {
 				recon_describe(&out, lo, hi, mine)
 			}
 		case .List:
-			recon_compare(s, r, &wants, scope, lo, hi)
+			recon_compare(s, r, &wants, scope, lo, hi, id, !owner_sent)
 			recon_part(&out, hi, .Skip)
 		case:
 			r.bad = true
@@ -1630,14 +1639,16 @@ on_recon :: proc(s: ^Session, r: ^Reader) {
 	recon_end(&out)
 }
 
-// Walks their list beside this side's range, sending what they lack and asking for what differs.
+// Walks their list beside this side's range, sending what they lack and asking for what differs. What they lack is
+// sent for the watch `id`, owed to it if this end answers it, as a range they hold nothing of is (see push_range).
 @(private)
-recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, scope: Scope, lo, hi: Key) {
+recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, scope: Scope, lo, hi: Key, id: u64, owed: bool) {
 	n := s.node
 	count := read_count(r)
 	scan := tree_scan(n, n.shelf, lo, hi)
 	mine, have := tree_next(&scan)
 	prev: Key
+	gap := lo // what they did not name begins here: what this side has of it is one range to send, however much
 	for _ in 0 ..< count {
 		key := read_key_delta(r, prev)
 		print := read_u64(r)
@@ -1646,10 +1657,15 @@ recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, scope: Scope, lo, 
 			return
 		}
 		prev = key
+		lacks := false
 		for have && key_cmp(&mine.key, &key) < 0 {
-			push_row(s, mine.key)
+			lacks = true
 			mine, have = tree_next(&scan)
 		}
+		if lacks {
+			push_range(s, gap, key, id, owed)
+		}
+		gap = key_next(key)
 		if have && mine.key == key {
 			if mine.val[0] != print {
 				want_row(wants, key_row(key))
@@ -1659,17 +1675,8 @@ recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, scope: Scope, lo, 
 			want_row(wants, key_row(key))
 		}
 	}
-	for have {
-		push_row(s, mine.key)
-		mine, have = tree_next(&scan)
-	}
-}
-
-// Sends a row the peer lacks, if the peer would keep it.
-@(private)
-push_row :: proc(s: ^Session, key: Key) {
-	if (s.peer_full || watched(s, key)) && !row_queued(s, key_row(key), key, s.hurrying) {
-		queue(s, s.hurrying, {kind = .Row, row = key_row(key)})
+	if have {
+		push_range(s, gap, hi, id, owed)
 	}
 }
 
@@ -1807,9 +1814,7 @@ on_want :: proc(s: ^Session, r: ^Reader) {
 			continue
 		}
 		if len(held) == 0 {
-			if !row_queued(s, row, nil, first) {
-				queue(s, first, {kind = .Row, row = row})
-			}
+			push_row(s, row, first)
 			continue
 		}
 		keys := make([]Key, len(held), context.temp_allocator)
@@ -2004,9 +2009,15 @@ emit_row :: proc(s: ^Session, row: Id) {
 		c := row_next(&s.node.store, &scan) or_break
 		emit_cell(s, &c)
 	}
+	typing_owed(s, row)
+}
+
+// Now that it holds the row, what is being typed in it, where it watches.
+@(private)
+typing_owed :: proc(s: ^Session, row: Id) {
 	for x in s.node.typing {
 		if x.row == row {
-			s.typing_due = true // now that it holds the row, what is being typed in it, where it watches
+			s.typing_due = true
 			break
 		}
 	}
@@ -3035,17 +3046,30 @@ run_task :: proc(s: ^Session, t: ^Task) {
 	n := s.node
 	task := t^
 	switch task.kind {
-	case .Row:
-		task_done(s)
-		emit_row(s, task.row)
-	case .Cell:
-		task_done(s)
-		scan := tree_scan(n, n.cells, task.lo, key_next(task.hi))
-		for leaf in tree_next(&scan) {
+	case .Row, .Cell:
+		// Of a row, all of it, or a run of its cells; as much at a time as there is room for, and the rest after.
+		first, last := Key{task.row[0], task.row[1], 0, 0, 0}, Key{task.row[0], task.row[1], 256 << 8, 0, 0}
+		if task.kind == .Cell {
+			last = key_next(task.hi)
+		}
+		scan := tree_scan(n, n.cells, task.lo if key_less(first, task.lo) else first, last)
+		for {
+			leaf, ok := tree_next(&scan)
+			if !ok {
+				task_done(s)
+				if task.kind == .Row {
+					typing_owed(s, task.row)
+				}
+				return
+			}
 			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 			c, at := cell_unkey(leaf)
 			c.body = log_bytes(&n.store, at.off, at.len)
 			emit_cell(s, &c)
+			if len(s.out) - s.sent >= OUT_HIGH {
+				t.lo = key_next(leaf.key)
+				return
+			}
 		}
 	case .Fill:
 		scan := tree_scan(n, n.shelf, task.lo, task.hi)
