@@ -27,6 +27,10 @@ Ring :: struct {
 	// been sent anyway.
 	gone:  [dynamic]Gone,
 	known: u64,
+	// Told of each change as it falls off the back, before it is gone: so those who have yet to be told of it can say
+	// whether it was anything to them.
+	dropped:      proc(data: rawptr, c: ^Change, at: u64),
+	dropped_data: rawptr,
 }
 
 @(private)
@@ -67,6 +71,10 @@ ring_clear :: proc(r: ^Ring) {
 
 ring_push :: proc(r: ^Ring, e: Event, before, after: ^Places) {
 	if r.next - r.first == u64(len(r.items)) {
+		if r.dropped != nil {
+			c := ring_at(r, r.first)
+			r.dropped(r.dropped_data, &c, r.first)
+		}
 		if k, ok := r.spill[r.first]; ok {
 			delete(k)
 			delete_key(&r.spill, r.first)

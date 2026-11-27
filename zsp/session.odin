@@ -86,6 +86,7 @@ Session :: struct {
 	hurrying:  bool, // within on_recon, of one of them
 	cells:     Cells_Frame,
 	cursor:    u64, // into the event ring
+	missed:    bool, // something fell off the ring before the cursor reached it that would have been said
 	whole:     Id, // a row lately sent whole, covering its events before whole_to
 	whole_to:  u64,
 	watches:   [dynamic]Watch, // theirs on us
@@ -756,7 +757,7 @@ session_authorize :: proc(s: ^Session) {
 		return
 	}
 	s.ready = true
-	s.cursor = n.events.next
+	s.cursor, s.missed = n.events.next, false
 	roots_send(s)
 	if node_tracks(n) && s.peer_full {
 		outbox_send(s)
@@ -2909,8 +2910,9 @@ flush_changes :: proc(s: ^Session, high := max(int), windowed := false) -> bool 
 	n := s.node
 	// Whoever flushes, the counts are owed until pump has told them.
 	s.counts_due ||= s.cursor != n.events.next
-	if s.cursor < n.events.first && !ring_lost(&n.events, s.cursor, s.id) {
-		// All it missed came from its peer, and would not have gone back to it: nothing to compare.
+	if s.cursor < n.events.first && !s.missed && s.cursor >= n.events.known {
+		// Nothing it missed would have been said: what came from its peer, and what lies in no window of it, nor in
+		// what it was shown. Nothing to compare.
 		s.cursor = n.events.first
 	}
 	if s.cursor < n.events.first && !unit_step(s, proc(s: ^Session, _: ^Task) {resync(s)}) {
@@ -2935,15 +2937,31 @@ flush_one :: proc(s: ^Session, _: ^Task) {
 	}
 }
 
+// A change falls off the ring: whoever has yet to be told of it, and would have been, has missed something, and is
+// brought level by comparison, once it next says anything; whoever would not have been, has missed nothing, and goes on.
+// Such as the session of a client with a window on a text, of a replica taking in, from its peer, a change at a time,
+// so many that they fall off the ring before the client's turn comes: were it to compare whenever any did, what it
+// shows would be said over, whole, every time. One not ready yet cannot tell what it will be told, and misses
+// whatever is not its own.
 @(private)
-emit_change :: proc(s: ^Session, c: ^Change) {
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	n := s.node
+node_dropped :: proc(data: rawptr, c: ^Change, at: u64) {
+	n := (^Node)(data)
+	for s in n.sessions {
+		if s.cursor <= at && !s.missed && c.origin != s.id {
+			was, now, _ := change_seen(s, c)
+			s.missed = !s.ready || was || now
+		}
+	}
+}
+
+// Whether a change touches what the peer is shown: was the row in view, is it now, and was it level there.
+@(private)
+change_seen :: proc(s: ^Session, c: ^Change) -> (was, now, level: bool) {
 	// Was the row in view before, and is the peer sure to hold it whole?
 	// A row that was nowhere until now was in nobody's, and may have cells that came before it did.
-	now := s.initiator && s.peer_full
-	was := now && (len(c.before) > 0 || len(c.after) == 0)
-	level := was && s.settled
+	now = s.initiator && s.peer_full
+	was = now && (len(c.before) > 0 || len(c.after) == 0)
+	level = was && s.settled
 	for &w in s.watches {
 		if !w.data {
 			continue
@@ -2961,6 +2979,14 @@ emit_change :: proc(s: ^Session, c: ^Change) {
 	if !now && s.role == .Open && session_shows(s, c.row) {
 		was, now, level = true, true, true // it was sent whole when it was found
 	}
+	return
+}
+
+@(private)
+emit_change :: proc(s: ^Session, c: ^Change) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	n := s.node
+	was, now, level := change_seen(s, c)
 	if !was && !now {
 		return
 	}
@@ -3081,7 +3107,7 @@ resync :: proc(s: ^Session) {
 	if store_misses(&n.store) != missed {
 		return // read before anything is done: to be done again
 	}
-	s.cursor = n.events.next
+	s.cursor, s.missed = n.events.next, false
 	if n.host.questions.again != nil && s.role == .Open {
 		n.host.questions.again(n.host.questions.data, s)
 	}

@@ -119,6 +119,7 @@ node_init :: proc(n: ^Node, disk: Disk, space: Key32, keys: ^Keyring, full: bool
 	n.next_id = 1
 	n.own = keys != nil && !full
 	store_open(&n.store, disk, ring) or_return
+	n.store.events.dropped, n.store.events.dropped_data = node_dropped, n
 	if keys != nil && full && n.whole {
 		// A full replica says it holds what others give it, and they forget it: its outbox names none of that, and is
 		// said not to be whole before anything is said at all.

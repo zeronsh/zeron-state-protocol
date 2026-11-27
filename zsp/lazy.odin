@@ -150,7 +150,7 @@ Session_Mark :: struct {
 	seq_out, cursor, whole_to, seq_in, ack_at: u64,
 	whole:                                    Id,
 	fault:                                    Fault,
-	closing, ready, settled, told:            bool,
+	closing, ready, settled, told, missed:    bool,
 }
 
 @(private)
@@ -176,6 +176,7 @@ session_mark :: proc(s: ^Session) -> (m: Session_Mark) {
 		ready     = s.ready,
 		settled   = s.settled,
 		told      = s.told,
+		missed    = s.missed,
 	}
 	if s.task_head < len(s.tasks) {
 		m.head = s.tasks[s.task_head]
@@ -206,6 +207,7 @@ session_restore :: proc(s: ^Session, m: ^Session_Mark) {
 	s.seq_out, s.cursor, s.whole_to, s.seq_in, s.ack_at = m.seq_out, m.cursor, m.whole_to, m.seq_in, m.ack_at
 	s.whole = m.whole
 	s.fault, s.closing, s.ready, s.settled, s.told = m.fault, m.closing, m.ready, m.settled, m.told
+	s.missed ||= m.missed // and whatever fell off the ring meanwhile, which the cursor is behind again
 }
 
 // Runs one frame as a step. False if it read something not yet at hand: then it is as though it had not been run,

@@ -3415,6 +3415,54 @@ fills_are_owed_by_name_and_standing :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// A client's session that falls behind the ring as its replica takes in, from a peer, more than the ring holds, of
+// what lies in none of its windows, missed nothing it would have been told: it goes on, rather than have what it shows
+// said over whole, as a text it shows would be, every time. Had anything fallen off that lay in a window, it is.
+@(test)
+behind_on_what_it_never_sees :: proc(t: ^testing.T) {
+	state := seeded(118)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 0, ring = 64)
+	defer sim_destroy(&s)
+	x := s.nodes[0]
+	shown, other := List{1 << 32 | 7, 7}, List{1 << 32 | 8, 8}
+	put :: proc(s: ^Sim, x: ^Sim_Node, l: List, order: u64, size: int) {
+		s.now += 3
+		x.node.now = sim_now(s, x)
+		place: [24]byte
+		put_u64(place[:], l[0])
+		put_u64(place[8:], l[1])
+		put_u64(place[16:], order)
+		body := make([]byte, size, context.temp_allocator)
+		row := node_id(&x.node, 1)
+		_ = node_write(&x.node, {{row, PLACE, .Place, node_stamp(&x.node), place[:]}, {row, DATA, .Value, node_stamp(&x.node), body}})
+		free_all(context.temp_allocator)
+	}
+	drained :: proc(ui: ^Session) -> (n: int) {
+		for len(session_output(ui)) > 0 {
+			n += len(session_output(ui))
+			session_sent(ui, len(session_output(ui)))
+		}
+		return
+	}
+	put(&s, x, shown, 1, 20_000)
+	ui := sim_client(&s, x)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(shown), list_hi(shown), 0, {data = true, live = true})
+	testing.expect(t, drained(ui) > 20_000, "the text is shown")
+	for i in 0 ..< 100 {
+		put(&s, x, other, u64(i), 10)
+	}
+	testing.expect(t, ui.cursor < x.node.store.events.first, "the client fell behind")
+	testing.expect(t, drained(ui) < 20_000, "what it shows was said over, though nothing in it changed")
+	for i in 0 ..< 100 {
+		put(&s, x, other if i != 50 else shown, u64(100 + i), 10)
+	}
+	testing.expect(t, ui.cursor < x.node.store.events.first, "the client fell behind")
+	testing.expect(t, drained(ui) > 20_000, "what it shows was not said over, though something in it changed")
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)
