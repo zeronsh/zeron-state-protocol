@@ -1131,6 +1131,7 @@ text_bundle :: proc(cells: []Cell, allocator := context.allocator) -> (out: Cell
 	inner := make([dynamic]Inner, context.temp_allocator)
 	names := make([dynamic]Stamp, context.temp_allocator)
 	for &c in cells {
+		out.row, out.slot = c.row, c.slot
 		#partial switch c.kind {
 		case .Piece:
 			append(&names, c.stamp)
@@ -1139,6 +1140,9 @@ text_bundle :: proc(cells: []Cell, allocator := context.allocator) -> (out: Cell
 			}
 		case .Bundle:
 			append(&names, c.stamp)
+			if len(c.body) < clear_size(.Bundle, c.body) || get_u32(c.body) == 0 {
+				continue // no bundle, and nothing of the text: gone with nothing in its place, as a piece too short is
+			}
 			for i in 0 ..< int(get_u32(c.body)) {
 				append(&names, bundle_at(c.body, i))
 			}
@@ -1156,7 +1160,6 @@ text_bundle :: proc(cells: []Cell, allocator := context.allocator) -> (out: Cell
 				}
 			}
 		}
-		out.row, out.slot = c.row, c.slot
 	}
 	slice.sort_by(names[:], proc(a, b: Stamp) -> bool {return stamp_less(a, b)})
 	slice.sort_by(inner[:], proc(a, b: Inner) -> bool {return stamp_less(a.stamp, b.stamp)})

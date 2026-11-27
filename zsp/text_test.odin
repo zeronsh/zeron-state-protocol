@@ -394,6 +394,16 @@ short_pieces_are_bundled_away :: proc(t: ^testing.T) {
 	again.stamp = {6 << 16, 6}
 	testing.expect(t, cell_valid(&again) && text_apply(&z, &again) == .Changed)
 	testing.expect_value(t, text_string(&z), "hello")
+	// And one that names nothing, or is too short to say, as no bundle is, is gone with nothing in its place.
+	for none in ([][]byte{{}, {0, 0}, {0, 0, 0, 0}, {0, 0, 0, 9}}) {
+		nothing := text_bundle({{row, DATA, .Bundle, {7 << 16, 7}, none}, cells[1]})
+		defer delete(nothing.body)
+		testing.expect_value(t, get_u32(nothing.body), 2)
+		// Of its row and slot, alone as with others.
+		alone := text_bundle({{row, DATA, .Bundle, {7 << 16, 7}, none}})
+		defer delete(alone.body)
+		testing.expect(t, alone.row == row && alone.slot == DATA && get_u32(alone.body) == 1)
+	}
 }
 
 // What is no operation at all, or one that refers to what its own piece has yet to make, waits for nothing: it is never
