@@ -406,9 +406,10 @@ review_index_saved_by_a_whole_sync :: proc(t: ^testing.T) {
 	testing.expect(t, !zsp.store_wants_checkpoint(&s.node.store), "the index saved, and the checkpoint due passed over")
 }
 
-// What is kept is kept whoever else is reading it, and read whoever is replacing it: on Windows, where a file another has
-// open cannot be replaced, nor one being replaced opened, as on any system. A writer, a reader of this host's own, and
-// another process's reader, all at once, as zspd's admin commands, tests and scanners read what a node keeps.
+// What is kept is kept whoever else is reading it, or keeping it too, and read whoever is replacing it: on Windows, where
+// a file another has open cannot be replaced, nor one being replaced opened, as on any system. Two writers, a reader of
+// this host's own, and another process's reader, all at once, as zspd's admin commands, tests and scanners read what a
+// node keeps, and a command may keep a roster beside it.
 @(test)
 review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
 	base, _ := os.temp_directory(context.temp_allocator)
@@ -421,6 +422,7 @@ review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
 		done:    bool, // atomic
 		torn:    int, // atomic: a read that was not one whole version
 		missing: int, // atomic: a read that found nothing
+		refused: int, // atomic: saves of the other writer that failed
 	}
 	sh := Shared{path = strings.clone(file_in(dir, "roster"))} // which outlasts the temporary memory let go of below
 	defer delete(sh.path)
@@ -456,6 +458,19 @@ review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
 			}
 		}
 	})
+	other := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
+		context = runtime.default_context()
+		for i := 0; !sync.atomic_load(&sh.done); i += 1 {
+			b := make([]byte, 4096 + 201 + i % 50, context.temp_allocator)
+			for &x in b {
+				x = byte(len(b) - 4096)
+			}
+			if !save(sh.path, b) {
+				sync.atomic_add(&sh.refused, 1)
+			}
+			free_all(context.temp_allocator)
+		}
+	})
 	failed := 0
 	for i in 1 ..= 200 {
 		if !save(sh.path, version(i)) {
@@ -466,8 +481,77 @@ review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
 	sync.atomic_store(&sh.done, true)
 	thread.join(ours)
 	thread.join(theirs)
+	thread.join(other)
 	thread.destroy(ours)
 	thread.destroy(theirs)
-	testing.expectf(t, failed == 0, "%d of 200 saves failed while others read", failed)
+	thread.destroy(other)
+	testing.expectf(t, failed == 0 && sh.refused == 0, "%d of 200 saves failed while others read, and %d of the other writer's", failed, sh.refused)
 	testing.expectf(t, sh.missing == 0 && sh.torn == 0, "reads while it was replaced: %d found nothing, %d torn", sh.missing, sh.torn)
+}
+
+// A roster drawn up from one kept here is kept only if that is still what is kept: one another command kept meanwhile,
+// later or not, is never replaced by it, which would lose that command's change.
+@(test)
+review_roster_kept_after_what_it_follows :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-follows-*", context.temp_allocator)
+	testing.expect(t, err == nil)
+	defer os.remove_all(dir)
+	secret, root: zsp.Key32
+	secret[0], root[0] = 1, 2
+	keys: zsp.Keyring
+	zsp.keyring_init(&keys, secret)
+	defer zsp.keyring_destroy(&keys)
+	space := zsp.ed25519_public(root)
+	none: zsp.Roster
+	d := zsp.draft_from(&none, 1 << 16)
+	home := zsp.draft_scope(&d)
+	zsp.draft_grant(&d, keys.device, keys.signer, home, {.Write}).owner = true
+	first, ok := zsp.roster_sign(&keys, root, &d, context.temp_allocator)
+	testing.expect(t, ok)
+	was, _ := zsp.roster_parse(first, space)
+	defer zsp.roster_destroy(&was)
+	// Two changes drawn up from it at once; the first is kept.
+	ours, theirs := zsp.draft_from(&was, 2 << 16), zsp.draft_from(&was, 3 << 16)
+	// Of two drawn up from one roster, which is later is chance: here it is the other.
+	ours.random = proc(into: []byte) {for &b in into {b = 0x00}}
+	theirs.random = proc(into: []byte) {for &b in into {b = 0xff}}
+	zsp.draft_scope(&ours)
+	zsp.draft_scope(&theirs, {.Signed})
+	mine, ok1 := zsp.roster_sign(&keys, root, &ours, context.temp_allocator)
+	later, ok2 := zsp.roster_sign(&keys, root, &theirs, context.temp_allocator)
+	testing.expect(t, ok1 && ok2)
+	a, _ := zsp.roster_claims(mine, space)
+	b, _ := zsp.roster_claims(later, space)
+	testing.expect(t, b > a, "the other change is not the later") // so that only what it was drawn up from keeps it out
+	testing.expect(t, save(file_in(dir, "roster"), first))
+	this, kept := roster_keep(dir, space, mine, first)
+	testing.expect(t, this && kept)
+	this, kept = roster_keep(dir, space, later, first)
+	testing.expectf(t, !this && kept, "a roster kept in place of one kept meanwhile (this %v, ok %v)", this, kept)
+	now, _ := read_file(file_in(dir, "roster"), context.temp_allocator)
+	testing.expect(t, string(now) == string(mine), "the change kept meanwhile was lost")
+}
+
+// On Windows, a replacement waits for whoever else has the file open as long as FILE_BUSY_WAIT, by the clock, and no
+// longer: however much longer the system's tick makes each short sleep within it, as the host's loop waits meanwhile.
+@(test)
+review_busy_file_waited_for_as_long_as_said :: proc(t: ^testing.T) {
+	when ODIN_OS == .Windows {
+		base, _ := os.temp_directory(context.temp_allocator)
+		dir, err := os.make_directory_temp(base, "zsp-busy-*", context.allocator)
+		testing.expect(t, err == nil)
+		defer delete(dir)
+		defer os.remove_all(dir)
+		path := strings.clone(file_in(dir, "roster"))
+		defer delete(path)
+		testing.expect(t, save(path, transmute([]byte)string("first")))
+		held, herr := os.open(path, {.Read}) // as another process opens it, letting nobody delete it
+		testing.expect(t, herr == nil)
+		start := time.tick_now()
+		saved := save(path, transmute([]byte)string("second"))
+		took := time.tick_since(start)
+		os.close(held)
+		testing.expectf(t, !saved && took >= FILE_BUSY_WAIT && took < FILE_BUSY_WAIT + 500 * time.Millisecond, "saved %v after %v, waiting as long as %v", saved, took, FILE_BUSY_WAIT)
+	}
 }

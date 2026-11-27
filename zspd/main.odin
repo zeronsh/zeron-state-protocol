@@ -373,11 +373,11 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 	space_dir := in_dir(dir, name)
 	switch {
 	case !reached:
-		kept, ok := host.roster_keep(space_dir, space, bytes) // for the node to read when it starts
+		kept, ok := host.roster_keep(space_dir, space, bytes, data) // for the node to read when it starts
 		if !ok {
 			say(os.stderr, "could not keep the roster\n")
 		} else if !kept {
-			say(os.stderr, "a later roster was kept here meanwhile: nothing was changed\n")
+			say(os.stderr, "the roster kept here was changed meanwhile, as by another command: nothing was changed\n")
 		}
 		return kept
 	case taken(space_dir, bytes):
@@ -386,7 +386,7 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 		say(os.stderr, "the node running here would not take it: it has a later roster, or one this does not follow from; nothing was changed\n")
 		return false
 	}
-	if kept, _ := host.roster_keep(space_dir, space, bytes); kept {
+	if kept, _ := host.roster_keep(space_dir, space, bytes, data); kept {
 		say(os.stderr, "the node running here did not say it has the change: it takes it when it next starts\n")
 	} else {
 		say(os.stderr, "the node running here did not say it has the change, nor could it be kept here: nothing was changed\n")

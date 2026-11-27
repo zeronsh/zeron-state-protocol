@@ -91,10 +91,14 @@ device_secret :: proc(dir: string) -> (secret: zsp.Key32, ok: bool) {
 	return secret, save(path, secret[:])
 }
 
+@(private)
+saves: u64 // atomic: made by this process, each written to a file of its own first
+
 save :: proc(path: string, bytes: []byte) -> bool {
-	// Whole or not at all.
-	partial := path_with(path, ".new")
-	f, err := os.open(partial, {.Write, .Create, .Trunc}, os.Permissions{.Read_User, .Write_User})
+	// Whole or not at all; and by a name of its own, so that a save beside it, by another process or this one, is
+	// neither written into nor taken for it.
+	partial := file_staging(path, sync.atomic_add(&saves, 1))
+	f, err := os.open(partial, {.Write, .Create, .Excl}, os.Permissions{.Read_User, .Write_User})
 	if err != nil {
 		return false
 	}
@@ -102,6 +106,7 @@ save :: proc(path: string, bytes: []byte) -> bool {
 	serr := os.sync(f)
 	os.close(f)
 	if werr != nil || serr != nil || !replace_file(partial, path) {
+		os.remove(partial)
 		return false
 	}
 	when ODIN_OS != .Windows {
@@ -112,14 +117,6 @@ save :: proc(path: string, bytes: []byte) -> bool {
 		}
 	}
 	return true
-}
-
-@(private)
-path_with :: proc(path, suffix: string) -> string {
-	b := make([]byte, len(path) + len(suffix), context.temp_allocator)
-	copy(b, path)
-	copy(b[len(path):], suffix)
-	return string(b)
 }
 
 // Opens a space held by this machine. On a relay, any space may be opened by name.
@@ -212,12 +209,21 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 
 // Keeps a space's roster in its directory, and the one it follows as roster.old, unless what is kept there is it already,
 // or later: as when whoever handed it over kept it first, or a later one is on its way to the node. Never the other way,
-// which would make roster.old the newer, or keep one older than is had. Whether the roster kept is this one, and false
-// for `ok` if what was to be written could not be.
-roster_keep :: proc(dir: string, space: zsp.Key32, bytes: []byte) -> (this, ok: bool) {
+// which would make roster.old the newer, or keep one older than is had. With `after`, only if what is kept is that, as
+// what it was drawn up from: else another's change made meanwhile would be lost. One keeps at a time, in any process,
+// so that none decides on what another is replacing. Whether the roster kept is this one, and false for `ok` if what
+// was to be written could not be.
+roster_keep :: proc(dir: string, space: zsp.Key32, bytes: []byte, after: []byte = nil) -> (this, ok: bool) {
 	serial := zsp.roster_claims(bytes, space) or_return
+	sync.guard(&keeping) // as another process's lock does not keep out another thread of this one
+	lock := file_lock(file_in(dir, "roster.lock")) or_return
+	defer file_unlock(lock)
 	path := file_in(dir, "roster")
-	if old, read := read_file(path, context.temp_allocator); read {
+	old, read := read_file(path, context.temp_allocator)
+	if after != nil && (!read || string(old) != string(after)) {
+		return string(old) == string(bytes), true
+	}
+	if read {
 		if kept, sound := zsp.roster_claims(old, space); sound && kept >= serial {
 			return string(old) == string(bytes), true
 		}
@@ -226,6 +232,9 @@ roster_keep :: proc(dir: string, space: zsp.Key32, bytes: []byte) -> (this, ok: 
 	this = save(path, bytes)
 	return this, this
 }
+
+@(private)
+keeping: sync.Mutex
 
 @(private)
 space_authenticate :: proc(data: rawptr, s: ^zsp.Session, credential: []byte) {
