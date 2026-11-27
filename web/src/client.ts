@@ -16,6 +16,7 @@ const ASK = 32, UNASK = 33, ANSWER = 34, FETCH = 35;
 const LIVE = 9, SYNCED = 10, PRESENCE = 12, ERROR = 13, SERVE = 14, CALL = 15, FLOW = 16, AUTHOR = 17;
 const GRAVE = 1, PLACE = 2, VALUE = 3, PIECE = 4, BUNDLE = 5;
 const W_DATA = 1, W_LIVE = 2, W_BACK = 4, W_ADOPT = 8, W_COUNTS = 32;
+const MESSAGE_MOST = 1 << 20; // bytes sent down the pipe at a time
 const F_DATA = 0, F_END = 1, F_FAULT = 2, F_CANCEL = 3, F_CREDIT = 4;
 const CALL_WINDOW = 262144;
 const WINDOW_MOST = 16 * CALL_WINDOW; // what the protocol lets a receiver credit ahead
@@ -595,9 +596,11 @@ export class Client {
     for (const row of typing) if (row.dirty.size > 0) this.#sendLive(row);
     const out = this.#out;
     if (out.pos > 0 && this.#wire) {
-      const sized = codec.written(out).slice();
+      // A piece at a time, for a pipe is a stream of bytes, and its messages may be no bigger than zspd's WebSockets take,
+      // 8 MiB: a burst of writes bigger than that, said again every time the pipe is dialled, would break it every time.
+      const written = codec.written(out);
+      for (let at = 0; at < written.length; at += MESSAGE_MOST) this.#wire.send(written.slice(at, at + MESSAGE_MOST));
       out.pos = 0;
-      this.#wire.send(sized);
     }
     for (const window of this.#windows.values()) if (window.changed) this.#publish(window);
     for (const a of [...this.#asked.values()]) {

@@ -32,6 +32,8 @@ function harness() {
     later: [] as (() => void)[],
     closes: 0,
     connects: 0,
+    sizes: [] as number[],
+    partial: new Uint8Array(0),
   };
   const run = () => {
     while (self.deferred.length > 0) self.deferred.shift()!();
@@ -51,11 +53,24 @@ function harness() {
       self.closed = closed;
       return {
         send: (data) => {
-          const r = codec.reader(data);
-          while (r.pos < r.len) {
-            const body = codec.bytes(r);
+          // A stream of bytes, in pieces of no more than a mebibyte, and frames whole only once all of each has come.
+          assert(data.length <= 1 << 20, `a message of ${data.length} bytes`);
+          self.sizes.push(data.length);
+          const all = new Uint8Array(self.partial.length + data.length);
+          all.set(self.partial);
+          all.set(data, self.partial.length);
+          let at = 0;
+          for (;;) {
+            let n = 0, shift = 0, p = at;
+            while (p < all.length && all[p] & 128) n += (all[p++] & 127) * 2 ** shift, (shift += 7);
+            if (p >= all.length) break;
+            n += all[p++] * 2 ** shift;
+            if (p + n > all.length) break;
+            const body = all.subarray(p, p + n);
             self.said.push({ kind: body[0], body: s(body.subarray(1)) });
+            at = p + n;
           }
+          self.partial = all.slice(at);
         },
         close: () => self.closes++,
       };
@@ -171,6 +186,24 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   assert.equal(asked.length, watches + 1, "the rest is asked for");
   const [, , from] = watchOf(asked[asked.length - 1]);
   assert.equal(from, keys[2], "from where the page now ends");
+}
+
+// More said at once than a WebSocket of zspd's takes in one message, 8 MiB, goes in pieces, and arrives whole; and so it
+// does again on a pipe dialled anew, which would otherwise break every time it was said.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  for (let i = 0; i < 12; i++) void h.client.write(1, (change) => change.insert({ v: c.bytes(16) }, "big", i, { v: new Uint8Array(900_000).fill(i) }));
+  h.run();
+  assert.equal(h.self.said.filter((x) => x.kind === CELLS).length, 12, "every write arrived whole");
+  assert(h.self.sizes.reduce((a, b) => a + b, 0) > 10 << 20 && Math.max(...h.self.sizes) <= 1 << 20);
+  h.self.closed();
+  h.run();
+  h.laters();
+  h.run();
+  h.greet();
+  assert.equal(h.self.said.filter((x) => x.kind === CELLS).length, 24, "and again, whole, on the next pipe");
 }
 
 // Writing nothing is still done; clearing a text says so.

@@ -9,7 +9,7 @@ local HELLO, ROSTER, WATCH, CELLS, ACK, SYNCED = 1, 2, 3, 7, 8, 10
 type Said = { kind: number, body: string }
 
 local function harness()
-	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, closes = 0 }
+	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, closes = 0, sizes = {} :: { number }, partial = "" }
 	local function run()
 		while #self.deferred > 0 do
 			(table.remove(self.deferred, 1) :: any)()
@@ -38,11 +38,31 @@ local function harness()
 			self.receive, self.closed = receive, closed
 			return {
 				send = function(data: buffer)
-					local r = codec.reader(data)
-					while r.pos < r.len do
-						local body = codec.bytes(r)
+					-- A stream of bytes, in pieces of no more than a mebibyte, and frames whole only once all of each has come.
+					assert(buffer.len(data) <= 1048576, `a message of {buffer.len(data)} bytes`)
+					table.insert(self.sizes, buffer.len(data))
+					local all = self.partial .. buffer.tostring(data)
+					local at = 1
+					while true do
+						local n, shift, p = 0, 0, at
+						while p <= #all and string.byte(all, p) >= 128 do
+							n += (string.byte(all, p) - 128) * 2 ^ shift
+							shift += 7
+							p += 1
+						end
+						if p > #all then
+							break
+						end
+						n += string.byte(all, p) * 2 ^ shift
+						p += 1
+						if p + n - 1 > #all then
+							break
+						end
+						local body = string.sub(all, p, p + n - 1)
 						table.insert(self.said, { kind = string.byte(body), body = string.sub(body, 2) })
+						at = p + n
 					end
+					self.partial = string.sub(all, at)
 				end,
 				close = function()
 					self.closes += 1
@@ -195,6 +215,42 @@ do
 	assert(#asked == before + 1, "the rest is asked for")
 	local _, _, from = watch_of(asked[#asked])
 	assert(from == keys[3], "from where the page now ends")
+end
+
+-- More said at once than a WebSocket of zspd's takes in one message, 8 MiB, goes in pieces, and arrives whole; and so it
+-- does again on a pipe dialled anew, which would otherwise break every time it was said.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	for i = 1, 12 do
+		h.client:write(1, function(change)
+			change.insert({ v = zsp.string(16) }, "big", i, { v = string.rep(string.char(i), 900000) })
+		end)
+	end
+	h.run()
+	local function cells(): number
+		local n = 0
+		for _, x in h.self.said do
+			n += if x.kind == CELLS then 1 else 0
+		end
+		return n
+	end
+	assert(cells() == 12, "every write arrived whole")
+	local total, most = 0, 0
+	for _, n in h.self.sizes do
+		total += n
+		most = math.max(most, n)
+	end
+	assert(total > 10 * 1048576 and most <= 1048576)
+	h.self.closed()
+	h.run()
+	for _, f in h.self.later do
+		f()
+	end
+	h.run()
+	h.greet()
+	assert(cells() == 24, "and again, whole, on the next pipe")
 end
 
 -- Writing nothing is still done; clearing a text says so.
