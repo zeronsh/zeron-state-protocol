@@ -711,7 +711,7 @@ ROOT :: u64(1) << 32
 @(private)
 roots_send :: proc(s: ^Session, afresh := false) {
 	n := s.node
-	if n.keys == nil || !n.full || !s.peer_full || !s.initiator {
+	if n.keys == nil || !n.full || !s.peer_full || !(s.initiator || n.becoming) {
 		return
 	}
 	if s.paused && !afresh {
@@ -887,7 +887,8 @@ on_synced :: proc(s: ^Session, r: ^Reader) {
 	n := s.node
 	id := read_varint(r)
 	if id < INTEREST {
-		if !s.initiator {
+		// One becoming partial watches whole, whichever end dialled: the other does not, for it says it is not full.
+		if !s.initiator && !n.becoming {
 			// The dialler has compared everything and sent what this end lacked: this end is level too.
 			flags := Synced_Flags(read_u8(r))
 			_, _ = read_key(r), read_key(r)
@@ -953,6 +954,17 @@ interest_bound :: proc(s: ^Session, id: u64, lo, hi: Key, before, after: int) {
 		to := node_session(n, it.session)
 		if to == nil {
 			return
+		}
+		// Whatever it says, a window closes only to where it meets what was said: if that would leave nothing, it says
+		// nothing of this window, and is not believed.
+		for w in to.watches {
+			if w.id == it.watch.id && w.data {
+				meet_lo := lo if key_less(w.lo, lo) else w.lo
+				meet_hi := hi if key_less(hi, w.hi) else w.hi
+				if !key_less(meet_lo, meet_hi) {
+					return
+				}
+			}
 		}
 		mine: ^Report
 		for &r in it.reports {
@@ -1761,6 +1773,15 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 	if len(refused) == 0 {
 		s.acked_out = max(s.acked_out, seq) // durable there, all of it
 		node_level(s)
+	} else if s.level_at != 0 {
+		// Something was refused, killed there by what it holds: not level on this session, whatever is acknowledged
+		// later; and what was refused is offered again, there or elsewhere.
+		s.level_at = 0
+		if node_tracks(n) {
+			for row in refused {
+				tree_put(n, &n.outbox, {row[0], row[1], 0, 0, 0}, {})
+			}
+		}
 	}
 	done := 0
 	for done < len(s.unacked) && s.unacked[done].seq <= seq {
@@ -2452,7 +2473,7 @@ pump :: proc(s: ^Session) {
 		s.typing_due = false
 		typing_give(s)
 	}
-	if go && s.initiator && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && s.task_head == len(s.tasks) {
+	if go && (s.initiator || n.becoming) && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && s.task_head == len(s.tasks) {
 		s.told = true
 		cells_close(s)
 		at := frame_begin(&s.out, .Synced)
@@ -2672,7 +2693,7 @@ resync :: proc(s: ^Session) {
 			recon_start(s, w.id, w.lo, w.hi, {count = 1}, store_range(&n.store, w.lo, w.hi))
 		}
 	}
-	if s.initiator && s.peer_full {
+	if (s.initiator || n.becoming) && s.peer_full {
 		if n.full {
 			s.paused = false
 			roots_send(s, afresh = true)

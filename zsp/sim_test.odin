@@ -1945,6 +1945,155 @@ review2_unstamped_list :: proc(t: ^testing.T) {
 	testing.expect_value(t, store_range(&phone.node.store, list_lo(b), list_hi(b)).count, 1)
 }
 
+// What a peer refused is not made up for by a later Ack that refuses nothing: a device becoming partial is not level on
+// that session, and offers the row again. (Review 3, 1.)
+@(test)
+review3_refused_then_clean :: proc(t: ^testing.T) {
+	state := seeded(61)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	dev := s.nodes[1]
+	sim_put(&s, dev, 1)
+	sim_restart(&s, dev, full = false)
+	sim_link(&s, 1, 2)
+	l := s.links[0]
+	testing.expect(t, sim_to_level(&s, l))
+	scan := tree_scan(&dev.node, dev.node.cells, KEY_MIN, KEY_MAX)
+	leaf, _ := tree_next(&scan)
+	w1 := Id{leaf.key[0], leaf.key[1]}
+	f: [dynamic]byte
+	defer delete(f)
+	at := frame_begin(&f, .Ack)
+	write_varint(&f, l.a.seq_out)
+	write_pair(&f, w1)
+	frame_end(&f, at)
+	session_input(l.a, f[:])
+	testing.expect(t, !dev.node.whole)
+	// Then something more is written, sent, and acknowledged with nothing refused.
+	sim_put(&s, dev, 2)
+	for _ in 0 ..< 10 {
+		sim_pass(&s, l.a, l.b)
+	}
+	clear(&f)
+	at = frame_begin(&f, .Ack)
+	write_varint(&f, l.a.seq_out)
+	frame_end(&f, at)
+	session_input(l.a, f[:])
+	_, offered := tree_get(&dev.node, dev.node.outbox, {w1[0], w1[1], 0, 0, 0})
+	testing.expectf(t, !dev.node.whole || offered, "level, with what was refused offered nowhere")
+}
+
+// A window a full peer is asked for with a limit, narrowed here to what is held, is not emptied by bounds the peer says
+// that meet what was asked but not the window. (Review 3, 2.)
+@(test)
+review3_limit_window :: proc(t: ^testing.T) {
+	state := seeded(62)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, victim := s.nodes[0], s.nodes[1]
+	for i in 0 ..< 20 {
+		sim_put(&s, big, u64(i))
+	}
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	list := List{1 << 32 | 5, 5}
+	ui := sim_client(&s, victim)
+	defer session_close(ui)
+	sim_watch(ui, 9, list_lo(list), list_hi(list), 0, {data = true})
+	sim_settle(&s)
+	sim_watch(ui, 9, list_lo(list), list_hi(list), 0, {})
+	sim_settle(&s)
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	keys := make([dynamic]Key, context.temp_allocator)
+	scan := tree_scan(&victim.node, victim.node.shelf, list_lo(list), list_hi(list))
+	for leaf in tree_next(&scan) {
+		append(&keys, leaf.key)
+	}
+	testing.expect_value(t, len(keys), 20)
+	sim_link(&s, 1, 0) // to a full peer, which is not to be believed of more than it was asked
+	sim_settle(&s)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 5, {data = true})
+	for _ in 0 ..< 3 {
+		sim_pass(&s, s.links[0].a, s.links[0].b)
+	}
+	var_it: ^Interest
+	for &it in victim.node.interests {
+		if it.watch.data {
+			var_it = &it
+		}
+	}
+	testing.expect(t, var_it != nil)
+	f: [dynamic]byte
+	defer delete(f)
+	at := frame_begin(&f, .Synced)
+	write_varint(&f, var_it.id)
+	write_u8(&f, 1)
+	write_key(&f, keys[10])
+	write_key(&f, list_hi(list))
+	write_varint(&f, 0)
+	write_varint(&f, 0)
+	frame_end(&f, at)
+	session_input(s.links[0].a, f[:])
+	for w in ui.watches {
+		w := w
+		testing.expectf(t, key_less(w.lo, w.hi), "the window %d came to nothing", w.id)
+	}
+	for it in victim.node.interests {
+		it := it
+		testing.expect(t, key_less(it.watch.lo, it.watch.hi))
+	}
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	for l in s.links {
+		testing.expectf(t, !l.a.closing && !l.b.closing, "closing %d->%d: %v %v %v %v", l.an, l.bn, l.a.closing, l.a.fault, l.b.closing, l.b.fault)
+	}
+}
+
+// A device becoming partial that is brought level by a full peer that is not a relay does not record all it was sent as
+// though it were its own: it can let go of it once partial, and does not send it all back. (Review 3, 3.)
+@(test)
+review3_becoming_takes_only_its_own :: proc(t: ^testing.T) {
+	state := seeded(63)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	desk, laptop := s.nodes[0], s.nodes[1]
+	for i in 0 ..< 50 {
+		sim_put(&s, desk, u64(i))
+	}
+	sim_restart(&s, laptop, full = false)
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	testing.expect(t, laptop.node.whole)
+	testing.expect_value(t, laptop.node.outbox.root, 0)
+}
+
+// A device becoming partial, dialled by a full peer, is brought level as well as one that dials. (Review 3, 5.)
+@(test)
+review3_becoming_dialled :: proc(t: ^testing.T) {
+	state := seeded(64)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	desk, laptop := s.nodes[0], s.nodes[1]
+	sim_put(&s, desk, 1)
+	sim_put(&s, laptop, 2)
+	sim_restart(&s, laptop, full = false)
+	sim_link(&s, 0, 1) // the desk dials
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&desk.node.store, KEY_MIN, KEY_MAX).count, 2)
+	testing.expect_value(t, store_range(&laptop.node.store, KEY_MIN, KEY_MAX).count, 2)
+	testing.expect(t, laptop.node.whole)
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)

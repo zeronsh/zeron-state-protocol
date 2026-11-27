@@ -555,10 +555,8 @@ node_commit :: proc(n: ^Node, cells: []Cell, from: ^Session) -> int {
 	if len(n.typing) > 0 {
 		typing_committed(n, cells)
 	}
-	// What its clients write; and, once it is becoming partial, what a peer that is not a relay gives it as to a full
-	// replica, which the peer then forgets.
-	takes := from == nil || from.role == .Open || (n.full && from.role == .Peer && !from.relay && !from.peer_relay)
-	if accepted > 0 && node_tracks(n) && takes {
+	// What its clients write: no peer forgets what it gives this one, which says it is not full however it serves.
+	if accepted > 0 && node_tracks(n) && (from == nil || from.role == .Open) {
 		for c in cells {
 			tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
 		}

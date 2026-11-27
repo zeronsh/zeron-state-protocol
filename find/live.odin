@@ -1062,8 +1062,9 @@ near_check :: proc(l: ^Live) {
 	sure := index_level(&l.f.x)
 	for list in far.near {
 		wanted, confirmed, pending := zsp.session_wanted(l.session, zsp.list_lo(list), zsp.list_hi(list))
-		if !confirmed && !pending {
-			// Refused, or nobody asked could be: it will not come, and what is held is the answer, and is said to be.
+		if !confirmed && !pending && l.once {
+			// Refused, or nobody asked could be: it will not come, and a Fetch is answered with what is held. A question
+			// that stays asked goes on wanting it, and has it once one who will is reached.
 			far.unfetchable = true
 			near_drop(l)
 			return

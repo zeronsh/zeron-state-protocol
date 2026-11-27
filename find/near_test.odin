@@ -277,13 +277,13 @@ near_fetch_unconfirmable :: proc(t: ^testing.T) {
 	for way in 0 ..< 2 {
 		state := rand.create(35)
 		context.random_generator = rand.default_random_generator(&state)
-		n: Near
-		near_make(t, &n)
-		defer near_destroy(&n)
 		f: World
 		defer if way == 0 {
 			world_destroy(&f)
 		}
+		n: Near
+		near_make(t, &n)
+		defer near_destroy(&n)
 		if way == 0 {
 			// Another full replica, which may read only scope 1, and nothing of scope 2.
 			for &b in f.secret {
@@ -333,4 +333,51 @@ near_fetch_unconfirmable :: proc(t: ^testing.T) {
 		testing.expectf(t, answered && a.flags & 32 != 0, "way %d: the Fetch was never answered", way)
 		testing.expectf(t, len(n.g.live) == 0, "way %d: %d questions left", way, len(n.g.live))
 	}
+}
+
+// A question asked and kept, whose list one peer refused to say anything of, is answered whole once a relay that will
+// is reached. (Review 3, 4.)
+@(test)
+near_ask_recovers :: proc(t: ^testing.T) {
+	state := rand.create(36)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Near
+	near_make(t, &n)
+	defer near_destroy(&n)
+	for i in 0 ..< 20 {
+		near_put(t, &n.w, list_of(2, 1), u64(i), transmute([]byte)string("x"))
+	}
+	near_link(&n, &n.w)
+	near_settle(t, &n)
+	near_cut(&n, &n.w)
+	near_link(&n, &n.p)
+	near_settle(t, &n)
+	q := make([dynamic]byte, context.temp_allocator)
+	where_list(&q, list_of(2, 1))
+	client_ask(t, &n.c, 1, near_question(q[:]))
+	finder_run(&n.g)
+	for it in n.p.node.interests {
+		if !it.watch.data {
+			continue
+		}
+		w := make([dynamic]byte, context.temp_allocator)
+		at := zsp.frame_begin(&w, .Synced)
+		zsp.write_varint(&w, it.id)
+		zsp.write_u8(&w, 4)
+		zsp.write_key(&w, it.watch.lo)
+		zsp.write_key(&w, it.watch.hi)
+		zsp.write_varint(&w, 0)
+		zsp.write_varint(&w, 0)
+		zsp.frame_end(&w, at)
+		zsp.session_input(n.links[0][0], w[:])
+	}
+	for _ in 0 ..< 20 {
+		finder_run(&n.g)
+		client_hear(t, &n.c)
+	}
+	near_cut(&n, &n.p)
+	near_link(&n, &n.p)
+	near_settle(t, &n)
+	a := n.c.answers[1]
+	testing.expectf(t, a.flags & 1 != 0 && a.total == 20, "settled %v, with %d of 20", a.flags & 1 != 0, a.total)
 }
