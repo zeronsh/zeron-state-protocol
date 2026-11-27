@@ -906,6 +906,19 @@ network_converges_seed_98 :: proc(t: ^testing.T) {
 	sim_worlds(t, .Slow, 98, 1)
 }
 
+// Worlds in which a partial device fell behind its ring of changes by what its full peer had sent it alone, and was
+// acknowledged meanwhile: it went on, rather than comparing all again, and so it must know then what it may let go
+// of, or what was acknowledged stays in its outbox for good.
+@(test)
+network_converges_seed_1038 :: proc(t: ^testing.T) {
+	sim_worlds(t, .Quick, 1038, 1)
+}
+
+@(test)
+network_converges_seed_1056 :: proc(t: ^testing.T) {
+	sim_worlds(t, .Slow, 1056, 1)
+}
+
 // And through relays whose storage holds only some of what they keep at hand, fetching the rest as it is wanted.
 @(test)
 network_converges_through_slow_relays :: proc(t: ^testing.T) {
@@ -2450,7 +2463,7 @@ window_goes_before_the_rest :: proc(t: ^testing.T) {
 	defer sim_destroy(&s)
 	big, fresh := s.nodes[0], s.nodes[1]
 	list := List{1 << 32 | 5, 5}
-	for i in 0 ..< 5000 {
+	for i in 0 ..< 10_000 {
 		sim_put(&s, big, u64(i))
 	}
 	sim_link(&s, 0, 2)
@@ -2479,8 +2492,8 @@ window_goes_before_the_rest :: proc(t: ^testing.T) {
 			break
 		}
 	}
-	testing.expect_value(t, store_range(&fresh.node.store, list_lo(list), list_hi(list)).count, 5000)
-	testing.expectf(t, held_when_settled >= 0 && held_when_settled < 2500, "the end of the list was had once %d rows of 5000 were", held_when_settled)
+	testing.expect_value(t, store_range(&fresh.node.store, list_lo(list), list_hi(list)).count, 10_000)
+	testing.expectf(t, held_when_settled >= 0 && held_when_settled < 5000, "the end of the list was had once %d rows of 10,000 were", held_when_settled)
 	w := ui.watches[0]
 	testing.expect_value(t, store_range(&fresh.node.store, w.lo, w.hi).count, 50)
 }
@@ -2932,6 +2945,135 @@ review8_narrow_answers_not_believed :: proc(t: ^testing.T) {
 	testing.expect(t, it.id == id, "a window was asked for again on the word of one that was not asked")
 	testing.expect_value(t, len(it.reports), reports)
 	testing.expect(t, ui.watches[0].settled)
+	free_all(context.temp_allocator)
+}
+
+// A full replica brought level by a relay while the relay is still taking in what was written, both falling behind
+// what comes in (rings of 256 changes): what it is sent is what there is, about once; not all it lacks again whenever
+// either falls behind, and again, while what it lacked is still on its way.
+@(test)
+catching_up_is_sent_once :: proc(t: ^testing.T) {
+	state := seeded(106)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	writer, fresh := s.nodes[0], s.nodes[1]
+	list := List{1 << 32 | 5, 5}
+	for i in 0 ..< 3000 {
+		sim_put_big(&s, writer, 5, u64(i), 200)
+	}
+	sim_link(&s, 0, 2)
+	up := s.links[0]
+	for _ in 0 ..< 4 { // the writing on its way to the relay, and some there
+		sim_pass(&s, up.a, up.b)
+		sim_pass(&s, up.b, up.a)
+	}
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&fresh.node.store, list_lo(list), list_hi(list)).count, 3000)
+	sent: u64
+	for l in s.links {
+		if l.an == 1 {
+			sent = l.b.taken // what the relay said to it
+		}
+	}
+	whole := u64(3000 * 300) // about what the rows come to, said
+	testing.expectf(t, sent < 2 * whole, "%d bytes were sent to bring level %d bytes' worth", sent, whole)
+}
+
+// A full replica taking in much from one peer, faster than its ring of changes keeps, misses only what came from that
+// peer, which it would never send back: it goes on, rather than asking for everything afresh as though it had missed
+// what it should send.
+@(test)
+missing_only_theirs_is_missing_nothing :: proc(t: ^testing.T) {
+	state := seeded(107)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	writer, fresh := s.nodes[0], s.nodes[1]
+	for i in 0 ..< 3000 {
+		sim_put_big(&s, writer, 5, u64(i), 200)
+	}
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	list := List{1 << 32 | 5, 5}
+	testing.expect_value(t, store_range(&fresh.node.store, list_lo(list), list_hi(list)).count, 3000)
+	for l in s.links {
+		if l.an == 1 {
+			testing.expectf(t, l.a.roots_gen == 0, "it asked for everything afresh %d times", l.a.roots_gen)
+		}
+	}
+}
+
+// What is queued to be sent is not queued again: a row, nor what a Fill still to come will send; but what a step undone
+// took back is, and what goes first is not taken to be sent by what goes after it.
+@(test)
+queued_once :: proc(t: ^testing.T) {
+	state := seeded(108)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	at := s.links[0].b // the relay's end: its peer is a full replica, to which every row may be pushed
+	list := List{1 << 32 | 5, 5}
+	key := Key{list_lo(list)[0], list_lo(list)[1], 7, 1, 2}
+	other := Key{list_lo(list)[0], list_lo(list)[1], 9, 3, 4}
+	base := len(at.tasks)
+	push_row(at, key)
+	push_row(at, key)
+	testing.expect_value(t, len(at.tasks) - base, 1)
+	// Taken back, as by a step undone: then queued again.
+	resize(&at.tasks, base)
+	push_row(at, key)
+	testing.expect_value(t, len(at.tasks) - base, 1)
+	// What a Fill still to come will send.
+	queue(at, false, {kind = .Fill, lo = list_lo(list), hi = list_hi(list)})
+	push_row(at, other)
+	testing.expect_value(t, len(at.tasks) - base, 2)
+	// Hurried: only what goes first counts.
+	at.hurrying = true
+	push_row(at, key)
+	at.hurrying = false
+	testing.expect_value(t, len(at.first), 1)
+	clear(&at.tasks)
+	clear(&at.first)
+	at.task_head, at.first_head = 0, 0
+}
+
+// A watch compared afresh is not compared where a Fill still to come will send all of it.
+@(test)
+unfilled_only_compared :: proc(t: ^testing.T) {
+	state := seeded(109)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	for i in 0 ..< 100 {
+		sim_put(&s, s.nodes[0], u64(i))
+	}
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	at: ^Session
+	for l in s.links {
+		if l.an == 1 {
+			at = l.b // the relay's end of the second's link: the second watches it whole
+		}
+	}
+	testing.expect(t, len(at.watches) > 0)
+	w := &at.watches[0]
+	queue(at, false, {kind = .Fill, lo = w.lo, hi = w.hi})
+	before := len(at.out)
+	recon_unfilled(at, w)
+	testing.expect_value(t, len(at.out), before)
+	clear(&at.tasks)
+	at.task_head = 0
 	free_all(context.temp_allocator)
 }
 

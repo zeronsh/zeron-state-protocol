@@ -80,6 +80,9 @@ Session :: struct {
 	first_head: int,
 	in_first:  bool, // a task of `first` is being run
 	hurried:   [dynamic]u64, // watches whose tasks go first, as the comparing of them goes on
+	queued:    map[Id]Queued, // where a row's task was queued, believed only while that task is there and still to do
+	fills:     [2][dynamic]int, // where Fill tasks were queued, in `tasks` and in `first`, likewise
+	fills_head: [2]int, // those before, done
 	hurrying:  bool, // within on_recon, of one of them
 	cells:     Cells_Frame,
 	cursor:    u64, // into the event ring
@@ -312,6 +315,9 @@ session_close :: proc(s: ^Session) {
 	delete(s.reoffer)
 	delete(s.first)
 	delete(s.hurried)
+	delete(s.queued)
+	delete(s.fills[0])
+	delete(s.fills[1])
 	delete(s.refused)
 	session_forget(s)
 	delete(s.owed)
@@ -934,7 +940,81 @@ HURRY_LIMIT :: 1024
 // is said once it has been.
 @(private)
 queue :: proc(s: ^Session, first: bool, tasks: ..Task) {
-	append(&s.first if first else &s.tasks, ..tasks)
+	list := &s.first if first else &s.tasks
+	for t, i in tasks {
+		#partial switch t.kind {
+		case .Row:
+			s.queued[t.row] = {first, len(list) + i}
+		case .Fill:
+			append(&s.fills[int(first)], len(list) + i)
+		}
+	}
+	append(list, ..tasks)
+}
+
+// Where a task was queued: believed only while the task there is still to be done, and is the one it was. So what a
+// step undone took back is not believed, nor what was done since.
+@(private)
+Queued :: struct {
+	first: bool,
+	at:    int,
+}
+
+@(private)
+queued_task :: proc(s: ^Session, q: Queued) -> ^Task {
+	list, head := s.tasks[:], s.task_head
+	if q.first {
+		list, head = s.first[:], s.first_head
+	}
+	return &list[q.at] if q.at >= head && q.at < len(list) else nil
+}
+
+// Compares afresh what a watch covers, but what a Fill still to come will send as it is then, to its end: that need
+// not be, as comparing it while it is still on its way would only find it lacking, and queue it again. What says the
+// watch is level is queued after that Fill already.
+@(private)
+recon_unfilled :: proc(s: ^Session, w: ^Watch) {
+	n := s.node
+	hi := w.hi
+	for which in 0 ..< 2 {
+		for at in s.fills[which][s.fills_head[which]:] {
+			t := queued_task(s, {which == 1, at})
+			if t != nil && t.kind == .Fill && key_less(t.lo, hi) && !key_less(t.hi, w.hi) {
+				hi = t.lo if key_less(w.lo, t.lo) else w.lo
+			}
+		}
+	}
+	if key_less(w.lo, hi) {
+		recon_start(s, w.id, w.lo, hi, {count = 1}, store_range(&n.store, w.lo, hi))
+	}
+}
+
+// Whether what is queued will send this row, as it is when it is sent, whoever asked: then it is not queued again, as
+// comparing a range over and over, while what was found to be lacking is still on its way, would have it queued
+// over and over. Of what goes first, only what goes first counts: what goes after it would come after what says a
+// window is level.
+@(private)
+row_queued :: proc(s: ^Session, row: Id, place: Maybe(Key), first: bool) -> bool {
+	if q, ok := s.queued[row]; ok && (q.first || !first) {
+		if t := queued_task(s, q); t != nil && t.kind == .Row && t.row == row {
+			return true
+		}
+	}
+	key := place.? or_return
+	for which in ([]bool{true, false} if !first else []bool{true}) {
+		fills, head := &s.fills[int(which)], &s.fills_head[int(which)]
+		// Tasks are done in order: those of Fills done are those before the first not done.
+		for head^ < len(fills) && queued_task(s, {which, fills[head^]}) == nil {
+			head^ += 1
+		}
+		for at, n := head^, 0; at < len(fills) && n < 16; at, n = at + 1, n + 1 { // more is what it costs, not what it saves
+			t := queued_task(s, {which, fills[at]})
+			if t != nil && t.kind == .Fill && !key_less(key, t.lo) && key_less(key, t.hi) {
+				return true // a Fill still to reach it
+			}
+		}
+	}
+	return false
 }
 
 // A task is done, of whichever queue it was.
@@ -1156,14 +1236,35 @@ bound_windows :: proc(s: ^Session) {
 		return
 	}
 	missed := store_misses(&n.store)
-	bounds := make([][2]Key, len(s.watches), context.temp_allocator)
-	moved := make([]bool, len(s.watches), context.temp_allocator)
+	bounds, moved := windows_bounded(s, level = true)
+	if store_misses(&n.store) != missed {
+		return // read before anything is done: to be done again
+	}
+	for &w, i in s.watches {
+		if moved[i] {
+			w.lo, w.hi = bounds[i][0], bounds[i][1]
+			// Not settled: it waits for an answer, though what it was said before may not have been told it yet.
+			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi})
+		}
+	}
+}
+
+// Where a local client's windows of limited size, waiting for an answer, would be bounded again, if they span more
+// than twice their size (and, with `level`, only those level with it): read, not changed.
+@(private)
+windows_bounded :: proc(s: ^Session, level: bool) -> (bounds: [][2]Key, moved: []bool) {
+	n := s.node
+	bounds = make([][2]Key, len(s.watches), context.temp_allocator)
+	moved = make([]bool, len(s.watches), context.temp_allocator)
+	if s.role != .Open {
+		return
+	}
 	for &it in n.interests {
 		if it.session != s.id || !it.watch.data || it.limit == 0 || it.waiting == 0 || len(it.reports) > 0 {
 			continue
 		}
 		for &w, i in s.watches {
-			if w.id != it.watch.id || !w.data || !w.level {
+			if w.id != it.watch.id || !w.data || (level && !w.level) {
 				continue
 			}
 			below, above := extended(s, w)
@@ -1178,20 +1279,12 @@ bound_windows :: proc(s: ^Session) {
 				} else {
 					bounds[i][1], moved[i] = tree_select(n, n.shelf, from + int(it.limit))
 				}
+				moved[i] &&= key_less(bounds[i][0], bounds[i][1])
 			}
 			break
 		}
 	}
-	if store_misses(&n.store) != missed {
-		return // read before anything is done: to be done again
-	}
-	for &w, i in s.watches {
-		if moved[i] && key_less(bounds[i][0], bounds[i][1]) {
-			w.lo, w.hi = bounds[i][0], bounds[i][1]
-			// Not settled: it waits for an answer, though what it was said before may not have been told it yet.
-			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi})
-		}
-	}
+	return
 }
 
 // Once per burst of changes, however many there were.
@@ -1529,7 +1622,7 @@ recon_compare :: proc(s: ^Session, r: ^Reader, wants: ^Wants, scope: Scope, lo, 
 // Sends a row the peer lacks, if the peer would keep it.
 @(private)
 push_row :: proc(s: ^Session, key: Key) {
-	if s.peer_full || watched(s, key) {
+	if (s.peer_full || watched(s, key)) && !row_queued(s, key_row(key), key, s.hurrying) {
 		queue(s, s.hurrying, {kind = .Row, row = key_row(key)})
 	}
 }
@@ -1670,7 +1763,9 @@ on_want :: proc(s: ^Session, r: ^Reader) {
 			continue
 		}
 		if len(held) == 0 {
-			queue(s, first, {kind = .Row, row = row})
+			if !row_queued(s, row, nil, first) {
+				queue(s, first, {kind = .Row, row = row})
+			}
 			continue
 		}
 		keys := make([]Key, len(held), context.temp_allocator)
@@ -1976,7 +2071,7 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 	for done < len(s.unacked) && s.unacked[done].seq <= seq {
 		done += 1
 	}
-	if done == 0 || s.cursor < n.events.first {
+	if done == 0 || ring_lost(&n.events, s.cursor, s.id) {
 		remove_range(&s.unacked, 0, done)
 		return // what was written since is not known
 	}
@@ -1988,7 +2083,8 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 	for v in s.unacked[done:] {
 		owed[v.row] = true
 	}
-	for i := s.cursor; i < n.events.next; i += 1 {
+	// What fell off the ring since came from there, if anything did: it would not have gone back.
+	for i := max(s.cursor, n.events.first); i < n.events.next; i += 1 {
 		if c := ring_at(&n.events, i); c.origin != s.id { // what came from there does not go back
 			owed[c.row] = true
 		}
@@ -2740,6 +2836,8 @@ pump :: proc(s: ^Session) {
 		if cap(s.tasks) > 64 {
 			shrink(&s.tasks)
 		}
+		clear(&s.fills[0])
+		s.fills_head[0] = 0
 	}
 	if s.first_head == len(s.first) && len(s.first) > 0 {
 		clear(&s.first)
@@ -2747,6 +2845,11 @@ pump :: proc(s: ^Session) {
 		if cap(s.first) > 64 {
 			shrink(&s.first)
 		}
+		clear(&s.fills[1])
+		s.fills_head[1] = 0
+	}
+	if tasks_idle(s) && len(s.queued) > 0 {
+		clear(&s.queued)
 	}
 	cells_close(s)
 	if s.seq_in > s.acked_in && n.synced >= s.ack_at {
@@ -2767,6 +2870,10 @@ flush_changes :: proc(s: ^Session, high := max(int)) -> bool {
 	n := s.node
 	// Whoever flushes, the counts are owed until pump has told them.
 	s.counts_due ||= s.cursor != n.events.next
+	if s.cursor < n.events.first && !ring_lost(&n.events, s.cursor, s.id) {
+		// All it missed came from its peer, and would not have gone back to it: nothing to compare.
+		s.cursor = n.events.first
+	}
 	if s.cursor < n.events.first && !unit_step(s, proc(s: ^Session, _: ^Task) {resync(s)}) {
 		return false
 	}
@@ -2906,7 +3013,6 @@ send_synced :: proc(s: ^Session, t: ^Task) {
 // What this end holds has changed otherwise than by being told: all that either watches is compared again.
 @(private)
 session_recompare :: proc(s: ^Session) {
-	n := s.node
 	if !s.ready {
 		return
 	}
@@ -2920,7 +3026,7 @@ session_recompare :: proc(s: ^Session) {
 	for &w in s.watches {
 		if w.data && key_less(w.lo, w.hi) {
 			w.level = false
-			recon_start(s, w.id, w.lo, w.hi, {count = 1}, store_range(&n.store, w.lo, w.hi))
+			recon_unfilled(s, &w)
 		}
 	}
 }
@@ -2929,16 +3035,26 @@ session_recompare :: proc(s: ^Session) {
 @(private)
 resync :: proc(s: ^Session) {
 	n := s.node
+	// A local client's window of limited size, waiting for an answer, is bounded again before it is said over: said
+	// over whole, it would be all that has come since, and again whenever the client fell behind.
+	missed := store_misses(&n.store)
+	bounds, moved := windows_bounded(s, level = false)
+	if store_misses(&n.store) != missed {
+		return // read before anything is done: to be done again
+	}
 	s.cursor = n.events.next
 	if n.host.questions.again != nil && s.role == .Open {
 		n.host.questions.again(n.host.questions.data, s)
 	}
-	for &w in s.watches {
+	for &w, i in s.watches {
 		if !w.data {
 			continue
 		}
 		w.level = false
 		if s.role == .Open {
+			if moved[i] {
+				w.lo, w.hi = bounds[i][0], bounds[i][1]
+			}
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, restart = true})
 			append(&s.tasks, Task{kind = .Fill, lo = w.lo, hi = w.hi})
 			settled := true
@@ -2947,7 +3063,7 @@ resync :: proc(s: ^Session) {
 			}
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = settled})
 		} else {
-			recon_start(s, w.id, w.lo, w.hi, {count = 1}, store_range(&n.store, w.lo, w.hi))
+			recon_unfilled(s, &w)
 		}
 	}
 	if (s.initiator || n.becoming) && s.peer_full {
