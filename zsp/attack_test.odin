@@ -1743,3 +1743,116 @@ a_garbled_ephemeral_takes_no_keys :: proc(t: ^testing.T) {
 	mine := keyring_scope(&k, 1)
 	testing.expect(t, mine != nil && mine.epochs[0] == held)
 }
+
+// A bundle is written when the last of what it names was, for what it names it kills: whoever may no longer write
+// cannot, by naming first something from before, kill what others wrote since. Nor is a bundle whose it says if
+// what it holds was written after its author could vouch for that.
+@(test)
+a_bundle_names_nothing_later_than_its_right :: proc(t: ^testing.T) {
+	state := seeded(84)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 3, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, c := s.nodes[0], s.nodes[2]
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	at_a := s.links[0].a // what c sends, a hears here
+	regrant :: proc(s: ^Sim, rights: Rights) -> bool {
+		d := draft_from(&s.nodes[0].node.roster, max(s.nodes[0].node.clock, s.now << 16))
+		draft_grant(&d, s.nodes[2].keys.device, s.nodes[2].keys.signer, 2, rights)
+		bytes, ok := roster_sign(&s.nodes[0].keys, s.root, &d, context.temp_allocator)
+		return ok && node_adopt(&s.nodes[0].node, bytes) && node_adopt(&s.nodes[2].node, bytes)
+	}
+	later :: proc(s: ^Sim) {
+		s.now += 1000
+		sim_level(s)
+	}
+	piece :: proc(n: ^Node, text: ^Text, at: int, s: string, fresh: u64) -> Cell {
+		text_insert(text, at, transmute([]byte)s, fresh)
+		stamp := node_stamp(n)
+		body, _ := text_close(text, stamp)
+		return {slot = DATA, kind = .Piece, stamp = stamp, body = body}
+	}
+	testing.expect(t, regrant(&s, {.Write, .Vouch}))
+	could, _ := roster_parse(c.node.roster.bytes, s.space) // as c may say it still can: its node would not
+	defer roster_destroy(&could)
+	later(&s)
+	text: Text
+	defer text_destroy(&text)
+	row := node_id(&a.node, 2)
+	place: [24]byte
+	tag := list_tag(keyring_scope(&a.keys, 2), "docs")
+	put_u64(place[:], tag[0])
+	put_u64(place[8:], tag[1])
+	first := piece(&a.node, &text, 0, "Hello", 1)
+	first.row = row
+	testing.expect(t, node_write(&a.node, {{row, PLACE, .Place, node_stamp(&a.node), place[:]}, first}))
+	later(&s)
+	testing.expect(t, regrant(&s, {.Read}))
+	later(&s)
+	since := piece(&a.node, &text, 5, " world", 2)
+	since.row = row
+	testing.expect(t, node_write(&a.node, {since}))
+	sim_settle(&s)
+
+	// c may only read, and kills what a wrote since with a bundle that first names something from before.
+	names := make([dynamic]byte, context.temp_allocator)
+	write_u32(&names, 2)
+	write_stamp(&names, {row_born(row), 1})
+	write_stamp(&names, since.stamp)
+	evil := Cell{row, DATA, .Bundle, node_stamp(&c.node), names[:]}
+	testing.expect(t, cell_valid(&evil) && cell_seal(&c.keys, &could, &evil, 0, transmute([]byte)string("ceo")))
+	testing.expect(t, !cell_lawful(&a.node.roster, &evil))
+	testing.expect(t, session_input(at_a, raw_cells({evil})))
+	_, kept := store_cell(&a.node.store, row, DATA, .Piece, since.stamp)
+	_, taken := store_cell(&a.node.store, row, DATA, .Bundle, evil.stamp)
+	testing.expect(t, kept && !taken)
+	// Its own node, sealing that, names only what c may still kill.
+	trimmed := Cell{row, DATA, .Bundle, evil.stamp, names[:]}
+	testing.expect(t, cell_seal(&c.keys, &c.node.roster, &trimmed) && get_u32(trimmed.body) == 1)
+	testing.expect(t, cell_lawful(&a.node.roster, &trimmed))
+
+	// c may write and vouch again, then only write; and holds in a bundle, under an early name, what it wrote since.
+	later(&s)
+	testing.expect(t, regrant(&s, {.Write, .Vouch}))
+	later(&s)
+	testing.expect(t, regrant(&s, {.Write}))
+	later(&s)
+	vouched_until: u64
+	for g in roster_member(&a.node.roster, c.keys.device).grants {
+		if .Vouch in g.rights {
+			vouched_until = max(vouched_until, g.until)
+		}
+	}
+	held := make([dynamic]byte, context.temp_allocator)
+	write_u32(&held, 1)
+	write_stamp(&held, {row_born(row), 2})
+	write_stamp(&held, node_stamp(&c.node))
+	write_u64(&held, 77)
+	ops := make([dynamic]byte, context.temp_allocator)
+	append(&ops, 1, 0, 0)
+	write_bytes(&ops, transmute([]byte)string("forged"))
+	write_bytes(&held, ops[:])
+	forged := Cell{row, DATA, .Bundle, node_stamp(&c.node), held[:]}
+	testing.expect(t, cell_valid(&forged) && cell_seal(&c.keys, &c.node.roster, &forged, 0, transmute([]byte)string("ceo")))
+	testing.expect(t, cell_authentic(&a.node.roster, &forged))
+	by: By
+	testing.expect(t, cell_open(&a.keys, &a.node.roster, &forged, &by))
+	_, subject, vouched, known := cell_author(&a.node.roster, &forged, by)
+	testing.expect(t, known && !vouched && string(subject) != "ceo")
+	// What it holds from while it could vouch, it is believed about, as it would be had it written it then.
+	honest := make([dynamic]byte, context.temp_allocator)
+	write_u32(&honest, 1)
+	early := Stamp{vouched_until, 3}
+	write_stamp(&honest, early)
+	write_stamp(&honest, early)
+	write_u64(&honest, 78)
+	write_bytes(&honest, ops[:])
+	again := Cell{row, DATA, .Bundle, node_stamp(&c.node), honest[:]}
+	testing.expect(t, cell_valid(&again) && cell_seal(&c.keys, &c.node.roster, &again, 0, transmute([]byte)string("ceo")))
+	testing.expect(t, cell_open(&a.keys, &a.node.roster, &again, &by))
+	_, subject, vouched, known = cell_author(&a.node.roster, &again, by)
+	testing.expect(t, known && vouched && string(subject) == "ceo")
+}
