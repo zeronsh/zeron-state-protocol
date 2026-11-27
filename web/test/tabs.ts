@@ -326,6 +326,57 @@ const tests: Record<string, () => Promise<void>> = {
     await call(b, "create", "of");
     await call(b, "put", "of", "notes", ["one"]);
   },
+  // The tab running the device hangs, its worker answering nothing and holding the store: a tab that opens the device is
+  // told the store is locked, in time, rather than waiting for ever; and has it once the other is back.
+  async tab_hung_leader() {
+    const leader = await page();
+    await call(leader, "device", "hl");
+    await call(leader, "create", "hl");
+    await call(leader, "put", "hl", "notes", ["one"]);
+    const worker = leader.workers[leader.workers.length - 1];
+    await leader.cdp("Debugger.enable", {}, worker);
+    await leader.cdp("Debugger.pause", {}, worker); // at whatever it next does, which is to hear the next tab
+    const other = await page();
+    const t = performance.now();
+    const said = await within(15000, call<string>(other, "deviceOrError", "hl"));
+    const took = performance.now() - t;
+    console.log(`     said to be locked in ${took.toFixed(0)} ms: ${said}`);
+    if (!said.startsWith("StoreLocked (StoreLocked): ")) throw new Error(`a store held by a tab that answers nothing: ${said}`);
+    await leader.cdp("Debugger.resume", {}, worker);
+    await leader.cdp("Debugger.disable", {}, worker);
+    expectEqual(await call<string>(other, "deviceOrError", "hl"), "ok", "opened once the other is back");
+    await call(other, "put", "hl", "notes", ["two"]);
+    expectEqual((await call<string[]>(other, "titles", "hl", "notes", 2)).join(), "one,two");
+  },
+  // The renderer of the tab running the device crashes, worker and all: the device is had again by a tab opened after, if
+  // the browser lets go of what the renderer held, as it does but on Linux, where Chrome has been seen to leave a crashed
+  // renderer, and its lock, as they were; and if it does not, that tab is told the store is locked, rather than nothing.
+  async tab_crashed_leader() {
+    const p = await page();
+    await call(p, "device", "rk");
+    await call(p, "create", "rk");
+    await call(p, "put", "rk", "notes", ["one", "two"]);
+    // The next in line may have a renderer of its own, or share the leader's, as Chrome may put tabs of a site together,
+    // and crash with it: a tab opened after has the device either way, run by the one or the other.
+    const next = await page();
+    await call(next, "device", "rk");
+    await call(next, "put", "rk", "notes", ["three"]);
+    void p.cdp("Page.crash").catch(() => {});
+    const survived = (await within(2000, next.evaluate<number>("1"))) === 1;
+    console.log(`     the leader's renderer crashed, ${survived ? "the next in line's renderer another" : "and the next in line's with it"}`);
+    const after = await page();
+    const crashed = performance.now();
+    const opened = await within(15000, call<string>(after, "deviceOrError", "rk"));
+    const told = survived ? await within(2000, call<string[]>(next, "failures")) : [];
+    console.log(`     a tab opened after was answered ${(performance.now() - crashed).toFixed(0)} ms later; the next in line was told ${JSON.stringify(told)}`);
+    if (opened !== "ok") {
+      if (!opened.startsWith("StoreLocked (StoreLocked): the store is held by something that does not answer")) throw new Error(`opened once the leader crashed: ${opened}`);
+      console.log("     the crashed renderer's lock was never let go of: said to be locked");
+      return;
+    }
+    expectEqual(await within(10000, call(after, "put", "rk", "notes", ["four"]).then(() => "written")), "written", "written once the leader crashed");
+    expectEqual((await call<string[]>(after, "titles", "rk", "notes", 4)).join(), "one,two,three,four");
+  },
   // A tab's worker carries its pipe to the leader's, which never hears of it: the pipe is broken off, and the client
   // dials again, rather than waiting for ever.
   async tab_unheard() {

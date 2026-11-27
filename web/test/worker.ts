@@ -362,6 +362,38 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   assert.equal(lines.get("zsp:line")?.length ?? 0, 0, "one closed is still in line");
 }
 
+// A store held by something that answers nothing, as a tab whose renderer has hung does: what is asked is said to have
+// failed as the store is locked, after a silence and as long again asked whether it is there, rather than waited on for
+// ever; and the worker, still in line, runs the device once it is let go of. One that holds it and is there, opening it
+// slowly, is waited for.
+{
+  let letGo!: () => void;
+  void request("zsp:mute", () => new Promise<void>((done) => (letGo = done)));
+  const w = await worker();
+  await w.tell({ open: { name: "mute" } });
+  const t = performance.now();
+  await Promise.race([w.tell({ ask: 1, op: "identity", args: [] }), sleep(10000)]);
+  const took = performance.now() - t;
+  assert.equal(answered(w.said, 1)?.name, "StoreLocked", `asked of a store held by what answers nothing: ${JSON.stringify(answered(w.said, 1))}`);
+  assert(took >= 2 * 3000 && took < 2 * 3000 + 1000, `said to be locked after ${took} ms`);
+  assert(w.said.some((r) => "failed" in r && r.name === "StoreLocked"), "its tab was not told the store is locked");
+  letGo();
+  await w.tell({ ask: 2, op: "identity", args: [] });
+  assert.equal(answered(w.said, 2)?.error, undefined, "not run once it was let go of");
+
+  let opened!: () => void;
+  void request("zsp:slow", () => new Promise<void>((done) => (opened = done)));
+  const holder = new Channel("zsp:slow");
+  holder.onmessage = (e) => (e.data as { anyone?: true }).anyone && holder.postMessage({ here: true });
+  const s = await worker();
+  await s.tell({ open: { name: "slow" } });
+  setTimeout(() => (holder.close(), opened()), 8000);
+  await s.tell({ ask: 1, op: "identity", args: [] });
+  assert.equal(answered(s.said, 1)?.error, undefined, `one there, if slow, was given up on: ${JSON.stringify(answered(s.said, 1))}`);
+  await w.tell({ ask: 3, op: "close", args: [] });
+  await s.tell({ ask: 2, op: "close", args: [] });
+}
+
 // Put away, as its tab is frozen or left: every file is closed at once, as the worker is told, for nothing after is sure to
 // be run; and the lock let go of once nothing is being opened.
 {

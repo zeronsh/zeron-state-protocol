@@ -78,7 +78,9 @@ type Shout =
   | { taking: string } // an ask the leader is doing now, which it may have done should it go before it answers
   | { answer: string; value?: unknown; error?: string; name?: string }
   | Given // a credential a tab has given, for whichever worker runs the node now and later
-  | { credentials: true }; // a worker that has just begun, asking to be told the newest given before it
+  | { credentials: true } // a worker that has just begun, asking to be told the newest given before it
+  | { anyone: true } // a worker whose asks nobody has answered: whoever holds the store says it is there
+  | { here: true }; // the worker that holds the store, opening it or running it
 
 // What may be asked again of the next leader, as having been done or not it is the same: anything else, asked of one that
 // went as it did it, may have been done, and is said to have failed rather than be done twice.
@@ -129,6 +131,9 @@ let leaving = false; // closed, or about to be stopped: the store is let go of, 
 let letGo: (() => void) | undefined; // ends the running of the node here, closed or put away, and so the hold on the store
 let line: AbortController | undefined; // gives up this worker's place in line for the store, while it is in line
 let held: Promise<void> = Promise.resolve(); // resolves once this worker holds the store no longer, nor is in line for it
+let holding = false; // has the store's lock, and is opening it, running it or letting go of it
+let silence: ReturnType<typeof setTimeout> | undefined; // until asks of whoever holds the store are given up on
+let holderHeard = false; // whoever holds the store, since this worker last looked
 
 /** What went wrong, as a tab is told it: the error's name too, where it is one an application may tell apart. */
 export type Failure = { message: string; name?: string };
@@ -212,6 +217,7 @@ function contend(): void {
   const request = navigator.locks.request("zsp:" + o.name, { signal: giveUp.signal }, async () => {
     if (line === giveUp) line = undefined; // had: nothing to give up now but the store itself
     if (leaving) return;
+    holding = true;
     let node: Node;
     let ended: Promise<Error | undefined>; // failed, or closed or put away
     let stopped: Error | undefined;
@@ -227,7 +233,7 @@ function contend(): void {
       });
       if (newest !== given && !stopped) node.setCredential(newest!.credential); // given while it opened
     } catch (error) {
-      contending = false;
+      holding = contending = false;
       fail(failure(error));
       return;
     }
@@ -251,6 +257,7 @@ function contend(): void {
       fail(failure(error));
     }
     await node.close();
+    holding = false;
   });
   held = Promise.all([held, request.catch(() => {})]).then(() => {}); // given up while in line, it is refused
 }
@@ -370,6 +377,7 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
 function failedAsks(f: Failure): void {
   for (const [id, done] of waiting) unheard.delete(id), taken.delete(id), done({ error: f.message, name: f.name });
   waiting.clear();
+  clearTimeout(silence), (silence = undefined);
 }
 
 // What a leader that has gone was doing as it went, and may have done: unless it may be done again, it is said to have
@@ -383,11 +391,38 @@ function gone(id: string, op: Op): { error: string } | undefined {
 function shout(id: string, s: Shout): void {
   unheard.set(id, s);
   channel.postMessage(s);
+  if ("ask" in s) listen();
+}
+
+// Asks of whoever holds the store are given up on, said to have failed as the store is locked, should nothing that holds it
+// say anything for HEARD_WITHIN, nor when asked whether it is there for as long again: for a live one answers at once, or,
+// opening the store, says it is there. One that answers nothing holds it all the same, and this worker would wait in line
+// for ever, as when a tab's renderer has hung, or crashed and not been let go of, which Chrome has been seen to do on Linux:
+// its tab is told so, rather than nothing. This worker stays in line, and has the store should it ever be let go of.
+let askedHolder = false; // whether it is there, since its asks were last heard
+function listen(): void {
+  if (silence !== undefined || holding) return;
+  holderHeard = askedHolder = false;
+  silence = setTimeout(function quiet() {
+    silence = undefined;
+    if (waiting.size === 0 || holding) return;
+    if (holderHeard || !askedHolder) {
+      if (!holderHeard) channel.postMessage({ anyone: true } satisfies Shout), (askedHolder = true);
+      else askedHolder = false;
+      holderHeard = false;
+      silence = setTimeout(quiet, HEARD_WITHIN);
+      return;
+    }
+    const f: Failure = { message: "the store is held by something that does not answer: another tab of this site, hung, or the browser, until it is restarted", name: "StoreLocked" };
+    failedAsks(f);
+    self.postMessage({ failed: f.message, name: f.name } satisfies Report);
+  }, HEARD_WITHIN);
 }
 
 // Anything on the channel is of this origin; but what is not as a worker says it is ignored, rather than thrown at.
 function heard(s: Shout): void {
   if (typeof s !== "object" || s === null) return;
+  if ("here" in s || "leader" in s || "taking" in s || "answer" in s) holderHeard = true; // whoever holds the store is there
   if ("failed" in s) {
     if (typeof s.failed !== "string") return;
     const f: Failure = { message: s.failed, ...(s.name === "StoreLocked" ? { name: s.name } : {}) };
@@ -409,6 +444,8 @@ function heard(s: Shout): void {
     heardGiven(s);
   } else if ("credentials" in s) {
     if (newest) channel.postMessage({ ...newest, old: true } satisfies Shout); // to one that has just begun, and so to all
+  } else if ("anyone" in s) {
+    if (holding) channel.postMessage({ here: true } satisfies Shout);
   } else if ("taking" in s) {
     if (typeof s.taking === "string" && waiting.has(s.taking)) taken.add(s.taking);
   } else if ("answer" in s) {
@@ -417,6 +454,7 @@ function heard(s: Shout): void {
     unheard.delete(s.answer);
     waiting.delete(s.answer);
     taken.delete(s.answer);
+    if (waiting.size === 0) clearTimeout(silence), (silence = undefined); // nothing more to wait on it for
     done?.({ value: s.value, error: s.error, name: s.name === "StoreLocked" ? s.name : undefined });
   } else if (device && "ask" in s) {
     if (typeof s.ask !== "string" || typeof s.op !== "string" || !Array.isArray(s.args)) return;
