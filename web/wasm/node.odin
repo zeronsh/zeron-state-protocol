@@ -34,6 +34,7 @@ foreign host {
 	dial :: proc(conn: u32, url: [^]byte, len: int) ---
 	send :: proc(conn: u32, ptr: [^]byte, len: int) ---
 	room :: proc(conn: u32) -> int --- // what may be sent now without piling up
+	backlog :: proc(conn: u32) -> int --- // what was sent and is not yet on its way; the host is woken as it goes
 	ping :: proc(conn: u32) --- // a text message "ping", for a browser cannot send a WebSocket's own
 	hangup :: proc(conn: u32) ---
 	say :: proc(level: u32, ptr: [^]byte, len: int) ---
@@ -321,6 +322,15 @@ start :: proc "c" (full: bool, age, bytes: f64) -> bool {
 		questions = questions(),
 		reach = relayed_reach,
 		link = relayed_input,
+		backlog = proc(_: rawptr, s: ^zsp.Session) -> int {
+			c := conn_of(s)
+			return backlog(c.id) if c != nil else 0
+		},
+		flush = proc(_: rawptr, s: ^zsp.Session) {
+			if c := conn_of(s); c != nil {
+				conn_push(c)
+			}
+		},
 	}
 	synced_at = time.tick_now()
 	started = true
@@ -586,6 +596,43 @@ conn_drop :: proc(c: ^Conn) {
 	free(c)
 }
 
+@(private)
+conn_of :: proc(s: ^zsp.Session) -> ^Conn {
+	for _, c in conns {
+		if c.session == s {
+			return c
+		}
+	}
+	return nil
+}
+
+// What a session has queued already, to the host now, as far as it has room: in the midst of the session's own work or
+// another's, so nothing more is made and nothing is let go (see zsp.Host.flush).
+@(private)
+conn_push :: proc(c: ^Conn) {
+	for {
+		out := zsp.session_queued(c.session)
+		space := room(c.id)
+		if len(out) == 0 || space <= 0 {
+			return
+		}
+		n := min(len(out), MAX_PLAIN, space)
+		conn_send(c, out[:n])
+		zsp.session_sent(c.session, n)
+	}
+}
+
+@(private)
+conn_send :: proc(c: ^Conn, out: []byte) {
+	if c.dialer == nil {
+		send(c.id, raw_data(out), len(out))
+	} else {
+		sealed := make([dynamic]byte, 0, len(out) + zsp.TAG, context.temp_allocator)
+		zsp.channel_seal(&c.channel, &sealed, out)
+		send(c.id, raw_data(sealed), len(sealed))
+	}
+}
+
 // Draws what a connection's session has to say, for as long as the host has room.
 @(private)
 conn_flush :: proc(c: ^Conn) {
@@ -600,13 +647,7 @@ conn_flush :: proc(c: ^Conn) {
 			break
 		}
 		n := min(len(out), MAX_PLAIN, space)
-		if c.dialer == nil {
-			send(c.id, raw_data(out), n)
-		} else {
-			sealed := make([dynamic]byte, 0, n + zsp.TAG, context.temp_allocator)
-			zsp.channel_seal(&c.channel, &sealed, out[:n])
-			send(c.id, raw_data(sealed), len(sealed))
-		}
+		conn_send(c, out[:n])
 		zsp.session_sent(s, n)
 	}
 	if s.closing && len(zsp.session_output(s)) == 0 {

@@ -813,6 +813,88 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   await Promise.all([a.close(), b.close()]);
 }
 
+// While the way to the relay is full, what a link it carries would send waits in the link, unsent: not handed on to be
+// dropped, which the link would take for the path's congestion and send again. A burst sent while the WebSocket says it
+// is full costs no more on the wire than one sent while it is not.
+{
+  const { spawn } = await import("node:child_process");
+  const relay = spawn(BIN, ["serve", join(TMP, "full-relay"), "--listen=127.0.0.1:0", "--no-udp"], { stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    const said: string = await new Promise((done) => relay.stdout!.once("data", (d) => done(String(d))));
+    const [, key, address] = said.match(/(\w{64}) listening on ws:\/\/(\S+)/)!;
+    let full = false;
+    let wire = 0;
+    // A WebSocket that says it is full while told to, and counts what is sent on it.
+    class Counted {
+      #ws: WebSocket;
+      binaryType = "arraybuffer";
+      onopen: ((e: Event) => void) | null = null;
+      onmessage: ((e: MessageEvent) => void) | null = null;
+      onclose: ((e: CloseEvent) => void) | null = null;
+      onerror: ((e: Event) => void) | null = null;
+      constructor(url: string) {
+        this.#ws = new WebSocket(url);
+        this.#ws.binaryType = "arraybuffer";
+        this.#ws.onopen = (e) => this.onopen?.(e);
+        this.#ws.onmessage = (e) => this.onmessage?.(e);
+        this.#ws.onclose = (e) => this.onclose?.(e);
+        this.#ws.onerror = (e) => this.onerror?.(e);
+      }
+      get readyState() {
+        return this.#ws.readyState;
+      }
+      get bufferedAmount() {
+        return full ? 300_000 : this.#ws.bufferedAmount;
+      }
+      send(data: Uint8Array<ArrayBuffer> | ArrayBuffer | string) {
+        if (typeof data !== "string") wire += data.byteLength;
+        this.#ws.send(data);
+      }
+      close() {
+        this.#ws.close();
+      }
+    }
+    const a = await Node.open({ volume: new MemoryVolume(), module, log: () => {}, WebSocket: Counted as unknown as typeof WebSocket });
+    const b = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+    const space = a.create();
+    a.relay(key, `ws://${address}`);
+    a.admit(b.key, 1);
+    b.join(space, { url: `ws://${address}`, key });
+    const ca = new Client({ connect: a.connect });
+    const cb = new Client({ connect: b.connect });
+    await Promise.all([ca.ready, cb.ready]);
+    let got = 0;
+    cb.serve(1, "sink", (call) => {
+      call.ondata = (chunk: Uint8Array) => void (got += chunk.length);
+    });
+    for (const end = Date.now() + 10_000; !ca.devices.some((d) => d.id === b.id); await new Promise((done) => setTimeout(done, 25))) {
+      assert(Date.now() < end, "b never came online");
+    }
+    const calls = [ca.call(b.id, 1, "sink", new Uint8Array(0)), ca.call(b.id, 1, "sink", new Uint8Array(0))];
+    for (const c of calls) c.send(Uint8Array.of(1, 2, 3, 4));
+    for (const end = Date.now() + 10_000; got < 8; await new Promise((done) => setTimeout(done, 10))) assert(Date.now() < end, "the calls never began");
+    const chunk = new Uint8Array(4096).fill(0x5a);
+    const burst = async (held: boolean) => {
+      wire = 0;
+      const want = got + 2 * 50 * chunk.length; // more than a relay queues for a session
+      full = held;
+      for (let i = 0; i < 50; i++) for (const c of calls) c.send(chunk);
+      if (held) await new Promise((done) => setTimeout(done, 200));
+      full = false;
+      for (const end = Date.now() + 20_000; got < want; await new Promise((done) => setTimeout(done, 5))) assert(Date.now() < end, "the burst never arrived");
+      return wire;
+    };
+    const free = await burst(false);
+    const held = await burst(true);
+    assert(held - free < 4096, `a burst sent while the relay's way was full cost ${held - free} bytes more`);
+    ca.close();
+    cb.close();
+    await Promise.all([a.close(), b.close()]);
+  } finally {
+    relay.kill();
+  }
+}
+
 // Where a relay keeps a space, a proxy's query staying at the end.
 assert.equal(spaceUrl("wss://relay.example/", "ab"), "wss://relay.example/ab");
 assert.equal(spaceUrl("wss://relay.example/zsp?key=1", "ab"), "wss://relay.example/zsp/ab?key=1");
