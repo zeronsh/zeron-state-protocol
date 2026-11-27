@@ -495,8 +495,9 @@ docs/relay-storage.md.)
 | 0 | stamp (16) ‖ XChaCha20-Poly1305 under derive(X25519 of the two devices, "zsp-signal"), nonce stamp ‖ 0 ‖ 0x41 ‖ 0 (6), associated data from ‖ to |
 | 7 | a link's packet (§14), as over UDP |
 
-Others are passed over. Devices with no direct link reach each other by a **link through a relay**: the same link as over UDP, its packets in signals
-of kind 7, taken only from members and only through a relay the receiver dialled. Whoever has a call to make and no session for it dials; the other
+Others are passed over, as is a signal of any kind from a device that is not a member, or that comes other than through a relay the receiver
+dialled. Devices with no direct link reach each other by a **link through a relay**: the same link as over UDP, its packets in signals
+of kind 7. Whoever has a call to make and no session for it dials; the other
 answers. Over it runs a calls session (§8). Its packets are at most 8192 bytes; it needs no probing of its path's size, and no NAT keeps it. A
 packet that comes newest yet by another relay both are present at moves the link there, and an end whose relay has gone, or whose peer has gone
 from it, sends by another: a link outlives a relay, and its calls with it. A link whose calls have been over for 30 seconds is closed.

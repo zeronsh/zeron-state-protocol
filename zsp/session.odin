@@ -2673,13 +2673,14 @@ on_signal :: proc(s: ^Session, r: ^Reader) {
 		}
 		return
 	}
-	if len(rest) == 0 {
+	// Of whatever kind, taken only from members, and only through a relay this device dialled.
+	if m := roster_member(&n.roster, device); len(rest) == 0 || m == nil || !member_active(m) || !s.peer_relay {
 		return
 	}
 	switch Post(rest[0]) {
 	case .Plain:
 	case .Link:
-		if m := roster_member(&n.roster, device); m != nil && member_active(m) && n.host.link != nil && s.peer_relay {
+		if n.host.link != nil {
 			n.host.link(n.host.data, s.id, device, rest[1:])
 		}
 		return
