@@ -125,8 +125,10 @@ self.onmessage = async (e: MessageEvent<Command>) => {
 
 let options: Options;
 let contending = false; // in line for the store, or running it
-let leaving = false; // about to be stopped: the store is let go of, and never had again
+let leaving = false; // closed, or about to be stopped: the store is let go of, and never had again
 let letGo: (() => void) | undefined; // ends the running of the node here, closed or put away, and so the hold on the store
+let line: AbortController | undefined; // gives up this worker's place in line for the store, while it is in line
+let held: Promise<void> = Promise.resolve(); // resolves once this worker holds the store no longer, nor is in line for it
 
 /** What went wrong, as a tab is told it: the error's name too, where it is one an application may tell apart. */
 export type Failure = { message: string; name?: string };
@@ -206,7 +208,9 @@ function contend(): void {
   const o = options;
   // Nothing of the store is let go of, lock and all, while any of its files is open or being opened: the next to have the
   // lock would find it held. Node.open, failing, has let go of every one; and `close` says when they are.
-  void navigator.locks.request("zsp:" + o.name, async () => {
+  const giveUp = (line = new AbortController());
+  const request = navigator.locks.request("zsp:" + o.name, { signal: giveUp.signal }, async () => {
+    if (line === giveUp) line = undefined; // had: nothing to give up now but the store itself
     if (leaving) return;
     let node: Node;
     let ended: Promise<Error | undefined>; // failed, or closed or put away
@@ -227,7 +231,7 @@ function contend(): void {
       fail(failure(error));
       return;
     }
-    if (leaving) void node.closeNow(), letGo!(); // put away as it opened
+    if (leaving) void node.closeNow(), letGo!(); // closed or put away as it opened
     else if (!stopped) {
       device = node;
       breakCarried();
@@ -248,18 +252,24 @@ function contend(): void {
     }
     await node.close();
   });
+  held = Promise.all([held, request.catch(() => {})]).then(() => {}); // given up while in line, it is refused
 }
 
-// Its tab is about to stop it, as the tab is frozen or left: the node is stopped, what it holds made durable, and every file
-// closed, at once, for nothing after this is sure to be run; and the lock is let go of once nothing is being opened, unless
-// the worker is stopped first, which lets go of it anyway. Chrome runs what was sent a worker before it stops it, and so this.
-function away(): void {
+// Lets go of the store for good, as the device is closed or its tab is about to stop this worker: the node is stopped, what
+// it holds made durable, and every file closed, at once, for nothing after this is sure to be run; a place in line is given
+// up; and the lock is let go of once nothing is being opened, unless the worker is stopped first, which lets go of it
+// anyway. Resolves once it is. Chrome runs what was sent a worker before it stops it, and so this.
+function leave(): Promise<void> {
   leaving = true;
+  line?.abort();
   const d = device;
   device = undefined;
   void d?.closeNow();
   letGo?.();
+  return held;
 }
+
+const away = () => void leave();
 
 // Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
 function fail(f: Failure): void {
@@ -290,14 +300,10 @@ async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: 
     return { value: give(c, at, true) }; // given now, and so after any this worker knows of
   }
   if (op === "close") {
-    // This tab's device goes: if this worker runs the node, it is stopped as it should be, what it holds written down,
-    // before the worker goes with the lock and another takes it. Another's node is not this tab's to stop.
-    if (device) {
-      const d = device;
-      device = undefined;
-      await d.close().catch(() => {});
-      letGo?.(); // and so the store, its files all closed
-    }
+    // This tab's device goes: if this worker runs the node, or is opening it, it is stopped as it should be, what it holds
+    // written down, and the store let go of, before the worker goes and another takes it. Another's node is not this
+    // tab's to stop: this worker's place in line for it is given up.
+    await leave();
     return {};
   }
   if (device) return answer(op, args);

@@ -131,10 +131,12 @@ function pause(store: string, name: string): { reached: Promise<void>; release: 
 /** The handles open in a store's directory. */
 const held = (store: string) => [...open].filter((h) => h.file.path.startsWith(`/zsp/${store}/`)).length;
 
-// Web Locks: one holder of a name at a time, the rest in line, in order.
+// Web Locks: one holder of a name at a time, the rest in line, in order, any of which may give up its place.
 const locks = new Set<string>();
 const lines = new Map<string, (() => void)[]>();
-function request<T>(name: string, f: () => T | Promise<T>): Promise<T> {
+function request<T>(name: string, a: { signal?: AbortSignal } | (() => T | Promise<T>), b?: () => T | Promise<T>): Promise<T> {
+  const f = (typeof a === "function" ? a : b)!;
+  const signal = typeof a === "function" ? undefined : a.signal;
   return new Promise<T>((resolve, reject) => {
     const grant = () => {
       locks.add(name);
@@ -150,7 +152,12 @@ function request<T>(name: string, f: () => T | Promise<T>): Promise<T> {
       })();
     };
     if (!locks.has(name)) return grant();
-    (lines.get(name) ?? (lines.set(name, []), lines.get(name)!)).push(grant);
+    const line = lines.get(name) ?? (lines.set(name, []), lines.get(name)!);
+    line.push(grant);
+    signal?.addEventListener("abort", () => {
+      const at = line.indexOf(grant);
+      if (at >= 0) line.splice(at, 1), reject(new DOMException("given up", "AbortError"));
+    });
   });
 }
 
@@ -183,13 +190,16 @@ Object.defineProperty(globalThis, "FileSystemFileHandle", { value: Entry, config
 let workers = 0;
 async function worker() {
   const said: Report[] = [];
-  const scope = { location: { href: "file:///" }, onmessage: null as ((e: { data: unknown }) => Promise<void>) | null, postMessage: (r: Report) => said.push(r) };
+  let onSaid: ((r: Report) => void) | undefined;
+  const scope = { location: { href: "file:///" }, onmessage: null as ((e: { data: unknown }) => Promise<void>) | null, postMessage: (r: Report) => (said.push(r), onSaid?.(r)) };
   Object.defineProperty(globalThis, "self", { value: scope, configurable: true });
   await import(`../src/worker.ts?${++workers}`); // a module of its own, as a worker's is
   const on = scope.onmessage!;
   return {
     said,
     tell: (data: unknown) => on({ data }),
+    /** Says, as it is said, what was so then. */
+    watch: (f: (r: Report) => void) => void (onSaid = f),
   };
 }
 const answered = (said: Report[], id: number) => said.find((r) => "answer" in r && r.answer === id) as { answer: number; value?: unknown; error?: string; name?: string } | undefined;
@@ -314,6 +324,42 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   await Promise.race([asking, sleep(500)]);
   assert.equal(refused, before, "the second worker opened the store's files, held by the first");
   assert.deepEqual(answered(b.said, 1)?.value, answered(a.said, 1)?.value, "the second tab's device is not the first's");
+  await a.tell({ ask: 2, op: "close", args: [] });
+  await b.tell({ ask: 2, op: "close", args: [] });
+  assert.equal(held("app"), 0);
+}
+
+// Closed as it opens the store, the device is closed once it has, every file closed and the lock let go of, before it says
+// it is: its tab stops the worker as soon as it hears.
+{
+  const roster = pause("closing", "roster.1");
+  const w = await worker();
+  await w.tell({ open: { name: "closing" } });
+  void w.tell({ ask: 1, op: "identity", args: [] });
+  await roster.reached;
+  assert(held("closing") > 5);
+  let then: { files: number; lock: boolean } | undefined;
+  w.watch((r) => "answer" in r && r.answer === 2 && (then = { files: held("closing"), lock: locks.has("zsp:closing") }));
+  const closing = w.tell({ ask: 2, op: "close", args: [] });
+  await sleep(20);
+  assert.equal(then, undefined, "said to be closed while it was still opening the store");
+  roster.release();
+  await closing;
+  assert.deepEqual(then, { files: 0, lock: false }, "said to be closed with files open, or the lock held");
+}
+
+// And a tab in line for the store, run by another's, closes at once, giving up its place.
+{
+  const a = await worker();
+  await a.tell({ open: { name: "line" } });
+  await a.tell({ ask: 1, op: "identity", args: [] });
+  const b = await worker();
+  await b.tell({ open: { name: "line" } });
+  await b.tell({ ask: 1, op: "identity", args: [] });
+  assert.equal(await Promise.race([b.tell({ ask: 2, op: "close", args: [] }).then(() => "closed"), sleep(500).then(() => "waiting")]), "closed");
+  await a.tell({ ask: 2, op: "close", args: [] });
+  assert(!locks.has("zsp:line"), "the store was had by one closed");
+  assert.equal(lines.get("zsp:line")?.length ?? 0, 0, "one closed is still in line");
 }
 
 // Put away, as its tab is frozen or left: every file is closed at once, as the worker is told, for nothing after is sure to
