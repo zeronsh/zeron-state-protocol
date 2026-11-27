@@ -484,9 +484,16 @@ async function partialThrough(kind: string): Promise<void> {
   await cp.write(1, (c) => c.insert(Row, "feed", 5000, { n: -1 }));
   const last = () => tail.state!.rows[tail.state!.rows.length - 1];
   await eventually("and is shown", () => last()?.n === -1);
+  // And what is typed in a text it holds.
+  const typed = tail.state!.rows[0];
+  const editor = cp.text(typed.id, Row.body);
+  await eventually("the text is had", () => editor.read() === typed.body);
+  editor.append(" and typed while away");
+  editor.close();
 
   // What nobody has watched for long enough goes; what is watched, and what it wrote, stay.
-  await eventually("the list nobody watches is let go of", () => p.node.held < held, AGE * 1000 + 5000);
+  // Once its window has been let go of, as a client does when nobody has looked for a while, 5 s, and then once it is of age.
+  await eventually("the list nobody watches is let go of", () => p.node.held < held, AGE * 1000 + 5000 + 10000);
   const o0 = watch(cp, "other", 50);
   await eventually("and is no longer there", () => o0.state?.status === "stale" && o0.state.rows.length === 0);
   o0.stop();
@@ -498,6 +505,9 @@ async function partialThrough(kind: string): Promise<void> {
   const seen = watch(writer, "feed", 1);
   await eventually("what it wrote while away is had by the others", () => seen.state?.rows.at(-1)?.n === -1);
   seen.stop();
+  let body = "";
+  writer.window({ scope: 1, list: "feed", table: Row, size: 30 }, (x) => (body = x.rows.find((r) => r.id === typed.id)?.body ?? ""));
+  await eventually("and what was typed", () => body.endsWith(" and typed while away"));
   const o1 = watch(cp, "other", 50);
   await eventually("what went comes again", () => o1.state?.status === "ready" && o1.state.rows.length === 5);
   o1.stop();

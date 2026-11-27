@@ -129,7 +129,11 @@ node_retain :: proc(n: ^Node) -> (more: bool) {
 		return false
 	}
 	if !r.running {
-		if r.due == 0 || n.now < r.due || len(n.sweep.plans) > 0 {
+		if r.due == 0 || n.now < r.due {
+			return false
+		}
+		if len(n.sweep.plans) > 0 {
+			r.due = n.now + 1000 // what a roster made unlawful is gone over first; then this
 			return false
 		}
 		r.running, r.over, r.cursor = true, false, KEY_MIN

@@ -125,7 +125,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     owner: (key: string) => ask<void>("owner", key),
     relay: (key: string, url: string) => ask<void>("relay", key, url),
     members: () => ask<Member[]>("members"),
-    held: () => ask<number>("held"),
+    usage: () => ask<{ held: number; memory: number }>("usage"),
     connect,
     client: (host = {}) => new Client({ ...host, connect }),
     close: async () => worker.terminate(),

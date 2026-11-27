@@ -43,7 +43,9 @@ too big to hold can be asked about, as any rows can, at any depth ([docs/mirror.
 
 **A browser tab is a device.** It has its own key, its own encrypted store and its own node, the very same Odin, and meets the others
 at a relay, or links to them directly from Node. Its client speaks to it as every client speaks to its node, and is held to the same
-tests ([docs/web.md](docs/web.md)).
+tests ([docs/web.md](docs/web.md)). It is a partial replica: it has what it watches as soon as it is asked for, however big the space,
+keeps no more than it is told to of what it no longer watches, says whether what it shows is kept up, and is what it holds when it
+reaches nobody.
 
 **The log is the database.** A sealed cell is appended once. The bytes on disk are the bytes on the wire are the bytes on the relay.
 

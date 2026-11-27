@@ -45,7 +45,7 @@ export async function open(options: OpenOptions): Promise<Device & { readonly no
     owner: async (key: string) => node.owner(key),
     relay: async (key: string, url: string) => node.relay(key, url),
     members: async () => node.members(),
-    held: async () => node.held,
+    usage: async () => ({ held: node.held, memory: node.memory }),
     connect: node.connect,
     client: (host = {}) => new Client({ ...host, connect: node.connect }),
     close: () => node.close(),

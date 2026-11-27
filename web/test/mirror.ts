@@ -17,8 +17,9 @@ export interface Sides {
 
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
 
+// Ten seconds: where nobody who can read is there, one that has just gone may be asked first, until it is known to be gone.
 async function eventually(what: string, f: () => boolean): Promise<void> {
-  for (let k = 0; k < 500; k++) {
+  for (let k = 0; k < 1000; k++) {
     if (f()) return;
     await sleep(10);
   }

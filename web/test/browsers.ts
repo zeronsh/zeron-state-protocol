@@ -321,7 +321,7 @@ const tests: Record<string, () => Promise<void>> = {
       return x?.status === "ready" && x.titles.length === 20 && x.before === 1981 && x.titles[19] === "last";
     });
     console.log(`     the end of a list of 2001, in a browser that held none of it: ${(performance.now() - opened).toFixed(0)} ms`);
-    const held = await call<number>(first, "held", "bp");
+    const { held } = await call<{ held: number }>(first, "usage", "bp");
     if (held > 20000) throw new Error(`it holds ${held} bytes, as though it held the whole list`);
 
     // It reaches nobody.
@@ -399,9 +399,124 @@ const bench = async () => {
   console.log(`a streamed token, to another browser device through zspd's relay  ${ms(r.across)}`);
 };
 
+// Not a test, and not run unless named: `node test/browsers.ts partial [rows]`. A partial device against a full one, in
+// Node and in Chrome, on a big space (so many rows, and large texts), over a good network and a poor one: how soon the
+// end of a list is shown, how soon a large text is, and what each comes to hold, in memory and in storage.
+const partialBench = async () => {
+  const ROWS = Number(process.argv[3] ?? 100000), TEXTS = 20, TEXT = 400_000, WAIT = 300_000;
+  const Row = { title: columns.string(16), body: columns.text(17) };
+  const { open: openNode } = await import("../src/nodejs.ts");
+  const { readdirSync, statSync } = await import("node:fs");
+  const du = (dir: string): number =>
+    readdirSync(dir, { withFileTypes: true }).reduce((n, e) => n + (e.isDirectory() ? du(join(dir, e.name)) : statSync(join(dir, e.name)).size), 0);
+  const mb = (b: number) => `${(b / 2 ** 20).toFixed(1)} MB`;
+  const ms = (x: number) => (x < 0 ? `> ${WAIT / 1000} s` : x < 1000 ? `${x.toFixed(0)} ms` : `${(x / 1000).toFixed(1)} s`);
+  const results: string[][] = [];
+  const networks = [
+    { name: "good", slow: undefined },
+    { name: "poor: 1.6 Mbit/s, 300 ms round trip", slow: { bytesPerSecond: 200_000, latency: 150 } },
+  ];
+  for (const net of networks) {
+    const relay = await node("serve", join(TMP, `pb-${results.length}-relay`));
+    const through = await proxy(relay.url, net.slow);
+    const via = { key: relay.key, url: through.url };
+    const s = await space(`pb-${results.length}`, via);
+    // The space: the owner writes it all, and a full device beside the relay, unthrottled, sees that it is all there.
+    const writer = new Client({ connect: zspdConnect(s.o.address), credential: token(s.owner) });
+    await eventually("the writer may write", () => writer.may(1, "write"));
+    const began = performance.now();
+    const writes: Promise<void>[] = [];
+    for (let i = 0; i < ROWS; i += 1000)
+      writes.push(writer.write(1, (c) => {
+        for (let k = i; k < Math.min(i + 1000, ROWS); k++) c.insert(Row, "big", k, { title: `note ${k}`, body: `the quick brown fox jumps over the lazy dog, ${k} times over and again` });
+      }));
+    for (let i = 0; i < TEXTS; i++) writes.push(writer.write(1, (c) => c.insert(Row, "docs", i, { title: `doc ${i}`, body: String.fromCharCode(97 + (i % 26)).repeat(TEXT) })));
+    await Promise.all(writes);
+    const check = await openNode({ dir: join(TMP, `pb-${results.length}-check`), udp: false, log: () => {} });
+    s.admit(check.key, "check", false);
+    await check.join(s.sid, relay);
+    await eventually("the relay has it all", async () => (await check.usage()).held > ROWS * 150 + TEXTS * TEXT, 900000);
+    let all = 0;
+    await eventually("and the device beside it all of it", async () => {
+      const held = (await check.usage()).held;
+      const same = held === all;
+      all = held;
+      return same;
+    }, 900000).catch(() => {});
+    await check.close();
+    console.log(`     ${net.name}: ${ROWS} rows and ${TEXTS} texts of ${TEXT / 1000} KB, ${mb(all)}, written in ${ms(performance.now() - began)}`);
+    // A full device holds everything once it holds what the one beside the relay does; a partial one is given ten seconds.
+    const settle = async (full: boolean, held: () => Promise<number>, since: number): Promise<string> => {
+      if (!full) {
+        await new Promise((done) => setTimeout(done, 10000));
+        return "";
+      }
+      for (let t = performance.now(); performance.now() - t < WAIT; await new Promise((done) => setTimeout(done, 250))) {
+        if ((await held()) >= all * 0.999) return ms(performance.now() - since);
+      }
+      return ms(-1);
+    };
+    // Each device, made from nothing, joins through the network and is asked for the end of the list and a text.
+    for (const full of [false, true]) {
+      // In Node.
+      const dir = join(TMP, `pb-${results.length}-node-${full}`);
+      const d = await openNode({ dir, udp: false, full, log: () => {} });
+      s.admit(d.key, "n", false);
+      const t0 = performance.now();
+      await d.join(s.sid, via);
+      const c = d.client();
+      const tail = await new Promise<number>((done) => {
+        const w = c.window({ scope: 1, list: "big", table: Row, size: 50 }, (st) => {
+          if (st.status === "ready" && st.rows.length >= 50 && st.rows[st.rows.length - 1].title === `note ${ROWS - 1}`) w.stop(), done(performance.now() - t0);
+        });
+        setTimeout(() => done(-1), WAIT);
+      });
+      const t1 = performance.now();
+      const text = await new Promise<number>((done) => {
+        const w = c.window({ scope: 1, list: "docs", table: Row, size: 1, from: "start" }, (st) => {
+          if (st.rows[0]?.body.length === TEXT) w.stop(), done(performance.now() - t1);
+        });
+        setTimeout(() => done(-1), WAIT);
+      });
+      // And then, once a full one holds everything, and a partial one has had a while: what it holds, in memory and on disk.
+      const whole = await settle(full, () => d.usage().then((u) => u.held), t0);
+      const u = await d.usage();
+      results.push([net.name, "Node", full ? "full" : "partial", ms(tail), ms(text), whole, mb(u.held), mb(u.memory), mb(du(dir))]);
+      console.log("     " + results[results.length - 1].join(" | "));
+      c.close();
+      await d.close();
+      // In Chrome.
+      const p = await page();
+      const store = `pb-${results.length}`;
+      const before = await call<number>(p, "estimate");
+      const { key } = await call<{ key: string }>(p, "device", store, undefined, full);
+      s.admit(key, "c", false);
+      const t2 = performance.now();
+      await call(p, "join", store, s.sid, via);
+      const ctail = await call<number>(p, "timeTail", store, "big", 50, `note ${ROWS - 1}`, WAIT);
+      const ctailAll = ctail < 0 ? -1 : performance.now() - t2;
+      const ctext = await call<number>(p, "timeText", store, "docs", TEXT, WAIT);
+      const cwhole = await settle(full, () => call<{ held: number }>(p, "usage", store).then((u) => u.held), t2);
+      const cu = await call<{ held: number; memory: number }>(p, "usage", store);
+      const after = await call<number>(p, "estimate");
+      results.push([net.name, "Chrome", full ? "full" : "partial", ms(ctailAll), ms(ctext), cwhole, mb(cu.held), mb(cu.memory), mb(after - before)]);
+      console.log("     " + results[results.length - 1].join(" | "));
+      await call(p, "close", store);
+      await p.close();
+      pages.splice(pages.indexOf(p), 1);
+    }
+    writer.close();
+    await stopAll();
+  }
+  console.log("\n| network | where | replica | the end of the list | a text of 400 KB | everything | held | memory | storage |");
+  console.log("|---|---|---|---|---|---|---|---|---|");
+  for (const r of results) console.log(`| ${r.join(" | ")} |`);
+};
+
 async function main(): Promise<void> {
   const names = process.argv.slice(2).length > 0 ? process.argv.slice(2) : Object.keys(tests);
   if (names[0] === "bench") tests.bench = bench;
+  if (names[0] === "partial") (tests.partial = partialBench), names.splice(1);
   chrome = await Chrome.launch();
   let failed = 0;
   for (const name of names) {
@@ -409,7 +524,7 @@ async function main(): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       // However a page fails to answer, the test fails, by name, rather than waiting for ever.
-      const limit = new Promise<never>((_, fail) => (timer = setTimeout(() => fail(new Error("not done in three minutes")), 180000)));
+      const limit = new Promise<never>((_, fail) => (timer = setTimeout(() => fail(new Error("not done in three minutes")), name === "partial" ? 3600000 : 180000)));
       await Promise.race([tests[name](), limit]);
       console.log(`ok   ${name} ${((performance.now() - start) / 1000).toFixed(2)}s`);
     } catch (e) {

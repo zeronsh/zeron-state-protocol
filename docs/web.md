@@ -49,6 +49,50 @@ What comes in a call is credited only as it is taken: told to `ondata` that retu
 What is sent goes only as there is room: `room` says how much may go at once, and `onroom` when more may; `finish` goes after
 whatever waits.
 
+## Partial and full
+
+**A browser's device is a partial replica; one in Node is a full one, as zspd is; either can be told otherwise.** A full replica
+holds the whole of every scope it can read. A partial one holds what its clients watch and ask about, fetched through a relay
+as it is wanted, and so has the end of a list of a million rows as soon as it has the end of a list of ten, and never needs room
+for the whole space: what a browser can store, and how fast its network is, are no longer what a space is bounded by.
+
+```ts
+const device = await open({ name: "notes" });                      // in a browser: partial
+const whole = await open({ name: "notes", full: true });           // or a full replica, which holds everything
+const kept = await open({ name: "notes", keep: { days: 7, bytes: 64 << 20 } }); // what is kept of what is no longer watched
+```
+
+**A window is served at once from what is held, and then as a full replica says.** A partial device answers a window from what
+it holds straight away, with the status `"stale"`; once a full replica (a relay is one, and pages a list as any is) has said what
+the window spans and how much lies beyond it, `"ready"`. A window that a full replica says ends sooner than it was first shown
+to, as one answered from a cache with gaps does, asks for what lay beyond again, as scrolling there would. `"ready"` means kept
+up by a full replica now: when the last one goes, the window is `"stale"` again, and `"ready"` once one is back.
+
+**A question is answered by a full replica that can read, when one is reachable**: a zspd device, or a browser's opened with
+`full: true`. The partial device holds the rows of the answer, and keeps them up. When none can read, but a relay holds the
+space, the lists a question names (`where.inList`, as every question of `mirror.ask` does) are fetched whole from the relay,
+and the question is answered as a full replica would answer it, `"ready"` once the relay has confirmed them. A question that
+names no list is about a whole scope, and is answered from what is held, `"stale"`, for that is all it can be.
+
+**What a partial device keeps, and for how long.** Whatever is watched or asked about, and whatever it wrote that no full
+replica is yet known to hold, it keeps, however long. Of the rest it keeps a list for 30 days after it was last watched or
+written in, and no more than about 256 MiB of everything, letting go of the lists watched least lately first, and of what lies
+outside watched ranges last of all; `keep: { days, bytes }` says otherwise, and `keep: false` keeps everything. It looks once
+it has opened, when a checkpoint leaves it holding much more than it may, and when a list comes of age, and does so a step
+at a time; what it lets go of comes again, through a relay, when it is next watched. `device.usage()` says what it holds and
+the memory its node has.
+
+**Offline, a partial device is what it holds.** It shows every window and answers every question from what it has, saying
+`"stale"`; it writes as ever, durably, and what it writes reaches the others once it reaches a relay again; and texts are typed
+in as ever. After a restart it is the same. What it never watched it does not have until it is back: open what you will want
+on a plane before you board.
+
+**A device may be either, from one start to the next, and loses nothing.** Every replica keeps what its clients wrote on record
+until a full replica says it holds it, so one that was full and is now partial offers what nobody else has, and one that was
+partial and is now full fetches the rest. A store kept before this was so, opened partial, goes on as a full replica until it is
+level with one, and is partial from its next start. The tabs of an origin share one device, and whichever runs it opens it as
+it says: give them all the same options.
+
 ## How it is put together
 
 **The client speaks to the node as every client does.** `Client` is the local client of SPEC.md §8, over a pipe: to the node in
@@ -105,7 +149,7 @@ builds `web/dist` (zsp.js, worker.js and node.wasm, side by side: each finds the
 | `test/mirror_model.ts` | structured state to its model, and what is asked about to what a node finds, as `luau/tests/mirror_model.luau` |
 | `test/store.ts` | what is said to be durable, through crashes at any moment, small segments, and files that open late |
 | `test/node.ts` | a device on its own |
-| `test/end_to_end.ts` | `test/live.ts`, which is `luau/tests/live.luau`, over every way devices meet: the client of zspd; web devices with zspd devices through zspd's relay and the Durable Object; two web devices; a space a web device governs; keepalive; direct links, and beacons with no relay |
-| `test/browsers.ts` | headless Chrome: the live suite against a zspd device and between browser devices through the Durable Object; tabs sharing a device and handing it on; a device the same after a restart, with no relay |
+| `test/end_to_end.ts` | `test/live.ts`, which is `luau/tests/live.luau`, over every way devices meet: the client of zspd; partial and full web devices with zspd devices through zspd's relay and the Durable Object; two partial web devices; structured state, with and without a full replica that can read; a space a web device governs; keepalive; direct links, and beacons with no relay; and a partial device's windows, offline life, keeping and letting go, and questions with nobody to ask |
+| `test/browsers.ts` | headless Chrome: the live suite against a zspd device and between browser devices through the Durable Object, partial as browsers' are; tabs sharing a device and handing it on; a device the same after a restart, with no relay; a partial device's first window, offline life and restart, and its store opened full and partial again |
 
 Chrome is found where the platform keeps it, or at `$CHROME`; without it, `test/browsers.ts` says so and passes, but in CI it fails.

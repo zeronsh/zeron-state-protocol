@@ -324,18 +324,27 @@ slipped from a part not yet compared to one already passed. A row that was nowhe
 row's first place become visible with it, and the row is then sent whole to everyone, its sender included.
 
 An owner that cannot keep up may drop what it owes a watch and instead reconcile it afresh; to a local client it says Synced with *restart*, resends
-the range, and says Synced again: rows not mentioned between are gone. *settled* says that a full replica has confirmed the range, or that none can
-be reached. Before honouring Unwatch, an owner sends what it committed while the watch stood. When a grant
+the range, and says Synced again: rows not mentioned between are gone. *settled* says that a full replica has confirmed the range, and that none
+has gone since: a partial replica that can reach none says Synced without it, of what it holds, and with it once one has confirmed the range; and when
+the last that had goes, it says Synced without it again. Before honouring Unwatch, an owner sends what it committed while the watch stood. When a grant
 ends, its watches end with Synced *denied*; to a local client, a new Roster comes first.
 
-A **full replica** watches, on each session it dials, every scope it can read, whole. A **partial replica** watches what its local clients watch, and
-keeps what it wrote on record until a full replica acknowledges it. When all a dialler's whole-scope watches are level, and it has sent all the other
+A **full replica** watches, on each session it dials, every scope it can read, whole. A **partial replica** watches what its local clients watch. Every
+replica keeps what its clients wrote on record until a full replica acknowledges it, and a partial one offers it again on every session with one; so a
+device may be either, from one start to the next, and lose nothing. One whose store cannot vouch for that record, as one kept before there was any, is
+a full replica, though asked to be partial, until a full replica it brought level has said it holds all it was sent. When all a dialler's whole-scope watches are level, and it has sent all the other
 lacked, it says so: Synced with id 0, settled, empty keys and zero counts. The other heeds it from a full replica that has such a watch here. When the
 roster changes, all of these are asked for afresh: either end may have dropped one under a roster the other never heard.
 
 With *counts* the owner says Synced again whenever, after a burst of changes, how much lies before or after differs from what it last said. A
 partial replica relays to its client the bounds and counts a full replica gives it, closing the window to those bounds, for what it holds
-beyond them may have gaps.
+beyond them may have gaps. A client whose window so closes on what it showed asks for what lay beyond again.
+
+**Keeping.** A partial replica may let go of what it holds, as though it had never come, but not of what it has yet to see acknowledged, of a row any
+watch or question of its own covers, nor of one being typed in; what it lets go of it has again by watching it. Here it keeps, by list, when each
+was last watched or written in, and lets go of a list nobody has watched for an age (30 days unless told otherwise); and when it holds more than a
+size (256 MiB in a browser, 1 GiB for zspd, unless told otherwise), of lists, those watched least lately first, until it holds three quarters of it,
+and of what lies outside watched ranges last of all.
 
 ## 10 Reconciling
 
@@ -582,6 +591,11 @@ serve it, and it needs Read where others need Call, in every scope the question 
 each row's key, as in a Watch, in place of its id, any key of it. The partial replica watches those
 places, data and live, and answers its client once it holds the rows. It believes nothing else that would not be an answer to what it asked. A device that will not answer faults *unserved*, and another is asked; until one
 does, and when none can be reached, the answer is of what is held. A Fetch waits for the other, if one can be reached, and for its rows to be confirmed.
+
+With none to ask that can read, but a full replica that holds what it cannot, as a relay, a partial replica watches, data and live, the lists a
+question's rows must all be in, if it names any, and answers as it would were it full; the answer is *settled* while that replica has confirmed them
+all. Once one that can read answers, those lists are watched no longer. A question that names no list is about a whole scope, and is answered of what is
+held.
 
 ## 16 Who handles what
 

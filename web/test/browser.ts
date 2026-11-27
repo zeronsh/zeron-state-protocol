@@ -58,8 +58,8 @@ const windows = new Map<string, { state?: State<typeof Note>; stop: () => void }
 
 const zsp = {
   /** Opens this origin's device of a name; says its key. */
-  async device(name: string, credential?: string, full?: boolean): Promise<{ id: string; key: string; space?: string }> {
-    const d = await open({ name, credential, full, onFailure: (e) => failures.push(e.message) });
+  async device(name: string, credential?: string, full?: boolean, keep?: { days?: number; bytes?: number }): Promise<{ id: string; key: string; space?: string }> {
+    const d = await open({ name, credential, full, keep, onFailure: (e) => failures.push(e.message) });
     devices.set(name, d);
     return { id: d.id, key: d.key, space: d.space };
   },
@@ -164,8 +164,36 @@ const zsp = {
     windows.get(`${name}/${list}/${from ?? ""}`)?.stop();
     windows.delete(`${name}/${list}/${from ?? ""}`);
   },
-  async held(name: string): Promise<number> {
-    return devices.get(name)!.held();
+  async usage(name: string): Promise<{ held: number; memory: number }> {
+    return devices.get(name)!.usage();
+  },
+  /** Milliseconds until the end of a list shows, so many rows ending in that title, settled; -1 if not in so long. */
+  async timeTail(name: string, list: string, size: number, last: string, ms: number): Promise<number> {
+    const t = performance.now();
+    let st: State<typeof Note> | undefined;
+    const w = clientOf(name).window({ scope: 1, list, table: Note, size }, (s) => (st = s));
+    while (!(st?.status === "ready" && st.rows.length >= size && st.rows[st.rows.length - 1].title === last)) {
+      if (performance.now() - t > ms) return w.stop(), -1;
+      await sleep(5);
+    }
+    w.stop();
+    return performance.now() - t;
+  },
+  /** Milliseconds until the first row of a list has a text of so many characters in slot 17; -1 if not in so long. */
+  async timeText(name: string, list: string, length: number, ms: number): Promise<number> {
+    const t = performance.now();
+    let st: State<{ body: ReturnType<typeof columns.text> }> | undefined;
+    const w = clientOf(name).window({ scope: 1, list, table: { body: columns.text(17) }, size: 1, from: "start" }, (s) => (st = s));
+    while (!(st?.rows[0]?.body.length === length)) {
+      if (performance.now() - t > ms) return w.stop(), -1;
+      await sleep(5);
+    }
+    w.stop();
+    return performance.now() - t;
+  },
+  /** What the origin's storage holds, by the browser's own reckoning. */
+  async estimate(): Promise<number> {
+    return (await navigator.storage.estimate()).usage ?? 0;
   },
   /** Writes notes to a list of scope 1, and resolves once they are durable on the device. */
   async put(name: string, list: string, titles: string[]): Promise<void> {
