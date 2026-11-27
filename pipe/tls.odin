@@ -158,8 +158,12 @@ tls_input :: proc(t: ^Tls, bytes: []byte, plain, w: ^[dynamic]byte) -> bool {
 	return true
 }
 
-// Appends plaintext as records.
+// Appends plaintext as records: once the handshake is done, before which there is no key to seal it with, and nothing
+// is written.
 tls_write :: proc(t: ^Tls, plain: []byte, w: ^[dynamic]byte) {
+	if t.state != .Open {
+		return
+	}
 	plain := plain
 	if t.update_due && len(plain) > 0 {
 		t.update_due = false

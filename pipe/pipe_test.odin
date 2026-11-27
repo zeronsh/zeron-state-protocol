@@ -224,3 +224,18 @@ tls_names_no_address :: proc(t: ^testing.T) {
 		testing.expect_value(t, int(b[6]) << 16 | int(b[7]) << 8 | int(b[8]), len(b) - 9)
 	}
 }
+
+// Nothing is sealed before the handshake gives a key to seal it with: not under the zeros a key is before then.
+@(test)
+tls_writes_nothing_before_open :: proc(t: ^testing.T) {
+	tls: Tls
+	w: [dynamic]byte
+	defer {
+		tls_destroy(&tls)
+		delete(w)
+	}
+	tls_start(&tls, "x", &w)
+	hello := len(w)
+	tls_write(&tls, transmute([]byte)string("ping"), &w)
+	testing.expectf(t, len(w) == hello && tls.send.n == 0, "%d bytes written in state %v", len(w) - hello, tls.state)
+}

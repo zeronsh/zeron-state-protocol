@@ -637,10 +637,11 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 				d.stream.dead = true
 				continue
 			}
+			// Until it is admitted, HANDSHAKE_WAIT is what stands for this: and nothing may be said on it then.
 			quiet := time.tick_diff(d.stream.quiet_at, now)
 			if d.stream.pinged && quiet >= PONG_WAIT {
 				d.stream.dead = true
-			} else if !d.stream.pinged && quiet >= PING_IDLE {
+			} else if !d.stream.pinged && quiet >= PING_IDLE && d.admitted {
 				d.stream.pinged = true
 				d.stream.quiet_at = now
 				stream_put(d.stream, .Ping, nil)
