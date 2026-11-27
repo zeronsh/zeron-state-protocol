@@ -630,6 +630,24 @@ def test_scopes_by_number():
     assert " 1:rwc" in line, line
 
 
+def test_stops_when_told():
+    """Told to stop, as a service manager or Ctrl+C tells it, a node finishes what it is doing and writes down what it keeps
+    before it goes; told again, it goes at once."""
+    if os.name == "nt":
+        return  # a console's Ctrl+C reaches a process only in its own console; and Python's terminate is TerminateProcess
+    relay, (a,) = space("st")
+    ca = a.client()
+    ca.put(1, "x", 1, [b"kept"])
+    ca.until(lambda: ca.acked == ca.seq)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        a.p.send_signal(sig)
+        assert a.p.wait(timeout=20) == 0, (sig, a.p.returncode)
+        a.start()
+        c = a.client()
+        c.watch(1, 1, "x")
+        c.until(lambda: len(c.list(1, "x")) == 1)
+
+
 def test_limits():
     relay, (a, b) = space("aa", "ab")
     ca, cb = a.client(), b.client()

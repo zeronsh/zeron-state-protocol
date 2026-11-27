@@ -656,11 +656,15 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	}
 	config.listen = at
 
+	stop_signals_held()
 	h: host.Host
 	if !host.host_init(&h, config) {
 		return 1
 	}
+	defer stop_over()
 	defer host.host_destroy(&h)
+	defer stop_done()
+	stop_on_signal(rawptr(&h)) // let go of, by stop_done, before h is
 	if !relay {
 		space, _, have := read_space(dir)
 		if !have {

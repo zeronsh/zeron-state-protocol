@@ -7,6 +7,7 @@ import "core:nbio"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
+import "core:sync"
 import "core:time"
 import "../pipe"
 import "../zsp"
@@ -47,7 +48,8 @@ Host :: struct {
 	shared:       []byte, // everything is received into this
 	sync_due:     time.Tick,
 	syncing:      bool, // sync_due is set
-	stopping:     bool,
+	stopping:     bool, // atomic, as host_stop may be called from anywhere
+	loop:         ^nbio.Event_Loop,
 	methods:      map[string]Host_Method, // that the host answers itself, in-process: see host_serve
 	accepting:    ^nbio.Operation,
 }
@@ -289,6 +291,7 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 		report(.Error, "the event loop failed: ", fmt.tprint(err))
 		return false
 	}
+	h.loop = nbio.current_thread_event_loop()
 	if at, ok := h.listen.?; ok {
 		// core:net's listener may reuse a port its last owner died holding; core:nbio's may not.
 		listener, err := net.listen_tcp(at)
@@ -316,7 +319,7 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 
 host_run :: proc(h: ^Host) -> bool {
 	dialers_refresh(h)
-	for !h.stopping {
+	for !sync.atomic_load(&h.stopping) {
 		host_settle(h)
 		wait := nbio.NO_TIMEOUT
 		if due, ok := host_deadline(h); ok {
@@ -332,6 +335,13 @@ host_run :: proc(h: ^Host) -> bool {
 		free_all(context.temp_allocator)
 	}
 	return true
+}
+
+// Has host_run return once what it is doing is done, from any thread, as one that hears a signal to stop: host_destroy
+// then lets go of everything, writing down what was kept, as a process that stops politely should.
+host_stop :: proc(h: ^Host) {
+	sync.atomic_store(&h.stopping, true)
+	nbio.wake_up(h.loop)
 }
 
 host_destroy :: proc(h: ^Host) {
