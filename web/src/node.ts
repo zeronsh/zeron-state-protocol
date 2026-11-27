@@ -640,6 +640,7 @@ export class Node {
       dial: (id: number, ptr: number, len: number) => this.#dial(id, decoder.decode(view(ptr, len))),
       send: (id: number, ptr: number, len: number) => this.#send(id, view(ptr, len)),
       room: (id: number) => this.#room(id),
+      backlog: (id: number) => this.#backlog(id),
       ping: (id: number) => {
         const c = this.#conns.get(id);
         if (c?.kind === "socket" && c.ws.readyState === 1) c.ws.send("ping");
@@ -789,6 +790,17 @@ export class Node {
     const room = HIGH - c.ws.bufferedAmount;
     if (room <= 0) this.#drain();
     return room;
+  }
+
+  // What was handed to a pipe and is not yet on its way; and while there is any, the node is woken as it drains, for it is
+  // asked only when something waits on it.
+  #backlog(id: number): number {
+    const c = this.#conns.get(id);
+    if (!c) return 0;
+    if (c.kind === "client") return c.inflight;
+    if (c.ws.readyState !== 1) return 0;
+    if (c.ws.bufferedAmount > 0) this.#drain();
+    return c.ws.bufferedAmount;
   }
 
   // A WebSocket says nothing when its backlog clears, so while there is one it is looked at now and then.
