@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import * as codec from "../src/codec.ts";
-import { Client, sealNow, Undelivered, columns as c, type Answer, type State } from "../src/client.ts";
+import { Client, sealNow, Undelivered, cells, slotsHeld, columns as c, type Answer, type State } from "../src/client.ts";
 import * as text from "../src/text.ts";
 import * as ask from "../src/ask.ts";
 import { where } from "../src/ask.ts";
@@ -200,6 +200,52 @@ function cellOf(row: string, kind: number, slot: number, n: number, body: string
   assert(mine, "another shape of row is another window");
 }
 
+// A long text heard reads the same whether it is made while what was heard is first shown, of the bytes it came in, or
+// after, of its cell.
+{
+  const w = harness();
+  w.run();
+  w.greet();
+  w.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  w.run();
+  let id = "";
+  void w.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  w.run();
+  w.tell(ACK, "\x01");
+  const long = Array.from({ length: 3000 }, (_, i) => String.fromCharCode(32 + ((i * 37) % 900))).join(""); // and bytes of every value, as UTF-8
+  const editor = w.client.text(id, Note.body);
+  editor.append(long);
+  editor.close();
+  w.run();
+  const cells = w.self.said
+    .filter((x) => x.kind === CELLS)
+    .map((x) => {
+      let p = 0;
+      while (x.body.charCodeAt(p) & 128) p++;
+      return x.body.slice(p + 1); // what was written, as another is sent it
+    })
+    .join("");
+  assert(cells.length > 3000, "the text was written in a long cell");
+  for (const shown of [true, false]) {
+    const r = harness();
+    r.run();
+    r.greet();
+    let st: State<typeof Note> | undefined;
+    // Shown, or only held, by a window that does not read the text: which is made after, when an editor asks for it.
+    if (shown) r.client.window({ scope: 1, list: "a", table: Note }, (x) => (st = x));
+    else r.client.window({ scope: 1, list: "a", table: { title: Note.title } }, () => {});
+    r.run();
+    const watch = r.self.said.find((x) => x.kind === WATCH);
+    r.tell(CELLS, "\x00" + cells);
+    if (watch) {
+      const [page, , lo, hi] = watchOf(watch);
+      synced(r, page, 1, lo, hi);
+    }
+    const read = shown ? st?.rows[0]?.body : r.client.text(id, Note.body).read();
+    assert.equal(read, long, shown ? "made of the bytes it came in" : "made of its cell");
+  }
+}
+
 // A page a partial replica answered at once, from what it held, may end sooner once a full replica has said where it ends:
 // what the window showed beyond it is not let go of unseen, but asked for again as the page that follows.
 {
@@ -215,7 +261,7 @@ function cellOf(row: string, kind: number, slot: number, n: number, body: string
   const [page, , lo, hi] = watchOf(h.last(WATCH)!);
   synced(h, page, 0, lo, hi); // what is held: all three, to the end
   assert.equal(st.rows.length, 3);
-  const keys = (Client.internals(h.client) as any).windows.values().next().value.entries.map((e: { key: string }) => e.key);
+  const keys: string[] = [...(Client.internals(h.client) as any).windows.values().next().value.keys]; // as they are now
   const watches = h.self.said.filter((x) => x.kind === WATCH).length;
   synced(h, page, 1, keys[0], keys[2], 0, 1); // as a full replica says: two, and one more after
   const asked = h.self.said.filter((x) => x.kind === WATCH);
@@ -262,9 +308,10 @@ for (const what of ["move", "delete"]) {
     for (let i = 1; i <= 70; i++) change.insert(Note, "items", i, { title: `r${i}` });
   });
   h.run();
-  const window = (Client.internals(h.client).windows as ReadonlyMap<string, { entries: { key: string; row: { hex: string } }[]; at: Map<unknown, string> }>)
+  const win = (Client.internals(h.client).windows as ReadonlyMap<string, { keys: string[]; held: { id: string }[]; at: Map<unknown, string> }>)
     .values()
     .next().value!;
+  const window = { entries: win.keys.map((key, i) => ({ key, row: Object.assign(win.held[i], { hex: codec.hex(win.held[i].id) }) })), at: win.at };
   const keys = window.entries.map((e) => e.key);
   assert.deepEqual(keys, [...keys].sort(), "out of order");
   assert.equal(window.entries.length, window.at.size, "held where it is not");
@@ -470,7 +517,7 @@ for (const what of ["move", "delete"]) {
   await tick();
   h.run();
   const row = h.client.held(id);
-  assert(row && row.held.size === 0 && row.asking === undefined, "it is held for ever");
+  assert(row && (row.held === undefined || row.held.size === 0) && row.asking === undefined, "it is held for ever");
   assert(h.last(UNASK), "and asked for for ever");
   assert.equal(text.read(h.client.heldText(id, 17)!), "hello!", "what was typed is not what was asked");
   assert(h.self.said.slice(said).some((x) => x.kind === CELLS), "and was not written");
@@ -1334,7 +1381,7 @@ for (const bad of [
   // The row as it is held: not deleted, its title what it was, its text what it was.
   const row = h.client.held(id)!;
   assert(!row.dead, "the deletion stands");
-  const titles = [...row.slots.get(16)!.values()].map((cell) => new TextDecoder().decode(cell.body));
+  const titles = cells(row, 16).map((cell) => new TextDecoder().decode(cell.body));
   assert.deepEqual(titles, ["kept"], "what the new title killed is not back");
   assert.equal(text.read(h.client.heldText(id, Note.body.slot)!), "typed");
 }
@@ -1363,7 +1410,7 @@ for (const bad of [
   void h.client.write(1, (change) => change.set(id, Note, { body: "over" }));
   h.run();
   assert.equal(editor.read(), "over", "what was written over");
-  assert.deepEqual([...h.client.held(id)!.slots.get(17)!.values()].map((c) => c.kind), [3], "what was typed outlived what was written over it");
+  assert.deepEqual(cells(h.client.held(id)!, 17).map((c) => c.kind), [3], "what was typed outlived what was written over it");
   editor.close();
 }
 
@@ -1411,7 +1458,7 @@ for (const bad of [
     [mine, theirs, other]
       .flatMap((id) => {
         const row = h.client.held(id);
-        return row ? ["row", ...[...row.slots].flatMap(([slot, cells]) => [...cells.keys()].map((stamp) => `${slot}:${codec.hex(stamp)}`))] : ["none"];
+        return row ? ["row", ...slotsHeld(row).flatMap((slot) => cells(row, slot).map((c) => `${slot}:${codec.hex(c.stamp)}`))] : ["none"];
       })
       .sort()
       .join();
@@ -1987,7 +2034,6 @@ for (const code of [2, 3]) {
   answer(one, two);
   assert(found().rows[0].title === "kept" && found().rows[0].body === "new", "it is as it was before from then on");
 }
-
 // ---------------------------------------------------------------- what is written, as a client ends
 
 // The cells a client said, of every frame of Cells from the given one on: by what kind each is, and what it is of.
@@ -2391,6 +2437,515 @@ for (const how of ["given up on", "refused"] as const) {
   for (let i = 0; i < 5; i++) await tick(), h.run(), h.laters(), h.run(); // as long as it would take to dial again
   assert.equal(h.self.connects, 1, "a client refused for good dialled again");
   assert(closing.settled && closing.failed instanceof Error, "its close said all it wrote was delivered");
+}
+
+// What a document has read of what is gone is let go of: it keeps what is there, however much has come and gone.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const Step = m.map({ n: c.number(16) });
+  const Task = m.map({
+    title: c.string(16),
+    steps: m.list(17, Step),
+    tags: m.record(c.string(16)),
+    plan: m.tree(18, m.map({ label: c.string(16) })),
+    meta: m.map({ note: c.string(16), marks: m.list(17, m.map({ label: c.string(16) })), more: m.map({ x: c.string(16) }) }),
+  });
+  const Doc = m.map({
+    tasks: m.list(18, Task),
+    outline: m.tree(19, m.map({ name: c.string(16) })),
+    people: m.record(Task),
+    nest: m.tree(20, m.map({ name: c.string(16), inner: m.tree(17, m.map({ v: c.string(16) })) })),
+  });
+  const doc = m.open(h.client, { scope: 1, name: "churn", schema: Doc });
+  // And one that only watches: it writes nothing, and so never has a write to tidy up after.
+  const watcher = m.open(h.client, { scope: 1, name: "churn", schema: Doc });
+  h.run();
+  const acked = () => {
+    const w = codec.writer();
+    codec.putVarint(w, 1000000); // everything written so far is durable
+    h.tell(ACK, s(codec.written(w)));
+  };
+  const full = (round: number) => {
+    const tasks = [], outline = [], nest = [];
+    const people: Record<string, unknown> = {};
+    for (let i = 1; i <= 40; i++) {
+      tasks.push({
+        title: `t${round}.${i}`,
+        steps: [{ n: 1 }, { n: 2 }],
+        tags: { a: "x", b: "y" },
+        plan: [{ label: "r", children: [{ label: "c1" }] }],
+        meta: i % 2 === 0 ? { note: "n", marks: [{ label: "m" }] } : {}, // some maps within never written
+      });
+      outline.push({ name: `n${round}.${i}`, children: [{ name: "leaf" }] });
+      people[`p${i}`] = { title: `who ${round}`, steps: [{ n: round }] }; // the same keys, which keep their rows
+      nest.push({ name: `o${i}`, inner: [{ v: "r", children: [{ v: "c1" }] }], children: [] }); // a tree within a tree
+    }
+    return { tasks, outline, people, nest } as any;
+  };
+  const most: Record<string, number> = {};
+  const stray: string[] = [];
+  for (let round = 1; round <= 6; round++) {
+    void doc.set(full(round));
+    h.run();
+    acked();
+    assert(doc.state.tasks.length === 40 && doc.state.outline.length === 40, "all of it is there");
+    // A node given another child, so that the order of what hangs from it is read.
+    void doc.update((d: any) => {
+      for (const task of d.tasks) task.plan[0].children.push({ label: "c2" });
+      for (const node of d.nest) node.inner[0].children.push({ v: "c2" });
+    });
+    h.run();
+    acked();
+    // Rows that say they are in a field of the document no schema has, as a writer who minds nothing may write: made, and
+    // deleted below.
+    const raw = c.custom<Uint8Array>(255, (v) => v, (v) => v);
+    const root = codec.binaryFromHex(doc.state.id);
+    void h.client.write(1, (change) => {
+      for (let i = 0; i < 5; i++) {
+        const field = `stray ${round}.${i}`;
+        stray[i] = change.insert({ "\0where": raw }, "mirror/churn", 0, { "\0where": b(root + ch(field.length) + field + "\x01" + rep("m", 12)) });
+      }
+    });
+    h.run();
+    acked();
+    // Half of what holds anything deleted on its own first, as another might: what was in it is let go of next.
+    void h.client.write(1, (change) => doc.state.tasks.forEach((task: any, i: number) => i % 2 === 1 && change.delete(task.id)));
+    h.run();
+    acked();
+    void h.client.write(1, (change) => stray.forEach((id) => change.delete(id)));
+    void doc.set({ tasks: [], outline: [], people: {}, nest: [] });
+    h.run();
+    acked();
+    const now: any = doc.state;
+    assert(now.tasks.length === 0 && now.outline.length === 0, "and then none of it");
+    for (const [who, d] of [["doc", doc], ["watcher", watcher]] as const) {
+      for (const [name, n] of Object.entries(m._sizes(d))) {
+        const k = `${who} ${name}`;
+        if (round === 2) most[k] = n;
+        else if (round > 2) assert(n <= most[k], `${k} grows with what came and went: ${n} after round ${round}, ${most[k]} after round 2`);
+      }
+    }
+  }
+  // No more than of what is held: the document's rows, and those of keys let go of, which keep theirs to be set again.
+  const held = Client.internals(h.client).rows.size;
+  for (const [who, d] of [["doc", doc], ["watcher", watcher]] as const) {
+    for (const [name, n] of Object.entries(m._sizes(d))) assert(n <= 2 * held + 8, `${who} ${name} keeps ${n} things for ${held} rows held`);
+  }
+  watcher.close();
+  doc.close();
+}
+
+// A place is in slots 1 to 15: one written in slot 0, where only a deletion is, is nonsense, and ends the pipe; the row
+// stays where it was put.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let seen!: State<typeof Note>;
+  h.client.window({ scope: 1, list: "a", table: Note }, (x) => (seen = x));
+  h.run();
+  const id = "\0\0\0\x01\0\0\0\x01" + rep("z", 8);
+  const cells = (slot: number, n: number) => {
+    const w = codec.writer();
+    codec.putBinary(w, "\0" + ch(2) + id + ch(slot) + "\0\0\x6b\x4a" + ch(0, n, 0, 0) + rep("s", 8));
+    codec.putBytes(w, b(h.client.tag(1, "a") + codec.u64(1)));
+    return s(codec.written(w));
+  };
+  h.tell(CELLS, cells(1, 1));
+  assert.equal(seen.rows.length, 1, "a place in slot 1 is one");
+  h.tell(CELLS, cells(0, 2));
+  assert.equal(h.self.closes, 1, "the pipe was not let go of");
+  assert.equal(seen.rows.length, 1, "and the row was let go of");
+}
+
+// What a node could have sent but would not keep is passed over, as it would be, and is the end of nothing here. (What no
+// node could have sent ends the pipe: see above.)
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let seen!: State<typeof Note>;
+  h.client.window({ scope: 1, list: "a", table: Note }, (x) => (seen = x));
+  h.run();
+  const tag = h.client.tag(1, "a");
+  let n = 0;
+  const frame = (...cells: [id: string, kind: number, slot: number, body: string][]) => {
+    let out = "\0";
+    for (const [id, kind, slot, body] of cells) {
+      n++;
+      const w = codec.writer();
+      codec.putBinary(w, ch(kind) + id + ch(slot) + "\0\0\x6b\x4a" + ch(0, n, 0, 0) + rep("s", 8));
+      codec.putBytes(w, b(body));
+      out += s(codec.written(w));
+    }
+    return out;
+  };
+  const row = (k: number) => "\0\0\0\x01\0\0\0\x01" + rep(ch(64 + k), 8);
+  // Places in another scope's list, or the graveyard.
+  h.tell(CELLS, frame([row(4), 2, 1, "\0\0\0\x02" + tag.slice(4) + codec.u64(1)]));
+  h.tell(CELLS, frame([row(5), 2, 1, "\0\0\0\x01" + rep("\0", 12) + codec.u64(1)]));
+  assert.equal(seen.rows.length, 0, "none of those is a place");
+  // Bundles that hold no stamps, or hold them out of order.
+  const piece = rep("p", 8) + "\x01" + rep("\0", 12) + "\x02hi";
+  const s1 = "\0\0\x6b\x4a" + ch(0, n + 2, 0, 0) + rep("s", 8);
+  h.tell(CELLS, frame([row(6), 2, 1, tag + codec.u64(1)], [row(6), 4, 17, piece]));
+  for (const body of ["\0\0\0\0", "\0\0\0\x02" + s1 + s1]) h.tell(CELLS, frame([row(6), 5, 17, body]));
+  assert.equal(seen.rows.length, 1, "the row with a place is there");
+  const kept = cells(h.client.held(codec.hex(row(6)))!, 17);
+  assert(kept.length === 1 && kept[0].kind === 4, "and its piece, which no such bundle takes away");
+  assert.equal(h.self.closes, 0, "and the pipe is as it was");
+}
+
+// A length may be padded, to ten bytes and no more (SPEC.md 2): what says where a row is, with more, says nothing.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const Doc = m.map({ items: m.list(18, m.map({ n: c.number(16) })) });
+  const doc = m.open(h.client, { scope: 1, name: "padded", schema: Doc });
+  h.run();
+  void doc.set({ items: [{ n: 1 }] });
+  h.run();
+  const id = doc.state.items[0].id;
+  const body = cells(h.client.held(id)!, 255)[0].body;
+  assert.equal(body[16], 5, "the field's length is one byte");
+  const raw = c.custom<Uint8Array>(255, (v) => v, (v) => v);
+  const said = (length: number[]) => {
+    void h.client.write(1, (change) => change.set(id, { "\0where": raw }, { "\0where": Uint8Array.from([...body.subarray(0, 16), ...length, ...body.subarray(17)]) }));
+    h.run();
+  };
+  said([133, ...Array(8).fill(128), 0]);
+  assert.equal(doc.state.items.length, 1, "ten bytes are five");
+  said([133, ...Array(9).fill(128), 0]);
+  assert.equal((doc.state as any).items.length, 0, "eleven are nothing");
+  doc.close();
+}
+
+// Of two moves that make a loop, the later is undone: a node's word on where it is, said again as it was, is later, and what
+// is shown follows it, as it does for whoever reads it all afresh.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const Doc = m.map({ outline: m.tree(19, m.map({ name: c.string(16) })) });
+  const doc = m.open(h.client, { scope: 1, name: "loop", schema: Doc });
+  h.run();
+  void doc.set({ outline: [{ name: "a" }, { name: "b" }] });
+  h.run();
+  const a = doc.state.outline[0].id, b2 = doc.state.outline[1].id;
+  const whereOf = (id: string) => s(cells(h.client.held(id)!, 255)[0].body);
+  const wa = whereOf(a), wb = whereOf(b2);
+  const raw = c.custom<Uint8Array>(255, (v) => v, (v) => v);
+  const said = (id: string, body: string) => {
+    void h.client.write(1, (change) => change.set(id, { "\0where": raw }, { "\0where": b(body) }));
+    h.run();
+  };
+  // Each under the other, by a marker that is nowhere, and back where it was should that be undone.
+  const head = wa.slice(0, 25);
+  const under = (parent: string, back: string) => head + codec.binaryFromHex(parent) + rep("x", 12) + rep("\0", 16) + back.slice(41, 53);
+  const underB = under(b2, wa);
+  said(a, underB);
+  said(b2, under(a, wb));
+  assert(doc.state.outline.length === 1 && doc.state.outline[0].id === b2, "b, which moved later, is back where it was");
+  said(a, underB);
+  const fresh = m.open(h.client, { scope: 1, name: "loop", schema: Doc });
+  h.run();
+  assert.equal(fresh.state.outline[0].id, a, "a, said again, moved later");
+  assert.equal(doc.state.outline[0].id, a, "and so it is in the document as it was open");
+  fresh.close();
+  doc.close();
+}
+
+// Whose a cell is, is the cell's: two of one row with the same stamp in two slots, as two writers may have, are each their
+// own writer's; and a place said over again as gone takes whose it was with it.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.tell(AUTHOR, "\x01" + rep("e", 32) + "\x03zoe");
+  h.tell(AUTHOR, "\x02" + rep("e", 32) + "\x03ann");
+  const T = { a: c.string(16), b: c.string(17), wa: c.author(16), wb: c.author(17) };
+  let first!: State<typeof T>, second!: State<typeof T>;
+  h.client.window({ scope: 1, list: "a", table: T }, (x) => (first = x));
+  h.client.window({ scope: 1, list: "b", table: T }, (x) => (second = x));
+  h.run();
+  const id = "\0\0\0\x01\0\0\0\x01" + rep("w", 8);
+  const stamp = (n: number) => "\0\0\x6b\x4a" + ch(0, n, 0, 0) + rep("s", 8);
+  const cell = (kind: number, slot: number, n: number, body: string, who: number) => {
+    const w = codec.writer();
+    codec.putBinary(w, ch(kind + 64) + id + ch(slot) + stamp(n));
+    codec.putBytes(w, b(body));
+    codec.putVarint(w, who);
+    return s(codec.written(w));
+  };
+  h.tell(CELLS, "\0" + cell(2, 1, 1, h.client.tag(1, "a") + codec.u64(1), 1) + cell(2, 2, 1, h.client.tag(1, "b") + codec.u64(1), 2) + cell(3, 16, 2, "x", 1) + cell(3, 17, 2, "y", 2));
+  assert(first.rows[0].wa === "zoe" && first.rows[0].wb === "ann", "each is its own writer's");
+  h.tell(CELLS, "\0" + cell(3, 17, 3, "z", 2));
+  assert(first.rows[0].wa === "zoe" && first.rows[0].wb === "ann", "and stays so when the other is written over");
+  // The first window's range said over again without the row: its place there is gone, and whose that was.
+  const [page, , lo, hi] = watchOf(h.self.said.find((x) => x.kind === WATCH)!);
+  synced(h, page, 2, lo, hi);
+  synced(h, page, 1, lo, hi);
+  assert(first.rows.length === 0 && second.rows.length === 1, "gone from the one, and not from the other");
+  for (const key of h.client.held(codec.hex(id))!.authors?.keys() ?? []) assert.notEqual(key.charCodeAt(0), 1, "and nothing is kept of whose its place in slot 1 was");
+}
+
+// In a scope that says whose what is written is, a text edited in a change is this client's; and so is what it types, once
+// sealed, which whoever shows the row is told, though the text is as it was.
+{
+  const h = harness();
+  h.run();
+  h.tell(ROSTER, rep("\0", 8) + "\x01" + ch(7 + 128) + rep("k", 32));
+  h.tell(AUTHOR, "\0" + rep("d", 32) + "\x02me");
+  const T = { body: c.text(17), by: c.author(17) };
+  let state!: State<typeof T>;
+  h.client.window({ scope: 1, list: "a", table: T }, (x) => (state = x));
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => void (id = change.insert(T, "a", 1, {})));
+  h.run();
+  void h.client.write(1, (change) => change.edit(id, 17, (t, fresh) => text.insert(t, 0, "hi", fresh)));
+  h.run();
+  assert(state.rows[0].body === "hi" && state.rows[0].by === "me", "an edit in a change is whose the change is");
+  const typing = h.client.text(id, T.body);
+  h.run();
+  typing.insert(0, ">");
+  h.run();
+  let told = 0;
+  h.client.window({ scope: 1, list: "a", table: T }, (x) => {
+    told++;
+    state = x;
+  });
+  told = 0;
+  h.laters(); // the piece is sealed once a second has passed
+  h.run();
+  assert(told > 0, "whoever shows the row is told");
+  const now: any = state;
+  assert(now.rows[0].body === ">hi" && now.rows[0].by === "me", "and the text is whose it is");
+  typing.close();
+}
+
+// Whoever follows rows may write as it hears of them, while many come at once: what it deletes goes, what it makes comes, and
+// what was there stays.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let state!: State<typeof Note>;
+  h.client.window({ scope: 1, list: "a", table: Note }, (x) => (state = x));
+  h.run();
+  let innocent = "";
+  void h.client.write(1, (change) => void (innocent = change.insert(Note, "a", 0, { title: "innocent" })));
+  h.run();
+  const ids: string[] = [];
+  let cells2 = "\0";
+  for (let i = 1; i <= 70; i++) {
+    const id = "\0\0\0\x01\0\0\0\x01" + "\0\0\0\0\0\0" + ch(i >> 8, i & 255);
+    ids.push(codec.hex(id));
+    const w = codec.writer();
+    codec.putBinary(w, ch(2) + id + ch(1) + "\0\0\x6b\x4a" + ch(0, i, 0, 0) + rep("s", 8));
+    codec.putBytes(w, b(h.client.tag(1, "a") + codec.u64(i)));
+    cells2 += s(codec.written(w));
+  }
+  let heard = 0, made = 0;
+  const stop = h.client.follow((id) => {
+    if (id === innocent) return;
+    heard++;
+    if (heard === 2) void h.client.write(1, (change) => change.delete(ids[0]));
+    else if (heard === 3) {
+      void h.client.write(1, (change) => {
+        for (let i = 1; i <= 65; i++, made++) change.insert(Note, "a", 100 + i, { title: `made ${i}` });
+      });
+    }
+  });
+  h.tell(CELLS, cells2);
+  stop();
+  h.run();
+  assert.equal(state.rows.length, 1 + 69 + made, "all of it is there");
+  const seen = new Set<string>();
+  state.rows.forEach((row, i) => {
+    assert.notEqual(row.id, ids[0], "but what was deleted");
+    assert(!seen.has(row.id), "each once");
+    seen.add(row.id);
+    if (i > 0) assert(state.rows[i - 1].order <= row.order, "in order");
+  });
+  assert(seen.has(innocent), "and what was there stays");
+}
+
+// An item that shared a marker with one before it, which is then deleted, shares it with nothing: writing the list again
+// leaves it where it is, rather than give it a marker of its own it no longer needs.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const Doc = m.map({ items: m.list(18, m.map({ n: c.number(16) })) });
+  const doc = m.open(h.client, { scope: 1, name: "shared", schema: Doc });
+  h.run();
+  void doc.set({ items: [{ n: 1 }, { n: 2 }, { n: 3 }] });
+  h.run();
+  let [first, second] = [doc.state.items[0].id, doc.state.items[1].id];
+  if (codec.binaryFromHex(second) < codec.binaryFromHex(first)) [first, second] = [second, first]; // the later by id is the one that shares
+  const whereOf = (id: string) => cells(h.client.held(id)!, 255)[0];
+  const raw = c.custom<Uint8Array>(255, (v) => v, (v) => v);
+  void h.client.write(1, (change) => change.set(second, { "\0where": raw }, { "\0where": whereOf(first).body }));
+  h.run();
+  void h.client.write(1, (change) => change.delete(first));
+  h.run();
+  assert.equal(doc.state.items.length, 2, "two are left");
+  const was = whereOf(second).stamp;
+  void doc.set({ items: doc.state.items.map((item) => (item.id === second ? item : { ...item, n: (item.n ?? 0) + 10 })) });
+  h.run();
+  assert.equal(whereOf(second).stamp, was, "what shares nothing now is left where it is");
+  doc.close();
+}
+
+// A change that fails undoes what it did, but not what an editor had open in a row it touched, which it seals first: that
+// stands, and is shown, with whose it is.
+{
+  const h = harness();
+  h.run();
+  h.tell(ROSTER, rep("\0", 8) + "\x01" + ch(7 + 128) + rep("k", 32));
+  h.tell(AUTHOR, "\0" + rep("d", 32) + "\x02me");
+  const T = { title: c.string(16), body: c.text(17), by: c.author(17) };
+  let state!: State<typeof T>;
+  h.client.window({ scope: 1, list: "a", table: T }, (x) => (state = x));
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => void (id = change.insert(T, "a", 1, { title: "t" })));
+  h.run();
+  const typing = h.client.text(id, T.body);
+  h.run();
+  typing.insert(0, "abc");
+  h.run();
+  assert(state.rows[0].body === "abc" && state.rows[0].by === undefined, "typed, and not yet sealed");
+  assert.throws(() =>
+    h.client.write(1, (change) => {
+      change.set(id, T, { title: "t2" });
+      throw new Error("changed my mind");
+    }),
+  );
+  h.run();
+  const now: any = state;
+  assert(now.rows[0].title === "t" && now.rows[0].body === "abc", "the change is undone");
+  assert.equal(now.rows[0].by, "me", "and what was typed is sealed, and shown as whose it is");
+  typing.close();
+}
+
+// An edit of a row not held, in a change that fails, leaves nothing held.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const ghost = codec.hex("\0\0\0\x01\0\0\0\x01" + rep("g", 8));
+  assert.throws(() =>
+    h.client.write(1, (change) =>
+      change.edit(ghost, 16, (t, fresh) => {
+        text.insert(t, 0, "hello", fresh);
+        throw new Error("boom");
+      }),
+    ),
+  );
+  assert.equal(h.client.held(ghost), undefined, "nothing is held of it");
+}
+
+// A cell said again with less of it, as a node says one whose writer may no longer have written all of it, is of the same
+// kind: another kind with the same stamp is no shorter bundle, nor makes one that names what came after it, or loops.
+for (const evil of ["future", "endless"]) {
+  const h = harness();
+  h.run();
+  h.greet();
+  const T = { body: c.text(17) };
+  let state!: State<typeof T>;
+  h.client.window({ scope: 1, list: "a", table: T }, (x) => (state = x));
+  h.run();
+  const id = "\0\0\0\x01\0\0\0\x01" + rep("b", 8);
+  const stamp = (n: number) => "\0\0\x6b\x4a" + ch(0, n, 0, 0) + rep("s", 8);
+  const frame = (kind: number, slot: number, n: number, body: string) => {
+    const w = codec.writer();
+    codec.putBinary(w, "\0" + ch(kind) + id + ch(slot) + stamp(n));
+    codec.putBytes(w, b(body));
+    return s(codec.written(w));
+  };
+  const ops = "\x01\0\0\x02ab";
+  h.tell(CELLS, frame(2, 1, 1, h.client.tag(1, "a") + codec.u64(1)));
+  h.tell(CELLS, frame(4, 17, 2, rep("p", 8) + ops));
+  h.tell(CELLS, frame(5, 17, 3, "\0\0\0\x01" + stamp(2) + stamp(2) + rep("p", 8) + ch(ops.length) + ops));
+  h.tell(CELLS, frame(3, 17, 3, evil === "future" ? "\0\0\0\x01" + stamp(9) : "\xff\xff\xff\xff"));
+  h.tell(CELLS, frame(4, 17, 9, rep("q", 8) + "\x01\0\0\x05hello"));
+  assert(state.rows[0].body.includes("hello") && state.rows[0].body.includes("ab"), "what came after is not taken for bundled");
+  // And of anything but a bundle, another body for what is held is no news (SPEC.md 4), whatever its length.
+  const Titled = { title: c.string(16) };
+  let titled!: State<typeof Titled>;
+  h.client.window({ scope: 1, list: "a", table: Titled }, (x) => (titled = x));
+  h.run();
+  for (const body of ["kept", "else", "longer than it"]) h.tell(CELLS, frame(3, 16, 20, body));
+  assert.equal(titled.rows[0].title, "kept", "a value said again otherwise is as it was first said");
+}
+
+// A change that edits nothing still has what editors had open sealed, and shown; and of a row not held, leaves nothing held.
+{
+  const h = harness();
+  h.run();
+  h.tell(ROSTER, rep("\0", 8) + "\x01" + ch(7 + 128) + rep("k", 32));
+  h.tell(AUTHOR, "\0" + rep("d", 32) + "\x02me");
+  const T = { body: c.text(17), by: c.author(17) };
+  let state!: State<typeof T>;
+  h.client.window({ scope: 1, list: "a", table: T }, (x) => (state = x));
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => void (id = change.insert(T, "a", 1, {})));
+  h.run();
+  const typing = h.client.text(id, T.body);
+  h.run();
+  typing.insert(0, "hi");
+  h.run();
+  void h.client.write(1, (change) => change.edit(id, 18, () => {}));
+  h.run();
+  assert(state.rows[0].body === "hi" && state.rows[0].by === "me", "sealed, and shown");
+  typing.close();
+  const ghost = codec.hex("\0\0\0\x01\0\0\0\x01" + rep("h", 8));
+  void h.client.write(1, (change) => change.edit(ghost, 17, () => {}));
+  h.run();
+  assert.equal(h.client.held(ghost), undefined, "nothing is held of a row not held that nothing was written in");
+}
+
+// A message that ends in nonsense leaves nothing held of what it began.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const ghost = "\0\0\0\x01\0\0\0\x01" + rep("n", 8);
+  h.tell(CELLS, "\0\x03" + ghost);
+  assert.equal(h.self.closes, 1, "the pipe is let go of");
+  assert.equal(h.client.held(codec.hex(ghost)), undefined, "and nothing is held of the row it began");
+}
+
+// A place said again in a shape no node keeps, while a range is said over again, is not said: the row goes from the range,
+// as in Luau.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let seen!: State<typeof Note>;
+  h.client.window({ scope: 1, list: "a", table: Note }, (x) => (seen = x));
+  h.run();
+  const id = "\0\0\0\x01\0\0\0\x01" + rep("y", 8);
+  const place = (body: string) => {
+    const w = codec.writer();
+    codec.putBinary(w, "\0" + ch(2) + id + ch(1) + "\0\0\x6b\x4a" + ch(0, 1, 0, 0) + rep("s", 8));
+    codec.putBytes(w, b(body));
+    return s(codec.written(w));
+  };
+  h.tell(CELLS, place(h.client.tag(1, "a") + codec.u64(1)));
+  assert.equal(seen.rows.length, 1);
+  const [page, , lo, hi] = watchOf(h.last(WATCH)!);
+  synced(h, page, 1, lo, hi);
+  synced(h, page, 2, lo, hi);
+  h.tell(CELLS, place("\0\0\0\x02" + h.client.tag(1, "a").slice(4) + codec.u64(1))); // in another scope's list
+  synced(h, page, 1, lo, hi);
+  assert.equal(seen.rows.length, 0, "what was not said is gone");
 }
 
 console.log("ok");

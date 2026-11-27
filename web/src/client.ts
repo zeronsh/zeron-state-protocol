@@ -121,23 +121,23 @@ const unwritable = (): never => {
   throw new Error("whose a row is cannot be written");
 };
 
+// How the columns that are not made up write and read, one function each, by which what reads cells knows them.
+const encodeString = (v: string): Uint8Array => utf8.encode(v);
+const decodeString = (b: Uint8Array): string => fromUtf8.decode(b);
+const encodeNumber = (v: number): Uint8Array => {
+  const b = new Uint8Array(8);
+  new DataView(b.buffer).setFloat64(0, v);
+  return b;
+};
+// As Luau reads it: eight bytes or more, the first eight; fewer, nothing.
+const decodeNumber = (b: Uint8Array): number => (b.length >= 8 ? new DataView(b.buffer, b.byteOffset, 8).getFloat64(0) : (undefined as unknown as number));
+
 export const columns = Object.freeze({
   /** Text, as UTF-8. */
-  string: (slot: number): Column<string> => column(slot, "string", (v: string) => utf8.encode(v), (b) => fromUtf8.decode(b)),
+  string: (slot: number): Column<string> => column(slot, "string", encodeString, decodeString),
   /** Bytes as they are, and asked about byte for byte. */
   bytes: (slot: number): Column<Uint8Array> => column<Uint8Array>(slot, "bytes", (v) => v, (b) => b.slice()),
-  number: (slot: number): Column<number> =>
-    column(
-      slot,
-      "number",
-      (v: number) => {
-        const b = new Uint8Array(8);
-        new DataView(b.buffer).setFloat64(0, v);
-        return b;
-      },
-      // As Luau reads it: eight bytes or more, the first eight; fewer, nothing.
-      (b) => (b.length >= 8 ? new DataView(b.buffer, b.byteOffset, 8).getFloat64(0) : (undefined as unknown as number)),
-    ),
+  number: (slot: number): Column<number> => column(slot, "number", encodeNumber, decodeNumber),
   boolean: (slot: number): Column<boolean> => column(slot, "boolean", (v: boolean) => Uint8Array.of(v ? 1 : 0), (b) => b.length === 1 && b[0] === 1),
   /** Another row, by its id. */
   row: (slot: number): Column<string> => column(slot, "id", (v: string) => codec.unhex(v), (b) => codec.hex(b)),
@@ -283,6 +283,7 @@ type Told = { status: boolean; devices: readonly Device[]; self: Device; error: 
 
 // ---------------------------------------------------------------- what is held
 
+/** A cell, read plainly: what cells(row, slot) gives. */
 export interface Cell {
   kind: number;
   stamp: string;
@@ -290,20 +291,34 @@ export interface Cell {
   author?: Device;
 }
 
-/** A row as it is held: its cells by slot and stamp. Not to be changed. */
+/**
+ * A cell as it is held: one binary string, its kind (1 byte), its stamp (16) and its body, the rest. One string rather than
+ * an object, a string and bytes, which is a fraction of the memory and of the work, and made from what came in one go.
+ */
+type Held = string;
+/** What a slot holds: its one cell, which is what almost every slot holds; or, of a text's pieces, several, by stamp. */
+type Cells = Held | Map<string, Held>;
+
+/**
+ * A row as it is held: its cells, by slot, as pairs in one array (slot, cells, slot, cells, …). Not to be changed. Its
+ * fields are all there from the first, so that every row has the same shape; what only some rows need is undefined until
+ * they need it.
+ */
 export interface Stored {
   readonly id: string;
-  readonly hex: string;
-  slots: Map<number, Map<string, Cell>>;
-  dead: boolean;
+  hex: string | undefined; // its id as an application sees it, once that has been asked for
+  slots: (number | Cells | undefined)[];
   pages: number; // that hold it
-  texts: Map<number, text.Text>;
-  held: Map<number, number>; // open editors, by slot
-  asking?: () => void; // for the sake of those, while nothing else shows it: ends that
-  awaited: (() => void)[]; // by those, until it is here
-  lives: Map<number, number>; // when live text was last heard, by slot
-  views: Map<Table, Row<any>>; // by table, until the row changes
-  dirty: Set<number>; // slots with live text to send
+  version: number; // counts changes to what it holds, that whoever reads it may know whether to again
+  dead: boolean;
+  authors: Map<string, Device> | undefined; // who wrote each cell, by its slot (a char) and stamp, where that is known
+  texts: Map<number, text.Text> | undefined;
+  held: Map<number, number> | undefined; // open editors, by slot
+  asking: (() => void) | undefined; // for the sake of those, while nothing else shows it: ends that
+  awaited: (() => void)[] | undefined; // by those, until it is here
+  lives: Map<number, number> | undefined; // when live text was last heard, by slot
+  views: Map<Table, Row<any>> | undefined; // by table, until the row changes
+  dirty: Set<number> | undefined; // slots with live text to send
 }
 
 export interface Entry {
@@ -336,7 +351,8 @@ interface Win {
   size: number;
   back: boolean; // it begins at the end
   pages: Page[];
-  entries: Entry[]; // in order
+  keys: string[]; // of the rows it holds, in order,
+  held: Stored[]; // and the rows, each where its key is
   at: Map<Stored, string>; // where each of them is among them
   bare: boolean; // its observers want to know when it changes, not how it is
   observers: Set<(state: State<any>) => void>;
@@ -368,7 +384,7 @@ interface Asked {
 }
 
 interface Follower {
-  readonly f: (id: string) => void;
+  readonly f: (row: Stored) => void;
   on: boolean; // until it is stopped, even while the rest are being told
 }
 
@@ -447,65 +463,307 @@ export class Undelivered extends Error {
   }
 }
 
-// ---------------------------------------------------------------- merging
+// ---------------------------------------------------------------- what is held, and merging
 
-function bundleHas(body: Uint8Array, stamp: string): boolean {
-  const n = ((body[0] << 24) | (body[1] << 16) | (body[2] << 8) | body[3]) >>> 0;
+// Versions of rows, of every client here: no two states of any rows have the same, so that one is known again only as
+// itself, though the row be let go of and come again.
+let versions = 0;
+
+function newRow(id: string): Stored {
+  return {
+    id,
+    hex: undefined,
+    slots: new Array(8), // room for four
+    pages: 0,
+    version: ++versions,
+    dead: false,
+    authors: undefined,
+    texts: undefined,
+    held: undefined,
+    asking: undefined,
+    awaited: undefined,
+    lives: undefined,
+    views: undefined,
+    dirty: undefined,
+  };
+}
+
+/** A row's id as an application sees it. */
+export function hexOf(row: Stored): string {
+  return (row.hex ??= codec.hex(row.id));
+}
+
+/** What a slot of a row holds. */
+function slotOf(row: Stored, slot: number): Cells | undefined {
+  const a = row.slots;
+  for (let i = 0; i < a.length; i += 2) {
+    const s = a[i];
+    if (s === slot) return a[i + 1] as Cells;
+    if (s === undefined) return undefined;
+  }
+  return undefined;
+}
+
+/** Puts what a slot holds, or with undefined takes it away. */
+function setSlot(row: Stored, slot: number, v: Cells | undefined): void {
+  const a = row.slots;
+  let i = 0;
+  for (; i < a.length && a[i] !== undefined; i += 2) {
+    if (a[i] !== slot) continue;
+    if (v !== undefined) {
+      a[i + 1] = v;
+      return;
+    }
+    // The last pair takes its place.
+    let last = i;
+    while (last + 2 < a.length && a[last + 2] !== undefined) last += 2;
+    a[i] = a[last];
+    a[i + 1] = a[last + 1];
+    a[last] = a[last + 1] = undefined;
+    return;
+  }
+  if (v === undefined) return;
+  a[i] = slot;
+  a[i + 1] = v;
+}
+
+/** The slots a row has something in, and what. */
+function eachSlot(row: Stored, f: (slot: number, v: Cells) => void): void {
+  const a = row.slots;
+  for (let i = 0; i < a.length && a[i] !== undefined; i += 2) f(a[i] as number, a[i + 1] as Cells);
+}
+
+/** The slots a row has something in: for what reads cells plainly, as tests do. */
+export function slotsHeld(row: Stored): number[] {
+  return slotsOf(row);
+}
+
+function slotsOf(row: Stored): number[] {
+  const out: number[] = [];
+  eachSlot(row, (slot) => out.push(slot));
+  return out;
+}
+
+const kindOf = (c: Held): number => c.charCodeAt(0);
+// A cell's stamp, as a string of its own. Cut from the cell, it would be a slice of it, which V8 compares with others
+// only through its runtime, slowly: as a Map does its keys, when a set of cells is copied.
+const stampOf = (c: Held): string =>
+  String.fromCharCode(
+    c.charCodeAt(1), c.charCodeAt(2), c.charCodeAt(3), c.charCodeAt(4), c.charCodeAt(5), c.charCodeAt(6), c.charCodeAt(7), c.charCodeAt(8),
+    c.charCodeAt(9), c.charCodeAt(10), c.charCodeAt(11), c.charCodeAt(12), c.charCodeAt(13), c.charCodeAt(14), c.charCodeAt(15), c.charCodeAt(16),
+  );
+// How sixteen characters of one string compare with sixteen of another, read where they are: less than 0, 0, or more.
+function cmp16(a: string, at: number, b: string, bt: number): number {
+  for (let i = 0; i < 16; i++) {
+    const d = a.charCodeAt(at + i) - b.charCodeAt(bt + i);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+// A cell's body for its text, which keeps it as long as the text is: cut from a slab shared with others, so that each is
+// only a view, with no buffer of its own. (A text only reads what it is given; where it would add to it, it copies.) A
+// slab is kept while any body cut from it is, so it is small, and a body of more than a quarter of one has its own.
+const SLAB = 1024;
+// Of the bodies of long cells of texts just heard, kept as the bytes they came in (see Client's heardBodies), the most.
+const HEARD_MOST = 1 << 24;
+let slab = new Uint8Array(0);
+let slabAt = 0;
+function textBody(c: Held, heard: Map<Held, Uint8Array>): Uint8Array {
+  const n = c.length - 17;
+  if (n > SLAB / 4) return heard.get(c) ?? bodyOf(c);
+  if (slabAt + n > slab.length) (slab = new Uint8Array(SLAB)), (slabAt = 0);
+  const out = slab.subarray(slabAt, slabAt + n);
+  slabAt += n;
+  for (let i = 0; i < n; i++) out[i] = c.charCodeAt(17 + i);
+  return out;
+}
+function bodyOf(c: Held): Uint8Array {
+  const out = new Uint8Array(c.length - 17);
+  for (let i = 0; i < out.length; i++) out[i] = c.charCodeAt(17 + i);
+  return out;
+}
+const cellOf = (kind: number, stamp: string, body: Uint8Array): Held => String.fromCharCode(kind) + stamp + codec.binary(body);
+
+/** The latest value in a slot, if any. */
+export function latest(row: Stored, slot: number): Held | undefined {
+  const v = slotOf(row, slot);
+  if (typeof v === "string") return v.charCodeAt(0) === VALUE ? v : undefined;
+  if (v === undefined) return undefined;
+  let best: Held | undefined;
+  for (const c of v.values()) if (c.charCodeAt(0) === VALUE && (best === undefined || c > best)) best = c; // of one kind, the stamp decides
+  return best;
+}
+
+/** Each cell of a slot, read plainly: for what reads cells as they are, as tests do. */
+export function cells(row: Stored, slot: number): Cell[] {
+  const v = slotOf(row, slot);
+  const all = typeof v === "string" ? [v] : v === undefined ? [] : [...v.values()];
+  return all.map((c) => {
+    const stamp = stampOf(c);
+    const author = row.authors?.get(String.fromCharCode(slot) + stamp);
+    return author ? { kind: kindOf(c), stamp, body: bodyOf(c), author } : { kind: kindOf(c), stamp, body: bodyOf(c) };
+  });
+}
+
+/** Whose what is in a slot is: whom the last to write there goes by; or, `all`, everyone who has, in order of their names. */
+export function whose(row: Stored, slot: number, all: boolean): string | readonly string[] | undefined {
+  const v = slotOf(row, slot);
+  const authors = row.authors;
+  let last: Held | undefined;
+  const names = new Set<string>();
+  const see = (c: Held) => {
+    if (last === undefined || cmp16(c, 1, last, 1) > 0) last = c;
+    const who = authors?.get(String.fromCharCode(slot) + stampOf(c));
+    if (who && who.subject !== "") names.add(who.subject);
+  };
+  if (typeof v === "string") see(v);
+  else if (v !== undefined) for (const c of v.values()) see(c);
+  if (all) return Object.freeze([...names].sort());
+  const who = last !== undefined ? authors?.get(String.fromCharCode(slot) + stampOf(last)) : undefined;
+  return who && who.subject !== "" ? who.subject : undefined;
+}
+
+function forgetAuthor(row: Stored, slot: number, stamp: string): void {
+  const authors = row.authors;
+  if (authors) {
+    authors.delete(String.fromCharCode(slot) + stamp);
+    if (authors.size === 0) row.authors = undefined;
+  }
+}
+
+// A slot's cells as compact as they go: one held as itself, none not at all.
+function compact(row: Stored, slot: number): void {
+  const v = slotOf(row, slot);
+  if (v === undefined || typeof v === "string") return;
+  if (v.size === 0) setSlot(row, slot, undefined);
+  else if (v.size === 1) setSlot(row, slot, v.values().next().value!);
+}
+
+// That it holds something other than it did: what was read of it is to be read again.
+function unview(row: Stored): void {
+  row.version = ++versions;
+  row.views = undefined;
+}
+
+const MAX_CELL = 1048576;
+const u32At = (s: string, at: number): number =>
+  ((s.charCodeAt(at) << 24) | (s.charCodeAt(at + 1) << 16) | (s.charCodeAt(at + 2) << 8) | s.charCodeAt(at + 3)) >>> 0;
+
+// Whether a cell has the shape a node keeps (SPEC.md 1, as zsp/types.odin's cell_valid has it): a kind there is, in a slot
+// for it, with all of its clear prefix, and a bundle whose stamps are in order and before its own. What has not is passed
+// over, as a node would pass it over; whether whoever wrote it might is for the node to say.
+function shaped(id: string, slot: number, c: Held): boolean {
+  const n = c.length - 17;
+  if (n > MAX_CELL || c.charCodeAt(1) >= 128) return false; // a body too long, or a time of 2^63 or more
+  const kind = c.charCodeAt(0);
+  if (kind === GRAVE) return slot === 0;
+  if (kind === PLACE) {
+    if (slot < 1 || slot > 15 || n < 24 || u32At(c, 17) !== u32At(id, 0)) return false;
+    return u32At(c, 21) !== 0 || u32At(c, 25) !== 0 || u32At(c, 29) !== 0; // not the scope's graveyard
+  }
+  if (kind === VALUE || kind === PIECE) return slot >= 16;
+  if (kind === BUNDLE) {
+    if (slot < 16 || n < 4) return false;
+    const count = u32At(c, 17);
+    if (count === 0 || count > MAX_CELL / 16 || n < 4 + count * 16) return false;
+    for (let i = 1; i < count; i++) if (cmp16(c, 21 + i * 16, c, 5 + i * 16) <= 0) return false;
+    return cmp16(c, 5 + count * 16, c, 1) < 0;
+  }
+  return false;
+}
+
+// Whether a place's body, at pos in what came, is of the row's scope and not the scope's graveyard, as a node keeps it.
+function placeFine(buf: Uint8Array, pos: number, size: number, id: string): boolean {
+  if (size < 24 || ((buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]) >>> 0 !== u32At(id, 0)) return false;
+  for (let i = 4; i < 16; i++) if (buf[pos + i] !== 0) return true;
+  return false;
+}
+
+// Whether a held cell's body is the size bytes at pos in what came.
+function sameBody(held: Held, buf: Uint8Array, pos: number, size: number): boolean {
+  for (let i = 0; i < size; i++) if (held.charCodeAt(17 + i) !== buf[pos + i]) return false;
+  return true;
+}
+
+// Whether a bundle (a cell, its body from char 17) holds a piece of the stamp in s at at. One too short to say holds none.
+function bundleHas(c: Held, s: string, at: number): boolean {
+  if (c.length < 21) return false;
+  const n = ((c.charCodeAt(17) << 24) | (c.charCodeAt(18) << 16) | (c.charCodeAt(19) << 8) | c.charCodeAt(20)) >>> 0;
   let lo = 0, hi = n;
   while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    const s = codec.binary(body, 4 + mid * 16, 20 + mid * 16);
-    if (s === stamp) return true;
-    if (s < stamp) lo = mid + 1;
+    const mid = (lo + hi) >>> 1;
+    const d = cmp16(c, 21 + mid * 16, s, at);
+    if (d === 0) return true;
+    if (d < 0) lo = mid + 1;
     else hi = mid;
   }
   return false;
 }
 
-// Whether a cell is one a node could have sent: what the merge rule and placing read of it is there. One that is not, as
-// a bundle that says it holds more stamps than it does, is nonsense, and not to be looked through.
-function sound(kind: number, slot: number, body: Uint8Array): boolean {
-  switch (kind) {
-    case VALUE:
-    case PIECE:
-      return slot >= 16;
-    case PLACE:
-      return slot >= 1 && slot <= 15 && body.length >= 24;
-    case GRAVE:
-      return slot === 0;
-    case BUNDLE:
-      return slot >= 16 && body.length >= 4 && 4 + (((body[0] << 24) | (body[1] << 16) | (body[2] << 8) | body[3]) >>> 0) * 16 <= body.length;
-  }
-  return false;
-}
-
-// The merge rule. Returns whether the cell was news.
-function merge(row: Stored, slot: number, kind: number, stamp: string, body: Uint8Array, author?: Device): boolean {
+// The merge rule, for a cell. Returns whether it was news.
+function merge(row: Stored, slot: number, c: Held, author?: Device): boolean {
   if (row.dead) return false;
+  const kind = c.charCodeAt(0);
   if (kind === GRAVE) {
     row.dead = true;
-    row.slots = new Map();
+    row.slots = [];
+    row.authors = undefined;
     return true;
   }
-  let cells = row.slots.get(slot);
-  if (!cells) row.slots.set(slot, (cells = new Map()));
-  if (cells.has(stamp)) return false;
-  for (const [s, c] of cells) {
-    if ((c.kind === PLACE || c.kind === VALUE) && stamp <= s) return false;
-    if (c.kind === BUNDLE && (kind === PIECE || kind === BUNDLE) && bundleHas(c.body, stamp)) return false;
+  const v = slotOf(row, slot);
+  // Stamps are compared where they are in the cells, and made strings of their own only to be kept as keys.
+  if (v === undefined) {
+    setSlot(row, slot, c);
+  } else if (typeof v === "string") {
+    const d = cmp16(c, 1, v, 1); // this stamp against the one held
+    if (d === 0) return false;
+    const k = v.charCodeAt(0);
+    if ((k === PLACE || k === VALUE) && d < 0) return false;
+    if (k === BUNDLE && (kind === PIECE || kind === BUNDLE) && bundleHas(v, c, 1)) return false;
+    let drop = false;
+    if (kind === PLACE || kind === VALUE) drop = d > 0;
+    else if (kind === BUNDLE) drop = (k === PIECE || k === BUNDLE) && bundleHas(c, v, 1);
+    if (drop) {
+      forgetAuthor(row, slot, stampOf(v));
+      setSlot(row, slot, c);
+    } else {
+      setSlot(
+        row,
+        slot,
+        new Map([
+          [stampOf(v), v],
+          [stampOf(c), c],
+        ]),
+      );
+    }
+  } else {
+    const stamp = stampOf(c);
+    if (v.has(stamp)) return false;
+    for (const x of v.values()) {
+      const k = x.charCodeAt(0);
+      if ((k === PLACE || k === VALUE) && cmp16(c, 1, x, 1) <= 0) return false;
+      if (k === BUNDLE && (kind === PIECE || kind === BUNDLE) && bundleHas(x, c, 1)) return false;
+    }
+    if (kind === PLACE || kind === VALUE) {
+      for (const [s, x] of [...v]) {
+        if (cmp16(x, 1, c, 1) < 0) {
+          v.delete(s);
+          forgetAuthor(row, slot, s);
+        }
+      }
+    } else if (kind === BUNDLE) {
+      for (const [s, x] of [...v]) {
+        const k = x.charCodeAt(0);
+        if ((k === PIECE || k === BUNDLE) && bundleHas(c, x, 1)) {
+          v.delete(s);
+          forgetAuthor(row, slot, s);
+        }
+      }
+    }
+    v.set(stamp, c);
+    compact(row, slot);
   }
-  if (kind === PLACE || kind === VALUE) {
-    for (const s of [...cells.keys()]) if (s < stamp) cells.delete(s);
-  } else if (kind === BUNDLE) {
-    for (const [s, c] of [...cells]) if ((c.kind === PIECE || c.kind === BUNDLE) && bundleHas(body, s)) cells.delete(s);
-  }
-  cells.set(stamp, { kind, stamp, body, author });
-  return true;
-}
-
-function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  if (author) (row.authors ??= new Map()).set(String.fromCharCode(slot) + stampOf(c), author);
   return true;
 }
 
@@ -521,9 +779,34 @@ function stampTime(ms: number, n: number): string {
   return codec.u32Binary(Math.floor(ms / 65536)) + String.fromCharCode((ms % 65536) >> 8, ms % 256, n >> 8, n & 255);
 }
 
-function placeKey(c: Cell, id: string): string {
-  return codec.binary(c.body, 0, 24) + id;
+// A place's key: the first 24 bytes of its body, and the row's id.
+function placeKey(c: Held, id: string): string {
+  return c.slice(17, 41) + id;
 }
+
+// Where a row is to be in a window: the least of its places in what the window spans.
+function wanted(row: Stored, lo: string, hi: string): string | undefined {
+  if (row.dead) return undefined;
+  let want: string | undefined;
+  const a = row.slots;
+  for (let i = 0; i < a.length && a[i] !== undefined; i += 2) {
+    if ((a[i] as number) > 15 || a[i] === 0) continue; // places are in slots 1 to 15
+    const v = a[i + 1] as Cells;
+    if (typeof v === "string") {
+      const key = placeKey(v, row.id);
+      if (key >= lo && key < hi && (want === undefined || key < want)) want = key;
+    } else {
+      for (const c of v.values()) {
+        const key = placeKey(c, row.id);
+        if (key >= lo && key < hi && (want === undefined || key < want)) want = key;
+      }
+    }
+  }
+  return want;
+}
+
+// Where cells are made from what came, one at a time, to be made one string each: their kind, stamp and body side by side.
+let scratch = new Uint8Array(4096);
 
 // ---------------------------------------------------------------- the client
 
@@ -540,6 +823,10 @@ export class Client {
   #input: Uint8Array[] = [];
   #inputBytes = 0;
   #inputWants = 0; // so many bytes at least, before a frame is whole
+  // The bodies of long cells of texts just heard, as the bytes they came in: what a text made before what was heard is
+  // shown is made of, rather than of each character of the cell, read again one at a time. Let go of once it is shown.
+  #heardBodies = new Map<Held, Uint8Array>();
+  #heardBytes = 0;
   #clockMs = 0;
   #clockN = 0;
   #scopes = new Map<number, { rights: number; key: Uint8Array }>();
@@ -578,7 +865,7 @@ export class Client {
   #followers: readonly Follower[] = []; // made anew as they change: what is being told stays as it was
   #typing = new Set<Stored>(); // rows with live text to send
   #tags = new Map<string, string>(); // of lists, by their scope, its key and their name
-  #bulk?: Map<Win, Entry[]>; // rows to add to windows, all at once
+  #bulk?: Map<Win, Stored[]>; // rows to add to windows, all at once
   #timers = new Set<() => void>(); // what is to be done later, by the ways to cancel each
 
   constructor(host: Host) {
@@ -783,9 +1070,9 @@ export class Client {
     // What editors typed before their rows were here is typed in them now, as held, as it would be were they looked for and
     // not found: there is no time to wait for them, the tab going.
     for (const row of this.#rows.values()) {
-      if (row.awaited.length === 0) continue;
       const awaited = row.awaited;
-      row.awaited = [];
+      if (awaited === undefined || awaited.length === 0) continue;
+      row.awaited = undefined;
       for (const f of awaited) f();
     }
     this.#sealAll();
@@ -794,7 +1081,7 @@ export class Client {
 
   // What editors have typed and not yet sealed, sealed, as the client ends or its tab is put away.
   #sealAll(): void {
-    for (const row of this.#rows.values()) for (const [slot, t] of row.texts) if (t.open !== "") this.#seal(row, slot);
+    for (const row of this.#rows.values()) for (const [slot, t] of row.texts ?? []) if (t.open !== "") this.#seal(row, slot);
   }
 
   // Resolves once everything written so far is acknowledged; rejects should any of it never be, once the rest is: what was
@@ -869,7 +1156,7 @@ export class Client {
     // Rows with live text to send: only those, however many rows are held.
     const typing = this.#typing;
     this.#typing = new Set();
-    for (const row of typing) if (row.dirty.size > 0) this.#sendLive(row);
+    for (const row of typing) if (row.dirty && row.dirty.size > 0) this.#sendLive(row);
     const out = this.#out;
     if (this.#abandoned) out.pos = 0; // a client given up on, or refused for good, sends nothing more
     if (out.pos > 0 && this.#wire) {
@@ -881,12 +1168,16 @@ export class Client {
       const wire = this.#wire;
       for (let at = 0; at < written.length && this.#wire === wire; at += MESSAGE_MOST) wire.send(written.slice(at, at + MESSAGE_MOST));
     }
-    for (const window of [...this.#windows.values()]) if (window.changed) this.#publish(window);
-    for (const a of [...this.#asked.values()]) {
-      if (a.changed && !a.stopped) {
-        a.changed = false;
-        this.#hand(a.observer, this.#answer(a));
+    try {
+      for (const window of [...this.#windows.values()]) if (window.changed) this.#publish(window);
+      for (const a of [...this.#asked.values()]) {
+        if (a.changed && !a.stopped) {
+          a.changed = false;
+          this.#hand(a.observer, this.#answer(a));
+        }
       }
+    } finally {
+      if (this.#heardBytes > 0) this.#heardBodies.clear(), (this.#heardBytes = 0);
     }
   }
 
@@ -1168,7 +1459,8 @@ export class Client {
         size,
         back: from !== "start",
         pages: [],
-        entries: [],
+        keys: [],
+        held: [],
         at: new Map(),
         bare: query.bare === true,
         observers: new Set(),
@@ -1196,7 +1488,7 @@ export class Client {
       visible: (first: number, last: number) => void (stopped || this.#visible(win, first, last)),
       loadBefore: () => void (stopped || this.#loadBefore(win)),
       loadAfter: () => void (stopped || this.#loadAfter(win)),
-      entries: () => win.entries,
+      entries: () => win.keys.map((key, i) => ({ key, row: win.held[i] })),
       stop: () => {
         if (stopped) return;
         stopped = true;
@@ -1244,7 +1536,8 @@ export class Client {
   // What is not mentioned before the next sync is gone.
   #mark(page: Page): void {
     const stale: Said = new Map();
-    for (const e of page.window.entries) if (e.key >= page.lo && e.key < page.hi) stale.set(e.row.id, new Set());
+    const { keys, held } = page.window;
+    for (let i = 0; i < keys.length; i++) if (keys[i] >= page.lo && keys[i] < page.hi) stale.set(held[i].id, new Set());
     page.stale = stale;
   }
 
@@ -1293,7 +1586,7 @@ export class Client {
     // short in turn; a page after it, and after that, would follow what is held a page at a time, as far as it went, the
     // window never settled, and growing all the while, as when a replica is being brought level from the far end of
     // the list.
-    const cut = (lo: string, hi: string) => !page.keeps && lo < hi && window.entries.some((e) => e.key >= lo && e.key < hi);
+    const cut = (lo: string, hi: string) => !page.keeps && lo < hi && window.keys.some((key) => key >= lo && key < hi);
     const after = page === window.pages[window.pages.length - 1] && cut(page.hi, was[1]);
     const before = page === window.pages[0] && cut(was[0], page.lo);
     // Where a full replica says the page ends, what lay past it was never known to be whole.
@@ -1305,12 +1598,24 @@ export class Client {
   // A range was said over again and this row was not in it: it was moved away, or deleted, while this client was not
   // listening. Only its place there is known to be wrong. Where else it is, and what is being typed in it, stand.
   #unplace(row: Stored, lo: string, hi: string): void {
-    for (let slot = 1; slot <= 15; slot++) {
-      const cells = row.slots.get(slot);
-      if (!cells) continue;
-      for (const [stamp, c] of [...cells]) {
-        const key = placeKey(c, row.id);
-        if (key >= lo && key < hi) cells.delete(stamp);
+    for (const slot of slotsOf(row)) {
+      if (slot > 15 || slot === 0) continue;
+      const v = slotOf(row, slot)!;
+      if (typeof v === "string") {
+        const key = placeKey(v, row.id);
+        if (key >= lo && key < hi) {
+          setSlot(row, slot, undefined);
+          forgetAuthor(row, slot, stampOf(v));
+        }
+      } else {
+        for (const [stamp, c] of [...v]) {
+          const key = placeKey(c, row.id);
+          if (key >= lo && key < hi) {
+            v.delete(stamp);
+            forgetAuthor(row, slot, stamp);
+          }
+        }
+        compact(row, slot);
       }
     }
     this.#place(row);
@@ -1320,22 +1625,29 @@ export class Client {
   // yet to be acknowledged may not have been there to say.
   #prune(row: Stored, said: Set<string>): void {
     if (this.#isPending(row.id)) return;
-    let some = false;
-    for (const [slot, cells] of row.slots) {
-      let gone = false;
-      for (const stamp of [...cells.keys()]) {
-        if (!said.has(stamp)) {
-          cells.delete(stamp);
-          gone = true;
+    // Which slots lost something, first: what is done for each may write in the row.
+    const gone: number[] = [];
+    eachSlot(row, (slot, v) => {
+      if (typeof v === "string" ? !said.has(stampOf(v)) : [...v.keys()].some((stamp) => !said.has(stamp))) gone.push(slot);
+    });
+    for (const slot of gone) {
+      const v = slotOf(row, slot);
+      if (typeof v === "string") {
+        forgetAuthor(row, slot, stampOf(v));
+        setSlot(row, slot, undefined);
+      } else if (v !== undefined) {
+        for (const stamp of [...v.keys()]) {
+          if (!said.has(stamp)) {
+            v.delete(stamp);
+            forgetAuthor(row, slot, stamp);
+          }
         }
+        compact(row, slot);
       }
-      if (gone) {
-        some = true;
-        this.#rebuild(row, slot);
-      }
+      this.#rebuild(row, slot);
     }
-    if (some) {
-      row.views.clear();
+    if (gone.length > 0) {
+      unview(row);
       this.#place(row);
     }
   }
@@ -1370,13 +1682,13 @@ export class Client {
     if (window.pages.length === 0 || !this.#ready || window.size === 0) return;
     const near = Math.floor(window.size / 2);
     if (first <= near) this.#loadBefore(window);
-    if (last > window.entries.length - near) this.#loadAfter(window);
+    if (last > window.keys.length - near) this.#loadAfter(window);
     // A page that has grown far past its size is two pages.
     for (let i = 0; i < window.pages.length; i++) {
       const page = window.pages[i];
       const [lo, hi] = this.#span(window, page);
       if (!page.open && hi - lo > window.size * 2) {
-        const middle = window.entries[Math.floor((lo + hi) / 2) - 1].key;
+        const middle = window.keys[Math.floor((lo + hi) / 2) - 1];
         const upper = this.#page(window, middle, page.hi);
         upper.open = false;
         upper.settled = page.settled;
@@ -1403,7 +1715,7 @@ export class Client {
       const page = window.pages[window.pages.length - 1];
       const [lo] = this.#span(window, page);
       if (page.open || lo - window.size * 2 <= last) break;
-      const count = window.entries.length - lo + 1;
+      const count = window.keys.length - lo + 1;
       window.pages.pop();
       const edge = window.pages[window.pages.length - 1];
       edge.after = Math.max(edge.after, page.after + count);
@@ -1419,11 +1731,11 @@ export class Client {
 
   // Position, from 1, of the first entry at or past a key.
   #find(window: Win, key: string): number {
-    const entries = window.entries;
-    let lo = 0, hi = entries.length;
+    const keys = window.keys;
+    let lo = 0, hi = keys.length;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      if (entries[mid].key < key) lo = mid + 1;
+      if (keys[mid] < key) lo = mid + 1;
       else hi = mid;
     }
     return lo + 1;
@@ -1431,57 +1743,61 @@ export class Client {
 
   #trim(window: Win): void {
     const lo = window.pages[0].lo, hi = window.pages[window.pages.length - 1].hi;
-    const kept: Entry[] = [];
-    window.at.clear();
-    for (const e of window.entries) {
-      if (e.key >= lo && e.key < hi) {
-        kept.push(e);
-        window.at.set(e.row, e.key);
+    const { keys, held } = window;
+    // What lies outside is let go of; what is kept stays where it is, and is known where it was.
+    let n = 0;
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i], row = held[i];
+      if (key >= lo && key < hi) {
+        keys[n] = key;
+        held[n++] = row;
       } else {
-        this.#release(e.row);
+        window.at.delete(row);
+        this.#release(row);
       }
     }
-    window.entries = kept;
+    keys.length = held.length = n;
     this.#touch(window);
   }
 
   #forget(window: Win): void {
     this.#windows.delete(window.key);
     for (const page of window.pages) this.#dropPage(page);
-    for (const e of window.entries) this.#release(e.row);
+    for (const row of window.held) this.#release(row);
   }
 
   #release(row: Stored): void {
     row.pages--;
     if (row.pages === 0 && !row.asking && !row.dead) this.#keep(row);
-    if (row.pages === 0 && row.held.size === 0 && !this.#isPending(row.id)) this.#rows.delete(row.id);
+    if (row.pages === 0 && !row.held && !this.#isPending(row.id)) this.#rows.delete(row.id);
   }
 
   // Has a row that is being edited shown, if nothing else shows it, so that what others write in it is heard of too. Calls
   // back once it is here, or known not to be anywhere.
   #keep(row: Stored, here?: () => void): void {
-    if (row.pages > 0 || row.held.size === 0) {
+    if (row.pages > 0 || !row.held) {
       here?.();
       return;
     }
-    const question = { scope: codec.u32Of(row.id), table: {}, where: ask.where.ids([row.hex]), limit: 1 };
+    const question = { scope: codec.u32Of(row.id), table: {}, where: ask.where.ids([hexOf(row)]), limit: 1 };
     const release = () => {
       const awaited = row.awaited;
-      row.awaited = [];
-      for (const f of awaited) f();
+      row.awaited = undefined;
+      for (const f of awaited ?? []) f();
     };
     if (here) {
-      row.awaited.push(here);
+      const awaited = (row.awaited ??= []);
+      awaited.push(here);
       // Once, too: answered by one who holds everything if one can be reached, and otherwise with what is held, as a
       // partial replica with nobody to ask that can read answers it, never "ready". What waits for the row goes on then.
-      if (row.awaited.length === 1) void this.fetch(question).then(release, release);
+      if (awaited.length === 1) void this.fetch(question).then(release, release);
     }
     if (row.asking) return;
     const hear = (answer: Answer<any>) => {
       if (answer.rows.length > 0 || answer.status === "ready" || answer.status === "denied" || answer.status === "faulty") release();
     };
     const asked = this.ask(question, hear);
-    if (row.held.size > 0) row.asking = asked.stop;
+    if (row.held) row.asking = asked.stop;
     else asked.stop();
   }
 
@@ -1493,7 +1809,8 @@ export class Client {
 
   #state(window: Win): State<any> {
     if (window.state) return window.state;
-    const rows = window.entries.map((e) => this.#view(e.row, window.schema, e.key));
+    const held = window.held;
+    const rows = window.keys.map((key, i) => this.#view(held[i], window.schema, key));
     let status: Status = "ready";
     for (const page of window.pages) {
       if (page.open) {
@@ -1526,165 +1843,262 @@ export class Client {
 
   // A row as the application sees it: one frozen object, the same one until something in it changes.
   #view(row: Stored, schema: Table, key: string): Row<any> {
-    const view = row.views.get(schema);
+    const view = row.views?.get(schema);
     const order = codec.fromU64(key, 16);
     if (view && view.order === order) return view;
-    const made: Record<string, unknown> = { id: row.hex, order };
+    const made: Record<string, unknown> = { id: hexOf(row), order };
     for (const name in schema) {
       const c = schema[name];
       if (c.who) {
-        let latest: Cell | undefined;
-        const names = new Set<string>();
-        for (const cell of row.slots.get(c.slot)?.values() ?? []) {
-          if (!latest || cell.stamp > latest.stamp) latest = cell;
-          if (cell.author && cell.author.subject !== "") names.add(cell.author.subject);
-        }
-        if (c.who === "all") made[name] = Object.freeze([...names].sort());
-        else if (latest?.author && latest.author.subject !== "") made[name] = latest.author.subject;
+        const v = whose(row, c.slot, c.who === "all");
+        if (v !== undefined) made[name] = v;
       } else if (c.text) {
-        made[name] = text.read(this.#text(row, c.slot));
+        made[name] = this.readText(row, c.slot);
       } else {
-        const slot = row.slots.get(c.slot);
-        if (slot) {
-          for (const cell of slot.values()) {
-            if (cell.kind !== VALUE) continue;
-            // What cannot be read is no value: anyone may write anything in a slot.
-            let value: unknown;
-            try {
-              value = c.decode(cell.body);
-            } catch {
-              value = undefined;
-            }
-            if (value !== undefined) made[name] = value;
+        const cell = latest(row, c.slot);
+        if (cell !== undefined) {
+          // What cannot be read is no value: anyone may write anything in a slot.
+          let value: unknown;
+          try {
+            value = c.decode(bodyOf(cell));
+          } catch {
+            value = undefined;
           }
+          if (value !== undefined) made[name] = value;
         }
       }
     }
     Object.freeze(made);
-    row.views.set(schema, made as Row<any>);
+    (row.views ??= new Map()).set(schema, made as Row<any>);
     return made as Row<any>;
+  }
+
+  /**
+   * What a text column of a held row reads as. One that nothing has been typed in, only set, is what was set: there is no
+   * text to make of it until someone types, or reads it as a text. For what is built on the client.
+   */
+  readText(row: Stored, slot: number): string {
+    const t = row.texts?.get(slot);
+    if (t) return text.read(t);
+    const v = slotOf(row, slot);
+    if (v === undefined) return "";
+    if (typeof v === "string" && v.charCodeAt(0) === VALUE) return fromUtf8.decode(bodyOf(v));
+    return text.read(this.#text(row, slot));
   }
 
   // ---------------------------------------------------------------- rows
 
   #row(id: string): Stored {
     let row = this.#rows.get(id);
-    if (!row) {
-      row = {
-        id,
-        hex: codec.hex(id),
-        slots: new Map(),
-        dead: false,
-        pages: 0,
-        texts: new Map(),
-        held: new Map(),
-        awaited: [],
-        lives: new Map(),
-        views: new Map(),
-        dirty: new Set(),
-      };
-      this.#rows.set(id, row);
-    }
+    if (!row) this.#rows.set(id, (row = newRow(id)));
     return row;
   }
 
+  // Whether anything listens for what is said again, as a page or a question being sent afresh does.
+  #saying(): boolean {
+    for (const page of this.#pages.values()) if (page.stale) return true;
+    for (const a of this.#asked.values()) if (a.said) return true;
+    return false;
+  }
+
   #onCells(r: codec.Reader): void {
-    codec.varint(r);
-    let id = "";
-    // Of pages and questions being said afresh, which is most often none, what has been said of each row.
-    let saids: Said[] | undefined;
-    for (const page of this.#pages.values()) if (page.stale) (saids ??= []).push(page.stale);
-    for (const a of this.#asked.values()) if (a.said) (saids ??= []).push(a.said);
+    // What came before any nonsense in a message is placed, as it is held; and so is let go of what has nothing in it.
     const touched = new Set<Stored>();
     try {
-      while (r.pos < r.len) {
-        const tag = codec.u8(r);
-        if (tag < 128) id = codec.takeBinary(r, 16);
-        if (id === "") throw new codec.Malformed();
-        const slot = codec.u8(r);
-        const stamp = codec.takeBinary(r, 16);
-        const body = codec.bytes(r).slice();
-        const author = tag & 64 ? this.#authors.get(codec.varint(r)) : undefined;
-        if (!sound(tag % 64, slot, body)) throw new codec.Malformed();
-        this.#heard(stamp);
-        const row = this.#row(id);
-        touched.add(row);
-        if (saids) for (const said of saids) said.get(id)?.add(stamp);
-        this.#accept(row, slot, tag % 64, stamp, body, author);
-      }
+      this.#readCells(r, touched);
     } finally {
-      this.#placeAll(touched); // what came before any nonsense is shown, as it is held
+      this.#placeAll(touched);
     }
   }
 
-  #accept(row: Stored, slot: number, kind: number, stamp: string, body: Uint8Array, author?: Device): boolean {
-    if (!merge(row, slot, kind, stamp, body, author)) {
-      // Known already; but perhaps not whose it is, or by what name they go now.
-      const cell = row.slots.get(slot)?.get(stamp);
-      if (cell && author) {
-        if (!cell.author || cell.author.subject !== author.subject) row.views.clear();
-        cell.author = author;
+  #readCells(r: codec.Reader, touched: Set<Stored>): void {
+    codec.varint(r);
+    const buf = r.buf, len = r.len;
+    let pos = r.pos;
+    const rows = this.#rows;
+    const saying = this.#saying();
+    let id = "";
+    let row: Stored | undefined;
+    while (pos < len) {
+      const tag = buf[pos++];
+      if (tag < 128) {
+        if (pos + 16 > len) throw new codec.Malformed();
+        id = codec.binary(buf, pos, pos + 16);
+        pos += 16;
+        row = rows.get(id);
+        if (!row) rows.set(id, (row = newRow(id)));
+        touched.add(row);
       }
-      if (cell && !equalBytes(cell.body, body)) {
-        cell.body = body; // less of it, since its author may no longer have written the rest
+      if (row === undefined) throw new codec.Malformed();
+      if (pos + 17 > len) throw new codec.Malformed();
+      const slot = buf[pos];
+      const at = pos + 1;
+      r.pos = at + 16;
+      const size = codec.varint(r);
+      pos = r.pos;
+      if (pos + size > len) throw new codec.Malformed();
+      // What no node could have sent is nonsense, and ends the pipe: a kind there is not, in a slot not its kind's, a place
+      // too short to say where, a bundle too short to hold what it says it does. What a node could have sent but would not
+      // keep, as a place of another scope, is passed over, as it would be (see shaped).
+      const kind = tag % 64;
+      if (
+        kind === VALUE || kind === PIECE
+          ? slot < 16
+          : kind === PLACE
+            ? slot < 1 || slot > 15 || size < 24
+            : kind === GRAVE
+              ? slot !== 0
+              : kind !== BUNDLE || slot < 16 || size < 4 || 4 + (((buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]) >>> 0) * 16 > size
+      )
+        throw new codec.Malformed();
+      // One held already, as a node says whole rows again when any of them changes: known by its stamp and kind, and passed
+      // over without anything made of it. Another body for what is held is no news (SPEC.md 4), but of a bundle, which a node
+      // may say again with less of it: that is looked at where it is.
+      if (!(tag & 64) && !row.dead) {
+        const v = slotOf(row, slot);
+        if (v !== undefined) {
+          const stamp = codec.binary(buf, at, at + 16);
+          const held = typeof v === "string" ? (cmp16(v, 1, stamp, 0) === 0 ? v : undefined) : v.get(stamp);
+          // Of the shape a node keeps, as everything heard is looked at first in Luau: of a place, its prefix, the rest held.
+          // (Nothing here loops but this loop, each cell once: V8, compiling a loop within it while it runs, would leave
+          // that compiled code each time that loop ended, at a cost each time.)
+          const fine = size <= MAX_CELL && (tag % 64 !== PLACE || placeFine(buf, pos, size, id));
+          if (fine && held !== undefined && held.charCodeAt(0) === tag % 64 && (tag % 64 !== BUNDLE || held.length === 17 + size)) {
+            if (tag % 64 !== BUNDLE || sameBody(held, buf, pos, size)) {
+              pos += size;
+              if (saying) this.#said(id, stamp);
+              continue;
+            }
+          }
+        }
+      }
+      // The cell, one string: its kind, its stamp and its body, put side by side and read as one.
+      if (scratch.length < 17 + size) scratch = new Uint8Array(Math.max(scratch.length * 2, 17 + size));
+      scratch[0] = tag % 64;
+      scratch.set(buf.subarray(at, at + 16), 1);
+      scratch.set(buf.subarray(pos, pos + size), 17);
+      const c = codec.binary(scratch, 0, 17 + size);
+      if ((tag % 64 === PIECE || tag % 64 === BUNDLE) && size > SLAB / 4 && this.#heardBytes + size <= HEARD_MOST) {
+        this.#heardBodies.set(c, buf.slice(pos, pos + size));
+        this.#heardBytes += size;
+      }
+      pos += size;
+      let author: Device | undefined;
+      if (tag & 64) {
+        r.pos = pos;
+        author = this.#authors.get(codec.varint(r));
+        pos = r.pos;
+      }
+      if (!shaped(id, slot, c)) continue; // what a node would not keep is passed over, as it would be
+      // What it says of the time, as late as anything heard of.
+      const time = u32At(c, 1) * 65536 + ((c.charCodeAt(5) << 8) | c.charCodeAt(6));
+      const n = (c.charCodeAt(7) << 8) | c.charCodeAt(8);
+      if (time > this.#clockMs || (time === this.#clockMs && n > this.#clockN)) (this.#clockMs = time), (this.#clockN = n);
+      if (saying) this.#said(id, c.slice(1, 17)); // only looked for again, once: so not made a string of its own
+      if (author === undefined && !row.dead && !row.texts && tag % 64 !== GRAVE && slotOf(row, slot) === undefined) {
+        // What almost every cell of a row heard for the first time is: one where there was none.
+        setSlot(row, slot, c);
+        row.version = ++versions;
+        row.views = undefined;
+      } else {
+        this.#accept(row, slot, c, author);
+      }
+    }
+    r.pos = pos;
+  }
+
+  // A stamp of a row said again, for the pages and questions being sent afresh that listen for what is.
+  #said(id: string, stamp: string): void {
+    for (const page of this.#pages.values()) page.stale?.get(id)?.add(stamp);
+    for (const a of this.#asked.values()) a.said?.get(id)?.add(stamp);
+  }
+
+  #accept(row: Stored, slot: number, c: Held, author?: Device): boolean {
+    if (!merge(row, slot, c, author)) {
+      // Known already; but perhaps not whose it is, or by what name they go now.
+      const stamp = stampOf(c);
+      const v = slotOf(row, slot);
+      const held = typeof v === "string" ? (cmp16(v, 1, c, 1) === 0 ? v : undefined) : v?.get(stamp);
+      if (held !== undefined && author) {
+        const authors = (row.authors ??= new Map());
+        const was = authors.get(String.fromCharCode(slot) + stamp);
+        if (!was || was.subject !== author.subject) unview(row);
+        authors.set(String.fromCharCode(slot) + stamp, author);
+      }
+      if (held !== undefined && held.charCodeAt(0) === BUNDLE && c.charCodeAt(0) === BUNDLE && held !== c && held.slice(17) !== c.slice(17)) {
+        // A bundle with less of it, since its author may no longer have written the rest (SPEC.md 4): another body for what
+        // is held is otherwise no news.
+        const less = held.slice(0, 17) + c.slice(17);
+        if (typeof v === "string") setSlot(row, slot, less);
+        else v!.set(stamp, less);
         this.#rebuild(row, slot);
       }
       return false;
     }
-    const t = row.texts.get(slot);
+    const kind = c.charCodeAt(0);
+    const t = row.texts?.get(slot);
     if (t && kind >= VALUE) {
-      if (text.apply(t, kind, stamp, body) === "rebuild") this.#rebuild(row, slot);
+      if (text.apply(t, kind, stampOf(c), textBody(c, this.#heardBodies)) === "rebuild") this.#rebuild(row, slot);
     }
-    row.views.clear();
+    unview(row);
     return true;
   }
 
   // The text in a slot, made from its cells when first wanted.
   #text(row: Stored, slot: number): text.Text {
-    let t = row.texts.get(slot);
+    let t = row.texts?.get(slot);
     if (!t) {
       t = text.create();
-      row.texts.set(slot, t);
-      const cells = row.slots.get(slot);
-      if (cells) {
-        const sorted = [...cells.values()].sort((a, b) => (a.stamp < b.stamp ? -1 : a.stamp > b.stamp ? 1 : 0));
-        for (const c of sorted) text.apply(t, c.kind, c.stamp, c.body);
-      }
+      (row.texts ??= new Map()).set(slot, t);
+      const v = slotOf(row, slot);
+      const sorted = typeof v === "string" ? [v] : v === undefined ? [] : [...v.values()].sort((a, b) => cmp16(a, 1, b, 1));
+      for (const c of sorted) text.apply(t, kindOf(c), stampOf(c), textBody(c, this.#heardBodies));
     }
     return t;
   }
 
   #rebuild(row: Stored, slot: number): void {
-    const old = row.texts.get(slot);
+    const old = row.texts?.get(slot);
     if (old && old.open !== "") this.#seal(row, slot); // nothing typed here may be lost with it
-    row.texts.delete(slot);
-    row.lives.delete(slot);
-    row.views.clear();
+    if (row.texts) {
+      row.texts.delete(slot);
+      if (row.texts.size === 0) row.texts = undefined;
+    }
+    if (row.lives) {
+      row.lives.delete(slot);
+      if (row.lives.size === 0) row.lives = undefined;
+    }
+    unview(row);
   }
 
   // Puts a row where its placements say, in every window, and takes it from where they do not. Followers hear of it
   // first, unless they have been told already.
   #place(row: Stored, told = false): void {
     if (!told) this.#follow(row);
-    const keys: string[] = [];
-    if (!row.dead) {
-      for (let slot = 1; slot <= 15; slot++) {
-        const cells = row.slots.get(slot);
-        if (cells) for (const c of cells.values()) keys.push(placeKey(c, row.id));
-      }
-    }
     let left = false; // some window it was in, which is let go of only once where it now is is known
     for (const window of this.#windows.values()) {
       if (window.pages.length === 0) continue;
-      const lo = window.pages[0].lo, hi = window.pages[window.pages.length - 1].hi;
-      let want: string | undefined;
-      for (const key of keys) if (key >= lo && key < hi && (want === undefined || key < want)) want = key;
-      const entries = window.entries;
+      const want = wanted(row, window.pages[0].lo, window.pages[window.pages.length - 1].hi);
+      const keys = window.keys;
       // Where it is now, found by where it was: keys are in order, and each is a row's own.
       const was = window.at.get(row);
       let have: number | undefined = was !== undefined ? this.#find(window, was) - 1 : undefined;
-      if (have !== undefined && (want === undefined || entries[have].key !== want)) {
-        entries.splice(have, 1);
+      const queued = this.#bulk?.get(window);
+      if (have !== undefined && keys[have] !== was && queued) {
+        // Not among them yet, but among those to be put in all at once: there it stays, or is taken out.
+        if (want !== undefined) {
+          window.at.set(row, want);
+          continue;
+        }
+        queued.splice(queued.indexOf(row), 1);
+        window.at.delete(row);
+        row.pages--;
+        left = true;
+        continue;
+      }
+      if (have !== undefined && (want === undefined || keys[have] !== want)) {
+        keys.splice(have, 1);
+        window.held.splice(have, 1);
         window.at.delete(row);
         row.pages--;
         left = true;
@@ -1692,47 +2106,78 @@ export class Client {
         have = undefined;
       }
       if (want !== undefined && have === undefined) {
-        const e: Entry = { key: want, row };
         const bulk = this.#bulk;
         if (bulk) {
           let add = bulk.get(window);
           if (!add) bulk.set(window, (add = []));
-          add.push(e);
+          add.push(row);
         } else {
-          entries.splice(this.#find(window, want) - 1, 0, e);
+          const at = this.#find(window, want) - 1;
+          keys.splice(at, 0, want);
+          window.held.splice(at, 0, row);
         }
         window.at.set(row, want);
         row.pages++;
-        this.#touch(window);
-      } else if (want !== undefined) {
+        if (window.state || !window.changed) this.#touch(window);
+      } else if (want !== undefined && (window.state || !window.changed)) {
         this.#touch(window);
       }
     }
     // A row moved within a window, or from one to another, never left what shows it: an editor of it needs no question.
     if (left && row.pages === 0 && !row.asking && !row.dead) this.#keep(row);
     this.#touchAsked(row);
-    if (row.pages <= 0 && row.held.size === 0 && (row.dead || !this.#isPending(row.id))) {
+    if (row.pages <= 0 && !row.held && (row.dead || !this.#isPending(row.id))) {
       if (this.#asked.size > 0 && !row.dead) this.#loose.add(row.id);
       else this.#rows.delete(row.id);
     }
   }
 
-  // Places rows, each once. Many at once go into windows at once: sorted together, rather than each moving all after it.
+  // Places rows, each once. Many at once go into windows at once: sorted among themselves, and merged with what was there.
   // Followers hear of them all first, so that whatever they do of it is done before any row is half put, as one held
   // where it goes and not yet among the rows there.
   #placeAll(rows: Set<Stored>): void {
-    if (rows.size <= 64) {
+    if (rows.size <= 64 || this.#bulk) {
       for (const row of rows) this.#place(row);
       return;
     }
     for (const row of rows) this.#follow(row);
-    const bulk = new Map<Win, Entry[]>();
-    this.#bulk = bulk;
+    this.#bulk = new Map();
     for (const row of rows) this.#place(row, true);
+    this.#mergeBulk();
+  }
+
+  #mergeBulk(): void {
+    const bulk = this.#bulk!;
     this.#bulk = undefined;
     for (const [window, add] of bulk) {
-      window.entries.push(...add);
-      window.entries.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0));
+      const at = window.at;
+      let keys = add.map((row) => at.get(row)!);
+      let placed = add;
+      let sorted = true;
+      for (let i = 1; i < keys.length && sorted; i++) sorted = keys[i - 1] < keys[i];
+      if (!sorted) {
+        // By their keys, compared as they are in an array, not looked up for each comparison.
+        const order = keys.map((_, i) => i).sort((x, y) => (keys[x] < keys[y] ? -1 : 1));
+        placed = order.map((i) => add[i]);
+        keys = order.map((i) => keys[i]);
+      }
+      const oldKeys = window.keys, oldHeld = window.held;
+      const n = oldKeys.length, m = keys.length;
+      if (n === 0 || (m > 0 && oldKeys[n - 1] < keys[0])) {
+        for (let j = 0; j < m; j++) {
+          oldKeys.push(keys[j]);
+          oldHeld.push(placed[j]);
+        }
+      } else {
+        const outKeys: string[] = new Array(n + m), outHeld: Stored[] = new Array(n + m);
+        let i = 0, j = 0, k = 0;
+        while (i < n || j < m) {
+          if (i < n && (j >= m || oldKeys[i] < keys[j])) (outKeys[k] = oldKeys[i]), (outHeld[k++] = oldHeld[i++]);
+          else (outKeys[k] = keys[j]), (outHeld[k++] = placed[j++]);
+        }
+        window.keys = outKeys;
+        window.held = outHeld;
+      }
     }
   }
 
@@ -1928,7 +2373,7 @@ export class Client {
   #sweep(): void {
     for (const id of this.#loose) {
       const row = this.#rows.get(id);
-      if (row && row.pages <= 0 && row.held.size === 0 && !this.#isPending(id)) this.#rows.delete(id);
+      if (row && row.pages <= 0 && !row.held && !this.#isPending(id)) this.#rows.delete(id);
     }
     this.#loose.clear();
   }
@@ -1952,8 +2397,9 @@ export class Client {
         // A row's order is that of its first place.
         let key = ZERO40;
         for (let slot = 1; slot <= 15; slot++) {
-          const c = row.slots.get(slot)?.values().next().value;
-          if (c) {
+          const v = slotOf(row, slot);
+          const c = typeof v === "string" ? v : v?.values().next().value;
+          if (c !== undefined) {
             key = placeKey(c, id);
             break;
           }
@@ -1985,20 +2431,24 @@ export class Client {
     if (!row || row.dead) return;
     const t = this.#text(row, slot);
     if (text.live(t, piece, offset, codec.rest(r).slice()) === "changed") {
-      row.views.clear();
+      unview(row);
       this.#place(row);
-      if (!row.lives.has(slot)) this.#expire(row, slot);
-      row.lives.set(slot, this.#host.now());
+      const lives = (row.lives ??= new Map());
+      if (!lives.has(slot)) this.#expire(row, slot);
+      lives.set(slot, this.#host.now());
     }
   }
 
   // Live text whose writer vanished before sealing it is not text.
   #expire(row: Stored, slot: number): void {
     this.#after(LIVE_MS, () => {
-      const last = row.lives.get(slot);
-      const t = row.texts.get(slot);
+      const last = row.lives?.get(slot);
+      const t = row.texts?.get(slot);
       if (last === undefined || !t) return;
-      if (!text.provisional(t)) row.lives.delete(slot);
+      if (!text.provisional(t)) {
+        row.lives!.delete(slot);
+        if (row.lives!.size === 0) row.lives = undefined;
+      }
       else if (this.#host.now() - last >= LIVE_MS) {
         this.#rebuild(row, slot);
         this.#place(row);
@@ -2009,9 +2459,10 @@ export class Client {
   }
 
   #sendLive(row: Stored): void {
-    for (const slot of [...row.dirty]) {
-      row.dirty.delete(slot);
-      const t = row.texts.get(slot);
+    const dirty = row.dirty;
+    row.dirty = undefined;
+    for (const slot of dirty ?? []) {
+      const t = row.texts?.get(slot);
       if (t && t.open !== "") {
         const [piece, offset, bytes] = text.flush(t);
         if (bytes.length > 0 && this.#ready) {
@@ -2024,7 +2475,7 @@ export class Client {
           codec.put(w, bytes);
           this.#frame(LIVE, w);
         }
-        if (t.size >= PIECE_BYTES) this.#seal(row, slot);
+        if (t.size >= PIECE_BYTES) this.#sealShown(row, slot);
       }
     }
   }
@@ -2040,16 +2491,23 @@ export class Client {
     return s && s.rights & 128 ? this.#authors.get(0) : undefined;
   }
 
-  #seal(row: Stored, slot: number): void {
-    const t = row.texts.get(slot);
-    if (!t || t.open === "") return;
+  // Seals what is typed, and has it shown: the text is as it was, but whose it is may not be.
+  #sealShown(row: Stored, slot: number): void {
+    if (this.#seal(row, slot)) this.#place(row);
+  }
+
+  #seal(row: Stored, slot: number): boolean {
+    const t = row.texts?.get(slot);
+    if (!t || t.open === "") return false;
     const stamp = this.#stamp();
     const body = text.close(t, stamp);
     if (body) {
-      merge(row, slot, PIECE, stamp, body, this.#mine(codec.u32Of(row.id)));
-      row.views.clear();
+      merge(row, slot, cellOf(PIECE, stamp, body), this.#mine(codec.u32Of(row.id)));
+      unview(row);
       this.#sendCells([{ row: row.id, slot, kind: PIECE, stamp, body }]);
+      return true;
     }
+    return false;
   }
 
   /** An editor for a text column. Edits show here at once, reach everyone watching as they are made, and become durable a piece at a time. */
@@ -2062,9 +2520,10 @@ export class Client {
     // What is done before there is a row to do it to: none is held as the node has it, in a window or an answer, or another
     // editor of it waits for it still. A row held for nothing but what this client wrote to it may have more to it.
     const was = this.#rows.get(bin);
-    let early: (() => void)[] | undefined = was === undefined || was.pages === 0 || was.awaited.length > 0 ? [] : undefined;
+    let early: (() => void)[] | undefined = was === undefined || was.pages === 0 || (was.awaited !== undefined && was.awaited.length > 0) ? [] : undefined;
     const row = this.#row(bin);
-    row.held.set(slot, (row.held.get(slot) ?? 0) + 1);
+    const holding = (row.held ??= new Map());
+    holding.set(slot, (holding.get(slot) ?? 0) + 1);
     let closed = false, ended = false;
     let sealed: Promise<void> | undefined; // as it was closed
     // Should what it typed have been sealed where the client may no longer write, that is what any commit and close say.
@@ -2077,9 +2536,9 @@ export class Client {
     if (early) this.#early.add((applied = new Promise<void>((done) => (apply = done))));
     const fresh = () => codec.binary(this.#host.random(8));
     const edited = () => {
-      row.dirty.add(slot);
+      (row.dirty ??= new Set()).add(slot);
       this.#typing.add(row);
-      row.views.clear();
+      unview(row);
       this.#place(row);
       this.#later();
     };
@@ -2088,7 +2547,7 @@ export class Client {
       if (!timer) {
         timer = this.#after(PIECE_MS, () => {
           timer = undefined;
-          this.#seal(row, slot);
+          this.#sealShown(row, slot);
         });
       }
     };
@@ -2109,11 +2568,13 @@ export class Client {
       timer?.();
       timer = undefined;
       this.#seal(row, slot);
-      const n = row.held.get(slot)! - 1;
-      if (n === 0) row.held.delete(slot);
-      else row.held.set(slot, n);
+      const holding = row.held!;
+      const n = holding.get(slot)! - 1;
+      if (n === 0) holding.delete(slot);
+      else holding.set(slot, n);
+      if (holding.size === 0) row.held = undefined;
       const asking = row.asking;
-      if (asking && row.held.size === 0) {
+      if (asking && !row.held) {
         row.asking = undefined;
         asking();
       }
@@ -2185,8 +2646,8 @@ export class Client {
         });
       },
       commit: () => {
-        if (early) return handled(applied!.then(() => (this.#seal(row, slot), refused() ?? this.#barrier())));
-        this.#seal(row, slot);
+        if (early) return handled(applied!.then(() => (this.#sealShown(row, slot), refused() ?? this.#barrier())));
+        this.#sealShown(row, slot);
         return handled(refused() ?? this.#barrier());
       },
       close: () => {
@@ -2204,6 +2665,11 @@ export class Client {
 
   /** Hears of every row that changes, here or anywhere, by its id. Returns a way to stop. */
   follow(f: (id: string) => void): () => void {
+    return this.followRows((row) => f(hexOf(row)));
+  }
+
+  /** Hears of every row that changes, here or anywhere, as it is held. Returns a way to stop. */
+  followRows(f: (row: Stored) => void): () => void {
     const own: Follower = { f, on: true }; // its own, though the same function follow twice
     this.#followers = [...this.#followers, own];
     return () => {
@@ -2214,7 +2680,7 @@ export class Client {
 
   // Followers hear of a row, those following still, while the client is open: one closed within it tells no more.
   #follow(row: Stored): void {
-    for (const x of this.#followers) if (x.on && !this.#closed) this.#hand(x.f, row.hex);
+    for (const x of this.#followers) if (x.on && !this.#closed) this.#hand(x.f, row);
   }
 
   /** A row as it is held: its cells by slot and stamp, or undefined. Not to be changed. */
@@ -2222,10 +2688,20 @@ export class Client {
     return this.#rows.get(rowId(id));
   }
 
+  /** The same, by its id as it is held: for what is built on the client. */
+  heldRow(id: string): Stored | undefined {
+    return this.#rows.get(id);
+  }
+
   /** A text column of a held row, as it is; undefined if the row is not held. */
   heldText(id: string, slot: number): text.Text | undefined {
     const row = this.held(id);
     return row ? this.#text(row, slot) : undefined;
+  }
+
+  /** The same, of a row as it is held. */
+  textOf(row: Stored, slot: number): text.Text {
+    return this.#text(row, slot);
   }
 
   /** The key of a scope, of which its lists' tags are made, once it is known; undefined until then. Not to be changed. */
@@ -2324,7 +2800,7 @@ export class Client {
       if (n > 0) this.#unacked.set(id, n);
       else this.#unacked.delete(id);
       const row = this.#rows.get(id);
-      if (n === 0 && row && row.pages === 0 && row.held.size === 0) this.#rows.delete(id);
+      if (n === 0 && row && row.pages === 0 && !row.held) this.#rows.delete(id);
     }
   }
 
@@ -2343,7 +2819,7 @@ export class Client {
     const fresh = new Set<string>(); // rows made here
     const rows = new Set<string>();
     // How each row was before this touched it, so that a change that throws leaves nothing behind.
-    const before = new Map<string, { existed: boolean; slots: Map<number, Map<string, Cell>>; dead: boolean; texts: Set<number> }>();
+    const before = new Map<string, { existed: boolean; slots: (number | Cells | undefined)[]; authors: Map<string, Device> | undefined; dead: boolean; texts: Set<number> }>();
     const mine = this.#mine(scope); // whose what this change writes is, the same throughout,
     const now = Math.floor(this.#host.now()); // and when
     const touch = (id: string, slot: number): Stored => {
@@ -2355,26 +2831,36 @@ export class Client {
       if (!was) {
         // What editors have open in it goes first, and stands, whatever becomes of this change: so what is put back is
         // as it was with that, and nothing the node has heard is taken back here.
-        for (const [s, t] of row.texts) if (t.open) this.#seal(row, s);
-        const slots = new Map<number, Map<string, Cell>>();
-        for (const [k, cells] of row.slots) slots.set(k, new Map(cells));
-        before.set(id, (was = { existed: existed !== undefined, slots, dead: row.dead, texts: new Set() }));
+        if (row.texts) for (const [s, t] of row.texts) if (t.open) this.#seal(row, s);
+        const slots = row.slots.map((v) => (v instanceof Map ? new Map(v) : v));
+        const authors = row.authors ? new Map(row.authors) : undefined;
+        before.set(id, (was = { existed: existed !== undefined, slots, authors, dead: row.dead, texts: new Set() }));
       }
       was.texts.add(slot);
       return row;
     };
     const undo = () => {
+      const back = new Set<Stored>();
       for (const [id, was] of before) {
         const row = this.#rows.get(id);
         if (!row) continue;
         row.slots = was.slots;
+        row.authors = was.authors;
         row.dead = was.dead;
         // What was made of the slots' texts is made again from their cells, when wanted: whatever this change typed in
         // them goes with it. (An editor's own typing that was open was sealed before this touched the row, and stands.)
-        for (const slot of was.texts) row.texts.delete(slot), row.lives.delete(slot);
-        row.views.clear();
-        if (!was.existed && row.pages === 0 && row.held.size === 0 && !this.#isPending(id)) this.#rows.delete(id);
+        for (const slot of was.texts) {
+          row.texts?.delete(slot);
+          row.lives?.delete(slot);
+        }
+        if (row.texts?.size === 0) row.texts = undefined;
+        if (row.lives?.size === 0) row.lives = undefined;
+        unview(row);
+        if (!was.existed && row.pages === 0 && !row.held && !this.#isPending(id)) this.#rows.delete(id);
+        else back.add(row);
       }
+      // What editors had open in the rows it touched was sealed, and stands: those rows are shown as they now are.
+      this.#placeAll(back);
     };
     const put = (row: string, slot: number, kind: number, body: Uint8Array) => {
       if (body.length > MAX_OPEN) throw new RangeError("a value may be 1 MiB at most, less 192 bytes");
@@ -2382,7 +2868,7 @@ export class Client {
       const stamp = this.#stamp(now);
       rows.add(row);
       cells.push({ row, slot, kind, stamp, body });
-      this.#accept(stored, slot, kind, stamp, body, mine);
+      this.#accept(stored, slot, cellOf(kind, stamp, body), mine);
     };
     const set = (bin: string, schema: Table, values: Record<string, unknown>) => {
       for (const name in values) {
@@ -2393,7 +2879,7 @@ export class Client {
         if (value === undefined) continue;
         // Empty text is what a text is before anything is written: it need only be said to clear one.
         const row = this.#rows.get(bin);
-        if (value !== "" || !c.text || (row && row.slots.has(c.slot)) || !fresh.has(bin)) put(bin, c.slot, VALUE, c.encode(value));
+        if (value !== "" || !c.text || (row && slotOf(row, c.slot) !== undefined) || !fresh.has(bin)) put(bin, c.slot, VALUE, c.encode(value));
       }
     };
     const place = (bin: string, list: string, order: number, slot?: number) => {
@@ -2425,6 +2911,7 @@ export class Client {
           if (!Number.isInteger(slot) || slot < 16 || slot > 255) throw new RangeError("data slots are 16 to 255");
           const bin = idOf(id);
           const row = touch(bin, slot); // and what an editor has open in it goes first, and stands
+          rows.add(bin); // and it is shown as it is, though nothing be edited, or let go of if there is nothing
           const t = this.#text(row, slot);
           f(t, () => codec.binary(this.#host.random(8)));
           const stamp = this.#stamp(now);
@@ -2433,8 +2920,8 @@ export class Client {
             if (body.length > MAX_OPEN) throw new RangeError("an edit may be 1 MiB at most, less 192 bytes");
             rows.add(bin);
             cells.push({ row: bin, slot, kind: PIECE, stamp, body });
-            merge(row, slot, PIECE, stamp, body, mine);
-            row.views.clear();
+            merge(row, slot, cellOf(PIECE, stamp, body), mine);
+            unview(row);
           }
         },
       });

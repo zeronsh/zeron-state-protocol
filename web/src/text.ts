@@ -1043,6 +1043,27 @@ export function position(t: Text, id: string): [label: number, offset: number] |
   return [s.label, offset];
 }
 
+/**
+ * Where elements are along the text, deleted ones counted, as whole numbers from 1, and how many there are: for asking of
+ * many at once, made once. Each is null for an element not here.
+ */
+export function ordinals(t: Text): [ordinal: (id: string) => number | null, total: number] {
+  const start = new Map<Span, number>();
+  let n = 0;
+  for (const b of t.blocks) {
+    for (const s of b.spans) {
+      start.set(s, n - s.offset);
+      n += s.len;
+    }
+  }
+  const ordinal = (id: string): number | null => {
+    const offset = codec.u32Of(id, 8);
+    const s = spanOf(t.pieces.get(id.slice(0, 8)), offset);
+    return s === null ? null : start.get(s)! + offset + 1;
+  };
+  return [ordinal, n];
+}
+
 // Whether an element is here, and not deleted.
 export function standing(t: Text, id: string): boolean {
   const p = t.pieces.get(id.slice(0, 8));

@@ -257,8 +257,15 @@ bench)
 		! stale web/src/node.wasm || web_wasm
 		web_deps
 		ZSPD=build/zspd-speed$EXE node web/test/browsers.ts partial ${3:-100000}
-	elif [ "${2:-}" = mirror ]; then # what structured state costs a client: ./x bench mirror [rows]
-		lune run luau/tests/mirror_bench.luau ${3:-2000}
+	elif [ "${2:-}" = mirror ]; then # what structured state costs a client: ./x bench mirror [rows], or every case measured: ./x bench mirror table [rows...]
+		web_deps
+		if [ "${3:-}" = table ]; then
+			shift 3
+			$PYTHON bench/mirror.py luau "$@" && $PYTHON bench/mirror.py ts "$@"
+		else
+			lune run luau/tests/mirror_bench.luau ${3:-2000}
+			node --expose-gc web/test/mirror_bench.ts ${3:-2000}
+		fi
 	elif [ "${2:-}" = find ]; then # what it costs to ask: ./x bench find [rows]
 		odin build bench/find -out:build/bench-find$EXE -o:speed $STRICT
 		build/bench-find$EXE ${3:-1000000}

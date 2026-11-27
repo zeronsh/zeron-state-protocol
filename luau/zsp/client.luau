@@ -24,7 +24,6 @@ local WINDOW_QUICK = 0.25 -- seconds: a window used up within this grows
 local MAX_OPEN = 1048576 - 192
 local ZERO32 = string.rep("\0", 32)
 local ZERO16 = string.rep("\0", 16)
-local NONE = table.freeze({}) :: { any }
 
 local PIECE_BYTES = 4096 -- a piece is sealed at this size,
 local PIECE_MOST = 65536 - 128 -- and is never more, as no live frame a node carries is;
@@ -91,20 +90,157 @@ type Asked = {
 }
 export type Device = { read id: string, read subject: string }
 
-type Cell = { kind: number, stamp: string, body: string, author: Device?, key: string? } -- key: of a placement, where it puts the row
+-- A cell, as one string: its kind (1 byte), its stamp (16) and its body, the rest. One string rather than a table of
+-- three, which is a fifth of the memory and one allocation, read from what came in a single read.
+type Cell = string
+-- What a slot holds: its one cell, which is what almost every slot holds; or, of a text's pieces, several, by stamp.
+type Cells = Cell | { [string]: Cell }
+-- A row as it is held: one table, its cells under their slots' numbers beside its fields. What only some rows need is
+-- there only once they need it, so that a row no one edits, types in or views is three fields and its cells.
 type Stored = {
+	[number]: Cells, -- by slot
 	id: string,
-	slots: { [number]: { [string]: Cell } }, -- by stamp
-	dead: boolean,
 	pages: number, -- that hold it
-	texts: { [number]: text.Text },
-	held: { [number]: number }, -- open editors, by slot
+	version: number, -- counts changes to what it holds, that whoever reads it may know whether to again
+	dead: true?,
+	authors: { [string]: Device }?, -- who wrote each cell, by its slot (a byte) and stamp, where that is known
+	texts: { [number]: text.Text }?,
+	held: { [number]: number }?, -- open editors, by slot
 	asking: (() -> ())?, -- for the sake of those, while nothing else shows it: ends that
-	awaited: { () -> () }, -- by those, until it is here
-	lives: { [number]: number }, -- when live text was last heard, by slot
-	views: { [any]: Row }, -- by table, until the row changes
-	dirty: { [number]: boolean }, -- slots with live text to send
+	awaited: { () -> () }?, -- by those, until it is here
+	lives: { [number]: number }?, -- when live text was last heard, by slot
+	views: { [any]: Row }?, -- by table, until the row changes
+	dirty: { [number]: boolean }?, -- slots with live text to send
 }
+
+-- What a row is made from: room for its three fields and five cells, so that it is made once rather than grown.
+local ROW = { id = false, pages = false, version = false, a = false, b = false, c = false, d = false, e = false }
+for k in ROW do
+	ROW[k] = nil -- the room stays
+end
+
+local function cell(kind: number, stamp: string, body: string): Cell
+	return string.char(kind) .. stamp .. body
+end
+
+local function kind_of(c: Cell): number
+	return (string.byte(c, 1))
+end
+
+local function stamp_of(c: Cell): string
+	return string.sub(c, 2, 17)
+end
+
+local function body_of(c: Cell): string
+	return string.sub(c, 18)
+end
+
+-- The latest value in a slot, if any.
+local function latest(row: Stored, slot: number): Cell?
+	local v = row[slot]
+	if type(v) == "string" then
+		return if string.byte(v, 1) == VALUE then v else nil
+	end
+	local best: Cell? = nil
+	for _, c in v or {} :: any do
+		if string.byte(c, 1) == VALUE and (not best or c > best) then -- of one kind, the stamp decides
+			best = c
+		end
+	end
+	return best
+end
+
+-- Whose what is in a slot is: whom the last to write there goes by; or, `all`, everyone who has, in order of their names.
+local function whose(row: Stored, slot: number, all: boolean): any
+	local v = row[slot]
+	local authors = row.authors
+	local last: Cell? = nil
+	local names: { [string]: boolean } = {}
+	local function see(c: Cell)
+		if not last or stamp_of(c) > stamp_of(last) then
+			last = c
+		end
+		local who = if authors then authors[string.char(slot) .. stamp_of(c)] else nil
+		if who and who.subject ~= "" then
+			names[who.subject] = true
+		end
+	end
+	if type(v) == "string" then
+		see(v)
+	elseif v then
+		for _, c in v do
+			see(c)
+		end
+	end
+	if all then
+		local list: { string } = {}
+		for name in names do
+			table.insert(list, name)
+		end
+		table.sort(list)
+		return table.freeze(list)
+	end
+	local who = if last and authors then authors[string.char(slot) .. stamp_of(last)] else nil
+	return if who and who.subject ~= "" then who.subject else nil
+end
+
+-- Each cell of a slot, as a table: for what reads cells plainly, as tests do.
+local function cells_of(row: Stored, slot: number): { { kind: number, stamp: string, body: string, author: Device? } }
+	local out = {}
+	local v = row[slot]
+	local all: { Cell } = if type(v) == "string" then { v } else {}
+	if type(v) == "table" then
+		for _, c in v do
+			table.insert(all, c)
+		end
+	end
+	for _, c in all do
+		local stamp = stamp_of(c)
+		table.insert(out, { kind = kind_of(c), stamp = stamp, body = body_of(c), author = if row.authors then row.authors[string.char(slot) .. stamp] else nil })
+	end
+	return out
+end
+
+local function forget_author(row: Stored, slot: number, stamp: string)
+	local authors = row.authors
+	if authors then
+		authors[string.char(slot) .. stamp] = nil
+		if next(authors) == nil then
+			row.authors = nil
+		end
+	end
+end
+
+-- A slot's cells as compact as they go: one held as itself, none not at all.
+local function compact(row: Stored, slot: number)
+	local v = row[slot]
+	if type(v) == "table" then
+		local k, c = next(v)
+		if k == nil then
+			row[slot] = nil
+		elseif next(v, k) == nil then
+			row[slot] = c
+		end
+	end
+end
+
+-- Versions of rows, of every client here: no two states of any rows have the same, so that one is known again only as
+-- itself, though the row be let go of and come again.
+local versions = 0
+local function version(): number
+	versions += 1
+	return versions
+end
+
+-- That it holds something other than it did: what was read of it is to be read again.
+-- (A field set to nil that is not there is made there, empty, in a table that may have to grow for it: so it is only
+-- let go of where it is.)
+local function unview(row: Stored)
+	row.version = version()
+	if row.views then
+		row.views = nil
+	end
+end
 type Said = { [string]: { [string]: boolean } }
 -- What was written and not yet acknowledged; and the editors' texts sealed in it, by row and slot, told why should it never be durable.
 type Pending = { seq: number, scope: number, body: string, rows: { string }, cells: number, texts: { string }, done: (() -> ())? }
@@ -131,7 +267,8 @@ export type Window = {
 	size: number,
 	back: boolean, -- it begins at the end
 	pages: { Page },
-	entries: { { key: string, row: Stored } }, -- in order
+	keys: { string }, -- of the rows it holds, in order,
+	held: { Stored }, -- and the rows, each where its key is
 	at: { [Stored]: string }, -- where each of them is among them
 	bare: boolean, -- its observers want to know when it changes, not how it is
 	observers: { [(State) -> ()]: boolean },
@@ -205,12 +342,16 @@ function columns.string(slot: number): Column
 	return column(slot, "string", same, same)
 end
 
+local function encode_number(v: any): string
+	return string.pack(">d", v)
+end
+
+local function decode_number(s: string): any
+	return (string.unpack(">d", s))
+end
+
 function columns.number(slot: number): Column
-	return column(slot, "number", function(v)
-		return string.pack(">d", v)
-	end, function(s)
-		return (string.unpack(">d", s))
-	end)
+	return column(slot, "number", encode_number, decode_number)
 end
 
 function columns.boolean(slot: number): Column
@@ -309,7 +450,7 @@ local function new_client(host: Host)
 		followers = {} :: { Follower }, -- made anew as they change: what is being told stays as it was
 		typing = {} :: { [Stored]: boolean }, -- rows with live text to send
 		tags = {} :: { [number]: { key: string, lists: { [string]: string } } }, -- of lists, by their scope, while its key is the same
-		bulk = nil :: { [Window]: { { key: string, row: Stored } } }?, -- rows to add to windows, all at once
+		bulk = nil :: { [Window]: { Stored } }?, -- rows to add to windows, all at once
 		timers = {} :: { [() -> ()]: boolean }, -- what is to be done later, by the ways to cancel each
 	}, Client)
 	self:_dial()
@@ -596,7 +737,7 @@ end
 -- What editors have typed and not yet sealed, sealed, as the client ends.
 function Client._seal_all(self: Client)
 	for _, row in self.rows do
-		for slot, t in row.texts do
+		for slot, t in row.texts or {} do
 			if t.open ~= "" then
 				self:_seal(row, slot)
 			end
@@ -706,7 +847,7 @@ function Client._flush(self: Client)
 	local typing = self.typing
 	self.typing = {}
 	for row in typing do
-		if next(row.dirty) ~= nil then
+		if row.dirty and next(row.dirty) ~= nil then
 			self:_send_live(row)
 		end
 	end
@@ -1074,7 +1215,8 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 			size = query.size or 50,
 			back = from ~= "start",
 			pages = {},
-			entries = {},
+			keys = {},
+			held = {},
 			at = {},
 			bare = query.bare == true,
 			observers = {},
@@ -1125,7 +1267,11 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 		end,
 		-- The rows as they are held, in order: for what is built on the client, such as a mirror.
 		entries = function(): { { key: string, row: Stored } }
-			return window.entries
+			local out: { { key: string, row: Stored } } = table.create(#window.keys) :: any
+			for i, key in window.keys do
+				out[i] = { key = key, row = window.held[i] }
+			end
+			return out
 		end,
 		stop = function()
 			if stopped then
@@ -1195,9 +1341,10 @@ end
 -- What is not mentioned before the next sync is gone.
 function Client._mark(self: Client, page: Page)
 	local stale: Said = {}
-	for _, e in page.window.entries do
-		if e.key >= page.lo and e.key < page.hi then
-			stale[e.row.id] = {}
+	local held = page.window.held
+	for i, key in page.window.keys do
+		if key >= page.lo and key < page.hi then
+			stale[held[i].id] = {}
 		end
 	end
 	page.stale = stale
@@ -1251,8 +1398,8 @@ function Client._on_synced(self: Client, r: codec.Reader)
 		if lo >= hi then
 			return false
 		end
-		for _, e in window.entries do
-			if e.key >= lo and e.key < hi then
+		for _, key in window.keys do
+			if key >= lo and key < hi then
 				return true
 			end
 		end
@@ -1270,26 +1417,27 @@ function Client._on_synced(self: Client, r: codec.Reader)
 	end
 end
 
--- What was read of a row is read again when next it is wanted. Nothing keeps the table of views but the row, so one
--- that is empty already need not be made again: a cell comes for each column of each row, and this is all of them.
-local function unview(row: Stored)
-	if next(row.views) ~= nil then
-		row.views = {}
-	end
-end
-
 -- A range was said over again and this row was not in it: it was moved away, or deleted, while this client
 -- was not listening. Only its place there is known to be wrong. Where else it is, and what is being typed in
 -- it, stand.
 function Client._unplace(self: Client, row: Stored, lo: string, hi: string)
-	for slot = 1, 15 do
-		local cells = row.slots[slot]
-		if cells then
-			for stamp, c in cells do
-				local key = c.key :: string
+	for slot, v in row do
+		if type(slot) == "number" and slot >= 1 and slot <= 15 then
+			if type(v) == "string" then
+				local key = string.sub(v, 18, 41) .. row.id
 				if key >= lo and key < hi then
-					cells[stamp] = nil
+					row[slot] = nil
+					forget_author(row, slot, stamp_of(v))
 				end
+			else
+				for stamp, c in v do
+					local key = string.sub(c, 18, 41) .. row.id
+					if key >= lo and key < hi then
+						v[stamp] = nil
+						forget_author(row, slot, stamp)
+					end
+				end
+				compact(row, slot)
 			end
 		end
 	end
@@ -1302,21 +1450,42 @@ function Client._prune(self: Client, row: Stored, said: { [string]: boolean })
 	if self:_pending(row.id) then
 		return
 	end
-	local some = false
-	for slot, cells in row.slots do
-		local gone = false
-		for stamp in cells do
-			if not said[stamp] then
-				cells[stamp] = nil
-				gone = true
+	-- Which slots lost something, first: what is done for each may write in the row, which is not to be changed while it is
+	-- gone through.
+	local gone: { number } = {}
+	for slot, v in row do
+		if type(slot) ~= "number" then
+			continue
+		elseif type(v) == "string" then
+			if not said[stamp_of(v)] then
+				table.insert(gone, slot)
+			end
+		else
+			for stamp in v do
+				if not said[stamp] then
+					table.insert(gone, slot)
+					break
+				end
 			end
 		end
-		if gone then
-			some = true
-			self:_rebuild(row, slot)
-		end
 	end
-	if some then
+	for _, slot in gone do
+		local v = row[slot]
+		if type(v) == "string" then
+			forget_author(row, slot, stamp_of(v))
+			row[slot] = nil
+		elseif v then
+			for stamp in v do
+				if not said[stamp] then
+					v[stamp] = nil
+					forget_author(row, slot, stamp)
+				end
+			end
+			compact(row, slot)
+		end
+		self:_rebuild(row, slot)
+	end
+	if #gone > 0 then
 		unview(row)
 		self:_place(row)
 	end
@@ -1358,14 +1527,14 @@ function Client._visible(self: Client, window: Window, first: number, last: numb
 	if first <= near then
 		self:_load_before(window)
 	end
-	if last > #window.entries - near then
+	if last > #window.keys - near then
 		self:_load_after(window)
 	end
 	-- A page that has grown far past its size is two pages.
 	for i, page in window.pages do
 		local lo, hi = self:_span(window, page)
 		if not page.open and hi - lo > window.size * 2 then
-			local middle = window.entries[(lo + hi) // 2].key
+			local middle = window.keys[(lo + hi) // 2]
 			local upper = self:_page(window, middle, page.hi)
 			upper.open, upper.settled, upper.after = false, page.settled, page.after
 			page.hi = middle
@@ -1394,7 +1563,7 @@ function Client._visible(self: Client, window: Window, first: number, last: numb
 		if page.open or lo - window.size * 2 <= last then
 			break
 		end
-		local count = #window.entries - lo + 1
+		local count = #window.keys - lo + 1
 		table.remove(window.pages)
 		local edge = window.pages[#window.pages]
 		edge.after = math.max(edge.after, page.after + count)
@@ -1410,11 +1579,11 @@ end
 
 -- Position of the first entry at or past a key.
 function Client._find(self: Client, window: Window, key: string): number
-	local entries = window.entries
-	local lo, hi = 1, #entries + 1
+	local keys = window.keys
+	local lo, hi = 1, #keys + 1
 	while lo < hi do
 		local mid = (lo + hi) // 2
-		if entries[mid].key < key then
+		if keys[mid] < key then
 			lo = mid + 1
 		else
 			hi = mid
@@ -1425,17 +1594,22 @@ end
 
 function Client._trim(self: Client, window: Window)
 	local lo, hi = window.pages[1].lo, window.pages[#window.pages].hi
-	local kept = {}
-	table.clear(window.at)
-	for _, e in window.entries do
-		if e.key >= lo and e.key < hi then
-			table.insert(kept, e)
-			window.at[e.row] = e.key
+	local keys, held = window.keys, window.held
+	-- What lies outside is let go of; what is kept stays where it is, and is known where it was.
+	local n = 0
+	for i, key in keys do
+		local row = held[i]
+		if key >= lo and key < hi then
+			n += 1
+			keys[n], held[n] = key, row
 		else
-			self:_release(e.row)
+			window.at[row] = nil
+			self:_release(row)
 		end
 	end
-	window.entries = kept
+	for i = #keys, n + 1, -1 do
+		keys[i], held[i] = nil, nil
+	end
 	self:_touch(window)
 end
 
@@ -1444,8 +1618,8 @@ function Client._forget(self: Client, window: Window)
 	for _, page in window.pages do
 		self:_drop_page(page)
 	end
-	for _, e in window.entries do
-		self:_release(e.row)
+	for _, row in window.held do
+		self:_release(row)
 	end
 end
 
@@ -1454,7 +1628,7 @@ function Client._release(self: Client, row: Stored)
 	if row.pages == 0 and not row.asking and not row.dead then
 		self:_keep(row)
 	end
-	if row.pages == 0 and next(row.held) == nil and not self:_pending(row.id) then
+	if row.pages == 0 and not row.held and not self:_pending(row.id) then
 		self.rows[row.id] = nil
 	end
 end
@@ -1462,7 +1636,7 @@ end
 -- Has a row that is being edited shown, if nothing else shows it, so that what others write in it is heard of too.
 -- Calls back once it is here, or known not to be anywhere.
 function Client._keep(self: Client, row: Stored, here: (() -> ())?)
-	if row.pages > 0 or next(row.held) == nil then
+	if row.pages > 0 or not row.held then
 		if here then
 			here()
 		end
@@ -1473,16 +1647,20 @@ function Client._keep(self: Client, row: Stored, here: (() -> ())?)
 	end
 	local function release()
 		local awaited = row.awaited
-		row.awaited = {}
-		for _, f in awaited do
+		if awaited then
+			row.awaited = nil
+		end
+		for _, f in awaited or {} do
 			f()
 		end
 	end
 	if here then
-		table.insert(row.awaited, here)
+		local awaited = row.awaited or {}
+		row.awaited = awaited
+		table.insert(awaited, here)
 		-- Once, too: answered by one who holds everything if one can be reached, and otherwise with what is held, as a
 		-- partial replica with nobody to ask that can read answers it, never "ready". What waits for the row goes on then.
-		if #row.awaited == 1 then
+		if #awaited == 1 then
 			coroutine.wrap(function()
 				pcall(self.fetch, self, question())
 				release()
@@ -1498,7 +1676,7 @@ function Client._keep(self: Client, row: Stored, here: (() -> ())?)
 		end
 	end
 	local asked = self:ask(question(), hear)
-	if next(row.held) then
+	if row.held then
 		row.asking = asked.stop
 	else
 		asked.stop()
@@ -1516,9 +1694,10 @@ function Client._state(self: Client, window: Window): State
 	if state then
 		return state
 	end
-	local rows: { Row } = table.create(#window.entries) :: any
-	for i, e in window.entries do
-		rows[i] = self:_view(e.row, window.schema, e.key)
+	local rows: { Row } = table.create(#window.keys) :: any
+	local held = window.held
+	for i, key in window.keys do
+		rows[i] = self:_view(held[i], window.schema, key)
 	end
 	local status: "loading" | "stale" | "ready" | "denied" = "ready"
 	for _, page in window.pages do
@@ -1562,7 +1741,8 @@ end
 
 -- A row as the application sees it: one frozen table, the same one until something in it changes.
 function Client._view(self: Client, row: Stored, schema: Table, key: string): Row
-	local view = row.views[schema]
+	local views = row.views
+	local view = if views then views[schema] else nil
 	local order = codec.from_u64(string.sub(key, 17, 24))
 	if view and view.order == order then
 		return view
@@ -1570,45 +1750,41 @@ function Client._view(self: Client, row: Stored, schema: Table, key: string): Ro
 	local made: { [string]: any } = { id = row.id, order = order }
 	for name, c in schema do
 		if c.who then
-			local latest: Cell? = nil
-			local names: { [string]: boolean } = {}
-			for _, cell in row.slots[c.slot] or {} :: any do
-				if not latest or cell.stamp > latest.stamp then
-					latest = cell
-				end
-				if cell.author and cell.author.subject ~= "" then
-					names[cell.author.subject] = true
-				end
-			end
-			local list: { string } = {}
-			for name in names do
-				table.insert(list, name)
-			end
-			table.sort(list)
-			if c.who == "all" then
-				made[name] = table.freeze(list)
-			elseif latest and latest.author and latest.author.subject ~= "" then
-				made[name] = latest.author.subject
-			end
+			made[name] = whose(row, c.slot, c.who == "all")
 		elseif c.text then
-			local t = self:_text(row, c.slot)
-			made[name] = text.read(t)
+			made[name] = self:_read_text(row, c.slot)
 		else
-			local slot = row.slots[c.slot]
-			if slot then
-				for _, cell in slot do
-					if cell.kind == VALUE then
-						-- What cannot be read as the column's kind is no value, rather than the end of everything shown.
-						local fine, v = pcall(c.decode, cell.body)
-						made[name] = if fine then v else nil
-					end
-				end
+			local v = latest(row, c.slot)
+			if v then
+				-- What cannot be read as the column's kind is no value, rather than the end of everything shown.
+				local fine, x = pcall(c.decode, body_of(v))
+				made[name] = if fine then x else nil
 			end
 		end
 	end
 	table.freeze(made)
-	row.views[schema] = made :: any
+	if not views then
+		views = {}
+		row.views = views
+	end
+	(views :: any)[schema] = made
 	return made :: any
+end
+
+-- What a text column reads as. One that nothing has been typed in, only set, is what was set: there is no text to make of
+-- it until someone types, or reads it as a text.
+function Client._read_text(self: Client, row: Stored, slot: number): string
+	local t = if row.texts then row.texts[slot] else nil
+	if not t then
+		local v = row[slot]
+		if v == nil then
+			return ""
+		elseif type(v) == "string" and string.byte(v, 1) == VALUE then
+			return body_of(v)
+		end
+		return text.read(self:_text(row, slot))
+	end
+	return text.read(t)
 end
 
 -- ---------------------------------------------------------------- rows
@@ -1616,19 +1792,66 @@ end
 function Client._row(self: Client, id: string): Stored
 	local row = self.rows[id]
 	if not row then
-		local made: Stored = { id = id, slots = {}, dead = false, pages = 0, texts = {}, held = {}, lives = {}, views = {}, dirty = {}, asking = nil, awaited = {} }
+		local made: Stored = table.clone(ROW) :: any
+		made.id, made.pages, made.version = id, 0, version()
 		row = made
 		self.rows[id] = made
 	end
 	return row
 end
 
-local function bundle_has(body: string, stamp: string): boolean
-	local n: number = string.unpack(">I4", body) :: any
+local MAX_CELL = 1048576
+
+-- Whether a cell has the shape a node keeps (SPEC.md 1, as zsp/types.odin's cell_valid has it): a kind there is, in a slot
+-- for it, with all of its clear prefix, and a bundle whose stamps are in order and before its own. What has not is passed
+-- over, as a node would pass it over; whether whoever wrote it might is for the node to say.
+local function shaped(id: string, slot: number, c: Cell): boolean
+	local n = #c - 17
+	if n > MAX_CELL or string.byte(c, 2) >= 128 then -- a body too long, or a time of 2^63 or more
+		return false
+	end
+	local kind = string.byte(c, 1)
+	if kind == GRAVE then
+		return slot == 0
+	elseif kind == PLACE then
+		if slot < 1 or slot > 15 or n < 24 or string.unpack(">I4", c, 18) ~= string.unpack(">I4", id) then
+			return false
+		end
+		local a, b, d = string.unpack(">I4I4I4", c, 22)
+		return a ~= 0 or b ~= 0 or d ~= 0 -- not the scope's graveyard
+	elseif kind == VALUE or kind == PIECE then
+		return slot >= 16
+	elseif kind == BUNDLE then
+		if slot < 16 or n < 4 then
+			return false
+		end
+		local count: number = string.unpack(">I4", c, 18) :: any
+		if count == 0 or count > MAX_CELL // 16 or n < 4 + count * 16 then
+			return false
+		end
+		local prev = string.sub(c, 22, 37)
+		for i = 1, count - 1 do
+			local s = string.sub(c, 22 + i * 16, 37 + i * 16)
+			if s <= prev then
+				return false
+			end
+			prev = s
+		end
+		return prev < string.sub(c, 2, 17)
+	end
+	return false
+end
+
+-- Whether a bundle (a cell, its body from byte 18) holds a piece of this stamp. One too short to say holds none.
+local function bundle_has(c: Cell, stamp: string): boolean
+	if #c < 21 then
+		return false
+	end
+	local n: number = string.unpack(">I4", c, 18) :: any
 	local lo, hi = 0, n
 	while lo < hi do
 		local mid = (lo + hi) // 2
-		local s = string.sub(body, 5 + mid * 16, 20 + mid * 16)
+		local s = string.sub(c, 22 + mid * 16, 37 + mid * 16)
 		if s == stamp then
 			return true
 		elseif s < stamp then
@@ -1640,149 +1863,281 @@ local function bundle_has(body: string, stamp: string): boolean
 	return false
 end
 
--- Whether a cell is one a node could have sent: what the merge rule and placing read of it is there. One that is not, as
--- a bundle that says it holds more stamps than it does, is nonsense, and not to be looked through.
-local function sound(kind: number, slot: number, body: string): boolean
-	if kind == VALUE or kind == PIECE then
-		return slot >= 16
-	elseif kind == PLACE then
-		return slot >= 1 and slot <= 15 and #body >= 24
-	elseif kind == GRAVE then
-		return slot == 0
-	elseif kind == BUNDLE then
-		return slot >= 16 and #body >= 4 and 4 + (string.unpack(">I4", body) :: any) * 16 <= #body
-	end
-	return false
-end
-
--- The merge rule. Returns whether the cell was news.
-local function merge(row: Stored, slot: number, kind: number, stamp: string, body: string, author: Device?): boolean
+-- The merge rule, for a cell. Returns whether it was news.
+local function merge(row: Stored, slot: number, c: Cell, author: Device?): boolean
 	if row.dead then
 		return false
 	end
+	local kind = string.byte(c, 1)
 	if kind == GRAVE then
 		row.dead = true
-		row.slots = {}
+		for k in row do
+			if type(k) == "number" then
+				row[k] = nil
+			end
+		end
+		if row.authors then
+			row.authors = nil
+		end
 		return true
 	end
-	local cells = row.slots[slot]
-	if not cells then
-		cells = {}
-		row.slots[slot] = cells
-	end
-	if cells[stamp] then
-		return false
-	end
-	for s, c in cells do
-		if (c.kind == PLACE or c.kind == VALUE) and stamp <= s then
-			return false
-		elseif c.kind == BUNDLE and (kind == PIECE or kind == BUNDLE) and bundle_has(c.body, stamp) then
+	local slots = row
+	local v = slots[slot]
+	local stamp = if v == nil and not author then "" else string.sub(c, 2, 17)
+	if v == nil then
+		slots[slot] = c
+	elseif type(v) == "string" then
+		local s = string.sub(v, 2, 17)
+		if s == stamp then
 			return false
 		end
-	end
-	if kind == PLACE or kind == VALUE then
-		for s in cells do
-			if s < stamp then
-				cells[s] = nil
+		local k = string.byte(v, 1)
+		if (k == PLACE or k == VALUE) and stamp <= s then
+			return false
+		elseif k == BUNDLE and (kind == PIECE or kind == BUNDLE) and bundle_has(v, stamp) then
+			return false
+		end
+		local drop = false
+		if kind == PLACE or kind == VALUE then
+			drop = s < stamp
+		elseif kind == BUNDLE then
+			drop = (k == PIECE or k == BUNDLE) and bundle_has(c, s)
+		end
+		if drop then
+			forget_author(row, slot, s)
+			slots[slot] = c
+		else
+			slots[slot] = { [s] = v, [stamp] = c }
+		end
+	else
+		if v[stamp] then
+			return false
+		end
+		for s, x in v do
+			local k = string.byte(x, 1)
+			if (k == PLACE or k == VALUE) and stamp <= s then
+				return false
+			elseif k == BUNDLE and (kind == PIECE or kind == BUNDLE) and bundle_has(x, stamp) then
+				return false
 			end
 		end
-	elseif kind == BUNDLE then
-		for s, c in cells do
-			if (c.kind == PIECE or c.kind == BUNDLE) and bundle_has(body, s) then
-				cells[s] = nil
+		if kind == PLACE or kind == VALUE then
+			for s in v do
+				if s < stamp then
+					v[s] = nil
+					forget_author(row, slot, s)
+				end
+			end
+		elseif kind == BUNDLE then
+			for s, x in v do
+				local k = string.byte(x, 1)
+				if (k == PIECE or k == BUNDLE) and bundle_has(c, s) then
+					v[s] = nil
+					forget_author(row, slot, s)
+				end
 			end
 		end
+		v[stamp] = c
+		compact(row, slot)
 	end
-	cells[stamp] = { kind = kind, stamp = stamp, body = body, author = author, key = if kind == PLACE then string.sub(body, 1, 24) .. row.id else nil }
+	if author then
+		local authors = row.authors or {}
+		row.authors = authors
+		authors[string.char(slot) .. stamp] = author
+	end
 	return true
 end
 
-local function cells_of(self: Client, r: codec.Reader, touched: { [Stored]: boolean })
-	codec.varint(r)
-	-- Of pages and questions being said afresh, which is most often none, what has been said of each row.
-	local saids: { Said }? = nil
+-- Whether anything listens for what is said again, as a page or a question being sent afresh does.
+function Client._saying(self: Client): boolean
 	for _, page in self.pages do
 		if page.stale then
-			saids = saids or {}
-			table.insert(saids :: { Said }, page.stale)
+			return true
 		end
 	end
 	for _, a in self.asked do
 		if a.said then
-			saids = saids or {}
-			table.insert(saids :: { Said }, a.said)
+			return true
 		end
 	end
-	local id = ""
-	local buf, len = r.buf, r.len
-	while r.pos < len do
-		-- What every cell begins with, read at once, as all of it is there or the cell is not: the most of what is read.
-		local pos = r.pos
-		local tag = buffer.readu8(buf, pos)
-		if pos + (if tag < 128 then 34 else 18) > len then
-			error(codec.Malformed, 0)
-		end
-		if tag < 128 then
-			id = buffer.readstring(buf, pos + 1, 16)
-			pos += 16
-		elseif id == "" then
-			error(codec.Malformed, 0)
-		end
-		local slot = buffer.readu8(buf, pos + 1)
-		local stamp = buffer.readstring(buf, pos + 2, 16)
-		r.pos = pos + 18
-		local body = codec.bytes(r)
-		local author: Device? = nil
-		if bit32.btest(tag, 64) then
-			author = self.authors[codec.varint(r)]
-		end
-		if not sound(tag % 64, slot, body) then
-			error(codec.Malformed, 0)
-		end
-		self:_heard(stamp)
-		local row = self:_row(id)
-		touched[row] = true
-		for _, said in saids or NONE do
-			local of = said[id]
-			if of then
-				of[stamp] = true
-			end
-		end
-		self:_accept(row, slot, tag % 64, stamp, body, author)
-	end
+	return false
 end
 
 function Client._on_cells(self: Client, r: codec.Reader)
+	-- What came before any nonsense in a message is placed, as it is held; and so is let go of what has nothing in it.
 	local touched: { [Stored]: boolean } = {}
-	local fine, why = pcall(cells_of, self, r, touched)
-	self:_place_all(touched) -- what came before any nonsense is shown, as it is held
-	if not fine then
+	local ok, why = pcall(self._read_cells, self, r, touched)
+	self:_place_all(touched)
+	if not ok then
 		error(why, 0)
 	end
 end
 
-function Client._accept(self: Client, row: Stored, slot: number, kind: number, stamp: string, body: string, author: Device?): boolean
-	if not merge(row, slot, kind, stamp, body, author) then
+function Client._read_cells(self: Client, r: codec.Reader, touched: { [Stored]: boolean })
+	codec.varint(r)
+	-- Read straight from the message, which is this client's own copy: each cell is made one string in place, its kind
+	-- written just before its stamp, which is moved to just before its body, over what has been read already.
+	local buf, pos, len = r.buf, r.pos, r.len
+	local malformed = codec.Malformed
+	local rows = self.rows
+	local saying = self:_saying()
+	local id = ""
+	local scope = 0 -- of the row, as four bytes are read from a buffer
+	local row: Stored? = nil
+	while pos < len do
+		local tag = buffer.readu8(buf, pos)
+		pos += 1
+		if tag < 128 then
+			if pos + 16 > len then
+				error(malformed, 0)
+			end
+			id = buffer.readstring(buf, pos, 16)
+			scope = buffer.readu32(buf, pos)
+			pos += 16
+			row = rows[id] or self:_row(id)
+			touched[row :: Stored] = true
+		elseif not row then
+			error(malformed, 0) -- the same row as no row before it
+		end
+		if pos + 18 > len then -- slot, stamp, and a length
+			error(malformed, 0)
+		end
+		local slot = buffer.readu8(buf, pos)
+		local at = pos + 1
+		pos = at + 16
+		local size, scale = 0, 1
+		for k = 1, 11 do
+			if k == 11 or pos >= len then
+				error(malformed, 0) -- a length of more than ten bytes, or none
+			end
+			local b = buffer.readu8(buf, pos)
+			pos += 1
+			size += bit32.band(b, 127) * scale
+			if b < 128 then
+				break
+			end
+			scale *= 128
+		end
+		if size > len - pos then
+			error(malformed, 0)
+		end
+		-- What no node could have sent is nonsense, and ends the pipe: a kind there is not, in a slot not its kind's, a place
+		-- too short to say where, a bundle too short to hold what it says it does. What a node could have sent but would not
+		-- keep, as a place of another scope, is passed over, as it would be (see shaped).
+		local kind = tag % 64
+		local fine: boolean?
+		if kind == VALUE or kind == PIECE then
+			if slot < 16 then
+				error(malformed, 0)
+			end
+			fine = true
+		elseif kind == PLACE then
+			if slot < 1 or slot > 15 or size < 24 then
+				error(malformed, 0)
+			end
+			fine = buffer.readu32(buf, pos) == scope
+				and (buffer.readu32(buf, pos + 4) ~= 0 or buffer.readu32(buf, pos + 8) ~= 0 or buffer.readu32(buf, pos + 12) ~= 0)
+		elseif kind == GRAVE then
+			if slot ~= 0 then
+				error(malformed, 0)
+			end
+			fine = true
+		elseif kind == BUNDLE then
+			if slot < 16 or size < 4 or 4 + bit32.byteswap(buffer.readu32(buf, pos)) * 16 > size then
+				error(malformed, 0)
+			end
+			fine = nil -- looked at whole
+		else
+			error(malformed, 0)
+		end
+		if size > MAX_CELL or buffer.readu8(buf, at) >= 128 then
+			fine = false
+		end
+		-- What it says of the time, read before it is moved.
+		local ms = bit32.byteswap(buffer.readu32(buf, at)) * 65536 + bit32.rshift(bit32.byteswap(buffer.readu16(buf, at + 4)), 16)
+		local n = bit32.rshift(bit32.byteswap(buffer.readu16(buf, at + 6)), 16)
+		buffer.copy(buf, pos - 16, buf, at, 16)
+		buffer.writeu8(buf, pos - 17, tag % 64)
+		local c = buffer.readstring(buf, pos - 17, 17 + size)
+		pos += size
+		local author: Device? = nil
+		if bit32.btest(tag, 64) then
+			r.pos = pos
+			author = self.authors[codec.varint(r)]
+			pos = r.pos
+		end
+		if fine == false or (fine == nil and not shaped(id, slot, c)) then
+			continue -- what a node would not keep is passed over, as it would be
+		end
+		-- As late as anything heard of.
+		local known = self.clock_ms
+		if ms > known or (ms == known and n > self.clock_n) then
+			self.clock_ms, self.clock_n = ms, n
+		end
+		if saying then
+			local stamp = string.sub(c, 2, 17)
+			for _, page in self.pages do
+				local said = page.stale and page.stale[id]
+				if said then
+					said[stamp] = true
+				end
+			end
+			for _, a in self.asked do
+				local said = a.said and a.said[id]
+				if said then
+					said[stamp] = true
+				end
+			end
+		end
+		local into = row :: Stored
+		local slots = into
+		if slots[slot] == nil and not author and not into.dead and not into.texts and tag % 64 ~= GRAVE then
+			-- What almost every cell of a row heard for the first time is: one where there was none.
+			slots[slot] = c
+			versions += 1
+			into.version = versions
+			if into.views then
+				into.views = nil
+			end
+		else
+			self:_accept(into, slot, c, author)
+		end
+	end
+	r.pos = pos
+end
+
+function Client._accept(self: Client, row: Stored, slot: number, c: Cell, author: Device?): boolean
+	if not merge(row, slot, c, author) then
 		-- Known already; but perhaps not whose it is, or by what name they go now.
-		local cell = row.slots[slot] and row.slots[slot][stamp]
-		if cell and author then
-			if not cell.author or cell.author.subject ~= author.subject then
+		local stamp = string.sub(c, 2, 17)
+		local v = row[slot]
+		local held: Cell? = if type(v) == "string" then (if string.sub(v, 2, 17) == stamp then v else nil) elseif v then v[stamp] else nil
+		if held and author then
+			local authors = row.authors or {}
+			row.authors = authors
+			local was = authors[string.char(slot) .. stamp]
+			if not was or was.subject ~= author.subject then
 				unview(row)
 			end
-			cell.author = author
+			authors[string.char(slot) .. stamp] = author
 		end
-		if cell and cell.body ~= body then
-			cell.body = body -- less of it, since its author may no longer have written the rest
-			if cell.key then
-				cell.key = string.sub(body, 1, 24) .. row.id
+		if held and string.byte(held, 1) == BUNDLE and string.byte(c, 1) == BUNDLE and held ~= c and string.sub(held, 18) ~= string.sub(c, 18) then
+			-- A bundle with less of it, since its author may no longer have written the rest (SPEC.md 4): another body for what
+			-- is held is otherwise no news.
+			local less = string.sub(held, 1, 17) .. string.sub(c, 18)
+			if type(v) == "string" then
+				row[slot] = less
+			else
+				(v :: any)[stamp] = less
 			end
 			self:_rebuild(row, slot)
 		end
 		return false
 	end
-	local t = row.texts[slot]
+	local kind = string.byte(c, 1)
+	local t = if row.texts then row.texts[slot] else nil
 	if t and kind >= VALUE then
-		if text.apply(t, kind, stamp, body) == "rebuild" then
+		if text.apply(t, kind, string.sub(c, 2, 17), string.sub(c, 18)) == "rebuild" then
 			self:_rebuild(row, slot)
 		end
 	end
@@ -1792,35 +2147,93 @@ end
 
 -- The text in a slot, made from its cells when first wanted.
 function Client._text(self: Client, row: Stored, slot: number): text.Text
-	local t = row.texts[slot]
+	local texts = row.texts
+	local t = if texts then texts[slot] else nil
 	if not t then
 		t = text.new()
-		row.texts[slot] = t
-		local cells = row.slots[slot]
-		if cells then
-			local sorted: { Cell } = {}
-			for _, c in cells do
-				table.insert(sorted, c)
+		if not texts then
+			texts = {}
+			row.texts = texts
+		end
+		(texts :: any)[slot] = t
+		local v = row[slot]
+		if type(v) == "string" then
+			text.apply(t, string.byte(v, 1), stamp_of(v), body_of(v))
+		elseif v then
+			-- In the order of their stamps, which the set is keyed by: sorted as strings are, with nothing cut to compare.
+			local stamps: { string } = {}
+			for stamp in v do
+				table.insert(stamps, stamp)
 			end
-			table.sort(sorted, function(a: Cell, b: Cell)
-				return a.stamp < b.stamp
-			end)
-			for _, c in sorted do
-				text.apply(t, c.kind, c.stamp, c.body)
+			table.sort(stamps)
+			for _, stamp in stamps do
+				local c = v[stamp]
+				text.apply(t, string.byte(c, 1), stamp, body_of(c))
 			end
 		end
 	end
-	return t
+	return t :: text.Text
 end
 
 function Client._rebuild(self: Client, row: Stored, slot: number)
-	local old = row.texts[slot]
+	local texts = row.texts
+	local old = if texts then texts[slot] else nil
 	if old and old.open ~= "" then
 		self:_seal(row, slot) -- nothing typed here may be lost with it
 	end
-	row.texts[slot] = nil
-	row.lives[slot] = nil
+	texts = row.texts
+	if texts then
+		texts[slot] = nil
+		if next(texts) == nil then
+			row.texts = nil
+		end
+	end
+	local lives = row.lives
+	if lives then
+		lives[slot] = nil
+		if next(lives) == nil then
+			row.lives = nil
+		end
+	end
 	unview(row)
+end
+
+-- A place's key: the first 24 bytes of its body, and the row's id. Put together where it is to be read from, which is one
+-- string made rather than two, for a place as anyone writes it.
+local scratch = buffer.create(64)
+local function key_of(c: Cell, id: string): string
+	if #c == 41 then
+		buffer.writestring(scratch, 0, c)
+		buffer.writestring(scratch, 41, id)
+		return buffer.readstring(scratch, 17, 24 + #id)
+	end
+	return string.sub(c, 18, 41) .. id
+end
+
+-- Where a row is to be in a window: the least of its places in what the window spans.
+local function wanted(row: Stored, lo: string, hi: string): string?
+	if row.dead then
+		return nil
+	end
+	local want: string? = nil
+	for slot, v in row do
+		if type(slot) == "number" and slot >= 1 and slot <= 15 then
+			if type(v) == "string" then
+				local key = key_of(v, row.id)
+				if key >= lo and key < hi and (not want or key < want) then
+					want = key
+				end
+			else
+				for _, c in v do
+					local key = key_of(c, row.id)
+					if key >= lo and key < hi and (not want or key < want) then
+						want = key
+					end
+				end
+			end
+		end
+	end
+	return want
 end
 
 -- Puts a row where its placements say, in every window, and takes it from where they do not. Followers hear of it
@@ -1829,43 +2242,30 @@ function Client._place(self: Client, row: Stored, told: boolean?)
 	if not told then
 		self:_follow(row)
 	end
-	-- Where its placements put it: most often in one place, which needs no table of them.
-	local first: string? = nil
-	local more: { string }? = nil
-	if not row.dead then
-		for slot, cells in row.slots do
-			if slot <= 15 then
-				for _, c in cells do
-					if not first then
-						first = c.key
-					elseif more then
-						table.insert(more, c.key :: string)
-					else
-						more = { c.key :: string }
-					end
-				end
-			end
-		end
-	end
 	local left = false -- some window it was in, which is let go of only once where it now is is known
 	for _, window in self.windows do
 		if #window.pages > 0 then
-			local lo, hi = window.pages[1].lo, window.pages[#window.pages].hi
-			local want: string? = nil
-			if first and first >= lo and first < hi then
-				want = first
-			end
-			for _, key in more or NONE do
-				if key >= lo and key < hi and (not want or key < want) then
-					want = key
-				end
-			end
-			local entries = window.entries
+			local want = wanted(row, window.pages[1].lo, window.pages[#window.pages].hi)
+			local keys = window.keys
 			-- Where it is now, found by where it was: keys are in order, and each is a row's own.
 			local was = window.at[row]
 			local have: number? = if was then self:_find(window, was) else nil
-			if have and (not want or entries[have].key ~= want) then
-				table.remove(entries, have)
+			local queued = if self.bulk then self.bulk[window] else nil
+			if have and keys[have] ~= was and queued then
+				-- Not among them yet, but among those to be put in all at once: there it stays, or is taken out.
+				if want then
+					window.at[row] = want
+					continue
+				end
+				table.remove(queued, table.find(queued, row) :: number)
+				window.at[row] = nil
+				row.pages -= 1
+				left = true
+				continue
+			end
+			if have and (not want or keys[have] ~= want) then
+				table.remove(keys, have)
+				table.remove(window.held, have)
 				window.at[row] = nil
 				row.pages -= 1
 				left = true
@@ -1873,18 +2273,25 @@ function Client._place(self: Client, row: Stored, told: boolean?)
 				have = nil
 			end
 			if want and not have then
-				local e = { key = want, row = row }
 				local bulk = self.bulk
 				if bulk then
-					bulk[window] = bulk[window] or {}
-					table.insert(bulk[window], e)
+					local add = bulk[window]
+					if not add then
+						add = {}
+						bulk[window] = add
+					end
+					table.insert(add, row)
 				else
-					table.insert(entries, self:_find(window, want), e)
+					local at = self:_find(window, want)
+					table.insert(keys, at, want)
+					table.insert(window.held, at, row)
 				end
 				window.at[row] = want
 				row.pages += 1
-				self:_touch(window)
-			elseif want then
+				if window.state or not window.changed then
+					self:_touch(window)
+				end
+			elseif want and (window.state or not window.changed) then
 				self:_touch(window)
 			end
 		end
@@ -1894,7 +2301,7 @@ function Client._place(self: Client, row: Stored, told: boolean?)
 		self:_keep(row)
 	end
 	self:_touch_asked(row)
-	if row.pages <= 0 and next(row.held) == nil and (row.dead or not self:_pending(row.id)) then
+	if row.pages <= 0 and not row.held and (row.dead or not self:_pending(row.id)) then
 		if next(self.asked) ~= nil and not row.dead then
 			self.loose[row.id] = true
 		else
@@ -1903,9 +2310,10 @@ function Client._place(self: Client, row: Stored, told: boolean?)
 	end
 end
 
--- Places rows, each once. Many at once go into windows at once: sorted together, rather than each moving all after it.
--- Followers hear of them all first, so that whatever they do of it is done before any row is half put, as one held
--- where it goes and not yet among the rows there.
+-- Places rows, each once. Many at once go into windows at once: sorted among themselves, by their keys as strings,
+-- which needs no call for each comparison, and then merged with what was there. Followers hear of them all first, so
+-- that whatever they do of it is done before any row is half put, as one held where it goes and not yet among the rows
+-- there.
 function Client._place_all(self: Client, rows: { [Stored]: boolean })
 	local many = 0
 	for _ in rows do
@@ -1914,7 +2322,7 @@ function Client._place_all(self: Client, rows: { [Stored]: boolean })
 			break
 		end
 	end
-	if many <= 64 then
+	if many <= 64 or self.bulk then
 		for row in rows do
 			self:_place(row)
 		end
@@ -1923,28 +2331,60 @@ function Client._place_all(self: Client, rows: { [Stored]: boolean })
 	for row in rows do
 		self:_follow(row)
 	end
-	local bulk: { [Window]: { { key: string, row: Stored } } } = {}
-	self.bulk = bulk
+	self.bulk = {}
 	for row in rows do
 		self:_place(row, true)
 	end
+	self:_merge_bulk()
+end
+
+
+function Client._merge_bulk(self: Client)
+	local bulk = self.bulk
 	self.bulk = nil
-	for window, add in bulk do
-		-- By their keys, which are each a row's own, sorted as strings are: quicker than asking a function of every pair.
-		local entries = window.entries
-		local by: { [string]: { key: string, row: Stored } } = {}
-		local keys = table.create(#entries + #add) :: { string }
-		for _, e in entries do
-			by[e.key] = e
-			table.insert(keys, e.key)
+	for window, add in bulk or {} :: any do
+		local at = window.at
+		local m = #add
+		local keys: { string } = table.create(m) :: any
+		local sorted = true
+		for i, row in add do
+			local key = at[row]
+			keys[i] = key
+			sorted = sorted and (i == 1 or keys[i - 1] < key)
 		end
-		for _, e in add do
-			by[e.key] = e
-			table.insert(keys, e.key)
+		local placed: { Stored } = add
+		if not sorted then
+			-- Sorted as strings, which needs no call for each comparison; and each found again by its key.
+			local by: { [string]: Stored } = {}
+			for i, row in add do
+				by[keys[i]] = row
+			end
+			table.sort(keys)
+			placed = table.create(m) :: any
+			for i, key in keys do
+				placed[i] = by[key]
+			end
 		end
-		table.sort(keys)
-		for i, k in keys do
-			entries[i] = by[k :: string]
+		local old_keys, old_held = window.keys, window.held
+		local n = #old_keys
+		if n == 0 or (m > 0 and old_keys[n] < keys[1]) then
+			table.move(keys, 1, m, n + 1, old_keys)
+			table.move(placed, 1, m, n + 1, old_held)
+		else
+			local out_keys: { string } = table.create(n + m) :: any
+			local out_held: { Stored } = table.create(n + m) :: any
+			local i, j, k = 1, 1, 0
+			while i <= n or j <= m do
+				k += 1
+				if i <= n and (j > m or old_keys[i] < keys[j]) then
+					out_keys[k], out_held[k] = old_keys[i], old_held[i]
+					i += 1
+				else
+					out_keys[k], out_held[k] = keys[j], placed[j]
+					j += 1
+				end
+			end
+			window.keys, window.held = out_keys, out_held
 		end
 	end
 end
@@ -2208,7 +2648,7 @@ end
 function Client._sweep(self: Client)
 	for id in self.loose do
 		local row = self.rows[id]
-		if row and row.pages <= 0 and next(row.held) == nil and not self:_pending(id) then
+		if row and row.pages <= 0 and not row.held and not self:_pending(id) then
 			self.rows[id] = nil
 		end
 	end
@@ -2240,10 +2680,10 @@ function Client._answer(self: Client, a: Asked): Answer
 			-- A row's order is that of its first place.
 			local key = string.rep("\0", 40)
 			for slot = 1, 15 do
-				local cells = row.slots[slot]
-				local _, c = next(cells or {} :: { [string]: Cell })
+				local v = row[slot]
+				local c: Cell? = if type(v) == "string" then v elseif v then select(2, next(v)) else nil
 				if c then
-					key = c.key :: string
+					key = string.sub(c, 18, 41) .. id
 					break
 				end
 			end
@@ -2278,23 +2718,29 @@ function Client._on_live(self: Client, r: codec.Reader)
 	if text.live(t, piece, offset, codec.rest(r)) == "changed" then
 		unview(row)
 		self:_place(row)
-		if not row.lives[slot] then
+		local lives = row.lives or {}
+		row.lives = lives
+		if not lives[slot] then
 			self:_expire(row, slot)
 		end
-		row.lives[slot] = self.host.now()
+		lives[slot] = self.host.now()
 	end
 end
 
 -- Live text whose writer vanished before sealing it is not text.
 function Client._expire(self: Client, row: Stored, slot: number)
 	self:_after(LIVE_SECONDS, function()
-		local last = row.lives[slot]
-		local t = row.texts[slot]
+		local lives = row.lives
+		local last = if lives then lives[slot] else nil
+		local t = if row.texts then row.texts[slot] else nil
 		if not last or not t then
 			return
 		end
 		if not text.provisional(t) then
-			row.lives[slot] = nil
+			(lives :: any)[slot] = nil
+			if next(lives :: any) == nil then
+				row.lives = nil
+			end
 		elseif self.host.now() - last >= LIVE_SECONDS then
 			self:_rebuild(row, slot)
 			self:_place(row)
@@ -2305,9 +2751,10 @@ function Client._expire(self: Client, row: Stored, slot: number)
 end
 
 function Client._send_live(self: Client, row: Stored)
-	for slot in row.dirty do
-		row.dirty[slot] = nil
-		local t = row.texts[slot]
+	local dirty = row.dirty
+	row.dirty = nil
+	for slot in dirty or {} do
+		local t = if row.texts then row.texts[slot] else nil
 		if t and t.open ~= "" then
 			local piece, offset, bytes = text.flush(t)
 			if bytes ~= "" and self.ready then
@@ -2321,7 +2768,7 @@ function Client._send_live(self: Client, row: Stored)
 				self:_frame(LIVE, w)
 			end
 			if t.size >= PIECE_BYTES then
-				self:_seal(row, slot)
+				self:_seal_shown(row, slot)
 			end
 		end
 	end
@@ -2338,18 +2785,27 @@ function Client._mine(self: Client, scope: number): Device?
 	return if s and bit32.btest(s.rights, 128) then self.authors[0] else nil
 end
 
-function Client._seal(self: Client, row: Stored, slot: number)
-	local t = row.texts[slot]
+-- Seals what is typed, and has it shown: the text is as it was, but whose it is may not be.
+function Client._seal_shown(self: Client, row: Stored, slot: number)
+	if self:_seal(row, slot) then
+		self:_place(row)
+	end
+end
+
+function Client._seal(self: Client, row: Stored, slot: number): boolean
+	local t = if row.texts then row.texts[slot] else nil
 	if not t or t.open == "" then
-		return
+		return false
 	end
 	local stamp = self:_stamp()
 	local body = text.close(t, stamp)
 	if body then
-		merge(row, slot, PIECE, stamp, body, self:_mine(string.unpack(">I4", row.id) :: any))
+		merge(row, slot, cell(PIECE, stamp, body), self:_mine(string.unpack(">I4", row.id) :: any))
 		unview(row)
 		self:_send_cells({ { row = row.id, slot = slot, kind = PIECE, stamp = stamp, body = body } })
+		return true
 	end
+	return false
 end
 
 -- An editor for a text column. Edits show here at once, reach everyone watching as they are made, and
@@ -2362,9 +2818,11 @@ function Client.text(self: Client, id: string, col: Column)
 	local scope: number = string.unpack(">I4", id) :: any
 	-- What is done before there is a row to do it to: none is held, or another editor of it waits for it still.
 	local was = self.rows[id]
-	local early: { () -> () }? = if was == nil or was.pages == 0 or #was.awaited > 0 then {} else nil
+	local early: { () -> () }? = if was == nil or was.pages == 0 or (was.awaited ~= nil and #was.awaited > 0) then {} else nil
 	local row = self:_row(id)
-	row.held[slot] = (row.held[slot] or 0) + 1
+	local holding = row.held or {}
+	row.held = holding
+	holding[slot] = (holding[slot] or 0) + 1
 	local closed, ended = false, false
 	-- What is typed before the row is here is typed in it once it is: until then, what is to be done then waits for it.
 	local applied: { () -> () }? = if early then {} else nil
@@ -2376,7 +2834,9 @@ function Client.text(self: Client, id: string, col: Column)
 		return self.host.random(8)
 	end
 	local function edited()
-		row.dirty[slot] = true
+		local dirty = row.dirty or {}
+		row.dirty = dirty
+		dirty[slot] = true
 		self.typing[row] = true
 		unview(row)
 		self:_place(row)
@@ -2387,7 +2847,7 @@ function Client.text(self: Client, id: string, col: Column)
 		if not timer then
 			timer = self:_after(PIECE_SECONDS, function()
 				timer = nil
-				self:_seal(row, slot)
+				self:_seal_shown(row, slot)
 			end)
 		end
 	end
@@ -2413,12 +2873,16 @@ function Client.text(self: Client, id: string, col: Column)
 			timer()
 		end
 		self:_seal(row, slot)
-		row.held[slot] -= 1
-		if row.held[slot] == 0 then
-			row.held[slot] = nil
+		local holding = row.held :: { [number]: number }
+		holding[slot] -= 1
+		if holding[slot] == 0 then
+			holding[slot] = nil
+			if next(holding) == nil then
+				row.held = nil
+			end
 		end
 		local asking = row.asking
-		if asking and next(row.held) == nil then
+		if asking and not row.held then
 			row.asking = nil
 			asking()
 		end
@@ -2542,11 +3006,11 @@ function Client.text(self: Client, id: string, col: Column)
 			local waiting = applied
 			if waiting then
 				table.insert(waiting, function()
-					self:_seal(row, slot)
+					self:_seal_shown(row, slot)
 				end)
 				return
 			end
-			self:_seal(row, slot)
+			self:_seal_shown(row, slot)
 		end,
 		-- Seals what has been written, and yields until it is acknowledged, durable on the node the client speaks to, and
 		-- all the client wrote before it. Returns true; or false and why, should it never be (Client.flushed).
@@ -2740,7 +3204,7 @@ function Client._settle(self: Client, p: Pending)
 		local n = self.unacked[id] - 1
 		self.unacked[id] = if n > 0 then n else nil
 		local row = self.rows[id]
-		if n == 0 and row and row.pages == 0 and next(row.held) == nil then
+		if n == 0 and row and row.pages == 0 and not row.held then
 			self.rows[id] = nil
 		end
 	end
@@ -2779,16 +3243,19 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			if row then
 				-- What editors have open in the row is their own writing, sent whatever becomes of this change: first, then,
 				-- so that undoing the change cannot take it back, and what the change writes over it is later.
-				for k, t in row.texts do
+				for k, t in row.texts or {} do
 					if t.open ~= "" then
 						self:_seal(row, k)
 					end
 				end
 				local slots = {}
-				for k, cs in row.slots do
-					slots[k] = table.clone(cs)
+				for k, v in row do
+					if type(k) == "number" then
+						slots[k] = if type(v) == "table" then table.clone(v) else v
+					end
 				end
-				was = { dead = row.dead, slots = slots, touched = {} }
+				local authors = row.authors
+				was = { dead = row.dead, slots = slots, authors = if authors then table.clone(authors) else nil, touched = {} }
 			else
 				was = false
 			end
@@ -2805,7 +3272,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		local stamp = self:_stamp(now)
 		rows[row] = true
 		table.insert(cells, { row = row, slot = slot, kind = kind, stamp = stamp, body = body })
-		self:_accept(stored, slot, kind, stamp, body, mine)
+		self:_accept(stored, slot, cell(kind, stamp, body), mine)
 	end
 	local function set(id: string, schema: Table, values: { [string]: any })
 		for name, value in values do
@@ -2816,7 +3283,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			end
 			-- Empty text is what a text is before anything is written: it need only be said to clear one.
 			local row = self.rows[id]
-			if value ~= "" or not c.text or (row and row.slots[c.slot]) or not fresh[id] then
+			if value ~= "" or not c.text or (row and row[c.slot]) or not fresh[id] then
 				put(id, c.slot, VALUE, c.encode(value))
 			end
 		end
@@ -2848,7 +3315,8 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		end,
 		edit = function(id, slot, f)
 			assert(slot >= 16 and slot <= 255 and slot % 1 == 0, "data slots are 16 to 255")
-			local row = keep(id, slot) -- and what an editor has open in it goes first, and stands
+			local row = keep(id, slot) -- what an editor has open goes first, and stands; and the row is known as it was, or as not there
+			rows[id] = true -- and is shown as it is, though nothing be edited, or let go of if there is nothing
 			local t = self:_text(row, slot)
 			f(t, function(): string
 				return self.host.random(8)
@@ -2859,7 +3327,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 				assert(#body <= MAX_OPEN, "an edit may be 1 MiB at most, less 192 bytes")
 				rows[id] = true
 				table.insert(cells, { row = id, slot = slot, kind = PIECE, stamp = stamp, body = body })
-				merge(row, slot, PIECE, stamp, body, mine)
+				merge(row, slot, cell(PIECE, stamp, body), mine)
 				unview(row)
 			end
 		end,
@@ -2877,26 +3345,65 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		end
 	end)
 	if not ok then
-		-- All or nothing: whatever was done here is undone, and nothing is said.
+		-- All or nothing: whatever was done here is undone, and nothing is said. What editors had open in the rows it
+		-- touched was sealed, and stands: those rows are shown as they now are.
+		local back: { [Stored]: boolean } = {}
 		for id, was in saved do
 			local row = self.rows[id]
 			if row and was then
 				row.dead = was.dead
-				row.slots = was.slots
+				for k in row do
+					if type(k) == "number" then
+						row[k] = nil
+					end
+				end
+				for k, v in was.slots do
+					row[k] = v
+				end
+				row.authors = was.authors
 				for slot in was.touched do
-					row.texts[slot] = nil -- read again from its cells when next wanted
-					row.lives[slot] = nil
+					-- Read again from its cells when next wanted.
+					if row.texts then
+						row.texts[slot] = nil
+						if next(row.texts) == nil then
+							row.texts = nil
+						end
+					end
+					if row.lives then
+						row.lives[slot] = nil
+						if next(row.lives) == nil then
+							row.lives = nil
+						end
+					end
 				end
 				unview(row)
+				back[row] = true
 			elseif row then
 				-- Nothing of it was held before, and nothing of this change is.
-				row.dead, row.slots, row.texts, row.lives = false, {}, {}, {}
+				if row.dead then
+					row.dead = nil
+				end
+				for k in row do
+					if type(k) == "number" then
+						row[k] = nil
+					end
+				end
+				if row.authors then
+					row.authors = nil
+				end
+				if row.texts then
+					row.texts = nil
+				end
+				if row.lives then
+					row.lives = nil
+				end
 				unview(row)
-				if row.pages == 0 and next(row.held) == nil and not self:_pending(id) then
+				if row.pages == 0 and not row.held and not self:_pending(id) then
 					self.rows[id] = nil
 				end
 			end
 		end
+		self:_place_all(back)
 		error(why, 0)
 	end
 	if #cells > 0 then
@@ -3226,4 +3733,14 @@ function Client._on_flow(self: Client, r: codec.Reader)
 	end
 end
 
-return table.freeze({ connect = new_client, columns = columns })
+return table.freeze({
+	connect = new_client,
+	columns = columns,
+	-- For what is built on the client: a row's cells, read plainly; the latest value in a slot; who wrote in one; and how
+	-- the columns that are not made up read, to read them straight from a cell.
+	cells = cells_of,
+	latest = latest,
+	whose = whose,
+	same = same,
+	decode_number = decode_number,
+})

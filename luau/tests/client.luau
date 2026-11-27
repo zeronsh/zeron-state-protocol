@@ -3,6 +3,7 @@
 
 local codec = require("../zsp/codec")
 local zsp = require("../zsp")
+local zsp_client = require("../zsp/client")
 
 -- `./x selftest` sets ZSP_FAIL, to see that ./x test says this failed.
 if require("@lune/process").env.ZSP_FAIL then
@@ -522,7 +523,7 @@ do
 	answer_fetch(h, id)
 	h.run()
 	local row = h.client:held(id)
-	assert(row and next(row.held) == nil and row.asking == nil, "it is held for ever")
+	assert(row and (row.held == nil or next(row.held) == nil) and row.asking == nil, "it is held for ever")
 	assert(h.last(33), "and asked for for ever")
 	assert(zsp.Text.read(h.client:held_text(id, 17) :: any) == "hello!", "what was typed is not what was asked")
 	local written = false
@@ -2289,9 +2290,9 @@ do
 		for _, id in { mine, theirs, other } do
 			local row = h.client:held(id)
 			table.insert(out, if row then "row" else "none")
-			for slot, cells in row and row.slots or {} :: any do
-				for stamp in cells do
-					table.insert(out, `{slot}:{stamp}`)
+			for slot = 0, if row then 255 else -1 do
+				for _, c in zsp_client.cells(row :: any, slot) do
+					table.insert(out, `{slot}:{c.stamp}`)
 				end
 			end
 		end
@@ -2442,7 +2443,7 @@ do
 	h.run()
 	assert(editor.read() == "over", `what was written over is {editor.read()}`)
 	local cells = 0
-	for _, c in (h.client:held(id) :: any).slots[17] do
+	for _, c in zsp_client.cells(h.client:held(id) :: any, 17) do
 		cells += 1
 		assert(c.kind == 3, "what was typed outlived what was written over it")
 	end
@@ -2537,6 +2538,758 @@ do
 		Text.delete(t, rnd(Text.len(t)), 1, fresh)
 	end
 	assert(asked / 9000 < 100, `{asked / 9000} spans looked at for each of 9000 edits of a text of {Text.len(t)} bytes`)
+
+end
+
+-- What a document has read of what is gone is let go of: it keeps what is there, however much has come and gone.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local m = zsp.mirror
+	local Step = m.map({ n = zsp.number(16) })
+	local Task = m.map({
+		title = zsp.string(16),
+		steps = m.list(17, Step),
+		tags = m.record(zsp.string(16)),
+		plan = m.tree(18, m.map({ label = zsp.string(16) })),
+		meta = m.map({ note = zsp.string(16), marks = m.list(17, m.map({ label = zsp.string(16) })), more = m.map({ x = zsp.string(16) }) }),
+	})
+	local Doc = m.map({
+		tasks = m.list(18, Task),
+		outline = m.tree(19, m.map({ name = zsp.string(16) })),
+		people = m.record(Task),
+		nest = m.tree(20, m.map({ name = zsp.string(16), inner = m.tree(17, m.map({ v = zsp.string(16) })) })),
+	})
+	local doc: any = m.open(h.client, { scope = 1, name = "churn", schema = Doc })
+	-- And one that only watches: it writes nothing, and so never has a write to tidy up after.
+	local watcher: any = m.open(h.client, { scope = 1, name = "churn", schema = Doc })
+	h.run()
+	local seq = 0
+	local function acked()
+		local w = codec.writer()
+		seq += 1
+		codec.put_varint(w, 1000000) -- everything written so far is durable
+		h.tell(ACK, codec.string(w))
+	end
+	local function full(round: number): any
+		local tasks, outline, people, nest = {}, {}, {}, {}
+		for i = 1, 40 do
+			tasks[i] = {
+				title = `t{round}.{i}`,
+				steps = { { n = 1 }, { n = 2 } },
+				tags = { a = "x", b = "y" },
+				plan = { { label = "r", children = { { label = "c1" } } } },
+				meta = if i % 2 == 0 then { note = "n", marks = { { label = "m" } } } else {}, -- some maps within never written
+			}
+			outline[i] = { name = `n{round}.{i}`, children = { { name = "leaf" } } }
+			people[`p{i}`] = { title = `who {round}`, steps = { { n = round } } } -- the same keys, which keep their rows
+			nest[i] = { name = `o{i}`, inner = { { v = "r", children = { { v = "c1" } } } }, children = {} } -- a tree within a tree
+		end
+		return { tasks = tasks, outline = outline, people = people, nest = nest }
+	end
+	local most: { [string]: number } = {}
+	local stray: { string } = {}
+	for round = 1, 6 do
+		doc.set(full(round))
+		h.run()
+		acked()
+		assert(#doc.state().tasks == 40 and #doc.state().outline == 40, "all of it is there")
+		-- A node given another child, so that the order of what hangs from it is read.
+		doc.update(function(d)
+			for _, task in d.tasks do
+				table.insert(task.plan[1].children, { label = "c2" })
+			end
+			for _, node in d.nest do
+				table.insert(node.inner[1].children, { v = "c2" })
+			end
+		end)
+		h.run()
+		acked()
+		-- Rows that say they are in a field of the document no schema has, as a writer who minds nothing may write: made, and
+		-- deleted below.
+		local raw = zsp.custom(255, function(v)
+			return v
+		end, function(v)
+			return v
+		end)
+		local root = doc.state().id
+		h.client:write(1, function(change)
+			for i = 1, 5 do
+				local field = `stray {round}.{i}`
+				stray[i] = change.insert({ ["\0where"] = raw }, "mirror/churn", 0, {
+					["\0where"] = root .. string.char(#field) .. field .. "\1" .. string.rep("m", 12),
+				})
+			end
+		end)
+		h.run()
+		acked()
+		-- Half of what holds anything deleted on its own first, as another might: what was in it is let go of next.
+		h.client:write(1, function(change)
+			for i, task in doc.state().tasks do
+				if i % 2 == 0 then
+					change.delete(task.id)
+				end
+			end
+		end)
+		h.run()
+		acked()
+		h.client:write(1, function(change)
+			for _, id in stray do
+				change.delete(id)
+			end
+		end)
+		doc.set({ tasks = {}, outline = {}, people = {}, nest = {} })
+		h.run()
+		acked()
+		assert(#doc.state().tasks == 0 and #doc.state().outline == 0, "and then none of it")
+		for who, d in { doc = doc, watcher = watcher } do
+			for name, n in d._sizes() do
+				local k = who .. " " .. name
+				if round == 2 then
+					most[k] = n
+				elseif round > 2 then
+					assert(n <= most[k], `{k} grows with what came and went: {n} after round {round}, {most[k]} after round 2`)
+				end
+			end
+		end
+	end
+	-- No more than of what is held: the document's rows, and those of keys let go of, which keep theirs to be set again.
+	local held = 0
+	for _ in h.client.rows do
+		held += 1
+	end
+	for who, d in { doc = doc, watcher = watcher } do
+		for name, n in d._sizes() do
+			assert(n <= 2 * held + 8, `{who} {name} keeps {n} things for {held} rows held`)
+		end
+	end
+	watcher.stop()
+	doc.stop()
+end
+
+-- A place is in slots 1 to 15: one written in slot 0, where only a deletion is, is nonsense, and ends the pipe; the row
+-- stays where it was put.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local state: any = nil
+	h.client:window({ scope = 1, list = "a", table = Note }, function(s)
+		state = s
+	end)
+	h.run()
+	local id = string.pack(">I4I4", 1, 1) .. string.rep("z", 8)
+	local function cells(slot: number, n: number): string
+		local w = codec.writer()
+		codec.put_varint(w, 0)
+		codec.put_u8(w, 2)
+		codec.put(w, id)
+		codec.put_u8(w, slot)
+		codec.put(w, string.pack(">I4I2I2", 27466, n, 0) .. string.rep("s", 8))
+		codec.put_bytes(w, h.client:_tag(1, "a") .. codec.u64(1))
+		return codec.string(w)
+	end
+	h.tell(CELLS, cells(1, 1))
+	assert(state and #state.rows == 1, "a place in slot 1 is one")
+	h.tell(CELLS, cells(0, 2))
+	assert(h.self.closes == 1, "the pipe was not let go of")
+	assert(#state.rows == 1, "and the row was let go of")
+end
+
+-- What a node could have sent but would not keep is passed over, as it would be, and is the end of nothing here. (What no
+-- node could have sent ends the pipe: see above.)
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local state: any = nil
+	h.client:window({ scope = 1, list = "a", table = Note }, function(s)
+		state = s
+	end)
+	h.run()
+	local tag = h.client:_tag(1, "a")
+	local n = 0
+	local function frame(cells: { { id: string, kind: number, slot: number, body: string } }): string
+		local w = codec.writer()
+		codec.put_varint(w, 0)
+		for _, c in cells do
+			n += 1
+			codec.put_u8(w, c.kind)
+			codec.put(w, c.id)
+			codec.put_u8(w, c.slot)
+			codec.put(w, string.pack(">I4I2I2", 27466, n, 0) .. string.rep("s", 8))
+			codec.put_bytes(w, c.body)
+		end
+		return codec.string(w)
+	end
+	local function row(k: number): string
+		return string.pack(">I4I4", 1, 1) .. string.rep(string.char(64 + k), 8)
+	end
+	-- Places in another scope's list, or the graveyard.
+	h.tell(CELLS, frame({ { id = row(4), kind = 2, slot = 1, body = string.pack(">I4", 2) .. string.sub(tag, 5) .. codec.u64(1) } }))
+	h.tell(CELLS, frame({ { id = row(5), kind = 2, slot = 1, body = string.pack(">I4", 1) .. string.rep("\0", 12) .. codec.u64(1) } }))
+	assert(#state.rows == 0, "none of those is a place")
+	-- Bundles that hold no stamps, or hold them out of order.
+	local piece = string.rep("p", 8) .. "\1" .. string.rep("\0", 12) .. "\2hi"
+	local s1 = string.pack(">I4I2I2", 27466, n + 2, 0) .. string.rep("s", 8)
+	h.tell(CELLS, frame({
+		{ id = row(6), kind = 2, slot = 1, body = tag .. codec.u64(1) },
+		{ id = row(6), kind = 4, slot = 17, body = piece },
+	}))
+	for _, body in { string.pack(">I4", 0), string.pack(">I4", 2) .. s1 .. s1 } do
+		h.tell(CELLS, frame({ { id = row(6), kind = 5, slot = 17, body = body } }))
+	end
+	assert(#state.rows == 1, "the row with a place is there")
+	local kept = zsp_client.cells(h.client:held(row(6)), 17)
+	assert(#kept == 1 and kept[1].kind == 4, "and its piece, which no such bundle takes away")
+	assert(h.self.closes == 0, "and the pipe is as it was")
+end
+
+-- Nonsense in cells, too, ends the pipe and nothing else, as it does in TypeScript: a cell of the row before it with no row
+-- before it, a length of more than ten bytes, a cell that runs past the end of its message.
+for _, body in { "\0" .. string.char(2 + 128, 1) .. string.rep("\0", 16) .. "\0", "\0" .. "\2" .. string.rep("r", 16) .. "\1" .. string.rep("\0", 16) .. string.rep("\128", 160) .. "\0", "\0" .. "\2" .. string.rep("r", 16) .. "\1" .. string.rep("\0", 16) .. "\40abc" } do
+	local h = harness()
+	h.run()
+	h.greet()
+	local rows = 0
+	for _ in h.client.rows do
+		rows += 1
+	end
+	h.tell(CELLS, body)
+	assert(h.self.closes == 1, "the pipe is let go of")
+	local after = 0
+	for id in h.client.rows do
+		assert(#id == 16, "and no row is made of nothing")
+		after += 1
+	end
+end
+
+-- A length may be padded, to ten bytes and no more (SPEC.md 2): what says where a row is, with more, says nothing.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local m = zsp.mirror
+	local Doc = m.map({ items = m.list(18, m.map({ n = zsp.number(16) })) })
+	local doc: any = m.open(h.client, { scope = 1, name = "padded", schema = Doc })
+	h.run()
+	doc.set({ items = { { n = 1 } } })
+	h.run()
+	local id = doc.state().items[1].id
+	local body = string.sub(zsp_client.latest(h.client:held(id), 255) :: string, 18)
+	assert(string.byte(body, 17) == 5, "the field's length is one byte")
+	local raw = zsp.custom(255, function(v)
+		return v
+	end, function(v)
+		return v
+	end)
+	local function said(length: string)
+		h.client:write(1, function(change)
+			change.set(id, { ["\0where"] = raw }, { ["\0where"] = string.sub(body, 1, 16) .. length .. string.sub(body, 18) })
+		end)
+		h.run()
+	end
+	said("\133" .. string.rep("\128", 8) .. "\0")
+	assert(#doc.state().items == 1, "ten bytes are five")
+	said("\133" .. string.rep("\128", 9) .. "\0")
+	assert(#doc.state().items == 0, "eleven are nothing")
+	doc.stop()
+end
+
+-- Of two moves that make a loop, the later is undone: a node's word on where it is, said again as it was, is later, and
+-- what is shown follows it, as it does for whoever reads it all afresh.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local m = zsp.mirror
+	local Doc = m.map({ outline = m.tree(19, m.map({ name = zsp.string(16) })) })
+	local doc: any = m.open(h.client, { scope = 1, name = "loop", schema = Doc })
+	h.run()
+	doc.set({ outline = { { name = "a" }, { name = "b" } } })
+	h.run()
+	local a, b = doc.state().outline[1].id, doc.state().outline[2].id
+	local function where_of(id: string): string
+		return string.sub(zsp_client.latest(h.client:held(id), 255) :: string, 18)
+	end
+	local wa, wb = where_of(a), where_of(b)
+	local raw = zsp.custom(255, function(v)
+		return v
+	end, function(v)
+		return v
+	end)
+	local function said(id: string, body: string)
+		h.client:write(1, function(change)
+			change.set(id, { ["\0where"] = raw }, { ["\0where"] = body })
+		end)
+		h.run()
+	end
+	-- Each under the other, by a marker that is nowhere, and back where it was should that be undone.
+	local head = string.sub(wa, 1, 25)
+	local function under(parent: string, back: string): string
+		return head .. parent .. string.rep("x", 12) .. string.rep("\0", 16) .. string.sub(back, 42, 53)
+	end
+	local under_b = under(b, wa)
+	said(a, under_b)
+	said(b, under(a, wb))
+	assert(#doc.state().outline == 1 and doc.state().outline[1].id == b, "b, which moved later, is back where it was")
+	said(a, under_b)
+	local fresh: any = m.open(h.client, { scope = 1, name = "loop", schema = Doc })
+	h.run()
+	assert(fresh.state().outline[1].id == a, "a, said again, moved later")
+	assert(doc.state().outline[1].id == a, "and so it is in the document as it was open")
+	fresh.stop()
+	doc.stop()
+end
+
+-- Whose a cell is, is the cell's: two of one row with the same stamp in two slots, as two writers may have, are each their
+-- own writer's; and a place said over again as gone takes whose it was with it.
+do
+	local AUTHOR = 17
+	local h = harness()
+	h.run()
+	h.greet()
+	h.tell(AUTHOR, "\1" .. string.rep("e", 32) .. "\3zoe")
+	h.tell(AUTHOR, "\2" .. string.rep("e", 32) .. "\3ann")
+	local T = { a = zsp.string(16), b = zsp.string(17), wa = zsp.author(16), wb = zsp.author(17) }
+	local first: any, second: any = nil, nil
+	h.client:window({ scope = 1, list = "a", table = T }, function(s)
+		first = s
+	end)
+	h.client:window({ scope = 1, list = "b", table = T }, function(s)
+		second = s
+	end)
+	h.run()
+	local id = string.pack(">I4I4", 1, 1) .. string.rep("w", 8)
+	local function stamp(n: number): string
+		return string.pack(">I4I2I2", 27466, n, 0) .. string.rep("s", 8)
+	end
+	local function cell(w: any, kind: number, slot: number, n: number, body: string, who: number)
+		codec.put_u8(w, kind + 64)
+		codec.put(w, id)
+		codec.put_u8(w, slot)
+		codec.put(w, stamp(n))
+		codec.put_bytes(w, body)
+		codec.put_varint(w, who)
+	end
+	local w = codec.writer()
+	codec.put_varint(w, 0)
+	cell(w, 2, 1, 1, h.client:_tag(1, "a") .. codec.u64(1), 1)
+	cell(w, 2, 2, 1, h.client:_tag(1, "b") .. codec.u64(1), 2)
+	cell(w, 3, 16, 2, "x", 1)
+	cell(w, 3, 17, 2, "y", 2)
+	h.tell(CELLS, codec.string(w))
+	assert(first.rows[1].wa == "zoe" and first.rows[1].wb == "ann", "each is its own writer's")
+	w = codec.writer()
+	codec.put_varint(w, 0)
+	cell(w, 3, 17, 3, "z", 2)
+	h.tell(CELLS, codec.string(w))
+	assert(first.rows[1].wa == "zoe" and first.rows[1].wb == "ann", "and stays so when the other is written over")
+	-- The first window's range said over again without the row: its place there is gone, and whose that was.
+	local page, lo, hi = nil, nil, nil
+	for _, said in h.self.said do
+		if said.kind == WATCH and not page then
+			page, _, lo, hi = watch_of(said)
+		end
+	end
+	synced(h, page, 2, lo, hi)
+	synced(h, page, 1, lo, hi)
+	assert(#first.rows == 0 and #second.rows == 1, "gone from the one, and not from the other")
+	for key in h.client:held(id).authors or {} do
+		assert(string.byte(key) ~= 1, "and nothing is kept of whose its place in slot 1 was")
+	end
+end
+
+-- In a scope that says whose what is written is, a text edited in a change is this client's; and so is what it types, once
+-- sealed, which whoever shows the row is told, though the text is as it was.
+do
+	local AUTHOR = 17
+	local h = harness()
+	h.run()
+	h.tell(ROSTER, string.rep("\0", 8) .. "\1" .. string.char(7 + 128) .. string.rep("k", 32))
+	h.tell(AUTHOR, "\0" .. string.rep("d", 32) .. "\2me")
+	local T = { body = zsp.text(17), by = zsp.author(17) }
+	local state: any = nil
+	h.client:window({ scope = 1, list = "a", table = T }, function(s)
+		state = s
+	end)
+	h.run()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(T, "a", 1, {})
+	end)
+	h.run()
+	h.client:write(1, function(change)
+		change.edit(id, 17, function(t, fresh)
+			zsp.Text.insert(t, 0, "hi", fresh)
+		end)
+	end)
+	h.run()
+	assert(state.rows[1].body == "hi" and state.rows[1].by == "me", "an edit in a change is whose the change is")
+	local typing = h.client:text(id, T.body)
+	h.run()
+	typing.insert(0, ">")
+	h.run()
+	local told = 0
+	h.client:window({ scope = 1, list = "a", table = T }, function(s)
+		told += 1
+		state = s
+	end)
+	told = 0
+	for _, f in table.clone(h.self.later) do
+		f() -- the piece is sealed once a second has passed
+	end
+	h.run()
+	assert(told > 0, "whoever shows the row is told")
+	assert(state.rows[1].body == ">hi" and state.rows[1].by == "me", "and the text is whose it is")
+	typing.close()
+end
+
+-- A row let go of while it was out of a document is not deleted, and when it is held again, saying nothing that can be read
+-- of where it is, what is in it is not let go of, as what was in a row deleted is.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local m = zsp.mirror
+	local Task = m.map({ title = zsp.string(16), steps = m.list(17, m.map({ n = zsp.number(16) })) })
+	local Doc = m.map({ title = zsp.string(16), tasks = m.list(18, Task) })
+	local doc: any = m.open(h.client, { scope = 1, name = "away", schema = Doc })
+	h.run()
+	local function acked()
+		local w = codec.writer()
+		codec.put_varint(w, 1000000)
+		h.tell(ACK, codec.string(w))
+	end
+	doc.set({ title = "t", tasks = { { title = "a", steps = { { n = 1 } } } } })
+	h.run()
+	acked()
+	local task = doc.state().tasks[1].id
+	local step = doc.state().tasks[1].steps[1].id
+	-- Out of the document's list, and let go of from memory.
+	h.client:write(1, function(change)
+		change.place(task, "elsewhere", 0)
+	end)
+	h.run()
+	acked()
+	assert(h.client:held(task) == nil, "let go of")
+	doc._mark(task) -- read again, as mirror.ask has a row read: it is not held, and so as good as gone
+	doc._refresh()
+	-- Back, saying nothing of where it is that can be read.
+	local raw = zsp.custom(255, function(v)
+		return v
+	end, function(v)
+		return v
+	end)
+	h.client:write(1, function(change)
+		change.place(task, "mirror/away", 0)
+		change.set(task, { ["\0where"] = raw }, { ["\0where"] = "nonsense" })
+	end)
+	h.run()
+	acked()
+	doc.set({ title = "u", tasks = {} })
+	h.run()
+	local held = h.client:held(step)
+	assert(held and not held.dead, "what is in it is not deleted")
+end
+
+-- Whoever follows rows may write as it hears of them, while many come at once: what it deletes goes, what it makes comes,
+-- and what was there stays.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local state: any = nil
+	h.client:window({ scope = 1, list = "a", table = Note }, function(s)
+		state = s
+	end)
+	h.run()
+	local innocent = ""
+	h.client:write(1, function(change)
+		innocent = change.insert(Note, "a", 0, { title = "innocent" })
+	end)
+	h.run()
+	local w = codec.writer()
+	codec.put_varint(w, 0)
+	local ids = {}
+	for i = 1, 70 do
+		ids[i] = string.pack(">I4I4", 1, 1) .. string.pack(">I8", i)
+		codec.put_u8(w, 2)
+		codec.put(w, ids[i])
+		codec.put_u8(w, 1)
+		codec.put(w, string.pack(">I4I2I2", 27466, i, 0) .. string.rep("s", 8))
+		codec.put_bytes(w, h.client:_tag(1, "a") .. codec.u64(i))
+	end
+	local heard, made = 0, 0
+	local stop = h.client:follow(function(id: string)
+		if id == innocent then
+			return
+		end
+		heard += 1
+		if heard == 2 then
+			h.client:write(1, function(change)
+				change.delete(ids[1])
+			end)
+		elseif heard == 3 then
+			h.client:write(1, function(change)
+				for i = 1, 65 do
+					change.insert(Note, "a", 100 + i, { title = `made {i}` })
+					made += 1
+				end
+			end)
+		end
+	end)
+	h.tell(CELLS, codec.string(w))
+	stop()
+	h.run()
+	assert(#state.rows == 1 + 69 + made, `all of it is there: {#state.rows}`)
+	local seen = {}
+	for i, row in state.rows do
+		assert(row.id ~= ids[1], "but what was deleted")
+		assert(not seen[row.id], "each once")
+		seen[row.id] = true
+		if i > 1 then
+			assert(state.rows[i - 1].order <= row.order, "in order")
+		end
+	end
+	assert(seen[innocent], "and what was there stays")
+end
+
+-- An item that shared a marker with one before it, which is then deleted, shares it with nothing: writing the list again
+-- leaves it where it is, rather than give it a marker of its own it no longer needs.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local m = zsp.mirror
+	local Doc = m.map({ items = m.list(18, m.map({ n = zsp.number(16) })) })
+	local doc: any = m.open(h.client, { scope = 1, name = "shared", schema = Doc })
+	h.run()
+	doc.set({ items = { { n = 1 }, { n = 2 }, { n = 3 } } })
+	h.run()
+	local items = doc.state().items
+	local first, second = items[1].id, items[2].id
+	if second < first then
+		first, second = second, first -- the later by id is the one that shares
+	end
+	local function where_of(id: string): string
+		return zsp_client.latest(h.client:held(id), 255) :: string
+	end
+	local raw = zsp.custom(255, function(v)
+		return v
+	end, function(v)
+		return v
+	end)
+	h.client:write(1, function(change)
+		change.set(second, { ["\0where"] = raw }, { ["\0where"] = string.sub(where_of(first), 18) })
+	end)
+	h.run()
+	h.client:write(1, function(change)
+		change.delete(first)
+	end)
+	h.run()
+	assert(#doc.state().items == 2, "two are left")
+	local was = where_of(second)
+	local list = table.clone(doc.state().items)
+	for i, item in list do
+		if item.id ~= second then
+			local changed = table.clone(item)
+			changed.n += 10
+			list[i] = changed
+		end
+	end
+	doc.set({ items = list })
+	h.run()
+	assert(where_of(second) == was, "what shares nothing now is left where it is")
+	doc.stop()
+end
+
+-- A change that fails undoes what it did, but not what an editor had open in a row it touched, which it seals first: that
+-- stands, and is shown, with whose it is.
+do
+	local AUTHOR = 17
+	local h = harness()
+	h.run()
+	h.tell(ROSTER, string.rep("\0", 8) .. "\1" .. string.char(7 + 128) .. string.rep("k", 32))
+	h.tell(AUTHOR, "\0" .. string.rep("d", 32) .. "\2me")
+	local T = { title = zsp.string(16), body = zsp.text(17), by = zsp.author(17) }
+	local state: any = nil
+	h.client:window({ scope = 1, list = "a", table = T }, function(s)
+		state = s
+	end)
+	h.run()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(T, "a", 1, { title = "t" })
+	end)
+	h.run()
+	local typing = h.client:text(id, T.body)
+	h.run()
+	typing.insert(0, "abc")
+	h.run()
+	assert(state.rows[1].body == "abc" and state.rows[1].by == nil, "typed, and not yet sealed")
+	local fine = pcall(function()
+		h.client:write(1, function(change)
+			change.set(id, T, { title = "t2" })
+			error("changed my mind")
+		end)
+	end)
+	assert(not fine)
+	h.run()
+	assert(state.rows[1].title == "t" and state.rows[1].body == "abc", "the change is undone")
+	assert(state.rows[1].by == "me", "and what was typed is sealed, and shown as whose it is")
+	typing.close()
+end
+
+-- An edit of a row not held, in a change that fails, leaves nothing held.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local ghost = string.pack(">I4I4", 1, 1) .. string.rep("g", 8)
+	local fine = pcall(function()
+		h.client:write(1, function(change)
+			change.edit(ghost, 16, function(t, fresh)
+				zsp.Text.insert(t, 0, "hello", fresh)
+				error("boom")
+			end)
+		end)
+	end)
+	assert(not fine)
+	assert(h.client:held(ghost) == nil, "nothing is held of it")
+end
+
+-- A cell said again with less of it, as a node says one whose writer may no longer have written all of it, is of the same
+-- kind: another kind with the same stamp is no shorter bundle, nor makes one that names what came after it.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local T = { body = zsp.text(17) }
+	local state: any = nil
+	h.client:window({ scope = 1, list = "a", table = T }, function(s)
+		state = s
+	end)
+	h.run()
+	local id = string.pack(">I4I4", 1, 1) .. string.rep("b", 8)
+	local function stamp(n: number): string
+		return string.pack(">I4I2I2", 27466, n, 0) .. string.rep("s", 8)
+	end
+	local function frame(kind: number, slot: number, n: number, body: string): string
+		local w = codec.writer()
+		codec.put_varint(w, 0)
+		codec.put_u8(w, kind)
+		codec.put(w, id)
+		codec.put_u8(w, slot)
+		codec.put(w, stamp(n))
+		codec.put_bytes(w, body)
+		return codec.string(w)
+	end
+	local ops = "\1\0\0\2ab"
+	h.tell(CELLS, frame(2, 1, 1, h.client:_tag(1, "a") .. codec.u64(1)))
+	h.tell(CELLS, frame(4, 17, 2, string.rep("p", 8) .. ops))
+	-- A bundle of that piece, then a value with the bundle's stamp that would name a piece still to come.
+	h.tell(CELLS, frame(5, 17, 3, string.pack(">I4", 1) .. stamp(2) .. stamp(2) .. string.rep("p", 8) .. string.char(#ops) .. ops))
+	h.tell(CELLS, frame(3, 17, 3, string.pack(">I4", 1) .. stamp(9)))
+	h.tell(CELLS, frame(4, 17, 9, string.rep("q", 8) .. "\1\0\0\5hello"))
+	assert(string.find(state.rows[1].body, "hello", 1, true), "what came after is not taken for bundled")
+	assert(string.find(state.rows[1].body, "ab", 1, true), "and what was is there")
+	-- And of anything but a bundle, another body for what is held is no news (SPEC.md 4), whatever its length.
+	local Titled = { title = zsp.string(16) }
+	local titled: any = nil
+	h.client:window({ scope = 1, list = "a", table = Titled }, function(s)
+		titled = s
+	end)
+	h.run()
+	h.tell(CELLS, frame(3, 16, 20, "kept"))
+	h.tell(CELLS, frame(3, 16, 20, "else"))
+	h.tell(CELLS, frame(3, 16, 20, "longer than it"))
+	assert(titled.rows[1].title == "kept", "a value said again otherwise is as it was first said")
+end
+
+-- A change that edits nothing still has what editors had open sealed, and shown; and of a row not held, leaves nothing held.
+do
+	local AUTHOR = 17
+	local h = harness()
+	h.run()
+	h.tell(ROSTER, string.rep("\0", 8) .. "\1" .. string.char(7 + 128) .. string.rep("k", 32))
+	h.tell(AUTHOR, "\0" .. string.rep("d", 32) .. "\2me")
+	local T = { body = zsp.text(17), by = zsp.author(17) }
+	local state: any = nil
+	h.client:window({ scope = 1, list = "a", table = T }, function(s)
+		state = s
+	end)
+	h.run()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(T, "a", 1, {})
+	end)
+	h.run()
+	local typing = h.client:text(id, T.body)
+	h.run()
+	typing.insert(0, "hi")
+	h.run()
+	h.client:write(1, function(change)
+		change.edit(id, 18, function() end)
+	end)
+	h.run()
+	assert(state.rows[1].body == "hi" and state.rows[1].by == "me", "sealed, and shown")
+	typing.close()
+	local ghost = string.pack(">I4I4", 1, 1) .. string.rep("h", 8)
+	h.client:write(1, function(change)
+		change.edit(ghost, 17, function() end)
+	end)
+	h.run()
+	assert(h.client:held(ghost) == nil, "nothing is held of a row not held that nothing was written in")
+end
+
+-- A message that ends in nonsense leaves nothing held of what it began.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local ghost = string.pack(">I4I4", 1, 1) .. string.rep("n", 8)
+	h.tell(CELLS, "\0" .. "\3" .. ghost)
+	assert(h.self.closes == 1, "the pipe is let go of")
+	assert(h.client:held(ghost) == nil, "and nothing is held of the row it began")
+end
+
+-- A place said again in a shape no node keeps, while a range is said over again, is not said: the row goes from the range,
+-- as in TypeScript.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local state: any = nil
+	h.client:window({ scope = 1, list = "a", table = Note }, function(s)
+		state = s
+	end)
+	h.run()
+	local id = string.pack(">I4I4", 1, 1) .. string.rep("y", 8)
+	local function place(body: string): string
+		local w = codec.writer()
+		codec.put_varint(w, 0)
+		codec.put_u8(w, 2)
+		codec.put(w, id)
+		codec.put_u8(w, 1)
+		codec.put(w, string.pack(">I4I2I2", 27466, 1, 0) .. string.rep("s", 8))
+		codec.put_bytes(w, body)
+		return codec.string(w)
+	end
+	h.tell(CELLS, place(h.client:_tag(1, "a") .. codec.u64(1)))
+	assert(#state.rows == 1)
+	local page, lo, hi = nil, nil, nil
+	for _, said in h.self.said do
+		if said.kind == WATCH then
+			page, _, lo, hi = watch_of(said)
+		end
+	end
+	synced(h, page, 1, lo, hi)
+	synced(h, page, 2, lo, hi)
+	h.tell(CELLS, place(string.pack(">I4", 2) .. string.sub(h.client:_tag(1, "a"), 5) .. codec.u64(1))) -- in another scope's list
+	synced(h, page, 1, lo, hi)
+	assert(#state.rows == 0, "what was not said is gone")
 end
 
 -- ---------------------------------------------------------------- calls
@@ -3086,7 +3839,6 @@ do
 	assert(table.concat(faults, ", ") == "answered lost, made lost", table.concat(faults, ", "))
 	assert(next(h.client.calls) == nil and next(h.client.answers) == nil)
 end
-
 -- ---------------------------------------------------------------- what is written, as a client ends
 
 -- The cells a client said, of every frame of Cells from the given one on: by what kind each is.
@@ -3499,6 +4251,371 @@ do
 	h.run()
 	assert(h.self.connects == 1, "a client refused for good dialled again")
 	assert(flushed.done and flushed.ok == false, "flushed() said all it wrote was delivered")
+end
+
+-- Two clients that hear what each other writes, as a node would send it; and a way to make one's writing later than the
+-- other's, at the same time, by writing as much more elsewhere first.
+local function pair()
+	local a, b = harness(), harness()
+	for _, h in { a, b } do
+		h.run()
+		h.greet()
+	end
+	local told = { [a] = 0, [b] = 0 }
+	local function share()
+		for _, from in { a, b } do
+			local to = if from == a then b else a
+			for i = told[from] + 1, #from.self.said do
+				local x = from.self.said[i]
+				if x.kind == CELLS then
+					local r = codec.reader(x.body)
+					codec.varint(r)
+					to.tell(CELLS, "\0" .. codec.rest(r))
+				end
+			end
+			told[from] = #from.self.said
+		end
+	end
+	return a, b, share
+end
+-- How many rows a client deleted, in what it said from `since` on.
+local function graves(h: any, since: number): number
+	local n = 0
+	for i = since + 1, #h.self.said do
+		local x = h.self.said[i]
+		if x.kind == CELLS then
+			local r = codec.reader(x.body)
+			codec.varint(r)
+			while r.pos < r.len do
+				local tag = codec.u8(r)
+				if tag < 128 then
+					codec.take(r, 16)
+				end
+				codec.u8(r)
+				codec.take(r, 16)
+				codec.bytes(r)
+				if tag % 64 == 1 then
+					n += 1
+				end
+			end
+		end
+	end
+	return n
+end
+local function later(h: any)
+	for _ = 1, 30 do
+		h.client:write(1, function(change)
+			change.insert({ n = zsp.number(16) }, "elsewhere", 0, { n = 1 })
+		end)
+	end
+	h.run()
+end
+
+-- A text not given where the document has not come yet is not written: an empty one over it, newer, would wipe what
+-- another typed in it meanwhile.
+do
+	local m = zsp.mirror
+	local Doc = m.map({ title = zsp.string(16), notes = zsp.text(17) })
+	local a, b, share = pair()
+	local da: any = m.open(a.client, { scope = 1, name = "unheard", schema = Doc })
+	local db: any = m.open(b.client, { scope = 1, name = "unheard", schema = Doc })
+	a.run()
+	b.run()
+	da.set({ notes = "what a typed" })
+	a.run()
+	later(b)
+	db.set({ title = "hello" }) -- b has heard nothing of the document
+	b.run()
+	share()
+	assert(da.state().title == "hello")
+	assert(da.state().notes == "what a typed", "what a typed was wiped by what b did not say")
+	assert(db.state().notes == "what a typed")
+	da.stop()
+	db.stop()
+end
+
+-- A key of a record within a key let go of is let go of as a key is, not deleted, which would be for ever: so that it can
+-- be set again, in the change that sets its key again or any after.
+do
+	local m = zsp.mirror
+	local Doc = m.map({ title = zsp.string(16), outer = m.record(m.map({ inner = m.record(zsp.number(17)) })) })
+	local h = harness()
+	h.run()
+	h.greet()
+	local d: any = m.open(h.client, { scope = 1, name = "keys", schema = Doc })
+	h.run()
+	for _, step in { { "1", { x = { inner = { k = 1 } } } }, { "2", {} }, { "3", { x = { inner = { k = 42 } } } }, { "4", { x = { inner = { k = 99 } } } } } :: { any } do
+		d.set({ title = step[1], outer = step[2] })
+		h.run()
+		local x = d.state().outer.x
+		local want = if step[2].x then step[2].x.inner.k else nil
+		assert((if x then x.inner.k else nil) == want, `set {step[1]}`)
+	end
+	d.stop()
+end
+-- And one another put in it while it was let go of here, let go of by what this writes next, is too.
+do
+	local m = zsp.mirror
+	local Doc = m.map({ groups = m.record(m.map({ members = m.record(zsp.string(16)) })) })
+	local a, b, share = pair()
+	local da: any = m.open(a.client, { scope = 1, name = "groups", schema = Doc })
+	local db: any = m.open(b.client, { scope = 1, name = "groups", schema = Doc })
+	a.run()
+	b.run()
+	da.set({ groups = { team = { members = { alice = "lead" } } } })
+	a.run()
+	share()
+	db.set({ groups = { team = { members = { alice = "lead", bob = "eng" } } } })
+	b.run()
+	later(a)
+	da.set({ groups = {} }) -- after what b did, which a has not heard
+	a.run()
+	share()
+	local since = #a.self.said
+	da.set({ groups = { other = { members = {} } } }) -- and so bob, in team let go of, is let go of too
+	a.run()
+	assert(graves(a, since) == 0, "a key was deleted, for ever, at a node, which keeps what is deleted")
+	share()
+	assert(da.state().groups.team == nil, "team is let go of")
+	db.set({ groups = { other = { members = {} }, team = { members = { bob = "back" } } } })
+	b.run()
+	share()
+	local team = da.state().groups.team
+	assert(team and team.members.bob == "back", "bob can never be set again")
+	assert(db.state().groups.team.members.bob == "back")
+	da.stop()
+	db.stop()
+end
+
+-- And the key set again with it, here, has it as it is set: what is set again is not let go of after.
+do
+	local m = zsp.mirror
+	local Doc = m.map({ groups = m.record(m.map({ members = m.record(zsp.string(16)) })) })
+	local a, b, share = pair()
+	local da: any = m.open(a.client, { scope = 1, name = "again", schema = Doc })
+	local db: any = m.open(b.client, { scope = 1, name = "again", schema = Doc })
+	a.run()
+	b.run()
+	da.set({ groups = { team = { members = { alice = "lead" } } } })
+	a.run()
+	share()
+	db.set({ groups = { team = { members = { alice = "lead", bob = "eng" } } } })
+	b.run()
+	later(a)
+	da.set({ groups = {} })
+	a.run()
+	share()
+	da.set({ groups = { team = { members = { bob = "mine" } } } })
+	a.run()
+	share()
+	local team = da.state().groups.team
+	assert(team and team.members.bob == "mine", "what was set again was let go of after")
+	assert(db.state().groups.team.members.bob == "mine")
+	da.stop()
+	db.stop()
+end
+
+-- Concurrent edits of a character of more than one byte are of whole characters: what they make is UTF-8 still.
+do
+	local m = zsp.mirror
+	local Doc = m.map({ body = zsp.text(16) })
+	local a, b, share = pair()
+	local da: any = m.open(a.client, { scope = 1, name = "utf8", schema = Doc })
+	local db: any = m.open(b.client, { scope = 1, name = "utf8", schema = Doc })
+	a.run()
+	b.run()
+	da.set({ body = "caf\u{e9}" })
+	a.run()
+	share()
+	da.set({ body = "caf\u{e8}" })
+	a.run()
+	db.set({ body = "caf\u{ea}" })
+	b.run()
+	share()
+	local x = da.state().body
+	assert(x == db.state().body)
+	assert(x == "caf\u{e8}\u{ea}" or x == "caf\u{ea}\u{e8}", `what they made is {x}, UTF-8: {utf8.len(x) ~= nil}`)
+	da.stop()
+	db.stop()
+end
+
+-- What is asked of a scope this client may not read says so, as a question of its own does, rather than load for ever.
+do
+	local m = zsp.mirror
+	local h = harness()
+	h.run()
+	h.greet()
+	local Doc = m.map({ items = m.list(18, m.map({ name = zsp.string(16) })) })
+	local mine, theirs = "", ""
+	local own = h.client:ask({ scope = 99, table = { name = zsp.string(16) } }, function(x)
+		mine = x.status
+	end)
+	local q = m.ask(h.client, { scope = 99, name = "doc", schema = Doc }, { "items" }, {}, function(f)
+		theirs = f.status
+	end)
+	h.run()
+	assert(mine == "denied")
+	assert(theirs == "denied", "it loads for ever")
+	own.stop()
+	q.stop()
+end
+
+-- What answers at once, as a record asked about does once what this client may do is known, is said after loading and
+-- not before it: so what is said last is what answers, with its keys.
+do
+	local m = zsp.mirror
+	local h = harness()
+	h.run()
+	h.greet()
+	local Doc = m.map({ tags = m.record(zsp.string(16)) })
+	local said: { any } = {}
+	local q = m.ask(h.client, { scope = 1, name = "tagged", schema = Doc }, { "tags" }, {}, function(f)
+		table.insert(said, f)
+	end)
+	assert(said[1].status == "loading" and said[1].keys ~= nil, "loading is said first, as of a record")
+	assert(said[#said].keys ~= nil, "what answered was said over by loading, with no keys")
+	q.stop()
+end
+
+-- Each key let go of is let go of once, however many keys let go of it is within: no row is written twice in one place by
+-- one change.
+local function twice(h: any, since: number): boolean
+	for i = since + 1, #h.self.said do
+		local x = h.self.said[i]
+		if x.kind == CELLS then
+			local r = codec.reader(x.body)
+			codec.varint(r)
+			local seen, id = {}, ""
+			while r.pos < r.len do
+				local tag = codec.u8(r)
+				if tag < 128 then
+					id = codec.take(r, 16)
+				end
+				local slot = codec.u8(r)
+				codec.take(r, 16)
+				codec.bytes(r)
+				if seen[id .. string.char(slot)] then
+					return true
+				end
+				seen[id .. string.char(slot)] = true
+			end
+		end
+	end
+	return false
+end
+do
+	local m = zsp.mirror
+	local Doc = m.map({ a = m.record(m.map({ b = m.record(m.map({ c = m.record(zsp.string(16)) })) })) })
+	local p1, p2, share = pair()
+	local d1: any = m.open(p1.client, { scope = 1, name = "deep", schema = Doc })
+	local d2: any = m.open(p2.client, { scope = 1, name = "deep", schema = Doc })
+	p1.run()
+	p2.run()
+	d1.set({ a = { k1 = { b = { k2 = { c = { x = "1" } } } } } })
+	p1.run()
+	share()
+	d2.set({ a = { k1 = { b = { k2 = { c = { x = "1", k4 = "v" } } } } } })
+	p2.run()
+	later(p1)
+	d1.set({ a = {} })
+	p1.run()
+	share()
+	local since = #p1.self.said
+	d1.set({ a = { other = { b = {} } } }) -- and so k4, in k2 in k1, both let go of, is let go of too
+	p1.run()
+	assert(not twice(p1, since), "a row written twice in one place, by one change")
+	d1.stop()
+	d2.stop()
+end
+-- Nor is any gone into for ever, where rows say each is in the other: a map in a key of a record in it.
+do
+	local m = zsp.mirror
+	local h = harness()
+	h.run()
+	h.greet()
+	local Doc = m.map({ title = zsp.string(16) })
+	local d: any = m.open(h.client, { scope = 1, name = "loop", schema = Doc })
+	h.run()
+	local raw = zsp.custom(255, function(v)
+		return v
+	end, function(v)
+		return v
+	end)
+	local function where(owner: string, field: string, kind: number, extra: string): string
+		local w = codec.writer()
+		codec.put(w, owner)
+		codec.put_bytes(w, field)
+		codec.put_u8(w, kind)
+		codec.put(w, extra)
+		return codec.string(w)
+	end
+	local b = "\0\0\0\1" .. string.rep("b", 12)
+	local e = d._derive(b, "rec", "k")
+	h.client:write(1, function(change)
+		change.set(b, { ["\0where"] = raw }, { ["\0where"] = where(e, "m", 0, "") }) -- a map, in e
+		change.set(e, { ["\0where"] = raw }, { ["\0where"] = where(b, "rec", 2, "\0k") }) -- a key of b's, let go of
+		change.place(b, "mirror/loop", 0)
+		change.place(e, "mirror/loop", 0)
+	end)
+	h.run()
+	d.set({ title = "still" })
+	h.run()
+	assert(d.state().title == "still")
+	d.stop()
+end
+
+-- What is said first is said once: what answers at once, the same, is not said again.
+do
+	local m = zsp.mirror
+	local h = harness()
+	h.run()
+	h.greet()
+	local Doc = m.map({ items = m.list(18, m.map({ name = zsp.string(16) })) })
+	local said: { any } = {}
+	local q = m.ask(h.client, { scope = 1, name = "once", schema = Doc }, { "items" }, {}, function(f)
+		table.insert(said, f)
+	end)
+	assert(#said == 1, `loading was said {#said} times`)
+	assert(table.isfrozen(said[1].totals), "and can be changed")
+	q.stop()
+end
+
+-- What is asked about and stopped by what answers at once, as it is asked, is stopped: every question with it.
+do
+	local m = zsp.mirror
+	local h = harness()
+	h.run()
+	local made, stopped = 0, 0
+	local ask = h.client.ask
+	h.client.ask = function(self: any, q: any, f: any)
+		made += 1
+		local a = ask(self, q, f)
+		return {
+			move = a.move,
+			stop = function()
+				stopped += 1
+				a.stop()
+			end,
+		}
+	end
+	local Ref = zsp.custom(17, function(v)
+		return v
+	end, function(v)
+		return v
+	end)
+	local Doc = m.map({ items = m.list(16, m.map({ title = zsp.string(16), ref = Ref })) })
+	local statuses: { string } = {}
+	local q: any
+	q = m.ask(h.client, { scope = 1, name = "leak", schema = Doc }, { "items" }, { where = zsp.where.refers("ref", 99, zsp.where.in_list("other")) }, function(f)
+		table.insert(statuses, f.status)
+		if f.status == "denied" then
+			q.stop()
+		end
+	end)
+	h.greet() -- and so it is asked, and denied at once
+	h.run()
+	assert(table.find(statuses, "denied"), `said {table.concat(statuses, ",")}`)
+	assert(made > 0 and stopped == made, `{made} asked and {stopped} stopped`)
 end
 
 print("ok")

@@ -14,7 +14,7 @@ import { where, type Total, type Where as Condition } from "./ask.ts";
 import * as codec from "./codec.ts";
 import { sha256 } from "./sha256.ts";
 import * as text from "./text.ts";
-import type { Answer, Asking, AuthorsColumn, Cell, Change, Client, Column, Stored, Table, TextColumn } from "./client.ts";
+import { columns, hexOf, latest, whose, type Answer, type Asking, type AuthorsColumn, type Change, type Client, type Column, type Stored, type Table, type TextColumn } from "./client.ts";
 
 const WHERE = 255; // the slot that says what a row is in
 const W = "\0where";
@@ -22,7 +22,6 @@ const ZERO = "\0".repeat(16);
 const MAP = 0, ITEM = 1, ENTRY = 2, NODE = 3;
 const MARK = "\0"; // a marker in a list's order
 const NOWHERE = "\0".repeat(12); // no marker
-const VALUE = 3;
 const EMPTY = new Uint8Array(0);
 const NONE: readonly never[] = Object.freeze([]); // to read from, never to show
 const NOBODY: readonly string[] = Object.freeze([]); // who has written in a row that is not there
@@ -288,7 +287,6 @@ interface Where {
   parent: string; // of a node: ZERO for the top
   from: string; // of a node: what it was moved from,
   back: string; // and its marker there
-  body: string;
   stamp: string;
 }
 
@@ -302,48 +300,59 @@ function whereEncode(owner: string, field: string, kind: number, extra = ""): Ui
   return codec.written(w).slice();
 }
 
-function whereDecode(body: Uint8Array, stamp: string): Where | undefined {
-  let out: Where, rest: string;
-  try {
-    const r = codec.reader(body);
-    out = {
-      owner: codec.takeBinary(r, 16),
-      field: codec.binary(codec.bytes(r)),
-      kind: codec.u8(r),
-      marker: "",
-      present: false,
-      key: "",
-      name: undefined,
-      parent: ZERO,
-      from: ZERO,
-      back: "",
-      body: codec.binary(body),
-      stamp,
-    };
-    rest = codec.binary(codec.rest(r));
-  } catch (e) {
-    if (e instanceof codec.Malformed) return undefined;
-    throw e;
+// What a cell in slot 255 says, from char 17 of it (its body) on, or undefined if it says nothing that can be read.
+function whereDecode(c: string): Where | undefined {
+  const n = c.length;
+  if (n < 17 + 18) return undefined;
+  let p = 17 + 16, len = 0, scale = 1;
+  for (;;) {
+    if (p >= n || p - 33 >= 10) return undefined; // a varint of ten bytes at most
+    const b = c.charCodeAt(p++);
+    len += (b & 127) * scale;
+    if (b < 128) break;
+    scale *= 128;
   }
-  if (out.kind === ITEM && rest.length === 12) {
-    out.marker = rest;
-  } else if (out.kind === ENTRY && rest.length >= 1) {
-    out.present = rest.charCodeAt(0) !== 0;
-    out.key = rest.slice(1);
+  if (len > Number.MAX_SAFE_INTEGER || p + len >= n) return undefined; // the field, and the kind after it
+  const out: Where = {
+    owner: c.slice(17, 33),
+    field: c.slice(p, p + len),
+    kind: c.charCodeAt(p + len),
+    marker: "",
+    present: false,
+    key: "",
+    name: undefined,
+    parent: ZERO,
+    from: ZERO,
+    back: "",
+    stamp: c.slice(1, 17),
+  };
+  const at = p + len + 1;
+  const rest = n - at;
+  if (out.kind === ITEM && rest === 12) {
+    out.marker = c.slice(at);
+  } else if (out.kind === ENTRY && rest >= 1) {
+    out.present = c.charCodeAt(at) !== 0;
+    out.key = c.slice(at + 1);
     try {
       out.name = strict.decode(codec.bytesOf(out.key));
     } catch {
       out.name = undefined; // a key that is not text is no key a document can have
     }
-  } else if (out.kind === NODE && rest.length === 56) {
-    out.parent = rest.slice(0, 16);
-    out.marker = rest.slice(16, 28);
-    out.from = rest.slice(28, 44);
-    out.back = rest.slice(44, 56);
-  } else if (out.kind !== MAP || rest !== "") {
+  } else if (out.kind === NODE && rest === 56) {
+    out.parent = c.slice(at, at + 16);
+    out.marker = c.slice(at + 16, at + 28);
+    out.from = c.slice(at + 28, at + 44);
+    out.back = c.slice(at + 44, at + 56);
+  } else if (out.kind !== MAP || rest !== 0) {
     return undefined;
   }
   return out;
+}
+
+// Whether two say the same: as their bodies would, but for how a writer chose to write a length; and, of a node, when it was
+// said, for of two moves that make a loop the later is undone.
+function sameWhere(a: Where, b: Where): boolean {
+  return a.kind === b.kind && (a.kind !== NODE || a.stamp === b.stamp) && a.owner === b.owner && a.field === b.field && a.marker === b.marker && a.present === b.present && a.key === b.key && a.parent === b.parent && a.from === b.from && a.back === b.back;
 }
 
 // A marker's name, and the one so many after it in the same piece.
@@ -430,19 +439,17 @@ function staying(seq: readonly string[], before: ReadonlyMap<string, number>): U
   return keep;
 }
 
-function latest(row: Stored, slot: number): Cell | undefined {
-  const cells = row.slots.get(slot);
-  if (!cells) return undefined;
-  let best: Cell | undefined;
-  for (const cell of cells.values()) if (cell.kind === VALUE && (!best || cell.stamp > best.stamp)) best = cell;
-  return best;
+// A cell's body, from char 17 of it, as bytes.
+function bodyOf(c: string): Uint8Array {
+  const out = new Uint8Array(c.length - 17);
+  for (let i = 0; i < out.length; i++) out[i] = c.charCodeAt(17 + i);
+  return out;
 }
 
-function startsWith(body: Uint8Array, prefix: string): boolean {
-  if (body.length < prefix.length) return false;
-  for (let i = 0; i < prefix.length; i++) if (body[i] !== prefix.charCodeAt(i)) return false;
-  return true;
-}
+// How the columns that are not made up read, to read them straight from a cell.
+const AS_NUMBER = columns.number(16).decode;
+const AS_STRING = columns.string(16).decode;
+const eight = new DataView(new ArrayBuffer(8));
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
@@ -522,6 +529,12 @@ type Items = Extract<BoxState, { kind: "items" }>;
  * Opens a document: the observer hears it at once, and again whenever anything in it changes, at most once a turn, with
  * whatever did not change the very same object as before.
  */
+// For tests: how much each open document keeps of what it has read, that it may be seen not to grow without end.
+const sizes = new WeakMap<object, () => Record<string, number>>();
+export function _sizes(mirror: Mirror<any>): Record<string, number> {
+  return sizes.get(mirror)!();
+}
+
 export function open<S extends MapSchema<any>>(client: Client, options: { scope: number; name: string; schema: S }, observer?: (state: Doc<S>) => void): Mirror<S> {
   return opened(client, options, observer, false).mirror;
 }
@@ -573,15 +586,12 @@ function opened<S extends MapSchema<any>>(
   };
   const keyOf = (owner: string, field: string): string => owner + field;
   const hex = codec.hex;
-  // Rows as the client holds them. While the document is read, nothing changes what is held, so each is asked for once.
-  let reading: Map<string, Stored | undefined> | undefined;
-  const held = (id: string): Stored | undefined => {
-    if (!reading) return client.held(hex(id));
-    let row = reading.get(id);
-    if (row === undefined && !reading.has(id)) reading.set(id, (row = client.held(hex(id))));
-    return row;
+  // Rows as the client holds them, by their ids as it holds them.
+  const held = (id: string): Stored | undefined => client.heldRow(id);
+  const heldText = (id: string, slot: number): text.Text | undefined => {
+    const row = client.heldRow(id);
+    return row ? client.textOf(row, slot) : undefined;
   };
-  const heldText = (id: string, slot: number): text.Text | undefined => client.heldText(hex(id), slot);
 
   // What is known of the document's rows, kept as they change.
   const wheres = new Map<string, Where>();
@@ -592,34 +602,52 @@ function opened<S extends MapSchema<any>>(
   const treeUp = new Map<string, string>(); // of each tree node, as last read: the node it hangs from
   const losing = new Set<string>(); // trees with nodes beneath what is not there
   const standingIn = new Map<string, string>(); // of each map within a map: where it is, which its id says, row or no row
-  const versions = new Map<string, { t: text.Text | undefined; v: number }>(); // of each text that keeps an order, as last read
+  // Of each row, of each text in it that keeps an order, by slot, as last read; and those made anew, whose items may be gone.
+  const versions = new Map<string, Map<number, { t: text.Text | undefined; v: number }>>();
+  const remade = new Map<string, Set<number>>();
+  const setVersion = (id: string, slot: number, t: text.Text | undefined): void => {
+    let of = versions.get(id);
+    if (!of) versions.set(id, (of = new Map()));
+    of.set(slot, { t, v: t ? t.version : 0 });
+  };
+  // Whether a text was made anew since it was last read: once, as it is read.
+  const wasRemade = (id: string, slot: number): boolean => {
+    const of = remade.get(id);
+    if (!of || !of.delete(slot)) return false;
+    if (of.size === 0) remade.delete(id);
+    return true;
+  };
   const dirtyRows = new Set<string>();
   const movedIn = new Map<string, Map<string, string | true>>(); // of each list: what came, went or moved, and from which marker
   const garbage = new Map<string, Set<string>>(); // of each list: markers nothing has
   const deadRows = new Set<string>(); // seen to be deleted: what is in them is no longer anywhere
+  const cleaning = new Set<string>(); // of those, any that may still have something in them, to let go of
   const emptied = new Set<string>(); // keys let go of: what is put in them meanwhile is not anywhere either
   const dirtyNode = new Set<string>();
   const dirtyBox = new Map<string, boolean>(); // true if what is in it or its order may have changed; false if only its members
   const nodes = new Map<string, Obj>(); // maps, as last read, by id
+  const seen = new Map<string, number>(); // of each map row: the version of it last read
   const boxes = new Map<string, BoxState>(); // lists, records and trees, as last read
   const tnodes = new Map<string, { node: Obj; out: Obj }>(); // tree nodes with their children
   let current: Obj = undefined as unknown as Obj;
   let stopped = false;
   let tag: string | undefined;
-  // What is read of a row is kept with it, among its views, which the client lets go of whenever the row changes.
-  const ME: Table = Object.freeze({});
 
-  const ours = (id: string, hexId: string): boolean => {
-    if (wheres.has(id)) return true;
-    const row = client.held(hexId);
-    if (!row) return false;
+  const ours = (row: Stored): boolean => {
+    if (wheres.has(row.id)) return true;
     if (tag === undefined) {
       if (!client.scopeKey(scope)) return false;
       tag = client.tag(scope, list);
     }
-    for (let slot = 1; slot <= 15; slot++) {
-      const cells = row.slots.get(slot);
-      if (cells) for (const c of cells.values()) if (startsWith(c.body, tag)) return true;
+    const a = row.slots;
+    for (let i = 0; i < a.length && a[i] !== undefined; i += 2) {
+      if ((a[i] as number) > 15 || a[i] === 0) continue; // places are in slots 1 to 15
+      const v = a[i + 1] as string | Map<string, string>;
+      if (typeof v === "string") {
+        if (v.startsWith(tag, 17)) return true;
+      } else {
+        for (const c of v.values()) if (c.startsWith(tag, 17)) return true;
+      }
     }
     return false;
   };
@@ -629,19 +657,24 @@ function opened<S extends MapSchema<any>>(
   const changedIn = new Map<string, Set<string>>(); // of each list and record: members that changed
   const marked = new Set<string>(); // in this pass: passed on to what it is in already
   const markBox = (key: string, structural: boolean, member?: string): void => {
-    if (member !== undefined) {
-      let set = changedIn.get(key);
-      if (!set) changedIn.set(key, (set = new Set()));
-      set.add(member);
+    // Of a box not read yet, everything is read when it is: only of one that has been is anything marked. Which members
+    // changed is read only by a list of maps or a record.
+    const st = boxes.get(key);
+    if (st) {
+      if (member !== undefined && (st.kind === "items" || st.kind === "record")) {
+        let set = changedIn.get(key);
+        if (!set) changedIn.set(key, (set = new Set()));
+        set.add(member);
+      }
+      if (structural) dirtyBox.set(key, true);
+      else if (!dirtyBox.has(key)) dirtyBox.set(key, false);
     }
-    if (structural) dirtyBox.set(key, true);
-    else if (!dirtyBox.has(key)) dirtyBox.set(key, false);
     markNode(key.slice(0, 16));
   };
   const markNode = (id: string): void => {
     if (id === ZERO || marked.has(id)) return;
     marked.add(id);
-    dirtyNode.add(id);
+    if (nodes.has(id) || tnodes.has(id)) dirtyNode.add(id); // of one not read yet, everything is read when it is
     const up = treeUp.get(id);
     if (up !== undefined && up !== ZERO) markNode(up);
     const w = wheres.get(id);
@@ -654,22 +687,89 @@ function opened<S extends MapSchema<any>>(
 
   const whereOf = (row: Stored): Where | undefined => {
     const c = latest(row, WHERE);
-    return c ? whereDecode(c.body, c.stamp) : undefined;
+    return c !== undefined ? whereDecode(c) : undefined;
   };
 
   // Whether a text that keeps an order has changed since it was last read.
-  const remade = new Set<string>(); // texts of order made anew: what was in them may be gone
   const moved = (id: string, slot: number): boolean => {
     const t = heldText(id, slot);
-    const k = id + String.fromCharCode(slot);
-    const was = versions.get(k);
+    const was = versions.get(id)?.get(slot);
     const v = t ? t.version : 0;
     if (!was || was.t !== t || was.v !== v) {
-      if (!was || was.t !== t) remade.add(k); // a text made again is another, as when a value was written over it
-      versions.set(k, { t, v });
+      if (!was || was.t !== t) {
+        // A text made again is another, as when a value was written over it.
+        let of = remade.get(id);
+        if (!of) remade.set(id, (of = new Set()));
+        of.add(slot);
+      }
+      setVersion(id, slot, t);
       return true;
     }
     return false;
+  };
+
+  // Where it was when the list was last read, to find it there: true if it was not in it then. Only of a list of maps that
+  // has been read: one that has not is read whole.
+  const moving = (k: string, id: string, from: string | true): void => {
+    if (boxes.get(k)?.kind !== "items") return;
+    let mv = movedIn.get(k);
+    if (!mv) movedIn.set(k, (mv = new Map()));
+    if (!mv.has(id)) mv.set(id, from);
+  };
+
+  // What was read of a row that is in nothing any more, and gone, and of what was in it: none of it is shown, and should the
+  // row come again it is read anew. (What says what was in it is kept, for whoever writes next to let go of.)
+  const forgotten = new Map<string, Where>(); // in this pass: let go of once all that came has been read
+  // What was read of what is in a row, or a map within one, by its schema: its lists, records, trees and maps.
+  const forgetBox = (k: string): void => {
+    boxes.delete(k);
+    dirtyBox.delete(k);
+    changedIn.delete(k);
+    movedIn.delete(k);
+    losing.delete(k);
+    garbage.delete(k);
+  };
+  const forgetBoxes = (id: string, s: MapSchema): void => {
+    for (let i = 0; i < s.names.length; i++) {
+      const b = s.boxes[i];
+      if (!b) continue;
+      forgetBox(keyOf(id, s.keys[i]));
+      if (b.kind === "map") {
+        forgetMap(derive(id + "\0" + s.keys[i]), b);
+      }
+    }
+  };
+  const forgetRead = (id: string): void => {
+    nodes.delete(id);
+    schemaOf.delete(id);
+    seen.delete(id);
+    tnodes.delete(id);
+    dirtyNode.delete(id);
+    treeUp.delete(id);
+    versions.delete(id);
+    remade.delete(id);
+  };
+  // A map within a map of what is gone, which is there only while that is: whether its own row has come or not.
+  const forgetMap = (id: string, s: MapSchema): void => {
+    if (!standing.delete(id)) return;
+    standingIn.delete(id);
+    forgetRead(id);
+    forgetBoxes(id, s);
+  };
+  const forget = (id: string, old: Where): void => {
+    const s = schemaOf.get(id);
+    forgetRead(id);
+    if (s) forgetBoxes(id, s);
+    for (const k of owned.get(id) ?? NONE) forgetBox(k);
+  };
+  // What is deleted needs, once nothing is in it, nothing more than to be known to be deleted.
+  const cleaned = (id: string): void => {
+    let any = hangs.has(id);
+    for (const k of owned.get(id) ?? NONE) any ||= members.has(k);
+    if (!any) {
+      cleaning.delete(id);
+      owned.delete(id);
+    }
   };
 
   const absorb = (): void => {
@@ -678,19 +778,35 @@ function opened<S extends MapSchema<any>>(
       const row = held(id);
       const w = row && !row.dead ? whereOf(row) : undefined;
       const old = wheres.get(id);
-      if (old && old.kind === NODE && (!w || w.parent !== old.parent)) hangs.get(old.parent)?.delete(id);
+      if (old && old.kind === NODE && (!w || w.parent !== old.parent)) {
+        const h = hangs.get(old.parent);
+        if (h) {
+          h.delete(id);
+          if (h.size === 0) hangs.delete(old.parent);
+        }
+      }
       if (w && w.kind === NODE && w.parent !== ZERO) {
         let set = hangs.get(w.parent);
         if (!set) hangs.set(w.parent, (set = new Set()));
         set.add(id);
+        if (deadRows.has(w.parent)) cleaning.add(w.parent); // hung from what is deleted: let go of by whoever next writes
       }
-      if (old && (!w || old.body !== w.body)) {
+      if (old && (!w || !sameWhere(old, w))) {
         const k = keyOf(old.owner, old.field);
-        members.get(k)?.delete(id);
-        // Where it was when the list was last read, to find it there: true if it was not in it then.
-        let mv = movedIn.get(k);
-        if (!mv) movedIn.set(k, (mv = new Map()));
-        if (!mv.has(id)) mv.set(id, old.kind === ITEM ? old.marker : true);
+        const mk = members.get(k);
+        if (mk) {
+          mk.delete(id);
+          if (mk.size === 0) {
+            // Nothing says it is in it: neither it nor its owner need say so.
+            members.delete(k);
+            const ks = owned.get(old.owner);
+            if (ks) {
+              ks.delete(k);
+              if (ks.size === 0) owned.delete(old.owner);
+            }
+          }
+        }
+        moving(k, id, old.kind === ITEM ? old.marker : true);
         if (old.kind === ITEM && (!w || w.marker !== old.marker)) {
           // A marker no longer anyone's, if it is still there: let go of when the list is next written.
           const box = boxes.get(k);
@@ -707,20 +823,21 @@ function opened<S extends MapSchema<any>>(
       else wheres.delete(id);
       if (w && w.kind === ENTRY && !w.present) emptied.add(id);
       else emptied.delete(id);
-      if (w && (!old || old.body !== w.body)) {
+      if (w && (!old || !sameWhere(old, w))) {
         const k = keyOf(w.owner, w.field);
         let m = members.get(k);
         if (!m) members.set(k, (m = new Set()));
         m.add(id);
+        if (deadRows.has(w.owner)) cleaning.add(w.owner); // put in what is deleted: let go of by whoever next writes
         let o = owned.get(w.owner);
         if (!o) owned.set(w.owner, (o = new Set()));
         o.add(k);
-        let mv = movedIn.get(k);
-        if (!mv) movedIn.set(k, (mv = new Map()));
-        if (!mv.has(id)) mv.set(id, true);
+        moving(k, id, true);
         markBox(k, true);
       }
-      markNode(id);
+      // What is in it is marked as having changed, and so on up. A row heard of for the first time is in nothing yet but
+      // what it says, which is marked already, unless it is a map within a map or a node.
+      if (old !== undefined || nodes.has(id) || tnodes.has(id) || standingIn.has(id) || treeUp.has(id)) markNode(id);
       const s = schemaOf.get(id);
       if (s) {
         for (let i = 0; i < s.names.length; i++) {
@@ -737,15 +854,24 @@ function opened<S extends MapSchema<any>>(
       // seen of it, as when it was let go of from memory while it was elsewhere, and is back. Where only some rows are
       // held, one that is not held is not known to be gone.
       const gone = heldOnly ? row !== undefined && row.dead : !row || row.dead;
-      if (old && !w && gone) deadRows.add(id); // deleted, and perhaps let go of from memory already
-      else if (row && !row.dead) deadRows.delete(id);
+      if (old && !w && gone) {
+        deadRows.add(id); // deleted, and perhaps let go of from memory already
+        cleaning.add(id);
+      } else if (row && !row.dead && deadRows.delete(id)) {
+        cleaning.delete(id);
+      }
       // What is in a row that comes or goes is there or not with it.
       if ((old === undefined) !== (w === undefined)) {
         const ks = owned.get(id);
         if (ks) for (const k of ks) markBox(k, true);
       }
+      if (old && !w && (!row || row.dead) && !standing.has(id)) forgotten.set(id, old);
     }
     dirtyRows.clear();
+    // What was in what went may have been marked as it went, too.
+    for (const [id, old] of forgotten) forget(id, old);
+    forgotten.clear();
+    if (cleaning.size > 0) for (const id of [...cleaning]) cleaned(id);
   };
 
   // ------------------------------------------------ reading
@@ -753,43 +879,31 @@ function opened<S extends MapSchema<any>>(
   // A value as a column holds it: a text is always one, empty or not; otherwise what is empty is nothing. Who wrote it,
   // of a column that says so, is as the client tells it of any row.
   const decode = (c: Column<any>, row: Stored): unknown => {
-    if (c.who) {
-      let last: Cell | undefined;
-      const names = new Set<string>();
-      for (const cell of row.slots.get(c.slot)?.values() ?? NONE) {
-        if (!last || cell.stamp > last.stamp) last = cell;
-        if (cell.author && cell.author.subject !== "") names.add(cell.author.subject);
-      }
-      if (c.who === "all") return Object.freeze([...names].sort());
-      return last?.author && last.author.subject !== "" ? last.author.subject : undefined;
-    }
-    if (c.text) return text.read(client.heldText(row.hex, c.slot)!);
+    if (c.who) return whose(row, c.slot, c.who === "all");
+    if (c.text) return client.readText(row, c.slot);
     const cell = latest(row, c.slot);
-    if (!cell || cell.body.length === 0) return undefined;
+    if (cell === undefined || cell.length === 17) return undefined;
+    const how = c.decode;
+    if (how === AS_NUMBER) {
+      // As the column reads its value: the first eight bytes, which there must be.
+      if (cell.length < 25) return undefined;
+      for (let i = 0; i < 8; i++) eight.setUint8(i, cell.charCodeAt(17 + i));
+      return eight.getFloat64(0);
+    }
+    if (how === AS_STRING) {
+      // UTF-8 that is all ASCII is itself.
+      let ascii = true;
+      for (let i = 17; i < cell.length && ascii; i++) ascii = cell.charCodeAt(i) < 128;
+      if (ascii) return cell.slice(17);
+    }
     try {
-      return settled(c.decode(cell.body));
+      return settled(how(bodyOf(cell)));
     } catch {
       return undefined; // what does not read as one of its kind is nothing
     }
   };
   // What a column of a map whose row is not here reads as.
   const absent = (c: Column<any> | undefined): unknown => (c?.text ? "" : c?.who === "all" ? NOBODY : undefined);
-
-  const valuesOf = (s: MapSchema, row: Stored): unknown[] => {
-    const views = row.views as unknown as Map<Table, Map<MapSchema, unknown[]>>;
-    let c = views.get(ME);
-    if (!c) views.set(ME, (c = new Map()));
-    let v = c.get(s);
-    if (!v) {
-      v = new Array(s.names.length);
-      for (let i = 0; i < s.names.length; i++) {
-        const col = s.columns[i];
-        if (col) v[i] = decode(col, row);
-      }
-      c.set(s, v);
-    }
-    return v;
-  };
 
   const alive = (id: string): Stored | undefined => {
     const row = held(id);
@@ -810,19 +924,36 @@ function opened<S extends MapSchema<any>>(
     dirtyNode.delete(id);
     schemaOf.set(id, s);
     const row = alive(id);
-    const vals = row ? valuesOf(s, row) : undefined;
+    // What is in its own row is read again only if the row has changed since it was last read, which its version says:
+    // versions are never the same for two states of rows.
+    const again = row !== undefined && (was === undefined || plain || seen.get(id) !== row.version); // read the long way, read again
+    if (row) seen.set(id, row.version);
+    else seen.delete(id);
     const n = s.names.length;
+    const names = s.names;
+    if (was === undefined) {
+      // Made for the first time: straight into what is given.
+      const out: Record<string, unknown> = { id: row ? hexOf(row) : hex(id) };
+      for (let i = 0; i < n; i++) {
+        const b = s.boxes[i];
+        const v = b ? buildBox(b, id, s.keys[i]) : row ? decode(s.columns[i]!, row) : absent(s.columns[i]);
+        if (v !== undefined) out[names[i]] = v;
+      }
+      frozen(out);
+      nodes.set(id, out);
+      return out;
+    }
     const parts = new Array(n);
-    let changed = was === undefined;
+    let changed = false;
     for (let i = 0; i < n; i++) {
       const b = s.boxes[i];
-      const v = b ? buildBox(b, id, s.keys[i]) : vals ? vals[i] : absent(s.columns[i]);
+      const v = b ? buildBox(b, id, s.keys[i]) : !row ? absent(s.columns[i]) : again ? decode(s.columns[i]!, row) : was[names[i]];
       parts[i] = v;
-      if (!changed) changed = !Object.is(was![s.names[i]], v);
+      if (!changed) changed = !Object.is(was[names[i]], v);
     }
-    if (!changed) return was!;
-    const out: Record<string, unknown> = { id: hex(id) };
-    for (let i = 0; i < n; i++) if (parts[i] !== undefined) out[s.names[i]] = parts[i];
+    if (!changed) return was;
+    const out: Record<string, unknown> = { id: was.id };
+    for (let i = 0; i < n; i++) if (parts[i] !== undefined) out[names[i]] = parts[i];
     frozen(out);
     nodes.set(id, out);
     return out;
@@ -850,6 +981,84 @@ function opened<S extends MapSchema<any>>(
   const less = (lx: number, ox: number, x: string, ly: number, oy: number, y: string): boolean =>
     lx !== ly ? lx < ly : ox !== oy ? ox < oy : x < y;
 
+  // Where an item is among a list's ids, found by where its marker is, as they are in order: by place, and then by id.
+  // Undefined if it cannot be found so, as when what it is compared with has no place.
+  // The last found, which is found again first: what is typed in, or heard of, is often the same item again and again.
+  let lastIds: readonly string[] | undefined, lastId = "", lastAt = -1;
+  const findIn = (ids: readonly string[], id: string, t: text.Text | undefined): number | undefined => {
+    if (ids === lastIds && id === lastId && ids[lastAt] === id) return lastAt;
+    const at = seek(ids, id, t);
+    if (at !== undefined) (lastIds = ids), (lastId = id), (lastAt = at);
+    return at;
+  };
+  const seek = (ids: readonly string[], id: string, t: text.Text | undefined): number | undefined => {
+    const w = wheres.get(id);
+    if (!t || !w || w.kind !== ITEM) return undefined;
+    const p = text.position(t, w.marker);
+    if (!p) return undefined;
+    let lo = 0, hi = ids.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const m = ids[mid];
+      if (m === id) return mid;
+      const wm = wheres.get(m);
+      const q = wm && wm.kind === ITEM ? text.position(t, wm.marker) : null;
+      if (!q) return undefined;
+      if (less(q[0], q[1], m, p[0], p[1], id)) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return undefined;
+  };
+
+  // The items of a list from nothing, in order: by where their markers are, and then by id; what has nowhere to be yet; and
+  // those that share a marker with the one before them. Each is put where its marker is along the text: in an array as
+  // long as the text, if that is not much longer than the list, or else by those places sorted, as numbers are.
+  const orderOf = (mine: ReadonlySet<string>, t: text.Text | undefined): [string[], Set<string>, Set<string>] => {
+    const ids: string[] = [], hidden = new Set<string>(), dups = new Set<string>();
+    const [ordinal, total] = t ? text.ordinals(t) : [undefined, 0];
+    const of: string[] = [], at: number[] = [];
+    for (const id of mine) {
+      const row = held(id);
+      if (!row || row.dead) continue;
+      const w = wheres.get(id);
+      const k = ordinal && w && w.kind === ITEM ? ordinal(w.marker) : null;
+      if (k === null) hidden.add(id);
+      else of.push(id), at.push(k);
+    }
+    const n = of.length;
+    const direct = total <= 4 * n + 64;
+    const by: (string | string[] | undefined)[] = direct ? new Array(total + 1) : [];
+    const sparse = direct ? undefined : new Map<number, string | string[]>();
+    const places: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const k = at[i];
+      const x = direct ? by[k] : sparse!.get(k);
+      const next = x === undefined ? of[i] : typeof x === "string" ? [x, of[i]] : (x.push(of[i]), x);
+      if (direct) by[k] = next;
+      else sparse!.set(k, next);
+      if (x === undefined && !direct) places.push(k);
+    }
+    const put = (x: string | string[]) => {
+      if (typeof x === "string") return void ids.push(x);
+      // Sharing a marker: all but the first are given one of their own when the list is next written.
+      x.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      for (let i = 0; i < x.length; i++) {
+        ids.push(x[i]);
+        if (i > 0) dups.add(x[i]);
+      }
+    };
+    if (direct) {
+      for (let k = 1; k <= total; k++) {
+        const x = by[k];
+        if (x !== undefined) put(x);
+      }
+    } else {
+      places.sort((a, b) => a - b);
+      for (const k of places) put(sparse!.get(k)!);
+    }
+    return [ids, hidden, dups];
+  };
+
   const buildBox = (b: Schema, owner: string, field: string): unknown => {
     const key = keyOf(owner, field);
     const st = boxes.get(key);
@@ -869,12 +1078,12 @@ function opened<S extends MapSchema<any>>(
       const prior = st as Items | undefined;
       let ids = prior ? prior.ids : [];
       let hidden = prior ? prior.hidden : new Set<string>();
+      let freshDups: Set<string> | undefined;
       const living = holds(owner);
       if (structural) {
-        const slotKey = owner + String.fromCharCode(b.slot);
         const t = living ? heldText(owner, b.slot) : undefined;
         // The text read, to know later whether it is still the one.
-        versions.set(slotKey, { t, v: t ? t.version : 0 });
+        setVersion(owner, b.slot, t);
         // Where an item's marker is, if it is one there is: asked once of each, as nothing moves while it is read.
         const places = new Map<string, [label: number, offset: number] | null>();
         const pos = (id: string): [label: number, offset: number] | null => {
@@ -889,8 +1098,7 @@ function opened<S extends MapSchema<any>>(
         const redo = movedIn.get(key) ?? new Map<string, string | true>();
         movedIn.delete(key);
         const mine = members.get(key) ?? new Set<string>();
-        const again = remade.has(slotKey);
-        remade.delete(slotKey);
+        const again = wasRemade(owner, b.slot);
         if (prior && prior.living === living && !again && !plain) {
           // What did not move keeps its order, for the order of what is there never changes; what came, moved, or had
           // nowhere to be yet, is taken out and put in its place, in arrays as they were.
@@ -926,21 +1134,24 @@ function opened<S extends MapSchema<any>>(
             const at = atOf(id, was);
             if (at !== undefined) gone.push(at);
           }
-          let newIds: string[], parts: Obj[];
+          // The ids are this list's own, and changed where they are; what is shown is a new array.
+          const count = ids.length;
+          let newIds: string[] = ids, parts: Obj[];
           if (gone.length === 0) {
-            newIds = ids.slice();
             parts = copy(prior.out);
           } else {
             // Taken out all at once, the rest keeping their order.
-            const out = new Uint8Array(ids.length);
+            const out = new Uint8Array(count);
             for (const at of gone) out[at] = 1;
-            newIds = [];
-            parts = [];
-            for (let i = 0; i < ids.length; i++) {
+            parts = copy(prior.out); // and changed where it is, read as an array of its own rather than one frozen
+            let j = 0;
+            for (let i = 0; i < count; i++) {
               if (out[i]) continue;
-              newIds.push(ids[i]);
-              parts.push(prior.out[i]);
+              ids[j] = ids[i];
+              parts[j++] = parts[i];
             }
+            ids.length = j;
+            parts.length = j;
           }
           hidden = new Set();
           // Where each put back is, so long as they are few enough to keep count of as more go in; and past that, all
@@ -1004,17 +1215,25 @@ function opened<S extends MapSchema<any>>(
           let freshIndex: Map<string, number> | undefined;
           if (touched) {
             for (const id of touched) {
-              if (!redo.has(id)) {
-                freshIndex ??= indexOf(newIds);
-                const at = freshIndex.get(id);
+              if (!redo.has(id) && !hidden.has(id)) {
+                // Found where it is, by its marker; failing that, by a table of where each is, made once.
+                let at = findIn(newIds, id, t);
+                if (at === undefined) at = (freshIndex ??= indexOf(newIds)).get(id);
                 if (at !== undefined) parts[at] = buildMap(of, id);
               }
             }
           }
-          const out = gone.length === 0 && newIds.length === ids.length && sameList(prior.out, parts) ? prior.out : frozen(parts);
+          const out = gone.length === 0 && newIds.length === count && sameList(prior.out, parts) ? prior.out : frozen(parts);
           // Sharing a marker is looked for only beside what was put back: what moved is looked at again.
           const dups = new Set(prior.dups);
           for (const id of redo.keys()) dups.delete(id);
+          // What shared a marker with one that is gone, or has moved, may not now: each, of those few, is looked at again
+          // beside what is before it now.
+          for (const id of [...dups]) {
+            const i = findIn(newIds, id, t);
+            const beforeIt = i !== undefined && i > 0 ? wheres.get(newIds[i - 1]) : undefined;
+            if (i !== undefined && !(beforeIt && beforeIt.marker === wheres.get(id)!.marker)) dups.delete(id);
+          }
           const beside = (i: number): void => {
             for (let j = i; j <= i + 1; j++) {
               const x = newIds[j - 1], y = newIds[j];
@@ -1028,27 +1247,24 @@ function opened<S extends MapSchema<any>>(
           boxes.set(key, { kind: "items", out, ids: newIds, hidden, living, index: freshIndex, slot: b.slot, dups });
           return out;
         }
-        hidden = new Set();
-        const at: { id: string; l: number; o: number }[] = [];
-        for (const id of mine) {
-          if (alive(id)) {
-            const p = pos(id);
-            if (p) at.push({ id, l: p[0], o: p[1] });
-            else hidden.add(id);
-          }
-        }
-        at.sort((x, y) => (x.l !== y.l ? x.l - y.l : x.o !== y.o ? x.o - y.o : x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
-        ids = at.map((x) => x.id);
+        [ids, hidden, freshDups] = orderOf(mine, t);
       }
       const touched = changedIn.get(key);
       changedIn.delete(key);
       if (!structural && prior) {
-        // In the same order: only what changed is read again.
-        const index = prior.index ?? indexOf(ids);
+        // In the same order: only what changed is read again, each found where it is by its marker, in the text as it was
+        // read; failing that, by a table of where each is, made once and kept.
+        let index = prior.index;
+        const t = versions.get(owner)?.get(b.slot)?.t;
         let parts: Obj[] | undefined;
         if (touched) {
           for (const id of touched) {
-            const i = index.get(id);
+            let i: number | undefined;
+            if (index) i = index.get(id);
+            else if (!hidden.has(id)) {
+              i = findIn(ids, id, t);
+              if (i === undefined) i = (index = indexOf(ids)).get(id);
+            }
             if (i !== undefined) {
               const v = buildMap(of, id);
               if (v !== prior.out[i]) {
@@ -1064,7 +1280,7 @@ function opened<S extends MapSchema<any>>(
       }
       const parts = ids.map((id) => buildMap(of, id));
       const out = prior && sameList(prior.out, parts) ? prior.out : frozen(parts);
-      boxes.set(key, { kind: "items", out, ids, hidden, living, index: undefined, slot: b.slot, dups: sharing(ids) });
+      boxes.set(key, { kind: "items", out, ids, hidden, living, index: undefined, slot: b.slot, dups: freshDups ?? sharing(ids) });
       return out;
     } else if (b.kind === "list") {
       const prior = st as Extract<BoxState, { kind: "values" }> | undefined;
@@ -1270,16 +1486,11 @@ function opened<S extends MapSchema<any>>(
   };
 
   const read = (): Obj => {
-    reading = new Map();
-    try {
-      absorb();
-      // What is not reached now stays to be read when it is.
-      const root = derive("");
-      standing.add(root);
-      return buildMap(schema, root);
-    } finally {
-      reading = undefined;
-    }
+    absorb();
+    // What is not reached now stays to be read when it is.
+    const root = derive("");
+    standing.add(root);
+    return buildMap(schema, root);
   };
 
   const refresh = (): void => {
@@ -1290,10 +1501,8 @@ function opened<S extends MapSchema<any>>(
   };
 
   const watching = heldOnly ? undefined : client.window({ scope, list, table: WINDOW, size: 0, from: "start", bare: true }, () => refresh());
-  const unfollow = client.follow((id) => {
-    if (stopped) return;
-    const bin = binaryOf(id);
-    if (ours(bin, id)) dirtyRows.add(bin);
+  const unfollow = client.followRows((row) => {
+    if (!stopped && ours(row)) dirtyRows.add(row.id);
   });
   for (const e of watching?.entries() ?? NONE) dirtyRows.add(e.row.id);
   refresh();
@@ -1322,6 +1531,8 @@ function opened<S extends MapSchema<any>>(
     // A row and everything in it, wherever that is, shown or not.
     const deleting = new Set<string>();
     const spared = new Set<string>(); // nodes the new state has, wherever they hung before
+    const written = new Set<string>(); // rows the new state has, as written here: none of them is let go of after
+    const emptying = new Set<string>(); // each once, whatever says it is in what
     const deleteRow = (id: string): void => {
       if (deleting.has(id) || spared.has(id)) return;
       deleting.add(id);
@@ -1332,6 +1543,7 @@ function opened<S extends MapSchema<any>>(
     };
 
     const writeValue = (of: Of, old: any, nv: any, id: string, made: boolean, where?: Uint8Array): void => {
+      written.add(id);
       if (isMap(of)) {
         writeMap(of, old, nv, id, made, where);
         return;
@@ -1376,6 +1588,7 @@ function opened<S extends MapSchema<any>>(
     };
 
     const writeMap = (s: MapSchema, old: Obj | undefined, nv: Obj | undefined, id: string, made: boolean, where?: Uint8Array): void => {
+      written.add(id);
       if (old === nv && !made && !where && !plain) return; // the very object that was read: nothing in it has changed
       const n: Obj = nv ?? {};
       const values: Record<string, unknown> = {};
@@ -1391,6 +1604,9 @@ function opened<S extends MapSchema<any>>(
         // A text is always a string, and one not given is empty: written as an edit, so that what others type meanwhile
         // is kept, as for any other.
         const v = c.text && !made && n[name] === undefined ? "" : n[name], ov = old ? old[name] : undefined;
+        // Nor is an empty text written where the row is made here: one with no cells is empty, and an empty value written
+        // over one not come yet would wipe what another typed in it meanwhile.
+        if (c.text && made && (v === undefined || v === "") && (ov === undefined || ov === "")) continue;
         if (c.text && !made && typeof v === "string") {
           if (v !== ov && !(v === "" && ov === undefined)) edit(id, c.slot, v);
         } else if (!sameValue(c, v, ov) || made) {
@@ -1755,18 +1971,27 @@ function opened<S extends MapSchema<any>>(
     writeMap(schema, current, state as Obj, root, !exists);
     // What others put in keys that were being let go of meanwhile goes too; but not a map within it, which is that
     // key's for ever, and only emptied.
+    // A key of a record within is let go of as any key is, and not deleted, which would be for ever, as its id is its key's:
+    // so that it can be set again. Nothing the new state has is let go of, as a key set again here is not.
     const empty = (id: string): void => {
+      if (written.has(id) || emptying.has(id)) return;
+      emptying.add(id);
       for (const k of owned.get(id) ?? NONE) {
         for (const m of members.get(k) ?? NONE) {
+          if (written.has(m)) continue;
           const w = wheres.get(m);
           if (w && w.kind === MAP) empty(m);
-          else deleteRow(m);
+          else if (w && w.kind === ENTRY && m === derive(w.owner + "\0" + w.field + "\0" + w.key)) {
+            if (w.present) change.set(hex(m), WINDOW, { [W]: whereEncode(w.owner, w.field, ENTRY, "\0" + w.key) });
+            empty(m);
+          } else deleteRow(m);
         }
       }
     };
     for (const id of emptied) empty(id);
-    // What others put in rows that were being deleted meanwhile is let go of too.
-    for (const id of deadRows) {
+    // What others put in rows that were being deleted meanwhile is let go of too: of those that may have anything in them,
+    // not of every row ever deleted.
+    for (const id of cleaning) {
       for (const k of owned.get(id) ?? NONE) for (const m of members.get(k) ?? NONE) deleteRow(m);
       for (const m of hangs.get(id) ?? NONE) deleteRow(m);
     }
@@ -1802,6 +2027,12 @@ function opened<S extends MapSchema<any>>(
       unfollow();
       watching?.stop();
     },
+  });
+  sizes.set(mirror, () => {
+    const all: Record<string, ReadonlyMap<unknown, unknown> | ReadonlySet<unknown>> = { nodes, schemaOf, seen, tnodes, boxes, changedIn, movedIn, dirtyBox, versions, dirtyNode, owned, members, hangs, cleaning, standing, standingIn, treeUp, garbage, remade };
+    let ownedKeys = 0;
+    for (const ks of owned.values()) ownedKeys += ks.size;
+    return { ...Object.fromEntries(Object.entries(all).map(([name, t]) => [name, t.size])), ownedKeys };
   });
   return { mirror, refresh, derive, mark: (id) => void dirtyRows.add(id), current: () => current };
 }
@@ -2116,6 +2347,13 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
     say(answer);
   };
 
+  // A question asked, kept to be stopped; or stopped at once, where what answered at once had this stopped.
+  const kept = (into: Asking[], q: Asking): Asking => {
+    if (stopped) q.stop();
+    else into.push(q);
+    return q;
+  };
+
   // Rows asked for by id, a thousand to a question, asked again only when they change.
   let byId: Asking[] = [];
   let byIdOf = "";
@@ -2129,13 +2367,15 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
     for (const k of [...answers.keys()]) if (k.startsWith("maps ")) answers.delete(k);
     for (let n = 0; n * 1000 < ids.length; n++) {
       const part = ids.slice(n * 1000, (n + 1) * 1000).map((id) => codec.hex(id));
-      byId.push(
+      kept(
+        byId,
         // In the document's list, as every row of it is: so a node that has to fetch what a question is about knows where.
         client.ask({ scope, table: BY_WHERE, where: where.all(where.inList(list), where.ids(part)), limit: 1000 }, (a) => {
           answers.set(`maps ${n}`, a);
           tell();
         }),
       );
+      if (stopped) return;
     }
   };
 
@@ -2171,38 +2411,45 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
       columns.value = b.of;
     }
     const within = whereEncode(p.owner, p.field, KIND_OF[b.kind], b.kind === "record" ? "\x01" : "");
-    found = client.ask(
-      {
-        scope,
-        table: columns,
-        where: where.all(where.inList(list), where.begins(W, within), asking.where ?? where.all()),
-        order: asking.order,
-        offset: asking.offset,
-        limit: asking.limit,
-        fromEnd: asking.fromEnd,
-        totals: asking.totals,
-      },
-      (a) => {
-        answers.set("found", a);
-        mapsOfGiven();
-        tell();
-      },
+    found = kept(
+      questions,
+      client.ask(
+        {
+          scope,
+          table: columns,
+          where: where.all(where.inList(list), where.begins(W, within), asking.where ?? where.all()),
+          order: asking.order,
+          offset: asking.offset,
+          limit: asking.limit,
+          fromEnd: asking.fromEnd,
+          totals: asking.totals,
+        },
+        (a) => {
+          answers.set("found", a);
+          mapsOfGiven();
+          tell();
+        },
+      ),
     );
-    questions.push(found);
+    if (stopped) return true;
     if (moved) found.move(moved.offset, moved.limit);
     // The rows on the way: whether what answers is there is theirs to say.
-    questions.push(
+    kept(
+      questions,
       client.ask({ scope, table: BY_WHERE, where: where.all(where.inList(list), where.ids(p.chain.map((id) => codec.hex(id)))), limit: 1000 }, (a) => {
         answers.set("chain", a);
         tell();
       }),
     );
+    if (stopped) return true;
     // Every node of a tree on the way: which are there, and where, is known only from all of them.
     p.trees.forEach((t, i) => {
       const pages = new Set<number>();
       const page = (n: number): void => {
+        if (stopped) return;
         pages.add(n);
-        questions.push(
+        kept(
+          questions,
           client.ask(
             {
               scope,
@@ -2225,13 +2472,23 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
     return true;
   };
 
-  // Ids are made with the scope's key: what is on the way is known once that is.
-  say(last);
+  // Ids are made with the scope's key: what is on the way is known once that is. A client that knows what it may do, and
+  // may not read there, is told so, as a question of its own would be; and what answers comes should that change.
+  const loading = last;
+  const refused = Object.freeze({ ...loading, status: "denied" as const });
+  const denied = () => client.ready && !client.scopeKey(scope);
+  let saidDenied = denied();
+  // What is said is what what answers is the same as or not.
+  say((last = saidDenied ? refused : loading));
   let unwait: (() => void) | undefined;
   if (!start()) {
     let started = false;
     const off = client.on("status", () => {
-      if (started || !start()) return;
+      if (started || stopped) return;
+      if (!start()) {
+        if (denied() !== saidDenied) say((last = (saidDenied = !saidDenied) ? refused : loading));
+        return;
+      }
       started = true;
       unwait?.();
       unwait = undefined;
@@ -2424,11 +2681,11 @@ const LIST_METHODS: { readonly [name: string]: Function } = Object.assign(Object
   },
   pop(this: Listy) {
     const st = this[STATE];
-    return st.drafts.item(st, changed(this).pop());
+    return st.drafts.taken(st, changed(this).pop());
   },
   shift(this: Listy) {
     const st = this[STATE];
-    return st.drafts.item(st, changed(this).shift());
+    return st.drafts.taken(st, changed(this).shift());
   },
   unshift(this: Listy, ...items: unknown[]) {
     return changed(this).unshift(...items);
@@ -2437,7 +2694,7 @@ const LIST_METHODS: { readonly [name: string]: Function } = Object.assign(Object
     const st = this[STATE];
     return changed(this)
       .splice(...args)
-      .map((x) => st.drafts.item(st, x));
+      .map((x) => st.drafts.taken(st, x));
   },
   sort(this: Listy, compare?: (x: unknown, y: unknown) => number) {
     const st = this[STATE];
@@ -2544,6 +2801,13 @@ class Drafts {
     let d = this.#of.get(x);
     if (!d) this.#of.set(x, (d = this.map(st.elem, x as Obj, st.tree)));
     return d;
+  }
+
+  // An item taken out of a list, handed out as one read there is: a value that was there, JSON or bytes, as a copy, which
+  // may be changed in place, as it is no longer in the list.
+  taken(st: ListDraftState, x: unknown): unknown {
+    if (!st.elem && typeof x === "object" && x !== null && this.#was(st).has(x)) return structuredClone(x);
+    return this.item(st, x);
   }
 
   mapGet(st: MapDraftState, key: string): unknown {

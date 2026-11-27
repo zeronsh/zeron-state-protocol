@@ -260,7 +260,8 @@ for i = 1, 100 do
 		local want = said
 		shown = function()
 			if live == nil and state.rows[#state.rows].body == want then
-				local t = b.rows[id] and b.rows[id].texts[Message.body.slot]
+				local row = b.rows[id]
+				local t = row and row.texts and row.texts[Message.body.slot] -- texts: none until one is made
 				live = t ~= nil and zsp.Text.provisional(t)
 			end
 		end
