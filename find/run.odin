@@ -130,11 +130,15 @@ leaf_span :: proc(p: ^Pred) -> (lo, hi: Key) {
 	return
 }
 
-// Seconds as the keys of row ids.
+// Seconds as the keys of row ids: as many as there may be rows of, the rest judged one by one. What is not a number
+// comes after every number, as its key does, and so after every row.
 @(private)
 created_span :: proc(p: ^Pred) -> (lo, hi: Key) {
 	to :: proc(k: Key) -> Key {
 		v := key_number(k)
+		if v != v {
+			return KEY_MAX if k.hi >> 63 != 0 else KEY_MIN // a key past every number's, or before
+		}
 		if !(v > 0) {
 			return KEY_MIN
 		}
@@ -142,6 +146,9 @@ created_span :: proc(p: ^Pred) -> (lo, hi: Key) {
 	}
 	lo, hi = leaf_span(p)
 	lo = to(lo) if lo != KEY_MIN else KEY_MIN
+	if lo == KEY_MAX {
+		return KEY_MAX, KEY_MIN // from past every row: none
+	}
 	if hi != KEY_MAX {
 		k := to(hi)
 		hi = {k.hi + 1 << 32, 0} if k.hi < u64(max(u32)) << 32 else KEY_MAX
