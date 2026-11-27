@@ -505,7 +505,7 @@ export class Client {
   #answers = new Map<number, LiveCall>(); // of others
   #nextCall = 0;
   #handlers = new Map<string, (call: Call, data: Uint8Array) => void>();
-  #followers = new Set<(id: string) => void>();
+  #followers: readonly ((id: string) => void)[] = []; // made anew as they change: what is being told stays as it was
   #typing = new Set<Stored>(); // rows with live text to send
   #tags = new Map<string, string>(); // of lists, by their scope, its key and their name
   #bulk?: Map<Win, Entry[]>; // rows to add to windows, all at once
@@ -570,12 +570,10 @@ export class Client {
     this.#wire = undefined;
     this.#ready = false;
     this.#authors.clear();
-    for (const set of [this.#calls, this.#answers]) {
-      for (const [id, c] of [...set]) {
-        set.delete(id);
-        c.call.onfault?.("lost");
-      }
-    }
+    // All of this client's own first, the next pipe asked for too: then those told of it, whatever they do.
+    const calls = [...this.#calls.values(), ...this.#answers.values()];
+    this.#calls.clear();
+    this.#answers.clear();
     for (const window of this.#windows.values()) {
       for (const page of window.pages) page.settled = false;
       this.#touch(window);
@@ -588,7 +586,6 @@ export class Client {
       }
     }
     this.#sweep();
-    this.#tell("status", false);
     if (!this.#closed) {
       // Soon after a pipe that was well; later and later after each that never came up, or that the node found fault
       // with, since what this client says it would say again.
@@ -597,6 +594,8 @@ export class Client {
       this.#failures++;
       this.#after(wait, () => this.#dial());
     }
+    for (const c of calls) if (c.call.onfault) this.#hand(c.call.onfault, "lost", c.call);
+    this.#tell("status", false);
   }
 
   /** Lets go of the pipe, saying first whatever is still to be said. Questions asked once are answered as far as they got. */
@@ -659,11 +658,11 @@ export class Client {
       const wire = this.#wire;
       for (let at = 0; at < written.length && this.#wire === wire; at += MESSAGE_MOST) wire.send(written.slice(at, at + MESSAGE_MOST));
     }
-    for (const window of this.#windows.values()) if (window.changed) this.#publish(window);
+    for (const window of [...this.#windows.values()]) if (window.changed) this.#publish(window);
     for (const a of [...this.#asked.values()]) {
       if (a.changed && !a.stopped) {
         a.changed = false;
-        a.observer(this.#answer(a));
+        this.#hand(a.observer, this.#answer(a));
       }
     }
   }
@@ -707,8 +706,8 @@ export class Client {
         this.#handle(codec.u8(r), r);
       } catch (e) {
         if (!(e instanceof codec.Malformed)) {
-          // What the code of whoever was told of it threw is theirs, and theirs alone: the pipe is read on from the frame
-          // after, on a turn of its own, as though it had not been thrown, rather than losing the rest.
+          // What is thrown while a frame is read, as by a host, which no code of an application can be: the pipe is read on
+          // from the frame after, on a turn of its own, rather than losing the rest and reading on from inside a frame.
           if (this.#wire === wire) {
             this.#input = s.slice(at);
             this.#host.defer(() => this.#wire === wire && this.#receive(new Uint8Array(0)));
@@ -797,7 +796,7 @@ export class Client {
           this.#touch(window);
         }
       }
-      for (const a of this.#asked.values()) if (a.status === "denied" && !a.stopped) this.#ask(a, a.question, true);
+      for (const a of [...this.#asked.values()]) if (a.status === "denied" && !a.stopped) this.#ask(a, a.question, true);
       this.#tell("status", true);
       return;
     }
@@ -820,26 +819,30 @@ export class Client {
       if (window.pages.length === 0) this.#open(window);
       else for (const page of window.pages) this.#watch(page);
     }
-    for (const a of this.#asked.values()) this.#ask(a, a.question, true);
+    for (const a of [...this.#asked.values()]) this.#ask(a, a.question, true); // and none asked meanwhile, twice
     this.#tell("status", true);
   }
 
   // ---------------------------------------------------------------- observing things that are not windows
 
-  // Each hears, whatever another does: one that throws does so on a turn of its own, never in the middle of what a pipe
-  // said, where all that came after it would be lost.
+  // Calls code that is not this client's own, once all that this client does of its own is done: what it throws is its
+  // own, thrown on a turn of its own, so that whoever else was to hear does, and nothing of this client is left half done.
+  // A call's own callbacks are called on it, as its methods.
+  #hand<A>(f: (a: A) => unknown, a: A, that?: unknown): unknown {
+    try {
+      return f.call(that, a);
+    } catch (e) {
+      this.#host.defer(() => {
+        throw e;
+      });
+      return undefined;
+    }
+  }
+
+  // Each hears, whatever another does.
   #tell<E extends Event>(what: E, value: Told[E]): void {
     const set = this.#watchers.get(what);
-    if (!set) return;
-    for (const f of [...set]) {
-      try {
-        f(value);
-      } catch (e) {
-        this.#host.defer(() => {
-          throw e;
-        });
-      }
-    }
+    if (set) for (const f of [...set]) this.#hand(f, value);
   }
 
   /**
@@ -852,9 +855,10 @@ export class Client {
     // Each is its own, though the same function hear twice: stopping one stops no other.
     const own = (value: Told[E]) => f(value);
     set.add(own);
-    if (what === "status") (f as (v: boolean) => void)(this.#ready);
-    else if (what === "devices") (f as (v: readonly Device[]) => void)(this.#devices);
-    else if (what === "self" && this.#authors.has(0)) (f as (v: Device) => void)(this.#authors.get(0)!);
+    // What is known is told at once, and what that throws is thrown later: the caller has the way to stop it first.
+    if (what === "status") this.#hand(f as (v: boolean) => void, this.#ready);
+    else if (what === "devices") this.#hand(f as (v: readonly Device[]) => void, this.#devices);
+    else if (what === "self" && this.#authors.has(0)) this.#hand(f as (v: Device) => void, this.#authors.get(0)!);
     return () => void set.delete(own);
   }
 
@@ -935,7 +939,7 @@ export class Client {
     const own = (state: State<any>) => observer(state);
     win.observers.add(own);
     win.watching++;
-    own(win.bare ? (undefined as unknown as State<T>) : this.#state(win));
+    this.#hand(own, win.bare ? (undefined as unknown as State<T>) : this.#state(win));
     let stopped = false;
     return Object.freeze({
       visible: (first: number, last: number) => this.#visible(win, first, last),
@@ -1256,7 +1260,7 @@ export class Client {
   #publish(window: Win): void {
     window.changed = false;
     const state = window.bare ? (undefined as unknown as State<any>) : this.#state(window);
-    for (const f of [...window.observers]) f(state);
+    for (const f of [...window.observers]) this.#hand(f, state);
   }
 
   // A row as the application sees it: one frozen object, the same one until something in it changes.
@@ -1400,7 +1404,7 @@ export class Client {
   // Puts a row where its placements say, in every window, and takes it from where they do not. Followers hear of it
   // first, unless they have been told already.
   #place(row: Stored, told = false): void {
-    if (!told) for (const f of this.#followers) f(row.hex);
+    if (!told) for (const f of this.#followers) this.#hand(f, row.hex);
     const keys: string[] = [];
     if (!row.dead) {
       for (let slot = 1; slot <= 15; slot++) {
@@ -1460,7 +1464,7 @@ export class Client {
       for (const row of rows) this.#place(row);
       return;
     }
-    for (const row of rows) for (const f of this.#followers) f(row.hex);
+    for (const row of rows) for (const f of this.#followers) this.#hand(f, row.hex);
     const bulk = new Map<Win, Entry[]>();
     this.#bulk = bulk;
     for (const row of rows) this.#place(row, true);
@@ -1482,7 +1486,7 @@ export class Client {
     const a = this.#newAsked(question, observer as (answer: Answer<any>) => void);
     this.#asked.set(a.id, a);
     if (this.#ready) this.#ask(a);
-    observer(this.#answer(a) as Answer<T>);
+    this.#hand(observer, this.#answer(a) as Answer<T>);
     return Object.freeze({
       // A stretch that cannot be asked for is refused at once, and what was asked stands: else it is said again on every
       // pipe, and refused there.
@@ -1923,8 +1927,8 @@ export class Client {
   /** Hears of every row that changes, here or anywhere, by its id. Returns a way to stop. */
   follow(f: (id: string) => void): () => void {
     const own = (id: string) => f(id); // its own, though the same function follow twice
-    this.#followers.add(own);
-    return () => void this.#followers.delete(own);
+    this.#followers = [...this.#followers, own];
+    return () => void (this.#followers = this.#followers.filter((x) => x !== own));
   }
 
   /** A row as it is held: its cells by slot and stamp, or undefined. Not to be changed. */
@@ -2328,7 +2332,7 @@ export class Client {
     const data = codec.rest(r).slice();
     const live = this.#call(id, 1, device, method, subject);
     this.#consumed(id, live, data.length); // the first message is always taken
-    handler(live.call, data);
+    this.#hand((d: Uint8Array) => handler(live.call, d), data);
   }
 
   #onFlow(r: codec.Reader): void {
@@ -2342,19 +2346,21 @@ export class Client {
     const call = live.call;
     if (kind === F_DATA) {
       const data = codec.rest(r).slice();
-      if (call.ondata?.(data) !== false && set.get(id) === live) this.#consumed(id, live, data.length);
+      // Kept only if the reader says so, and one that threw kept nothing: else what it was sent would never be credited
+      // back, and the call would wait for good.
+      if ((!call.ondata || this.#hand(call.ondata, data, call) !== false) && set.get(id) === live) this.#consumed(id, live, data.length);
     } else if (kind === F_CREDIT) {
       live.credit += codec.varint(r);
       this.#drain(id, live);
-      if (live.queue.length === 0 && set.get(id) === live) call.onroom?.();
+      if (live.queue.length === 0 && set.get(id) === live && call.onroom) this.#hand(call.onroom, undefined, call);
     } else if (kind === F_END) {
       live.theirsEnded = true;
       if (live.mineEnded) set.delete(id);
-      call.onend?.();
+      if (call.onend) this.#hand(call.onend, undefined, call);
     } else {
       set.delete(id);
       const code = kind === F_FAULT && r.pos < r.len ? codec.u8(r) : 0;
-      call.onfault?.(FAULTS[code] ?? "cancelled");
+      if (call.onfault) this.#hand(call.onfault, FAULTS[code] ?? "cancelled", call);
     }
   }
 }

@@ -106,7 +106,7 @@ type Stored = {
 	dirty: { [number]: boolean }, -- slots with live text to send
 }
 type Said = { [string]: { [string]: boolean } }
-type Pending = { seq: number, scope: number, body: string, rows: { string }, done: () -> () }
+type Pending = { seq: number, scope: number, body: string, rows: { string }, done: (() -> ())? }
 type Page = {
 	id: number,
 	window: Window,
@@ -287,7 +287,7 @@ local function new_client(host: Host)
 		answers = {} :: { [number]: Live_Call }, -- of others
 		next_call = 0,
 		handlers = {} :: { [string]: (Call, string) -> () },
-		followers = {} :: { [(string) -> ()]: boolean },
+		followers = {} :: { (string) -> () }, -- made anew as they change: what is being told stays as it was
 		typing = {} :: { [Stored]: boolean }, -- rows with live text to send
 		tags = {} :: { [number]: { key: string, lists: { [string]: string } } }, -- of lists, by their scope, while its key is the same
 		bulk = nil :: { [Window]: { { key: string, row: Stored } } }?, -- rows to add to windows, all at once
@@ -346,13 +346,13 @@ function Client._lost(self: Client)
 	self.wire = nil
 	self.ready = false
 	table.clear(self.authors)
+	-- All of this client's own first, the next pipe asked for too: then those told of it, whatever they do.
+	local calls = {}
 	for _, set in { self.calls, self.answers } do
-		for id, c in set do
-			set[id] = nil
-			if c.call.on_fault then
-				c.call.on_fault("lost")
-			end
+		for _, c in set do
+			table.insert(calls, c)
 		end
+		table.clear(set)
 	end
 	for _, window in self.windows do
 		for _, page in window.pages do
@@ -369,7 +369,6 @@ function Client._lost(self: Client)
 		end
 	end
 	self:_sweep()
-	self:_tell("status", false)
 	if not self.closed then
 		-- Soon after a pipe that was well; later and later after each that never came up, or that the node found fault
 		-- with, since what this client says it would say again.
@@ -382,6 +381,12 @@ function Client._lost(self: Client)
 			self:_dial()
 		end)
 	end
+	for _, c in calls do
+		if c.call.on_fault then
+			self:_hand(c.call.on_fault, "lost")
+		end
+	end
+	self:_tell("status", false)
 end
 
 function Client.close(self: Client)
@@ -480,7 +485,7 @@ function Client._flush(self: Client)
 			wire.send(piece)
 		end
 	end
-	for _, window in self.windows do
+	for _, window in table.clone(self.windows) do
 		if window.changed then
 			self:_publish(window)
 		end
@@ -488,7 +493,7 @@ function Client._flush(self: Client)
 	for _, a in table.clone(self.asked) do
 		if a.changed and not a.stopped then
 			a.changed = false
-			a.observer(self:_answer(a))
+			self:_hand(a.observer, self:_answer(a))
 		end
 	end
 end
@@ -535,8 +540,9 @@ function Client._receive(self: Client, data: buffer | string)
 		local fine, why = pcall(handle, self, r)
 		if not fine then
 			if why ~= codec.Malformed then
-				-- What the code of whoever was told of it threw is theirs, and theirs alone: the pipe is read on from the
-				-- frame after, on a turn of its own, as though it had not been thrown, rather than losing the rest.
+				-- What is thrown while a frame is read, as by a host, which no code of an application can be: the pipe is
+				-- read on from the frame after, on a turn of its own, rather than losing the rest and reading on from inside a
+				-- frame.
 				if self.wire == wire then
 					self.input = string.sub(s, at)
 					self.host.defer(function()
@@ -634,7 +640,7 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 				self:_touch(window)
 			end
 		end
-		for _, a in self.asked do
+		for _, a in table.clone(self.asked) do
 			if a.status == "denied" and not a.stopped then
 				self:_ask(a, nil, true)
 			end
@@ -668,7 +674,7 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 			end
 		end
 	end
-	for _, a in self.asked do
+	for _, a in table.clone(self.asked) do -- and none asked meanwhile, twice
 		self:_ask(a, nil, true)
 	end
 	self:_tell("status", true)
@@ -676,18 +682,36 @@ end
 
 -- ---------------------------------------------------------------- observing things that are not windows
 
--- Each hears, whatever another does: one that throws does so on a turn of its own, never in the middle of what a pipe
--- said, where all that came after it would be lost.
+-- Calls code that is not this client's own, once all that this client does of its own is done: what it throws is its
+-- own, thrown on a turn of its own, so that whoever else was to hear does, and nothing of this client is left half done.
+function Client._hand(self: Client, f: (any) -> ...any, a: any): any
+	local fine, out = pcall(f, a)
+	if fine then
+		return out
+	end
+	self.host.defer(function()
+		error(out, 0)
+	end)
+	return nil
+end
+
+-- Resumes a thread that waits for this client, on a turn of its own, as a promise would be kept: what it does then is
+-- never done in the middle of what this client does, and what it throws is thrown there.
+function Client._resume(self: Client, thread: thread)
+	self.host.defer(function()
+		local fine, why = coroutine.resume(thread)
+		if not fine then
+			error(why, 0)
+		end
+	end)
+end
+
+-- Each hears, whatever another does.
 function Client._tell(self: Client, what: string, value: any)
 	local set = self.watchers[what]
 	if set then
 		for f in table.clone(set) do
-			local fine, why = pcall(f, value)
-			if not fine then
-				self.host.defer(function()
-					error(why, 0)
-				end)
-			end
+			self:_hand(f, value)
 		end
 	end
 end
@@ -702,12 +726,13 @@ function Client.on(self: Client, what: "status" | "devices" | "self" | "error", 
 		f(value)
 	end
 	set[own] = true
+	-- What is known is told at once, and what that throws is thrown later: the caller has the way to stop it first.
 	if what == "status" then
-		f(self.ready)
+		self:_hand(f, self.ready)
 	elseif what == "devices" then
-		f(self.devices)
+		self:_hand(f, self.devices)
 	elseif what == "self" and self.authors[0] then
-		f(self.authors[0])
+		self:_hand(f, self.authors[0])
 	end
 	return function()
 		set[own] = nil
@@ -805,7 +830,7 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 	end
 	window.observers[own] = true
 	window.watching += 1
-	own(if window.bare then nil :: any else self:_state(window))
+	self:_hand(own, if window.bare then nil :: any else self:_state(window))
 	local stopped = false
 
 	return table.freeze({
@@ -1246,7 +1271,7 @@ function Client._publish(self: Client, window: Window)
 	window.changed = false
 	local state = if window.bare then nil :: any else self:_state(window)
 	for f in table.clone(window.observers) do
-		f(state)
+		self:_hand(f, state)
 	end
 end
 
@@ -1517,8 +1542,8 @@ end
 -- first, unless they have been told already.
 function Client._place(self: Client, row: Stored, told: boolean?)
 	if not told then
-		for f in self.followers do
-			f(row.id)
+		for _, f in self.followers do
+			self:_hand(f, row.id)
 		end
 	end
 	-- Where its placements put it: most often in one place, which needs no table of them.
@@ -1613,8 +1638,8 @@ function Client._place_all(self: Client, rows: { [Stored]: boolean })
 		return
 	end
 	for row in rows do
-		for f in self.followers do
-			f(row.id)
+		for _, f in self.followers do
+			self:_hand(f, row.id)
 		end
 	end
 	local bulk: { [Window]: { { key: string, row: Stored } } } = {}
@@ -1675,7 +1700,7 @@ function Client.ask(self: Client, question: asking.Question, observer: (Answer) 
 	if self.ready then
 		self:_ask(a)
 	end
-	observer(self:_answer(a))
+	self:_hand(observer, self:_answer(a))
 	return table.freeze({
 		-- A stretch that cannot be asked for is refused at once, and what was asked stands: else it is said again on every
 		-- pipe, and refused there.
@@ -1729,7 +1754,7 @@ function Client.fetch(self: Client, question: asking.Question): Answer
 		once = function(made)
 			answer = made
 			if waiting then
-				coroutine.resume(thread)
+				self:_resume(thread)
 			end
 		end,
 		stopped = false,
@@ -2232,9 +2257,16 @@ function Client.follow(self: Client, f: (string) -> ()): () -> ()
 	local function own(id: string) -- its own, though the same function follow twice
 		f(id)
 	end
-	self.followers[own] = true
+	local list = table.clone(self.followers)
+	table.insert(list, own)
+	self.followers = list
 	return function()
-		self.followers[own] = nil
+		local i = table.find(self.followers, own)
+		if i then
+			local rest = table.clone(self.followers)
+			table.remove(rest, i)
+			self.followers = rest
+		end
 	end
 end
 
@@ -2324,7 +2356,7 @@ function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
 	end
 	self.seq += 1
 	local body = codec.string(w)
-	table.insert(self.pending, { seq = self.seq, scope = scope, body = body, rows = rows, done = done or function() end })
+	table.insert(self.pending, { seq = self.seq, scope = scope, body = body, rows = rows, done = done })
 	if self.ready then
 		local framed = codec.writer()
 		codec.put_varint(framed, self.seq)
@@ -2333,11 +2365,14 @@ function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
 	end
 end
 
+-- Each write acknowledged is let go of, and whoever waits for it is told on a turn of its own, as a promise is kept.
 function Client._on_ack(self: Client, seq: number)
 	while #self.pending > 0 and self.pending[1].seq <= seq do
 		local p = table.remove(self.pending, 1) :: Pending
 		self:_settle(p)
-		p.done()
+		if p.done then
+			self.host.defer(p.done)
+		end
 	end
 end
 
@@ -2691,7 +2726,7 @@ function Client.request(self: Client, device: string, scope: number, method: str
 		if not settled then
 			settled = true
 			if waiting then
-				coroutine.resume(thread)
+				self:_resume(thread)
 			end
 		end
 	end
@@ -2761,7 +2796,9 @@ function Client._on_call(self: Client, r: codec.Reader)
 	local live = self:_call(id, 1, device, method)
 	live.call.subject = subject
 	self:_consume(id, live, #data) -- the first message is always taken
-	handler(live.call, data)
+	self:_hand(function(d: string)
+		handler(live.call, d)
+	end, data)
 end
 
 function Client._on_flow(self: Client, r: codec.Reader)
@@ -2777,9 +2814,11 @@ function Client._on_flow(self: Client, r: codec.Reader)
 	local call = live.call
 	if kind == F_DATA then
 		local data = codec.rest(r)
+		-- Kept only if the reader says so, and one that threw kept nothing: else what it was sent would never be credited
+		-- back, and the call would wait for good.
 		local done = true
 		if call.on_data then
-			done = call.on_data(data) ~= false
+			done = self:_hand(call.on_data, data) ~= false
 		end
 		if done and set[id] == live then
 			self:_consume(id, live, #data)
@@ -2788,7 +2827,7 @@ function Client._on_flow(self: Client, r: codec.Reader)
 		live.credit += codec.varint(r)
 		self:_drain(id, live)
 		if call.on_room and set[id] == live then
-			call.on_room()
+			self:_hand(call.on_room, nil)
 		end
 	elseif kind == F_END then
 		live.theirs_ended = true
@@ -2796,13 +2835,13 @@ function Client._on_flow(self: Client, r: codec.Reader)
 			set[id] = nil
 		end
 		if call.on_end then
-			call.on_end()
+			self:_hand(call.on_end, nil)
 		end
 	else
 		set[id] = nil
 		if call.on_fault then
 			local code = if kind == F_FAULT and r.pos < r.len then codec.u8(r) else 0
-			call.on_fault(Faults[code] or "cancelled")
+			self:_hand(call.on_fault, Faults[code] or "cancelled")
 		end
 	end
 end

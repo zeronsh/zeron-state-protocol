@@ -15,7 +15,9 @@ local ANSWER, FETCH = 34, 35
 type Said = { kind: number, body: string }
 
 local function harness()
-	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, waits = {} :: { number }, timers = 0, closes = 0, connects = 0, sizes = {} :: { number }, partial = "" }
+	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, waits = {} :: { number }, timers = 0, closes = 0, connects = 0, sizes = {} :: { number }, partial = "", clock = function(): number
+		return 1800000000
+	end }
 	local function run()
 		while #self.deferred > 0 do
 			(table.remove(self.deferred, 1) :: any)()
@@ -24,7 +26,7 @@ local function harness()
 	local client = zsp.connect({
 		credential = "x",
 		now = function(): number
-			return 1800000000
+			return self.clock()
 		end,
 		random = function(n: number): string
 			local out = {}
@@ -870,38 +872,384 @@ do
 	assert(#h.client.devices == 0, "the pipe was not read on")
 end
 
--- And what any other code told of the pipe throws is its own: the pipe is read on from the frame after, on a turn of its
--- own, as if it had not been thrown, rather than losing the rest and reading what comes after as nonsense.
+-- Code told of anything is told after all this client does of its own, each alone: what one throws it throws on a turn of
+-- its own, and leaves nothing half done, nor anyone else untold. And whatever else is thrown while a frame is read, as by a
+-- host, the pipe is read on from the frame after, on a turn of its own, rather than losing the rest.
+local function frame_of(kind: number, body: string): string
+	local w = codec.writer()
+	codec.put_bytes(w, string.char(kind) .. body)
+	return codec.string(w)
+end
+local function synced_of(id: number, lo: string, hi: string): string
+	local w = codec.writer()
+	codec.put_varint(w, id)
+	codec.put_u8(w, 1)
+	codec.put_key(w, lo)
+	codec.put_key(w, hi)
+	codec.put_varint(w, 0)
+	codec.put_varint(w, 0)
+	return frame_of(SYNCED, codec.string(w))
+end
+local function cell_of(row: string, kind: number, slot: number, n: number, body: string): string
+	local w = codec.writer()
+	codec.put(w, string.char(kind) .. row .. string.char(slot) .. string.rep("\0", 15) .. string.char(n))
+	codec.put_bytes(w, body)
+	return codec.string(w)
+end
+-- Runs what was put off, and says how many of those threw.
+local function thrown(h: any, what: string): number
+	local n = 0
+	while true do
+		local fine, why = pcall(h.run)
+		if fine then
+			return n
+		end
+		assert(string.find(tostring(why), what, 1, true), `it was {why}`)
+		n += 1
+	end
+end
+local DEVICE = string.rep("d", 32)
 do
+	-- A follower that throws: every row is put where it goes, and every other follower hears of each, whether the rows
+	-- came down the pipe or were written here.
 	local h = harness()
 	h.run()
 	h.greet()
-	local function frame(kind: number, body: string): string
-		local w = codec.writer()
-		codec.put_bytes(w, string.char(kind) .. body)
-		return codec.string(w)
+	local shown = 0
+	local win = h.client:window({ scope = 1, list = "a", table = Note }, function(st)
+		shown = #st.rows
+	end)
+	h.run()
+	local heard = 0
+	h.client:follow(function()
+		error("a follower's own", 0)
+	end)
+	h.client:follow(function()
+		heard += 1
+	end)
+	local tag = h.client:_tag(1, "a")
+	local function placed(n: number): string
+		return cell_of("\0\0\0\1" .. string.rep("\7", 11) .. string.char(n), 2, 1, n, tag .. string.rep("\0", 7) .. string.char(n))
 	end
-	local function cell(id: string): string
-		local w = codec.writer()
-		codec.put(w, "\3" .. id .. "\16" .. string.rep("\0", 15) .. "\1")
-		codec.put_bytes(w, "t")
-		return codec.string(w)
+	h.self.receive(frame_of(CELLS, "\0" .. placed(1) .. placed(2)))
+	assert(#win.entries() == 2, "the rows were not put where they go")
+	assert(heard == 2, "a follower was not told")
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 9, { title = "w" })
+	end)
+	assert(#win.entries() == 3 and heard == 3)
+	assert(thrown(h, "a follower's own") == 3)
+	assert(shown == 3)
+end
+do
+	-- A call told it is lost that throws: every other call is told, the windows and questions are stale, "status" is told,
+	-- and the pipe is dialled again.
+	local h = harness()
+	h.run()
+	h.greet()
+	local up = true
+	h.client:on("status", function(x)
+		up = x
+	end)
+	local status = ""
+	h.client:window({ scope = 1, list = "a", table = Note }, function(st)
+		status = st.status
+	end)
+	h.run()
+	local page, _, lo, hi = watch_of(h.last(WATCH))
+	h.self.receive(synced_of(page, lo, hi))
+	h.run()
+	assert(status == "ready")
+	local one, two = h.client:call(DEVICE, 1, "m", "x"), h.client:call(DEVICE, 1, "m", "x")
+	one.on_fault = function()
+		error("a call's own", 0)
 	end
-	local throwing = true
-	local stop = h.client:follow(function()
+	local fault = ""
+	two.on_fault = function(f)
+		fault = f
+	end
+	h.run()
+	local waits = #h.self.waits
+	h.self.closed()
+	assert(fault == "lost" and not up, `told {fault} and {up}`)
+	assert(#h.self.waits == waits + 1, "the pipe was not dialled again")
+	assert(thrown(h, "a call's own") == 1)
+	assert(status == "stale")
+	h.laters()
+	h.run()
+	assert(h.self.connects == 2)
+end
+do
+	-- An observer that throws: every other observer, window and question is told, now and later; and a client closed
+	-- while one would throw is closed whole, its pipe let go of and what was asked once answered.
+	local ASK = 32
+	local h = harness()
+	h.run()
+	h.greet()
+	local throwing = false
+	local second, other, answered = 0, 0, 0
+	h.client:window({ scope = 1, list = "a", table = Note }, function()
 		if throwing then
-			error("a follower's own", 0)
+			error("an observer's own", 0)
 		end
 	end)
-	local row = "\0\0\0\1" .. string.rep("\7", 12)
-	local fine, why = pcall(h.self.receive, frame(CELLS, "\0" .. cell(row)) .. frame(12, string.rep("d", 32) .. "\3who"))
-	assert(not fine and why == "a follower's own", `it was {why}`)
-	throwing = false
+	h.client:window({ scope = 1, list = "a", table = Note }, function()
+		second += 1
+	end)
+	h.client:window({ scope = 1, list = "b", table = Note }, function()
+		other += 1
+	end)
+	h.client:ask({ scope = 1, table = Note }, function()
+		answered += 1
+	end)
+	h.run()
+	local pages = {}
+	for _, x in h.self.said do
+		if x.kind == WATCH then
+			table.insert(pages, { watch_of(x) })
+		end
+	end
+	local ask_id = codec.varint(codec.reader((h.last(ASK) :: any).body))
+	second, other, answered, throwing = 0, 0, 0, true
+	local w = codec.writer()
+	codec.put_varint(w, ask_id)
+	codec.put_u8(w, 1)
+	for _ = 1, 4 do
+		codec.put_varint(w, 0)
+	end
+	local answer = frame_of(ANSWER, codec.string(w))
+	for round = 1, 2 do
+		local chunk = {}
+		for _, p in pages do
+			table.insert(chunk, synced_of(p[1], p[3], p[4]))
+		end
+		h.self.receive(table.concat(chunk) .. answer)
+		assert(thrown(h, "an observer's own") == 1)
+		assert(second == round and other == round and answered == round, `told {second} {other} {answered}`)
+	end
+	local fetched = false
+	coroutine.wrap(function()
+		h.client:fetch({ scope = 1, table = Note })
+		fetched = true
+	end)()
+	h.run()
+	h.self.receive(synced_of(pages[1][1], pages[1][3], pages[1][4]))
+	local closes = h.self.closes
+	h.client:close()
+	assert(h.self.closes == closes + 1, "the pipe was not let go of")
+	assert(h.self.timers == 0, "something was left to be done later")
+	assert(thrown(h, "an observer's own") == 2) -- as it was when closed, and once its pipe was let go of
+	assert(fetched, "what was asked once was not answered")
+end
+do
+	-- A reader of a call that throws keeps nothing: what came is credited back, so the call goes on.
+	local FLOW = 16
+	local h = harness()
+	h.run()
+	h.greet()
+	local call = h.client:call(DEVICE, 1, "m", "x")
+	call.on_data = function()
+		error("a reader's own", 0)
+	end
+	h.run()
+	local function flow(kind: number, body: string): string
+		local w = codec.writer()
+		codec.put_varint(w, 1 * 2 + 1)
+		codec.put_u8(w, kind)
+		return frame_of(FLOW, codec.string(w) .. body)
+	end
+	local from = #h.self.said
+	h.self.receive(flow(0, string.rep("x", 1000)) .. flow(0, string.rep("y", 10)))
+	assert(thrown(h, "a reader's own") == 2)
+	local credited = 0
+	for i = from + 1, #h.self.said do
+		local x = h.self.said[i]
+		if x.kind == FLOW then
+			local r = codec.reader(x.body)
+			if codec.varint(r) == 2 and codec.u8(r) == 4 then
+				credited += codec.varint(r)
+			end
+		end
+	end
+	assert(credited == 1010, "what came was not credited back")
+end
+do
+	-- Whoever waits for a write that throws: every write acknowledged is let go of, whoever waits for each is told, and
+	-- none of them is said again down the next pipe.
+	local h = harness()
+	h.run()
+	h.greet()
+	local told = 0
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 1, { title = "one" })
+	end, function()
+		error("a waiter's own", 0)
+	end)
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 2, { title = "two" })
+	end, function()
+		told += 1
+	end)
+	h.run()
+	local w = codec.writer()
+	codec.put_varint(w, 2)
+	h.self.receive(frame_of(ACK, codec.string(w)))
+	assert(#h.client.pending == 0, "what was acknowledged is pending still")
+	assert(thrown(h, "a waiter's own") == 1)
+	assert(told == 1, "whoever waited for the second was not told")
+	h.self.closed()
+	h.run()
+	h.laters()
+	h.run()
+	local from = #h.self.said
+	h.greet()
+	for i = from + 1, #h.self.said do
+		assert(h.self.said[i].kind ~= CELLS, "what was acknowledged was said again")
+	end
+end
+do
+	-- What a host throws while a frame is read: the pipe is read on from the frame after it.
+	local CALL = 15
+	local h = harness()
+	h.run()
+	h.greet()
+	local served = 0
+	h.client:serve(1, "m", function()
+		served += 1
+	end)
+	local function call_of(id: number): string
+		local w = codec.writer()
+		codec.put_varint(w, id)
+		codec.put(w, string.rep("d", 32))
+		codec.put_varint(w, 1)
+		codec.put_bytes(w, "m")
+		codec.put_bytes(w, "")
+		return frame_of(CALL, codec.string(w) .. "x")
+	end
+	h.self.clock = function(): number
+		error("a host's own", 0)
+	end
+	local fine, why = pcall(h.self.receive, call_of(1) .. frame_of(12, string.rep("d", 32) .. "\3who"))
+	assert(not fine and why == "a host's own", `it was {why}`)
+	h.self.clock = function(): number
+		return 1800000000
+	end
 	h.run()
 	assert(#h.client.devices == 1, "what came after it was lost")
-	h.self.receive(frame(12, ""))
-	assert(h.client.ready and #h.client.devices == 0 and h.self.closes == 0, "the pipe was not read on")
-	stop()
+	h.self.receive(call_of(2) .. frame_of(12, ""))
+	assert(h.client.ready and #h.client.devices == 0 and served == 1 and h.self.closes == 0, "the pipe was not read on")
+end
+do
+	-- Questions asked meanwhile, as by code that waited for one asked once, are asked once each.
+	local ASK = 32
+	local h = harness()
+	h.run()
+	for _ = 1, 5 do
+		h.client:ask({ scope = 1, table = Note }, function() end)
+	end
+	for _ = 1, 5 do
+		coroutine.wrap(function()
+			h.client:fetch({ scope = 99, table = Note })
+			for _ = 1, 10 do
+				h.client:ask({ scope = 1, table = Note }, function() end)
+			end
+		end)()
+	end
+	local from = #h.self.said
+	h.greet()
+	h.run()
+	local counts: { [number]: number } = {}
+	local n = 0
+	for i = from + 1, #h.self.said do
+		local x = h.self.said[i]
+		if x.kind == ASK then
+			local id = codec.varint(codec.reader(x.body))
+			if not counts[id] then
+				n += 1
+			end
+			counts[id] = (counts[id] or 0) + 1
+		end
+	end
+	assert(n == 55, `{n} were asked`)
+	for id, k in counts do
+		assert(k == 1, `question {id} was asked {k} times`)
+	end
+end
+do
+	-- What waited for this client goes on on a turn of its own, as a promise kept: and what it throws then is thrown,
+	-- rather than lost with the thread.
+	local h = harness()
+	h.run()
+	h.greet()
+	local went = false
+	coroutine.wrap(function()
+		h.client:fetch({ scope = 1, table = Note })
+		went = true
+		error("a waiter's own", 0)
+	end)()
+	h.run()
+	local w = codec.writer()
+	codec.put_varint(w, codec.varint(codec.reader((h.last(FETCH) :: any).body)))
+	codec.put_u8(w, 1)
+	for _ = 1, 4 do
+		codec.put_varint(w, 0)
+	end
+	h.self.receive(frame_of(ANSWER, codec.string(w)))
+	assert(not went, "it went on in the middle of what this client did")
+	assert(thrown(h, "a waiter's own") == 1)
+	assert(went)
+end
+do
+	-- Nor is one asked meanwhile by this client itself, as for an editor's row that nothing shows once its question is
+	-- denied on the pipe come up.
+	local ASK = 32
+	local h = harness()
+	h.run()
+	local function roster(scopes: { number }): string
+		local out = string.rep("\0", 8)
+		for _, n in scopes do
+			out ..= string.char(n) .. "\7" .. string.rep("k", 32)
+		end
+		return out
+	end
+	h.tell(ROSTER, roster({ 1, 2 }))
+	h.client:ask({ scope = 2, table = Note }, function() end)
+	h.run()
+	local row = "\0\0\0\1" .. string.rep("\7", 12)
+	local w = codec.writer()
+	codec.put_varint(w, codec.varint(codec.reader((h.last(ASK) :: any).body)))
+	codec.put_u8(w, 1)
+	codec.put_varint(w, 1)
+	codec.put_varint(w, 0)
+	codec.put_varint(w, 1)
+	codec.put(w, row)
+	codec.put_varint(w, 0)
+	h.tell(ANSWER, codec.string(w))
+	local editor = h.client:text(row, Note.body)
+	h.run()
+	h.self.closed()
+	h.run()
+	h.laters()
+	h.run()
+	local from = #h.self.said
+	h.tell(ROSTER, roster({ 1 }))
+	local counts: { [number]: number } = {}
+	local n = 0
+	for i = from + 1, #h.self.said do
+		local x = h.self.said[i]
+		if x.kind == ASK then
+			local id = codec.varint(codec.reader(x.body))
+			if not counts[id] then
+				n += 1
+			end
+			counts[id] = (counts[id] or 0) + 1
+		end
+	end
+	assert(n == 1, "the editor's row was not asked for")
+	for id, k in counts do
+		assert(k == 1, `question {id} was asked {k} times`)
+	end
+	editor.close()
 end
 
 -- A row an editor has open that moves within its window, or from one window to another, is never without one to show

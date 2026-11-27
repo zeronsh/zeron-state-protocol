@@ -13,7 +13,7 @@ import * as m from "../src/mirror.ts";
 if (process.env.ZSP_FAIL) throw new Error("failing, as ZSP_FAIL asks");
 
 const HELLO = 1, ROSTER = 2, WATCH = 3, CELLS = 7, ACK = 8, SYNCED = 10, ERROR = 13;
-const ASK = 32, UNASK = 33, ANSWER = 34, FETCH = 35, CALL = 15, SERVE = 14, AUTHOR = 17;
+const ASK = 32, UNASK = 33, ANSWER = 34, FETCH = 35, CALL = 15, SERVE = 14, AUTHOR = 17, FLOW = 16;
 
 // Binary strings, one char a byte, as the protocol's identifiers are kept.
 const b = (s: string) => codec.bytesOf(s);
@@ -39,13 +39,14 @@ function harness() {
     connects: 0,
     sizes: [] as number[],
     partial: new Uint8Array(0),
+    clock: () => 1800000000000, // what the host says the time is
   };
   const run = () => {
     while (self.deferred.length > 0) self.deferred.shift()!();
   };
   const client = new Client({
     credential: "x",
-    now: () => 1800000000000,
+    now: () => self.clock(),
     random: (n) => Uint8Array.from({ length: n }, () => Math.floor(Math.random() * 256)),
     defer: (f) => self.deferred.push(f),
     after: (ms, f) => {
@@ -652,30 +653,251 @@ function piecesOf(h: ReturnType<typeof harness>, slot: number): [stamp: string, 
   assert.equal(h.client.devices.length, 0, "the pipe was not read on");
 }
 
-// And what any other code told of the pipe throws is its own: the pipe is read on from the frame after, on a turn of its
-// own, as if it had not been thrown, rather than losing the rest and reading what comes after as nonsense.
+// Code told of anything is told after all this client does of its own, each alone: what one throws it throws on a turn of
+// its own, and leaves nothing half done, nor anyone else untold. And whatever else is thrown while a frame is read, as by a
+// host, the pipe is read on from the frame after, on a turn of its own, rather than losing the rest.
+const frameOf = (kind: number, body: string) => {
+  const w = codec.writer();
+  codec.putBytes(w, b(ch(kind) + body));
+  return s(codec.written(w));
+};
+const syncedOf = (id: number, lo: string, hi: string) => {
+  const w = codec.writer();
+  codec.putVarint(w, id);
+  codec.putU8(w, 1);
+  codec.putKey(w, lo);
+  codec.putKey(w, hi);
+  codec.putVarint(w, 0);
+  codec.putVarint(w, 0);
+  return frameOf(SYNCED, s(codec.written(w)));
+};
+// Runs what was put off, and says how many of those threw.
+const thrown = (h: ReturnType<typeof harness>, what: RegExp) => {
+  let n = 0;
+  for (;;) {
+    try {
+      h.run();
+      return n;
+    } catch (e) {
+      assert.match(String(e), what);
+      n++;
+    }
+  }
+};
+const DEVICE = "d".repeat(64);
 {
+  // A follower that throws: every row is put where it goes, and every other follower hears of each, whether the rows came
+  // down the pipe or were written here.
   const h = harness();
   h.run();
   h.greet();
-  const frame = (kind: number, body: string) => {
-    const w = codec.writer();
-    codec.putBytes(w, b(ch(kind) + body));
-    return s(codec.written(w));
-  };
-  let throwing = true;
-  const stop = h.client.follow(() => {
-    if (throwing) throw new Error("a follower's own");
+  let shown = 0;
+  const win = h.client.window({ scope: 1, list: "a", table: Note }, (st) => (shown = st.rows.length));
+  h.run();
+  const heard: string[] = [];
+  h.client.follow(() => {
+    throw new Error("a follower's own");
   });
-  const row = "\0\0\0\x01" + rep("\x07", 12);
-  assert.throws(() => h.self.receive(b(frame(CELLS, "\0" + cellOf(row, 3, 16, 1, "t")) + frame(12, rep("d", 32) + "\x03who"))), /a follower's own/);
-  throwing = false;
+  h.client.follow((id) => heard.push(id));
+  const tag = h.client.tag(1, "a");
+  const placed = (n: number) => cellOf("\0\0\0\x01" + rep("\x07", 11) + ch(n), 2, 1, n, tag + rep("\0", 7) + ch(n));
+  h.self.receive(b(frameOf(CELLS, "\0" + placed(1) + placed(2))));
+  assert.equal(win.entries().length, 2, "the rows were not put where they go");
+  assert.equal(heard.length, 2, "a follower was not told");
+  void h.client.write(1, (change) => change.insert(Note, "a", 9, { title: "w" }));
+  assert.equal(win.entries().length, 3);
+  assert.equal(heard.length, 3);
+  assert.equal(thrown(h, /a follower's own/), 3);
+  assert.equal(shown, 3);
+}
+{
+  // A call told it is lost that throws: every other call is told, the windows and questions are stale, "status" is told,
+  // and the pipe is dialled again.
+  const h = harness();
+  h.run();
+  h.greet();
+  let up = true;
+  h.client.on("status", (x) => (up = x));
+  let status = "";
+  h.client.window({ scope: 1, list: "a", table: Note }, (st) => (status = st.status));
+  h.run();
+  const [page, , lo, hi] = watchOf(h.last(WATCH)!);
+  h.self.receive(b(syncedOf(page, lo, hi)));
+  h.run();
+  assert.equal(status, "ready");
+  const one = h.client.call(DEVICE, 1, "m", "x"), two = h.client.call(DEVICE, 1, "m", "x");
+  one.onfault = () => {
+    throw new Error("a call's own");
+  };
+  let fault = "";
+  two.onfault = (f) => (fault = f);
+  h.run();
+  const waits = h.self.waits.length;
+  h.self.closed();
+  assert(fault === "lost" && !up, `told ${fault} and ${up}`);
+  assert.equal(h.self.waits.length, waits + 1, "the pipe was not dialled again");
+  assert.equal(thrown(h, /a call's own/), 1);
+  assert.equal(status, "stale");
+  h.laters();
+  h.run();
+  assert.equal(h.self.connects, 2);
+}
+{
+  // An observer that throws: every other observer, window and question is told, now and later; and a client closed while
+  // one would throw is closed whole, its pipe let go of and what was asked once answered.
+  const h = harness();
+  h.run();
+  h.greet();
+  let throwing = false;
+  let second = 0, other = 0, answered = 0;
+  h.client.window({ scope: 1, list: "a", table: Note }, () => {
+    if (throwing) throw new Error("an observer's own");
+  });
+  h.client.window({ scope: 1, list: "a", table: Note }, () => second++);
+  h.client.window({ scope: 1, list: "b", table: Note }, () => other++);
+  h.client.ask({ scope: 1, table: Note }, () => answered++);
+  h.run();
+  const pages = h.self.said.filter((x) => x.kind === WATCH).map(watchOf);
+  const askId = codec.varint(codec.reader(b(h.last(ASK)!.body)));
+  (second = 0), (other = 0), (answered = 0), (throwing = true);
+  const answer = (() => {
+    const w = codec.writer();
+    codec.putVarint(w, askId);
+    codec.putU8(w, 1);
+    for (let i = 0; i < 4; i++) codec.putVarint(w, 0);
+    return frameOf(ANSWER, s(codec.written(w)));
+  })();
+  for (let round = 1; round <= 2; round++) {
+    h.self.receive(b(pages.map(([id, , lo, hi]) => syncedOf(id, lo, hi)).join("") + answer));
+    assert.equal(thrown(h, /an observer's own/), 1);
+    assert.deepEqual([second, other, answered], [round, round, round]);
+  }
+  let fetched = false;
+  void h.client.fetch({ scope: 1, table: Note }).then(() => (fetched = true));
+  h.run();
+  const [id, , lo, hi] = pages[0];
+  h.self.receive(b(syncedOf(id, lo, hi)));
+  const closes = h.self.closes;
+  h.client.close();
+  assert.equal(h.self.closes, closes + 1, "the pipe was not let go of");
+  assert.equal(h.self.timers, 0, "something was left to be done later");
+  await tick();
+  assert(fetched, "what was asked once was not answered");
+  assert.equal(thrown(h, /an observer's own/), 2); // as it was when closed, and once its pipe was let go of
+}
+{
+  // A reader of a call that throws keeps nothing: what came is credited back, so the call goes on.
+  const h = harness();
+  h.run();
+  h.greet();
+  const call = h.client.call(DEVICE, 1, "m", "x");
+  call.ondata = () => {
+    throw new Error("a reader's own");
+  };
+  h.run();
+  const flow = (kind: number, body: string) => {
+    const w = codec.writer();
+    codec.putVarint(w, 1 * 2 + 1);
+    codec.putU8(w, kind);
+    return frameOf(FLOW, s(codec.written(w)) + body);
+  };
+  const from = h.self.said.length;
+  h.self.receive(b(flow(0, rep("x", 1000)) + flow(0, rep("y", 10))));
+  assert.equal(thrown(h, /a reader's own/), 2);
+  let credited = 0;
+  for (const x of h.self.said.slice(from)) {
+    if (x.kind !== FLOW) continue;
+    const r = codec.reader(b(x.body));
+    if (codec.varint(r) === 2 && codec.u8(r) === 4) credited += codec.varint(r);
+  }
+  assert.equal(credited, 1010, "what came was not credited back");
+}
+{
+  // What a host throws while a frame is read: the pipe is read on from the frame after it.
+  const h = harness();
+  h.run();
+  h.greet();
+  let served = 0;
+  h.client.serve(1, "m", () => served++);
+  const callOf = (id: number) => {
+    const w = codec.writer();
+    codec.putVarint(w, id);
+    codec.putBinary(w, rep("d", 32));
+    codec.putVarint(w, 1);
+    codec.putBytes(w, b("m"));
+    codec.putBytes(w, b(""));
+    return frameOf(CALL, s(codec.written(w)) + "x");
+  };
+  h.self.clock = () => {
+    throw new Error("a host's own");
+  };
+  assert.throws(() => h.self.receive(b(callOf(1) + frameOf(12, rep("d", 32) + "\x03who"))), /a host's own/);
+  h.self.clock = () => 1800000000000;
   h.run();
   const devices = () => h.client.devices.length;
   assert.equal(devices(), 1, "what came after it was lost");
-  h.self.receive(b(frame(12, "")));
-  assert(h.client.ready && devices() === 0 && h.self.closes === 0, "the pipe was not read on");
-  stop();
+  h.self.receive(b(callOf(2) + frameOf(12, "")));
+  assert(h.client.ready && devices() === 0 && served === 1 && h.self.closes === 0, "the pipe was not read on");
+}
+{
+  // Questions asked meanwhile, as by code that waited for one asked once, are asked once each.
+  const h = harness();
+  h.run();
+  for (let i = 0; i < 5; i++) h.client.ask({ scope: 1, table: Note }, () => {});
+  for (let i = 0; i < 5; i++) {
+    void h.client.fetch({ scope: 99, table: Note }).then(() => {
+      for (let j = 0; j < 10; j++) h.client.ask({ scope: 1, table: Note }, () => {});
+    });
+  }
+  const from = h.self.said.length;
+  h.greet();
+  await tick();
+  h.run();
+  const counts = new Map<number, number>();
+  for (const x of h.self.said.slice(from)) {
+    if (x.kind !== ASK) continue;
+    const id = codec.varint(codec.reader(b(x.body)));
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  assert.equal(counts.size, 55);
+  for (const [id, n] of counts) assert.equal(n, 1, `question ${id} was asked ${n} times`);
+}
+{
+  // Nor is one asked meanwhile by this client itself, as for an editor's row that nothing shows once its question is
+  // denied on the pipe come up.
+  const h = harness();
+  h.run();
+  const roster = (...scopes: number[]) => rep("\0", 8) + scopes.map((n) => ch(n) + "\x07" + rep("k", 32)).join("");
+  h.tell(ROSTER, roster(1, 2));
+  h.client.ask({ scope: 2, table: Note }, () => {});
+  h.run();
+  const row = "\0\0\0\x01" + rep("\x07", 12);
+  const w = codec.writer();
+  codec.putVarint(w, codec.varint(codec.reader(b(h.last(ASK)!.body))));
+  codec.putU8(w, 1);
+  codec.putVarint(w, 1);
+  codec.putVarint(w, 0);
+  codec.putVarint(w, 1);
+  codec.putBinary(w, row);
+  codec.putVarint(w, 0);
+  h.tell(ANSWER, s(codec.written(w)));
+  const editor = h.client.text(codec.hex(b(row)), Note.body);
+  h.run();
+  h.self.closed();
+  h.run();
+  h.laters();
+  h.run();
+  const from = h.self.said.length;
+  h.tell(ROSTER, roster(1));
+  const counts = new Map<number, number>();
+  for (const x of h.self.said.slice(from)) {
+    if (x.kind !== ASK) continue;
+    const id = codec.varint(codec.reader(b(x.body)));
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  assert.equal(counts.size, 1, "the editor's row was not asked for");
+  for (const [id, n] of counts) assert.equal(n, 1, `question ${id} was asked ${n} times`);
+  editor.close();
 }
 
 // A row an editor has open that moves within its window, or from one window to another, is never without one to show
