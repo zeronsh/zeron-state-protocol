@@ -48,11 +48,26 @@ export function peer(random: (n: number) => Uint8Array, now: () => number, told 
     after: () => () => {},
     connect: (receive) => {
       self.receive = receive;
+      let partial = new Uint8Array(0); // a frame not yet all here: a pipe is a stream, sent a mebibyte at a time
       return {
-        send: (data) => {
+        send: (piece) => {
+          let data = piece;
+          if (partial.length > 0) {
+            data = new Uint8Array(partial.length + piece.length);
+            data.set(partial);
+            data.set(piece, partial.length);
+          }
           const r = codec.reader(data);
           while (r.pos < r.len) {
-            const body = codec.bytes(r);
+            const at = r.pos;
+            let body: Uint8Array;
+            try {
+              body = codec.bytes(r);
+            } catch (e) {
+              if (!(e instanceof codec.Malformed)) throw e;
+              partial = data.slice(at);
+              return;
+            }
             const f = codec.reader(body.subarray(1));
             if (body[0] === CELLS) {
               // What it writes, as another would be sent it; and its own node has it.
@@ -70,6 +85,7 @@ export function peer(random: (n: number) => Uint8Array, now: () => number, told 
               self.said.delete(id);
             }
           }
+          partial = new Uint8Array(0);
         },
         close: () => {},
       };
