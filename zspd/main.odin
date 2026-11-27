@@ -355,7 +355,12 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 	space_dir := in_dir(dir, name)
 	switch {
 	case !reached:
-		kept, _ := host.roster_keep(space_dir, space, bytes) // for the node to read when it starts
+		kept, ok := host.roster_keep(space_dir, space, bytes) // for the node to read when it starts
+		if !ok {
+			say(os.stderr, "could not keep the roster\n")
+		} else if !kept {
+			say(os.stderr, "a later roster was kept here meanwhile: nothing was changed\n")
+		}
 		return kept
 	case taken(space_dir, bytes):
 		return true
