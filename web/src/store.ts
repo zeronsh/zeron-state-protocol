@@ -93,22 +93,36 @@ export class Store {
 
   static async open(volume: Volume, segment: number): Promise<Store> {
     const s = new Store(volume, segment);
-    const names = await volume.list();
-    for (const name of names) {
-      const n = segmentNumber(name);
-      if (n !== undefined) {
-        const f = await volume.open(name, false);
-        if (f) s.#segments.set(n, f);
+    // Whatever it opened is closed should opening fail: each file holds itself until closed, as a browser's do, and would
+    // keep the next to open the store from it.
+    const opened: File[] = [];
+    const open = async (name: string, create: boolean) => {
+      const f = await volume.open(name, create);
+      if (f) opened.push(f);
+      return f;
+    };
+    try {
+      const names = await volume.list();
+      for (const name of names) {
+        const n = segmentNumber(name);
+        if (n !== undefined) {
+          const f = await open(name, false);
+          if (f) s.#segments.set(n, f);
+        }
       }
-    }
-    s.#tree = (await volume.open("tree", true))!;
-    s.#find = (await volume.open("find", true))!;
-    s.#journal = (await volume.open("journal", true))!;
-    await s.#replay();
-    for (const what of KEPT) {
-      const a = (await volume.open(what + ".0", true))!;
-      const b = (await volume.open(what + ".1", true))!;
-      s.#kept.set(what, [Store.#slot(a), Store.#slot(b)]);
+      s.#tree = (await open("tree", true))!;
+      s.#find = (await open("find", true))!;
+      s.#journal = (await open("journal", true))!;
+      await s.#replay(open);
+      for (const what of KEPT) {
+        const a = (await open(what + ".0", true))!;
+        const b = (await open(what + ".1", true))!;
+        s.#kept.set(what, [Store.#slot(a), Store.#slot(b)]);
+      }
+    } catch (e) {
+      for (const f of opened) f.close();
+      volume.close?.();
+      throw e;
     }
     const last = Math.max(-1, ...s.#segments.keys());
     s.#ahead(last);
@@ -187,6 +201,7 @@ export class Store {
       grown.set(h.bytes.subarray(0, h.length));
       h.bytes = grown;
     }
+    if (at > h.length) h.bytes.fill(0, h.length, at); // as a file reads where nothing was written since it was cut short
     h.bytes.set(bytes, at);
     h.length = Math.max(h.length, at + bytes.length);
     h.journaled = Math.min(h.journaled, at); // the log only grows, but should anything be written over, it is journaled again
@@ -204,8 +219,12 @@ export class Store {
     this.#dropped.delete(n);
     if (this.#segments.has(n) || this.#opening.has(n)) return;
     const opening = this.#after(async () => {
-      const f = (await this.volume.open(segmentName(n), true))!;
-      this.#opening.delete(n);
+      let f: File;
+      try {
+        f = (await this.volume.open(segmentName(n), true))!;
+      } finally {
+        this.#opening.delete(n); // opened or not: should it be wanted again, it is opened again
+      }
       if (this.#abandoned) {
         f.close();
         return;
@@ -218,10 +237,16 @@ export class Store {
       const h = this.#held.get(n);
       if (h) {
         // What was held is written where it belongs; once that is durable the journal need not say it, and must not,
-        // before anything else is written to the file, or a replay would write it over what came after.
-        f.write(h.bytes.subarray(0, h.length), 0);
-        f.truncate(h.length);
-        f.flush();
+        // before anything else is written to the file, or a replay would write it over what came after. Should that fail,
+        // the file is closed, for nothing else would close it, and what was held is held still.
+        try {
+          f.write(h.bytes.subarray(0, h.length), 0);
+          f.truncate(h.length);
+          f.flush();
+        } catch (e) {
+          f.close();
+          throw e;
+        }
         this.#held.delete(n);
         this.#forget(n, h);
       }
@@ -363,7 +388,7 @@ export class Store {
 
   // Puts what the journal holds where it belongs: at the start, before anything reads the log. What it says is played in
   // memory, and only what was still held at the end is written, to its segment, whole.
-  async #replay(): Promise<void> {
+  async #replay(open: (name: string, create: boolean) => Promise<File | undefined>): Promise<void> {
     const size = this.#journal.size();
     if (size === 0) return;
     const all = new Uint8Array(size);
@@ -395,7 +420,7 @@ export class Store {
     }
     for (const [n, image] of images) {
       let f = this.#segments.get(n);
-      if (!f) this.#segments.set(n, (f = (await this.volume.open(segmentName(n), true))!));
+      if (!f) this.#segments.set(n, (f = (await open(segmentName(n), true))!));
       f.write(image.bytes.subarray(0, image.length), 0);
       f.truncate(image.length);
       f.flush();

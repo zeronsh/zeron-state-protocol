@@ -6,7 +6,7 @@ import { Store } from "../src/store.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryVolume, type Volume } from "../src/volume.ts";
+import { MemoryVolume, type File, type Volume } from "../src/volume.ts";
 import { NodeVolume } from "../src/volume-node.ts";
 
 const SEGMENT = 1000;
@@ -212,6 +212,68 @@ for (const volume of [new MemoryVolume(), new NodeVolume(mkdtempSync(join(tmpdir
   const c = await Store.open(volume, SEGMENT);
   assert.equal(read(c, 1), "b".repeat(40));
   await c.close();
+}
+
+// A held segment cut short and then written past its end reads nothing but zeroes between, as a file does: not what was
+// there before it was cut short.
+{
+  const volume = new MemoryVolume({ slow: true });
+  const s = await opened(volume);
+  const at = 50 * SEGMENT; // well past what was opened ahead: held
+  assert(s.logWrite(at, bytes("a", 64)));
+  s.logTruncate(at + 8);
+  assert(s.logWrite(at + 32, bytes("b", 8)));
+  assert.equal(s.settled, false, "it was not held");
+  const between = new Uint8Array(24);
+  assert(s.logRead(at + 8, between));
+  assert.deepEqual([...between], new Array(24).fill(0), "what was cut short came back");
+  assert(s.logSync());
+  for (let i = 0; i < 50 && !s.settled; i++) volume.settle(), await turn(); // and so once its file has it
+  assert(s.settled);
+  assert(s.logRead(at + 8, between));
+  assert.deepEqual([...between], new Array(24).fill(0), "what was cut short came back, written");
+  const settling = setInterval(() => volume.settle(), 1);
+  await s.close();
+  clearInterval(settling);
+}
+
+// Files are closed whatever goes wrong: each holds itself until closed, as a browser's do, and would keep the store from
+// the next to open it. When opening fails partway, what was opened is closed; and so is a segment's file that could not
+// be given what was held of it.
+{
+  class Counting extends MemoryVolume {
+    open_ = 0;
+    closed_ = 0;
+    failOn?: string;
+    failFlush = false;
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      if (name === this.failOn) throw new Error("no room to make it");
+      const f = await super.open(name, create);
+      if (!f) return f;
+      this.open_++;
+      const close = f.close.bind(f), flush = f.flush.bind(f);
+      f.close = () => (this.closed_++, close());
+      f.flush = () => {
+        if (this.failFlush && /\.log$/.test(name)) throw new Error("the disk is full");
+        flush();
+      };
+      return f;
+    }
+  }
+  const failing = new Counting();
+  failing.failOn = "roster.1";
+  await assert.rejects(Store.open(failing, SEGMENT), /no room/);
+  assert(failing.open_ > 3);
+  assert.equal(failing.closed_, failing.open_, "files opened before it failed were left open");
+
+  const volume = new Counting({ slow: true });
+  const s = await opened(volume);
+  assert(s.logWrite(50 * SEGMENT, bytes("a", 10))); // held, its file not open
+  volume.failFlush = true;
+  for (let i = 0; i < 50 && !s.failure; i++) volume.settle(), await turn();
+  assert(s.failure, "it says that storage failed");
+  s.letGo();
+  assert.equal(volume.closed_, volume.open_, "a segment's file that could not be given what was held was left open");
 }
 
 console.log("ok");
