@@ -298,8 +298,11 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 	if old.serial == 0 && n.serial >= n.roster.serial {
 		return // what is held was held against this one, or a later, before a restart
 	}
-	// Of two rosters drawn up at once, one is dropped: what was held by it is held to nothing.
-	fork := old.serial != 0 && !roster_extends(old, &n.roster)
+	// Of two rosters drawn up at once, one is dropped: what was held by it is held to nothing. And what was held against a
+	// roster that is not here to compare with, as after a start when more than the last change was still to be looked
+	// over, may have been held against one that was dropped.
+	unknown := old.serial == 0 && n.serial != 0
+	fork := unknown || (old.serial != 0 && !roster_extends(old, &n.roster))
 	plans := make([dynamic]Sweep_Plan, context.temp_allocator)
 	for &info in n.roster.scopes {
 		// With no roster to compare with, every end is new.
@@ -334,8 +337,21 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 	if fork {
 		for was in old.scopes {
 			if roster_scope(&n.roster, was.id) == nil {
-				append(&plans, Sweep_Plan{scope = was.id, gone = true})
+				append(&plans, Sweep_Plan{scope = was.id, last = was.id, gone = true})
 			}
+		}
+	}
+	if unknown {
+		// Whatever scopes it had, those there are not now are gone.
+		next := Scope(1)
+		for info in n.roster.scopes {
+			if info.id > next {
+				append(&plans, Sweep_Plan{scope = next, last = info.id - 1, gone = true})
+			}
+			next = info.id + 1
+		}
+		if next < max(Scope) {
+			append(&plans, Sweep_Plan{scope = next, last = max(Scope) - 1, gone = true})
 		}
 	}
 	w := &n.sweep
@@ -344,7 +360,7 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 		merged := false
 		for &q in w.plans {
 			if q.scope == p.scope {
-				q.from, q.gone, merged = min(q.from, p.from), q.gone || p.gone, true
+				q.from, q.last, q.gone, merged = min(q.from, p.from), max(q.last, p.last), q.gone || p.gone, true
 			}
 		}
 		if !merged {
@@ -364,10 +380,11 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 	return
 }
 
-// What a roster has made unlawful in one scope: cells later than `from`, or, of a scope there is no more, all.
+// What a roster has made unlawful in one scope: cells later than `from`, or, of scopes there are no more, all.
 @(private)
 Sweep_Plan :: struct {
 	scope: Scope,
+	last:  Scope, // of scopes gone, the last of them, from `scope` on
 	from:  u64,
 	gone:  bool,
 }
@@ -413,7 +430,7 @@ sweep_step :: proc(n: ^Node, old: ^Roster, budget: int) -> (done: bool) {
 	late := make([dynamic]Leaf, context.temp_allocator)
 	lost: [dynamic]Leaf // not in temporary memory, which is given back below
 	defer delete(lost)
-	scan := tree_scan(n, n.cells, w.cursor, scope_hi(plan.scope))
+	scan := tree_scan(n, n.cells, w.cursor, scope_hi(max(plan.scope, plan.last)))
 	finished := true
 	seen := 0
 	for leaf in tree_next(&scan) {
