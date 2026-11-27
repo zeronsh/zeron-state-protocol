@@ -295,7 +295,8 @@ def test_lan_without_relay():
     cb.serve(1, "wait", lambda device, body: None)
     ca.until(lambda: len(ca.devices) == 2)
     threading.Timer(0.7, b.stop).start()
-    assert ca.call(ca.devices[1][0], 1, "wait", timeout=15)["fault"] == 4
+    # Known after some 9 s (the link, gone quiet, given up on): time enough for a machine with much else to do.
+    assert ca.call(ca.devices[1][0], 1, "wait", timeout=30)["fault"] == 4
 
 
 def refused(*args):
