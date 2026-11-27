@@ -1148,3 +1148,44 @@ sets_are_conditions :: proc(t: ^testing.T) {
 	ok, _ = parse(w[:])
 	testing.expect(t, !ok)
 }
+
+// The least or the greatest of values that share their first sixteen bytes is of those alone, the last but one of all
+// such firsts too: not of those whose first sixteen bytes are all there can be.
+@(test)
+extremes_are_of_their_key_alone :: proc(t: ^testing.T) {
+	state := rand.create(12)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	values: [2][]byte
+	values[0] = make([]byte, 17, context.temp_allocator)
+	slice.fill(values[0][:15], 0xff)
+	values[0][15], values[0][16] = 0xfe, 'a'
+	values[1] = make([]byte, 16, context.temp_allocator)
+	slice.fill(values[1], 0xff)
+	for v, i in values {
+		w.node.now += 1000
+		id := zsp.node_id(&w.node, 2)
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(2, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		zsp.put_u64(b[16:], u64(i))
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}, {id, 16, .Value, zsp.node_stamp(&w.node), v}}))
+	}
+	for fn in ([]Fn{.Min, .Max}) {
+		source := []byte{2, u8(Op.All), 0, 0, 0, 10, 1, u8(fn), u8(Kind.Bytes), 16, 0, 1}
+		q, ok := query_parse(source)
+		testing.expect(t, ok)
+		index_follow(&w.x)
+		query_prepare(&w.x, &q)
+		index_finish(&w.x)
+		s := index_scope(&w.x, 2)
+		totals := query_totals(s, &q, &s.all)
+		testing.expect(t, len(totals) == 1 && len(totals[0].facets) == 1)
+		got := facet_bytes(s, &q.totals[0], totals[0].facets[0])
+		testing.expectf(t, string(got) == string(values[0 if fn == .Min else 1]), "%v of them is %x", fn, got)
+	}
+}

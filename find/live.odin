@@ -599,11 +599,11 @@ pred_touched :: proc(f: ^Finder, s: ^Scope, p: ^Pred, out: ^Set) -> bool {
 	cost := 0
 	refers :: proc(x: ^Index, p: ^Pred, id: zsp.Id, out: ^Set, cost: ^int) -> bool {
 		key := Key{id[0], id[1]}
-		cost^ += tree_between(x, p.held.by_key, key, key_next(key)).count
+		cost^ += tree_between(x, p.held.by_key, key, key, through = true).count
 		if cost^ > TOUCHED + p.held.scope.all.count / 64 {
 			return false
 		}
-		tree_subs(x, p.held.by_key, key, key_next(key), out)
+		tree_subs(x, p.held.by_key, key, key, out, through = true)
 		return true
 	}
 	referred :: proc(s: ^Scope, key: Key, out: ^Set) {

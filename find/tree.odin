@@ -738,11 +738,16 @@ tree_total :: proc(p: ^Pager, t: Tree) -> (s: Total) {
 	return
 }
 
-// Entries of keys from `lo` up to, and not including, `hi`; where `hi` is KEY_MAX, including it.
+// Entries of keys from `lo` up to, and not including, `hi`; where `hi` is KEY_MAX, or `through`, including it. (So that
+// one key, or a range to the last but one, is said without the key after it, which may be KEY_MAX, or past it.)
 @(require_results)
-tree_between :: proc(p: ^Pager, t: Tree, lo, hi: Key) -> (s: Total) {
+tree_between :: proc(p: ^Pager, t: Tree, lo, hi: Key, through := false) -> (s: Total) {
 	a := tree_before(p, t, lo, 0)
-	s = tree_total(p, t) if hi == KEY_MAX else tree_before(p, t, hi, 0)
+	if hi == KEY_MAX {
+		s = tree_total(p, t)
+	} else {
+		s = tree_before(p, t, key_next(hi) if through else hi, 0)
+	}
 	return {max(s.count - a.count, 0), s.sum - a.sum}
 }
 
@@ -900,8 +905,26 @@ cursor_step :: proc(c: ^Cursor, way: int) -> bool {
 	return true
 }
 
-// Every entry of keys from `lo` up to, and not including, `hi`, as fast as they can be read.
-tree_each :: proc(p: ^Pager, t: Tree, lo, hi: Key, data: rawptr, each: proc(data: rawptr, e: ^Entry)) {
+// Every entry of keys from `lo` up to, and not including, `hi`, as fast as they can be read: as tree_between.
+tree_each :: proc(p: ^Pager, t: Tree, lo, hi: Key, data: rawptr, each: proc(data: rawptr, e: ^Entry), through := false) {
+	if through && hi != KEY_MAX {
+		if next := key_next(hi); next != KEY_MAX {
+			tree_each(p, t, lo, next, data, each)
+			return
+		}
+		// Through the last key but one: to the last, and what is of that is passed over.
+		Only :: struct {
+			data: rawptr,
+			each: proc(data: rawptr, e: ^Entry),
+		}
+		only := Only{data, each}
+		tree_each(p, t, lo, KEY_MAX, &only, proc(data: rawptr, e: ^Entry) {
+			if only := (^Only)(data); e.key != KEY_MAX {
+				only.each(only.data, e)
+			}
+		})
+		return
+	}
 	walk :: proc(p: ^Pager, t: ^Tree, no: u32, lo, hi: Key, data: rawptr, each: proc(data: rawptr, e: ^Entry)) {
 		pg := page_get(p, no)
 		if pg.level > 0 {
@@ -935,8 +958,17 @@ tree_each :: proc(p: ^Pager, t: Tree, lo, hi: Key, data: rawptr, each: proc(data
 	}
 }
 
-// The subs of every entry of keys from `lo` up to, and not including, `hi`.
-tree_subs :: proc(p: ^Pager, t: Tree, lo, hi: Key, out: ^Set) {
+// The subs of every entry of keys from `lo` up to, and not including, `hi`: as tree_between.
+tree_subs :: proc(p: ^Pager, t: Tree, lo, hi: Key, out: ^Set, through := false) {
+	if through && hi != KEY_MAX {
+		if next := key_next(hi); next != KEY_MAX {
+			tree_subs(p, t, lo, next, out)
+			return
+		}
+		tree_each(p, t, lo, hi, out, proc(data: rawptr, e: ^Entry) {set_put((^Set)(data), e.sub)}, through = true)
+		set_settle(out)
+		return
+	}
 	// `within`: all of this node lies between them, and its keys need not be made out.
 	walk :: proc(p: ^Pager, t: ^Tree, no: u32, lo, hi: Key, within: bool, out: ^Set) {
 		pg := page_get(p, no)
