@@ -3,10 +3,11 @@
 // fails, is closed and is put away; what it says; and when it lets go of the lock. `node test/worker.ts`
 
 import assert from "node:assert/strict";
+import { Client } from "../src/client.ts";
 import { Node } from "../src/node.ts";
 import { Store } from "../src/store.ts";
 import { HELD_WITHIN, OpfsVolume, take } from "../src/volume-opfs.ts";
-import { StoreLocked } from "../src/volume.ts";
+import { MemoryVolume, StoreLocked } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
 import type { Report } from "../src/worker.ts";
 
@@ -19,7 +20,7 @@ const HELD = "Access Handles cannot be created if there is another open Access H
 // Every file is held by one handle at most, which is had in its own time, a turn later: as a browser's are.
 const open = new Set<Handle>(); // every handle not closed
 let refused = 0; // how often a handle was asked for and the file was held
-let failFlush: string | undefined; // the name of a file whose flush throws, as a full disk's may
+let failFlush: string | undefined; // the name of a file whose flush throws, as a full disk's may, or "*" for every one
 let failClose: string | undefined; // and whose close throws
 const pauses = new Map<string, { reached: () => void; release: Promise<void> }>(); // by path: a file's next handle, held as it is had
 
@@ -59,7 +60,7 @@ class Handle {
   }
   flush(): void {
     this.#check();
-    if (failFlush === this.file.name) throw new DOMException("the disk is full", "QuotaExceededError");
+    if (failFlush === "*" || failFlush === this.file.name) throw new DOMException("the disk is full", "QuotaExceededError");
   }
   close(): void {
     if (failClose === this.file.name) throw new DOMException("it could not be closed", "UnknownError");
@@ -307,6 +308,36 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   void w.tell({ away: true });
   assert.equal(held("away"), 0, "files left open as it was put away");
   await until("the lock is let go of", () => !locks.has("zsp:away"));
+}
+
+// A node that fails in its first turn, as it opens, its storage failing: every tab is told, and the lock is let go of, for
+// another to have; not held for ever by a worker waiting to be told what it was told before it listened.
+{
+  // A device of a space, whose roster has changed since its trees were last made durable, as after a crash: the first
+  // thing it does, opened again, is write, and make that durable.
+  const other = await Node.open({ volume: new MemoryVolume(), module });
+  const node = await Node.open({ volume: await OpfsVolume.at("zsp/first"), module, full: true });
+  node.create();
+  node.admit(other.key, 1);
+  const c = new Client({ connect: node.connect });
+  while (!c.may(1, "write")) await sleep(1);
+  await c.write(1, (change) => change.insert({}, "x", 1, {}));
+  await node.settled();
+  const tree = await (await (await root.getDirectoryHandle("zsp")).getDirectoryHandle("first")).getFileHandle("tree");
+  const before = tree.data.slice();
+  node.revoke(other.key, 1);
+  await node.settled();
+  c.close();
+  await node.close();
+  await other.close();
+  tree.data = before;
+  failFlush = "*";
+  const w = await worker();
+  await w.tell({ open: { name: "first", full: true } });
+  await until("its tab is told", () => w.said.some((r) => "failed" in r), 2000);
+  await until("the lock is let go of", () => !locks.has("zsp:first"), 2000);
+  assert.equal(held("first"), 0);
+  failFlush = undefined;
 }
 
 console.log("ok");

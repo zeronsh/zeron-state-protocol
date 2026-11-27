@@ -204,21 +204,25 @@ function contend(): void {
     if (leaving) return;
     let node: Node;
     let ended: Promise<Error | undefined>; // failed, or closed or put away
+    let stopped: Error | undefined;
     try {
       const volume = await OpfsVolume.at("zsp/" + o.name);
       const module = await loadModule(o.wasm ? new URL(o.wasm, self.location.href) : undefined);
       // Partial unless told otherwise: a browser holds what its tabs watch and ask about, not the whole space.
       const given = newest;
       node = await Node.open({ volume, module, full: o.full === true, keep: o.keep, credential: given?.credential });
-      ended = new Promise((done) => ((node.onFailure = done), (letGo = () => done(undefined))));
-      if (newest !== given) node.setCredential(newest!.credential); // given while it opened
+      ended = new Promise((done) => {
+        letGo = () => done(undefined);
+        node.onFailure = (e) => done((stopped ??= e)); // at once, should it have failed in its first turn, as it opened
+      });
+      if (newest !== given && !stopped) node.setCredential(newest!.credential); // given while it opened
     } catch (error) {
       contending = false;
       fail(failure(error));
       return;
     }
     if (leaving) void node.closeNow(), letGo!(); // put away as it opened
-    else {
+    else if (!stopped) {
       device = node;
       breakCarried();
       channel.postMessage({ leader: true } satisfies Shout);

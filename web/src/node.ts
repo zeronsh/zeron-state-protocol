@@ -181,8 +181,20 @@ export class Node {
   #closing?: Promise<void>;
   #failure?: Error;
   #waiting: (() => void)[] = [];
-  /** Told once if the node stops of itself: storage has failed, and nothing more can be made durable. */
-  onFailure?: (error: Error) => void;
+  #onFailure?: (error: Error) => void;
+  #toldFailure = false;
+
+  /**
+   * Told once if the node stops of itself: storage has failed, and nothing more can be made durable. Told at once if it has
+   * already, as it may have before whoever opened it could say whom to tell: its first turn comes as it is opened.
+   */
+  get onFailure(): ((error: Error) => void) | undefined {
+    return this.#onFailure;
+  }
+  set onFailure(f: ((error: Error) => void) | undefined) {
+    this.#onFailure = f;
+    if (f && this.#failure && !this.#toldFailure) (this.#toldFailure = true), f(this.#failure);
+  }
 
   private constructor(options: NodeOptions) {
     this.#options = options;
@@ -902,6 +914,6 @@ export class Node {
       this.#stop();
       this.#closing = this.store.letGo();
     }
-    this.onFailure?.(error);
+    if (this.#onFailure) (this.#toldFailure = true), this.#onFailure(error);
   }
 }
