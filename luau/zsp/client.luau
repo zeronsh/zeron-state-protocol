@@ -27,6 +27,7 @@ local PIECE_BYTES = 4096 -- a piece is sealed at this size,
 local PIECE_SECONDS = 1 -- or this long after it began,
 local LIVE_SECONDS = 10 -- and live text unconfirmed for this long is dropped
 local LEAP_SECONDS = 15 * 60 -- a node refuses a stamp further ahead of its clock than this
+local NOWHERE = "no such position"
 
 export type Wire = { send: (data: buffer) -> (), close: () -> () }
 export type Host = {
@@ -1935,7 +1936,9 @@ function Client.text(self: Client, id: string, col: Column)
 	assert(type(id) == "string" and #id == 16, "a row's id is 16 bytes")
 	local slot = col.slot
 	local scope: number = string.unpack(">I4", id) :: any
-	local early: { () -> () }? = if self.rows[id] then nil else {} -- what is done before there is a row to do it to
+	-- What is done before there is a row to do it to: none is held, or another editor of it waits for it still.
+	local was = self.rows[id]
+	local early: { () -> () }? = if was == nil or #was.awaited > 0 then {} else nil
 	local row = self:_row(id)
 	row.held[slot] = (row.held[slot] or 0) + 1
 	local closed, ended = false, false
@@ -1994,34 +1997,67 @@ function Client.text(self: Client, id: string, col: Column)
 	self:_keep(row, function()
 		local todo = early
 		early = nil
+		local fine, why = true, nil
 		if todo and #todo > 0 and not row.dead then
+			local made = false
 			for _, f in todo do
-				f()
+				-- An edit at a place the text did not have once it came was asked of a text not yet here: it is not made,
+				-- and those after it are made as if it had not been asked for.
+				fine, why = pcall(f)
+				if not fine and why ~= NOWHERE then
+					break
+				end
+				made = made or fine
+				fine = true
 			end
-			edited()
-			schedule()
+			if made then
+				edited()
+				schedule()
+			end
 		end
 		if closed then
 			finish()
 		end
+		if not fine then
+			error(why, 0)
+		end
 	end)
+	-- What is no place in any text is refused at once, whether or not the text is here yet; what is no place in this
+	-- one, once it is here.
+	local function place(n: number)
+		if type(n) ~= "number" or n < 0 or n ~= math.floor(n) or n > 9007199254740991 then
+			error(NOWHERE, 3)
+		end
+	end
+	local function within(t: text.Text, n: number)
+		if n > text.len(t) then
+			error(NOWHERE, 0)
+		end
+	end
 	return table.freeze({
 		read = function(): string
 			return text.read(self:_text(row, slot))
 		end,
 		-- Positions count bytes.
 		insert = function(pos: number, s: string)
+			place(pos)
+			assert(type(s) == "string", "what is typed is a string")
 			edit(function(t)
+				within(t, pos)
 				text.insert(t, pos, s, fresh)
 			end)
 		end,
 		append = function(s: string)
+			assert(type(s) == "string", "what is typed is a string")
 			edit(function(t)
 				text.insert(t, text.len(t), s, fresh)
 			end)
 		end,
 		delete = function(pos: number, count: number)
+			place(pos)
+			place(count)
 			edit(function(t)
+				within(t, pos + count)
 				text.delete(t, pos, count, fresh)
 			end)
 		end,

@@ -371,6 +371,59 @@ for (const what of ["move", "delete"]) {
   assert(h.self.said.filter((x) => x.kind === CELLS).length > before, "what was typed was never written");
 }
 
+// An editor of a row not yet here, closed before it came: what is no place in any text is refused at once; an edit at a
+// place the text did not have once it came is not made, and the rest are; and the row is then let go of, and nothing
+// is left asked for its sake.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const id = "00000001" + "6b49d200" + "0102030405060708", bin = codec.binaryFromHex(id);
+  const editor = h.client.text(id, Note.body);
+  h.run();
+  assert.throws(() => editor.insert(-5, "x"), RangeError);
+  assert.throws(() => editor.delete(0, 1.5), RangeError);
+  editor.insert(10, "x");
+  editor.append("!");
+  editor.close();
+  const fetched = codec.varint(codec.reader(b(h.last(FETCH)!.body)));
+  h.tell(CELLS, "\0" + cellOf(bin, 3, 17, 2, "hello"));
+  const said = h.self.said.length;
+  const w = codec.writer();
+  codec.putVarint(w, fetched);
+  codec.putBinary(w, "\x01\x01\0\x01" + bin + "\0");
+  h.tell(ANSWER, s(codec.written(w)));
+  await tick();
+  h.run();
+  const row = h.client.held(id);
+  assert(row && row.held.size === 0 && row.asking === undefined, "it is held for ever");
+  assert(h.last(UNASK), "and asked for for ever");
+  assert.equal(text.read(h.client.heldText(id, 17)!), "hello!", "what was typed is not what was asked");
+  assert(h.self.said.slice(said).some((x) => x.kind === CELLS), "and was not written");
+}
+
+// Two editors of a row not yet here: what each does waits for it, and is done, in turn, to the text that came.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const id = "00000001" + "6b49d200" + "0102030405060709", bin = codec.binaryFromHex(id);
+  const one = h.client.text(id, Note.body), two = h.client.text(id, Note.body);
+  h.run();
+  for (const [editor, letter] of [[one, "X"], [two, "Y"]] as const) editor.delete(0, 1), editor.insert(2, letter);
+  const fetched = codec.varint(codec.reader(b(h.last(FETCH)!.body)));
+  h.tell(CELLS, "\0" + cellOf(bin, 3, 17, 2, "HELLO"));
+  const w = codec.writer();
+  codec.putVarint(w, fetched);
+  codec.putBinary(w, "\x01\x01\0\x01" + bin + "\0");
+  h.tell(ANSWER, s(codec.written(w)));
+  await tick();
+  h.run();
+  assert.equal(one.read(), "LXYLO");
+  assert.equal(two.read(), "LXYLO");
+  one.close(), two.close();
+}
+
 // Writing nothing is still done; clearing a text says so.
 {
   const h = harness();

@@ -1736,7 +1736,9 @@ export class Client {
     const slot = col.slot;
     const bin = rowId(id);
     const scope = codec.u32Of(bin);
-    let early: (() => void)[] | undefined = this.#rows.has(bin) ? undefined : []; // what is done before there is a row to do it to
+    // What is done before there is a row to do it to: none is held, or another editor of it waits for it still.
+    const was = this.#rows.get(bin);
+    let early: (() => void)[] | undefined = was === undefined || was.awaited.length > 0 ? [] : undefined;
     const row = this.#row(bin);
     row.held.set(slot, (row.held.get(slot) ?? 0) + 1);
     let closed = false, ended = false;
@@ -1787,30 +1789,51 @@ export class Client {
     this.#keep(row, () => {
       const todo = early;
       early = undefined;
-      if (todo && todo.length > 0 && !row.dead) {
-        for (const f of todo) f();
-        edited();
-        schedule();
+      try {
+        if (todo && todo.length > 0 && !row.dead) {
+          let made = false;
+          for (const f of todo) {
+            // An edit at a place the text did not have once it came was asked of a text not yet here: it is not made,
+            // and those after it are made as if it had not been asked for.
+            try {
+              f();
+              made = true;
+            } catch (e) {
+              if (!(e instanceof RangeError)) throw e;
+            }
+          }
+          if (made) edited(), schedule();
+        }
+      } finally {
+        if (closed) finish();
       }
-      if (closed) finish();
     });
     // Where a UTF-16 index of what is shown falls in its bytes, whatever they are.
     const at = (t: text.Text, index: number) => codec.utf8Offset(text.content(t), index);
+    // What is no place in any text is refused at once, whether or not the text is here yet.
+    const place = (n: number) => {
+      if (!Number.isSafeInteger(n) || n < 0) throw new RangeError("no such position");
+    };
     return Object.freeze({
       read: () => text.read(this.#text(row, slot)),
-      insert: (index: number, s: string) =>
+      insert: (index: number, s: string) => {
+        place(index);
         edit((t) => {
           text.insert(t, at(t, index), utf8.encode(s), fresh);
-        }),
+        });
+      },
       append: (s: string) =>
         edit((t) => {
           text.insert(t, text.len(t), utf8.encode(s), fresh);
         }),
-      delete: (index: number, count: number) =>
+      delete: (index: number, count: number) => {
+        place(index);
+        place(count);
         edit((t) => {
           const from = at(t, index);
           text.erase(t, from, at(t, index + count) - from, fresh);
-        }),
+        });
+      },
       commit: () => this.#seal(row, slot),
       close: () => {
         if (closed) return;

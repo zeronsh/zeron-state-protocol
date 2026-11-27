@@ -484,6 +484,71 @@ do
 	assert(cells() > before, "what was typed was never written")
 end
 
+-- An editor of a row not yet here, closed before it came: what is no place in any text is refused at once; an edit at a
+-- place the text did not have once it came is not made, and the rest are; and the row is then let go of, and nothing
+-- is left asked for its sake.
+local function cell_of(row: string, kind: number, slot: number, n: number, body: string): string
+	local w = codec.writer()
+	codec.put(w, string.char(kind) .. row .. string.char(slot) .. string.rep("\0", 15) .. string.char(n))
+	codec.put_bytes(w, body)
+	return codec.string(w)
+end
+local function answer_fetch(h: any, row: string)
+	local w = codec.writer()
+	codec.put_varint(w, codec.varint(codec.reader(h.last(FETCH).body)))
+	codec.put(w, "\1\1\0\1" .. row .. "\0")
+	h.tell(ANSWER, codec.string(w))
+end
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local id = "\0\0\0\1" .. string.pack(">I4", 1800000000) .. "\1\2\3\4\5\6\7\8"
+	local editor = h.client:text(id, Note.body)
+	h.run()
+	assert(not pcall(editor.insert, -5, "x"), "a place no text has was taken")
+	assert(not pcall(editor.delete, 0, 1.5), "a place no text has was taken")
+	assert(not pcall(editor.insert, 0, nil :: any), "what is not a string was typed")
+	editor.insert(10, "x")
+	editor.append("!")
+	editor.close()
+	h.tell(CELLS, "\0" .. cell_of(id, 3, 17, 2, "hello"))
+	local said = #h.self.said
+	answer_fetch(h, id)
+	h.run()
+	local row = h.client:held(id)
+	assert(row and next(row.held) == nil and row.asking == nil, "it is held for ever")
+	assert(h.last(33), "and asked for for ever")
+	assert(zsp.Text.read(h.client:held_text(id, 17) :: any) == "hello!", "what was typed is not what was asked")
+	local written = false
+	for k = said + 1, #h.self.said do
+		written = written or h.self.said[k].kind == CELLS
+	end
+	assert(written, "and was not written")
+end
+
+-- Two editors of a row not yet here: what each does waits for it, and is done, in turn, to the text that came.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local id = "\0\0\0\1" .. string.pack(">I4", 1800000000) .. "\1\2\3\4\5\6\7\9"
+	local one, two = h.client:text(id, Note.body), h.client:text(id, Note.body)
+	h.run()
+	for _, pair in { { one, "X" }, { two, "Y" } } do
+		local editor = pair[1] :: any
+		editor.delete(0, 1)
+		editor.insert(2, pair[2])
+	end
+	h.tell(CELLS, "\0" .. cell_of(id, 3, 17, 2, "HELLO"))
+	answer_fetch(h, id)
+	h.run()
+	assert(one.read() == "LXYLO", one.read())
+	assert(two.read() == "LXYLO", two.read())
+	one.close()
+	two.close()
+end
+
 -- Writing nothing is still done; clearing a text says so.
 do
 	local h = harness()
