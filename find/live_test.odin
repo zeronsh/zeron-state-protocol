@@ -1060,6 +1060,74 @@ what_a_roster_takes_is_not_answered :: proc(t: ^testing.T) {
 	}
 }
 
+// A partial replica that can watch no more answers of what it holds, rather than wait for ever for rows it could not
+// ask for; and what it let go of after is only what it had asked for, not what another question had.
+@(test)
+what_cannot_be_watched_is_not_waited_for :: proc(t: ^testing.T) {
+	state := rand.create(111)
+	context.random_generator = rand.default_random_generator(&state)
+	w, p: World
+	world_make(t, &w, &p)
+	defer world_destroy(&w)
+	defer world_destroy(&p)
+	f, g: Finder
+	pages: [2]Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages[0]), w.secret)
+	finder_open(&g, &p.node, memory_disk(&pages[1]), p.secret)
+	f.settled = true
+	elsewhere := client_open(&w, &f)
+	c := client_open(&p, &g)
+	filler := client_open(&p, &g)
+	for x in ([]^World{&w, &p}) {
+		x.node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+			zsp.session_accept(s, nil if s.role == .Peer else {{0, {.Read, .Write}, 0}})
+		}
+	}
+	for _ in 0 ..< 40 {
+		world_write(t, &w)
+	}
+	link := link_make(&p, &w)
+	defer {
+		zsp.session_close(link[0])
+		zsp.session_close(link[1])
+		zsp.session_close(c.session)
+		zsp.session_close(elsewhere.session)
+		finder_close(&f)
+		finder_close(&g)
+		client_free(&c)
+		client_free(&elsewhere)
+		client_free(&filler)
+		for &d in pages {
+			memory_disk_destroy(&d)
+		}
+	}
+	testing.expect(t, link_settle(t, link, &f, &g))
+	few := []byte{1, 0, 1, 2, 1, 0, 0, 5, 0} // the newest five
+	client_ask(t, &c, 1, few)
+	testing.expect(t, link_settle(t, link, &f, &g))
+	client_hear_out(t, &c, &g)
+	testing.expect(t, 1 in c.answers && len(c.answers[1].ids) == 5)
+	held := len(p.node.interests)
+	for i := 0; len(p.node.interests) < zsp.MAX_INTERESTS; i += 1 {
+		k := zsp.Key{1 << 32 | 99, u64(i), 0, 0, 0}
+		testing.expect(t, zsp.session_wants(filler.session, k, zsp.key_next(k), true))
+	}
+	all := []byte{1, 8, 1, 16, 0, 1, 2, 1, 0, 0, 50, 0} // every one with a value, newest first
+	client_ask(t, &c, 2, all, FETCH)
+	testing.expect(t, link_settle(t, link, &f, &g))
+	client_hear_out(t, &c, &g)
+	testing.expect_value(t, c.answers[2].flags, 32) // what is held, and not said to be settled: it is not all there is
+	zsp.session_close(filler.session)
+	testing.expect_value(t, len(p.node.interests), held)
+	unask := make([dynamic]byte, context.temp_allocator)
+	at := zsp.frame_begin(&unask, zsp.Message(UNASK))
+	zsp.write_varint(&unask, 2)
+	zsp.frame_end(&unask, at)
+	testing.expect(t, zsp.session_input(c.session, unask[:]))
+	testing.expect(t, link_settle(t, link, &f, &g))
+	testing.expect_value(t, len(p.node.interests), held)
+}
+
 // Pages that are not what was last written are known not to be, and the answers are right all the same.
 @(test)
 pages_are_believed_only_if_they_are :: proc(t: ^testing.T) {

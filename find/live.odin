@@ -1157,16 +1157,25 @@ far_wants :: proc(l: ^Live, r: ^zsp.Reader) -> bool {
 		append(&keys, k)
 		new[k], rows[zsp.key_row(k)] = true, true
 	}
+	// Only what is wanted is said to be, so that what is let go of is this answer's alone.
+	had := make([dynamic]zsp.Key, 0, n)
 	for k in l.far.keys {
 		if k in new {
 			delete_key(&new, k)
+			append(&had, k)
 		} else {
 			zsp.session_unwants(l.session, k, zsp.key_next(k), true)
 		}
 	}
+	delete(l.far.keys)
+	l.far.keys = had
 	for k in keys {
 		if k in new {
-			zsp.session_wants(l.session, k, zsp.key_next(k), true)
+			if !zsp.session_wants(l.session, k, zsp.key_next(k), true) {
+				delete(keys)
+				return false // no more may be watched, and so the rows would never come: as if nobody could answer
+			}
+			append(&l.far.keys, k)
 		}
 	}
 	delete(l.far.keys)
@@ -1300,7 +1309,8 @@ live_wants :: proc(l: ^Live, page: []zsp.Id) {
 		}
 	}
 	for w in want[:count] {
-		zsp.session_wants(l.session, w[0], w[1])
-		append(&l.lives, w)
+		if zsp.session_wants(l.session, w[0], w[1]) { // else no more may be watched, and none of it is to come
+			append(&l.lives, w)
+		}
 	}
 }
