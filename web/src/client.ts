@@ -1304,6 +1304,10 @@ export class Client {
   #onCells(r: codec.Reader): void {
     codec.varint(r);
     let id = "";
+    // Of pages and questions being said afresh, which is most often none, what has been said of each row.
+    let saids: Said[] | undefined;
+    for (const page of this.#pages.values()) if (page.stale) (saids ??= []).push(page.stale);
+    for (const a of this.#asked.values()) if (a.said) (saids ??= []).push(a.said);
     const touched = new Set<Stored>();
     try {
       while (r.pos < r.len) {
@@ -1318,8 +1322,7 @@ export class Client {
         this.#heard(stamp);
         const row = this.#row(id);
         touched.add(row);
-        for (const page of this.#pages.values()) page.stale?.get(id)?.add(stamp);
-        for (const a of this.#asked.values()) a.said?.get(id)?.add(stamp);
+        if (saids) for (const said of saids) said.get(id)?.add(stamp);
         this.#accept(row, slot, tag % 64, stamp, body, author);
       }
     } finally {
@@ -1900,8 +1903,9 @@ export class Client {
     if (ms > this.#clockMs || (ms === this.#clockMs && n > this.#clockN)) (this.#clockMs = ms), (this.#clockN = n);
   }
 
-  #stamp(): string {
-    const ms = Math.floor(this.#host.now());
+  // A stamp, as of now, or of a time read once for many, as a change's are.
+  #stamp(now?: number): string {
+    const ms = now ?? Math.floor(this.#host.now());
     if (ms > this.#clockMs) (this.#clockMs = ms), (this.#clockN = 0);
     else if (this.#clockN < 65535) this.#clockN++;
     else (this.#clockMs++, (this.#clockN = 0));
@@ -1983,7 +1987,8 @@ export class Client {
     const rows = new Set<string>();
     // How each row was before this touched it, so that a change that throws leaves nothing behind.
     const before = new Map<string, { existed: boolean; slots: Map<number, Map<string, Cell>>; dead: boolean; texts: Set<number> }>();
-    const mine = this.#mine(scope); // whose what this change writes is, the same throughout
+    const mine = this.#mine(scope); // whose what this change writes is, the same throughout,
+    const now = Math.floor(this.#host.now()); // and when
     const touch = (id: string, slot: number): Stored => {
       let was = before.get(id);
       // First touched: what is done to a row of another scope is refused, and the whole change with it, by any node.
@@ -2017,7 +2022,7 @@ export class Client {
     const put = (row: string, slot: number, kind: number, body: Uint8Array) => {
       if (body.length > MAX_OPEN) throw new RangeError("a value may be 1 MiB at most, less 192 bytes");
       const stored = touch(row, slot);
-      const stamp = this.#stamp();
+      const stamp = this.#stamp(now);
       rows.add(row);
       cells.push({ row, slot, kind, stamp, body });
       this.#accept(stored, slot, kind, stamp, body, mine);
@@ -2048,8 +2053,7 @@ export class Client {
       f({
         insert: (schema, list, order, values) => {
           // As late as anything heard of: later, then, than any right that is known to have ended.
-          const ms = Math.floor(this.#host.now());
-          if (ms > this.#clockMs) (this.#clockMs = ms), (this.#clockN = 0);
+          if (now > this.#clockMs) (this.#clockMs = now), (this.#clockN = 0);
           const bin = codec.u32Binary(scope) + codec.u32Binary(Math.floor(this.#clockMs / 1000)) + codec.binary(this.#host.random(8));
           fresh.add(bin);
           place(bin, list, order);
@@ -2065,7 +2069,7 @@ export class Client {
           const row = touch(bin, slot); // and what an editor has open in it goes first, and stands
           const t = this.#text(row, slot);
           f(t, () => codec.binary(this.#host.random(8)));
-          const stamp = this.#stamp();
+          const stamp = this.#stamp(now);
           const body = text.close(t, stamp);
           if (body) {
             if (body.length > MAX_OPEN) throw new RangeError("an edit may be 1 MiB at most, less 192 bytes");

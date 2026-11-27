@@ -1366,6 +1366,20 @@ end
 
 local function cells_of(self: Client, r: codec.Reader, touched: { [Stored]: boolean })
 	codec.varint(r)
+	-- Of pages and questions being said afresh, which is most often none, what has been said of each row.
+	local saids: { Said }? = nil
+	for _, page in self.pages do
+		if page.stale then
+			saids = saids or {}
+			table.insert(saids :: { Said }, page.stale)
+		end
+	end
+	for _, a in self.asked do
+		if a.said then
+			saids = saids or {}
+			table.insert(saids :: { Said }, a.said)
+		end
+	end
 	local id = ""
 	local buf, len = r.buf, r.len
 	while r.pos < len do
@@ -1395,16 +1409,10 @@ local function cells_of(self: Client, r: codec.Reader, touched: { [Stored]: bool
 		self:_heard(stamp)
 		local row = self:_row(id)
 		touched[row] = true
-		for _, page in self.pages do
-			local said = page.stale and page.stale[id]
-			if said then
-				said[stamp] = true
-			end
-		end
-		for _, a in self.asked do
-			local said = a.said and a.said[id]
-			if said then
-				said[stamp] = true
+		for _, said in saids or NONE do
+			local of = said[id]
+			if of then
+				of[stamp] = true
 			end
 		end
 		self:_accept(row, slot, tag % 64, stamp, body, author)
@@ -1590,12 +1598,22 @@ function Client._place_all(self: Client, rows: { [Stored]: boolean })
 	end
 	self.bulk = nil
 	for window, add in bulk do
-		for _, e in add do
-			table.insert(window.entries, e)
+		-- By their keys, which are each a row's own, sorted as strings are: quicker than asking a function of every pair.
+		local entries = window.entries
+		local by: { [string]: { key: string, row: Stored } } = {}
+		local keys = table.create(#entries + #add) :: { string }
+		for _, e in entries do
+			by[e.key] = e
+			table.insert(keys, e.key)
 		end
-		table.sort(window.entries, function(x: { key: string, row: Stored }, y: { key: string, row: Stored }): boolean
-			return x.key < y.key
-		end)
+		for _, e in add do
+			by[e.key] = e
+			table.insert(keys, e.key)
+		end
+		table.sort(keys)
+		for i, k in keys do
+			entries[i] = by[k :: string]
+		end
 	end
 end
 
@@ -2182,8 +2200,9 @@ function Client._heard(self: Client, stamp: string)
 	end
 end
 
-function Client._stamp(self: Client): string
-	local ms = math.floor(self.host.now() * 1000)
+-- A stamp, as of now, or of a time read once for many, as a change's are.
+function Client._stamp(self: Client, now: number?): string
+	local ms = now or math.floor(self.host.now() * 1000)
 	if ms > self.clock_ms then
 		self.clock_ms, self.clock_n = ms, 0
 	elseif self.clock_n < 65535 then
@@ -2292,7 +2311,8 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	-- Each row as it was before this change touched it, to be put back if the change is not made after all: false for
 	-- one that was not held, which is put back as empty.
 	local saved: { [string]: any } = {}
-	local mine = self:_mine(scope) -- whose what this change writes is, the same throughout
+	local mine = self:_mine(scope) -- whose what this change writes is, the same throughout,
+	local now = math.floor(self.host.now() * 1000) -- and when
 	local function keep(id: string, slot: number): Stored
 		local was = saved[id]
 		local row = self.rows[id]
@@ -2327,7 +2347,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	local function put(row: string, slot: number, kind: number, body: string)
 		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 192 bytes")
 		local stored = keep(row, slot)
-		local stamp = self:_stamp()
+		local stamp = self:_stamp(now)
 		rows[row] = true
 		table.insert(cells, { row = row, slot = slot, kind = kind, stamp = stamp, body = body })
 		self:_accept(stored, slot, kind, stamp, body, mine)
@@ -2357,9 +2377,8 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	local change: Change = {
 		insert = function(schema, list, order, values)
 			-- As late as anything heard of: later, then, than any right that is known to have ended.
-			local ms = math.floor(self.host.now() * 1000)
-			if ms > self.clock_ms then
-				self.clock_ms, self.clock_n = ms, 0
+			if now > self.clock_ms then
+				self.clock_ms, self.clock_n = now, 0
 			end
 			local id = string.pack(">I4I4", scope, self.clock_ms // 1000) .. self.host.random(8)
 			fresh[id] = true
@@ -2379,7 +2398,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			f(t, function(): string
 				return self.host.random(8)
 			end)
-			local stamp = self:_stamp()
+			local stamp = self:_stamp(now)
 			local body = text.close(t, stamp)
 			if body then
 				assert(#body <= MAX_OPEN, "an edit may be 1 MiB at most, less 192 bytes")
