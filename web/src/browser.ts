@@ -4,6 +4,7 @@
 import { Client } from "./client.ts";
 import type { Device, Relay } from "./index.ts";
 import type { Connect, Member, Rights } from "./node.ts";
+import { storePath } from "./volume-opfs.ts";
 import { StoreLocked } from "./volume.ts";
 import type { Command, Op, Report, Say } from "./worker.ts";
 
@@ -13,7 +14,11 @@ export * from "./index.ts";
 const errorOf = (message: string, name?: string): Error => (name === "StoreLocked" ? new StoreLocked(message) : new Error(message));
 
 export interface OpenOptions {
-  /** Which store: one device each, shared by the origin's tabs. "default" unless said. */
+  /**
+   * Which store: one device each, shared by the origin's tabs. "default" unless said. A path of the origin's file system,
+   * under zsp/, whose empty parts are none: "app", "app/" and "/app" are one store. One of no parts, or of "." or "..", is a
+   * RangeError.
+   */
   name?: string;
   /**
    * Replicate everything, rather than what clients here watch and ask about. Not by default: a browser's device is a
@@ -36,7 +41,7 @@ export interface OpenOptions {
 
 /** Opens this origin's device of that name, making it if there is none. */
 export async function open(options: OpenOptions = {}): Promise<Device> {
-  const name = options.name ?? "default";
+  const name = storePath(options.name ?? "default");
   // The newest credential this tab has given, and when, which a worker it starts again is told: so that what it gave is
   // never taken for newer than what another tab gave since. By the clock workers judge it by.
   let credential = options.credential;

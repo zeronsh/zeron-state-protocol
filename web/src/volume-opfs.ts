@@ -50,6 +50,17 @@ export async function take<H>(name: string, open: () => Promise<H>, wait: (ms: n
   }
 }
 
+/**
+ * A store's path in the origin's file system, under zsp/, as its name gives it: what its directory, its lock and its
+ * channel are all named by, so that "app", "app/", "/app" and "app//" are one store, one lock. A name of no parts, or of
+ * "." or "..", names none.
+ */
+export function storePath(name: string): string {
+  const parts = name.split("/").filter(Boolean);
+  if (parts.length === 0 || parts.some((p) => p === "." || p === "..")) throw new RangeError(`no store is named ${JSON.stringify(name)}`);
+  return parts.join("/");
+}
+
 export class OpfsVolume implements Volume {
   #dir: FileSystemDirectoryHandle;
   #closed = false;

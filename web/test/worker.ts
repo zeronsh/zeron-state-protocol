@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { Client } from "../src/client.ts";
 import { Node } from "../src/node.ts";
 import { Store } from "../src/store.ts";
-import { HELD_WITHIN, OpfsVolume, take } from "../src/volume-opfs.ts";
+import { HELD_WITHIN, OpfsVolume, storePath, take } from "../src/volume-opfs.ts";
 import { MemoryVolume, StoreLocked } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
 import type { Report } from "../src/worker.ts";
@@ -297,6 +297,24 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
 }
 
 // ---------------------------------------------------------------- the worker
+
+// Store names: what is one store is one lock, one channel and one directory.
+{
+  for (const name of ["app", "app/", "/app", "app//", "//app/"]) assert.equal(storePath(name), "app");
+  assert.equal(storePath("a//b/"), "a/b");
+  for (const name of ["", "/", "//", ".", "a/./b", "a/../b", ".."]) assert.throws(() => storePath(name), RangeError, name);
+  // Two tabs that name it differently share it: the second's worker waits in line for the first's, and asks it.
+  const a = await worker();
+  await a.tell({ open: { name: "app" } });
+  await a.tell({ ask: 1, op: "identity", args: [] });
+  const b = await worker();
+  await b.tell({ open: { name: "app//" } });
+  const before = refused;
+  const asking = b.tell({ ask: 1, op: "identity", args: [] });
+  await Promise.race([asking, sleep(500)]);
+  assert.equal(refused, before, "the second worker opened the store's files, held by the first");
+  assert.deepEqual(answered(b.said, 1)?.value, answered(a.said, 1)?.value, "the second tab's device is not the first's");
+}
 
 // Put away, as its tab is frozen or left: every file is closed at once, as the worker is told, for nothing after is sure to
 // be run; and the lock let go of once nothing is being opened.

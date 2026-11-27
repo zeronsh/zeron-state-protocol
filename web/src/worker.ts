@@ -7,7 +7,7 @@
 /// <reference lib="webworker" />
 
 import { Node, type FarWire, type Rights } from "./node.ts";
-import { OpfsVolume } from "./volume-opfs.ts";
+import { OpfsVolume, storePath } from "./volume-opfs.ts";
 import { loadModule } from "./wasm.ts";
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -134,8 +134,14 @@ const failure = (e: unknown): Failure =>
   e instanceof Error ? { message: e.message, ...(e.name === "StoreLocked" ? { name: e.name } : {}) } : { message: String(e) };
 
 function open(o: Options): void {
-  options = o;
-  channel = new BroadcastChannel("zsp:" + o.name);
+  let name: string;
+  try {
+    name = storePath(o.name); // what its lock, its channel and its directory are all named by
+  } catch (e) {
+    return void self.postMessage({ failed: failure(e).message } satisfies Report);
+  }
+  options = { ...o, name };
+  channel = new BroadcastChannel("zsp:" + name);
   channel.onmessage = (e: MessageEvent<Shout>) => heard(e.data);
   channel.postMessage({ credentials: true } satisfies Shout);
   if (o.credential !== undefined) give(o.credential, o.credentialAt ?? Date.now(), o.credentialAgain !== true);
@@ -295,6 +301,7 @@ async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: 
     return {};
   }
   if (device) return answer(op, args);
+  if (!channel) return { error: "the device was never opened: its name names no store" };
   contend();
   const id = crypto.randomUUID();
   return new Promise((done) => {
