@@ -114,6 +114,12 @@ a_device_started_again_is_found_again :: proc(t: ^testing.T) {
 					world_run(&w, proc(_: ^World, _: rawptr) -> bool {return false}, nil, 200 * time.Millisecond) // what is on its way, heard
 				}
 				testing.expect(t, turned, "the link stays turned away")
+				// The other says something now, as a running process may at any time: it is not heard here.
+				for x in w.hosts[there].udp.links {
+					if x.device == w.keys[here].device && x.link != nil {
+						pipe.link_poke(x.link)
+					}
+				}
 			}
 			beacon := zsp.beacon_seal(&world_space(&w, there).node, bound.port)
 			beacon_heard(&w.hosts[here], beacon, address_from(net.Endpoint{net.IP4_Loopback, 9}))
