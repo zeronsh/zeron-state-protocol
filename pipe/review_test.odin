@@ -392,3 +392,54 @@ review_acks_alone_are_forgotten :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, len(a.sent) - a.sent_head < 64, "%d remembered", len(a.sent) - a.sent_head)
 }
+
+// What a peer says it held an acknowledgement for is a count of microseconds, never negative: one with its top bit set
+// neither lengthens the round trip to decades, nor wraps the time a probe is due to before now.
+@(test)
+review_ack_delay_is_unsigned :: proc(t: ^testing.T) {
+	for delay in ([]u64{1 << 63, transmute(u64)i64(-1_000_000_000_000_000), max(u64)}) {
+		a, b: Link
+		defer link_destroy(&a)
+		defer link_destroy(&b)
+		now: Time = 1_000_000
+		review_pair(t, &a, &b, now)
+		buf: [PACKET_MAX]byte
+		testing.expect(t, link_write(&a, 0, transmute([]byte)string("hello")))
+		testing.expect(t, link_output(&a, buf[:], now) != nil)
+		now += 10 * MS
+		plain: [64]byte
+		w := zsp_writer(plain[:])
+		put(&w, u8(Frame.Ack))
+		put_varint(&w, link_next(&a) - 1)
+		put_varint(&w, delay)
+		put_varint(&w, 1)
+		put_varint(&w, 0)
+		wire: [PACKET_MAX]byte
+		testing.expect(t, link_input(&a, seal_data_packet(&b, 1000, plain[:w.pos], wire[:]), now))
+		testing.expect(t, link_write(&a, 0, transmute([]byte)string("again")))
+		testing.expect(t, link_output(&a, buf[:], now) != nil)
+		due := link_deadline(&a)
+		testing.expectf(t, a.srtt < 1e6 && due > now && due - now < PROBE_MOST, "delay %x: srtt %v µs, probe due in %v µs", delay, a.srtt, due - now)
+	}
+}
+
+// A frame about a stream the peer may not have opened is refused, whatever its number: the last there is too, which
+// counted from 1 is not the first.
+@(test)
+review_last_stream_id_refused :: proc(t: ^testing.T) {
+	for dialler in ([]bool{true, false}) {
+		a, b: Link
+		defer link_destroy(&a)
+		defer link_destroy(&b)
+		now: Time = 1000
+		review_pair(t, &a, &b, now)
+		to, from := &a, &b
+		if !dialler {
+			to, from = &b, &a
+		}
+		plain := []byte{u8(Frame.Stream), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0, 1, 'x'}
+		wire: [PACKET_MAX]byte
+		_ = link_input(to, seal_data_packet(from, 1000, plain, wire[:]), now)
+		testing.expectf(t, !range_contains(to.seen[:], 1000), "dialler %v: a frame of stream %x was acknowledged", dialler, max(u64))
+	}
+}

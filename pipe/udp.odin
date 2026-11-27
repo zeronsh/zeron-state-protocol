@@ -562,7 +562,7 @@ stream_mine :: proc(l: ^Link, id: u64) -> bool {
 // Counting from 1, the how-manyth stream its opener opened.
 @(private)
 stream_number :: proc(id: u64) -> u64 {
-	return id / 2 if id % 2 == 0 else (id + 1) / 2
+	return id / 2 + id % 2 // not (id + 1) / 2, which wraps to 0 for the last id there is
 }
 
 // The end of what has been written.
@@ -1214,7 +1214,8 @@ link_reset_heard :: proc(l: ^Link, id: u64, size: u64) -> bool {
 @(private)
 link_acked :: proc(l: ^Link, r: ^zsp.Reader, now: Time) {
 	largest := zsp.read_varint(r)
-	delay := Time(zsp.read_varint(r))
+	// Bounded while still unsigned: as a Time, a delay past 2^63 would be negative, and add to the round trip.
+	delay := Time(min(zsp.read_varint(r), u64(MAX_ACK_DELAY)))
 	if largest >= link_next(l) {
 		r.bad = true // nothing so numbered was ever sent
 		return
@@ -1269,7 +1270,7 @@ link_acked :: proc(l: ^Link, r: ^zsp.Reader, now: Time) {
 			l.rtt_min, l.rtt_min_at = rtt, now
 		}
 		// Less what the peer says it sat on, as RFC 9002 has it, but never below the least ever seen.
-		if held := f64(min(delay, MAX_ACK_DELAY)); rtt - held >= l.rtt_min {
+		if held := f64(delay); rtt - held >= l.rtt_min {
 			rtt -= held
 		}
 		if !l.acked_any {
