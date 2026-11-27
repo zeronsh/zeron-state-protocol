@@ -61,6 +61,15 @@ function crc32(bytes: Uint8Array): number {
   return (c ^ 0xffffffff) >>> 0;
 }
 
+// Closes a file, whatever it throws: one that cannot be closed is let go of all the same, and keeps no other open.
+function closing(f: File): void {
+  try {
+    f.close();
+  } catch {
+    // nothing more can be done with it
+  }
+}
+
 export class Store {
   readonly volume: Volume;
   /** How long a segment is, as the node says. */
@@ -123,7 +132,7 @@ export class Store {
         s.#kept.set(what, [Store.#slot(a), Store.#slot(b)]);
       }
     } catch (e) {
-      for (const f of opened) f.close();
+      for (const f of opened) closing(f);
       volume.close?.();
       throw e;
     }
@@ -229,11 +238,11 @@ export class Store {
         this.#opening.delete(n); // opened or not: should it be wanted again, it is opened again
       }
       if (this.#abandoned) {
-        f.close();
+        closing(f);
         return;
       }
       if (this.#dropped.delete(n)) {
-        f.close();
+        closing(f);
         await this.volume.remove(segmentName(n));
         return;
       }
@@ -247,7 +256,7 @@ export class Store {
           f.truncate(h.length);
           f.flush();
         } catch (e) {
-          f.close();
+          closing(f);
           throw e;
         }
         // The file has it all: it is the store's from now on, to be closed with it, whatever the journal can be told.
@@ -529,14 +538,14 @@ export class Store {
   #shut(): void {
     if (this.#isShut) return;
     this.#isShut = true;
-    for (const f of this.#segments.values()) f.close();
+    for (const f of this.#segments.values()) closing(f);
     this.#segments.clear();
     this.#dirty.clear();
-    for (const [a, b] of this.#kept.values()) a.file.close(), b.file.close();
+    for (const [a, b] of this.#kept.values()) closing(a.file), closing(b.file);
     this.#kept.clear();
-    this.#tree.close();
-    this.#find.close();
-    this.#journal.close();
+    closing(this.#tree);
+    closing(this.#find);
+    closing(this.#journal);
     this.volume.close?.();
   }
 }

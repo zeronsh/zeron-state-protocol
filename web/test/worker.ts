@@ -4,6 +4,7 @@
 
 import assert from "node:assert/strict";
 import { Node } from "../src/node.ts";
+import { Store } from "../src/store.ts";
 import { HELD_WITHIN, OpfsVolume, take } from "../src/volume-opfs.ts";
 import { StoreLocked } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
@@ -19,6 +20,7 @@ const HELD = "Access Handles cannot be created if there is another open Access H
 const open = new Set<Handle>(); // every handle not closed
 let refused = 0; // how often a handle was asked for and the file was held
 let failFlush: string | undefined; // the name of a file whose flush throws, as a full disk's may
+let failClose: string | undefined; // and whose close throws
 const pauses = new Map<string, { reached: () => void; release: Promise<void> }>(); // by path: a file's next handle, held as it is had
 
 class Handle {
@@ -60,6 +62,7 @@ class Handle {
     if (failFlush === this.file.name) throw new DOMException("the disk is full", "QuotaExceededError");
   }
   close(): void {
+    if (failClose === this.file.name) throw new DOMException("it could not be closed", "UnknownError");
     open.delete(this);
     if (this.file.handle === this) this.file.handle = undefined;
   }
@@ -278,6 +281,18 @@ async function until(what: string, f: () => boolean, ms = 5000): Promise<void> {
   assert(e instanceof DOMException && e.name === "QuotaExceededError", String(e));
   assert.equal(held("inflight"), 0, "a file of a store that could not be opened was left open");
   failFlush = undefined;
+}
+
+// A file that cannot be closed keeps no other open, however the store is let go of.
+for (const how of ["letGo", "closeNow", "close"] as const) {
+  const volume = await OpfsVolume.at(`zsp/close-${how}`);
+  const store = await Store.open(volume, 1 << 20);
+  await sleep(10); // its segments opened ahead
+  failClose = "tree";
+  await store[how]();
+  failClose = undefined;
+  assert.equal(held(`close-${how}`), 1, `${how}: a file that could not be closed kept others open`);
+  for (const h of [...open]) if (h.file.path.startsWith(`/zsp/close-${how}/`)) h.close();
 }
 
 // ---------------------------------------------------------------- the worker
