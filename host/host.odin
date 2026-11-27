@@ -50,6 +50,7 @@ Host :: struct {
 	syncing:      bool, // sync_due is set
 	stopping:     bool, // atomic, as host_stop may be called from anywhere
 	loop:         ^nbio.Event_Loop,
+	waker:        Waker, // what host_stop wakes the loop by
 	methods:      map[string]Host_Method, // that the host answers itself, in-process: see host_serve
 	accepting:    ^nbio.Operation,
 }
@@ -275,6 +276,10 @@ host_init :: proc(h: ^Host, config: Config) -> bool {
 		return false
 	}
 	h.loop = nbio.current_thread_event_loop()
+	if !waker_init(h) {
+		report(.Error, "the event loop failed")
+		return false
+	}
 	if at, ok := h.listen.?; ok {
 		// core:net's listener may reuse a port its last owner died holding; core:nbio's may not.
 		listener, err := net.listen_tcp(at)
@@ -304,6 +309,9 @@ host_run :: proc(h: ^Host) -> bool {
 	dialers_refresh(h)
 	for !sync.atomic_load(&h.stopping) {
 		host_settle(h)
+		if sync.atomic_load(&h.stopping) {
+			break // as settling found storage failed, or a stop came meanwhile: nothing would wake a wait for it
+		}
 		wait := nbio.NO_TIMEOUT
 		if due, ok := host_deadline(h); ok {
 			wait = max(time.tick_diff(time.tick_now(), due), 0)
@@ -324,7 +332,7 @@ host_run :: proc(h: ^Host) -> bool {
 // then lets go of everything, writing down what was kept, as a process that stops politely should.
 host_stop :: proc(h: ^Host) {
 	sync.atomic_store(&h.stopping, true)
-	nbio.wake_up(h.loop)
+	waker_wake(h)
 }
 
 host_destroy :: proc(h: ^Host) {
@@ -350,6 +358,7 @@ host_destroy :: proc(h: ^Host) {
 		delete(method)
 	}
 	delete(h.methods)
+	waker_destroy(h)
 	nbio.release_thread_event_loop()
 }
 
@@ -371,19 +380,15 @@ host_settle :: proc(h: ^Host) {
 	ms := now_ms()
 	// First, and then nothing more: whatever has failed may have let the store count as durable what is not, and what
 	// would be said of it is not said.
-	for s in h.spaces {
-		if s.node.failed {
-			report(.Error, "storage failed; stopping rather than going on with what may be lost")
-			h.stopping = true
-			return
-		}
+	if host_failed(h) {
+		return
 	}
 	if h.syncing && time.tick_diff(h.sync_due, now) >= 0 {
 		h.syncing = false
 		for s in h.spaces {
 			if !zsp.node_sync(&s.node) {
 				report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
-				h.stopping = true
+				sync.atomic_store(&h.stopping, true)
 				return
 			}
 		}
@@ -417,6 +422,11 @@ host_settle :: proc(h: ^Host) {
 		}
 		stream_flush(s)
 	}
+	// And again, for what failed meanwhile, as keeping a roster a link or a relay brought: the host stops now, not when
+	// something next wakes it, and before a relay closes a space nobody is in, which would leave nothing to say so.
+	if host_failed(h) {
+		return
+	}
 	if h.relay {
 		// A space nobody is in costs nothing.
 		#reverse for s, i in h.spaces {
@@ -437,6 +447,19 @@ host_settle :: proc(h: ^Host) {
 			h.sync_due = time.tick_add(now, SYNC_DELAY)
 		}
 	}
+}
+
+// Whether a space's storage has failed, which stops the host.
+@(private)
+host_failed :: proc(h: ^Host) -> bool {
+	for s in h.spaces {
+		if s.node.failed {
+			report(.Error, "storage failed; stopping rather than going on with what may be lost")
+			sync.atomic_store(&h.stopping, true)
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
