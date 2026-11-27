@@ -100,7 +100,9 @@ def space(*names, udp=(), relay=None, options=(), partial={}):
 def test_sync_through_relay():
     relay, (a, b) = space("a", "b")
     ca, cb = a.client(), b.client()
-    cb.watch(1, 1, "chat", limit=50)
+    # All of the list, for all of it is waited for: a window of the last 50 shows only those, whenever more than that come
+    # at once, as they may through a busy relay, and a client holds those it was shown before only if they came apart.
+    cb.watch(1, 1, "chat")
     cb.until(lambda: 1 in cb.windows)
     rows = [ca.put(1, "chat", i, [b"message %d" % i]) for i in range(120)]
     ca.until(lambda: ca.acked == ca.seq)
@@ -577,7 +579,7 @@ def test_durable_object():
     cloud = Cloud().start(ACCESS_TOKEN="sesame")
     _, (a, b) = space("p", "q", relay=cloud, options=["--credential=" + cloud.token])
     ca, cb = a.client(), b.client()
-    cb.watch(1, 1, "chat", limit=50)
+    cb.watch(1, 1, "chat")  # all of it, which is waited for (see test_sync_through_relay)
     cb.until(lambda: 1 in cb.windows)
     for i in range(300):
         ca.put(1, "chat", i, [b"message %d" % i])
