@@ -493,7 +493,9 @@ try {
   await node.close();
   const gaps = dials.slice(1).map((t, i) => Math.round(t - dials[i]));
   // Each gap is HANDSHAKE_MS waited, then about a second, WAITED_REDIAL, and no sooner: a relay that lets it go at once has
-  // it dial no faster than that. Counted failures, the first gaps would be shorter and the last far longer.
-  assert(dials.length >= 6 && gaps.every((g) => g >= HANDSHAKE_MS + 1000 && g < HANDSHAKE_MS + 2500), `dialled ${dials.length} times, at gaps of ${gaps.join(", ")} ms`);
+  // it dial no faster than that. Counted failures, the first gaps would be shorter (0.7 to 1.1 s) and the last far
+  // longer. Less 50 ms below: the node and the relay time by Date.now(), in whole milliseconds that may step, and the
+  // gaps are measured by performance.now().
+  assert(dials.length >= 6 && gaps.every((g) => g >= HANDSHAKE_MS + 950 && g < HANDSHAKE_MS + 2500), `dialled ${dials.length} times, at gaps of ${gaps.join(", ")} ms`);
   console.log(`ok   a web device waiting at a relay for a roster neither has dials again soon (${gaps.join(", ")} ms)`);
 } finally { rmSync(tmp7, { recursive: true, force: true }); }
