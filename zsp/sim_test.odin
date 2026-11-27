@@ -1689,6 +1689,274 @@ review_over_when_let_go :: proc(t: ^testing.T) {
 	testing.expect(t, store_held(&phone.node.store) <= phone.node.keep.bytes)
 }
 
+// Brings a device becoming partial to the point where it has sent all it had to a relay, and waits to hear that it is
+// durable there: true if it got there before hearing, as is wanted.
+@(private)
+sim_to_level :: proc(s: ^Sim, l: Sim_Link) -> bool {
+	for _ in 0 ..< 10_000 {
+		if l.a.level_at > 0 {
+			return !l.a.node.whole
+		}
+		busy := sim_pass(s, l.a, l.b)
+		if l.a.level_at > 0 {
+			return !l.a.node.whole
+		}
+		busy |= sim_pass(s, l.b, l.a)
+		if store_unsynced(&l.b.node.store) {
+			node_sync(l.b.node)
+			busy = true
+		}
+		if !busy {
+			return false
+		}
+	}
+	return false
+}
+
+// What a device becoming partial is written, or given by a partial peer, while it waits to hear that all it sent is
+// durable, is not lost when it hears, and goes on to be partial. (Review 2, 1A.)
+@(test)
+review2_becoming_window :: proc(t: ^testing.T) {
+	for given in ([]bool{false, true}) {
+		state := seeded(51)
+		context.random_generator = rand.default_random_generator(&state)
+		s: Sim
+		sim_init(t, &s, full = 2, partial = 1, relays = 1, ring = 256)
+		defer sim_destroy(&s)
+		big, dev, phone := s.nodes[0], s.nodes[1], s.nodes[2]
+		sim_put(&s, dev, 1)
+		sim_restart(&s, dev, full = false)
+		testing.expect(t, dev.node.becoming)
+		sim_link(&s, 1, 3)
+		testing.expect(t, sim_to_level(&s, s.links[0]), "never got to the point where it waits")
+		if given {
+			// A partial peer gives it something, and forgets it once told it is held.
+			sim_link(&s, 2, 1)
+			sim_put(&s, phone, 2)
+			l := s.links[1]
+			for _ in 0 ..< 20 {
+				sim_pass(&s, l.a, l.b)
+				node_sync(&dev.node)
+				sim_pass(&s, l.b, l.a)
+			}
+		} else {
+			sim_put(&s, dev, 2)
+		}
+		// It hears that what it sent is durable, and the link goes before it says more.
+		l := s.links[0]
+		for _ in 0 ..< 20 {
+			node_sync(l.b.node)
+			sim_pass(&s, l.b, l.a)
+		}
+		testing.expect(t, dev.node.whole)
+		for len(s.links) > 0 {
+			sim_cut(&s, 0)
+		}
+		sim_restart(&s, dev, full = false)
+		testing.expect(t, !dev.node.becoming)
+		sim_link(&s, 1, 3)
+		sim_link(&s, 0, 3)
+		sim_link(&s, 2, 3)
+		sim_settle(&s)
+		testing.expectf(t, store_range(&big.node.store, KEY_MIN, KEY_MAX).count == 2, "given %v: big has %d of 2", given, store_range(&big.node.store, KEY_MIN, KEY_MAX).count)
+	}
+}
+
+// A device becoming partial is not level for an Ack that refuses something, for the whole-scope watches of a roster
+// since let go of, nor for watches the other refuses. (Review 2, 1B, 1C, 1D.)
+@(test)
+review2_level_is_earned :: proc(t: ^testing.T) {
+	for way in 0 ..< 3 {
+		state := seeded(52)
+		context.random_generator = rand.default_random_generator(&state)
+		s: Sim
+		sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+		defer sim_destroy(&s)
+		dev := s.nodes[1]
+		sim_put(&s, dev, 1)
+		sim_restart(&s, dev, full = false)
+		sim_link(&s, 1, 2)
+		l := s.links[0]
+		switch way {
+		case 0, 1:
+			testing.expect(t, sim_to_level(&s, l))
+			f: [dynamic]byte
+			defer delete(f)
+			if way == 0 {
+				at := frame_begin(&f, .Ack)
+				write_varint(&f, l.a.seq_out)
+				scan := tree_scan(&dev.node, dev.node.cells, KEY_MIN, KEY_MAX)
+				leaf, _ := tree_next(&scan)
+				write_pair(&f, Id{leaf.key[0], leaf.key[1]})
+				frame_end(&f, at)
+			} else {
+				roots_drop(l.a)
+				at := frame_begin(&f, .Ack)
+				write_varint(&f, l.a.seq_out)
+				frame_end(&f, at)
+			}
+			session_input(l.a, f[:])
+		case 2:
+			// Before anything is compared, the other says it holds none of what is watched.
+			for _ in 0 ..< 50 {
+				if len(l.a.roots) > 0 {
+					break
+				}
+				sim_pass(&s, l.a, l.b)
+				sim_pass(&s, l.b, l.a)
+			}
+			f: [dynamic]byte
+			defer delete(f)
+			for scope in l.a.roots {
+				at := frame_begin(&f, .Synced)
+				write_varint(&f, l.a.roots_gen * ROOT + u64(scope))
+				write_u8(&f, 4) // denied
+				write_key(&f, {})
+				write_key(&f, {})
+				write_varint(&f, 0)
+				write_varint(&f, 0)
+				frame_end(&f, at)
+			}
+			session_input(l.a, f[:])
+			_ = session_output(l.a)
+		}
+		testing.expectf(t, !dev.node.whole, "way %d: level without having earned it", way)
+	}
+}
+
+// Two devices becoming partial, that meet only each other, are not level with each other: neither holds for good what
+// the other has. (Review 2, 2.)
+@(test)
+review2_becoming_pair :: proc(t: ^testing.T) {
+	state := seeded(53)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	a, b, relay := s.nodes[0], s.nodes[1], s.nodes[2]
+	sim_put(&s, a, 1)
+	sim_put(&s, b, 2)
+	sim_restart(&s, a, full = false)
+	sim_restart(&s, b, full = false)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	sim_cut(&s, 0)
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	testing.expect(t, !a.node.whole && !b.node.whole)
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	sim_restart(&s, a, full = false)
+	sim_restart(&s, b, full = false)
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&relay.node.store, KEY_MIN, KEY_MAX).count, 2)
+}
+
+// What a full peer says of a window is believed only of what was asked for, and only when it says it is settled.
+// (Review 2, 3A, 3B.)
+@(test)
+review2_settled_from_a_full_peer :: proc(t: ^testing.T) {
+	for way in 0 ..< 2 {
+		state := seeded(54)
+		context.random_generator = rand.default_random_generator(&state)
+		s: Sim
+		sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+		defer sim_destroy(&s)
+		victim := s.nodes[1]
+		sim_link(&s, 1, 0)
+		sim_settle(&s)
+		ui := sim_client(&s, victim)
+		defer session_close(ui)
+		list, other := List{1 << 32 | 5, 5}, List{1 << 32 | 6, 6}
+		sim_watch(ui, 1, list_lo(list), list_hi(list), 0, {data = true, live = true})
+		for _ in 0 ..< 3 {
+			sim_pass(&s, s.links[0].a, s.links[0].b) // the watch reaches the peer, which has not answered
+		}
+		it := &victim.node.interests[0]
+		f: [dynamic]byte
+		defer delete(f)
+		at := frame_begin(&f, .Synced)
+		write_varint(&f, it.id)
+		if way == 0 {
+			write_u8(&f, 1)
+			write_key(&f, list_lo(other))
+			write_key(&f, list_hi(other))
+		} else {
+			write_u8(&f, 0)
+			write_key(&f, list_lo(list))
+			write_key(&f, list_hi(list))
+		}
+		write_varint(&f, 0)
+		write_varint(&f, 0)
+		frame_end(&f, at)
+		session_input(s.links[0].a, f[:])
+		w := victim.node.interests[0].watch
+		testing.expectf(t, key_less(w.lo, w.hi), "way %d: the window came to nothing", way)
+		testing.expectf(t, way == 0 || len(victim.node.interests[0].reports) == 0, "an unsettled Synced counted")
+		sim_link(&s, 1, 2)
+		sim_settle(&s)
+		for l in s.links {
+			testing.expect(t, !l.a.closing && !l.b.closing)
+		}
+	}
+}
+
+// A row in two lists, of which one was never said to be watched, as one held before lists' ages were kept, is kept as
+// long as any, whichever list is gone over first. (Review 2, 6.)
+@(test)
+review2_unstamped_list :: proc(t: ^testing.T) {
+	state := seeded(55)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, phone := s.nodes[0], s.nodes[1]
+	a, b := List{1 << 32 | 5, 5}, List{1 << 32 | 6, 6}
+	big.node.now = sim_now(&s, big)
+	row := node_id(&big.node, 1)
+	place :: proc(l: List) -> []byte {
+		body := make([]byte, 24, context.temp_allocator)
+		put_u64(body, l[0])
+		put_u64(body[8:], l[1])
+		return body
+	}
+	testing.expect(t, node_write(&big.node, {{row, PLACE, .Place, node_stamp(&big.node), place(a)}, {row, PLACE + 1, .Place, node_stamp(&big.node), place(b)}}))
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	node_keep(&phone.node, {age = 2000, bytes = 0})
+	ui := sim_client(&s, phone)
+	sim_watch(ui, 1, list_lo(b), list_hi(b), 0, {data = true})
+	sim_settle(&s)
+	session_close(ui)
+	sim_settle(&s)
+	clear_used(&phone.node) // as though held before lists' ages were kept
+	ui = sim_client(&s, phone)
+	sim_watch(ui, 1, list_lo(a), list_hi(a), 0, {data = true})
+	sim_settle(&s)
+	session_close(ui)
+	sim_settle(&s)
+	s.now += 5000
+	phone.node.now = sim_now(&s, phone)
+	for node_retain(&phone.node) {}
+	testing.expect_value(t, store_range(&phone.node.store, list_lo(b), list_hi(b)).count, 1)
+}
+
+@(private)
+clear_used :: proc(n: ^Node) {
+	keys := make([dynamic]Key, context.temp_allocator)
+	scan := tree_scan(n, n.used, KEY_MIN, KEY_MAX)
+	for leaf in tree_next(&scan) {
+		append(&keys, leaf.key)
+	}
+	for k in keys {
+		tree_delete(n, &n.used, k)
+	}
+}
+
 // Forgets what is in the outbox, as a store kept before full replicas kept one would never have had it.
 @(private)
 clear_map_outbox :: proc(n: ^Node) {

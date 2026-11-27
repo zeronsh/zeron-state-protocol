@@ -415,8 +415,9 @@ held_by_none :: proc(n: ^Node, row: Id, here: Key, held: [][2]Key, used: u64) ->
 					}
 				}
 			}
+			// One never said to have been watched is as one watched now, as list_used says, whichever is gone over first.
 			other := key_list(k)
-			if v, ok := tree_get(n, n.used, {other[0], other[1], 0, 0, 0}); ok && v[0] > used {
+			if v, ok := tree_get(n, n.used, {other[0], other[1], 0, 0, 0}); !ok || v[0] > used {
 				return false
 			}
 		}

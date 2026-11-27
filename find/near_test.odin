@@ -149,6 +149,7 @@ near_answers_whole :: proc(t: ^testing.T) {
 	defer near_destroy(&n)
 	big := list_of(2, 1)
 	value := make([]byte, 1500)
+	defer delete(value)
 	for i in 0 ..< 600 {
 		near_put(t, &n.w, big, u64(i), value)
 	}
@@ -267,4 +268,69 @@ near_fetch_without_relay :: proc(t: ^testing.T) {
 	a, answered := n.c.answers[1]
 	testing.expect(t, answered && a.flags & 32 != 0, "the Fetch was never answered")
 	testing.expect_value(t, len(n.g.live), 0)
+}
+
+// A Fetch is answered with what is held when the only full replica reached may not be sent what it is about, and when
+// the one asked refuses to say: neither will ever confirm it. (Review 2, 4A, 4B.)
+@(test)
+near_fetch_unconfirmable :: proc(t: ^testing.T) {
+	for way in 0 ..< 2 {
+		state := rand.create(35)
+		context.random_generator = rand.default_random_generator(&state)
+		n: Near
+		near_make(t, &n)
+		defer near_destroy(&n)
+		f: World
+		defer if way == 0 {
+			world_destroy(&f)
+		}
+		if way == 0 {
+			// Another full replica, which may read only scope 1, and nothing of scope 2.
+			for &b in f.secret {
+				b = byte(rand.uint32())
+			}
+			zsp.keyring_init(&f.keys, f.secret)
+			d := zsp.draft_from(&n.w.node.roster, 2)
+			zsp.draft_grant(&d, f.keys.device, f.keys.signer, 1, {.Read, .Write})
+			roster, ok := zsp.roster_sign(&n.w.keys, n.w.root, &d)
+			testing.expect(t, ok)
+			f.roster, f.space = roster, n.w.space
+			world_start(t, &f)
+			f.node.host.authenticate = n.w.node.host.authenticate
+			testing.expect(t, zsp.node_adopt(&n.p.node, roster))
+			append(&n.links, link_make(&n.p, &f))
+		} else {
+			near_link(&n, &n.p)
+		}
+		near_settle(t, &n)
+		q := make([dynamic]byte, context.temp_allocator)
+		where_list(&q, list_of(2, 1))
+		client_ask(t, &n.c, 1, near_question(q[:]), FETCH)
+		finder_run(&n.g)
+		if way == 1 {
+			// The relay refuses to say anything of it.
+			for it in n.p.node.interests {
+				if !it.watch.data {
+					continue
+				}
+				w := make([dynamic]byte, context.temp_allocator)
+				at := zsp.frame_begin(&w, .Synced)
+				zsp.write_varint(&w, it.id)
+				zsp.write_u8(&w, 4)
+				zsp.write_key(&w, it.watch.lo)
+				zsp.write_key(&w, it.watch.hi)
+				zsp.write_varint(&w, 0)
+				zsp.write_varint(&w, 0)
+				zsp.frame_end(&w, at)
+				zsp.session_input(n.links[0][0], w[:])
+			}
+		}
+		for _ in 0 ..< 50 {
+			finder_run(&n.g)
+			client_hear(t, &n.c)
+		}
+		a, answered := n.c.answers[1]
+		testing.expectf(t, answered && a.flags & 32 != 0, "way %d: the Fetch was never answered", way)
+		testing.expectf(t, len(n.g.live) == 0, "way %d: %d questions left", way, len(n.g.live))
+	}
 }

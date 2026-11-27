@@ -134,10 +134,10 @@ node_init :: proc(n: ^Node, disk: Disk, space: Key32, keys: ^Keyring, full: bool
 }
 
 // Whether this replica keeps on record what it is given to hold that nobody else may: a partial one, what its clients
-// write; and one becoming partial, once it is level with a full one, what peers who will forget it give it too.
+// write; and one becoming partial, from the first, what peers who may forget it give it too.
 @(require_results)
 node_tracks :: proc(n: ^Node) -> bool {
-	return n.own && (!n.full || n.whole)
+	return n.own
 }
 
 node_destroy :: proc(n: ^Node) {

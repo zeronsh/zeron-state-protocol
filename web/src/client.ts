@@ -598,9 +598,11 @@ export class Client {
     if (out.pos > 0 && this.#wire) {
       // A piece at a time, for a pipe is a stream of bytes, and its messages may be no bigger than zspd's WebSockets take,
       // 8 MiB: a burst of writes bigger than that, said again every time the pipe is dialled, would break it every time.
-      const written = codec.written(out);
-      for (let at = 0; at < written.length; at += MESSAGE_MOST) this.#wire.send(written.slice(at, at + MESSAGE_MOST));
+      // Emptied first, for sending may break the pipe, or say more, there and then: what is left is for the pipe it was for.
+      const written = codec.written(out).slice(); // a piece of its own each, which a pipe may hand on as it is
       out.pos = 0;
+      const wire = this.#wire;
+      for (let at = 0; at < written.length && this.#wire === wire; at += MESSAGE_MOST) wire.send(written.slice(at, at + MESSAGE_MOST));
     }
     for (const window of this.#windows.values()) if (window.changed) this.#publish(window);
     for (const a of [...this.#asked.values()]) {

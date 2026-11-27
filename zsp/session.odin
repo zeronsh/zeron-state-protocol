@@ -485,7 +485,9 @@ send_hello :: proc(s: ^Session) {
 	n := s.node
 	at := frame_begin(&s.out, .Hello)
 	write_u8(&s.out, VERSION)
-	write_u8(&s.out, u8(Hello_Flags{full = n.full && s.role != .Calls, relay = n.keys == nil, calls = s.role == .Calls}))
+	// One becoming partial is a full replica only for itself: nobody is to count on what it says it holds, nor be brought
+	// level with it as with one that will go on holding everything.
+	write_u8(&s.out, u8(Hello_Flags{full = n.full && !n.becoming && s.role != .Calls, relay = n.keys == nil, calls = s.role == .Calls}))
 	append(&s.out, ..n.space[:])
 	write_varint(&s.out, n.roster.serial)
 	write_bytes(&s.out, s.credential)
@@ -740,6 +742,7 @@ roots_drop :: proc(s: ^Session) {
 	s.roots_due = 0
 	s.settled = false
 	s.told = false
+	s.level_at = 0 // nor does what was sent for them make it level
 }
 
 // ---------------------------------------------------------------- watching
@@ -900,6 +903,19 @@ on_synced :: proc(s: ^Session, r: ^Reader) {
 			return
 		}
 		if id / ROOT == s.roots_gen && s.roots_due > 0 && slice.contains(s.roots[:], Scope(id % ROOT)) {
+			flags := Synced_Flags(read_u8(r))
+			if r.bad || flags.restart || !(flags.settled || flags.denied) {
+				return
+			}
+			if flags.denied {
+				// Not held there, and so not level there: never level, on this session, in what it holds keys for.
+				for x, i in s.roots {
+					if x == Scope(id % ROOT) {
+						ordered_remove(&s.roots, i)
+						break
+					}
+				}
+			}
 			s.roots_due -= 1
 			s.settled = s.roots_due == 0
 			node_balance(n)
@@ -1036,7 +1052,7 @@ interest_settled :: proc(n: ^Node, id: u64) {
 // answered before, of a range within the scope asked about.
 @(private)
 interest_asked :: proc(s: ^Session, id: u64, lo, hi: Key, flags: Synced_Flags) -> bool {
-	if !s.peer_full || flags.restart {
+	if !s.peer_full || flags.restart || !(flags.settled || flags.denied) {
 		return false
 	}
 	for &it in s.node.interests {
@@ -1046,8 +1062,14 @@ interest_asked :: proc(s: ^Session, id: u64, lo, hi: Key, flags: Synced_Flags) -
 		if flags.denied {
 			return slice.contains(s.owed[:], id)
 		}
+		// Of what was asked for, and some of it: whatever it says, the window closes only to where they meet.
 		scope := key_scope(it.watch.lo)
 		if !it.watch.data || !key_less(lo, hi) || key_scope(lo) != scope || key_less(scope_hi(scope), hi) {
+			return false
+		}
+		meet_lo := lo if key_less(it.watch.lo, lo) else it.watch.lo
+		meet_hi := hi if key_less(hi, it.watch.hi) else it.watch.hi
+		if !key_less(meet_lo, meet_hi) {
 			return false
 		}
 		if slice.contains(s.owed[:], id) {
@@ -1736,8 +1758,10 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 		r.bad = true // what was never sent cannot be durable
 		return
 	}
-	s.acked_out = max(s.acked_out, seq)
-	node_level(s)
+	if len(refused) == 0 {
+		s.acked_out = max(s.acked_out, seq) // durable there, all of it
+		node_level(s)
+	}
 	done := 0
 	for done < len(s.unacked) && s.unacked[done].seq <= seq {
 		done += 1
@@ -2010,20 +2034,22 @@ session_unwants :: proc(s: ^Session, lo, hi: Key, data := false) {
 	}
 }
 
-// Whether a session wants the data of a range shown, and whether a full replica has confirmed it, and none has gone since.
-session_wanted :: proc(s: ^Session, lo, hi: Key) -> (wanted, sure: bool) {
+// Whether a session wants the data of a range shown; whether a full replica has confirmed it, and none has gone since;
+// and, if not, whether one may yet.
+session_wanted :: proc(s: ^Session, lo, hi: Key) -> (wanted, sure, pending: bool) {
 	for &it in s.node.interests {
 		if it.session == s.id && it.watch.id == SHOWN && it.watch.data && it.watch.lo == lo && it.watch.hi == hi {
-			return true, interest_sure(&it)
+			return true, interest_sure(&it), it.waiting > 0 || len(it.reports) > 0
 		}
 	}
-	return false, false
+	return false, false, false
 }
 
-// Whether what a full replica holds can be had here, by watching it: some session with one is ready.
-node_fetches :: proc(n: ^Node) -> bool {
+// Whether what a full replica holds of a scope can be had here, by watching it: some session with one that may be sent
+// it is ready.
+node_fetches :: proc(n: ^Node, scope: Scope) -> bool {
 	for s in n.sessions {
-		if s.ready && s.role == .Peer && s.peer_full && !s.paused {
+		if s.ready && s.role == .Peer && s.peer_full && !s.paused && .Read in session_rights(s, scope) {
 			return true
 		}
 	}

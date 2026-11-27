@@ -253,6 +253,70 @@ do
 	assert(cells() == 24, "and again, whole, on the next pipe")
 end
 
+-- A pipe that breaks as the first piece of a long burst is sent is sent no more of it, and the burst goes, whole, to the
+-- pipe dialled next.
+do
+	local sends, connects = 0, 0
+	local closed: any, receive: any = nil, nil
+	local deferred, later = {}, {}
+	local function run()
+		while #deferred > 0 do
+			(table.remove(deferred, 1) :: any)()
+		end
+	end
+	local client = zsp.connect({
+		credential = "x",
+		now = function(): number
+			return 1800000000
+		end,
+		random = function(n: number): string
+			return string.rep("\7", n)
+		end,
+		defer = function(f: () -> ())
+			table.insert(deferred, f)
+		end,
+		after = function(_: number, f: () -> ())
+			table.insert(later, f)
+			return function() end
+		end,
+		connect = function(r: any, c: any)
+			connects += 1
+			receive, closed = r, c
+			local first = connects == 1
+			return {
+				send = function(data: buffer)
+					sends += 1
+					if first and buffer.len(data) == 1048576 then
+						closed() -- as the pipe breaks, there and then
+					end
+				end,
+				close = function() end,
+			}
+		end,
+	})
+	local function greet()
+		local w = codec.writer()
+		codec.put_bytes(w, string.char(ROSTER) .. string.rep("\0", 8) .. "\1\7" .. string.rep("k", 32))
+		receive(codec.string(w))
+		run()
+	end
+	run()
+	greet()
+	client:write(1, function(change)
+		change.insert({ v = zsp.string(16) }, "big", 1, { v = string.rep("a", 900000) })
+		change.insert({ v = zsp.string(16) }, "big", 2, { v = string.rep("b", 900000) })
+	end)
+	assert(pcall(run), "a pipe that broke as it was sent to")
+	local before = sends
+	for _, f in later do
+		f()
+	end
+	run()
+	greet()
+	assert(connects == 2)
+	assert(sends - before >= 2, "the burst went again, to the next pipe")
+end
+
 -- Writing nothing is still done; clearing a text says so.
 do
 	local h = harness()

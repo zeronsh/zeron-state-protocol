@@ -396,13 +396,21 @@ function Client._flush(self: Client)
 	if out.pos > 0 and self.wire then
 		-- A piece at a time, for a pipe is a stream of bytes, and its messages may be no bigger than zspd's WebSockets take,
 		-- 8 MiB: a burst of writes bigger than that, said again every time the pipe is dialled, would break it every time.
-		for at = 0, out.pos - 1, MESSAGE_MOST do
-			local n = math.min(MESSAGE_MOST, out.pos - at)
-			local piece = buffer.create(n)
-			buffer.copy(piece, 0, out.buf, at, n)
-			self.wire.send(piece)
-		end
+		-- Emptied first, for sending may break the pipe, or say more, there and then: what is left is for the pipe it was for.
+		local size = out.pos
+		local written = buffer.create(size)
+		buffer.copy(written, 0, out.buf, 0, size)
 		out.pos = 0
+		local wire = self.wire
+		for at = 0, size - 1, MESSAGE_MOST do
+			if self.wire ~= wire then
+				break
+			end
+			local n = math.min(MESSAGE_MOST, size - at)
+			local piece = buffer.create(n)
+			buffer.copy(piece, 0, written, at, n)
+			wire.send(piece)
+		end
 	end
 	for _, window in self.windows do
 		if window.changed then

@@ -206,6 +206,57 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   assert.equal(h.self.said.filter((x) => x.kind === CELLS).length, 24, "and again, whole, on the next pipe");
 }
 
+// A pipe that breaks as the first piece of a long burst is sent is sent no more of it, and the burst goes, whole, to the
+// pipe dialled next.
+{
+  let sends = 0, connects = 0;
+  let closed: () => void = () => {};
+  let receive: (d: Uint8Array) => void = () => {};
+  const deferred: (() => void)[] = [], later: (() => void)[] = [];
+  const run = () => {
+    while (deferred.length > 0) deferred.shift()!();
+  };
+  const client = new Client({
+    credential: "x",
+    now: () => 1800000000000,
+    random: (n) => new Uint8Array(n).fill(7),
+    defer: (f) => deferred.push(f),
+    after: (_ms, f) => (later.push(f), () => {}),
+    connect: (r, c) => {
+      connects++;
+      receive = r;
+      closed = c;
+      const first = connects === 1;
+      return {
+        send: (data) => {
+          sends++;
+          if (first && data.length === 1 << 20) closed(); // as the pipe breaks, there and then
+        },
+        close: () => {},
+      };
+    },
+  });
+  const greet = () => {
+    const w = codec.writer();
+    codec.putBytes(w, b(ch(ROSTER) + rep("\0", 8) + "\x01\x07" + rep("k", 32)));
+    receive(codec.written(w).slice());
+    run();
+  };
+  run();
+  greet();
+  void client.write(1, (change) => {
+    change.insert({ v: c.bytes(16) }, "big", 1, { v: new Uint8Array(900_000) });
+    change.insert({ v: c.bytes(16) }, "big", 2, { v: new Uint8Array(900_000) });
+  });
+  assert.doesNotThrow(run, "a pipe that broke as it was sent to");
+  const before = sends;
+  for (const f of later.splice(0)) f();
+  run();
+  greet();
+  assert.equal(connects, 2);
+  assert(sends - before >= 2, "the burst went again, to the next pipe");
+}
+
 // Writing nothing is still done; clearing a text says so.
 {
   const h = harness();

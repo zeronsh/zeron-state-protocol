@@ -68,6 +68,7 @@ Far :: struct {
 	// it, so that what is here is the answer; and whether it has confirmed them all, as was last said.
 	near:   [dynamic]zsp.List,
 	sure:   bool,
+	unfetchable: bool, // what was fetched was refused, or could be confirmed by nobody: what is held is the answer
 }
 
 @(private)
@@ -1037,7 +1038,7 @@ far_run :: proc(l: ^Live) {
 @(private)
 near_run :: proc(l: ^Live, start: bool) {
 	f, far := l.f, &l.far
-	if !zsp.node_fetches(f.n) {
+	if far.unfetchable || !zsp.node_fetches(f.n, l.q.scope) {
 		near_drop(l) // nobody to fetch from: what is held is the answer, and a Fetch is given it
 		return
 	}
@@ -1060,7 +1061,13 @@ near_check :: proc(l: ^Live) {
 	}
 	sure := index_level(&l.f.x)
 	for list in far.near {
-		wanted, confirmed := zsp.session_wanted(l.session, zsp.list_lo(list), zsp.list_hi(list))
+		wanted, confirmed, pending := zsp.session_wanted(l.session, zsp.list_lo(list), zsp.list_hi(list))
+		if !confirmed && !pending {
+			// Refused, or nobody asked could be: it will not come, and what is held is the answer, and is said to be.
+			far.unfetchable = true
+			near_drop(l)
+			return
+		}
 		sure &&= wanted && confirmed
 	}
 	if sure != far.sure {
