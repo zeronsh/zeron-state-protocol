@@ -440,6 +440,18 @@ on_flow :: proc(s: ^Session, r: ^Reader) {
 		r.bad = true
 		return
 	}
+	// What is passed on is taken as said by whoever it is told to: what cannot be is the fault of who said it.
+	#partial switch kind {
+	case .Credit:
+		credit := Reader{buf = payload}
+		_ = read_varint(&credit)
+		r.bad = credit.bad || credit.pos != len(payload)
+	case .Fault:
+		r.bad = len(payload) == 0
+	}
+	if r.bad {
+		return
+	}
 	side := int(tag & 1)
 	for &c, i in n.calls {
 		from := &c.ends[side]
@@ -453,6 +465,7 @@ on_flow :: proc(s: ^Session, r: ^Reader) {
 
 @(private)
 flow_pass :: proc(n: ^Node, i: int, side: int, kind: Flow, payload: []byte) {
+	payload := payload
 	c := &n.calls[i]
 	from, to := &c.ends[side], &c.ends[1 - side]
 	over := false
@@ -475,8 +488,13 @@ flow_pass :: proc(n: ^Node, i: int, side: int, kind: Flow, payload: []byte) {
 	case .Fault, .Cancel:
 		over = true
 	case .Credit:
+		// As much as it may be credited ahead, and no more, so that both ends count alike.
 		credit := Reader{buf = payload}
-		to.granted = min(to.granted + int(read_varint(&credit) & 0xff_ffff), 16 * CALL_WINDOW)
+		was := to.granted
+		to.granted = min(to.granted + int(min(read_varint(&credit), 16 * CALL_WINDOW)), 16 * CALL_WINDOW)
+		w := make([dynamic]byte, 0, 10, context.temp_allocator)
+		write_varint(&w, u64(max(to.granted - was, 0)))
+		payload = w[:]
 	case:
 		return
 	}
