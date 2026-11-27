@@ -393,19 +393,29 @@ stream_put :: proc(s: ^Stream, op: pipe.Opcode, payload: []byte) {
 	pipe.tls_write(s.tls, w[:], &s.out)
 }
 
-// Draws what the session has to say into the socket, for as long as the socket takes it.
+// The most a stream is given to send in one turn: the rest waits for the next, which comes at once, so that one
+// with much to say, to one that takes it as fast as it is said, does not keep every other waiting, nor what comes in.
+FLUSH_TURN :: OUT_HIGH / 2
+
+// Draws what the session has to say into the socket, for as long as the socket takes it, a turn's worth at most.
 @(private)
 stream_flush :: proc(s: ^Stream) {
 	if s.dead {
 		stream_close(s)
 		return
 	}
+	given := 0
 	for s.send_op == nil {
 		stream_answer(s)
-		stream_fill(s, true)
+		if given >= FLUSH_TURN {
+			s.host.more = true // another turn, at once
+			return
+		}
+		stream_fill(s, true, FLUSH_TURN - given)
 		if len(s.out) == s.sent {
 			break
 		}
+		given += len(s.out) - s.sent
 		if !stream_flush_bytes(s) {
 			stream_close(s)
 			return
@@ -449,14 +459,14 @@ stream_push :: proc(s: ^Stream) {
 	}
 }
 
-// Seals what the session has to say into what goes to the socket, OUT_HIGH of it at most; with `more`, what it has
+// Seals what the session has to say into what goes to the socket, so much of it at most; with `more`, what it has
 // yet to make too.
 @(private)
-stream_fill :: proc(s: ^Stream, more: bool) {
+stream_fill :: proc(s: ^Stream, more: bool, upto := OUT_HIGH) {
 	if s.session == nil || s.closing {
 		return
 	}
-	for len(s.out) - s.sent < OUT_HIGH {
+	for len(s.out) - s.sent < upto {
 		out := zsp.session_output(s.session) if more else zsp.session_queued(s.session)
 		if len(out) == 0 {
 			break
@@ -624,7 +634,7 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 	for d in h.dialers {
 		switch d.state {
 		case .Waiting:
-			if !d.dropped && time.tick_diff(d.due, now) >= 0 {
+			if !d.dropped && time.tick_diff(d.due, now) >= 0 && !dialer_twin(d) {
 				dialer_resolve(d)
 			}
 		case .Resolving:
@@ -638,6 +648,14 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 			if d.stream.session != nil && d.stream.session.ready && !d.admitted {
 				d.admitted = true
 				report(.Debug, "admitted by the relay at ", d.source)
+			}
+			if d.admitted && !d.dropped {
+				for x in h.dialers {
+					if x != d && x.space == d.space && x.key == d.key && x.admitted && x.state == .Up && dialer_preferred(x, d) {
+						d.stream.dead = true // the other way to it is kept
+						break
+					}
+				}
 			}
 			if d.dropped {
 				d.stream.dead = true
@@ -655,6 +673,33 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 		case .Dialling:
 		}
 	}
+}
+
+// Whether another way to the same relay is admitted: then this one is not tried. One relay is reached one way at a
+// time: through two, all that came in by one would go back by the other.
+@(private)
+dialer_twin :: proc(d: ^Dialer) -> bool {
+	for x in d.host.dialers {
+		if x != d && x.space == d.space && x.key == d.key && !x.dropped && x.state == .Up && x.admitted {
+			return true
+		}
+	}
+	return false
+}
+
+// Of two ways to one relay, both admitted, the one kept: one named by the embedder before one the roster names; else
+// the first.
+@(private)
+dialer_preferred :: proc(a, b: ^Dialer) -> bool {
+	if a.pinned != b.pinned {
+		return a.pinned
+	}
+	for x in a.host.dialers {
+		if x == a || x == b {
+			return x == a
+		}
+	}
+	return false
 }
 
 @(private)

@@ -711,13 +711,40 @@ dialer_failed :: proc(d: ^Dialer, waited := false) {
 	d.due = now() + wait + wait * f64(jitter[0] % 64) / 128
 }
 
+// Whether another way to the same relay is admitted: then this one is not tried. One relay is reached one way at a
+// time: through two, all that came in by one would go back by the other.
+@(private)
+dialer_twin :: proc(d: ^Dialer) -> bool {
+	for x in dialers {
+		if x != d && x.key == d.key && !x.dropped && x.conn != nil && x.conn.session != nil && x.conn.session.ready {
+			return true
+		}
+	}
+	return false
+}
+
+// Of two ways to one relay, both admitted, the one kept: one named by whoever runs this before one the roster names;
+// else the first.
+@(private)
+dialer_preferred :: proc(a, b: ^Dialer) -> bool {
+	if a.pinned != b.pinned {
+		return a.pinned
+	}
+	for x in dialers {
+		if x == a || x == b {
+			return x == a
+		}
+	}
+	return false
+}
+
 @(private)
 dialers_run :: proc(t: f64) {
 	for d in dialers {
 		c := d.conn
 		switch {
 		case c == nil:
-			if !d.dropped && t >= d.due {
+			if !d.dropped && t >= d.due && !dialer_twin(d) {
 				c = conn_new()
 				c.dialer = d
 				d.conn = c
@@ -728,6 +755,15 @@ dialers_run :: proc(t: f64) {
 		case:
 			if c.session != nil && c.session.ready {
 				c.admitted = true // not merely answered: whether that was a failure is known when it ends
+				for x in dialers {
+					if x != d && x.key == d.key && x.conn != nil && x.conn.session != nil && x.conn.session.ready && dialer_preferred(x, d) {
+						conn_drop(c) // the other way to it is kept
+						break
+					}
+				}
+				if d.conn == nil {
+					continue
+				}
 			}
 			quiet := t - c.quiet_at
 			if c.pinged && quiet >= pong_wait {

@@ -387,6 +387,27 @@ const tests: Record<string, () => Promise<void>> = {
       await stopAll();
     }
   },
+  // A relay named two ways is reached one way: the one the device was joined through, though the roster names another.
+  // Through two, all that came in by one would go back by the other.
+  async one_way_to_a_relay() {
+    const relay = await node("serve", join(TMP, "ow-relay"));
+    const named = await proxy(relay.url), joined = await proxy(relay.url);
+    const owner = join(TMP, "ow-owner");
+    const sid = zspd("create", owner);
+    zspd("relay", owner, relay.key, named.url);
+    await node("run", owner);
+    const d = await open({ dir: join(TMP, "ow-web"), udp: false, log: () => {} });
+    zspd("admit", owner, d.key, "1");
+    await d.join(sid, { key: relay.key, url: joined.url });
+    const c = d.client();
+    await eventually("it is admitted", () => c.may(1, "write"));
+    await new Promise((done) => setTimeout(done, 3000)); // the roster's way has been tried, if it is to be
+    expectEqual(joined.live(), 1);
+    expectEqual(named.live(), 1); // the owner's, and nobody else's
+    c.close();
+    await d.close();
+    await stopAll();
+  },
   // The TypeScript client, of zspd, as the Luau client is: the same suite, the same answers.
   async zspd_clients() {
     const relay = await node("serve", join(TMP, "z-relay"));

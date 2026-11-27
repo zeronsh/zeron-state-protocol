@@ -51,6 +51,7 @@ Host :: struct {
 	stopping:     bool, // atomic, as host_stop may be called from anywhere
 	loop:         ^nbio.Event_Loop,
 	waker:        Waker, // what host_stop wakes the loop by
+	more:         bool, // a stream had more to send than one turn's worth: the loop does not wait
 	methods:      map[string]Host_Method, // that the host answers itself, in-process: see host_serve
 	accepting:    ^nbio.Operation,
 	lock:         Dir_Lock, // of dir, held from host_init until host_destroy: see hold.odin
@@ -343,6 +344,7 @@ host_init :: proc(h: ^Host, config: Config) -> (started: bool) {
 host_run :: proc(h: ^Host) -> bool {
 	dialers_refresh(h)
 	for !sync.atomic_load(&h.stopping) {
+		h.more = false
 		host_settle(h)
 		if sync.atomic_load(&h.stopping) {
 			break // as settling found storage failed, or a stop came meanwhile: nothing would wake a wait for it
@@ -350,6 +352,9 @@ host_run :: proc(h: ^Host) -> bool {
 		wait := nbio.NO_TIMEOUT
 		if due, ok := host_deadline(h); ok {
 			wait = max(time.tick_diff(time.tick_now(), due), 0)
+		}
+		if h.more {
+			wait = 0 // a stream had more to send than its turn: what came in meanwhile, and then its next turn
 		}
 		if loop_held_back() {
 			wait = 0 // what it holds back goes to the system only by a tick that does not wait

@@ -447,6 +447,10 @@ const partialBench = async () => {
       s.admit(key, "c", false);
       made.set(String(full), { node: d, page: p, dir, store });
     }
+    // And one more, partial, to ask for the end of the list while the relay is busy bringing another level.
+    const probeDir = join(TMP, `pb-${results.length}-probe`);
+    const probe = await openNode({ dir: probeDir, udp: false, full: false, log: () => {} });
+    s.admit(probe.key, "probe", false);
     const writer = new Client({ connect: zspdConnect(s.o.address), credential: token(s.owner) });
     await eventually("the writer may write", () => writer.may(1, "write"));
     const began = performance.now();
@@ -541,6 +545,29 @@ const partialBench = async () => {
       await call(p, "close", store);
       await p.close();
       pages.splice(pages.indexOf(p), 1);
+    }
+    // While the relay is busy: a full device of zspd's, in a process of its own, joins it directly, unthrottled, and is
+    // brought level, which keeps the relay as busy as it can be; a second after, another asks for the end of the list.
+    {
+      const dir = join(TMP, `pb-${results.length}-busy`);
+      s.admit(zspd("key", dir), "busy", false);
+      zspd("join", dir, s.sid, relay.key, relay.url);
+      await node("run", dir);
+      await new Promise((done) => setTimeout(done, 1000));
+      const t0 = performance.now();
+      await probe.join(s.sid, via);
+      const c = probe.client();
+      const tail = await new Promise<number>((done) => {
+        const w = c.window({ scope: 1, list: "big", table: Row, size: 50 }, (st) => {
+          if (st.status === "ready" && st.rows.length >= 50 && st.rows[st.rows.length - 1].title === `note ${ROWS - 1}`) w.stop(), done(performance.now() - t0);
+        });
+        setTimeout(() => done(-1), WAIT);
+      });
+      const u = await probe.usage();
+      results.push([net.name, "Node", "partial, the relay busy", ms(tail), "", "", mb(u.held), mb(u.memory), mb(du(probeDir))]);
+      console.log("     " + results[results.length - 1].join(" | "));
+      c.close();
+      await probe.close();
     }
     writer.close();
     await stopAll();

@@ -109,7 +109,7 @@ export function zspdConnect(address: string): Connect {
 export async function proxy(
   to: string,
   slow?: { bytesPerSecond: number; latency: number },
-): Promise<{ url: string; connections: () => number; swallow: () => void; cut: () => void; mend: () => void }> {
+): Promise<{ url: string; connections: () => number; live: () => number; swallow: () => void; cut: () => void; mend: () => void }> {
   const { createServer, connect } = await import("node:net");
   const target = new URL(to.replace(/^ws/, "http"));
   // To a relay over TLS, as a deployed one is: what comes here plain goes there sealed, and says it is for that host.
@@ -178,6 +178,7 @@ export async function proxy(
   return {
     url: `ws://127.0.0.1:${port}`,
     connections: () => count,
+    live: () => live.size,
     swallow: () => live.forEach((s) => (s.swallowed = true)),
     cut: () => ((down = true), [...live].forEach((s) => s.end())),
     mend: () => void (down = false),

@@ -563,3 +563,72 @@ review_busy_file_waited_for_as_long_as_said :: proc(t: ^testing.T) {
 		testing.expectf(t, !saved && took >= file_busy_wait && took < time.Second, "saved %v after %v, waiting as long as %v", saved, took, file_busy_wait)
 	}
 }
+
+// One stream with much to say, to one that takes it as fast as it is said, is given a turn's worth at a time, and the
+// loop goes on at once: it does not keep every other stream waiting, nor what comes in, for as long as the socket takes
+// what it is given.
+@(test)
+stream_takes_turns :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = false))
+	a := world_space(&w, 1)
+	body := make([]byte, 16000)
+	defer delete(body)
+	for i in 0 ..< 400 {
+		place: [24]byte
+		zsp.put_u64(place[:], 1 << 32 | 5)
+		zsp.put_u64(place[8:], 5)
+		zsp.put_u64(place[16:], u64(i))
+		id := zsp.node_id(&a.node, 1)
+		_ = zsp.node_write(&a.node, {{id, zsp.PLACE, .Place, zsp.node_stamp(&a.node), place[:]}, {id, zsp.DATA, .Value, zsp.node_stamp(&a.node), body}})
+		free_all(context.temp_allocator)
+	}
+	// Once the relay has it all, it has all of it to say again to A, as when it brings A level afresh.
+	testing.expect(t, world_run(&w, proc(w: ^World, _: rawptr) -> bool {
+		return zsp.store_range(&world_space(w, 0).node.store, zsp.scope_lo(1), zsp.scope_hi(1)).count >= 400
+	}))
+	h := &w.hosts[0]
+	to_a: ^Stream
+	for s in h.streams {
+		if s.session != nil && s.session.ready && s.session.peer == w.keys[1].device {
+			to_a = s
+		}
+	}
+	testing.expect(t, to_a != nil)
+	if to_a == nil {
+		return
+	}
+	append(&to_a.session.tasks, zsp.Task{kind = .Fill, lo = zsp.scope_lo(1), hi = zsp.scope_hi(1)})
+	// Given one turn, with nobody reading the other end meanwhile.
+	before := to_a.session.taken
+	h.more = false
+	stream_flush(to_a)
+	given := int(to_a.session.taken - before)
+	testing.expectf(t, given <= FLUSH_TURN + MAX_PLAIN, "one turn gave a stream %d bytes", given)
+	testing.expect(t, given > 0)
+	testing.expect(t, h.more, "a stream with more to say was not given another turn at once")
+}
+
+// A relay named two ways, both at hand, is reached one way: through two, all that came in by one would go back by the
+// other.
+@(test)
+one_way_to_a_relay :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	testing.expect(t, world_ready(&w, direct = false))
+	// A names the relay again, otherwise: the same relay at another name.
+	other, _ := strings.replace(w.urls[0], "127.0.0.1", "localhost", 1, context.temp_allocator)
+	dial(&w.hosts[1], world_space(&w, 1), w.keys[0].device, other)
+	up :: proc(w: ^World) -> int {
+		n := 0
+		for d in w.hosts[1].dialers {
+			n += 1 if d.key == w.keys[0].device && d.state == .Up && d.admitted else 0
+		}
+		return n
+	}
+	world_run(&w, proc(w: ^World, _: rawptr) -> bool {return false}, within = 3 * time.Second)
+	testing.expect_value(t, up(&w), 1)
+}
