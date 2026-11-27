@@ -194,14 +194,14 @@ link :: proc() {
 	fmt.printfln("handshake       %8.0f µs           both ends", per(t, 1))
 	got := 0
 	b.data = &got
-	b.on_stream = proc(l: ^pipe.Link, bytes: []byte) {(^int)(l.data)^ += len(bytes)}
+	b.on_stream = proc(l: ^pipe.Link, _: u64, bytes: []byte, _: pipe.Stream_Event) {(^int)(l.data)^ += len(bytes)}
 	chunk: [64 << 10]byte
 	SIZE :: 256 << 20
 	now := pipe.Time(1000)
 	t = time.tick_now()
 	for got < SIZE {
 		for room := pipe.link_room(&a); room > 0; room = pipe.link_room(&a) {
-			pipe.link_write(&a, chunk[:min(room, len(chunk))])
+			pipe.link_write(&a, 0, chunk[:min(room, len(chunk))])
 		}
 		now += 50
 		for p := pipe.link_output(&a, buf[:], now); p != nil; p = pipe.link_output(&a, buf[:], now) {
