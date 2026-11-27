@@ -30,14 +30,25 @@ read_file :: proc(path: string, allocator := context.allocator) -> (data: []byte
 		return
 	}
 	defer win32.CloseHandle(handle)
-	out := make([dynamic]byte, 0, 4096, allocator)
+	size: win32.LARGE_INTEGER
+	if !win32.GetFileSizeEx(handle, &size) || size < 0 {
+		return
+	}
+	// Room for all of it and a byte more, made once: a read that fills the room finds out whether there is more, as
+	// there is of a file that grew since, which is then given room too. One that shrank ends where it ends now.
+	out := make([dynamic]byte, allocator)
+	if non_zero_reserve(&out, int(size) + 1) != nil {
+		return
+	}
 	for {
-		if len(out) == cap(out) {
-			reserve(&out, 2 * cap(out))
+		if len(out) == cap(out) && non_zero_reserve(&out, 2 * cap(out)) != nil {
+			delete(out)
+			return
 		}
 		n: win32.DWORD
-		room := out[len(out):cap(out)]
-		if !win32.ReadFile(handle, raw_data(room), win32.DWORD(len(room)), &n, nil) {
+		room := min(cap(out) - len(out), 1 << 30)
+		// Into what is reserved past the end, which slicing `out` would refuse: it holds only what is read so far.
+		if !win32.ReadFile(handle, &raw_data(out)[len(out)], win32.DWORD(room), &n, nil) {
 			delete(out)
 			return
 		}
