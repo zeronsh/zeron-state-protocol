@@ -1466,8 +1466,10 @@ index_check :: proc(x: ^Index, budget: int) {
 	for x.check_scope < len(x.scopes) {
 		s := x.scopes[x.check_scope]
 		if s.filling != nil {
-			// It begins again: what it has gone over may be gone too.
+			// It begins again: what it has gone over may be gone too, and so may what it has made of that already.
 			filling_free(&s.filling)
+			tree_clear(x, &s.ids)
+			tree_clear(x, &s.rows)
 			s.next = 0
 			set_destroy(&s.all)
 			scope_begin(s)
