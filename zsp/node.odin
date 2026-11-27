@@ -179,10 +179,11 @@ node_adopt :: proc(n: ^Node, bytes: []byte) -> bool {
 }
 
 // Adopts what was persisted, at the start. Should the last roster not have been looked over in full, the one
-// before says what it changed.
+// before says what it changed: if it is before it. One that is the same, as hosts once kept it at every start, says
+// nothing, and taken first would leave the roster itself not newer, and so not taken.
 node_resume :: proc(n: ^Node, before, roster: []byte) -> bool {
 	serial := roster_claims(roster, n.space) or_return
-	if n.serial < serial {
+	if was, ok := roster_claims(before, n.space); ok && was < serial && n.serial < serial {
 		node_adopt(n, before)
 	}
 	return node_adopt(n, roster)

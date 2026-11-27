@@ -356,3 +356,40 @@ review_dropped_signal_leaves_frames_whole :: proc(t: ^testing.T) {
 	_, has := row_next(&b.node.store, &scan)
 	testing.expectf(t, ok && whole && !rd.bad && has, "frames whole %v, b has the change %v", whole && !rd.bad, has)
 }
+
+// A store not yet held to its roster resumes with it, whatever roster.old says: the one before it, which says what
+// it changed; or the same one, which says nothing, as hosts once kept it at every start.
+@(test)
+review_resume_with_the_same_roster_before :: proc(t: ^testing.T) {
+	mine, root: Key32
+	for i in 0 ..< 32 {
+		mine[i], root[i] = byte(i + 1), byte(i * 5 + 2)
+	}
+	for same in ([]bool{false, true}) {
+		keys: Keyring
+		keyring_init(&keys, mine)
+		defer keyring_destroy(&keys)
+		none: Roster
+		d := draft_from(&none, 1 << 16)
+		home := draft_scope(&d)
+		draft_grant(&d, keys.device, keys.signer, home, {.Write}).owner = true
+		first, ok := roster_sign(&keys, root, &d, context.temp_allocator)
+		testing.expect(t, ok)
+		was, parsed := roster_parse(first, ed25519_public(root))
+		testing.expect(t, parsed)
+		defer roster_destroy(&was)
+		next := draft_from(&was, 2 << 16)
+		draft_scope(&next)
+		second, ok2 := roster_sign(&keys, root, &next, context.temp_allocator)
+		testing.expect(t, ok2)
+		m: Memory_Disk
+		defer memory_disk_destroy(&m)
+		n: Node
+		testing.expect(t, node_init(&n, memory_disk(&m), ed25519_public(root), &keys, true))
+		defer node_destroy(&n)
+		before := second if same else first
+		testing.expectf(t, node_resume(&n, before, second), "same %v: not resumed", same)
+		serial, _ := roster_claims(second, n.space)
+		testing.expectf(t, n.roster.serial == serial, "same %v: resumed with %x, not %x", same, n.roster.serial, serial)
+	}
+}
