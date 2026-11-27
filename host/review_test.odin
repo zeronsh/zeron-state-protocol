@@ -9,6 +9,7 @@ import "core:path/filepath"
 import "core:strings"
 import "core:testing"
 import "core:time"
+import "../find"
 import "../pipe"
 import "../zsp"
 
@@ -364,4 +365,40 @@ review_session_follows_the_handshake_at_once :: proc(t: ^testing.T) {
 	delete(s.pieces)
 	delete(s.out)
 	delete(s.pong)
+}
+
+// Saving what answers questions syncs the store as any sync does: a checkpoint due is made then, not passed over until
+// something else is written.
+@(test)
+review_index_saved_by_a_whole_sync :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-found-*", context.temp_allocator)
+	testing.expect(t, err == nil)
+	defer os.remove_all(dir)
+	h: Host
+	testing.expect(t, host_init(&h, {dir = dir}))
+	defer host_destroy(&h)
+	root: zsp.Key32
+	root[0] = 9
+	s := space_open(&h, zsp.ed25519_public(root))
+	testing.expect(t, s != nil)
+	if s == nil {
+		return
+	}
+	none: zsp.Roster
+	d := zsp.draft_from(&none, now_ms() << 16)
+	home := zsp.draft_scope(&d)
+	zsp.draft_grant(&d, s.keys.device, s.keys.signer, home, {.Read, .Write, .Call}).owner = true
+	roster, signed := zsp.roster_sign(&s.keys, root, &d, context.temp_allocator)
+	testing.expect(t, signed && zsp.node_adopt(&s.node, roster))
+	f := space_finder(s)
+	for i := 0; i < 1000 && !find.finder_run(f); i += 1 {} // until it has caught up
+	body: [512]byte
+	cell := zsp.Cell{row = zsp.Id{1, 100}, slot = 1, kind = .Value, stamp = zsp.Stamp{1000, 1}, body = body[:]}
+	testing.expect_value(t, zsp.store_commit(&s.node.store, []zsp.Cell{cell}, 0, own = false), 1)
+	s.node.store.serial += 1 // a checkpoint is due
+	f.x.tailing, f.x.unsaved = true, max(f.x.unsaved, 1)
+	found_save(s)
+	testing.expect(t, !zsp.store_unsynced(&s.node.store))
+	testing.expect(t, !zsp.store_wants_checkpoint(&s.node.store), "the index saved, and the checkpoint due passed over")
 }

@@ -89,10 +89,12 @@ found_run :: proc(s: ^Space, now: time.Tick) {
 	}
 }
 
+// Saves the index, once all it was made from is durable: by node_sync, as any sync here is, so that what a sync does
+// besides, a checkpoint that is due and letting go of what has grown too much, is not passed over for this one.
 @(private)
 found_save :: proc(s: ^Space) {
 	x := &s.found.finder.x
-	if x.unsaved > 0 && x.tailing && zsp.store_sync(&s.node.store) && !find.index_save(x) {
+	if x.unsaved > 0 && x.tailing && zsp.node_sync(&s.node) && !find.index_save(x) {
 		s.found.more ||= x.failed // it has to be made again
 	}
 }
