@@ -32,6 +32,7 @@ export class Storage {
   #running = 0;
   #done; // who hears of what finishes: the node of the moment
   #failures = 0; // in a row, for backing off
+  #waking = new Set(); // what wakes each operation backing off
   stats = { gets: 0, puts: 0, deletes: 0, got: 0, put: 0, rowsWritten: 0, rowsRead: 0, failures: 0 };
 
   constructor(ctx, env) {
@@ -364,11 +365,12 @@ export class Storage {
           return;
         }
         if (!r.ok) {
-          // Failing again and again: back off, up to a minute, before the node hears and asks again.
+          // Failing again and again: back off, up to a minute, before the node hears and asks again. Not for a node
+          // let go of, which never will: the place this holds is the next's.
           this.stats.failures++;
           this.#failures++;
           const base = Number(this.#env.R2_BACKOFF ?? 100);
-          await new Promise((wake) => setTimeout(wake, Math.min(600 * base, base * 2 ** Math.min(this.#failures, 10))));
+          if (done === this.#done) await this.#backoff(Math.min(600 * base, base * 2 ** Math.min(this.#failures, 10)));
         } else {
           this.#failures = 0;
         }
@@ -381,10 +383,20 @@ export class Storage {
     }
   }
 
+  // Waits ms, or until whoever would hear is let go of.
+  #backoff(ms) {
+    return new Promise((woken) => {
+      const wake = () => (clearTimeout(timer), this.#waking.delete(wake), woken());
+      const timer = setTimeout(wake, ms);
+      this.#waking.add(wake);
+    });
+  }
+
   // What a node that has been let go of asked for and was not yet started is not: nothing it did not finish is done.
   cancel() {
     this.#queue = [];
     this.#done = undefined; // and what the next asks for waits for it to say who hears of it
+    for (const wake of this.#waking) wake(); // nor does anything wait to tell it
   }
 
   // Lets go of what is cached, here and in SQLite, and of whatever was to be started: for measuring. The trees' tops

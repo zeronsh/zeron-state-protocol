@@ -538,6 +538,41 @@ async function cache_trimmed_on_opening(seed) {
   assert.ok(n <= 1 << 19, `${n} bytes of pages kept, past their share`);
 }
 
+// Bug hunt. A node let go of while all it started is backing off from failing: what the next starts is started at once,
+// not once those backoffs are over, which nobody waits for; and nothing of them is left waiting.
+async function the_next_waits_for_no_backoff(seed) {
+  const sql = new Sql(), waits = [];
+  let failing = true;
+  const bucket = {
+    get: async () => { if (failing) throw new Error("R2 is having a bad day"); return null; },
+    put: async () => {},
+    delete: async () => {},
+  };
+  const ctx = { storage: { sql, sync: async () => {} }, waitUntil: (p) => waits.push(p) };
+  const s = new Storage(ctx, { STORE: bucket, R2_BACKOFF: "1000" }); // seconds, then minutes
+  const space = new Uint8Array(32).fill(seed & 255);
+  s.open(space);
+  const memory = new Uint8Array(4096);
+  const host = s.imports((ptr, len) => memory.subarray(ptr, ptr + len), space);
+  host.log_write(0, 0, 1);
+  for (let i = 1; i <= 8; i++) host.start(i, 0, i, 0, 4096, 0, 0); // as many as are started at once
+  s.run(() => {});
+  for (let i = 0; i < 100 && s.stats.failures < 8; i++) await new Promise((go) => setTimeout(go, 1));
+  assert.equal(s.stats.failures, 8, "all of them failed");
+  s.cancel();
+  failing = false;
+  const heard = await Promise.race([
+    new Promise((done) => {
+      host.start(9, 0, 9, 0, 4096, 0, 0);
+      s.run((op) => done(op.id));
+    }),
+    new Promise((go) => setTimeout(() => go("nothing"), 200)),
+  ]);
+  assert.equal(heard, 9, "the next node's waited for the backoffs of the one let go of");
+  const left = await Promise.race([Promise.all(waits).then(() => 0), new Promise((go) => setTimeout(() => go(waits.length), 200))]);
+  assert.equal(left, 0, "and they are left waiting");
+}
+
 // Bug hunt. Runs of pages put across one another, as reads of a pack may be, in either order: each page is found in
 // whichever run it was put with, and paid for once; and a run let go of in part, from within, is let go of there.
 async function cached_runs_overlap_once(seed) {
@@ -614,5 +649,6 @@ for (let seed = first; seed < first + seeds; seed++) {
   if (seed === first) await cache_trimmed_on_opening(seed);
   if (seed === first) await space_kept_first(seed);
   if (seed === first) await cached_runs_overlap_once(seed);
+  if (seed === first) await the_next_waits_for_no_backoff(seed);
 }
 console.log(`ok   relay storage held to its model over ${seeds} seeds`);
