@@ -875,6 +875,61 @@ words_renewed_beneath_a_question :: proc(t: ^testing.T) {
 	testing.expect(t, renewed > 5)
 }
 
+// And where they are read afresh, and all of it done, within one go at what changed, what changed is judged once they
+// are: not against the column while it is empty.
+@(test)
+words_renewed_at_once :: proc(t: ^testing.T) {
+	state := rand.create(94)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	f: Finder
+	pages: Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+	f.settled, f.pace = true, false
+	c := client_open(&w, &f)
+	defer {
+		zsp.session_close(c.session)
+		finder_close(&f)
+		client_free(&c)
+		memory_disk_destroy(&pages)
+	}
+	write :: proc(t: ^testing.T, w: ^World, id: zsp.Id, text: string) {
+		w.node.now += 10
+		testing.expect(t, zsp.node_write(&w.node, {{id, 20, .Value, zsp.node_stamp(&w.node), transmute([]byte)text}}))
+	}
+	for i in 0 ..< 2 {
+		id := zsp.node_id(&w.node, 1)
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(1, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+		write(t, &w, id, "apple" if i == 0 else "noise")
+	}
+	q := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&q, 1)
+	append(&q, u8(Op.Match), u8(Kind.Words), 20, 0, 0, 0, 5)
+	append(&q, "apple")
+	append(&q, 1, 2, 1, 0, 0, 50, 0)
+	client_ask(t, &c, 1, q[:])
+	for i in 0 ..< 4 * DEAD {
+		write(t, &w, w.rows[1], fmt.tprintf("noise%d", i))
+		if i % 3 == 0 {
+			write(t, &w, w.rows[0], "apple" if i % 2 == 0 else "apple band")
+		}
+		for !finder_run(&f, 1 << 16) {
+		}
+		client_hear_out(t, &c, &f)
+		if !answer_check(t, &w, &f, &c, 1, q[:]) {
+			fmt.println("edit", i)
+			return
+		}
+	}
+}
+
 // What is dear to answer is answered no more often than it is worth, but is in the end.
 @(test)
 dear_answers_are_paced :: proc(t: ^testing.T) {
