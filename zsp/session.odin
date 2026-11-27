@@ -2942,14 +2942,15 @@ flush_one :: proc(s: ^Session, _: ^Task) {
 // Such as the session of a client with a window on a text, of a replica taking in, from its peer, a change at a time,
 // so many that they fall off the ring before the client's turn comes: were it to compare whenever any did, what it
 // shows would be said over, whole, every time. One not ready yet cannot tell what it will be told, and misses
-// whatever is not its own.
+// whatever is not its own. Nor can one that sends an outbox to a full peer: whatever was written, in any window or none,
+// may be what the outbox owes once what came before it is acknowledged (see on_ack), and is not known to have been sent.
 @(private)
 node_dropped :: proc(data: rawptr, c: ^Change, at: u64) {
 	n := (^Node)(data)
 	for s in n.sessions {
 		if s.cursor <= at && !s.missed && c.origin != s.id {
 			was, now, _ := change_seen(s, c)
-			s.missed = !s.ready || was || now
+			s.missed = !s.ready || (node_tracks(n) && s.peer_full) || was || now
 		}
 	}
 }
@@ -3131,8 +3132,11 @@ resync :: proc(s: ^Session) {
 			recon_unfilled(s, &w)
 		}
 	}
-	if (s.initiator || n.becoming) && s.peer_full {
-		if n.full {
+	// What it holds goes to a full peer afresh, as when it was first reached; and, whoever dialled, so does the outbox,
+	// all of it: what was written since it was sent is not known to have been, and would otherwise be taken out of it
+	// once what came before is acknowledged.
+	if s.peer_full {
+		if (s.initiator || n.becoming) && n.full {
 			s.paused = false
 			roots_send(s, afresh = true)
 		}

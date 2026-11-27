@@ -3463,6 +3463,58 @@ behind_on_what_it_never_sees :: proc(t: ^testing.T) {
 	testing.expect(t, drained(ui) > 20_000, "what it shows was not said over, though something in it changed")
 }
 
+// A replica with an outbox, partial or becoming so, dialled by a full peer, that writes again what it sent while the
+// peer's acknowledgment of it is on its way, and so much more that the ring lets go of that, sends it again: for what
+// fell off the ring is not known to have been sent, and is not taken out of the outbox when what came before it is
+// acknowledged. (Review 4 of the window, 1: whatever lies in no window of the peer's is still the outbox's.)
+@(test)
+dialled_outbox_survives_the_ring :: proc(t: ^testing.T) {
+	for way in 0 ..< 2 {
+		state := seeded(119)
+		context.random_generator = rand.default_random_generator(&state)
+		s: Sim
+		if way == 0 {
+			sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 16)
+		} else {
+			sim_init(t, &s, full = 1, partial = 1, relays = 0, ring = 16)
+		}
+		defer sim_destroy(&s)
+		desk, dev := s.nodes[0], s.nodes[1]
+		sim_put(&s, dev, 1)
+		scan := tree_scan(&dev.node, dev.node.shelf, KEY_MIN, KEY_MAX)
+		leaf, _ := tree_next(&scan)
+		row := key_row(leaf.key)
+		if way == 0 {
+			sim_restart(&s, dev, full = false) // becoming partial
+		}
+		sim_link(&s, 0, 1) // the desk dials
+		l := s.links[0]
+		has :: proc(x: ^Sim_Node, row: Id) -> bool {
+			return row_print(&x.node.store, row) != {}
+		}
+		// Until the desk has the row; and what it says of it, its acknowledgment, waits.
+		for _ in 0 ..< 1000 {
+			sim_pass(&s, l.a, l.b)
+			sim_pass(&s, l.b, l.a)
+			if has(desk, row) {
+				break
+			}
+		}
+		testing.expect(t, has(desk, row), "the row never came")
+		testing.expect(t, l.b.seq_out > 0, "not from the outbox")
+		s.now += 3
+		dev.node.now = sim_now(&s, dev)
+		testing.expect(t, node_write(&dev.node, {{row, DATA, .Value, node_stamp(&dev.node), transmute([]byte)string("again")}}))
+		for i in 0 ..< 30 {
+			sim_put(&s, dev, u64(10 + i))
+		}
+		testing.expect(t, l.b.cursor < dev.node.store.events.first, "the ring kept it all")
+		_ = session_output(l.b)
+		sim_settle(&s)
+		testing.expectf(t, row_print(&desk.node.store, row) == row_print(&dev.node.store, row), "what was written again never came, %s", "becoming partial" if way == 0 else "partial")
+	}
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)
