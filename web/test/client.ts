@@ -12,7 +12,7 @@ import * as m from "../src/mirror.ts";
 // `./x selftest` sets ZSP_FAIL, to see that ./x test says this failed.
 if (process.env.ZSP_FAIL) throw new Error("failing, as ZSP_FAIL asks");
 
-const HELLO = 1, ROSTER = 2, WATCH = 3, CELLS = 7, ACK = 8, SYNCED = 10;
+const HELLO = 1, ROSTER = 2, WATCH = 3, CELLS = 7, ACK = 8, SYNCED = 10, ERROR = 13;
 const ASK = 32, UNASK = 33, ANSWER = 34, FETCH = 35, CALL = 15, SERVE = 14, AUTHOR = 17;
 
 // Binary strings, one char a byte, as the protocol's identifiers are kept.
@@ -309,15 +309,15 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   assert.throws(() => h.client.write(1, (change) => change.set(id, Note, { title: rep("x", 1048576) })), "too much is refused before it is written");
 }
 
-// Nonsense from the pipe ends the pipe and nothing else.
-{
+// Nonsense from the pipe ends the pipe and nothing else: a length longer than any frame's, a frame of nothing, a frame cut
+// short, a varint of more bytes than any. And it is as lost as any pipe: dialled again, and all is as it was.
+for (const nonsense of [rep("\x80", 310) + "\0", "\0", "\x03\x02\0\0", "\x0c\x08" + rep("\x81", 10) + "\x01"]) {
   const h = harness();
   h.run();
   h.greet();
-  h.self.receive(b(rep("\x80", 310) + "\0"));
-  assert(h.self.closes === 1);
-  // And it is as lost as any pipe: dialled again, and all is as it was.
-  assert(!h.client.ready);
+  h.self.receive(b(nonsense));
+  assert.equal(h.self.closes, 1, "the pipe was not let go of");
+  assert(!h.client.ready, "and it is not connected");
   h.laters();
   h.run();
   assert.equal(h.self.connects, 2, "dialled again");
@@ -325,6 +325,23 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   assert(h.client.ready);
   const call = h.client.call(codec.hex(rep("d", 32)), 1, "m", "");
   assert.throws(() => call.send(new Uint8Array(262145)), "a message too big for any window is refused at once");
+}
+
+// What a pipe says after it was let go of, as by whoever was told of an error, is not heard: a client that was closed is
+// not connected again by a roster that followed.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.on("error", () => h.client.close());
+  const frame = (kind: number, body: string) => {
+    const w = codec.writer();
+    codec.putBytes(w, b(ch(kind) + body));
+    return s(codec.written(w));
+  };
+  h.self.receive(b(frame(ERROR, "\x04") + frame(ROSTER, rep("\0", 8) + "\x01\x07" + rep("k", 32))));
+  h.run();
+  assert(!h.client.ready, "connected by what was said after it was closed");
 }
 
 // What anyone may write cannot break what everyone reads: a value that does not read is no value, and a bundle cut short

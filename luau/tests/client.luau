@@ -9,13 +9,13 @@ if require("@lune/process").env.ZSP_FAIL then
 	error("failing, as ZSP_FAIL asks")
 end
 
-local HELLO, ROSTER, WATCH, CELLS, ACK, SYNCED = 1, 2, 3, 7, 8, 10
+local HELLO, ROSTER, WATCH, CELLS, ACK, SYNCED, ERROR = 1, 2, 3, 7, 8, 10, 13
 local ANSWER, FETCH = 34, 35
 
 type Said = { kind: number, body: string }
 
 local function harness()
-	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, closes = 0, sizes = {} :: { number }, partial = "" }
+	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, closes = 0, connects = 0, sizes = {} :: { number }, partial = "" }
 	local function run()
 		while #self.deferred > 0 do
 			(table.remove(self.deferred, 1) :: any)()
@@ -41,6 +41,7 @@ local function harness()
 			return function() end
 		end,
 		connect = function(receive: any, closed: any)
+			self.connects += 1
 			self.receive, self.closed = receive, closed
 			return {
 				send = function(data: buffer)
@@ -93,7 +94,14 @@ local function harness()
 		end
 		return nil
 	end
-	return { client = client, self = self, run = run, tell = tell, greet = greet, last = last }
+	local function laters()
+		local due = self.later
+		self.later = {}
+		for _, f in due do
+			f()
+		end
+	end
+	return { client = client, self = self, run = run, tell = tell, greet = greet, last = last, laters = laters }
 end
 
 local Note = { title = zsp.string(16), body = zsp.text(17) }
@@ -386,15 +394,58 @@ do
 	end), "too much is refused before it is written")
 end
 
--- Nonsense from the pipe ends the pipe and nothing else.
+-- Nonsense from the pipe ends the pipe and nothing else: a length longer than any frame's, a frame of nothing, a frame cut
+-- short, a varint of more bytes than any. And it is as lost as any pipe: dialled again, and all is as it was.
+do
+	for _, nonsense in { string.rep("\128", 310) .. "\0", "\0", "\3\2\0\0", "\12\8" .. string.rep("\129", 10) .. "\1" } do
+		local h = harness()
+		h.run()
+		h.greet()
+		h.self.receive(nonsense)
+		assert(h.self.closes == 1, "the pipe was not let go of")
+		assert(not h.client.ready, "and it is not connected")
+		h.laters()
+		h.run()
+		assert(h.self.connects == 2, "dialled again")
+		h.greet()
+		assert(h.client.ready)
+		local call = h.client:call(string.rep("d", 32), 1, "m", "")
+		assert(not pcall(call.send, string.rep("x", 262145)), "a message too big for any window is refused at once")
+	end
+	-- What does not decode is said to be so, as nothing else is: so that it is told from a fault of the reader's own.
+	local function malformed(f: (codec.Reader) -> any, bytes: string): boolean
+		local fine, why = pcall(f, codec.reader(bytes))
+		return not fine and why == codec.Malformed
+	end
+	assert(malformed(codec.varint, string.rep("\129", 200) .. "\1"), "a varint of more than ten bytes")
+	assert(malformed(codec.varint, string.rep("\255", 7) .. "\16"), "a varint beyond 2^53")
+	assert(not malformed(codec.varint, string.rep("\255", 7) .. "\15"), "and not one below it")
+	assert(malformed(codec.key, string.char(50) .. string.rep("A", 50)), "a key longer than 40 bytes")
+	assert(malformed(codec.u8, ""), "a byte that is not there")
+	local w = codec.writer()
+	codec.put(w, string.rep("x", 120))
+	assert(not pcall(codec.put_varint, w, 2 ^ 56), "no varint is written of what none is read as")
+	codec.put_varint(w, 2 ^ 53 - 1)
+	assert(codec.varint({ buf = w.buf, pos = 120, len = w.pos }) == 2 ^ 53 - 1)
+end
+
+-- What a pipe says after it was let go of, as by whoever was told of an error, is not heard: a client that was closed is
+-- not connected again by a roster that followed.
 do
 	local h = harness()
 	h.run()
 	h.greet()
-	h.self.receive(string.rep("\128", 310) .. "\0")
-	assert(h.self.closes == 1)
-	local call = h.client:call(string.rep("d", 32), 1, "m", "")
-	assert(not pcall(call.send, string.rep("x", 262145)), "a message too big for any window is refused at once")
+	h.client:on("error", function()
+		h.client:close()
+	end)
+	local function frame(kind: number, body: string): string
+		local w = codec.writer()
+		codec.put_bytes(w, string.char(kind) .. body)
+		return codec.string(w)
+	end
+	h.self.receive(frame(ERROR, "\4") .. frame(ROSTER, string.rep("\0", 8) .. "\1\7" .. string.rep("k", 32)))
+	h.run()
+	assert(not h.client.ready, "connected by what was said after it was closed")
 end
 
 -- What is sent for an answer waits for it, and what another answer shows outlives the one that stops.

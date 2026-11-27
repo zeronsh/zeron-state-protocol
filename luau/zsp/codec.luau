@@ -11,34 +11,73 @@ local codec = {}
 
 codec.KEY_MAX = string.rep("\255", 40)
 
+-- What does not decode: read past the end, a varint too long or too large, a key too long. Raised as this very table,
+-- so that whoever reads what a pipe says can tell nonsense from a fault of its own.
+local Malformed = table.freeze(setmetatable({}, {
+	__tostring = function(): string
+		return "malformed"
+	end,
+}))
+codec.Malformed = Malformed
+
+local function short()
+	error(Malformed, 0)
+end
+
 function codec.reader(data: buffer | string): Reader
 	local buf = if type(data) == "string" then buffer.fromstring(data) else data
 	return { buf = buf, pos = 0, len = buffer.len(buf) }
 end
 
 function codec.u8(r: Reader): number
-	local v = buffer.readu8(r.buf, r.pos)
-	r.pos += 1
-	return v
+	local pos = r.pos
+	if pos >= r.len then
+		short()
+	end
+	r.pos = pos + 1
+	return buffer.readu8(r.buf, pos)
 end
 
+-- Exact to 2^53, as TypeScript's: a varint of more than ten bytes, or beyond 2^53 - 1, is refused rather than come out
+-- as some other number.
 function codec.varint(r: Reader): number
-	local v, scale = 0, 1
-	while true do
-		local b = buffer.readu8(r.buf, r.pos)
-		r.pos += 1
-		v += bit32.band(b, 127) * scale
+	local buf, pos, len = r.buf, r.pos, r.len
+	if pos >= len then
+		short()
+	end
+	local b = buffer.readu8(buf, pos)
+	pos += 1
+	if b < 128 then
+		r.pos = pos
+		return b
+	end
+	local v, scale = bit32.band(b, 127), 128
+	for _ = 1, 9 do
+		if pos >= len then
+			short()
+		end
+		b = buffer.readu8(buf, pos)
+		pos += 1
+		v += bit32.band(b, 127) * scale -- exact while below 2^53, and past it no less than 2^53
 		if b < 128 then
+			if v > 9007199254740991 then
+				short()
+			end
+			r.pos = pos
 			return v
 		end
 		scale *= 128
 	end
+	error(Malformed, 0) -- a varint of more than ten bytes
 end
 
 function codec.take(r: Reader, n: number): string
-	local s = buffer.readstring(r.buf, r.pos, n)
-	r.pos += n
-	return s
+	local at = r.pos
+	if not (n >= 0 and at + n <= r.len) then
+		short()
+	end
+	r.pos = at + n
+	return buffer.readstring(r.buf, at, n)
 end
 
 function codec.bytes(r: Reader): string
@@ -53,6 +92,8 @@ function codec.key(r: Reader): string
 	local n = codec.u8(r)
 	if n == 255 then
 		return codec.KEY_MAX
+	elseif n > 40 then
+		short() -- no key is so long
 	end
 	return codec.take(r, n) .. string.rep("\0", 40 - n)
 end
@@ -78,7 +119,10 @@ function codec.put_u8(w: Writer, v: number)
 end
 
 function codec.put_varint(w: Writer, v: number)
-	room(w, 8)
+	if not (v >= 0 and v <= 9007199254740991 and v == math.floor(v)) then
+		error(`no varint for {v}`, 2)
+	end
+	room(w, 8) -- 7 × 8 bits hold everything below 2^53
 	while v >= 128 do
 		buffer.writeu8(w.buf, w.pos, v % 128 + 128)
 		w.pos += 1

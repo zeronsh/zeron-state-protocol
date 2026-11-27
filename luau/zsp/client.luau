@@ -240,6 +240,7 @@ local function new_client(host: Host)
 	local self = setmetatable({
 		host = host,
 		wire = nil :: Wire?,
+		hang_up = function() end,
 		ready = false,
 		closed = false,
 		failures = 0,
@@ -306,6 +307,12 @@ function Client._dial(self: Client)
 		return
 	end
 	self.wire = wire
+	-- A pipe let go of from this end is as lost as one that broke: nothing says so but this.
+	local let_go: Wire = wire
+	self.hang_up = function()
+		let_go.close()
+		closed()
+	end
 	local w = codec.writer()
 	codec.put(w, "\1\4") -- telling who wrote what
 	codec.put(w, ZERO32)
@@ -354,9 +361,7 @@ end
 function Client.close(self: Client)
 	self.closed = true
 	self:_flush()
-	if self.wire then
-		self.wire.close()
-	end
+	self.hang_up()
 	for _, a in table.clone(self.asked) do
 		self:_fetched(a) -- as far as it got
 	end
@@ -425,6 +430,10 @@ function Client._flush(self: Client)
 	end
 end
 
+local function handle(self: Client, r: codec.Reader)
+	self:_handle(codec.u8(r), r)
+end
+
 function Client._receive(self: Client, data: buffer | string)
 	local s = if type(data) == "string" then data else buffer.tostring(data)
 	if self.input ~= "" then
@@ -443,9 +452,7 @@ function Client._receive(self: Client, data: buffer | string)
 			p += 1
 			if p - at > 5 then -- no frame is so long
 				self.input = ""
-				if self.wire then
-					self.wire.close()
-				end
+				self.hang_up()
 				return
 			end
 			n += b % 128 * scale
@@ -460,7 +467,20 @@ function Client._receive(self: Client, data: buffer | string)
 		end
 		local r = codec.reader(string.sub(s, p, p + n - 1))
 		at = p + n
-		self:_handle(codec.u8(r), r)
+		local wire = self.wire
+		local fine, why = pcall(handle, self, r)
+		if not fine then
+			if why ~= codec.Malformed then
+				error(why, 0)
+			end
+			-- Nonsense from the pipe ends the pipe and nothing else.
+			self.input = ""
+			self.hang_up()
+			return
+		end
+		if self.wire ~= wire then
+			return -- let go of, by what it said or by whoever was told of it: nothing more is read from it
+		end
 	end
 	self.input = ""
 	self:_later()

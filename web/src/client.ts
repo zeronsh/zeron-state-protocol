@@ -646,6 +646,7 @@ export class Client {
       }
       const r = codec.reader(s.subarray(p, p + n));
       at = p + n;
+      const wire = this.#wire;
       try {
         this.#handle(codec.u8(r), r);
       } catch (e) {
@@ -655,6 +656,7 @@ export class Client {
         this.#hangUp();
         return;
       }
+      if (this.#wire !== wire) return; // let go of, by what it said or by whoever was told of it: nothing more is read from it
     }
     this.#input = new Uint8Array(0);
     this.#later();
