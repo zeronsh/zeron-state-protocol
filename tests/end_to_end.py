@@ -615,6 +615,21 @@ def test_unkept_address_stops_the_node():
     assert p.returncode == 1 and "could not keep" in p.stderr, (p.returncode, p.stderr)
 
 
+def test_scopes_by_number():
+    """A scope is named by its number, as the space has it: one past what a scope's number can be is no other scope, nor
+    is 0, which would be every scope; nor one the space does not have."""
+    d, other = Node("numbering").dir, Node("numbered").dir
+    zspd("create", d)
+    key = zspd("key", other)
+    zspd("admit", d, key, "1")
+    for bad in ("4294967297", "0", "7", "x"):
+        assert refused("admit", d, key, bad), bad
+    for bad in ("4294967296", "4294967297", "0", "7"):
+        assert refused("revoke", d, key, bad), bad
+    line = next(l for l in zspd("members", d).splitlines() if l.startswith(key))
+    assert " 1:rwc" in line, line
+
+
 def test_limits():
     relay, (a, b) = space("aa", "ab")
     ca, cb = a.client(), b.client()

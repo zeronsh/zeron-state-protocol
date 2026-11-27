@@ -106,7 +106,7 @@ run :: proc() -> int {
 	case "admit":
 		ok = len(rest) >= 2 && amend(dir, rest, proc(a: ^Admin, args: []string) -> bool {
 			key := parse_hex(args[0], 64) or_return
-			scope := strconv.parse_u64(args[1]) or_return
+			scope := parse_scope(a, args[1]) or_return
 			device, signer: zsp.Key32
 			copy(device[:], key)
 			copy(signer[:], key[32:])
@@ -121,7 +121,7 @@ run :: proc() -> int {
 					return false
 				}
 			}
-			zsp.draft_grant(&a.draft, device, signer, zsp.Scope(scope), rights)
+			zsp.draft_grant(&a.draft, device, signer, scope, rights)
 			return true
 		})
 	case "revoke":
@@ -133,11 +133,11 @@ run :: proc() -> int {
 				say(os.stderr, "an owner holds the key that is the space, and nothing can take that back\n")
 				return false
 			}
-			scope: u64
+			scope: zsp.Scope // every one
 			if len(args) > 1 {
-				scope = strconv.parse_u64(args[1]) or_return
+				scope = parse_scope(a, args[1]) or_return
 			}
-			zsp.draft_revoke(&a.draft, device, zsp.Scope(scope))
+			zsp.draft_revoke(&a.draft, device, scope)
 			return true
 		})
 	case "subject":
@@ -223,6 +223,21 @@ appoint :: proc(a: ^Admin, key: string, owner, yes: bool) -> bool {
 		}
 	}
 	return false
+}
+
+// A scope of the space, by its number: never one that would be taken for another, as 2^32 + 1 for 1, nor 0, which is
+// every scope.
+parse_scope :: proc(a: ^Admin, text: string) -> (scope: zsp.Scope, ok: bool) {
+	n, parsed := strconv.parse_u64(text)
+	if parsed && n > 0 && n <= u64(max(u32)) {
+		for s in a.draft.scopes {
+			if s.id == zsp.Scope(n) {
+				return s.id, true
+			}
+		}
+	}
+	say(os.stderr, "the space has no scope ", text, "\n")
+	return
 }
 
 in_dir :: proc(dir, name: string) -> string {
