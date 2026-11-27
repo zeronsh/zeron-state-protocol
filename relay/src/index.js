@@ -186,10 +186,11 @@ export class Space extends DurableObject {
     return then(bytes.length);
   }
 
-  // Runs your policy, which may take its time; the connection's input waits inside.
+  // Runs your policy, which may take its time; the connection's input waits inside. Whatever it throws, though at
+  // once, is a no, heard of later as any answer is: never thrown through the node, in the midst of that input.
   #judge(id, device, credential) {
     const space = hex(this.#space);
-    const answer = Promise.resolve(policy?.({ space, device, credential, env: this.env }) ?? true);
+    const answer = new Promise((given) => given(policy?.({ space, device, credential, env: this.env }) ?? true));
     this.ctx.waitUntil(
       answer.then(Boolean, () => false).then((yes) => {
         if (!this.#sockets.has(id)) return;

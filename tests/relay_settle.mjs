@@ -60,7 +60,7 @@ globalThis.WebSocketPair = class {
   }
 };
 
-const { Space, publicKey } = await import(pathToFileURL(join(REPO, "relay/src/index.js")).href);
+const { Space, publicKey, relay } = await import(pathToFileURL(join(REPO, "relay/src/index.js")).href);
 const { Node } = await import(pathToFileURL(join(REPO, "web/src/node.ts")).href);
 const { Store } = await import(pathToFileURL(join(REPO, "web/src/store.ts")).href);
 const { Client, columns } = await import(pathToFileURL(join(REPO, "web/src/client.ts")).href);
@@ -188,3 +188,47 @@ try {
   assert.equal(wsB.closed?.code, 1011);
   console.log("ok   a relay that cannot keep a roster says nothing of it");
 } finally { rmSync(tmp2, { recursive: true, force: true }); }
+
+// Bug hunt. A policy that throws, and at once, as one that is not async may: the device is turned away as by any other
+// no, and nothing is thrown through the node, which was in the midst of that device's input, nor out of the object.
+const tmp3 = mkdtempSync(join(tmpdir(), "zsp-r2-"));
+try {
+  relay({ authenticate: () => { throw new Error("no such account"); } });
+  const spaceId = execFileSync(ZSPD, ["create", tmp3], { encoding: "utf8" }).trim();
+  const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
+  const sockets = new Set(), serverSockets = [], thrown = [];
+  const ctx = { storage: { sql: new Sql(), sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+  const doSpace = new Space(ctx, { RELAY_SECRET: relaySecret });
+  class BridgeWS {
+    static OPEN = 1; static CLOSED = 3;
+    constructor(url) {
+      this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
+      doSpace.fetch(new Request(url.replace(/^ws/, "http")));
+      const { server, pair } = nextPair; this._s = server; serverSockets.push(server);
+      pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
+      pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
+      queueMicrotask(() => { this.readyState = 1; this._emit("open", {}); });
+    }
+    _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
+    addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
+    send(d) {
+      if (this.readyState !== 1) return;
+      const b = typeof d === "string" ? d : new Uint8Array(d).slice();
+      queueMicrotask(() => { try { doSpace.webSocketMessage(this._s, b); } catch (e) { thrown.push(e.message); } });
+    }
+    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+  }
+  const mod = await loadModule();
+  const vol = new MemoryVolume();
+  const st = await Store.open(vol, 16 << 20);
+  st.keep("device", readFileSync(join(tmp3, "device.key")));
+  await st.close();
+  const node = await Node.open({ volume: vol, module: mod, WebSocket: BridgeWS, log: () => {} });
+  execFileSync(ZSPD, ["relay", tmp3, relayPub, "ws://relay.local"]);
+  assert(node.adopt(readFileSync(join(tmp3, spaceId, "roster"))));
+  for (let i = 0; i < 100 && !serverSockets[0]?.closed && thrown.length === 0; i++) await new Promise((r) => setTimeout(r, 20));
+  await node.close();
+  assert.deepEqual(thrown, [], "thrown out of the object");
+  assert.equal(serverSockets[0]?.closed?.code, 1008, "and the device was not turned away");
+  console.log("ok   a relay whose policy throws turns the device away");
+} finally { relay({}); rmSync(tmp3, { recursive: true, force: true }); }
