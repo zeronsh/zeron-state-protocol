@@ -209,9 +209,11 @@ def main(root, direct):
         space = f.read().strip()
     zspd("join", b.dir, space, relay.name, "ws://" + relay.address)
     echo, stalled = Server(), Server(stalled=True)
-    closed = socket.create_server(("127.0.0.1", 0))
+    # A port nothing listens at, held so for the whole test: bound and never listening, so that it refuses every
+    # connection, and no listener made meanwhile, as the forward's own, can be given it.
+    closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    closed.bind(("127.0.0.1", 0))
     nothing = closed.getsockname()[1]
-    closed.close()
     to = {name: f"127.0.0.1:{port}" for name, port in (("echo", echo.port), ("stalled", stalled.port), ("nothing", nothing), ("unallowed", 1))}
     procs = []
     try:
@@ -252,6 +254,7 @@ def main(root, direct):
         bulk(port, 1 << 20)
         return sent
     finally:
+        closed.close()
         for p in procs:
             stop(p)
         relay.stop()
