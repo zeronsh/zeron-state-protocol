@@ -283,19 +283,24 @@ const tests: Record<string, () => Promise<void>> = {
       let id = "";
       await s.a.write(1, (change) => (id = change.insert(Note, "late", 1, { title: "note" })));
       const editor = s.a.text(id, Note.body);
-      editor.append("typed before anyone looked");
+      const typed = Date.now();
+      editor.append("typed before anyone looked"); // its piece is sealed a second from now, and no sooner
       await new Promise((done) => setTimeout(done, 200)); // said, and dropped, as nobody looked
       let shown: string | undefined;
       const looked = Date.now();
       const w = s.b.window({ scope: 1, list: "late", table: Note }, (state) => (shown = state.rows[0]?.body));
       await eventually("what was typed before it looked", () => shown === "typed before anyone looked");
-      const first = Date.now() - looked;
+      const seen = Date.now();
       const began = Date.now();
-      editor.append(", and after");
+      editor.append(", and after"); // in the same piece if that is not sealed yet, else in one of its own
+      const sealed = began < typed + 1000 ? typed + 1000 : began + 1000;
       await eventually("and what is typed after", () => shown === "typed before anyone looked, and after");
-      const after = Date.now() - began;
-      // A piece is sealed a second after it began: what is shown sooner was live.
-      if (first >= 500 || after >= 500) throw new Error(`${kind}: shown ${first} ms after looking, and ${after} ms after typing: once sealed, not live`);
+      const done = Date.now();
+      // A piece is sealed a second after it began, and no sooner: what is shown before then was live. (Not a bound on
+      // how soon after looking: that is all the while a slow machine takes to open the window.)
+      if (seen >= typed + 1000 || done >= sealed) {
+        throw new Error(`${kind}: shown ${seen - looked} ms after looking and ${done - began} ms after typing, ${seen - typed} and ${done - typed} ms after the piece began: once sealed, not live`);
+      }
       editor.close();
       w.stop();
       await s.close();
