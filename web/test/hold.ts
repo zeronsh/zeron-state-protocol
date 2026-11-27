@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -151,29 +151,60 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
   const database = readFileSync(join(TMP, "a-database"));
   const spoiled = Buffer.from(database);
   spoiled[100] = 0x99; // the first page's kind, which no page is
+  const versioned = Buffer.from(database);
+  versioned[18] = 3; // written by a version of SQLite to come, which SQLite only reads, and in which a write holds nothing
+  const schemed = Buffer.from(database);
+  schemed[47] = 5; // of a schema format to come, which SQLite does not read
   const fs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
-  const opened: string[] = [];
-  const watched = { openSync: fs.openSync, truncateSync: fs.truncateSync, writeFileSync: fs.writeFileSync };
-  fs.openSync = ((path: string, ...rest: unknown[]) => (opened.push(String(path)), (watched.openSync as (...a: unknown[]) => number)(path, ...rest))) as typeof fs.openSync;
-  fs.truncateSync = ((path: string, ...rest: unknown[]) => (opened.push(String(path)), (watched.truncateSync as (...a: unknown[]) => void)(path, ...rest))) as typeof fs.truncateSync;
-  for (const [name, bytes] of [["filled", Buffer.from("x".repeat(4096))], ["begun", database.subarray(0, 512)], ["spoiled", spoiled]] as const) {
+  const unwatched = { openSync: fs.openSync, truncateSync: fs.truncateSync };
+  const contents = [
+    ["filled", Buffer.from("x".repeat(4096))],
+    ["begun", database.subarray(0, 512)],
+    ["spoiled", spoiled],
+    ["versioned", versioned],
+    ["schemed", schemed],
+  ] as const;
+  for (const [name, bytes] of contents) {
     const filled = join(TMP, name);
     zspd("create", filled);
     writeFileSync(join(filled, LOCK), bytes);
-    opened.length = 0;
+    // Every open and truncation of a file by name, while the device opens, watched as volume-node.ts calls them.
+    const opened: string[] = [];
+    fs.openSync = ((path: string, ...rest: unknown[]) => (opened.push(String(path)), (unwatched.openSync as (...a: unknown[]) => number)(path, ...rest))) as typeof fs.openSync;
+    fs.truncateSync = ((path: string, ...rest: unknown[]) => (opened.push(String(path)), (unwatched.truncateSync as (...a: unknown[]) => void)(path, ...rest))) as typeof fs.truncateSync;
     syncBuiltinESMExports();
     let d;
     try {
       d = await open({ dir: filled, ...quiet });
     } finally {
-      Object.assign(fs, watched);
+      Object.assign(fs, unwatched);
       syncBuiltinESMExports();
     }
-    assert(!opened.includes(join(filled, LOCK)), `the lock file with ${name} in it was opened here: ${opened.join(", ")}`);
+    // Where it was held, as the device takes the path; opened there only where flock's lock is taken as it is opened.
+    const lock = join(realpathSync.native(filled), LOCK);
+    assert(opened.length > 0, `nothing was watched for ${name}`);
+    if (FLOCK.has(process.platform)) assert(opened.includes(lock), `the lock file with ${name} in it was not opened to be held: ${opened.join(", ")}`);
+    else assert(!opened.includes(lock), `the lock file with ${name} in it was opened here: ${opened.join(", ")}`);
     assert(!existsSync(join(filled, LOCK + "-journal")), "the journal that emptied it was left");
     const p = spawnSync(BIN, ["run", filled, "--listen=127.0.0.1:0", "--no-udp"], { encoding: "utf8", timeout: 30000 });
-    assert.match(p.stderr, IN_USE, `a device on a lock file with ${name} in it holds nothing`);
+    assert.match(p.stderr, IN_USE, `a device on a lock file with ${name} in it holds nothing, against zspd`);
+    const other = await holder(filled);
+    await killed(other.p);
+    assert.match(other.said, IN_USE, `a device on a lock file with ${name} in it holds nothing, against another device`);
     await d.close();
+  }
+
+  // And emptied by many at once, in processes of their own, of which one holds it and the others are told it is in use,
+  // and none fails otherwise: as when two play one journal, or one puts its own in place of a journal being played.
+  for (let round = 0; round < 4; round++) {
+    const dir = join(TMP, "contended-" + round);
+    mkdirSync(dir);
+    writeFileSync(join(dir, LOCK), spoiled);
+    const said = await Promise.all(Array.from({ length: 6 }, () => holder(dir)));
+    for (const { p } of said) await killed(p);
+    const held = said.filter(({ said }) => said === "held").length;
+    const refused = said.filter(({ said }) => IN_USE.test(said)).length;
+    assert(held === 1 && refused === 5, `of six at once: ${said.map(({ said }) => said).join("; ")}`);
   }
 }
 

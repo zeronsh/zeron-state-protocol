@@ -193,34 +193,52 @@ function holdDirectory(dir: string): [string, () => void] {
     }
   };
   const code = (e: unknown) => ((e as { errcode?: number }).errcode ?? 0) & 0xff;
+  const filled = () => (lstatSync(path, { throwIfNoEntry: false })?.size ?? 0) > 0;
   for (let tries = 0; ; tries++) {
+    // Something in it, which nothing writes and zspd pays no heed to, is emptied first: for SQLite makes of it what it
+    // may, and of some of it a database it only reads, in which it begins a write, says so, and holds nothing. It is
+    // emptied by SQLite itself, as it does what a hot journal beside a database says: through its own file and under its
+    // own lock, with what it holds in this process known to it, where anything else here opening the file and closing
+    // it would let go of what this process holds there, as a process's locks are let go of. SQLite plays the journal
+    // only with the file held by nobody, in this process or another, zspd or a device: so it is put there whether or not
+    // anyone holds the file now, which decides, and does no harm if someone does. The journal says the database had no
+    // pages before, and so is to have none, and nothing more; it is removed once played, or once the file is found
+    // empty. Put in its place whole, it is never read half written.
+    if (filled()) journalToEmpty(at, path);
+    let release: () => void;
     try {
-      return [at, take()];
+      release = take();
     } catch (e) {
       if (code(e) === 5 || code(e) === 6) throw inUse(); // SQLITE_BUSY, by another; SQLITE_LOCKED, by this one
-      if ((code(e) !== 26 && code(e) !== 11) || tries === 2) throw e;
+      // Anything else, with something in it still, is what is in it, whatever SQLite made of it, and is emptied once
+      // nobody holds it; with nothing in it, it is no such thing.
+      if (tries === 4 || !filled()) throw e;
+      continue;
     }
-    // SQLITE_NOTADB or SQLITE_CORRUPT: something is in it, which nothing writes, and which zspd pays no heed to; and
-    // nobody held it as this looked, in this process or another, for SQLite takes its lock before it reads, and would
-    // have said so first. It is emptied by SQLite itself, as it does what a hot journal beside a database says: through
-    // its own file and under its own lock, with what it holds in this process known to it, where anything else here
-    // opening the file and closing it would let go of what this process holds there, as a process's locks are let go
-    // of. The journal says the database had no pages before, and so is to have none, and nothing more; SQLite plays it
-    // only if nobody holds the file, and removes it once played, or once it finds the file empty. Put in its place
-    // whole, it is never read half written.
-    const journal = new Uint8Array(512);
-    const header = new DataView(journal.buffer);
-    journal.set([0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]); // the journal's magic
-    // records 0, checksum seed 0, pages the database had 0, then its sector size and its page size
-    header.setUint32(20, 512);
-    header.setUint32(24, 4096);
-    const aside = madeAside(at, journal);
-    try {
-      renameSync(aside, path + "-journal");
-    } catch (e) {
-      rmSync(aside, { force: true });
-      throw e;
-    }
+    // Held only of a file with nothing in it, of which SQLite's write is a write, and its lock the lock.
+    if (!filled()) return [at, release];
+    release();
+    if (tries === 4) throw new Error(`${path} has something in it that is not let go of: nothing writes it, so it may be removed once no node runs here`);
+  }
+}
+
+// Puts beside a lock file a hot journal that has SQLite empty it, once nobody holds it: see holdDirectory.
+function journalToEmpty(at: string, path: string): void {
+  const journal = new Uint8Array(512);
+  const header = new DataView(journal.buffer);
+  journal.set([0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]); // the journal's magic
+  // records 0, checksum seed 0, pages the database had 0, then its sector size and its page size
+  header.setUint32(20, 512);
+  header.setUint32(24, 4096);
+  const aside = madeAside(at, journal);
+  try {
+    renameSync(aside, path + "-journal");
+  } catch (e) {
+    rmSync(aside, { force: true });
+    // On Windows, another's journal being played, which SQLite has open and does not let be replaced meanwhile: that
+    // other is emptying the file, and then holds it, or not, as taking it finds.
+    const busy = ["EPERM", "EBUSY", "EACCES"].includes((e as NodeJS.ErrnoException).code ?? "");
+    if (!(process.platform === "win32" && busy)) throw e;
   }
 }
 
