@@ -271,6 +271,45 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   await assert.rejects(Node.open({ volume: new MemoryVolume(), module, full: false, keep, log: () => {} }), RangeError);
 }
 
+// A browser's device, closed twice, or twice at once, is closed once: its node stopped before its worker goes, and neither
+// close waits for ever. (With a worker of nothing but what the device says to it.)
+{
+  let terminated = false, closes = 0, release!: () => void;
+  const finished = new Promise<void>((done) => (release = done));
+  let closed = false;
+  class FakeWorker {
+    onmessage: ((e: { data: unknown }) => void) | null = null;
+    onerror: unknown = null;
+    postMessage(msg: { ask?: number; op?: string }) {
+      if (terminated || msg.ask === undefined) return;
+      const answer = (value?: unknown) => queueMicrotask(() => terminated || this.onmessage?.({ data: { answer: msg.ask, value } }));
+      if (msg.op === "identity") answer({ id: "a", key: "b" });
+      else if (msg.op === "close") {
+        closes++;
+        void finished.then(() => ((closed = true), answer()));
+      }
+    }
+    terminate() {
+      assert(closed, "the worker went before its node was stopped");
+      terminated = true;
+    }
+  }
+  const was = (globalThis as { Worker?: unknown }).Worker;
+  (globalThis as { Worker?: unknown }).Worker = FakeWorker;
+  try {
+    const { open } = await import("../src/browser.ts");
+    const device = await open();
+    const both = Promise.all([device.close(), device.close()]);
+    release();
+    const over = await Promise.race([both.then(() => "closed"), new Promise((done) => setTimeout(() => done("waiting"), 500))]);
+    assert.equal(over, "closed");
+    assert.equal(await Promise.race([device.close().then(() => "closed"), new Promise((done) => setTimeout(() => done("waiting"), 500))]), "closed");
+    assert.equal(closes, 1);
+  } finally {
+    (globalThis as { Worker?: unknown }).Worker = was;
+  }
+}
+
 // Where a relay keeps a space, a proxy's query staying at the end.
 assert.equal(spaceUrl("wss://relay.example/", "ab"), "wss://relay.example/ab");
 assert.equal(spaceUrl("wss://relay.example/zsp?key=1", "ab"), "wss://relay.example/zsp/ab?key=1");

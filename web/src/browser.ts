@@ -66,6 +66,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   };
   worker.postMessage(command);
   let space: string | undefined;
+  let closing: Promise<void> | undefined;
   const identity = await ask<{ id: string; key: string; space?: string }>("identity");
   space ??= identity.space;
 
@@ -128,9 +129,10 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     usage: () => ask<{ held: number; memory: number }>("usage"),
     connect,
     client: (host = {}) => new Client({ ...host, connect }),
-    close: async () => {
-      await ask<void>("close").catch(() => {});
-      worker.terminate();
-    },
+    // Once, however often asked: its node stopped as it should be, and then its worker let go of.
+    close: () => (closing ??= ask<void>("close").then(
+      () => worker.terminate(),
+      () => worker.terminate(),
+    )),
   };
 }
