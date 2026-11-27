@@ -466,7 +466,10 @@ try {
   const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
   const sockets = new Set(), dials = [];
   const ctx = { storage: { sql: new Sql(), sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
-  const doSpace = new Space(ctx, { RELAY_SECRET: relaySecret, HANDSHAKE_MS: 50 });
+  // Long enough that the device has said hello before it is let go of, however slow the machine: one let go of before
+  // that has failed, and asks again sooner, ever later; so all of what is timed below is waiting.
+  const HANDSHAKE_MS = 500;
+  const doSpace = new Space(ctx, { RELAY_SECRET: relaySecret, HANDSHAKE_MS });
   class BridgeWS {
     static OPEN = 1; static CLOSED = 3;
     constructor(url) {
@@ -486,11 +489,11 @@ try {
   const mod = await loadModule();
   const node = await Node.open({ volume: new MemoryVolume(), module: mod, WebSocket: BridgeWS, log: () => {} });
   node.join(spaceId, { key: relayPub, url: "ws://relay.local" });
-  for (let i = 0; i < 1200 && dials.length < 6; i++) await new Promise((r) => setTimeout(r, 10));
+  for (let i = 0; i < 3000 && dials.length < 6; i++) await new Promise((r) => setTimeout(r, 10));
   await node.close();
   const gaps = dials.slice(1).map((t, i) => Math.round(t - dials[i]));
-  // Turned away five times, it would wait 3.2 s or more before the sixth dial; waiting is no failure, so each is about a
-  // second, WAITED_REDIAL, and no sooner: a relay that lets it go at once has it dial no faster than that.
-  assert(dials.length >= 6 && gaps.every((g) => g >= 1000 && g < 2500), `dialled ${dials.length} times, at gaps of ${gaps.join(", ")} ms`);
+  // Each gap is HANDSHAKE_MS waited, then about a second, WAITED_REDIAL, and no sooner: a relay that lets it go at once has
+  // it dial no faster than that. Counted failures, the first gaps would be shorter and the last far longer.
+  assert(dials.length >= 6 && gaps.every((g) => g >= HANDSHAKE_MS + 1000 && g < HANDSHAKE_MS + 2500), `dialled ${dials.length} times, at gaps of ${gaps.join(", ")} ms`);
   console.log(`ok   a web device waiting at a relay for a roster neither has dials again soon (${gaps.join(", ")} ms)`);
 } finally { rmSync(tmp7, { recursive: true, force: true }); }

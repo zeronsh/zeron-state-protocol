@@ -551,10 +551,15 @@ review_busy_file_waited_for_as_long_as_said :: proc(t: ^testing.T) {
 		testing.expect(t, save(path, transmute([]byte)string("first")))
 		held, herr := os.open(path, {.Read}) // as another process opens it, letting nobody delete it
 		testing.expect(t, herr == nil)
+		// A wait of 200 ms, as the clock says: 200 tries of a millisecond each, as a wait counted in the sleeps asked for
+		// took it to be, would take three seconds or more, the system's tick making each sleep 15.6 ms. A machine slow
+		// for a while makes the wait no shorter, and a second of it no longer than allowed.
+		file_busy_wait = 200 * time.Millisecond
+		defer file_busy_wait = FILE_BUSY_WAIT
 		start := time.tick_now()
 		saved := save(path, transmute([]byte)string("second"))
 		took := time.tick_since(start)
 		os.close(held)
-		testing.expectf(t, !saved && took >= FILE_BUSY_WAIT && took < FILE_BUSY_WAIT + 500 * time.Millisecond, "saved %v after %v, waiting as long as %v", saved, took, FILE_BUSY_WAIT)
+		testing.expectf(t, !saved && took >= file_busy_wait && took < time.Second, "saved %v after %v, waiting as long as %v", saved, took, file_busy_wait)
 	}
 }

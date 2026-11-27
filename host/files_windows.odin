@@ -8,6 +8,10 @@ import "core:time"
 // waits a while for whoever else has it open (another process reading it, a scanner) rather than failing for them.
 FILE_BUSY_WAIT :: 2 * time.Second // at most, as the clock says
 
+// As FILE_BUSY_WAIT, but for a test, which holds a wait to the clock in less time than it takes.
+@(private)
+file_busy_wait := FILE_BUSY_WAIT
+
 @(private)
 file_busy :: proc(err: win32.DWORD) -> bool {
 	return err == win32.ERROR_ACCESS_DENIED || err == win32.ERROR_SHARING_VIOLATION
@@ -20,7 +24,7 @@ read_file :: proc(path: string, allocator := context.allocator) -> (data: []byte
 	start := time.tick_now()
 	for {
 		handle = win32.CreateFileW(name, win32.GENERIC_READ, win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE, nil, win32.OPEN_EXISTING, win32.FILE_ATTRIBUTE_NORMAL, nil)
-		if handle != win32.INVALID_HANDLE_VALUE || !file_busy(win32.GetLastError()) || time.tick_since(start) >= FILE_BUSY_WAIT {
+		if handle != win32.INVALID_HANDLE_VALUE || !file_busy(win32.GetLastError()) || time.tick_since(start) >= file_busy_wait {
 			break
 		}
 		win32.Sleep(1)
@@ -180,7 +184,7 @@ rename_file :: proc(handle: win32.HANDLE, to: []u16) -> bool {
 			posix = false // not on this system or file system: as Windows always did, then
 			continue
 		}
-		if !file_busy(err) || time.tick_since(start) >= FILE_BUSY_WAIT {
+		if !file_busy(err) || time.tick_since(start) >= file_busy_wait {
 			return false
 		}
 		win32.Sleep(1) // which the system's tick may make longer: the time waited is what is counted
