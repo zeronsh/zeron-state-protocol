@@ -248,13 +248,18 @@ lane_frames :: proc(s: ^Session, l: ^Lane, bytes: []byte) -> (used: int) {
 	return
 }
 
-// Frames that waited on lanes for the session to be ready may be taken now.
+// Frames that waited on lanes for the session to be ready may be taken now, of lanes the other end has ended too.
 @(private)
 lanes_take :: proc(s: ^Session) {
-	for i := 0; i < len(s.lanes); i += 1 {
-		if len(s.lanes[i].input) > 0 && !s.lanes[i].heard {
-			lane_take(s, s.lanes[i])
+	for i := 0; i < len(s.lanes); {
+		l := s.lanes[i]
+		if len(l.input) > 0 {
+			lane_take(s, l)
 		}
+		if l.heard && !lane_heard_done(s, l) {
+			continue // let go of, and what was after it is here now
+		}
+		i += 1
 	}
 }
 
@@ -264,20 +269,38 @@ session_lane_heard :: proc(s: ^Session, id: u64, given_up: bool) {
 	if l == nil {
 		return
 	}
-	if !given_up {
-		lane_take(s, l)
-	}
 	l.heard = true
-	if l.calls <= 0 {
-		l.over = true // nothing goes on on it, nor can now
-	}
-	if given_up || len(l.input) > 0 {
-		// A frame cut short, or frames that will now never be whole: its calls cannot go on, nor is any of it taken.
+	if given_up {
+		// What it carried is lost: its calls cannot go on, nor is any of it taken.
 		lane_drop_input(s, l)
 		calls_lost(s.node, s.id, lane = id)
 		l.over = true
+		lane_prune(s, l)
+		return
 	}
+	lane_take(s, l)
+	lane_heard_done(s, l)
+}
+
+// Once what came whole on a lane the other end has ended is taken, what is left was cut short. Whole frames that wait
+// for the session to be ready wait on, and are taken then. True while the lane is still there.
+@(private)
+lane_heard_done :: proc(s: ^Session, l: ^Lane) -> bool {
+	if len(l.input) > 0 && (!s.ready || s.busy) && !s.closing {
+		return true
+	}
+	if l.calls <= 0 {
+		l.over = true // nothing goes on on it, nor can now
+	}
+	if len(l.input) > 0 {
+		// A frame cut short, that will now never be whole: its calls cannot go on, nor is any of it taken.
+		lane_drop_input(s, l)
+		calls_lost(s.node, s.id, lane = l.id)
+		l.over = true
+	}
+	was := len(s.lanes)
 	lane_prune(s, l)
+	return len(s.lanes) == was
 }
 
 // What this end sent on a lane will not all arrive, for the other end wants no more of it.
