@@ -212,6 +212,27 @@ function cellOf(row: string, kind: number, slot: number, n: number, body: string
   assert.equal(from, keys[2], "from where the page now ends");
 }
 
+// A window of all of a list is one page, however long: nothing of it is split, loaded or let go of as it is scrolled.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let st!: State<typeof Note>;
+  const all = h.client.window({ scope: 1, list: "all", table: Note, size: 0 }, (x) => (st = x));
+  h.run();
+  for (let i = 1; i <= 10; i++) void h.client.write(1, (change) => change.insert(Note, "all", i, { title: `t${i}` }));
+  h.run();
+  h.tell(ACK, "\x0a");
+  const [page, , lo, hi] = watchOf(h.last(WATCH)!);
+  synced(h, page, 1, lo, hi);
+  const watches = h.self.said.filter((x) => x.kind === WATCH).length;
+  for (let i = 0; i < 5; i++) all.visible(1, 10), h.run();
+  all.visible(1, 3);
+  h.run();
+  assert.equal(h.self.said.filter((x) => x.kind === WATCH).length, watches, "pages were made of it");
+  assert.equal(st.rows.length, 10, "rows were let go of");
+}
+
 // More said at once than a WebSocket of zspd's takes in one message, 8 MiB, goes in pieces, and arrives whole; and so it
 // does again on a pipe dialled anew, which would otherwise break every time it was said.
 {

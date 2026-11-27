@@ -1034,7 +1034,8 @@ export class Client {
   }
 
   #visible(window: Win, first: number, last: number): void {
-    if (window.pages.length === 0 || !this.#ready) return;
+    // A window of all of a list is one page, however long it grows, and has nothing beyond it to load.
+    if (window.pages.length === 0 || !this.#ready || window.size === 0) return;
     const near = Math.floor(window.size / 2);
     if (first <= near) this.#loadBefore(window);
     if (last > window.entries.length - near) this.#loadAfter(window);

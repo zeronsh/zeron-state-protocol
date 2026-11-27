@@ -246,6 +246,43 @@ do
 	assert(from == keys[3], "from where the page now ends")
 end
 
+-- A window of all of a list is one page, however long: nothing of it is split, loaded or let go of as it is scrolled.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local st: any
+	local all = h.client:window({ scope = 1, list = "all", table = Note, size = 0 }, function(x)
+		st = x
+	end)
+	h.run()
+	for i = 1, 10 do
+		h.client:write(1, function(change)
+			change.insert(Note, "all", i, { title = `t{i}` })
+		end)
+	end
+	h.run()
+	h.tell(ACK, "\10")
+	local page, _, lo, hi = watch_of(h.last(WATCH))
+	synced(h, page, 1, lo, hi)
+	local function watches(): number
+		local n = 0
+		for _, x in h.self.said do
+			n += if x.kind == WATCH then 1 else 0
+		end
+		return n
+	end
+	local before = watches()
+	for _ = 1, 5 do
+		all.visible(1, 10)
+		h.run()
+	end
+	all.visible(1, 3)
+	h.run()
+	assert(watches() == before, "pages were made of it")
+	assert(#st.rows == 10, "rows were let go of")
+end
+
 -- More said at once than a WebSocket of zspd's takes in one message, 8 MiB, goes in pieces, and arrives whole; and so it
 -- does again on a pipe dialled anew, which would otherwise break every time it was said.
 do

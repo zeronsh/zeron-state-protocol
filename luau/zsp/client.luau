@@ -935,7 +935,8 @@ function Client._load_after(self: Client, window: Window)
 end
 
 function Client._visible(self: Client, window: Window, first: number, last: number)
-	if #window.pages == 0 or not self.ready then
+	-- A window of all of a list is one page, however long it grows, and has nothing beyond it to load.
+	if #window.pages == 0 or not self.ready or window.size == 0 then
 		return
 	end
 	local near = window.size // 2
