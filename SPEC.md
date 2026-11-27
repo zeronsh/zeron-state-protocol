@@ -119,7 +119,7 @@ signature (64, Ed25519 over everything before it)
 
 A serial is term × 2⁴⁴ + count × 2²⁰ + 20 random bits, its term being the charter's. Of two valid rosters the higher serial wins: a new charter
 outranks whatever was signed under an old one, however high it counts; and of two rosters drawn up at once, all agree which it is, and the other's
-change is to be made again. An admin carries the charter over untouched, and must hold every scope's keys. With all but the charter an admin is
+change is to be made again. An admin carries the charter over untouched, and must hold every scope's keys: one whose rights end in a scope is an admin no longer, which only an owner can say. With all but the charter an admin is
 trusted: who is who, who may do what, and when that ended.
 
 But no admin can shut an owner out. A roster is invalid unless every owner in its charter is a member, with the charter's signer, and Read and Write in force

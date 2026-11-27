@@ -506,3 +506,33 @@ call_is_taken_away_in_place :: proc(t: ^testing.T) {
 		}
 	}
 }
+
+// An admin whose rights end in a scope is an admin no longer, since it could not draw up a roster without that scope's
+// keys; and only an owner can unmake one, so another admin cannot do that either.
+@(test)
+an_admin_holds_every_scope :: proc(t: ^testing.T) {
+	root, space := test_root()
+	a, b, c := test_keyring(), test_keyring(), test_keyring()
+	defer keyring_destroy(&a)
+	defer keyring_destroy(&b)
+	defer keyring_destroy(&c)
+	none: Roster
+	d := draft_from(&none, 100)
+	home := draft_scope(&d)
+	draft_grant(&d, a.device, a.signer, home, {.Write}).owner = true
+	draft_grant(&d, b.device, b.signer, home, {.Write}).admin = true
+	draft_grant(&d, c.device, c.signer, home, {.Write}).admin = true
+	shown := draft_scope(&d, {.Signed})
+	r1 := test_publish(t, &a, root, space, &d)
+	defer roster_destroy(&r1)
+	testing.expect(t, roster_unwrap(&c, &r1) && roster_member(&r1, b.device).admin)
+	d = draft_from(&r1, 200)
+	draft_revoke(&d, b.device, shown)
+	_, by_admin := roster_sign(&c, nil, &d, context.temp_allocator)
+	testing.expect(t, !by_admin)
+	r2 := test_publish(t, &a, root, space, &d)
+	defer roster_destroy(&r2)
+	m := roster_member(&r2, b.device)
+	testing.expect(t, !m.admin && !slice.contains(r2.admins, b.signer) && member_rights(m, home) != {})
+	testing.expect(t, roster_member(&r2, c.device).admin)
+}

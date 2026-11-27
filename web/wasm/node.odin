@@ -1175,9 +1175,15 @@ govern :: proc "c" (op: Govern, size: int) -> int {
 		owner := op == .Owner
 		yes := owner || b[64] != 0
 		if yes {
-			// An admin or owner draws up rosters, and so must hold every scope's keys.
+			// An admin or owner draws up rosters, and so must hold every scope's keys; what more it may do stays.
 			for s in d.scopes {
-				zsp.draft_grant(&d, device, signer, s.id, {.Read, .Write, .Call})
+				rights := zsp.Rights{.Read, .Write, .Call}
+				for &m in d.members {
+					if m.device == device {
+						rights += zsp.member_rights(&m, s.id)
+					}
+				}
+				zsp.draft_grant(&d, device, signer, s.id, rights)
 			}
 		}
 		found_it := false
