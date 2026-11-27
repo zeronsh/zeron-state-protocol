@@ -40,7 +40,19 @@ export function node(mode: "run" | "serve", dir: string, ...options: string[]): 
   return started(spawn(BIN, [mode, dir, "--listen=127.0.0.1:0", "--no-udp", ...options], log(dir)), dir);
 }
 
-export function cloud(env: Record<string, string> = {}): Promise<Started> {
+// The Durable Object under workerd here; or, with CLOUD=wss://…, one deployed, which every test that asks for one shares
+// (each makes a space of its own). What the test asks to be set is set here, and cannot be there.
+export async function cloud(env: Record<string, string> = {}): Promise<Started> {
+  const remote = process.env.CLOUD;
+  if (remote) {
+    if (Object.keys(env).length > 0) throw new Error(`a relay deployed at ${remote} cannot be run with ${Object.keys(env).join(", ")} set`);
+    const at = new URL(remote.replace(/^ws/, "http"));
+    const key = (await (await fetch(at)).text()).trim();
+    if (!/^[0-9a-f]{64}$/.test(key)) throw new Error(`${remote} says it is ${JSON.stringify(key.slice(0, 80))}, not a relay's key`);
+    const p = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], { stdio: "ignore" }); // stands for it: stopped as a relay here would be
+    procs.push(p);
+    return { key, address: at.host, url: remote.replace(/\/$/, ""), p };
+  }
   return started(spawn(process.execPath, [join(ROOT, "relay", "dev.mjs")], { ...log("cloud"), env: { ...process.env, ...env } }), "cloud");
 }
 
@@ -100,6 +112,11 @@ export async function proxy(
 ): Promise<{ url: string; connections: () => number; swallow: () => void; cut: () => void; mend: () => void }> {
   const { createServer, connect } = await import("node:net");
   const target = new URL(to.replace(/^ws/, "http"));
+  // To a relay over TLS, as a deployed one is: what comes here plain goes there sealed, and says it is for that host.
+  const secure = target.protocol === "https:";
+  const { connect: connectTls } = await import("node:tls");
+  const dial = () =>
+    secure ? connectTls({ host: target.hostname, port: Number(target.port || 443), servername: target.hostname }) : connect(Number(target.port), target.hostname);
   const live = new Set<{ swallowed: boolean; end: () => void }>();
   let count = 0;
   let down = false;
@@ -115,13 +132,25 @@ export async function proxy(
   };
   const server = createServer((from) => {
     if (down) return void from.destroy();
-    count++;
-    const there = connect(Number(target.port), target.hostname);
+    // Counted if it asks for a WebSocket: something on the machine may look at any port that opens, as some do.
+    from.once("data", (d) => /^GET [^\r]*\r\n(?:[^\r]*\r\n)*upgrade: *websocket/im.test(d.subarray(0, 2048).toString("latin1")) && count++);
+    const there = dial();
     const state = { swallowed: false, end: () => {} };
     const end = () => (live.delete(state), from.destroy(), there.destroy());
     state.end = end;
     live.add(state);
-    from.on("data", carry(there, state));
+    const toThere = carry(there, state);
+    let head: Buffer | undefined = secure ? Buffer.alloc(0) : undefined; // the request, until it has all come
+    from.on("data", (d: Buffer) => {
+      if (head) {
+        head = Buffer.concat([head, d]);
+        const end = head.indexOf("\r\n\r\n");
+        if (end < 0) return;
+        const said = head.subarray(0, end).toString("latin1").replace(/^host:.*$/im, `Host: ${target.host}`);
+        (d = Buffer.concat([Buffer.from(said, "latin1"), head.subarray(end)])), (head = undefined);
+      }
+      toThere(d);
+    });
     there.on("data", carry(from, state));
     from.on("close", end).on("error", end);
     there.on("close", end).on("error", end);

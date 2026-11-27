@@ -321,7 +321,9 @@ const tests: Record<string, () => Promise<void>> = {
       const through = await proxy(relay.url);
       const owner = join(TMP, "k-owner-" + kind);
       const sid = zspd("create", owner);
-      zspd("relay", owner, relay.key, relay.url); // the web device alone goes through the proxy, whose connections are its
+      // Through the proxy, the only way there is to the relay: a device that could also go straight there would, once
+      // the relay has heard it belongs, while its way through the proxy waits to be tried again.
+      zspd("relay", owner, relay.key, through.url);
       await node("run", owner);
       const d = await open({ dir: join(TMP, "k-web-" + kind), keepalive: { idle: 500, wait: 2000 }, log: () => {} });
       zspd("admit", owner, d.key, "1");
@@ -330,7 +332,7 @@ const tests: Record<string, () => Promise<void>> = {
       await eventually("it is admitted", () => c.may(1, "write"));
       const before = through.connections();
       await new Promise((done) => setTimeout(done, 2500));
-      expectEqual(through.connections(), before); // pinged, and answered, five times over: in two seconds each, on a busy machine
+      expectEqual(through.connections(), before); // pinged, and answered, five times over
       through.swallow();
       await eventually("a connection that died without a word is dialled again", () => through.connections() > before, 5000);
       await eventually("and works", async () => {
