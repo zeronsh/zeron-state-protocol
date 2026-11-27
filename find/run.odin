@@ -182,7 +182,7 @@ pred_most :: proc(s: ^Scope, p: ^Pred) -> int {
 		}
 		sum := 0
 		for b in p.set {
-			sum += tree_between(x, p.held.by_key, b.key, key_next(b.key) if b.key != KEY_MAX else KEY_MAX).count
+			sum += tree_between(x, p.held.by_key, b.key, b.key, through = true).count
 		}
 		return min(sum, all)
 	case .List:
@@ -197,7 +197,7 @@ pred_most :: proc(s: ^Scope, p: ^Pred) -> int {
 			n := all
 			if word_plain(w, i) {
 				k, _ := bytes_key(word.bytes[:word.len])
-				n = tree_between(x, p.held.by_key, k, key_next(k)).count
+				n = tree_between(x, p.held.by_key, k, k, through = true).count
 			} else if w.flags.prefix && w.flags.edits == 0 && !w.flags.inside {
 				lo, hi := word_span(&word)
 				n = tree_between(x, p.held.by_key, lo, hi).count
@@ -327,7 +327,7 @@ pred_rows :: proc(s: ^Scope, p: ^Pred) -> (out: Set) {
 			for row in set_next(&it) {
 				id, _ := row_id(other, row)
 				key := Key{id[0], id[1]}
-				tree_subs(x, p.held.by_key, key, key_next(key), &out)
+				tree_subs(x, p.held.by_key, key, key, &out, through = true)
 			}
 			return
 		}
@@ -428,7 +428,7 @@ leaf_rows :: proc(s: ^Scope, p: ^Pred) -> Set {
 	if p.op == .In {
 		for b, i in p.set {
 			if i == 0 || p.set[i - 1].key != b.key {
-				tree_each(x, p.held.by_key, b.key, key_next(b.key) if b.key != KEY_MAX else KEY_MAX, &g, each)
+				tree_each(x, p.held.by_key, b.key, b.key, &g, each, through = true)
 			}
 		}
 	} else {
@@ -625,7 +625,7 @@ word_sure :: proc(h: ^Held, w: ^Word_Query, i: int, keys: []Key) -> bool {
 word_texts :: proc(h: ^Held, keys: []Key) -> Set {
 	out: Set
 	for k in keys {
-		tree_subs(h.scope.x, h.by_key, k, key_next(k), &out)
+		tree_subs(h.scope.x, h.by_key, k, k, &out, through = true)
 	}
 	return out
 }
@@ -643,7 +643,7 @@ match_texts :: proc(s: ^Scope, p: ^Pred) -> (out: Set, sure: bool) {
 	for i in 0 ..< len(w.words) {
 		keys[i] = word_keys(h, w, i)
 		for k in keys[i] {
-			counts[i] += tree_between(s.x, h.by_key, k, key_next(k)).count
+			counts[i] += tree_between(s.x, h.by_key, k, k, through = true).count
 		}
 		sure &&= word_sure(h, w, i, keys[i])
 	}
@@ -769,7 +769,7 @@ rows_scores :: proc(s: ^Scope, q: ^Query, rows: ^Set, scores: ^map[u32]f32) {
 		for i in 0 ..< len(p.words.words) {
 			for k in word_keys(h, &p.words, i) {
 				append(&keys, k)
-				postings += tree_between(s.x, h.by_key, k, key_next(k)).count
+				postings += tree_between(s.x, h.by_key, k, k, through = true).count
 			}
 		}
 		// A word asked for twice counts twice; one that answers two ways, once for each.
@@ -784,7 +784,7 @@ rows_scores :: proc(s: ^Scope, q: ^Query, rows: ^Set, scores: ^map[u32]f32) {
 			}
 		}
 		for k in keys {
-			have := f64(tree_between(s.x, h.by_key, k, key_next(k)).count)
+			have := f64(tree_between(s.x, h.by_key, k, k, through = true).count)
 			rarity := f32(math.ln(1 + (docs - min(have, docs) + 0.5) / (have + 0.5)))
 			if one {
 				for text, &t in texts {
@@ -799,12 +799,12 @@ rows_scores :: proc(s: ^Scope, q: ^Query, rows: ^Set, scores: ^map[u32]f32) {
 				rarity: f32,
 			}
 			a := Add{&texts, rarity}
-			tree_each(s.x, h.by_key, k, key_next(k), &a, proc(data: rawptr, e: ^Entry) {
+			tree_each(s.x, h.by_key, k, k, &a, proc(data: rawptr, e: ^Entry) {
 				a := (^Add)(data)
 				if t := &a.texts[e.sub]; t != nil {
 					t.worth += a.rarity * worth(e.val, t.size)
 				}
-			})
+			}, through = true)
 		}
 		for _, t in texts {
 			if t.worth > 0 {
@@ -1393,9 +1393,9 @@ group_next :: proc(g: ^Group) -> (f: Facet, ok: bool) {
 long_extreme :: proc(s: ^Scope, a: ^Aggregate, rows: ^Set, key: Key) -> (best: Facet) {
 	g := Group{s = s, a = a, rows = rows, key = key}
 	defer delete(g.longs)
-	tree_each(s.x, a.held.by_key, key, key_next(key) if key != KEY_MAX else KEY_MAX, &g, proc(data: rawptr, e: ^Entry) {
+	tree_each(s.x, a.held.by_key, key, key, &g, proc(data: rawptr, e: ^Entry) {
 		group_add((^Group)(data), e)
-	})
+	}, through = true)
 	best = g.short
 	if best.count > 0 && (a.fn == .Min || len(g.longs) == 0) {
 		return // it ends where the others go on
