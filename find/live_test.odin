@@ -1632,6 +1632,31 @@ what_goes_while_merging_is_gone :: proc(t: ^testing.T) {
 	}
 }
 
+// The least id a scope's row may have is a row's as any other is, when the index is first made.
+@(test)
+the_first_row_there_can_be_is_found :: proc(t: ^testing.T) {
+	state := rand.create(112)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	for i in 0 ..< 2 {
+		id := zsp.Id{2 << 32, u64(i)}
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(2, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		zsp.put_u64(b[16:], u64(i))
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+	}
+	index_follow(&w.x)
+	_ = index_want_scope(&w.x, 2)
+	index_finish(&w.x)
+	testing.expect_value(t, index_scope(&w.x, 2).all.count, 2)
+	check_index(t, &w)
+}
+
 // What cannot be synced is not made over and over; and what has fallen far behind is followed a little at a time.
 @(test)
 index_is_patient :: proc(t: ^testing.T) {
