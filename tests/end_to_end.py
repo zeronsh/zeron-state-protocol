@@ -1,10 +1,31 @@
 """Real processes on real sockets: a relay, devices and clients. Run by `./x test`."""
 
-import json, os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, time, urllib.request
+import json, os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, threading, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "clients", "python"))
 import zsp
+
+
+class Thread(threading.Thread):
+    """A thread whose failure is the test's: raised again where it is joined, rather than only printed, as Python does
+    with what a thread raises, letting the test pass."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.failed = None
+
+    def run(self):
+        try:
+            super().run()
+        except BaseException as e:
+            self.failed = e
+
+    def join(self, timeout=None):
+        super().join(timeout)
+        if self.failed is not None:
+            raise self.failed
+
 
 BIN = os.environ.get("ZSPD", os.path.join(ROOT, "build", "zspd.exe" if os.name == "nt" else "zspd"))
 TMP = tempfile.mkdtemp(prefix="zsp-")
@@ -97,6 +118,11 @@ def space(*names, udp=(), relay=None, options=(), partial={}):
     return relay, devices
 
 
+def test_runner_says_what_fails():
+    """Fails when ZSP_FAIL is set, as `./x selftest` sets it: to see that ./x test says this failed."""
+    assert not os.environ.get("ZSP_FAIL"), "failing, as ZSP_FAIL asks"
+
+
 def test_sync_through_relay():
     relay, (a, b) = space("a", "b")
     ca, cb = a.client(), b.client()
@@ -186,8 +212,6 @@ def test_direct_links():
 
 
 def test_lan_without_relay():
-    import threading
-
     a, b = Node("g"), Node("h")
     sid = zspd("create", a.dir)
     zspd("admit", a.dir, zspd("key", b.dir), "1")
@@ -311,8 +335,6 @@ def test_partial_keeps():
 
 
 def test_calls():
-    import threading
-
     relay, (a, b) = space("n", "o")
     ca, cb = a.client(), b.client()
     cb.serve(1, "add", lambda device, body: str(sum(map(int, body.split()))).encode())
@@ -322,7 +344,7 @@ def test_calls():
         while not stop.is_set():
             cb.drain(0.05)
 
-    t = threading.Thread(target=answer)
+    t = Thread(target=answer)
     t.start()
     try:
         ca.until(lambda: len(ca.devices) == 2)
@@ -587,8 +609,6 @@ def test_durable_object():
     row = cb.list(1, "chat")[-1][1]
     ca.live(row, 17, b"pieceone", 0, b"hello")
     cb.until(lambda: cb.lives)
-    import threading
-
     # The call is answered whenever it comes, as test_calls answers: not only within a second, which a busy machine
     # may take to carry it, as it does here, the answering device held up.
     cb.serve(1, "add", lambda device, body: body + b"!")
@@ -598,12 +618,12 @@ def test_durable_object():
         while not stop.is_set():
             cb.drain(0.05)
 
-    answering = threading.Thread(target=answer)
+    answering = Thread(target=answer)
     answering.start()
     held = None
     try:
         ca.until(lambda: len(ca.devices) == 2)
-        held = threading.Thread(target=pause, args=(b.p, 1.5))
+        held = Thread(target=pause, args=(b.p, 1.5))
         held.start()
         time.sleep(0.1)
         ca.send(zsp.CALL, zsp.varint(9) + ca.devices[1][0] + zsp.varint(1) + zsp.varint(3) + b"add\0" + bytes([zsp.URGENCY]) + b"hi")
@@ -637,8 +657,6 @@ def test_durable_object():
 
 def test_busy_node_takes_change():
     """A change made beside a running node that is slow to answer is held out to it until it says it has it."""
-    import threading
-
     d = Node("busy").dir
     zspd("create", d)
     server = socket.socket()
@@ -687,7 +705,7 @@ def test_busy_node_takes_change():
             conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" + bytes([0x82, len(answer)]) + answer)
             conn.close()
 
-    t = threading.Thread(target=busy, daemon=True)
+    t = Thread(target=busy, daemon=True)
     t.start()
     p = subprocess.run([BIN, "scope", d], capture_output=True, text=True, timeout=60)
     server.close()
@@ -833,8 +851,6 @@ def slow_hibernation():
 def test_call_outlasts_a_pause():
     """A call through a relay outlasts the relay's being silent for a while, as a busy machine's may be: the link between
     the devices waits before it gives up, however fast the path was."""
-    import threading
-
     relay, (a, b) = space("pa", "pb")
     ca, cb = a.client(), b.client()
     cb.serve(1, "echo", lambda device, body: body)
@@ -844,7 +860,7 @@ def test_call_outlasts_a_pause():
         while not stop.is_set():
             cb.drain(0.05)
 
-    t = threading.Thread(target=answer)
+    t = Thread(target=answer)
     t.start()
     try:
         ca.until(lambda: len(ca.devices) == 2)

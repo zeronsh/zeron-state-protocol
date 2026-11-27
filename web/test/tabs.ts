@@ -11,6 +11,9 @@ import { Chrome, findChrome, type Page } from "./chrome.ts";
 import { cleanUp, node, procs, ROOT, stopAll, TMP, token, zspd, zspdConnect, type Started } from "./procs.ts";
 import { Client, columns } from "../src/client.ts";
 
+// `./x selftest` sets ZSP_FAIL, to see that ./x test says this failed.
+if (process.env.ZSP_FAIL) throw new Error("failing, as ZSP_FAIL asks");
+
 if (!findChrome()) {
   if (process.env.CI) throw new Error("no Chrome here: set CHROME to where it is");
   console.log("skip tabs: no Chrome here; set CHROME to where it is");

@@ -11,6 +11,9 @@ import * as codec from "../src/codec.ts";
 import * as text from "../src/text.ts";
 import { random, type Random } from "./random.ts";
 
+// `./x selftest` sets ZSP_FAIL, to see that ./x test says this failed.
+if (process.env.ZSP_FAIL) throw new Error("failing, as ZSP_FAIL asks");
+
 const SEEDS = Number(process.argv[2] ?? 300);
 const FIRST = Number(process.argv[3] ?? 1);
 const STEPS = 250;

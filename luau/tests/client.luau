@@ -4,6 +4,11 @@
 local codec = require("../zsp/codec")
 local zsp = require("../zsp")
 
+-- `./x selftest` sets ZSP_FAIL, to see that ./x test says this failed.
+if require("@lune/process").env.ZSP_FAIL then
+	error("failing, as ZSP_FAIL asks")
+end
+
 local HELLO, ROSTER, WATCH, CELLS, ACK, SYNCED = 1, 2, 3, 7, 8, 10
 local ANSWER, FETCH = 34, 35
 

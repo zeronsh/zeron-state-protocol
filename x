@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|build|wasm|web|sim|bench [find|edits|mirror|web|partial|streams|aead]|nat|slow]
+# Everything there is to do here: ./x [check|test|selftest|build|wasm|web|sim|bench [find|edits|mirror|web|partial|streams|aead]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -49,6 +49,24 @@ end_to_end() {
 
 # The web client and node: on their own, against the other clients, beside zspd devices, and in a browser. Side by side,
 # each saying what it has to say at its end.
+# Waits for each `pid:name` given, saying in the file first given each that ended otherwise than well: as one killed
+# before it could say so itself, which a bare `wait` would let pass.
+joined() {
+	into=$1
+	shift
+	for j in "$@"; do
+		wait "${j%%:*}" || echo "${j#*:}" >>"$into"
+	done
+}
+
+# Runs what follows its name, saying in build/failed that it failed if it did, and goes on: so that one run says all
+# that fails, and fails if anything did.
+step() {
+	name=$1
+	shift
+	"$@" || echo "$name" >>build/failed
+}
+
 web_test() {
 	cd web
 	# Each said failed should it fail: web_test runs as part of `... || echo web`, where sh ignores set -e, so a test
@@ -57,12 +75,14 @@ web_test() {
 		set -- $t
 		node "test/$1.ts" ${2:+"$2"} || echo "web-$1" >>../build/failed
 	done
+	pids=
 	for t in text mirror_model mirror_interop store end_to_end browsers; do
 		args=
 		[ $t = store ] && args=../build/node-small.wasm
 		(node test/$t.ts $args >../build/web-$t.log 2>&1 || echo web-$t >>../build/failed) &
+		pids="$pids $!:web-$t"
 	done
-	wait
+	joined ../build/failed $pids
 	for t in text mirror_model mirror_interop store end_to_end browsers; do
 		cat ../build/web-$t.log
 	done
@@ -83,8 +103,10 @@ check) # every platform, no code generated
 	[ -z "$failed" ]
 	;;
 test)
-	# Side by side, since none needs another; each says what it has to say at its end.
+	# Side by side, since none needs another; each says what it has to say at its end. Whatever fails is said in
+	# build/failed and the rest goes on, so that one run says all that fails; and the run fails if anything did.
 	rm -f build/failed
+	pids=
 	for p in zsp pipe find host; do
 		# Host tests each run whole hosts, each with an event loop of its own. On Windows core:nbio has those loops share
 		# one completion port, and hands what one finds of another's to it, which may have let that go meanwhile: so
@@ -92,51 +114,80 @@ test)
 		one=
 		[ $p = host ] && [ -n "$EXE" ] && one=-define:ODIN_TEST_THREADS=1
 		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL $one -define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 -define:ZSP_FIND_RUN=64 -define:ZSP_FIND_HOT=0 >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &
+		pids="$pids $!:$p"
 	done
 	# And what shows only at the sizes a relay runs with, where CHECKPOINT_TAIL is larger than an extent.
 	(odin test zsp -out:build/zsp-sized-test$EXE $STRICT -define:ODIN_TEST_NAMES=$SIZED >build/zsp-sized.log 2>&1 || echo zsp-sized >>build/failed; cat build/zsp-sized.log) &
+	pids="$pids $!:zsp-sized"
 	(odin build zspd -out:build/zspd$EXE -debug $STRICT $TESTING || echo zspd >>build/failed) &
+	pids="$pids $!:zspd"
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
+	pids="$pids $!:vectors"
 	(odin build examples/apps -out:build/apps$EXE -debug $STRICT || echo examples >>build/failed) &
+	pids="$pids $!:examples"
 	(odin build examples/forward -out:build/forward$EXE -debug $STRICT || echo examples >>build/failed) &
+	pids="$pids $!:examples"
 	(! stale web/src/node.wasm || web_wasm || echo web >>build/failed) &
+	pids="$pids $!:web"
 	(! stale build/node-small.wasm || web_small || echo web >>build/failed) &
+	pids="$pids $!:web"
 	web_deps
 	relay_deps # before anything that runs the Durable Object, the web tests among them
 	[ -f relay/src/relay.wasm ] && [ -z "$(find zsp relay/wasm -name "*.odin" -newer relay/src/relay.wasm)" ] || wasm || echo wasm >>build/failed
-	wait
-	[ ! -f build/failed ]
+	joined build/failed $pids
+	if grep -qxE 'zspd|vectors|examples|web|wasm' build/failed 2>/dev/null; then # nothing more can run without them
+		echo "failed:" $(cat build/failed)
+		exit 1
+	fi
 	(web_test >build/web.log 2>&1 || echo web >>build/failed) &
 	web=$!
-	build/vectors$EXE | cmp - vectors/vectors.json
-	node tests/vectors.mjs vectors/vectors.json
-	lune run luau/tests/vectors.luau vectors/vectors.json
-	lune run luau/tests/client.luau
+	# Not piped: sh says only how the last of a pipe ended.
+	step vectors-made eval 'build/vectors$EXE >build/vectors.json'
+	step vectors cmp build/vectors.json vectors/vectors.json
+	step vectors-js node tests/vectors.mjs vectors/vectors.json
+	step vectors-luau lune run luau/tests/vectors.luau vectors/vectors.json
+	step luau-client lune run luau/tests/client.luau
 	# Structured state held to a model, with its shortcuts and without: side by side, as each is a minute or so.
 	lune run luau/tests/mirror_model.luau 300 & quick=$!
 	lune run luau/tests/mirror_model.luau 300 plain & long=$!
-	mfail=; wait $quick || mfail=1; wait $long || mfail=1; [ -z "$mfail" ]
-	node examples/relay/test.mjs
-	node tests/relay_storage.mjs
-	node tests/relay_settle.mjs
-	node tests/relay_checkpoints.mjs
-	node tests/relay_keep.mjs
-	node bench/aead_wasm/run.mjs simd check # zsp's ChaCha20-Poly1305 held to core's in WebAssembly, as the relay runs it
-	$PYTHON examples/apps/test.py
-	$PYTHON examples/forward/test.py
-	$PYTHON examples/organization.py
-	end_to_end
+	joined build/failed $quick:mirror_model $long:mirror_model-plain
+	step relay-example node examples/relay/test.mjs
+	step relay_storage node tests/relay_storage.mjs
+	step relay_settle node tests/relay_settle.mjs
+	step relay_checkpoints node tests/relay_checkpoints.mjs
+	step relay_keep node tests/relay_keep.mjs
+	step aead node bench/aead_wasm/run.mjs simd check # zsp's ChaCha20-Poly1305 held to core's in WebAssembly, as the relay runs it
+	step apps $PYTHON examples/apps/test.py
+	step forward $PYTHON examples/forward/test.py
+	step organization $PYTHON examples/organization.py
+	step end_to_end end_to_end
 	if [ "$(uname)" = Linux ]; then
 		# Calls and links again, under AddressSanitizer: what glibc forgives, it does not.
-		odin build zspd -out:build/zspd-asan -debug -sanitize:address $STRICT $TESTING
-		ZSPD=build/zspd-asan end_to_end test_calls test_direct_links test_sync_through_relay test_call_outlasts_a_pause
+		step zspd-asan odin build zspd -out:build/zspd-asan -debug -sanitize:address $STRICT $TESTING
+		step end_to_end-asan env ZSPD=build/zspd-asan $PYTHON tests/end_to_end.py test_calls test_direct_links test_sync_through_relay test_call_outlasts_a_pause
 	fi
-	wait $web || true
+	joined build/failed $web:web # one killed says nothing of itself
 	cat build/web.log
 	# Tabs as browsers treat them, last and alone: they hold back a Chrome's tabs, restart relays and fill pages, and beside
 	# anything that times what it sees would make it late.
 	(cd web && node test/tabs.ts) || echo web-tabs >>build/failed
-	[ ! -f build/failed ]
+	if [ -f build/failed ]; then
+		echo "failed:" $(cat build/failed)
+		exit 1
+	fi
+	;;
+selftest) # that ./x test says every kind of test that fails: with one made to fail in each, it fails, naming each
+	if ZSP_FAIL=1 ./x test >build/selftest.log 2>&1; then
+		echo "FAIL ./x test passed with a failure put in each kind of test: see build/selftest.log"
+		exit 1
+	fi
+	for name in zsp web-client web-text luau-client relay_settle forward end_to_end web-tabs; do
+		if ! grep -qx "$name" build/failed; then
+			echo "FAIL ./x test did not say $name failed: see build/selftest.log"
+			exit 1
+		fi
+	done
+	echo "ok   ./x test says every failure put in it"
 	;;
 build)
 	# Whole-program optimisation, in parallel where the linker speaks the compiler's own LLVM.
@@ -160,7 +211,8 @@ sim) # as many worlds as you have patience for: ./x sim 10000 [first]
 bench)
 	if [ "${2:-}" = streams ]; then # what streams cost and give, over UDP and a relay: ./x bench streams [bytes]
 		odin build host -build-mode:test -o:speed -out:build/bench-streams$EXE $STRICT -define:ZSP_BENCH=true -define:ZSP_BENCH_BYTES=${3:-268435456} -define:ODIN_TEST_NAMES=host.bench_streams
-		build/bench-streams$EXE 2>&1 | grep -v "^\[INFO"
+		build/bench-streams$EXE >build/bench-streams.log 2>&1 || { sed '/^\[INFO/d' build/bench-streams.log; exit 1; }
+		sed '/^\[INFO/d' build/bench-streams.log
 	elif [ "${2:-}" = web ]; then # what a web device costs, in Node and in a browser: ./x bench web [rows]
 		[ -f build/zspd$EXE ] || odin build zspd -out:build/zspd$EXE -debug $STRICT
 		! stale web/src/node.wasm || web_wasm

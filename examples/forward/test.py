@@ -20,6 +20,27 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from zspd import ROOT, Device, zspd  # noqa: E402
 
+
+class Thread(threading.Thread):
+    """A thread whose failure is the test's: raised again where it is joined, rather than only printed, as Python does
+    with what a thread raises, letting the test pass."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.failed = None
+
+    def run(self):
+        try:
+            super().run()
+        except BaseException as e:
+            self.failed = e
+
+    def join(self, timeout=None):
+        super().join(timeout)
+        if self.failed is not None:
+            raise self.failed
+
+
 FORWARD = os.path.join(ROOT, "build", "forward" + (".exe" if os.name == "nt" else ""))
 
 
@@ -31,7 +52,7 @@ class Server:
         self.sock = socket.create_server(("127.0.0.1", 0))
         self.port = self.sock.getsockname()[1]
         self.held = []
-        threading.Thread(target=self.serve, daemon=True).start()
+        Thread(target=self.serve, daemon=True).start()
 
     def serve(self):
         while not self.stop:
@@ -42,7 +63,7 @@ class Server:
             if self.stalled:
                 self.held.append(c)  # read never, closed at the end
                 continue
-            threading.Thread(target=self.echo, args=(c,), daemon=True).start()
+            Thread(target=self.echo, args=(c,), daemon=True).start()
 
     @staticmethod
     def echo(c):
@@ -112,7 +133,7 @@ def bulk(port, size):
     data = pattern(size, size)
     got = bytearray()
     with connect(port) as s:
-        sender = threading.Thread(target=lambda: (s.sendall(data), s.shutdown(socket.SHUT_WR)))
+        sender = Thread(target=lambda: (s.sendall(data), s.shutdown(socket.SHUT_WR)))
         sender.start()
         while chunk := s.recv(1 << 18):
             got += chunk
@@ -189,7 +210,12 @@ def main(root, direct):
 
         reachable(port)
         bulk(port, 24 << 20)
-        threads = [threading.Thread(target=bulk, args=(port, 2 << 20)) for _ in range(8)]  # many calls at once
+        def many():
+            if os.environ.get("ZSP_FAIL"):  # as `./x selftest` sets it: a thread's failure is the test's
+                raise AssertionError("failing, as ZSP_FAIL asks")
+            bulk(port, 2 << 20)
+
+        threads = [Thread(target=many) for _ in range(8)]  # many calls at once
         for t in threads:
             t.start()
         for t in threads:

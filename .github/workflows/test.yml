@@ -35,11 +35,17 @@ jobs:
             Windows) lune=windows-x86_64; luau=windows ;;
           esac
           mkdir -p ~/tools && cd ~/tools
-          curl -sSLo lune.zip https://github.com/lune-org/lune/releases/download/v0.11.1/lune-0.11.1-$lune.zip && unzip -qo lune.zip
-          curl -sSLo luau.zip https://github.com/luau-lang/luau/releases/download/0.748/luau-$luau.zip && unzip -qo luau.zip
+          # Each on its own line, and failing on an HTTP error: bash -e stops at no command of an `a && b` that fails but its last.
+          curl -fsSLo lune.zip https://github.com/lune-org/lune/releases/download/v0.11.1/lune-0.11.1-$lune.zip
+          unzip -qo lune.zip
+          curl -fsSLo luau.zip https://github.com/luau-lang/luau/releases/download/0.748/luau-$luau.zip
+          unzip -qo luau.zip
           echo "$HOME/tools" >> "$GITHUB_PATH"
       # What node needs, ./x installs, as it would on a fresh checkout anywhere.
       - run: ./x check
       - run: ./x test
+      # That ./x test says every failure: with one put in each kind of test, it must fail, naming each.
+      - if: runner.os == 'Linux'
+        run: ./x selftest
       - if: runner.os == 'Linux'
         run: ./x nat

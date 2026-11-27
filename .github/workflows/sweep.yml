@@ -18,7 +18,8 @@ jobs:
       - name: lune
         run: |
           mkdir -p ~/tools && cd ~/tools
-          curl -sSLo lune.zip https://github.com/lune-org/lune/releases/download/v0.11.1/lune-0.11.1-linux-x86_64.zip && unzip -qo lune.zip
+          curl -fsSLo lune.zip https://github.com/lune-org/lune/releases/download/v0.11.1/lune-0.11.1-linux-x86_64.zip
+          unzip -qo lune.zip
           echo "$HOME/tools" >> "$GITHUB_PATH"
       - name: seeds
         run: |

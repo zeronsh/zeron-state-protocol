@@ -10,6 +10,9 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 
+// `./x selftest` sets ZSP_FAIL, to see that ./x test says this failed.
+if (process.env.ZSP_FAIL) throw new Error("failing, as ZSP_FAIL asks");
+
 const REPO = resolve(".");
 const ZSPD = resolve("./build/zspd" + (process.platform === "win32" ? ".exe" : ""));
 

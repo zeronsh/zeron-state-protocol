@@ -9,6 +9,9 @@ import * as ask from "../src/ask.ts";
 import { where } from "../src/ask.ts";
 import * as m from "../src/mirror.ts";
 
+// `./x selftest` sets ZSP_FAIL, to see that ./x test says this failed.
+if (process.env.ZSP_FAIL) throw new Error("failing, as ZSP_FAIL asks");
+
 const HELLO = 1, ROSTER = 2, WATCH = 3, CELLS = 7, ACK = 8, SYNCED = 10;
 const ASK = 32, UNASK = 33, ANSWER = 34, FETCH = 35, CALL = 15, SERVE = 14, AUTHOR = 17;
 
