@@ -23,6 +23,7 @@ local WINDOW_MOST = 16 * CALL_WINDOW -- what a receiver may credit ahead
 local WINDOW_QUICK = 0.25 -- seconds: a window used up within this grows
 local MAX_OPEN = 1048576 - 192
 local ZERO32 = string.rep("\0", 32)
+local ZERO16 = string.rep("\0", 16)
 local NONE = table.freeze({}) :: { any }
 
 local PIECE_BYTES = 4096 -- a piece is sealed at this size,
@@ -625,7 +626,7 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 		end
 		for _, a in self.asked do
 			if a.status == "denied" and not a.stopped then
-				self:_ask(a)
+				self:_ask(a, nil, true)
 			end
 		end
 		self:_tell("status", true)
@@ -658,7 +659,7 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 		end
 	end
 	for _, a in self.asked do
-		self:_ask(a)
+		self:_ask(a, nil, true)
 	end
 	self:_tell("status", true)
 end
@@ -744,6 +745,11 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 		error("a page's size is a whole number", 2)
 	end
 	whole(query.scope)
+	-- A list is named by a string, as its tag is made of one: else it is refused here, not once it is opened, maybe on a
+	-- pipe come up, where it would stop all that comes after it.
+	if type(query.list) ~= "string" then
+		error("a list's name is a string", 2)
+	end
 	local key = `{query.scope}/{from}/{size}/{shape}/{query.list}/{query.bare == true}`
 	local window = self.windows[key]
 	if not window then
@@ -1651,12 +1657,18 @@ function Client.ask(self: Client, question: asking.Question, observer: (Answer) 
 	end
 	observer(self:_answer(a))
 	return table.freeze({
+		-- A stretch that cannot be asked for is refused at once, and what was asked stands: else it is said again on every
+		-- pipe, and refused there.
 		move = function(offset: number, limit: number?)
 			local q: any = table.clone(a.question)
 			q.offset, q.limit = offset, limit or q.limit
-			a.question = q
 			if self.ready and not a.stopped then
-				self:_ask(a)
+				self:_ask(a, q)
+			else
+				asking.write(q, function()
+					return ZERO16
+				end)
+				a.question = q
 			end
 		end,
 		stop = function()
@@ -1722,15 +1734,33 @@ function Client.fetch(self: Client, question: asking.Question): Answer
 	return answer :: any
 end
 
-function Client._ask(self: Client, a: Asked)
-	local may = self.scopes[a.question.scope] ~= nil
-	local body, totals = asking.write(a.question, function(scope, name)
+-- Asks a question, or asks it now as it is to be, which it is only once it can be said. One asked again, for a pipe come
+-- up or rights that came, that cannot be said, as one whose asker changed it since, is faulty: it alone, and at once.
+function Client._ask(self: Client, a: Asked, question: asking.Question?, again: boolean?)
+	local q = question or a.question
+	local may = self.scopes[q.scope] ~= nil
+	local function tag(scope: number, name: string): string
 		if self.scopes[scope] then
 			return self:_tag(scope, name)
 		end
 		may = false
-		return string.rep("\0", 16)
-	end)
+		return ZERO16
+	end
+	local body, totals
+	if again then
+		local fine, said, told = pcall(asking.write, q, tag)
+		if not fine then
+			a.status = "faulty"
+			self:_show(a, {})
+			self:_touch_answer(a)
+			self:_fetched(a)
+			return
+		end
+		body, totals = said, told
+	else
+		body, totals = asking.write(q, tag)
+	end
+	a.question = q
 	if not may then
 		a.status = "denied"
 		self:_show(a, {})

@@ -562,6 +562,67 @@ function piecesOf(h: ReturnType<typeof harness>, slot: number): [stamp: string, 
   }
 }
 
+// A stretch of a question that cannot be asked for is refused at once, connected or not, and what was asked stands: it
+// and every other question are asked again down the next pipe, as they were. One whose asker made it nonsense since is
+// faulty, alone, and the rest are asked all the same.
+{
+  const h = harness();
+  h.run();
+  let status = "";
+  const early = h.client.ask({ scope: 1, table: Note, offset: 3, limit: 5 }, () => {});
+  const mine = { scope: 1, table: Note, limit: 4 };
+  const spoilt = h.client.ask(mine, (x) => (status = x.status));
+  const later = h.client.ask({ scope: 1, table: Note, limit: 6 }, () => {});
+  // A list that is no list is refused as it is asked for, before it is said to anyone, as is a window of one.
+  for (const name of [undefined, null, 5]) {
+    assert.throws(() => h.client.window({ scope: 1, list: name as unknown as string, table: Note }, () => {}), TypeError);
+    assert.throws(() => h.client.ask({ scope: 1, table: Note, where: where.inList(name as unknown as string) }, () => {}), TypeError);
+  }
+  assert.equal(Client.internals(h.client).asked.size, 3);
+  assert.equal(Client.internals(h.client).windows.size, 0);
+  assert.throws(() => early.move(-1), RangeError);
+  assert.throws(() => early.move(1, 2 ** 64), RangeError);
+  const asks = (from: number) => {
+    const out = new Map<number, string>();
+    for (const x of h.self.said.slice(from)) {
+      if (x.kind !== ASK) continue;
+      const r = codec.reader(b(x.body));
+      out.set(codec.varint(r), x.body);
+    }
+    return out;
+  };
+  let from = h.self.said.length;
+  h.greet();
+  h.run();
+  const first = asks(from);
+  assert.equal(first.size, 3);
+  assert(first.get(1)!.endsWith("\x03\x05\0"), "the first is not as it was asked");
+  assert.throws(() => early.move(-1), RangeError);
+  assert.throws(() => later.move(0.5), RangeError);
+  h.run();
+  assert.equal(asks(from).size, 3, "and a stretch that cannot be was asked for");
+  (mine as { limit: number }).limit = -1;
+  h.self.closed();
+  h.run();
+  h.laters();
+  h.run();
+  from = h.self.said.length;
+  h.greet();
+  h.run();
+  assert(h.client.ready);
+  const again = asks(from);
+  assert.equal(again.size, 2, "the rest were not asked again");
+  assert.equal(again.get(1), first.get(1));
+  assert.equal(again.get(3), first.get(3));
+  assert.equal(status, "faulty");
+  early.move(4, 6);
+  h.run();
+  assert(h.last(ASK)!.body.endsWith("\x04\x06\0"));
+  assert.throws(() => h.client.ask({ scope: 1, table: Note, where: where.inList(null as unknown as string) }, () => {}), TypeError);
+  assert.equal(Client.internals(h.client).asked.size, 3);
+  spoilt.stop(), early.stop(), later.stop();
+}
+
 // An editor of a row held for nothing but what this client wrote in another of its columns waits, as for one not held at
 // all, for the row: what it does is done to the text the row has.
 {

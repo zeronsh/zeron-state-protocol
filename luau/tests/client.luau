@@ -752,6 +752,86 @@ do
 	end
 end
 
+-- A stretch of a question that cannot be asked for is refused at once, connected or not, and what was asked stands: it
+-- and every other question are asked again down the next pipe, as they were. One whose asker made it nonsense since is
+-- faulty, alone, and the rest are asked all the same.
+do
+	local ASK = 32
+	local h = harness()
+	h.run()
+	local status = ""
+	local early = h.client:ask({ scope = 1, table = Note, offset = 3, limit = 5 }, function() end)
+	local mine: any = { scope = 1, table = Note, limit = 4 }
+	local spoilt = h.client:ask(mine, function(x)
+		status = x.status
+	end)
+	local later = h.client:ask({ scope = 1, table = Note, limit = 6 }, function() end)
+	-- A list that is no list is refused as it is asked for, before it is said to anyone, as is a window of one.
+	for _, name in { false, 5, {} } do
+		assert(not pcall(function()
+			h.client:window({ scope = 1, list = name :: any, table = Note }, function() end)
+		end))
+		assert(not pcall(function()
+			h.client:ask({ scope = 1, table = Note, where = zsp.where.in_list(name :: any) }, function() end)
+		end))
+	end
+	assert(not pcall(function()
+		h.client:window({ scope = 1, list = nil :: any, table = Note }, function() end)
+	end))
+	assert(next(h.client.windows) == nil)
+	assert(not pcall(early.move, 1, 2 ^ 64))
+	local function asks(from: number): { [number]: string }
+		local out = {}
+		for i = from + 1, #h.self.said do
+			local x = h.self.said[i]
+			if x.kind == ASK then
+				out[codec.varint(codec.reader(x.body))] = x.body
+			end
+		end
+		return out
+	end
+	local function count(t: { [number]: string }): number
+		local n = 0
+		for _ in t do
+			n += 1
+		end
+		return n
+	end
+	local from = #h.self.said
+	h.greet()
+	h.run()
+	local first = asks(from)
+	assert(count(first) == 3)
+	assert(string.sub(first[1], -3) == "\3\5\0", "the first is not as it was asked")
+	assert(not pcall(early.move, -1))
+	assert(not pcall(later.move, 0.5))
+	h.run()
+	assert(count(asks(from)) == 3, "and a stretch that cannot be was asked for")
+	mine.limit = -1
+	h.self.closed()
+	h.run()
+	h.laters()
+	h.run()
+	from = #h.self.said
+	h.greet()
+	h.run()
+	assert(h.client.ready)
+	local again = asks(from)
+	assert(count(again) == 2, "the rest were not asked again")
+	assert(again[1] == first[1] and again[3] == first[3])
+	assert(status == "faulty")
+	early.move(4, 6)
+	h.run()
+	assert(string.sub((h.last(ASK) :: any).body, -3) == "\4\6\0")
+	assert(not pcall(function()
+		h.client:ask({ scope = 1, table = Note, where = zsp.where.in_list(nil :: any) }, function() end)
+	end))
+	assert(count(h.client.asked) == 3, "a question refused is asked")
+	spoilt.stop()
+	early.stop()
+	later.stop()
+end
+
 -- An editor of a row held for nothing but what this client wrote in another of its columns waits, as for one not held at
 -- all, for the row: what it does is done to the text the row has.
 do

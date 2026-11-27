@@ -280,6 +280,8 @@ function putWhere(x: Writing, c: Where): void {
       column(x, c.column, undefined);
       break;
     case "list":
+      // A list is named by a string, as its tag is made of one: else it is refused here, before anything is asked.
+      if (typeof c.name !== "string") throw new TypeError("a list's name is a string");
       codec.putU8(w, 9);
       codec.putBinary(w, x.tag(c.name));
       break;

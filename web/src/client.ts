@@ -789,7 +789,7 @@ export class Client {
           this.#touch(window);
         }
       }
-      for (const a of this.#asked.values()) if (a.status === "denied" && !a.stopped) this.#ask(a);
+      for (const a of this.#asked.values()) if (a.status === "denied" && !a.stopped) this.#ask(a, a.question, true);
       this.#tell("status", true);
       return;
     }
@@ -812,7 +812,7 @@ export class Client {
       if (window.pages.length === 0) this.#open(window);
       else for (const page of window.pages) this.#watch(page);
     }
-    for (const a of this.#asked.values()) this.#ask(a);
+    for (const a of this.#asked.values()) this.#ask(a, a.question, true);
     this.#tell("status", true);
   }
 
@@ -882,6 +882,9 @@ export class Client {
     const size = query.size ?? 50;
     if (!Number.isSafeInteger(size) || size < 0) throw new RangeError("a page's size is a whole number");
     whole(query.scope);
+    // A list is named by a string, as its tag is made of one: else it is refused here, not once it is opened, maybe on a
+    // pipe come up, where it would stop all that comes after it.
+    if (typeof query.list !== "string") throw new TypeError("a list's name is a string");
     const key = `${query.scope}/${from}/${size}/${shape}/${query.bare === true}/${query.list}`;
     let window = this.#windows.get(key);
     if (!window) {
@@ -1459,9 +1462,12 @@ export class Client {
     if (this.#ready) this.#ask(a);
     observer(this.#answer(a) as Answer<T>);
     return Object.freeze({
+      // A stretch that cannot be asked for is refused at once, and what was asked stands: else it is said again on every
+      // pipe, and refused there.
       move: (offset: number, limit?: number) => {
-        a.question = { ...a.question, offset, limit: limit ?? a.question.limit };
-        if (this.#ready && !a.stopped) this.#ask(a);
+        const q = { ...a.question, offset, limit: limit ?? a.question.limit };
+        if (this.#ready && !a.stopped) this.#ask(a, q);
+        else ask.write(q, () => ZERO16), (a.question = q);
       },
       stop: () => {
         if (a.stopped) return;
@@ -1510,13 +1516,27 @@ export class Client {
     };
   }
 
-  #ask(a: Asked): void {
-    let may = this.#scopes.has(a.question.scope);
-    const [body, totals] = ask.write(a.question, (scope, name) => {
-      if (this.#scopes.has(scope)) return this.tag(scope, name);
-      may = false;
-      return ZERO16;
-    });
+  // Asks a question, or asks it now as it is to be, which it is only once it can be said. One asked again, for a pipe come
+  // up or rights that came, that cannot be said, as one whose asker changed it since, is faulty: it alone, and at once.
+  #ask(a: Asked, q = a.question, again = false): void {
+    let may = this.#scopes.has(q.scope);
+    let said: [Uint8Array, ask.Told[]];
+    try {
+      said = ask.write(q, (scope, name) => {
+        if (this.#scopes.has(scope)) return this.tag(scope, name);
+        may = false;
+        return ZERO16;
+      });
+    } catch (e) {
+      if (!again) throw e;
+      a.status = "faulty";
+      this.#show(a, []);
+      this.#touchAnswer(a);
+      this.#fetched(a);
+      return;
+    }
+    a.question = q;
+    const [body, totals] = said;
     if (!may) {
       a.status = "denied";
       this.#show(a, []);

@@ -219,6 +219,10 @@ function put_where(x: Writing, c: Where)
 		codec.put_u8(w, 8)
 		column(x, a, nil)
 	elseif op == "list" then
+		-- A list is named by a string, as its tag is made of one: else it is refused here, before anything is asked.
+		if type(a) ~= "string" then
+			error("a list's name is a string", 0)
+		end
 		codec.put_u8(w, 9)
 		codec.put(w, x.tag(a))
 	elseif op == "matches" then
