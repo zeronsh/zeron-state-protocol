@@ -90,19 +90,39 @@ export function zspdConnect(address: string): Connect {
 
 
 /** A TCP proxy to a relay, which counts connections and can swallow whatever is said on those it has, saying nothing. */
-export async function proxy(to: string): Promise<{ url: string; connections: () => number; swallow: () => void }> {
+/**
+ * A proxy to a relay, which can swallow what its connections say, cut them and refuse more until mended, and carry no more
+ * than so many bytes a second each way, each after so many milliseconds, as a slow network does.
+ */
+export async function proxy(
+  to: string,
+  slow?: { bytesPerSecond: number; latency: number },
+): Promise<{ url: string; connections: () => number; swallow: () => void; cut: () => void; mend: () => void }> {
   const { createServer, connect } = await import("node:net");
   const target = new URL(to.replace(/^ws/, "http"));
-  const live = new Set<{ swallowed: boolean }>();
+  const live = new Set<{ swallowed: boolean; end: () => void }>();
   let count = 0;
+  let down = false;
+  // Each way of each connection is a line: what is sent goes once all before it has, at the rate allowed, and arrives later.
+  const carry = (into: import("node:net").Socket, state: { swallowed: boolean }) => {
+    if (!slow) return (d: Buffer) => state.swallowed || into.write(d);
+    let free = 0;
+    return (d: Buffer) => {
+      const now = performance.now();
+      free = Math.max(free, now) + (d.length / slow.bytesPerSecond) * 1000;
+      setTimeout(() => state.swallowed || into.destroyed || into.write(d), free - now + slow.latency);
+    };
+  };
   const server = createServer((from) => {
+    if (down) return void from.destroy();
     count++;
-    const state = { swallowed: false };
-    live.add(state);
     const there = connect(Number(target.port), target.hostname);
-    from.on("data", (d) => state.swallowed || there.write(d));
-    there.on("data", (d) => state.swallowed || from.write(d));
+    const state = { swallowed: false, end: () => {} };
     const end = () => (live.delete(state), from.destroy(), there.destroy());
+    state.end = end;
+    live.add(state);
+    from.on("data", carry(there, state));
+    there.on("data", carry(from, state));
     from.on("close", end).on("error", end);
     there.on("close", end).on("error", end);
   });
@@ -112,6 +132,8 @@ export async function proxy(to: string): Promise<{ url: string; connections: () 
     url: `ws://127.0.0.1:${port}`,
     connections: () => count,
     swallow: () => live.forEach((s) => (s.swallowed = true)),
+    cut: () => ((down = true), [...live].forEach((s) => s.end())),
+    mend: () => void (down = false),
   };
 }
 

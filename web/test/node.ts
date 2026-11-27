@@ -241,6 +241,36 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await node.close();
 }
 
+// A partial replica with nothing to do but, in a month, let go of what it no longer watches sets no timer for longer than
+// a timer can be set for: one that is goes off at once, and again, and again.
+{
+  const owner = join(TMP, "keep-owner");
+  const space = execFileSync(BIN, ["create", owner], { encoding: "utf8" }).trim();
+  const node = await Node.open({ volume: new MemoryVolume(), module, full: false, log: () => {} });
+  execFileSync(BIN, ["admit", owner, node.key, "1"]);
+  const longest: number[] = [];
+  const set = globalThis.setTimeout;
+  globalThis.setTimeout = ((f: () => void, ms?: number) => (longest.push(ms ?? 0), set(f, ms))) as typeof setTimeout;
+  try {
+    assert(node.adopt(readFileSync(join(owner, space, "roster"))));
+    const c = new Client({ connect: node.connect });
+    while (!c.may(1, "write")) await new Promise((done) => set(done, 10));
+    await c.write(1, (change) => change.insert({}, "x", 1, {}));
+    c.close();
+    await new Promise((done) => set(done, 300));
+  } finally {
+    globalThis.setTimeout = set;
+  }
+  assert(longest.length > 0 && longest.every((ms) => ms <= 2 ** 31 - 1), `timers set for ${Math.max(...longest)} ms`);
+  assert(longest.length < 50, `${longest.length} timers set while there was nothing to do`);
+  await node.close();
+}
+
+// What it keeps is said in days and bytes, of none or more.
+for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinity }]) {
+  await assert.rejects(Node.open({ volume: new MemoryVolume(), module, full: false, keep, log: () => {} }), RangeError);
+}
+
 // Where a relay keeps a space, a proxy's query staying at the end.
 assert.equal(spaceUrl("wss://relay.example/", "ab"), "wss://relay.example/ab");
 assert.equal(spaceUrl("wss://relay.example/zsp?key=1", "ab"), "wss://relay.example/zsp/ab?key=1");

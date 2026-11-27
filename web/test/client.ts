@@ -85,14 +85,14 @@ function watchOf(said: Said): [id: number, flags: number, lo: string, hi: string
   return [codec.varint(r), codec.u8(r), codec.key(r), codec.key(r), codec.varint(r)];
 }
 
-function synced(h: ReturnType<typeof harness>, id: number, flags: number, lo: string, hi: string) {
+function synced(h: ReturnType<typeof harness>, id: number, flags: number, lo: string, hi: string, before = 0, after = 0) {
   const w = codec.writer();
   codec.putVarint(w, id);
   codec.putU8(w, flags);
   codec.putKey(w, lo);
   codec.putKey(w, hi);
-  codec.putVarint(w, 0);
-  codec.putVarint(w, 0);
+  codec.putVarint(w, before);
+  codec.putVarint(w, after);
   h.tell(SYNCED, s(codec.written(w)));
 }
 
@@ -147,6 +147,30 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   let mine: State | undefined;
   h.client.window({ scope: 1, list: "b", table: { other: c.string(16) } }, (st) => (mine = st));
   assert(mine, "another shape of row is another window");
+}
+
+// A page a partial replica answered at once, from what it held, may end sooner once a full replica has said where it ends:
+// what the window showed beyond it is not let go of unseen, but asked for again as the page that follows.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let st!: State<typeof Note>;
+  h.client.window({ scope: 1, list: "a", table: Note, size: 2 }, (x) => (st = x));
+  h.run();
+  for (let i = 1; i <= 3; i++) void h.client.write(1, (change) => change.insert(Note, "a", i, { title: `t${i}` }));
+  h.run();
+  h.tell(ACK, "\x03");
+  const [page, , lo, hi] = watchOf(h.last(WATCH)!);
+  synced(h, page, 0, lo, hi); // what is held: all three, to the end
+  assert.equal(st.rows.length, 3);
+  const keys = (Client.internals(h.client) as any).windows.values().next().value.entries.map((e: { key: string }) => e.key);
+  const watches = h.self.said.filter((x) => x.kind === WATCH).length;
+  synced(h, page, 1, keys[0], keys[2], 0, 1); // as a full replica says: two, and one more after
+  const asked = h.self.said.filter((x) => x.kind === WATCH);
+  assert.equal(asked.length, watches + 1, "the rest is asked for");
+  const [, , from] = watchOf(asked[asked.length - 1]);
+  assert.equal(from, keys[2], "from where the page now ends");
 }
 
 // Writing nothing is still done; clearing a text says so.

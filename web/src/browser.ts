@@ -11,8 +11,15 @@ export * from "./index.ts";
 export interface OpenOptions {
   /** Which store: one device each, shared by the origin's tabs. "default" unless said. */
   name?: string;
-  /** Replicate everything, rather than what clients here watch and ask about: the default, as for zspd. */
+  /**
+   * Replicate everything, rather than what clients here watch and ask about. Not by default: a browser's device is a
+   * partial replica, which has what it needs at once however big the space, and keeps no more than `keep` says of what
+   * it no longer watches. A space needs a full replica somewhere that can read, to answer questions about all of it: a
+   * zspd device, or a browser's opened with `full: true`. A store may be opened either way, and lose nothing.
+   */
   full?: boolean;
+  /** What a partial replica keeps of what it no longer watches: see NodeOptions. */
+  keep?: { days?: number; bytes?: number } | false;
   /** Presented to relays, whose hosts decide by it whom they serve. */
   credential?: string | Uint8Array;
   /** Where the worker's script is, if not worker.js beside this one. */
@@ -55,7 +62,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       worker.postMessage({ ask: asked, op, args } satisfies Command);
     });
   const command: Command = {
-    open: { name: options.name ?? "default", full: options.full, credential: options.credential, wasm: options.wasm?.toString() },
+    open: { name: options.name ?? "default", full: options.full, keep: options.keep, credential: options.credential, wasm: options.wasm?.toString() },
   };
   worker.postMessage(command);
   let space: string | undefined;

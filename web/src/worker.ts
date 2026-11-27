@@ -16,6 +16,7 @@ export interface Options {
   /** Which store: a directory of the origin's private file system, under zsp/. */
   name: string;
   full?: boolean;
+  keep?: { days?: number; bytes?: number } | false;
   credential?: string | Uint8Array;
   /** Where node.wasm is, if not beside this script. */
   wasm?: string;
@@ -78,7 +79,8 @@ function contend(): void {
     try {
       const volume = await OpfsVolume.at("zsp/" + o.name);
       const module = await loadModule(o.wasm ? new URL(o.wasm, self.location.href) : undefined);
-      const node = await Node.open({ volume, module, full: o.full, credential: o.credential });
+      // Partial unless told otherwise: a browser holds what its tabs watch and ask about, not the whole space.
+      const node = await Node.open({ volume, module, full: o.full === true, keep: o.keep, credential: o.credential });
       failed = new Promise((done) => (node.onFailure = done));
       device = node;
     } catch (error) {

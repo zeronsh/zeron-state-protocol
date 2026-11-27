@@ -207,9 +207,10 @@ identity :: proc "c" (secret: ^zsp.Key32, into: [^]byte) {
 }
 
 // The buffer holds: secret (32), space (32), then the credential, the keys kept, the roster and the one before it,
-// each a u32 length, little-endian, and that many bytes.
+// each a u32 length, little-endian, and that many bytes. A partial replica keeps what it no longer watches for `age`
+// milliseconds, and no more than about `bytes` of all it holds: see zsp/retain.odin; 0 for no bound.
 @(export)
-start :: proc "c" (full: bool) -> bool {
+start :: proc "c" (full: bool, age, bytes: f64) -> bool {
 	context = ctx()
 	r := zsp.Reader{buf = message[:]}
 	secret, space: zsp.Key32
@@ -262,6 +263,10 @@ start :: proc "c" (full: bool) -> bool {
 	if len(roster) > 0 && !zsp.node_resume(&node, before, roster) {
 		report(.Warning, "the saved roster is not sound")
 	}
+	if node.becoming {
+		report(.Info, "this store was a full replica's: it is one until it is level with another, and partial from then on")
+	}
+	zsp.node_keep(&node, {u64(age), u64(bytes)})
 	node.host = {
 		keep = proc(_: rawptr, bytes: []byte) {
 			// Keys learnt and not kept are lost at the next start, and with them all sealed under them: storage has failed.
@@ -294,6 +299,13 @@ start :: proc "c" (full: bool) -> bool {
 	dialers_refresh()
 	free_all(context.temp_allocator)
 	return true
+}
+
+// How much the store holds, about, in bytes: of cells, and what each costs to keep.
+@(export)
+held :: proc "c" () -> f64 {
+	context = ctx()
+	return f64(zsp.store_held(&node.store)) if started else 0
 }
 
 // Whether this device belongs to the space, by the roster it holds.
@@ -365,7 +377,7 @@ stop :: proc "c" () {
 		free(c)
 	}
 	clear(&conns)
-	if zsp.store_sync(&node.store) && zsp.store_tail(&node.store) - node.checkpoint > 1 << 20 {
+	if zsp.store_sync(&node.store) && (zsp.store_tail(&node.store) - node.checkpoint > 1 << 20 || node.whole != node.whole_kept) {
 		zsp.store_checkpoint(&node.store)
 	}
 	zsp.node_destroy(&node)
@@ -751,6 +763,10 @@ tick :: proc "c" () -> f64 {
 	dialers_run(t)
 	links_run()
 	relayed_run(time.tick_now())
+	retain_more := false
+	if due := zsp.node_retain_due(&node); due != 0 && f64(due) <= t {
+		retain_more = zsp.node_retain(&node) // a step at a time, others' turns between
+	}
 	found_run(time.tick_now())
 	ids := make([dynamic]u32, 0, len(conns), context.temp_allocator)
 	for id in conns {
@@ -817,6 +833,11 @@ tick :: proc "c" () -> f64 {
 	}
 	if w, ok := found_deadline(time.tick_now()); ok {
 		sooner(&wait, f64(w) / f64(time.Millisecond))
+	}
+	if retain_more {
+		sooner(&wait, 0)
+	} else if due := zsp.node_retain_due(&node); due != 0 {
+		sooner(&wait, f64(due) - t)
 	}
 	if w, ok := links_deadline(); ok {
 		sooner(&wait, f64(w) / f64(time.Millisecond))
@@ -1015,3 +1036,4 @@ members :: proc "c" () -> int {
 	}
 	return len(message)
 }
+

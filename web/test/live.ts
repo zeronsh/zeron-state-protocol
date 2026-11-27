@@ -75,7 +75,7 @@ export async function live({ a, b, breakPipes, say = console.log }: Sides): Prom
     window.visible(1, 21);
     await sleep(20);
     for (const row of st().rows) seen.add(row.stars!);
-    if (st().before === 0 && st().status !== "loading") break;
+    if (st().before === 0 && st().status === "ready") break; // as a full replica has said: a partial one shows what it holds sooner
   }
   check(st().before === 0 && st().rows[0].stars === 1, `reached ${st().rows[0].stars} with ${st().before} before`);
   check(st().rows.length <= 250, `holds ${st().rows.length}`);
@@ -90,7 +90,7 @@ export async function live({ a, b, breakPipes, say = console.log }: Sides): Prom
   for (let k = 0; k < 40; k++) {
     window.visible(st().rows.length - 20, st().rows.length);
     await sleep(20);
-    if (st().after === 0 && st().status !== "loading") break;
+    if (st().after === 0 && st().status === "ready") break;
   }
   check(st().after === 0 && st().rows[st().rows.length - 1].stars === 1000, "the bottom came back");
   check(st().before === 301 - st().rows.length, "and what is before is counted");

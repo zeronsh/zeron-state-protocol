@@ -134,7 +134,7 @@ for _ = 1, 40 do
 	for _, row in state.rows do
 		seen[row.stars] = true
 	end
-	if state.before == 0 and state.status ~= "loading" then
+	if state.before == 0 and state.status == "ready" then -- as a full replica has said: a partial one shows what it holds sooner
 		break
 	end
 end
@@ -159,7 +159,7 @@ end)
 for _ = 1, 40 do
 	window.visible(#state.rows - 20, #state.rows)
 	task.wait(0.02)
-	if state.after == 0 and state.status ~= "loading" then
+	if state.after == 0 and state.status == "ready" then
 		break
 	end
 end

@@ -775,6 +775,7 @@ function Client._on_synced(self: Client, r: codec.Reader)
 		self:_mark(page)
 		return
 	end
+	local was_lo, was_hi = page.lo, page.hi
 	page.lo, page.hi = codec.key(r), codec.key(r)
 	page.limit = 0 -- from here on it is a range, however many are in it
 	page.before, page.after = codec.varint(r), codec.varint(r)
@@ -792,8 +793,30 @@ function Client._on_synced(self: Client, r: codec.Reader)
 			end
 		end
 	end
+	-- A page at an end of the window may come to end short of where it was first said to, as one a partial replica
+	-- answered at once from what it held ends where a full one says: what the window showed beyond it is had again by
+	-- the page that follows, rather than let go of unseen.
+	local function cut(lo: string, hi: string): boolean
+		if lo >= hi then
+			return false
+		end
+		for _, e in window.entries do
+			if e.key >= lo and e.key < hi then
+				return true
+			end
+		end
+		return false
+	end
+	local after = page == window.pages[#window.pages] and cut(page.hi, was_hi)
+	local before = page == window.pages[1] and cut(was_lo, page.lo)
 	-- Where a full replica says the page ends, what lay past it was never known to be whole.
 	self:_trim(window)
+	if after then
+		self:_load_after(window)
+	end
+	if before then
+		self:_load_before(window)
+	end
 end
 
 -- What was read of a row is read again when next it is wanted. Nothing keeps the table of views but the row, so one

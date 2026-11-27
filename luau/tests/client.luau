@@ -77,14 +77,14 @@ local function watch_of(said: any): (number, number, string, string, number)
 	return codec.varint(r), codec.u8(r), codec.key(r), codec.key(r), codec.varint(r)
 end
 
-local function synced(h: any, id: number, flags: number, lo: string, hi: string)
+local function synced(h: any, id: number, flags: number, lo: string, hi: string, before: number?, after: number?)
 	local w = codec.writer()
 	codec.put_varint(w, id)
 	codec.put_u8(w, flags)
 	codec.put_key(w, lo)
 	codec.put_key(w, hi)
-	codec.put_varint(w, 0)
-	codec.put_varint(w, 0)
+	codec.put_varint(w, before or 0)
+	codec.put_varint(w, after or 0)
 	h.tell(SYNCED, codec.string(w))
 end
 
@@ -151,6 +151,50 @@ do
 		mine = s
 	end)
 	assert(mine, "another shape of row is another window")
+end
+
+-- A page a partial replica answered at once, from what it held, may end sooner once a full replica has said where it ends:
+-- what the window showed beyond it is not let go of unseen, but asked for again as the page that follows.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local st
+	local window = h.client:window({ scope = 1, list = "a", table = Note, size = 2 }, function(s)
+		st = s
+	end)
+	h.run()
+	for i = 1, 3 do
+		h.client:write(1, function(change)
+			change.insert(Note, "a", i, { title = `t{i}` })
+		end)
+	end
+	h.run()
+	local w = codec.writer()
+	codec.put_varint(w, 3)
+	h.tell(ACK, codec.string(w))
+	local page, _, lo, hi = watch_of(h.last(WATCH))
+	synced(h, page, 0, lo, hi) -- what is held: all three, to the end
+	assert(#st.rows == 3)
+	local keys = {}
+	for i, e in window.entries() do
+		keys[i] = e.key
+	end
+	local function watches(): { any }
+		local out = {}
+		for _, x in h.self.said do
+			if x.kind == WATCH then
+				table.insert(out, x)
+			end
+		end
+		return out
+	end
+	local before = #watches()
+	synced(h, page, 1, keys[1], keys[3], 0, 1) -- as a full replica says: two, and one more after
+	local asked = watches()
+	assert(#asked == before + 1, "the rest is asked for")
+	local _, _, from = watch_of(asked[#asked])
+	assert(from == keys[3], "from where the page now ends")
 end
 
 -- Writing nothing is still done; clearing a text says so.

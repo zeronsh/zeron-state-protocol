@@ -41,8 +41,17 @@ export interface NodeOptions {
   volume: Volume;
   /** The node, compiled: see ./wasm.ts for where it comes from. */
   module: WebAssembly.Module;
-  /** Replicate everything, rather than what clients here watch and ask about: the default, as for zspd. */
+  /**
+   * Replicate everything, rather than what clients here watch and ask about: the default, as for zspd; in a browser,
+   * `open` makes it partial unless told otherwise. A store may be opened either way, and lose nothing: see docs/web.md.
+   */
   full?: boolean;
+  /**
+   * What a partial replica keeps of what it no longer watches: what nobody here has watched for so many days goes, 30
+   * unless said; and when it holds more than so many bytes, 256 MiB unless said, what was watched least lately goes
+   * first. Never what it wrote and nobody else is known to have, nor what is watched or asked about. `false` keeps all.
+   */
+  keep?: { days?: number; bytes?: number } | false;
   /** Presented to relays, whose hosts decide by it whom they serve. */
   credential?: string | Uint8Array;
   /** By default the platform's own. */
@@ -62,8 +71,9 @@ interface Exports {
   buffer(size: number): number;
   data(): number;
   identity(secret: number, into: number): void;
-  start(full: number): number;
+  start(full: number, age: number, bytes: number): number;
   member(): number;
+  held(): number;
   adopt(size: number): number;
   relay(size: number): void;
   stop(): void;
@@ -119,6 +129,10 @@ const REFUSED: Record<number, string> = {
 };
 
 const HIGH = 256 << 10; // bytes in flight to a pipe before the node waits for it
+const KEEP_DAYS = 30; // what a partial replica keeps of what nobody here watches, unless told otherwise
+const KEEP_BYTES = 256 * 2 ** 20;
+const DAY = 24 * 3600 * 1000;
+const LONGEST = 2 ** 31 - 1; // ms a timer may be set for: one set for longer goes off at once
 const PIECE = 64 << 10; // of what a client says, handed to the node at a time
 const DRAIN_POLL = 4; // ms between looks at a WebSocket's backlog, while it has one: nothing says when it drains
 const LEVELS: Level[] = ["debug", "info", "warning", "error", "error"];
@@ -143,6 +157,7 @@ export class Node {
   #key = "";
   #store!: Store;
   #options: NodeOptions;
+  #keep: { age: number; bytes: number };
   #secret!: Uint8Array;
   #wasm?: Exports;
   #instance?: WebAssembly.Instance;
@@ -162,6 +177,11 @@ export class Node {
 
   private constructor(options: NodeOptions) {
     this.#options = options;
+    const keep = options.keep === false ? { days: 0, bytes: 0 } : (options.keep ?? {});
+    this.#keep = { age: (keep.days ?? KEEP_DAYS) * DAY, bytes: keep.bytes ?? KEEP_BYTES };
+    if (!(this.#keep.age >= 0 && this.#keep.bytes >= 0 && this.#keep.age < Infinity && this.#keep.bytes < Infinity)) {
+      throw new RangeError("what is kept is kept for so many days, and so many bytes, of none or more");
+    }
     const wasm = this.#instantiate();
     if (options.keepalive) wasm.keepalive(options.keepalive.idle, options.keepalive.wait);
   }
@@ -202,6 +222,11 @@ export class Node {
   /** Bytes of memory the node has, all of which it may be using. */
   get memory(): number {
     return this.#wasm?.memory.buffer.byteLength ?? 0;
+  }
+
+  /** How much it holds, about, in bytes: of cells, and what each costs to keep. What `keep.bytes` bounds. */
+  get held(): number {
+    return this.#wasm && this.#space !== undefined && !this.#stopped ? this.#wasm.held() : 0;
   }
 
   /** Where it keeps what it holds. */
@@ -558,7 +583,7 @@ export class Node {
       b.set(part, p + 4);
       p += 4 + part.length;
     }
-    if (!wasm.start(this.#options.full === false ? 0 : 1)) throw new Error("could not open the store");
+    if (!wasm.start(this.#options.full === false ? 0 : 1, this.#keep.age, this.#keep.bytes)) throw new Error("could not open the store");
     this.#space = hex(space.subarray(0, 32));
     const udp = this.#options.datagrams;
     if (udp) {
@@ -690,7 +715,7 @@ export class Node {
       this.#fail(new Error("storage failed: the node has stopped rather than lose what it said was durable"));
       return;
     }
-    if (wait >= 0) this.#timer = setTimeout(() => this.#kick(), wait);
+    if (wait >= 0) this.#timer = setTimeout(() => this.#kick(), Math.min(wait, LONGEST));
     // Said only now, so that no client is told anything while the node is in the middle of something.
     for (const [c, data] of this.#deliveries.splice(0)) {
       if (data.length === 0) {

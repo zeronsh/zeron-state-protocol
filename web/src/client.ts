@@ -917,6 +917,7 @@ export class Client {
       this.#mark(page);
       return;
     }
+    const was = [page.lo, page.hi];
     page.lo = codec.key(r);
     page.hi = codec.key(r);
     page.limit = 0; // from here on it is a range, however many are in it
@@ -933,8 +934,16 @@ export class Client {
         else if (row && !this.#isPending(id)) this.#unplace(row, page.lo, page.hi);
       }
     }
+    // A page at an end of the window may come to end short of where it was first said to, as one a partial replica
+    // answered at once from what it held ends where a full one says: what the window showed beyond it is had again by
+    // the page that follows, rather than let go of unseen.
+    const cut = (lo: string, hi: string) => lo < hi && window.entries.some((e) => e.key >= lo && e.key < hi);
+    const after = page === window.pages[window.pages.length - 1] && cut(page.hi, was[1]);
+    const before = page === window.pages[0] && cut(was[0], page.lo);
     // Where a full replica says the page ends, what lay past it was never known to be whole.
     this.#trim(window);
+    if (after) this.#loadAfter(window);
+    if (before) this.#loadBefore(window);
   }
 
   // A range was said over again and this row was not in it: it was moved away, or deleted, while this client was not

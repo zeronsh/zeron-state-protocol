@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
-import { Client, columns } from "../src/client.ts";
+import { Client, columns, type State } from "../src/client.ts";
 import type { Connect, Wire } from "../src/node.ts";
 import { open } from "../src/nodejs.ts";
 import { live } from "./live.ts";
@@ -42,8 +42,9 @@ class Pipes {
   }
 }
 
-// A space as live.ts wants it: scope 1, and scope 2 signed, in which b may vouch; a goes by "ann" and b by "bob".
-async function space(name: string, relay: { key: string; url: string }, sides: ("zspd" | "web")[], options: string[] = [], relayCredential?: string) {
+// A space as live.ts wants it: scope 1, and scope 2 signed, in which b may vouch; a goes by "ann" and b by "bob". Web
+// devices are partial replicas, as a browser's are, unless they are "full" ones.
+async function space(name: string, relay: { key: string; url: string }, sides: ("zspd" | "web" | "full")[], options: string[] = [], relayCredential?: string) {
   const owner = join(TMP, name + "-owner");
   const sid = zspd("create", owner);
   zspd("relay", owner, relay.key, relay.url);
@@ -51,7 +52,7 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
   const pipes = new Pipes();
   const clients: Client[] = [];
   const closers: (() => Promise<void>)[] = [];
-  if (sides[0] === "web") {
+  if (sides[0] !== "zspd") {
     // The owner is zspd's, and runs only to tell the others who belongs.
     const n = await node("run", owner, ...options);
     closers.push(async () => void n.p.kill());
@@ -71,7 +72,7 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
       connect = zspdConnect(n.address);
       credential = token(dir);
     } else {
-      const d = await open({ dir: join(TMP, `${name}-${i}`), credential: relayCredential, log: (l, t) => l !== "debug" && console.error(`[web ${i}] ${l}: ${t}`) });
+      const d = await open({ dir: join(TMP, `${name}-${i}`), full: kind === "full", credential: relayCredential, log: (l, t) => l !== "debug" && console.error(`[web ${i}] ${l}: ${t}`) });
       key = d.key;
       zspd("admit", owner, key, "1");
       await d.join(sid, relay);
@@ -79,7 +80,7 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
       closers.push(() => d.close());
     }
     if (i === 1) zspd("admit", owner, key, "2", "vouch");
-    else if (kind === "web") zspd("admit", owner, key, "2");
+    else if (kind !== "zspd") zspd("admit", owner, key, "2");
     zspd("subject", owner, key, subject);
     clients.push(new Client({ connect: pipes.wrap(connect), credential, linger: 200 }));
   }
@@ -334,6 +335,14 @@ const tests: Record<string, () => Promise<void>> = {
       await stopAll();
     }
   },
+  // A partial web device has at once what it watches of a big space, and no more; says honestly whether what it shows is
+  // kept up; shows what it holds when it reaches nobody, and keeps what is written meanwhile; lets go of what nobody has
+  // watched for long enough, but not of what it wrote or what is watched; and has what it let go of again once it is
+  // watched. A Node device that is not told otherwise is a full replica, and has everything when it reaches nobody. Through
+  // zspd's relay and the Durable Object.
+  async web_partial() {
+    for (const kind of ["zspd", "cloud"]) await partialThrough(kind);
+  },
   // The TypeScript client, of zspd, as the Luau client is: the same suite, the same answers.
   async zspd_clients() {
     const relay = await node("serve", join(TMP, "z-relay"));
@@ -341,19 +350,25 @@ const tests: Record<string, () => Promise<void>> = {
     await live(s);
     await s.close();
   },
-  // A web device reads what a zspd device writes, through zspd's relay.
+  // A web device, a partial replica, reads what a zspd device writes, through zspd's relay; and one that is a full replica.
   async web_reads() {
     const relay = await node("serve", join(TMP, "r-relay"));
     const s = await space("r", relay, ["zspd", "web"]);
     await live(s);
     await s.close();
+    const t = await space("rf", relay, ["zspd", "full"]);
+    await live(t);
+    await t.close();
   },
-  // A web device writes what a zspd device reads, through the Durable Object.
+  // A web device writes what a zspd device reads, through the Durable Object; and reads what it writes.
   async web_writes_cloud() {
     const relay = await cloud({ ACCESS_TOKEN: "sesame" });
     const s = await space("c", relay, ["web", "zspd"], ["--credential=sesame"], "sesame");
     await live(s);
     await s.close();
+    const t = await space("cr", relay, ["zspd", "web"], ["--credential=sesame"], "sesame");
+    await live(t);
+    await t.close();
   },
   // Two web devices, and nothing else but a relay.
   async web_and_web() {
@@ -370,6 +385,80 @@ const tests: Record<string, () => Promise<void>> = {
     await s.close();
   },
 };
+
+async function partialThrough(kind: string): Promise<void> {
+  const relay = kind === "zspd" ? await node("serve", join(TMP, "pw-relay")) : await cloud();
+  const through = await proxy(relay.url);
+  const owner = join(TMP, `pw-${kind}-owner`);
+  const sid = zspd("create", owner);
+  zspd("relay", owner, relay.key, through.url);
+  const o = await node("run", owner);
+  const writer = new Client({ connect: zspdConnect(o.address), credential: token(owner) });
+  const quiet = (l: string, t: string) => l === "error" && console.error(`[web] ${t}`);
+  const AGE = 1.5; // seconds
+  const p = await open({ dir: join(TMP, `pw-${kind}-partial`), udp: false, full: false, keep: { days: AGE / 86400 }, log: quiet });
+  const f = await open({ dir: join(TMP, `pw-${kind}-full`), udp: false, log: quiet });
+  for (const d of [p, f]) {
+    zspd("admit", owner, d.key, "1");
+    await d.join(sid, { key: relay.key, url: through.url });
+  }
+  const Row = { n: columns.number(16), body: columns.text(17) };
+  await eventually("the writer may write", () => writer.may(1, "write"));
+  for (let i = 0; i < 2000; i++) void writer.write(1, (c) => c.insert(Row, "feed", i, { n: i, body: "x".repeat(100) }));
+  for (let i = 0; i < 5; i++) await writer.write(1, (c) => c.insert(Row, "other", i, { n: i }));
+  const cp = p.client(), cf = f.client();
+  await eventually("both may read", () => cp.may(1, "write") && cf.may(1, "write"));
+  const watch = (c: Client, list: string, size: number, from?: "start") => {
+    const w = { state: undefined as State<typeof Row> | undefined, stop: () => {} };
+    w.stop = c.window({ scope: 1, list, table: Row, size, from }, (s) => (w.state = s)).stop;
+    return w;
+  };
+  const full = watch(cf, "feed", 3000, "start");
+  await eventually("the full device has everything", () => full.state?.rows.length === 2000 && full.state.status === "ready", 20000);
+  full.stop();
+  const tail = watch(cp, "feed", 20);
+  await eventually("the tail, at once", () => tail.state?.status === "ready" && tail.state.rows.length === 20 && tail.state.before === 1980);
+  expectEqual(tail.state!.rows[19].n, 1999);
+  const other = watch(cp, "other", 50);
+  await eventually("another list", () => other.state?.status === "ready" && other.state.rows.length === 5);
+  other.stop();
+  const held = p.node.held;
+  if (held > 300 * 160) throw new Error(`the partial device holds ${held} bytes, as though it held much more than it watched`);
+
+  // It reaches nobody: what it shows is no longer kept up, and is said to be no more than what it holds.
+  through.cut();
+  await eventually("the tail is said to be what is held", () => tail.state?.status === "stale");
+  const p0 = watch(cp, "feed", 3000, "start"), f0 = watch(cf, "feed", 3000, "start");
+  await eventually("a partial device shows what it holds", () => p0.state?.status === "stale" && p0.state.rows.length === 20);
+  await eventually("a full one, everything", () => f0.state?.rows.length === 2000);
+  p0.stop(), f0.stop();
+  // What it writes meanwhile is durable here, and stays.
+  await cp.write(1, (c) => c.insert(Row, "feed", 5000, { n: -1 }));
+  const last = () => tail.state!.rows[tail.state!.rows.length - 1];
+  await eventually("and is shown", () => last()?.n === -1);
+
+  // What nobody has watched for long enough goes; what is watched, and what it wrote, stay.
+  await eventually("the list nobody watches is let go of", () => p.node.held < held, AGE * 1000 + 5000);
+  const o0 = watch(cp, "other", 50);
+  await eventually("and is no longer there", () => o0.state?.status === "stale" && o0.state.rows.length === 0);
+  o0.stop();
+  expectEqual(tail.state!.rows.length, 21);
+
+  // Back: what it wrote reaches the others, what it shows is kept up again, and what went comes again when watched.
+  through.mend();
+  await eventually("kept up again", () => tail.state?.status === "ready", 15000);
+  const seen = watch(writer, "feed", 1);
+  await eventually("what it wrote while away is had by the others", () => seen.state?.rows.at(-1)?.n === -1);
+  seen.stop();
+  const o1 = watch(cp, "other", 50);
+  await eventually("what went comes again", () => o1.state?.status === "ready" && o1.state.rows.length === 5);
+  o1.stop();
+  tail.stop();
+  for (const c of [writer, cp, cf]) c.close();
+  await p.close();
+  await f.close();
+  await stopAll();
+}
 
 async function main(): Promise<void> {
   const names = process.argv.slice(2).length > 0 ? process.argv.slice(2) : Object.keys(tests);
