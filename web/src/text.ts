@@ -14,7 +14,18 @@ type Span = {
   len: number;
   dead: boolean;
   label: number; // greater than that of any span before it: so where two elements are is found in a few steps
+  block: Block; // that holds it
 };
+
+// Some of the spans, in document order, dead ones included: so a span's place, and where a position falls, are found by
+// way of the blocks, as zsp/text.odin has it, rather than along every span.
+type Block = {
+  spans: Span[];
+  at: number; // among the blocks
+  visible: number; // bytes
+};
+const BLOCK = 64;
+const NOWHERE: Block = { spans: [], at: -1, visible: 0 }; // where a span is until it is put somewhere
 
 // Elements made at once: the first hangs beneath what its operation says, and each of the rest beneath the one before.
 type Run = {
@@ -45,11 +56,15 @@ type Piece = {
 type Waiting = { piece: string; rest: Uint8Array; at: number };
 
 export type Text = {
-  spans: Span[];
+  blocks: Block[];
+  count: number; // spans
+  counts: number[]; // of spans in the blocks, and
+  visibles: number[]; // of their bytes, each as a Fenwick tree: how many come before a block is a few steps away
   pieces: Map<string, Piece>;
   waiting: Waiting[];
   base: string;
-  hint: number;
+  near: Block; // the block last looked in, and
+  nearFrom: number; // the place of its first span
   open: string; // the piece being written here, or ""
   ops: codec.Writer; // its id and then its operations
   size: number; // bytes of operations
@@ -57,8 +72,6 @@ export type Text = {
   cache: string | null;
   content: Uint8Array<ArrayBuffer> | null; // the bytes that are there, once asked for
   visible: number; // how many
-  before: number[]; // visible bytes before each span, as far as known: to `known`, and not past what changed since
-  known: number;
   version: number; // counts changes, that whoever reads it may know whether to again
 };
 
@@ -77,11 +90,15 @@ const utf8 = new TextDecoder("utf-8", { ignoreBOM: true });
 
 export function create(): Text {
   return {
-    spans: [],
+    blocks: [],
+    count: 0,
+    counts: [0],
+    visibles: [0],
     pieces: new Map(),
     waiting: [],
     base: "",
-    hint: 0,
+    near: NOWHERE,
+    nearFrom: 0,
     open: "",
     ops: codec.writer(0),
     size: 0,
@@ -89,8 +106,6 @@ export function create(): Text {
     cache: null,
     content: null,
     visible: 0,
-    before: [],
-    known: -1,
     version: 0,
   };
 }
@@ -162,10 +177,69 @@ function spanOf(p: Piece | undefined, offset: number): Span | null {
   return at >= 0 ? p.spans[at] : null;
 }
 
-// Where a span is in the document: by its label, the spans' labels going up along it.
+// ---------------------------------------------------------------- the document, in blocks
+
+// Adds to a block's entry in a Fenwick tree.
+function grow(tree: number[], at: number, n: number): void {
+  for (let i = at + 1; i < tree.length; i += i & -i) tree[i] += n;
+}
+
+// The sum of the first so many blocks' entries.
+function sum(tree: number[], blocks: number): number {
+  let n = 0;
+  for (let i = blocks; i > 0; i -= i & -i) n += tree[i];
+  return n;
+}
+
+// How many whole blocks come before the entry that first takes the sum past n, or that reaches it, and setting `rest` to
+// what is left of n in that block.
+let rest = 0;
+function blockAt(tree: number[], n: number, reach: boolean): number {
+  let b = 0;
+  for (let step = tree.length > 1 ? 1 << (31 - Math.clz32(tree.length - 1)) : 0; step > 0; step >>= 1) {
+    const next = b + step;
+    if (next < tree.length && (reach ? tree[next] < n : tree[next] <= n)) {
+      b = next;
+      n -= tree[next];
+    }
+  }
+  rest = n;
+  return b;
+}
+
+// Both trees made again, as when a block is put among the others.
+function remake(t: Text): void {
+  const blocks = t.blocks;
+  const counts: number[] = [0], visibles: number[] = [0];
+  for (let k = 0; k < blocks.length; k++) counts.push(0), visibles.push(0);
+  for (let k = 0; k < blocks.length; k++) {
+    const b = blocks[k];
+    b.at = k;
+    counts[k + 1] += b.spans.length;
+    visibles[k + 1] += b.visible;
+    const up = k + 1 + ((k + 1) & -(k + 1));
+    if (up <= blocks.length) (counts[up] += counts[k + 1]), (visibles[up] += visibles[k + 1]);
+  }
+  t.counts = counts;
+  t.visibles = visibles;
+}
+
+// The span at a place in the document, from 0: in the first block, as all of a short text is, at once.
+function spanAt(t: Text, i: number): Span {
+  const k = i - t.nearFrom;
+  const near = t.near.spans;
+  if (k >= 0 && k < near.length) return near[k];
+  const b = blockAt(t.counts, i, false);
+  t.near = t.blocks[b];
+  t.nearFrom = i - rest;
+  return t.near.spans[rest];
+}
+
+// Where a span is in the document: its block's place, and then its label among the labels of that block, which go up
+// along it.
 function indexOf(t: Text, s: Span): number {
-  const spans = t.spans;
-  const label = s.label;
+  const b = s.block;
+  const spans = b.spans, label = s.label;
   let lo = 0;
   let hi = spans.length - 1;
   while (lo <= hi) {
@@ -173,115 +247,201 @@ function indexOf(t: Text, s: Span): number {
     const l = spans[mid].label;
     if (l < label) lo = mid + 1;
     else if (l > label) hi = mid - 1;
-    else return mid;
+    else return (b.at > 0 ? sum(t.counts, b.at) : 0) + mid;
   }
   throw new Error("a span is not where its label says");
 }
 
+// A visible span's bytes have grown, or shrunk, by n, or gone.
+function shown(t: Text, s: Span, n: number): void {
+  s.block.visible += n;
+  grow(t.visibles, s.block.at, n);
+}
+
+// Labels go up along the document, with room between them; when there is none, they are made again.
+const GAP = 2 ** 20;
+function label(t: Text, b: Block, k: number): void {
+  const spans = b.spans;
+  let before: Span | undefined, after: Span | undefined;
+  if (k > 0) before = spans[k - 1];
+  else if (b.at > 0) {
+    const prev = t.blocks[b.at - 1].spans;
+    before = prev[prev.length - 1];
+  }
+  if (k + 1 < spans.length) after = spans[k + 1];
+  else if (b.at < t.blocks.length - 1) after = t.blocks[b.at + 1].spans[0];
+  const lo = before !== undefined ? before.label : 0;
+  if (after === undefined) {
+    spans[k].label = lo + GAP;
+    return;
+  }
+  const l = (lo + after.label) / 2;
+  if (!(l > lo && l < after.label)) {
+    let n = 0;
+    for (const x of t.blocks) for (const y of x.spans) y.label = ++n * GAP;
+    return;
+  }
+  spans[k].label = l;
+}
+
+// Puts a span at a place in the document, from 0, and labels it.
+function put(t: Text, i: number, s: Span): void {
+  const blocks = t.blocks;
+  if (blocks.length === 1 && blocks[0].spans.length < BLOCK) {
+    // All of a short text, in one block with room.
+    const b = blocks[0], spans = b.spans;
+    if (i === spans.length) spans.push(s);
+    else spans.splice(i, 0, s);
+    s.block = b;
+    t.count++;
+    const n = s.dead ? 0 : s.len;
+    b.visible += n;
+    t.counts[1]++;
+    t.visibles[1] += n;
+    label(t, b, i);
+    return;
+  }
+  let b: Block, k: number;
+  if (blocks.length === 0) {
+    blocks.push((b = { spans: [], at: 0, visible: 0 }));
+    k = 0;
+    (t.counts = [0, 0]), (t.visibles = [0, 0]);
+    (t.near = b), (t.nearFrom = 0);
+  } else if (i === t.count) {
+    b = blocks[blocks.length - 1];
+    k = b.spans.length;
+  } else if (i < blocks[0].spans.length) {
+    b = blocks[0];
+    k = i;
+  } else {
+    b = blocks[blockAt(t.counts, i, false)];
+    k = rest;
+  }
+  let whole = false;
+  if (b.spans.length === BLOCK) {
+    // What is written at the end fills blocks, and elsewhere halves them.
+    const keep = k === BLOCK ? BLOCK : BLOCK / 2;
+    const more: Block = { spans: b.spans.splice(keep), at: b.at + 1, visible: 0 };
+    for (const x of more.spans) {
+      x.block = more;
+      if (!x.dead) more.visible += x.len;
+    }
+    b.visible -= more.visible;
+    blocks.splice(b.at + 1, 0, more);
+    if (k >= keep) (b = more), (k -= keep);
+    whole = true;
+  }
+  if (k === b.spans.length) b.spans.push(s);
+  else b.spans.splice(k, 0, s);
+  s.block = b;
+  t.count++;
+  const n = s.dead ? 0 : s.len;
+  b.visible += n;
+  if (whole) {
+    remake(t);
+    (t.near = blocks[0]), (t.nearFrom = 0);
+  } else {
+    grow(t.counts, b.at, 1);
+    if (n > 0) grow(t.visibles, b.at, n);
+    if (b.at < t.near.at) t.nearFrom++;
+  }
+  label(t, b, k);
+}
+
+// The span found by find, rightOf or seek.
+let found: Span | null = null;
+
 function find(t: Text, piece: string, offset: number): number {
-  const spans = t.spans;
-  const last = Math.min(t.hint + 2, spans.length - 1);
-  for (let i = Math.max(t.hint - 2, 0); i <= last; i++) {
-    const s = spans[i];
-    if (s.piece === piece && offset >= s.offset && offset < s.offset + s.len) return i;
-  }
-  // By the piece's spans, and the label of the one found; text.luau looks at every span instead, which comes to the same.
-  const p = t.pieces.get(piece);
-  const s = spanOf(p, offset);
-  if (s !== null) {
-    const i = indexOf(t, s);
-    t.hint = i;
-    return i;
-  }
+  // By the piece's spans, and the block of the one found.
+  const s = spanOf(t.pieces.get(piece), offset);
+  found = s;
+  if (s !== null) return indexOf(t, s);
   // Not there only if the piece's spans are out of order, which typing nothing with `after` brings about: as text.luau
   // does, it is looked for along the whole document.
-  for (let i = 0; i < spans.length; i++) {
-    const s = spans[i];
-    if (s.piece === piece && offset >= s.offset && offset < s.offset + s.len) {
-      t.hint = i;
-      return i;
+  let i = 0;
+  for (const b of t.blocks) {
+    for (const x of b.spans) {
+      if (x.piece === piece && offset >= x.offset && offset < x.offset + x.len) {
+        found = x;
+        return i;
+      }
+      i++;
     }
   }
   throw new Error("a reference that was checked is missing");
 }
 
-// Labels go up along the document, with room between them; when there is none, they are made again.
-const GAP = 2 ** 20;
-function label(t: Text, i: number): void {
-  const spans = t.spans;
-  const lo = i > 0 ? spans[i - 1].label : 0;
-  if (i === spans.length - 1) {
-    spans[i].label = lo + GAP;
-    return;
-  }
-  const hi = spans[i + 1].label;
-  const l = (lo + hi) / 2;
-  if (!(l > lo && l < hi)) {
-    for (let k = 0; k < spans.length; k++) spans[k].label = (k + 1) * GAP;
-    return;
-  }
-  spans[i].label = l;
-}
-
-// What is known of how much is visible before each span holds no further than a span that changed.
-function changed(t: Text, i: number): void {
-  if (i < t.known) t.known = i;
-}
-
-// The first span at or after which the visible bytes reach pos (from 1), or one past the last: found by halving what is
-// known of how much is visible before each, and counting only what changed since. So typing in one place, or at the
-// end, counts a span or two, however long the text.
+// The first span at or after which the visible bytes reach pos (from 1), or one past the last; and `rest`, the visible
+// bytes before it. By the blocks' bytes, and then along one block.
 function seek(t: Text, pos: number): number {
-  const spans = t.spans, before = t.before;
-  const n = spans.length;
-  let known = t.known;
-  if (known < 0) (before[0] = 0), (known = 0);
-  while (known < n) {
-    const s = spans[known];
-    const reach = before[known] + (s.dead ? 0 : s.len);
-    if (reach >= pos) break;
-    before[++known] = reach;
+  const b = t.blocks.length > 0 && pos <= t.blocks[0].visible ? ((rest = pos), 0) : blockAt(t.visibles, pos, true);
+  if (b === t.blocks.length) {
+    found = null;
+    return t.count;
   }
-  t.known = known;
-  if (known >= n) return n;
-  let lo = 0, hi = known;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    const s = spans[mid];
-    if (before[mid] + (s.dead ? 0 : s.len) >= pos) hi = mid;
-    else lo = mid + 1;
+  const block = t.blocks[b], spans = block.spans;
+  const start = pos - rest; // the visible bytes before the block
+  let k: number;
+  let before: number;
+  if (rest <= block.visible / 2) {
+    // From the start of the block, as it is the nearer,
+    before = start;
+    for (k = 0; ; k++) {
+      const s = spans[k];
+      const n = s.dead ? 0 : s.len;
+      if (before + n >= pos) break;
+      before += n;
+    }
+  } else {
+    // or from its end, to the first span whose bytes reach the position.
+    let after = start + block.visible;
+    k = spans.length - 1;
+    for (;;) {
+      const s = spans[k];
+      const at = after - (s.dead ? 0 : s.len);
+      if (k === 0 || at < pos) {
+        before = at;
+        break;
+      }
+      after = at;
+      k--;
+    }
   }
-  return lo;
+  rest = before;
+  found = spans[k];
+  return (b > 0 ? sum(t.counts, b) : 0) + k;
 }
 
-function split(t: Text, i: number, n: number): void {
-  const s = t.spans[i];
-  if (n === 0 || n >= s.len) return;
-  const tail: Span = { piece: s.piece, home: s.home, offset: s.offset + n, len: s.len - n, dead: s.dead, label: 0 };
-  t.spans.splice(i + 1, 0, tail);
+// Splits the span at a place in the document, s, so that its first n bytes stand alone. Returns what follows them.
+function split(t: Text, i: number, n: number, s: Span): Span {
+  if (n === 0 || n >= s.len) return s;
+  const tail: Span = { piece: s.piece, home: s.home, offset: s.offset + n, len: s.len - n, dead: s.dead, label: 0, block: s.block };
+  if (!s.dead) shown(t, s, -tail.len);
   s.len = n;
-  changed(t, i);
-  label(t, i + 1);
+  put(t, i + 1, tail);
   const p = s.home;
   const at = seat(p, s.offset);
   p.spans.splice((at >= 0 ? at : ~at) + 1, 0, tail); // as text.luau has it, should the piece's spans be out of order
+  return tail;
 }
 
 // Index of the span ending with the element; -1 for the document's start.
 function leftOf(t: Text, piece: string, offset: number): number {
   if (piece === "") return -1;
   const i = find(t, piece, offset);
-  split(t, i, offset - t.spans[i].offset + 1);
+  const s = found!;
+  split(t, i, offset - s.offset + 1, s);
   return i;
 }
 
-// Index of the span beginning with the element; one past the last for the document's end.
+// Index of the span beginning with the element, which is `found`; one past the last for the document's end.
 function rightOf(t: Text, piece: string, offset: number): number {
-  if (piece === "") return t.spans.length;
+  if (piece === "") return t.count;
   const i = find(t, piece, offset);
-  const n = offset - t.spans[i].offset;
+  const s = found!;
+  const n = offset - s.offset;
   if (n > 0) {
-    split(t, i, n);
+    found = split(t, i, n, s);
     return i + 1;
   }
   return i;
@@ -348,7 +508,7 @@ type Probe = { piece: string; offset: number; depth: number; kpiece: string; kof
 // left. Going away from the parent such spans come first, and then none.
 function probe(t: Text, i: number, q: Probe): boolean {
   taken++;
-  const s = t.spans[i];
+  const s = spanAt(t, i);
   if (!below(t, s.piece, s.offset, q.piece, q.offset)) return false;
   const cp = ancestor(t, s.piece, s.offset, q.depth + 1);
   const co = ancestorOffset;
@@ -358,7 +518,7 @@ function probe(t: Text, i: number, q: Probe): boolean {
 
 // The first index from i on of which the probe is false (or one past the last), by doubling and halving.
 function seekForward(t: Text, i: number, q: Probe): number {
-  const n = t.spans.length;
+  const n = t.count;
   if (i >= n || !probe(t, i, q)) return i;
   let lo = i;
   let step = 1;
@@ -424,33 +584,28 @@ function insertRun(t: Text, id: string, bytes: Uint8Array, lpiece: string, loffs
   // Among its siblings, each with all beneath it: on the right, after the parent; on the left, before it.
   const q: Probe = { piece: ppiece, offset: poffset, depth: depthOf(t, ppiece, poffset), kpiece: id, koffset: offset, right: !under };
   const at = under ? seekBack(t, rightOf(t, ppiece, poffset) - 1, q) + 1 : seekForward(t, leftOf(t, ppiece, poffset) + 1, q);
-  const spans = t.spans;
   if (at > 0 && chain) {
-    const b = spans[at - 1];
+    const b = spanAt(t, at - 1);
     if (b.piece === id && b.offset + b.len === offset && !b.dead) {
       b.len += bytes.length;
       t.visible += bytes.length;
-      changed(t, at - 1);
-      t.hint = at - 1;
+      shown(t, b, bytes.length);
       return;
     }
   }
-  const made: Span = { piece: id, home: p, offset, len: bytes.length, dead: false, label: 0 };
-  spans.splice(at, 0, made);
+  const made: Span = { piece: id, home: p, offset, len: bytes.length, dead: false, label: 0, block: NOWHERE };
+  put(t, at, made);
   t.visible += bytes.length;
-  changed(t, at);
-  label(t, at);
   p.spans.push(made); // the newest of its piece, so the last
-  t.hint = at;
 }
 
 function kill(t: Text, piece: string, offset: number, count: number): void {
   touch(t);
   while (count > 0) {
     const i = rightOf(t, piece, offset);
-    split(t, i, count);
-    const s = t.spans[i];
-    if (!s.dead) (t.visible -= s.len), changed(t, i);
+    const s = found!;
+    split(t, i, count, s);
+    if (!s.dead) (t.visible -= s.len), shown(t, s, -s.len);
     s.dead = true;
     offset += s.len;
     count -= s.len;
@@ -638,16 +793,17 @@ export function provisional(t: Text): boolean {
 export function content(t: Text): Uint8Array<ArrayBuffer> {
   if (t.content !== null) return t.content;
   const out = new Uint8Array(len(t));
-  const spans = t.spans;
   let at = 0;
-  for (let i = 0; i < spans.length; i++) {
-    const s = spans[i];
-    if (s.dead) continue;
-    const data = s.home.data;
-    const n = s.len;
-    if (n > 32) out.set(data.subarray(s.offset, s.offset + n), at);
-    else for (let k = 0, o = s.offset; k < n; k++) out[at + k] = data[o + k];
-    at += n;
+  for (const b of t.blocks) {
+    if (b.visible === 0) continue;
+    for (const s of b.spans) {
+      if (s.dead) continue;
+      const data = s.home.data;
+      const n = s.len;
+      if (n > 32) out.set(data.subarray(s.offset, s.offset + n), at);
+      else for (let k = 0, o = s.offset; k < n; k++) out[at + k] = data[o + k];
+      at += n;
+    }
   }
   t.content = out;
   return out;
@@ -724,7 +880,6 @@ function recordDelete(t: Text, s: Span): void {
 export function insert(t: Text, pos: number, bytes: Uint8Array | string, fresh: () => string): void {
   if (bytes.length === 0) return;
   begin(t, fresh);
-  const spans = t.spans;
   let lp = "";
   let lo = 0;
   let rp = "";
@@ -733,17 +888,18 @@ export function insert(t: Text, pos: number, bytes: Uint8Array | string, fresh: 
   if (pos > 0) {
     // The span the byte before it is in; past the end, it is put between the start and the end.
     i = seek(t, pos);
-    if (i < spans.length) {
-      split(t, i, pos - t.before[i]);
-      const s = spans[i];
+    const s = found;
+    if (s !== null) {
+      split(t, i, pos - rest, s);
       lp = s.piece;
       lo = s.offset + s.len - 1;
       i++;
     }
   }
-  if (i < spans.length) {
-    rp = spans[i].piece;
-    ro = spans[i].offset;
+  if (i < t.count) {
+    const s = spanAt(t, i);
+    rp = s.piece;
+    ro = s.offset;
   }
   const held = recordInsert(t, bytes, lp, lo, rp, ro);
   insertRun(t, t.open, held, lp, lo, rp, ro);
@@ -753,27 +909,27 @@ export function erase(t: Text, pos: number, count: number, fresh: () => string):
   if (count <= 0) return;
   begin(t, fresh);
   touch(t);
-  const spans = t.spans;
   // From the span the first byte is in.
   let i = seek(t, pos + 1);
-  if (i < spans.length) pos -= t.before[i];
-  while (i < spans.length && count > 0) {
-    let s = spans[i];
+  let next = found;
+  if (next !== null) pos -= rest;
+  while (i < t.count && count > 0) {
+    let s = next ?? spanAt(t, i);
+    next = null;
     if (s.dead) {
       i++;
     } else if (pos >= s.len) {
       pos -= s.len;
       i++;
     } else if (pos > 0) {
-      split(t, i, pos);
+      next = split(t, i, pos, s);
       pos = 0;
       i++;
     } else {
-      split(t, i, count);
-      s = spans[i];
+      split(t, i, count, s);
       s.dead = true;
       t.visible -= s.len;
-      changed(t, i);
+      shown(t, s, -s.len);
       recordDelete(t, s);
       count -= s.len;
       i++;
@@ -791,9 +947,11 @@ function eid(piece: string, offset: number): string {
 // The elements that are there, in order: one name for each visible byte.
 export function ids(t: Text): string[] {
   const out: string[] = [];
-  for (const s of t.spans) {
-    if (s.dead) continue;
-    for (let k = 0; k < s.len; k++) out.push(eid(s.piece, s.offset + k));
+  for (const b of t.blocks) {
+    for (const s of b.spans) {
+      if (s.dead) continue;
+      for (let k = 0; k < s.len; k++) out.push(eid(s.piece, s.offset + k));
+    }
   }
   return out;
 }
@@ -802,8 +960,10 @@ export function ids(t: Text): string[] {
 export function order(t: Text): Map<string, number> {
   const out = new Map<string, number>();
   let n = 0;
-  for (const s of t.spans) {
-    for (let k = 0; k < s.len; k++) out.set(eid(s.piece, s.offset + k), ++n);
+  for (const b of t.blocks) {
+    for (const s of b.spans) {
+      for (let k = 0; k < s.len; k++) out.set(eid(s.piece, s.offset + k), ++n);
+    }
   }
   return out;
 }
@@ -822,9 +982,10 @@ export function after(t: Text, after: string, bytes: Uint8Array | string, fresh:
   }
   let rp = "";
   let ro = 0;
-  if (i < t.spans.length) {
-    rp = t.spans[i].piece;
-    ro = t.spans[i].offset;
+  if (i < t.count) {
+    const s = spanAt(t, i);
+    rp = s.piece;
+    ro = s.offset;
   }
   const id = t.open;
   const first = pieceOf(t, id).count;
@@ -841,12 +1002,12 @@ export function remove(t: Text, id: string, count: number, fresh: () => string):
   let offset = codec.u32Of(id, 8);
   while (count > 0) {
     const i = rightOf(t, piece, offset);
-    split(t, i, count);
-    const s = t.spans[i];
+    const s = found!;
+    split(t, i, count, s);
     if (!s.dead) {
       s.dead = true;
       t.visible -= s.len;
-      changed(t, i);
+      shown(t, s, -s.len);
       recordDelete(t, s);
     }
     offset += s.len;

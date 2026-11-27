@@ -1473,41 +1473,66 @@ do
 	assert(asked({ typos = 1.5 }) ~= asked({ typos = 1, inside = true }), "and not one inside words")
 end
 
--- Typing at the end of a long text, or on at one place in it, costs no more than in a short one: its length is kept, and
--- where a place is, is found from what is known of the spans before it, not by counting them all again.
+-- Typing in a long text, anywhere in it, looks at a few of its spans, however many it has: where a place is, is found by
+-- way of blocks of them, not by counting them all. What is counted is how often whether a span is dead is asked.
 do
 	local Text = zsp.Text
-	local function typing(spans: number): number
-		local seed = 7
-		local function rnd(n: number): number
-			seed = (seed * 16807) % 2147483647
-			return seed % n
-		end
-		local n = 0
-		local function fresh(): string
-			n += 1
-			return string.pack(">I8", n)
-		end
-		local t = Text.new()
-		for k = 1, spans do
-			Text.insert(t, rnd(Text.len(t) + 1), "a", fresh)
-			Text.close(t, string.pack(">I8I8", k * 65536, k))
-		end
-		local began = os.clock()
-		for _ = 1, 2000 do
-			Text.insert(t, Text.len(t), "x", fresh)
-		end
-		local at = Text.len(t) // 2
-		for k = 0, 1999 do
-			Text.insert(t, at + k, "y", fresh)
-		end
-		for _ = 1, 1000 do
-			Text.delete(t, at + 1000, 1, fresh)
-		end
-		return os.clock() - began
+	local seed = 7
+	local function rnd(n: number): number
+		seed = (seed * 16807) % 2147483647
+		return seed % n
 	end
-	local short, long = typing(250), typing(8000)
-	assert(long < short * 5, `{long * 1000} ms in a text of 8000 spans, {short * 1000} ms in one of 250`)
+	local n = 0
+	local function fresh(): string
+		n += 1
+		return string.pack(">I8", n)
+	end
+	local t: any = Text.new()
+	for k = 1, 32000 do
+		Text.insert(t, rnd(Text.len(t) + 1), "a", fresh)
+		Text.close(t, string.pack(">I8I8", k * 65536, k))
+	end
+	local asked = 0
+	local function count(s: any)
+		local dead = s.dead
+		s.dead = nil
+		setmetatable(s, {
+			__index = function(_, k)
+				if k == "dead" then
+					asked += 1
+					return dead
+				end
+				return nil
+			end,
+			__newindex = function(x, k, v)
+				if k == "dead" then
+					dead = v
+				else
+					rawset(x, k, v)
+				end
+			end,
+		})
+	end
+	for _, b in t.blocks or { { spans = t.spans } } do
+		for _, s in b.spans do
+			count(s)
+		end
+	end
+	for _ = 1, 2000 do
+		Text.insert(t, Text.len(t), "x", fresh)
+	end
+	local at = Text.len(t) // 2
+	for k = 0, 1999 do
+		Text.insert(t, at + k, "y", fresh)
+	end
+	for _ = 1, 1000 do
+		Text.delete(t, at + 1000, 1, fresh)
+	end
+	for _ = 1, 2000 do
+		Text.insert(t, rnd(Text.len(t) + 1), "z", fresh)
+		Text.delete(t, rnd(Text.len(t)), 1, fresh)
+	end
+	assert(asked / 9000 < 100, `{asked / 9000} spans looked at for each of 9000 edits of a text of {Text.len(t)} bytes`)
 end
 
 -- ---------------------------------------------------------------- calls

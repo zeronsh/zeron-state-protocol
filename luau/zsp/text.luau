@@ -14,7 +14,17 @@ type Span = {
 	parts: { string },
 	dead: boolean,
 	label: number, -- greater than that of any span before it: so where two elements are is found in a few steps
+	block: Block, -- that holds it
 }
+
+-- Some of the spans, in document order, dead ones included: so a span's place, and where a position falls, are found by
+-- way of the blocks, as zsp/text.odin has it, rather than along every span.
+type Block = {
+	spans: { Span },
+	at: number, -- among the blocks
+	visible: number, -- bytes
+}
+local BLOCK = 64
 
 -- Elements made at once: the first hangs beneath what its operation says, and each of the rest beneath the one before.
 type Run = {
@@ -41,14 +51,14 @@ type Piece = {
 }
 
 export type Text = {
-	spans: { Span },
+	blocks: { Block },
+	count: number, -- spans
+	counts: { number }, -- of spans in the blocks, and
+	visibles: { number }, -- of their bytes, each as a Fenwick tree: how many come before a block is a few steps away
 	visible: number, -- bytes that are there
-	before: { number }?, -- visible bytes before each span, as far as known: to `known`, and not past what changed since
-	known: number,
 	pieces: { [string]: Piece },
 	waiting: { { piece: string, rest: string, at: number } },
 	base: string,
-	hint: number,
 	open: string,
 	ops: { string },
 	size: number, -- bytes of ops
@@ -66,14 +76,14 @@ local NOBODY = string.rep("\0", 8)
 
 function text.new(): Text
 	return {
-		spans = {},
+		blocks = {},
+		count = 0,
+		counts = {},
+		visibles = {},
 		visible = 0,
-		before = nil,
-		known = 0,
 		pieces = {},
 		waiting = {},
 		base = "",
-		hint = 1,
 		open = "",
 		ops = {},
 		size = 0,
@@ -107,52 +117,6 @@ local function joined(s: Span): string
 	return s.parts[1]
 end
 
--- What is known of how much is visible before each span holds no further than a span that changed.
-local function changed(t: Text, i: number)
-	if i <= t.known then
-		t.known = i
-	end
-end
-
--- The first span at or after which the visible bytes reach pos (from 1), or one past the last: found by halving what
--- is known of how much is visible before each, and counting only what changed since. So typing in one place, or at the
--- end, counts a span or two, however long the text.
-local function seek(t: Text, pos: number): number
-	local spans = t.spans
-	local before = t.before or {} -- made when first a place is looked for
-	t.before = before
-	local n = #spans
-	local known = t.known
-	if known == 0 then
-		before[1] = 0
-		known = 1
-	end
-	while known <= n do
-		local s = spans[known]
-		local reach = before[known] + (if s.dead then 0 else s.len)
-		if reach >= pos then
-			break
-		end
-		known += 1
-		before[known] = reach
-	end
-	t.known = known
-	if known > n then
-		return n + 1
-	end
-	local lo, hi = 1, known
-	while lo < hi do
-		local mid = (lo + hi) // 2
-		local s = spans[mid]
-		if before[mid] + (if s.dead then 0 else s.len) >= pos then
-			hi = mid
-		else
-			lo = mid + 1
-		end
-	end
-	return lo
-end
-
 -- A piece's span holding an element, and where it is among them.
 local function span_of(p: Piece, offset: number): (Span?, number)
 	local list = p.spans
@@ -171,10 +135,80 @@ local function span_of(p: Piece, offset: number): (Span?, number)
 	return nil, lo
 end
 
--- Where a span is in the document: by its label, the spans' labels going up along it.
+-- ---------------------------------------------------------------- the document, in blocks
+
+-- Adds to a block's entry in a Fenwick tree.
+local function grow(tree: { number }, at: number, n: number)
+	local i, last = at, #tree
+	while i <= last do
+		tree[i] += n
+		i += bit32.band(i, -i)
+	end
+end
+
+-- The sum of the first so many blocks' entries.
+local function sum(tree: { number }, blocks: number): number
+	local n, i = 0, blocks
+	while i > 0 do
+		n += tree[i]
+		i -= bit32.band(i, -i)
+	end
+	return n
+end
+
+-- How many whole blocks come before the entry that first takes the sum past n, or that reaches it; and what is left of n
+-- in that block.
+local function block_at(tree: { number }, n: number, reach: boolean): (number, number)
+	local last = #tree
+	local b = 0
+	local step = if last > 0 then bit32.lshift(1, 31 - bit32.countlz(last)) else 0
+	while step > 0 do
+		local next = b + step
+		if next <= last and (if reach then tree[next] < n else tree[next] <= n) then
+			b = next
+			n -= tree[next]
+		end
+		step //= 2
+	end
+	return b, n
+end
+
+-- Both trees made again, as when a block is put among the others.
+local function remake(t: Text)
+	local blocks = t.blocks
+	local last = #blocks
+	local counts, visibles = table.create(last, 0), table.create(last, 0)
+	for k, b in blocks do
+		b.at = k
+		counts[k] += #b.spans
+		visibles[k] += b.visible
+		local up = k + bit32.band(k, -k)
+		if up <= last then
+			counts[up] += counts[k]
+			visibles[up] += visibles[k]
+		end
+	end
+	t.counts, t.visibles = counts, visibles
+end
+
+-- The span at a place in the document, from 1: in the first block, as all of a short text is, at once. (Assigned, as
+-- shown is, rather than declared, so that it is called rather than copied into every caller: the copies cost more to
+-- load than they save.)
+local span_at: (Text, number) -> Span
+span_at = function(t: Text, i: number): Span
+	local first = t.blocks[1].spans
+	if i <= #first then
+		return first[i]
+	end
+	local b, rest = block_at(t.counts, i - 1, false)
+	return t.blocks[b + 1].spans[rest + 1]
+end
+
+-- Where a span is in the document: its block's place, and then its label among the labels of that block, which go up
+-- along it.
 local function index_of(t: Text, s: Span): number
-	local spans = t.spans
-	local label = s.label
+	local b = s.block
+	local spans, label = b.spans, s.label
 	local lo, hi = 1, #spans
 	while lo <= hi do
 		local mid = (lo + hi) // 2
@@ -184,59 +218,146 @@ local function index_of(t: Text, s: Span): number
 		elseif l > label then
 			hi = mid - 1
 		else
-			return mid
+			return (if b.at > 1 then sum(t.counts, b.at - 1) else 0) + mid
 		end
 	end
 	error("a span is not where its label says")
 end
 
-local function find(t: Text, piece: string, offset: number): number
-	local spans = t.spans
-	for i = math.max(t.hint - 2, 1), math.min(t.hint + 2, #spans) do
-		local s = spans[i]
-		if s.piece == piece and offset >= s.offset and offset < s.offset + s.len then
-			return i
+-- A visible span's bytes have grown, or shrunk, by n, or gone.
+local shown: (Text, Span, number) -> ()
+shown = function(t: Text, s: Span, n: number)
+	s.block.visible += n
+	grow(t.visibles, s.block.at, n)
+end
+
+-- Labels go up along the document, with room between them; when there is none, they are made again.
+local GAP = 2 ^ 20
+local function label(t: Text, b: Block, k: number)
+	local spans = b.spans
+	local before: Span? = spans[k - 1]
+	if not before and b.at > 1 then
+		local prev = t.blocks[b.at - 1].spans
+		before = prev[#prev]
+	end
+	local after: Span? = spans[k + 1]
+	if not after and b.at < #t.blocks then
+		after = t.blocks[b.at + 1].spans[1]
+	end
+	local lo = if before then before.label else 0
+	local l = if after then (lo + after.label) / 2 else lo + GAP
+	if after and not (l > lo and l < after.label) then
+		local n = 0
+		for _, x in t.blocks do
+			for _, y in x.spans do
+				n += 1
+				y.label = n * GAP
+			end
+		end
+		return
+	end
+	spans[k].label = l
+end
+
+-- Puts a span at a place in the document, from 1, and labels it.
+local function put(t: Text, i: number, s: Span)
+	local blocks = t.blocks
+	local b: Block, k: number
+	if #blocks == 0 then
+		b = { spans = {}, at = 1, visible = 0 }
+		table.insert(blocks, b)
+		k = 1
+		remake(t)
+	elseif i > t.count then
+		b = blocks[#blocks]
+		k = #b.spans + 1
+	else
+		local before, rest = block_at(t.counts, i - 1, false)
+		b, k = blocks[before + 1], rest + 1
+	end
+	local whole = false
+	if #b.spans == BLOCK then
+		-- What is written at the end fills blocks, and elsewhere halves them.
+		local keep = if k == BLOCK + 1 then BLOCK else BLOCK // 2
+		local more: Block = { spans = table.move(b.spans, keep + 1, BLOCK, 1, table.create(BLOCK) :: { Span }), at = b.at + 1, visible = 0 }
+		for x = BLOCK, keep + 1, -1 do
+			b.spans[x] = nil
+		end
+		for _, x in more.spans do
+			x.block = more
+			if not x.dead then
+				more.visible += x.len
+			end
+		end
+		b.visible -= more.visible
+		table.insert(blocks, b.at + 1, more)
+		if k > keep then
+			b, k = more, k - keep
+		end
+		whole = true
+	end
+	table.insert(b.spans, k, s)
+	s.block = b
+	t.count += 1
+	local n = if s.dead then 0 else s.len
+	b.visible += n
+	if whole then
+		remake(t)
+	else
+		grow(t.counts, b.at, 1)
+		if n > 0 then
+			grow(t.visibles, b.at, n)
 		end
 	end
-	-- By the piece's spans, and the label of the one found, as text.ts does.
+	label(t, b, k)
+end
+
+-- The first span at or after which the visible bytes reach pos (from 1), or one past the last; and the visible bytes
+-- before it. By the blocks' bytes, and then along one block.
+local function seek(t: Text, pos: number): (number, number, Span?)
+	local b, rest = block_at(t.visibles, pos, true)
+	if b == #t.blocks then
+		return t.count + 1, 0, nil
+	end
+	local spans = t.blocks[b + 1].spans
+	local before = pos - rest
+	local k = 1
+	while true do
+		local s = spans[k]
+		local n = if s.dead then 0 else s.len
+		if before + n >= pos then
+			return (if b > 0 then sum(t.counts, b) else 0) + k, before, s
+		end
+		before += n
+		k += 1
+	end
+end
+
+local function find(t: Text, piece: string, offset: number): (number, Span)
+	-- By the piece's spans, and the block of the one found, as text.ts does.
 	local p = t.pieces[piece]
 	local s = if p then span_of(p, offset) else nil
 	if s then
-		local i = index_of(t, s)
-		t.hint = i
-		return i
+		return index_of(t, s), s
 	end
 	-- Not there only if the piece's spans are out of order, which typing nothing with `after` brings about: it is looked
 	-- for along the whole document.
-	for i, x in spans do
-		if x.piece == piece and offset >= x.offset and offset < x.offset + x.len then
-			t.hint = i
-			return i
+	local i = 0
+	for _, b in t.blocks do
+		for _, x in b.spans do
+			i += 1
+			if x.piece == piece and offset >= x.offset and offset < x.offset + x.len then
+				return i, x
+			end
 		end
 	end
 	error("a reference that was checked is missing")
 end
 
--- Labels go up along the document, with room between them; when there is none, they are made again.
-local GAP = 2 ^ 20
-local function label(t: Text, i: number)
-	local spans = t.spans
-	local lo = if i > 1 then spans[i - 1].label else 0
-	local hi = if i < #spans then spans[i + 1].label else nil
-	local l = if hi then (lo + hi) / 2 else lo + GAP
-	if hi and not (l > lo and l < hi) then
-		for k, s in spans do
-			s.label = k * GAP
-		end
-		return
-	end
-	spans[i].label = l
-end
-
-local function split(t: Text, i: number, n: number)
-	local s = t.spans[i]
+-- Splits the span at a place in the document, s, so that its first n bytes stand alone. Returns what follows them.
+local function split(t: Text, i: number, n: number, s: Span): Span
 	if n == 0 or n >= s.len then
-		return
+		return s
 	end
 	local body = joined(s)
 	local tail: Span = {
@@ -246,17 +367,18 @@ local function split(t: Text, i: number, n: number)
 		parts = { string.sub(body, n + 1) },
 		dead = s.dead,
 		label = 0,
+		block = s.block,
 	}
-	table.insert(t.spans, i + 1, tail)
+	if not s.dead then
+		shown(t, s, -tail.len)
+	end
 	s.parts = { string.sub(body, 1, n) }
 	s.len = n
-	if i <= t.known then
-		t.known = i
-	end
-	label(t, i + 1)
+	put(t, i + 1, tail)
 	local p = piece_of(t, s.piece)
 	local _, at = span_of(p, s.offset)
 	table.insert(p.spans, at + 1, tail)
+	return tail
 end
 
 -- Index of the span ending with the element; 0 for the document's start.
@@ -264,23 +386,22 @@ local function left_of(t: Text, piece: string, offset: number): number
 	if piece == "" then
 		return 0
 	end
-	local i = find(t, piece, offset)
-	split(t, i, offset - t.spans[i].offset + 1)
+	local i, s = find(t, piece, offset)
+	split(t, i, offset - s.offset + 1, s)
 	return i
 end
 
--- Index of the span beginning with the element; one past the last for the document's end.
-local function right_of(t: Text, piece: string, offset: number): number
+-- Index of the span beginning with the element, and the span; one past the last for the document's end.
+local function right_of(t: Text, piece: string, offset: number): (number, Span?)
 	if piece == "" then
-		return #t.spans + 1
+		return t.count + 1, nil
 	end
-	local i = find(t, piece, offset)
-	local n = offset - t.spans[i].offset
+	local i, s = find(t, piece, offset)
+	local n = offset - s.offset
 	if n > 0 then
-		split(t, i, n)
-		return i + 1
+		return i + 1, split(t, i, n, s)
 	end
-	return i
+	return i, s
 end
 
 -- ---------------------------------------------------------------- the tree
@@ -349,7 +470,7 @@ type Probe = { piece: string, offset: number, depth: number, kpiece: string, kof
 -- left. Going away from the parent such spans come first, and then none.
 local function probe(t: Text, i: number, q: Probe): boolean
 	steps += 1
-	local s = t.spans[i]
+	local s = span_at(t, i)
 	if not below(t, s.piece, s.offset, q.piece, q.offset) then
 		return false
 	end
@@ -362,7 +483,7 @@ end
 
 -- The first index from i on of which the probe is false (or one past the last), by doubling and halving.
 local function seek_forward(t: Text, i: number, q: Probe): number
-	local n = #t.spans
+	local n = t.count
 	if i > n or not probe(t, i, q) then
 		return i
 	end
@@ -440,45 +561,36 @@ local function insert_run(t: Text, id: string, bytes: string, lpiece: string, lo
 	local q: Probe = { piece = ppiece, offset = poffset, depth = depth_of(t, ppiece, poffset), kpiece = id, koffset = offset, right = not under }
 	local at
 	if under then
-		at = seek_back(t, right_of(t, ppiece, poffset) - 1, q) + 1
+		at = seek_back(t, (right_of(t, ppiece, poffset)) - 1, q) + 1
 	else
 		at = seek_forward(t, left_of(t, ppiece, poffset) + 1, q)
 	end
-	local spans = t.spans
 	if at > 1 and chain then
-		local b = spans[at - 1]
+		local b = span_at(t, at - 1)
 		if b.piece == id and b.offset + b.len == offset and not b.dead then
 			table.insert(b.parts, bytes)
 			b.len += #bytes
 			t.visible += #bytes
-			if at - 1 <= t.known then
-				t.known = at - 1
-			end
-			t.hint = at - 1
+			shown(t, b, #bytes)
 			return
 		end
 	end
-	local made: Span = { piece = id, offset = offset, len = #bytes, parts = { bytes }, dead = false, label = 0 }
-	table.insert(spans, at, made)
+	local made: Span = { piece = id, offset = offset, len = #bytes, parts = { bytes }, dead = false, label = 0, block = nil :: any }
+	put(t, at, made)
 	t.visible += #bytes
-	if at <= t.known then
-		t.known = at
-	end
-	label(t, at)
 	table.insert(p.spans, made) -- the newest of its piece, so the last
-	t.hint = at
 end
 
 local function kill(t: Text, piece: string, offset: number, count: number)
 	t.cache = nil
 	t.version += 1
 	while count > 0 do
-		local i = right_of(t, piece, offset)
-		split(t, i, count)
-		local s = t.spans[i]
+		local i, at = right_of(t, piece, offset)
+		local s = at :: Span
+		split(t, i, count, s)
 		if not s.dead then
 			t.visible -= s.len
-			changed(t, i)
+			shown(t, s, -s.len)
 		end
 		s.dead = true
 		offset += s.len
@@ -718,9 +830,13 @@ function text.read(t: Text): string
 		return t.cache
 	end
 	local out = {}
-	for _, s in t.spans do
-		if not s.dead then
-			table.insert(out, joined(s))
+	for _, b in t.blocks do
+		if b.visible > 0 then
+			for _, s in b.spans do
+				if not s.dead then
+					table.insert(out, joined(s))
+				end
+			end
 		end
 	end
 	local s = table.concat(out)
@@ -759,27 +875,8 @@ local function record(t: Text, w: codec.Writer)
 	t.size += #s
 end
 
--- Types bytes before the visible byte at `pos` (zero-based). `fresh` draws eight random bytes.
-function text.insert(t: Text, pos: number, bytes: string, fresh: () -> string)
-	if bytes == "" then
-		return
-	end
-	begin(t, fresh)
-	local lp, lo, rp, ro = "", 0, "", 0
-	local i = 1
-	if pos > 0 then
-		-- The span the byte before it is in; past the end, it is put between the start and the end.
-		i = seek(t, pos)
-		if i <= #t.spans then
-			split(t, i, pos - (t.before :: { number })[i])
-			local s = t.spans[i]
-			lp, lo = s.piece, s.offset + s.len - 1
-			i += 1
-		end
-	end
-	if i <= #t.spans then
-		rp, ro = t.spans[i].piece, t.spans[i].offset
-	end
+-- Writes an insertion of bytes between two elements, and makes it.
+local function typed(t: Text, bytes: string, lp: string, lo: number, rp: string, ro: number)
 	local id = t.open
 	local p = piece_of(t, id)
 	local w = codec.writer()
@@ -795,6 +892,40 @@ function text.insert(t: Text, pos: number, bytes: string, fresh: () -> string)
 	insert_run(t, id, bytes, lp, lo, rp, ro)
 end
 
+-- Writes a deletion of a span, which is dead.
+local function deleted(t: Text, s: Span)
+	local w = codec.writer()
+	codec.put_u8(w, DELETE)
+	put_ref(w, t.open, s.piece, s.offset)
+	codec.put_varint(w, s.len)
+	record(t, w)
+end
+
+-- Types bytes before the visible byte at `pos` (zero-based). `fresh` draws eight random bytes.
+function text.insert(t: Text, pos: number, bytes: string, fresh: () -> string)
+	if bytes == "" then
+		return
+	end
+	begin(t, fresh)
+	local lp, lo, rp, ro = "", 0, "", 0
+	local i = 1
+	if pos > 0 then
+		-- The span the byte before it is in; past the end, it is put between the start and the end.
+		local before, s
+		i, before, s = seek(t, pos)
+		if s then
+			split(t, i, pos - before, s)
+			lp, lo = s.piece, s.offset + s.len - 1
+			i += 1
+		end
+	end
+	if i <= t.count then
+		local s = span_at(t, i)
+		rp, ro = s.piece, s.offset
+	end
+	typed(t, bytes, lp, lo, rp, ro)
+end
+
 function text.delete(t: Text, pos: number, count: number, fresh: () -> string)
 	if count <= 0 then
 		return
@@ -803,32 +934,28 @@ function text.delete(t: Text, pos: number, count: number, fresh: () -> string)
 	t.cache = nil
 	t.version += 1
 	-- From the span the first byte is in.
-	local i = seek(t, pos + 1)
-	if i <= #t.spans then
-		pos -= (t.before :: { number })[i]
+	local i, before, first = seek(t, pos + 1)
+	if first then
+		pos -= before
 	end
-	while i <= #t.spans and count > 0 do
-		local s = t.spans[i]
+	while i <= t.count and count > 0 do
+		local s = if first then first else span_at(t, i)
+		first = nil
 		if s.dead then
 			i += 1
 		elseif pos >= s.len then
 			pos -= s.len
 			i += 1
 		elseif pos > 0 then
-			split(t, i, pos)
+			first = split(t, i, pos, s)
 			pos = 0
 			i += 1
 		else
-			split(t, i, count)
-			s = t.spans[i]
+			split(t, i, count, s)
 			s.dead = true
 			t.visible -= s.len
-			changed(t, i)
-			local w = codec.writer()
-			codec.put_u8(w, DELETE)
-			put_ref(w, t.open, s.piece, s.offset)
-			codec.put_varint(w, s.len)
-			record(t, w)
+			shown(t, s, -s.len)
+			deleted(t, s)
 			count -= s.len
 			i += 1
 		end
@@ -849,10 +976,12 @@ end
 -- The elements that are there, in order: one name for each visible byte.
 function text.ids(t: Text): { string }
 	local out = {}
-	for _, s in t.spans do
-		if not s.dead then
-			for k = 0, s.len - 1 do
-				table.insert(out, eid(s.piece, s.offset + k))
+	for _, b in t.blocks do
+		for _, s in b.spans do
+			if not s.dead then
+				for k = 0, s.len - 1 do
+					table.insert(out, eid(s.piece, s.offset + k))
+				end
 			end
 		end
 	end
@@ -863,10 +992,12 @@ end
 function text.order(t: Text): { [string]: number }
 	local out = {}
 	local n = 0
-	for _, s in t.spans do
-		for k = 0, s.len - 1 do
-			n += 1
-			out[eid(s.piece, s.offset + k)] = n
+	for _, b in t.blocks do
+		for _, s in b.spans do
+			for k = 0, s.len - 1 do
+				n += 1
+				out[eid(s.piece, s.offset + k)] = n
+			end
 		end
 	end
 	return out
@@ -885,23 +1016,13 @@ function text.after(t: Text, after: string, bytes: string, fresh: () -> string):
 		i = left_of(t, lp, lo) + 1
 	end
 	local rp, ro = "", 0
-	if i <= #t.spans then
-		rp, ro = t.spans[i].piece, t.spans[i].offset
+	if i <= t.count then
+		local s = span_at(t, i)
+		rp, ro = s.piece, s.offset
 	end
 	local id = t.open
-	local p = piece_of(t, id)
-	local first = p.count
-	local w = codec.writer()
-	if p.count > 0 and lp == id and lo == p.count - 1 and rp == p.rpiece and ro == p.roffset then
-		codec.put_u8(w, EXTEND)
-	else
-		codec.put_u8(w, INSERT)
-		put_ref(w, id, lp, lo)
-		put_ref(w, id, rp, ro)
-	end
-	codec.put_bytes(w, bytes)
-	record(t, w)
-	insert_run(t, id, bytes, lp, lo, rp, ro)
+	local first = piece_of(t, id).count
+	typed(t, bytes, lp, lo, rp, ro)
 	return eid(id, first)
 end
 
@@ -912,18 +1033,14 @@ function text.remove(t: Text, id: string, count: number, fresh: () -> string)
 	t.version += 1
 	local piece, offset = uneid(id)
 	while count > 0 do
-		local i = right_of(t, piece, offset)
-		split(t, i, count)
-		local s = t.spans[i]
+		local i, at = right_of(t, piece, offset)
+		local s = at :: Span
+		split(t, i, count, s)
 		if not s.dead then
 			s.dead = true
 			t.visible -= s.len
-			changed(t, i)
-			local w = codec.writer()
-			codec.put_u8(w, DELETE)
-			put_ref(w, t.open, s.piece, s.offset)
-			codec.put_varint(w, s.len)
-			record(t, w)
+			shown(t, s, -s.len)
+			deleted(t, s)
 		end
 		offset += s.len
 		count -= s.len

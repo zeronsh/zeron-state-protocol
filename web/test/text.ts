@@ -1,6 +1,7 @@
 // Holds text.ts to text.luau: seeded writers type, delete, name elements, stream, seal, bundle and receive, here, and
 // text.luau does exactly the same; every step's outcome, the bodies sealed, and where every element ends up must be the
-// same byte for byte. node web/test/text.ts [seeds] [first]
+// same byte for byte. node web/test/text.ts [seeds] [first] [long]: as many seeds again, each long enough for its texts to
+// run to many blocks of spans, unless said.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -17,6 +18,8 @@ if (process.env.ZSP_FAIL) throw new Error("failing, as ZSP_FAIL asks");
 const SEEDS = Number(process.argv[2] ?? 300);
 const FIRST = Number(process.argv[3] ?? 1);
 const STEPS = 250;
+const LONG = Number(process.argv[4] ?? 6); // seeds of many more steps, whose texts have many blocks of spans
+const LONG_STEPS = 2000;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "../..");
@@ -139,7 +142,7 @@ class World {
 const utf8 = new TextEncoder();
 const LETTERS = ["a", "b", "c", "d", "e", "x", "y", "z", "é", "ß", "中", "😀", "﻿"];
 
-function generate(r: Random): { ops: Op[]; world: World } {
+function generate(r: Random, steps = STEPS): { ops: Op[]; world: World } {
   const world = new World();
   const ops: Op[] = [];
   const used: string[] = [];
@@ -160,7 +163,7 @@ function generate(r: Random): { ops: Op[]; world: World } {
   };
   const pieceCount = (t: text.Text, piece: string): number => t.pieces.get(piece)?.count ?? 0;
 
-  for (let k = 0; k < STEPS; k++) {
+  for (let k = 0; k < steps; k++) {
     const w = r.int(0, 2);
     const t = world.writers[w];
     const n = text.len(t);
@@ -269,6 +272,10 @@ for (let seed = FIRST; seed < FIRST + SEEDS; seed++) {
   const { ops, world } = generate(random(seed));
   seeds.push({ seed, ops, out: world.out });
 }
+for (let seed = FIRST; seed < FIRST + LONG; seed++) {
+  const { ops, world } = generate(random(1_000_000 + seed), LONG_STEPS);
+  seeds.push({ seed: 1_000_000 + seed, ops, out: world.out });
+}
 // What does not read as operations is nothing, and waits for nothing, since nothing that comes could make it read: an
 // operation there is none of, a reference of no kind, a deletion from the start, an extension of nothing. What refers to
 // what is not here waits for it, and once that has come is done as far as it reads. Held to text.luau as every seed is.
@@ -333,42 +340,35 @@ for (const s of seeds) {
 }
 assert.equal(at, theirs.length);
 console.log(
-  `${SEEDS} seeds, ${ops} steps (${threw} throwing in both), ${steps} steps in finding places: text.ts ${(ran - began).toFixed(0)} ms, ` +
+  `${SEEDS} seeds and ${LONG} long ones, ${ops} steps (${threw} throwing in both), ${steps} steps in finding places: text.ts ${(ran - began).toFixed(0)} ms, ` +
     `text.luau ${(replayed - ran).toFixed(0)} ms`,
 );
-// Typing at the end of a long text, or on at one place in it, looks at a few of its spans each time, however many it has:
-// what moves them along, to make room among them, is not counted.
+// Typing in a long text, anywhere in it, looks at a few of its spans, however many it has: where a place is, is found by
+// way of blocks of them, not by counting them all. What is counted is how often whether a span is dead is asked.
 {
   const r = random(7);
   let n = 0;
   const fresh = () => codec.u32Binary(0) + codec.u32Binary(++n);
   const t = text.create();
-  for (let k = 0; k < 4000; k++) {
+  for (let k = 0; k < 64000; k++) {
     text.insert(t, r.int(0, text.len(t)), "a", fresh);
     text.close(t, codec.u64(k * 65536) + "stamp" + codec.u32Binary(k) + "...");
   }
-  let looked = 0, moving = false;
-  t.spans = new Proxy(t.spans, {
-    get: (spans, key, self) => {
-      if (key === "splice") {
-        return (...args: [number, number, ...unknown[]]) => {
-          moving = true;
-          try {
-            return Array.prototype.splice.apply(self, args);
-          } finally {
-            moving = false;
-          }
-        };
-      }
-      if (!moving && typeof key === "string" && key >= "0" && key <= "9") looked++;
-      return Reflect.get(spans, key, self);
-    },
-  });
-  for (let k = 0; k < 200; k++) text.insert(t, text.len(t), "x", fresh);
+  let asked = 0;
+  const held = t as unknown as { spans?: { dead: boolean }[]; blocks?: { spans: { dead: boolean }[] }[] };
+  for (const s of held.spans ?? held.blocks!.flatMap((b) => b.spans)) {
+    let dead = s.dead;
+    Object.defineProperty(s, "dead", {
+      get: () => (asked++, dead),
+      set: (v: boolean) => void (dead = v),
+    });
+  }
+  for (let k = 0; k < 2000; k++) text.insert(t, text.len(t), "x", fresh);
   const at = Math.floor(text.len(t) / 2);
-  for (let k = 0; k < 200; k++) text.insert(t, at + k, "y", fresh);
-  for (let k = 0; k < 100; k++) text.erase(t, at + 100, 1, fresh);
-  assert(looked / 500 < 100, `${looked / 500} spans looked at for each of 500 edits, of ${t.spans.length}`);
+  for (let k = 0; k < 2000; k++) text.insert(t, at + k, "y", fresh);
+  for (let k = 0; k < 1000; k++) text.erase(t, at + 1000, 1, fresh);
+  for (let k = 0; k < 2000; k++) text.insert(t, r.int(0, text.len(t)), "z", fresh), text.erase(t, r.int(0, text.len(t) - 1), 1, fresh);
+  assert(asked / 9000 < 100, `${asked / 9000} spans looked at for each of 9,000 edits of a text of ${text.len(t)} bytes`);
 }
 
 console.log("ok");
