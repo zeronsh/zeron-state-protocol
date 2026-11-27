@@ -573,8 +573,16 @@ live_ordered :: proc(l: ^Live, c: ^Changed) -> bool {
 // Asks a question again of the rows it may hold for, or not, because of others that have changed.
 @(private)
 live_touched :: proc(l: ^Live) {
-	if !l.ready || l.renew || l.far.have || !query_ready(&l.f.x, &l.q) {
+	if !l.ready || l.renew || l.far.have {
 		return
+	}
+	if l.judged != l.f.batch {
+		// What it joins may be being made again, as what it asks of may: answered afresh, as live_changed has it.
+		if !query_ready(&l.f.x, &l.q) {
+			l.renew = true
+			return
+		}
+		l.judged = l.f.batch
 	}
 	s := index_scope(&l.f.x, l.q.scope)
 	touched: Set
