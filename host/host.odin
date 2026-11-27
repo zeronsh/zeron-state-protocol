@@ -55,6 +55,7 @@ Space :: struct {
 	disk: File_Disk,
 	dir:  string,
 	seen: u64, // events already noticed by links_poke
+	admitted: u64, // the roster whose members links were last held to: see peers_admitted
 	warned: bool, // of a clock
 	found: ^Found, // while anyone is asking anything
 	retaining: bool, // has more to let go of at once

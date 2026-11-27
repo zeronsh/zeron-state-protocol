@@ -65,6 +65,19 @@ knocks_are_heard_once :: proc(t: ^testing.T) {
 	testing.expect(t, pipe.link_answers(p.answer, new[:n]))
 	peer_answer(&h, old[:n], from)
 	testing.expect(t, pipe.link_answers(p.answer, new[:n]))
+
+	// A device the roster no longer admits is answered no more, however well it was known: nor is anything kept of it,
+	// once the change is seen.
+	gone := zsp.draft_from(&s.node.roster, 2)
+	zsp.draft_revoke(&gone, other.device, 0)
+	revoked, signed := zsp.roster_sign(&ours, root, &gone, context.temp_allocator)
+	testing.expect(t, signed && zsp.node_adopt(&s.node, revoked))
+	newer, _ := knock(t, &h, &s, theirs, 300)
+	peer_answer(&h, newer[:n], from)
+	testing.expect(t, !pipe.link_answers(p.answer, newer[:n]), "a revoked device's knock was answered")
+	testing.expect(t, peer_for(&s, other.device) == nil, "a revoked device is still a peer")
+	peers_admitted(&s)
+	testing.expect_value(t, len(h.udp.links), 0)
 }
 
 // A beacon from a device while a session with it stands: a live peer answers the poke it brings, and nothing more is

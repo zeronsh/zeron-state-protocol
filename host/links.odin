@@ -243,21 +243,44 @@ udp_input :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 	}
 }
 
+// What is known of reaching a device the roster admits; nil for any other, however well it was known before.
 @(private)
 peer_for :: proc(s: ^Space, device: zsp.Key32) -> ^Peer {
+	if !admitted(s, device) {
+		return nil
+	}
 	u := &s.host.udp
 	for p in u.links {
 		if p.space == s && p.device == device {
 			return p
 		}
 	}
-	if m := zsp.roster_member(&s.node.roster, device); m == nil || !zsp.member_active(m) || device == s.host.device {
-		return nil
-	}
 	p := new(Peer)
 	p.space, p.device = s, device
 	append(&u.links, p)
 	return p
+}
+
+@(private)
+admitted :: proc(s: ^Space, device: zsp.Key32) -> bool {
+	m := zsp.roster_member(&s.node.roster, device)
+	return m != nil && zsp.member_active(m) && device != s.host.device
+}
+
+// The roster has changed: a device it no longer admits is let go of, with all that was on its way to it, but a session,
+// which its node ends itself, saying why, and which goes with its link.
+@(private)
+peers_admitted :: proc(s: ^Space) {
+	u := &s.host.udp
+	#reverse for p, i in u.links {
+		if p.space != s || admitted(s, p.device) || p.session != nil {
+			continue
+		}
+		peer_drop(p)
+		delete(p.candidates)
+		free(p)
+		ordered_remove(&u.links, i)
+	}
 }
 
 // Of two devices, the one with the lesser key dials.
@@ -322,8 +345,8 @@ peer_heard :: proc(p: ^Peer, l: ^pipe.Link, from: pipe.Address) {
 // for a device answers only the knock of one that has no link, or thinks so; and only a proven one.
 @(private)
 peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
-	if l.state != .Open || (p.session != nil && l != p.answer) {
-		return
+	if l.state != .Open || (p.session != nil && l != p.answer) || !admitted(p.space, p.device) {
+		return // and one the roster no longer admits is let go of once links_run sees the roster has changed
 	}
 	if l == p.answer {
 		if p.session != nil {
@@ -711,6 +734,10 @@ links_run :: proc(h: ^Host) {
 		u.asking = false
 	}
 	for s in h.spaces {
+		if s.node.roster.serial != s.admitted {
+			s.admitted = s.node.roster.serial
+			peers_admitted(s)
+		}
 		// Something was written here: worth trying for a direct path to whoever is listening.
 		if s.node.events.next != s.seen {
 			s.seen = s.node.events.next

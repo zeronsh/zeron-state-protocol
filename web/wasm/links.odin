@@ -45,6 +45,7 @@ Udp :: struct {
 	outside:   Maybe(pipe.Address),
 	stun:      Maybe(pipe.Address),
 	seen:      u64, // events already noticed
+	admitted:  u64, // the roster whose members links were last held to: see peers_admitted
 }
 
 // What this host knows of reaching one device. Survives the link itself.
@@ -160,20 +161,42 @@ udp_input :: proc(packet: []byte, from: pipe.Address) {
 	}
 }
 
+// What is known of reaching a device the roster admits; nil for any other, however well it was known before.
 @(private)
 peer_for :: proc(device: zsp.Key32) -> ^Peer {
+	if !admitted(device) {
+		return nil
+	}
 	for p in udp.links {
 		if p.device == device {
 			return p
 		}
 	}
-	if m := zsp.roster_member(&node.roster, device); m == nil || !zsp.member_active(m) || device == keys.device {
-		return nil
-	}
 	p := new(Peer)
 	p.device = device
 	append(&udp.links, p)
 	return p
+}
+
+@(private)
+admitted :: proc(device: zsp.Key32) -> bool {
+	m := zsp.roster_member(&node.roster, device)
+	return m != nil && zsp.member_active(m) && device != keys.device
+}
+
+// The roster has changed: a device it no longer admits is let go of, with all that was on its way to it, but a session,
+// which the node ends itself, saying why, and which goes with its link.
+@(private)
+peers_admitted :: proc() {
+	#reverse for p, i in udp.links {
+		if admitted(p.device) || p.session != nil {
+			continue
+		}
+		peer_drop(p)
+		delete(p.candidates)
+		free(p)
+		ordered_remove(&udp.links, i)
+	}
 }
 
 // Of two devices, the one with the lesser key dials.
@@ -233,8 +256,8 @@ peer_heard :: proc(p: ^Peer, l: ^pipe.Link, from: pipe.Address) {
 // answers only the knock of one that has no link, or thinks so; and only a proven one.
 @(private)
 peer_opened :: proc(p: ^Peer, l: ^pipe.Link) {
-	if l.state != .Open || (p.session != nil && l != p.answer) {
-		return
+	if l.state != .Open || (p.session != nil && l != p.answer) || !admitted(p.device) {
+		return // and one the roster no longer admits is let go of once links_run sees the roster has changed
 	}
 	if l == p.answer {
 		if p.session != nil {
@@ -497,6 +520,10 @@ links_run :: proc() {
 	announce_run(now)
 	if udp.asking && time.tick_diff(udp.asked, now) > STUN_WAIT {
 		udp.asking = false
+	}
+	if node.roster.serial != udp.admitted {
+		udp.admitted = node.roster.serial
+		peers_admitted()
 	}
 	// Something was written here: worth trying for a direct path to whoever is listening.
 	if node.events.next != udp.seen {

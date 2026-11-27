@@ -711,6 +711,66 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   }
 }
 
+// A device revoked is answered no more over UDP, however well it was known: once the link it had is gone, it says where it
+// is, or knocks, and is told nothing, nor learns of any roster after it.
+{
+  const owner = join(TMP, "revoking-owner");
+  const space = execFileSync(BIN, ["create", owner], { encoding: "utf8" }).trim();
+  // Two ports on one network of nothing: broadcasts reach the other, and the test sees what goes where.
+  const ip = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1);
+  const hear = new Map<number, (ip: Uint8Array, port: number, data: Uint8Array) => void>();
+  const sent: { from: number; to: number; type: number }[] = [];
+  let toB = 0; // when a last sent b anything
+  const datagrams = (port: number) => ({
+    port,
+    interfaces: () => [{ ip, broadcast: Uint8Array.of(127, 0, 0, 255) }],
+    send(_to: Uint8Array, to: number, data: Uint8Array) {
+      const at = to === 9083 ? (port === 40001 ? 40002 : 40001) : to;
+      sent.push({ from: port, to: at, type: data[0] });
+      if (port === 40001 && at === 40002) toB = Date.now();
+      const receive = hear.get(at);
+      if (receive) queueMicrotask(() => receive(ip, port, data.slice()));
+    },
+    listen(receive: (ip: Uint8Array, port: number, data: Uint8Array) => void) {
+      hear.set(port, receive);
+    },
+    close() {
+      hear.delete(port);
+    },
+  });
+  const until = async (what: string, f: () => boolean, within = 5000) => {
+    for (const end = Date.now() + within; !f(); await new Promise((done) => setTimeout(done, 10))) {
+      if (Date.now() > end) throw new Error("never: " + what);
+    }
+  };
+  const a = await Node.open({ volume: new MemoryVolume(), module, datagrams: datagrams(40001), log: () => {} });
+  const kept = new MemoryVolume();
+  const b = await Node.open({ volume: kept, module, datagrams: datagrams(40002), log: () => {} });
+  execFileSync(BIN, ["admit", owner, a.key, "1"]);
+  execFileSync(BIN, ["admit", owner, b.key, "1"]);
+  const first = readFileSync(join(owner, space, "roster"));
+  assert(a.adopt(first) && b.adopt(first));
+  await until("a links to b directly", () => sent.some((p) => p.from === 40001 && p.to === 40002 && p.type === 0x43));
+  // Gone, as a process is, before it is revoked: so that it is told nothing then, on the session it had.
+  await b.close();
+  execFileSync(BIN, ["revoke", owner, b.key]);
+  const c = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  execFileSync(BIN, ["admit", owner, c.key, "1"]);
+  execFileSync(BIN, ["subject", owner, c.key, "after b"]);
+  assert(a.adopt(readFileSync(join(owner, space, "roster"))));
+  // What its session there says as it ends goes unanswered, and the link with it, in LINK_DEAD: after which a probes no
+  // more, as it would at least every PROBE_MOST while it had it.
+  await until("a lets go of its link to b", () => Date.now() - toB > 4000, 30_000);
+  sent.length = 0;
+  const again = await Node.open({ volume: kept, module, datagrams: datagrams(40002), log: () => {} });
+  await until("b says where it is", () => sent.some((p) => p.from === 40002 && p.to === 40001));
+  await new Promise((done) => setTimeout(done, 1000));
+  const answered = sent.filter((p) => p.from === 40001 && p.to === 40002 && (p.type === 0x41 || p.type === 0x42));
+  assert.equal(answered.length, 0, "a revoked device was knocked for, or answered");
+  assert(!again.members().some((m) => m.subject === "after b"), "a revoked device learned of a roster after it");
+  await Promise.all([a.close(), again.close(), c.close()]);
+}
+
 // Where a relay keeps a space, a proxy's query staying at the end.
 assert.equal(spaceUrl("wss://relay.example/", "ab"), "wss://relay.example/ab");
 assert.equal(spaceUrl("wss://relay.example/zsp?key=1", "ab"), "wss://relay.example/zsp/ab?key=1");
