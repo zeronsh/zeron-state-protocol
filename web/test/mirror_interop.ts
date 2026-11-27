@@ -109,6 +109,7 @@ function luau(): { ask: (line: string) => Promise<string>; done: () => Promise<v
   }
   const p = spawn("lune", ["run", join(here, "mirror_interop.luau"), relative(here, path)], { stdio: ["pipe", "pipe", "inherit"] });
   const lines = createInterface({ input: p.stdout })[Symbol.asyncIterator]();
+  const ended = new Promise<number | null>((go) => p.on("close", (code) => go(code))); // heard however early it ends
   return {
     ask: async (line) => {
       p.stdin.write(line + "\n");
@@ -118,9 +119,8 @@ function luau(): { ask: (line: string) => Promise<string>; done: () => Promise<v
     },
     // Ends the Luau side, and fails if it did not end well: what it said wrong after its last answer is a failure too.
     done: async () => {
-      const ended = new Promise<number | null>((go) => p.on("close", go));
-      p.stdin.end("quit\n");
-      const code = p.exitCode ?? (await ended);
+      if (p.exitCode === null && p.signalCode === null) p.stdin.end("quit\n");
+      const code = await ended;
       if (dir) rmSync(dir, { recursive: true, force: true });
       if (code !== 0) throw new Error(`the Luau side ended with ${code}`);
     },
