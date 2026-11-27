@@ -43,7 +43,13 @@ Retain :: struct {
 	left:    u64, // what was held when it was last done, so that what is held and cannot go is not gone over again and again
 	ended:   u64, // when it was last done
 	forgot:  u64, // the store's count of what it forgot, as the pass began
+	unsaved: u64, // when lists' ages first changed since they were written down, if they have: see RETAIN_SAVE
 }
+
+// How long after lists' ages change they are written down, by a checkpoint, however little else was: a browser's tab
+// may go at any moment, without the node being stopped, and a list read just now must not seem a month old after.
+@(private)
+RETAIN_SAVE :: 5000
 
 @(private)
 Aged :: struct {
@@ -72,6 +78,8 @@ node_retain_due :: proc(n: ^Node) -> u64 {
 		return 0
 	case n.retain.running:
 		return max(n.now, 1)
+	case n.retain.unsaved != 0 && (n.retain.due == 0 || n.retain.unsaved + RETAIN_SAVE < n.retain.due):
+		return n.retain.unsaved + RETAIN_SAVE
 	}
 	return n.retain.due
 }
@@ -108,6 +116,9 @@ used_stamp :: proc(n: ^Node, lo, hi: Key) {
 @(private)
 used_now :: proc(n: ^Node, list: List) {
 	tree_put(n, &n.used, {list[0], list[1], 0, 0, 0}, {n.now, 0})
+	if n.retain.unsaved == 0 {
+		n.retain.unsaved = max(n.now, 1)
+	}
 	if n.keep.age > 0 && !n.retain.running && (n.retain.due == 0 || n.retain.due > n.now + n.keep.age) {
 		n.retain.due = n.now + n.keep.age
 	}
@@ -132,6 +143,10 @@ node_retain :: proc(n: ^Node) -> (more: bool) {
 	if !retaining(n) {
 		retain_reset(r)
 		return false
+	}
+	if !r.running && r.unsaved != 0 && n.now >= r.unsaved + RETAIN_SAVE {
+		r.unsaved = 0
+		store_checkpoint(&n.store)
 	}
 	if !r.running {
 		if r.due == 0 || n.now < r.due {
@@ -223,7 +238,7 @@ retain_done :: proc(n: ^Node) {
 @(private)
 retain_reset :: proc(r: ^Retain) {
 	delete(r.lists)
-	r^ = {due = r.due, left = r.left, ended = r.ended}
+	r^ = {due = r.due, left = r.left, ended = r.ended, unsaved = r.unsaved}
 }
 
 // A step over the shelf, a list at a time, letting go of lists nobody has watched for long enough. True while there
@@ -273,6 +288,9 @@ list_used :: proc(n: ^Node, list: List) -> u64 {
 		return v[0]
 	}
 	tree_put(n, &n.used, {list[0], list[1], 0, 0, 0}, {n.now, 0})
+	if n.retain.unsaved == 0 {
+		n.retain.unsaved = max(n.now, 1)
+	}
 	return n.now
 }
 
@@ -337,6 +355,7 @@ retain_list :: proc(n: ^Node, list: List, lo: Key, used: u64, seen: ^int) -> (at
 	held := retain_held(n, list)
 	gone := make([dynamic]Id, context.temp_allocator)
 	at, done = hi, true
+	seen_rows := make(map[Id]bool, context.temp_allocator) // a row in several places of the list goes once
 	scan := tree_scan(n, n.shelf, lo, hi)
 	for leaf in tree_next(&scan) {
 		if seen^ >= RETAIN_STEP {
@@ -345,9 +364,10 @@ retain_list :: proc(n: ^Node, list: List, lo: Key, used: u64, seen: ^int) -> (at
 		}
 		seen^ += 1
 		row := key_row(leaf.key)
-		if held_by_none(n, row, leaf.key, held[:], used) {
+		if row not_in seen_rows && held_by_none(n, row, leaf.key, held[:], used) {
 			append(&gone, row)
 		}
+		seen_rows[row] = true
 	}
 	lost := make([dynamic]Leaf, context.temp_allocator)
 	for row in gone {

@@ -5,6 +5,7 @@ local codec = require("../zsp/codec")
 local zsp = require("../zsp")
 
 local HELLO, ROSTER, WATCH, CELLS, ACK, SYNCED = 1, 2, 3, 7, 8, 10
+local ANSWER, FETCH = 34, 35
 
 type Said = { kind: number, body: string }
 
@@ -315,6 +316,40 @@ do
 	greet()
 	assert(connects == 2)
 	assert(sends - before >= 2, "the burst went again, to the next pipe")
+end
+
+-- A text of a row not held, that nobody can say more of than that it is not held here, as a partial replica with nobody
+-- to ask who can read says: what is typed is kept, and written once it is closed, not held back for ever.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local id = "\0\0\0\1" .. "\106\11\28\45" .. "\1\2\3\4\5\6\7\8"
+	local editor = h.client:text(id, Note.body)
+	h.run()
+	editor.append("typed offline")
+	h.run()
+	local fetched = h.last(FETCH)
+	assert(fetched, "the row was not asked for once")
+	local w = codec.writer()
+	codec.put_varint(w, codec.varint(codec.reader(fetched.body)))
+	codec.put_u8(w, 32) -- the last, and not settled: what is held, which is nothing
+	for _ = 1, 4 do
+		codec.put_varint(w, 0)
+	end
+	h.tell(ANSWER, codec.string(w))
+	assert(editor.read() == "typed offline")
+	local function cells(): number
+		local n = 0
+		for _, x in h.self.said do
+			n += if x.kind == CELLS then 1 else 0
+		end
+		return n
+	end
+	local before = cells()
+	editor.close()
+	h.run()
+	assert(cells() > before, "what was typed was never written")
 end
 
 -- Writing nothing is still done; clearing a text says so.

@@ -1110,16 +1110,23 @@ export class Client {
       here?.();
       return;
     }
-    if (here) row.awaited.push(here);
+    const question = { scope: codec.u32Of(row.id), table: {}, where: ask.where.ids([row.hex]), limit: 1 };
+    const release = () => {
+      const awaited = row.awaited;
+      row.awaited = [];
+      for (const f of awaited) f();
+    };
+    if (here) {
+      row.awaited.push(here);
+      // Once, too: answered by one who holds everything if one can be reached, and otherwise with what is held, as a
+      // partial replica with nobody to ask that can read answers it, never "ready". What waits for the row goes on then.
+      if (row.awaited.length === 1) void this.fetch(question).then(release, release);
+    }
     if (row.asking) return;
     const hear = (answer: Answer<any>) => {
-      if (answer.rows.length > 0 || answer.status === "ready" || answer.status === "denied") {
-        const awaited = row.awaited;
-        row.awaited = [];
-        for (const f of awaited) f();
-      }
+      if (answer.rows.length > 0 || answer.status === "ready" || answer.status === "denied" || answer.status === "faulty") release();
     };
-    const asked = this.ask({ scope: codec.u32Of(row.id), table: {}, where: ask.where.ids([row.hex]), limit: 1 }, hear);
+    const asked = this.ask(question, hear);
     if (row.held.size > 0) row.asking = asked.stop;
     else asked.stop();
   }

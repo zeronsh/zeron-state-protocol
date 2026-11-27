@@ -70,9 +70,10 @@ up by a full replica now: when the last one goes, the window is `"stale"` again,
 
 **A question is answered by a full replica that can read, when one is reachable**: a zspd device, or a browser's opened with
 `full: true`. The partial device holds the rows of the answer, and keeps them up. When none can read, but a relay holds the
-space, the lists a question names (`where.inList`, as every question of `mirror.ask` does) are fetched whole from the relay,
-and the question is answered as a full replica would answer it, `"ready"` once the relay has confirmed them. A question that
-names no list is about a whole scope, and is answered from what is held, `"stale"`, for that is all it can be.
+space, the list a question names (`where.inList`, as every question of `mirror.ask` does) is fetched whole from the relay,
+and the question is answered as a full replica would answer it, `"ready"` once the relay has confirmed it all. A question
+that names no list, or that joins rows of others (`refers`, `referred`), is about more than one list, and is answered from
+what is held, `"stale"`, for that is all it can be.
 
 **What a partial device keeps, and for how long.** Whatever is watched or asked about, and whatever it wrote that no full
 replica is yet known to hold, it keeps, however long. Of the rest it keeps a list for 30 days after it was last watched or

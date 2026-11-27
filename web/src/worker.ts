@@ -26,7 +26,7 @@ export interface Options {
 export type Command = { open: Options } | { connect: MessagePort } | { ask: number; op: Op; args: unknown[] };
 
 /** What a device can be asked to do, by whichever tab. */
-export type Op = "identity" | "join" | "adopt" | "member" | "create" | "scope" | "admit" | "revoke" | "subject" | "admin" | "owner" | "relay" | "members" | "usage";
+export type Op = "identity" | "join" | "adopt" | "member" | "create" | "scope" | "admit" | "revoke" | "subject" | "admin" | "owner" | "relay" | "members" | "usage" | "close";
 
 /** What a worker tells its tab: an answer; that the node has stopped, its storage having failed; or the space it is of. */
 export type Report = { answer: number; value?: unknown; error?: string } | { failed: string } | { space: string | undefined };
@@ -124,6 +124,16 @@ function breakCarried(): void {
 // ---------------------------------------------------------------- the device, for any tab
 
 async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: string }> {
+  if (op === "close") {
+    // This tab's device goes: if this worker runs the node, it is stopped as it should be, what it holds written down,
+    // before the worker goes with the lock and another takes it. Another's node is not this tab's to stop.
+    if (device) {
+      const d = device;
+      device = undefined;
+      await d.close().catch(() => {});
+    }
+    return {};
+  }
   if (device) return answer(op, args);
   contend();
   const id = crypto.randomUUID();
@@ -173,6 +183,8 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
         return { value: d.members() };
       case "usage":
         return { value: { held: d.held, memory: d.memory } };
+      case "close":
+        return {}; // see ask
     }
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) };

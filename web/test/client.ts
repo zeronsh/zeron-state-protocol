@@ -257,6 +257,33 @@ const tick = () => new Promise<void>((done) => setTimeout(done, 0));
   assert(sends - before >= 2, "the burst went again, to the next pipe");
 }
 
+// A text of a row not held, that nobody can say more of than that it is not held here, as a partial replica with nobody
+// to ask who can read says: what is typed is kept, and written once it is closed, not held back for ever.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const id = "00000001" + "6a0b1c2d" + "0102030405060708";
+  const editor = h.client.text(id, Note.body);
+  h.run();
+  editor.append("typed offline");
+  h.run();
+  const fetched = h.last(FETCH);
+  assert(fetched, "the row was not asked for once");
+  const w = codec.writer();
+  codec.putVarint(w, codec.varint(codec.reader(b(fetched.body))));
+  codec.putU8(w, 32); // the last, and not settled: what is held, which is nothing
+  for (let i = 0; i < 4; i++) codec.putVarint(w, 0);
+  h.tell(ANSWER, s(codec.written(w)));
+  await tick();
+  h.run();
+  assert.equal(editor.read(), "typed offline");
+  const before = h.self.said.filter((x) => x.kind === CELLS).length;
+  editor.close();
+  h.run();
+  assert(h.self.said.filter((x) => x.kind === CELLS).length > before, "what was typed was never written");
+}
+
 // Writing nothing is still done; clearing a text says so.
 {
   const h = harness();

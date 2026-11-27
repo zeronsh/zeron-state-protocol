@@ -128,6 +128,9 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     usage: () => ask<{ held: number; memory: number }>("usage"),
     connect,
     client: (host = {}) => new Client({ ...host, connect }),
-    close: async () => worker.terminate(),
+    close: async () => {
+      await ask<void>("close").catch(() => {});
+      worker.terminate();
+    },
   };
 }

@@ -1030,27 +1030,36 @@ function Client._keep(self: Client, row: Stored, here: (() -> ())?)
 		end
 		return
 	end
+	local function question(): asking.Question
+		return { scope = string.unpack(">I4", row.id) :: any, table = {}, where = asking.where.ids({ row.id }), limit = 1 }
+	end
+	local function release()
+		local awaited = row.awaited
+		row.awaited = {}
+		for _, f in awaited do
+			f()
+		end
+	end
 	if here then
 		table.insert(row.awaited, here)
+		-- Once, too: answered by one who holds everything if one can be reached, and otherwise with what is held, as a
+		-- partial replica with nobody to ask that can read answers it, never "ready". What waits for the row goes on then.
+		if #row.awaited == 1 then
+			coroutine.wrap(function()
+				pcall(self.fetch, self, question())
+				release()
+			end)()
+		end
 	end
 	if row.asking then
 		return
 	end
 	local function hear(answer: Answer)
-		if #answer.rows > 0 or answer.status == "ready" or answer.status == "denied" then
-			local awaited = row.awaited
-			row.awaited = {}
-			for _, f in awaited do
-				f()
-			end
+		if #answer.rows > 0 or answer.status == "ready" or answer.status == "denied" or answer.status == "faulty" then
+			release()
 		end
 	end
-	local asked = self:ask({
-		scope = string.unpack(">I4", row.id) :: any,
-		table = {},
-		where = asking.where.ids({ row.id }),
-		limit = 1,
-	}, hear)
+	local asked = self:ask(question(), hear)
 	if next(row.held) then
 		row.asking = asked.stop
 	else

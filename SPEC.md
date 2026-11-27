@@ -333,12 +333,12 @@ A **full replica** watches, on each session it dials, every scope it can read, w
 keeps what it wrote on record until a full replica acknowledges it, offering it again on every session with one. A full replica's acknowledgement is
 counted on, and what it acknowledged forgotten: so a store that last served as a full one is a full replica, though asked to be partial, until a full
 replica it brought level, in every scope it holds keys for, has said it holds all it was sent, with nothing refused; meanwhile it keeps on record what its
-clients write and what peers that are not relays give it, says in its Hello that it is not a full replica, so that nobody counts on it nor is brought
-level with it, and it is partial from its next start. So a device may be either, from one start to the next, and lose nothing. A peer's
+clients write, says in its Hello that it is not a full replica, so that nobody counts on it nor is brought level with it, and watches whole whichever end
+dialled; and it is partial from its next start. So a device may be either, from one start to the next, and lose nothing. A peer's
 Synced for an interest is believed only from a full replica asked for it, settled or denied, of a range within its scope that meets what was asked; a
 whole-scope watch counts as level only when settled; an Ack of more than was sent ends the session
 as *malformed*. When all a dialler's whole-scope watches are level, and it has sent all the other
-lacked, it says so: Synced with id 0, settled, empty keys and zero counts. The other heeds it from a full replica that has such a watch here. When the
+lacked, it says so: Synced with id 0, settled, empty keys and zero counts (and so does one becoming partial that watches whole, though dialled). The other heeds it from a full replica that has such a watch here. When the
 roster changes, all of these are asked for afresh: either end may have dropped one under a roster the other never heard.
 
 With *counts* the owner says Synced again whenever, after a burst of changes, how much lies before or after differs from what it last said. A
@@ -597,10 +597,10 @@ each row's key, as in a Watch, in place of its id, any key of it. The partial re
 places, data and live, and answers its client once it holds the rows. It believes nothing else that would not be an answer to what it asked. A device that will not answer faults *unserved*, and another is asked; until one
 does, and when none can be reached, the answer is of what is held. A Fetch waits for the other, if one can be reached, and for its rows to be confirmed.
 
-With none to ask that can read, but a full replica that holds what it cannot, as a relay, a partial replica watches, data and live, the lists a
-question's rows must all be in, if it names any, and answers as it would were it full; the answer is *settled* while that replica has confirmed them
-all. Once one that can read answers, those lists are watched no longer. A question that names no list is about a whole scope, and is answered of what is
-held.
+With none to ask that can read, but a full replica that may be sent the scope and holds what it cannot, as a relay, a partial replica watches, data and
+live, a list the question's rows must all be in, if it names one at its top and joins no others, and answers as it would were it full; the answer is
+*settled* while that replica has confirmed the list and it has all been found. Once one that can read answers, the list is watched no longer. A question
+that names no list, or joins others, is answered of what is held.
 
 ## 16 Who handles what
 

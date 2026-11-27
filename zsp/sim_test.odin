@@ -1654,6 +1654,10 @@ review_keep_bounds :: proc(t: ^testing.T) {
 	node_keep(&phone.node, {age = max(u64), bytes = max(u64)})
 	for node_retain(&phone.node) {}
 	sim_put(&s, phone, 1)
+	// What it wrote is written down a little after, as when lists were last used is; and then nothing for a long while.
+	s.now += 10_000
+	phone.node.now = sim_now(&s, phone)
+	for node_retain(&phone.node) {}
 	due := node_retain_due(&phone.node)
 	testing.expectf(t, due == 0 || due > phone.node.now + 24 * 3600 * 1000, "due %v at %v", due, phone.node.now)
 }
@@ -2170,6 +2174,112 @@ review4_refused_early :: proc(t: ^testing.T) {
 			testing.expectf(t, n < 10, "a peer put %d rows in the outbox", n)
 		}
 	}
+}
+
+// When lists were last watched is written down soon after, though the node is never stopped, as a browser's tab may go
+// without stopping it: a list read the day before is not let go of after, and one read long ago is. (Review 5, 2.)
+@(test)
+review5_ages_are_kept :: proc(t: ^testing.T) {
+	state := seeded(81)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, phone := s.nodes[0], s.nodes[1]
+	DAY :: 24 * 3600 * 1000
+	sim_put(&s, big, 1)
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	list := List{1 << 32 | 5, 5}
+	tick :: proc(s: ^Sim, x: ^Sim_Node, after: u64) {
+		s.now += after
+		for y in s.nodes {
+			y.node.now = sim_now(s, y)
+		}
+		for node_retain(&x.node) {} // as a host does, when it is due
+	}
+	look :: proc(s: ^Sim, x: ^Sim_Node, list: List) {
+		ui := sim_client(s, x)
+		sim_watch(ui, 1, list_lo(list), list_hi(list), 0, {data = true})
+		sim_settle(s)
+		session_close(ui)
+		sim_settle(s)
+	}
+	// Gone without being stopped: what was synced is there, and what was checkpointed.
+	gone :: proc(s: ^Sim, x: ^Sim_Node) {
+		#reverse for l, j in s.links {
+			if l.a.node == &x.node || l.b.node == &x.node {
+				sim_cut(s, j)
+			}
+		}
+		testing.expect(s.t, store_sync(&x.node.store))
+		node_destroy(&x.node)
+		keyring_destroy(&x.keys)
+		keyring_init(&x.keys, x.secret)
+		if x.kept != nil {
+			testing.expect(s.t, keyring_load(&x.keys, x.kept))
+		}
+		sim_boot(s, x)
+		node_keep(&x.node, {age = 30 * DAY, bytes = 0})
+	}
+	node_keep(&phone.node, {age = 30 * DAY, bytes = 0})
+	look(&s, phone, list)
+	testing.expect(t, store_checkpoint(&phone.node.store)) // as it was, on the first day
+	tick(&s, phone, 10_000)
+	tick(&s, phone, 29 * DAY)
+	look(&s, phone, list) // read again on the 29th day
+	tick(&s, phone, 10_000)
+	gone(&s, phone)
+	tick(&s, phone, 2 * DAY)
+	testing.expect_value(t, store_range(&phone.node.store, list_lo(list), list_hi(list)).count, 1)
+	// And one not read again goes when its time is up, however often the device comes and goes.
+	tick(&s, phone, 10_000)
+	gone(&s, phone)
+	tick(&s, phone, 29 * DAY)
+	testing.expect_value(t, store_range(&phone.node.store, list_lo(list), list_hi(list)).count, 0)
+}
+
+// A row in several places of one list that is let go of is let go of once: what it left behind is counted once.
+// (Review 5, 3.)
+@(test)
+review5_let_go_once :: proc(t: ^testing.T) {
+	state := seeded(82)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, phone := s.nodes[0], s.nodes[1]
+	list := List{1 << 32 | 5, 5}
+	big.node.now = sim_now(&s, big)
+	row := node_id(&big.node, 1)
+	cells := make([dynamic]Cell, context.temp_allocator)
+	for slot in PLACE ..< PLACE + 5 {
+		body := make([]byte, 24, context.temp_allocator)
+		put_u64(body, list[0])
+		put_u64(body[8:], list[1])
+		put_u64(body[16:], u64(slot))
+		append(&cells, Cell{row, slot, .Place, node_stamp(&big.node), body})
+	}
+	append(&cells, Cell{row, DATA, .Value, node_stamp(&big.node), make([]byte, 10_000, context.temp_allocator)})
+	testing.expect(t, node_write(&big.node, cells[:]))
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	node_keep(&phone.node, {age = 1000, bytes = 0})
+	ui := sim_client(&s, phone)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 0, {data = true})
+	sim_settle(&s)
+	session_close(ui)
+	sim_settle(&s)
+	held := store_held(&phone.node.store)
+	forgot := phone.node.forgot
+	s.now += 5000
+	phone.node.now = sim_now(&s, phone)
+	for node_retain(&phone.node) {}
+	testing.expect_value(t, store_range(&phone.node.store, list_lo(list), list_hi(list)).count, 0)
+	testing.expectf(t, phone.node.forgot - forgot == 6, "forgot %d cells of 6", phone.node.forgot - forgot)
+	_ = held
 }
 
 @(private)

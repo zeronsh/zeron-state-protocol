@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { Chrome, findChrome, type Page } from "./chrome.ts";
 import { cloud, eventually, exists, expectEqual, node, proxy, stopAll, cleanUp, ROOT, TMP, token, zspd, zspdConnect } from "./procs.ts";
 import { Client, columns, type State } from "../src/client.ts";
+import { where } from "../src/ask.ts";
 import type { Side } from "./browser.ts";
 
 // A machine without a browser cannot run these, and says so; but CI is never such a machine.
@@ -359,6 +360,13 @@ const tests: Record<string, () => Promise<void>> = {
     await call(again, "device", "bp");
     await call(again, "put", "bp", "feed", ["partial again"]);
     await eventually("what it writes as a partial one again is had by the others", () => theirs?.rows.some((r) => r.title === "partial again") === true, 20000);
+    // Closed as a device is closed, it is stopped as it should be, and opened again it is as it was.
+    await call(again, "close", "bp");
+    await again.close();
+    pages.splice(pages.indexOf(again), 1);
+    const last = await page();
+    await call(last, "device", "bp");
+    expectEqual((await call<string[]>(last, "titles", "bp", "feed", 1)).includes("partial again"), true);
     writer.close();
   },
   async browser_restart() {
@@ -448,14 +456,18 @@ const partialBench = async () => {
     const check = await openNode({ dir: join(TMP, `pb-${results.length}-check`), udp: false, log: () => {} });
     s.admit(check.key, "check", false);
     await check.join(s.sid, relay);
-    await eventually("the relay has it all", async () => (await check.usage()).held > ROWS * 150 + TEXTS * TEXT, 900000);
+    // Every row, counted by a full device beside the relay: until then the owner is still sending it, slowly.
+    const counter = check.client();
+    const count = async (list: string) => (await counter.fetch({ scope: 1, table: {}, where: where.inList(list), limit: 1 })).total;
+    await eventually("the relay has it all", async () => (await count("big")) === ROWS && (await count("docs")) === TEXTS, 1800000);
     let all = 0;
-    await eventually("and the device beside it all of it", async () => {
+    await eventually("and has had it all", async () => {
       const held = (await check.usage()).held;
       const same = held === all;
       all = held;
-      return same;
-    }, 900000).catch(() => {});
+      return same && (await new Promise((done) => setTimeout(done, 1000)), (await check.usage()).held === all);
+    }, 60000);
+    counter.close();
     await check.close();
     console.log(`     ${net.name}: ${ROWS} rows and ${TEXTS} texts of ${TEXT / 1000} KB, ${mb(all)}, written in ${ms(performance.now() - began)}`);
     // A full device holds everything once it holds what the one beside the relay does; a partial one is given ten seconds.
