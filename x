@@ -62,11 +62,14 @@ web_test() {
 	node test/package.ts
 	node test/udp.ts
 	node test/find_memory.ts
-	for t in text mirror_model mirror_interop store end_to_end browsers tabs; do
+	for t in text mirror_model mirror_interop store end_to_end browsers; do
 		args=
 		[ $t = store ] && args=../build/node-small.wasm
 		(node test/$t.ts $args >../build/web-$t.log 2>&1 || echo web-$t >>../build/failed) &
 	done
+	# And the tabs after the browsers, rather than beside them: one Chrome at a time, as a small machine has room for.
+	wait $!
+	(node test/tabs.ts >../build/web-tabs.log 2>&1 || echo web-tabs >>../build/failed) &
 	wait
 	for t in text mirror_model mirror_interop store end_to_end browsers tabs; do
 		cat ../build/web-$t.log
