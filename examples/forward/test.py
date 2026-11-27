@@ -7,6 +7,7 @@ the writer back, rather than everything piling up between; a refusal; and what t
 
 import hashlib
 import os
+import random
 import re
 import shutil
 import socket
@@ -182,6 +183,19 @@ def held_back(port, stalled):
         return sent
 
 
+def unused():
+    """A port nothing listens at, and that no socket asking for any port is given meanwhile, as the forward's own
+    listeners are: one below where every system's ephemeral ports begin (32768 on Linux, 49152 on macOS and Windows)."""
+    while True:
+        port = random.randrange(20000, 32000)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+
+
 def refused(port):
     """Nothing listens there, or it is not allowed, or the roster does not let the call be made: the connection here is
     closed or reset, at once, and nothing comes back."""
@@ -209,11 +223,7 @@ def main(root, direct):
         space = f.read().strip()
     zspd("join", b.dir, space, relay.name, "ws://" + relay.address)
     echo, stalled = Server(), Server(stalled=True)
-    # A port nothing listens at, held so for the whole test: bound and never listening, so that it refuses every
-    # connection, and no listener made meanwhile, as the forward's own, can be given it.
-    closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    closed.bind(("127.0.0.1", 0))
-    nothing = closed.getsockname()[1]
+    nothing = unused()
     to = {name: f"127.0.0.1:{port}" for name, port in (("echo", echo.port), ("stalled", stalled.port), ("nothing", nothing), ("unallowed", 1))}
     procs = []
     try:
@@ -254,7 +264,6 @@ def main(root, direct):
         bulk(port, 1 << 20)
         return sent
     finally:
-        closed.close()
         for p in procs:
             stop(p)
         relay.stop()
