@@ -455,7 +455,8 @@ slow to arrive, or whose pipe was full, sees the rest as it is typed.
 A call is a stream of messages each way. `device` is the callee's on the way out and the caller's on arrival. For whom is at most 64 bytes: what a client says of that is disregarded, and its node says whom its host accepted it for, or nothing; the
 last node tells its own client the same if the calling device has Vouch in that scope, and otherwise the device's `subject`. Who may not vouch may not call for another: *denied*. Ids belong to whoever sent
 Call on that session. A call ends when both sides have sent End, or on Fault or Cancel. Each side may have 256 KiB of messages outstanding beyond what the
-other has credited, and may be credited ahead of what it has sent up to 4 MiB; the first message counts. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
+other has credited, and may be credited ahead of what it has sent up to 4 MiB, a node passing on of a credit what it comes to within that; the first message counts. A Flow
+whose payload is not what its kind says, as a credit that is not one varint or a fault without its code, is the sender's session's fault. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
 What answers a call at a device is the device's affair: a local client that serves the method, or the host itself in its stead; to the caller
 they are alike. (Here a local client serves at most 256 methods at once, and whether it may answer is asked as a call comes: of those that serve
 a method, one that may not call in the scope is passed over.)
