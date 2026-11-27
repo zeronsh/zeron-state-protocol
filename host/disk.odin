@@ -107,6 +107,21 @@ segment_file :: proc(d: ^File_Disk, number: u64) -> ^os.File {
 	return f
 }
 
+// Lets go of the files of segments from `first` on, before they go: one still open would be written to nothing, its
+// writes lost with a sync to say they were kept, or read from as though it were still there; and Windows removes no file
+// that is open.
+@(private)
+segments_close :: proc(d: ^File_Disk, first: u64, last := max(u64)) {
+	if d.active != nil && d.number >= first && d.number <= last {
+		os.close(d.active)
+		d.active, d.number, d.dirty = nil, max(u64), false // what it held is not wanted
+	}
+	if d.reading != nil && d.read_no >= first && d.read_no <= last {
+		os.close(d.reading)
+		d.reading, d.read_no = nil, max(u64)
+	}
+}
+
 @(private)
 disk_sync :: proc(f: ^os.File) -> bool {
 	return os.sync(f) == nil
@@ -160,21 +175,22 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 		},
 		log_drop = proc(data: rawptr, segment: u64) {
 			d := (^File_Disk)(data)
-			if segment == d.read_no {
-				os.close(d.reading)
-				d.reading, d.read_no = nil, max(u64)
-			}
+			segments_close(d, segment, segment)
 			os.remove(segment_path(d, segment))
 		},
 		log_truncate = proc(data: rawptr, off: u64) {
 			d := (^File_Disk)(data)
+			last := off / zsp.SEGMENT
+			segments_close(d, last + 1)
 			files, _ := os.read_all_directory_by_path(d.dir, context.temp_allocator)
 			for f in files {
-				if number, ok := segment_number(f.name); ok && number > off / zsp.SEGMENT {
+				if number, ok := segment_number(f.name); ok && number > last {
 					os.remove(segment_path(d, number))
 				}
 			}
-			if f, err := os.open(segment_path(d, off / zsp.SEGMENT), {.Write}); err == nil {
+			if last == d.number {
+				os.truncate(d.active, i64(off % zsp.SEGMENT))
+			} else if f, err := os.open(segment_path(d, last), {.Write}); err == nil {
 				os.truncate(f, i64(off % zsp.SEGMENT))
 				os.close(f)
 			}

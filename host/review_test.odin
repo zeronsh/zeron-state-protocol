@@ -1,5 +1,7 @@
 package host
 
+import "core:os"
+import "core:path/filepath"
 import "core:testing"
 import "../pipe"
 import "../zsp"
@@ -151,4 +153,61 @@ review_pings_owe_one_answer :: proc(t: ^testing.T) {
 	quiet.phase = .Noise
 	defer delete(quiet.in_buf)
 	testing.expect(t, !stream_input(&quiet, big[:]), "a mebibyte is waited for before any session")
+}
+
+// What a store forgets of its log is forgotten by the files that held it: a segment truncated away, or dropped, while it
+// is the one written to, is made again by the next write to it, and what is written then is there after a restart.
+@(test)
+review_disk_forgets_open_segments :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	root, err := os.make_directory_temp(base, "zsp-disk-*", context.temp_allocator)
+	testing.expect(t, err == nil)
+	defer os.remove_all(root)
+	seg := u64(zsp.SEGMENT)
+	read :: proc(dir: string, off: u64, n: int) -> (end: u64, got: string) {
+		d: File_Disk
+		if !file_disk_open(&d, dir) {
+			return
+		}
+		disk := file_disk(&d)
+		defer disk.close(disk.data)
+		buf := make([]byte, n, context.temp_allocator)
+		if disk.log_read(disk.data, off, buf) {
+			got = string(buf)
+		}
+		return disk.log_end(disk.data), got
+	}
+
+	truncated, _ := filepath.join({root, "truncated"}, context.temp_allocator)
+	{
+		d: File_Disk
+		testing.expect(t, file_disk_open(&d, truncated))
+		disk := file_disk(&d)
+		testing.expect(t, disk.log_write(disk.data, 0, transmute([]byte)string("first")))
+		testing.expect(t, disk.log_write(disk.data, seg, transmute([]byte)string("dropped")))
+		buf: [7]byte
+		testing.expect(t, disk.log_read(disk.data, seg, buf[:])) // and read, so that both handles are its
+		disk.log_truncate(disk.data, 5)
+		testing.expect(t, !disk.log_read(disk.data, seg, buf[:]), "a segment truncated away is still read")
+		testing.expect(t, disk.log_write(disk.data, seg, transmute([]byte)string("kept")))
+		testing.expect(t, disk.log_sync(disk.data))
+		disk.close(disk.data)
+	}
+	end, got := read(truncated, seg, 4)
+	testing.expectf(t, end == seg + 4 && got == "kept", "after a truncation: end %d, %q", end, got)
+
+	dropped, _ := filepath.join({root, "dropped"}, context.temp_allocator)
+	{
+		d: File_Disk
+		testing.expect(t, file_disk_open(&d, dropped))
+		disk := file_disk(&d)
+		testing.expect(t, disk.log_write(disk.data, 0, transmute([]byte)string("old")))
+		testing.expect(t, disk.log_sync(disk.data))
+		disk.log_drop(disk.data, 0)
+		testing.expect(t, disk.log_write(disk.data, 0, transmute([]byte)string("new!")))
+		testing.expect(t, disk.log_sync(disk.data))
+		disk.close(disk.data)
+	}
+	end, got = read(dropped, 0, 4)
+	testing.expectf(t, end == 4 && got == "new!", "after a drop: end %d, %q", end, got)
 }
