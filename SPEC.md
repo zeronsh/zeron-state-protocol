@@ -288,8 +288,10 @@ waits, saying nothing, until a roster comes, from its peer or from anyone, and i
 **Took.** A peer that says in its Hello that it says what it took (16) says, now and then, how many more bytes of the session's
 stream have come to it, whole frames or not, but those of Took frames, and those of what has come and is not yet taken in that is,
 or may yet prove to be, of one. To such a peer, what is made is held to a window: what is made and not yet said to have come is
-kept to two and a half times the most delivered lately per millisecond, times the least round trip timed on the session (64 KiB
-at least, 256 KiB until timed); a round trip is timed from when the first byte of what the host takes is taken to when it is said
+kept to two and a half times the most delivered lately per millisecond, times the least round trip timed on the session, or 20 ms
+if that is less (a peer says what came once it has taken it in, a message at a time, and a round trip shorter than that is none of
+the way's: two ends a millisecond apart would take turns, each waiting while the other worked) (64 KiB at least, 256 KiB until
+timed); a round trip is timed from when the first byte of what the host takes is taken to when it is said
 to have come. So whatever lies between, a socket's buffers, a proxy's, a network's, holds no more than that, and what goes first
 (a window of limited size newly asked for, and what it is owed, which may go 64 KiB beyond it) is taken within about a round trip
 or two, rather than after all that was handed over before it. Changes and Fills are held to it; frames that answer or ask, and

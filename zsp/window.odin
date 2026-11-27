@@ -9,6 +9,13 @@ package zsp
 // lump, leaves the way idle now and then). (Ever: a round trip taken later may have waited behind what the window let wait, and taken for the least,
 // would let more wait, and so on. A way that becomes slower is mostly a way taken afresh, by a session anew.)
 //
+// But never as less than WINDOW_RTT_LEAST. A peer says what it took once it has taken in a whole message, and a round
+// trip shorter than taking one in is no round trip of the way: on a way of a millisecond, a window of a few
+// milliseconds' worth holds a message or two, and the two ends take turns, the peer taking in what was made while this
+// end waits for word of it, and then this end making more while the peer waits for it; which takes the rate measured
+// down, and with it the window, until a message at a time goes. Whatever goes first then waits behind no more than
+// that much of taking in.
+//
 // What is taken is what has come, whole frames or not: a frame of 400 KB, said to be taken only once it had all come,
 // would keep the window shut for as long as it took to come, and then the way idle for a round trip.
 //
@@ -21,6 +28,7 @@ WINDOW_MAX :: 64 << 20
 WINDOW_HEADROOM :: 64 << 10 // what goes first may go so far beyond it
 WINDOW_SAMPLE :: 16 << 10 // a round trip is timed once for so many bytes
 WINDOW_GAIN :: 5 // halves: the window is so many halves of what is delivered in a round trip
+WINDOW_RTT_LEAST :: 20 // ms: the least round trip the window is reckoned for
 WINDOW_RATE_KEPT :: 2000 // ms: the most delivered is that of this long
 
 Window :: struct {
@@ -114,7 +122,7 @@ on_took :: proc(s: ^Session, r: ^Reader) {
 		if w.rtt == 0 || rtt < w.rtt {
 			w.rtt = rtt
 		}
-		w.size = clamp(WINDOW_GAIN * w.rate * w.rtt / 2, WINDOW_MIN, WINDOW_MAX)
+		w.size = clamp(WINDOW_GAIN * w.rate * max(w.rtt, WINDOW_RTT_LEAST) / 2, WINDOW_MIN, WINDOW_MAX)
 	}
 }
 
