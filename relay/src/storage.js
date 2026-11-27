@@ -128,8 +128,10 @@ export class Storage {
     return row && new Uint8Array(row.data);
   }
 
-  keep(name, bytes) {
-    this.write("INSERT INTO kept VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET data = excluded.data", name, bytes);
+  // Names and their bytes, one after another, in one statement: all of them kept, or none.
+  keep(...named) {
+    const rows = Array.from({ length: named.length / 2 }, () => "(?, ?)").join(", ");
+    this.write(`INSERT INTO kept VALUES ${rows} ON CONFLICT (name) DO UPDATE SET data = excluded.data`, ...named);
   }
 
   // Whether a write the node asked for was kept.

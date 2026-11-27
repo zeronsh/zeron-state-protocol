@@ -14,9 +14,10 @@ const REPO = resolve(".");
 const ZSPD = resolve("./build/zspd" + (process.platform === "win32" ? ".exe" : ""));
 
 class Sql {
-  constructor() { this.db = new DatabaseSync(":memory:"); }
+  constructor() { this.db = new DatabaseSync(":memory:"); this.full = null; }
   get databaseSize() { return this.db.prepare("PRAGMA page_count").get().page_count * this.db.prepare("PRAGMA page_size").get().page_size; }
   exec(query, ...args) {
+    if (this.full?.(query, args)) throw new Error("SQLITE_FULL: database or disk is full"); // as the object's says it
     const st = this.db.prepare(query);
     let rows = [], changes = 0;
     if (/^\s*(SELECT|PRAGMA)/i.test(query))
@@ -232,3 +233,61 @@ try {
   assert.equal(serverSockets[0]?.closed?.code, 1008, "and the device was not turned away");
   console.log("ok   a relay whose policy throws turns the device away");
 } finally { relay({}); rmSync(tmp3, { recursive: true, force: true }); }
+
+// Bug hunt. A roster kept as the latest, with the one before it: where there is no room for the next, neither is
+// changed, so that the one before is not lost to the latest standing in for it.
+const tmp4 = mkdtempSync(join(tmpdir(), "zsp-r2-"));
+try {
+  const spaceId = execFileSync(ZSPD, ["create", tmp4], { encoding: "utf8" }).trim();
+  const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
+  const sql = new Sql(), sockets = new Set(), serverSockets = [];
+  const ctx = { storage: { sql, sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+  const doSpace = new Space(ctx, { RELAY_SECRET: relaySecret });
+  class BridgeWS {
+    static OPEN = 1; static CLOSED = 3;
+    constructor(url) {
+      this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
+      doSpace.fetch(new Request(url.replace(/^ws/, "http")));
+      const { server, pair } = nextPair; this._s = server; serverSockets.push(server);
+      pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
+      pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
+      queueMicrotask(() => { this.readyState = 1; this._emit("open", {}); });
+    }
+    _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
+    addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
+    send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+  }
+  const mod = await loadModule();
+  const vol = new MemoryVolume();
+  const st = await Store.open(vol, 16 << 20);
+  st.keep("device", readFileSync(join(tmp4, "device.key")));
+  await st.close();
+  const node = await Node.open({ volume: vol, module: mod, WebSocket: BridgeWS, log: () => {} });
+  const other = await Node.open({ volume: new MemoryVolume(), module: mod, WebSocket: BridgeWS, log: () => {} });
+  const roster = () => readFileSync(join(tmp4, spaceId, "roster"));
+  const kept = (name) => {
+    if (!sql.exec("SELECT name FROM sqlite_master WHERE name = 'kept'").one()) return undefined; // nothing kept yet
+    const row = sql.exec("SELECT data FROM kept WHERE name = ?", name).one();
+    return row && Buffer.from(row.data);
+  };
+  const until = async (f) => { for (let i = 0; i < 100 && !f(); i++) await new Promise((r) => setTimeout(r, 20)); return f(); };
+  execFileSync(ZSPD, ["relay", tmp4, relayPub, "ws://relay.local"]);
+  const first = roster();
+  assert(node.adopt(first));
+  assert(await until(() => kept("roster")?.equals(first)), "the first roster kept");
+  execFileSync(ZSPD, ["admit", tmp4, other.key, "1"]);
+  const second = roster();
+  assert(node.adopt(second));
+  assert(await until(() => kept("roster")?.equals(second) && kept("roster.old")?.equals(first)), "the second kept, the first before it");
+  sql.full = (query, args) => /INSERT INTO kept/.test(query) && args.includes("roster"); // no room for the latest
+  execFileSync(ZSPD, ["revoke", tmp4, other.key]);
+  assert(node.adopt(roster()));
+  await until(() => serverSockets[0].closed);
+  sql.full = null;
+  await node.close(); await other.close();
+  assert.equal(serverSockets[0].closed?.code, 1011, "the relay with no room for it did not say so");
+  assert(kept("roster").equals(second), "the roster with no room for it is not the latest");
+  assert(kept("roster.old").equals(first), "the one before the latest was lost to it");
+  console.log("ok   a relay with no room for a roster keeps the two before it as they were");
+} finally { rmSync(tmp4, { recursive: true, force: true }); }

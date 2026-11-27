@@ -125,8 +125,9 @@ export class Space extends DurableObject {
         try {
           const old = storage.kept("roster");
           storage.make(space);
-          if (old) storage.keep("roster.old", old);
-          storage.keep("roster", view(ptr, len).slice());
+          // The one before kept with it, or neither: else, with no room for this one, the one before would be lost to
+          // the latest standing in for it.
+          storage.keep(...(old ? ["roster.old", old] : []), "roster", view(ptr, len).slice());
         } catch (e) {
           if (!(e instanceof Full)) throw e;
           this.#broken = true;
