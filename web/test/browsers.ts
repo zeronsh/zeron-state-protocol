@@ -10,8 +10,8 @@ import { createServer as tcp, connect as dial } from "node:net";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { Chrome, findChrome, type Page } from "./chrome.ts";
-import { cloud, eventually, exists, expectEqual, node, stopAll, cleanUp, ROOT, TMP, token, zspd, zspdConnect } from "./procs.ts";
-import { Client, columns } from "../src/client.ts";
+import { cloud, eventually, exists, expectEqual, node, proxy, stopAll, cleanUp, ROOT, TMP, token, zspd, zspdConnect } from "./procs.ts";
+import { Client, columns, type State } from "../src/client.ts";
 import type { Side } from "./browser.ts";
 
 // A machine without a browser cannot run these, and says so; but CI is never such a machine.
@@ -91,7 +91,8 @@ async function page(): Promise<Page> {
   return p;
 }
 
-const call = <T>(p: Page, f: string, ...args: unknown[]) => p.evaluate<T>(`window.zsp.${f}(${args.map((a) => JSON.stringify(a)).join(", ")})`);
+const call = <T>(p: Page, f: string, ...args: unknown[]) =>
+  p.evaluate<T>(`window.zsp.${f}(${args.map((a) => (a === undefined ? "undefined" : JSON.stringify(a))).join(", ")})`);
 
 // A space with scope 1, and scope 2 signed in which b may vouch: a goes by "ann" and b by "bob". Its owner is zspd's.
 async function space(name: string, relay: { key: string; url: string }, credential = "") {
@@ -99,13 +100,13 @@ async function space(name: string, relay: { key: string; url: string }, credenti
   const sid = zspd("create", owner);
   zspd("relay", owner, relay.key, relay.url);
   expectEqual(zspd("scope", owner, "signed"), "2");
-  await node("run", owner, ...(credential ? [`--credential=${credential}`] : []));
+  const o = await node("run", owner, ...(credential ? [`--credential=${credential}`] : []));
   const admit = (key: string, subject: string, vouch: boolean) => {
     zspd("admit", owner, key, "1");
     zspd("admit", owner, key, "2", ...(vouch ? ["vouch"] : []));
     zspd("subject", owner, key, subject);
   };
-  return { owner, sid, admit };
+  return { owner, sid, admit, o };
 }
 
 async function browserDevice(p: Page, store: string, s: { sid: string; admit: (k: string, sub: string, v: boolean) => void }, relay: { key: string; url: string }, subject: string, vouch: boolean, credential?: string) {
@@ -295,6 +296,71 @@ const tests: Record<string, () => Promise<void>> = {
     expectEqual(await call<string | undefined>(one, "spaceOf", "st-adopt"), sid);
   },
   // A device is what it was after its tabs have all gone, with no relay to be had: its key, and what it held.
+  // A browser's device is a partial replica unless told otherwise: it has the end of a big list at once and holds little
+  // more; it says that what it shows is only what it holds while it reaches nobody, and shows that, after a restart too;
+  // what it writes meanwhile reaches the others once it is back. Opened as a full replica it comes to hold everything, and
+  // opened as a partial one again it loses nothing.
+  async browser_partial() {
+    const relay = await node("serve", join(TMP, "bp-relay"));
+    const through = await proxy(relay.url);
+    const via = { key: relay.key, url: through.url };
+    const s = await space("bp", via);
+    const writer = new Client({ connect: zspdConnect(s.o.address), credential: token(s.owner) });
+    const Note = { title: columns.string(16) };
+    await eventually("the writer may write", () => writer.may(1, "write"));
+    for (let i = 0; i < 2000; i++) void writer.write(1, (c) => c.insert(Note, "feed", i, { title: "note " + i }));
+    await writer.write(1, (c) => c.insert(Note, "feed", 2000, { title: "last" }));
+    const first = await page();
+    await browserDevice(first, "bp", s, via, "ann", false);
+    const opened = performance.now();
+    await call(first, "watch", "bp", "feed", 20);
+    type Seen = { titles: string[]; status: string; before: number; after: number } | undefined;
+    const seen = (p: Page, list: string, from?: string) => call<Seen>(p, "seen", "bp", list, from);
+    await eventually("the end of the list, at once", async () => {
+      const x = await seen(first, "feed");
+      return x?.status === "ready" && x.titles.length === 20 && x.before === 1981 && x.titles[19] === "last";
+    });
+    console.log(`     the end of a list of 2001, in a browser that held none of it: ${(performance.now() - opened).toFixed(0)} ms`);
+    const held = await call<number>(first, "held", "bp");
+    if (held > 20000) throw new Error(`it holds ${held} bytes, as though it held the whole list`);
+
+    // It reaches nobody.
+    through.cut();
+    await eventually("what it shows is said to be what it holds", async () => (await seen(first, "feed"))?.status === "stale");
+    await call(first, "put", "bp", "feed", ["while away"]);
+    await first.close();
+    pages.splice(pages.indexOf(first), 1);
+    const later = await page();
+    await call(later, "device", "bp");
+    await call(later, "watch", "bp", "feed", 3000, "start");
+    await eventually("after a restart, what it held and what it wrote", async () => {
+      const x = await seen(later, "feed", "start");
+      return x?.status === "stale" && x.titles.length === 21 && x.titles.includes("while away");
+    });
+
+    // Back.
+    through.mend();
+    await eventually("kept up again", async () => (await seen(later, "feed", "start"))?.status === "ready", 20000);
+    let theirs: State<typeof Note> | undefined;
+    writer.window({ scope: 1, list: "feed", table: Note, size: 5 }, (x) => (theirs = x));
+    await eventually("what it wrote while away is had by the others", () => theirs?.rows.some((r) => r.title === "while away") === true, 20000);
+    await call(later, "unwatch", "bp", "feed", "start");
+    await later.close();
+    pages.splice(pages.indexOf(later), 1);
+
+    // The same store, as a full replica, and then as a partial one again.
+    const whole = await page();
+    await call(whole, "device", "bp", undefined, true);
+    await call(whole, "watch", "bp", "feed", 3000, "start");
+    await eventually("as a full replica, all of it", async () => (await seen(whole, "feed", "start"))?.titles.length === 2002, 20000);
+    await whole.close();
+    pages.splice(pages.indexOf(whole), 1);
+    const again = await page();
+    await call(again, "device", "bp");
+    await call(again, "put", "bp", "feed", ["partial again"]);
+    await eventually("what it writes as a partial one again is had by the others", () => theirs?.rows.some((r) => r.title === "partial again") === true, 20000);
+    writer.close();
+  },
   async browser_restart() {
     const relay = await node("serve", join(TMP, "br-relay"));
     const s = await space("br", relay);

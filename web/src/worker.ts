@@ -26,7 +26,7 @@ export interface Options {
 export type Command = { open: Options } | { connect: MessagePort } | { ask: number; op: Op; args: unknown[] };
 
 /** What a device can be asked to do, by whichever tab. */
-export type Op = "identity" | "join" | "adopt" | "member" | "create" | "scope" | "admit" | "revoke" | "subject" | "admin" | "owner" | "relay" | "members";
+export type Op = "identity" | "join" | "adopt" | "member" | "create" | "scope" | "admit" | "revoke" | "subject" | "admin" | "owner" | "relay" | "members" | "held";
 
 /** What a worker tells its tab: an answer; that the node has stopped, its storage having failed; or the space it is of. */
 export type Report = { answer: number; value?: unknown; error?: string } | { failed: string } | { space: string | undefined };
@@ -171,6 +171,8 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
         return { value: d.relay(args[0] as string, args[1] as string) };
       case "members":
         return { value: d.members() };
+      case "held":
+        return { value: d.held };
     }
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) };

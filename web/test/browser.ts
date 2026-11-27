@@ -54,11 +54,12 @@ const clientOf = (name: string) => {
   return c;
 };
 const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
+const windows = new Map<string, { state?: State<typeof Note>; stop: () => void }>();
 
 const zsp = {
   /** Opens this origin's device of a name; says its key. */
-  async device(name: string, credential?: string): Promise<{ id: string; key: string; space?: string }> {
-    const d = await open({ name, credential, onFailure: (e) => failures.push(e.message) });
+  async device(name: string, credential?: string, full?: boolean): Promise<{ id: string; key: string; space?: string }> {
+    const d = await open({ name, credential, full, onFailure: (e) => failures.push(e.message) });
     devices.set(name, d);
     return { id: d.id, key: d.key, space: d.space };
   },
@@ -147,6 +148,24 @@ const zsp = {
     await sleep(50);
     wire.close();
     return big.byteLength === 1024 && !closed ? "intact" : "detached";
+  },
+  /** Opens a window on a list of scope 1, of so many at its end, or its start, and keeps it until `unwatch`. */
+  async watch(name: string, list: string, size: number, from?: "start"): Promise<void> {
+    const w = { state: undefined as State<typeof Note> | undefined, stop: () => {} };
+    w.stop = clientOf(name).window({ scope: 1, list, table: Note, size, from }, (s) => (w.state = s)).stop;
+    windows.set(`${name}/${list}/${from ?? ""}`, w);
+  },
+  /** What such a window shows now. */
+  async seen(name: string, list: string, from?: "start"): Promise<{ titles: string[]; status: string; before: number; after: number } | undefined> {
+    const st = windows.get(`${name}/${list}/${from ?? ""}`)?.state;
+    return st && { titles: st.rows.map((r) => r.title ?? ""), status: st.status, before: st.before, after: st.after };
+  },
+  async unwatch(name: string, list: string, from?: "start"): Promise<void> {
+    windows.get(`${name}/${list}/${from ?? ""}`)?.stop();
+    windows.delete(`${name}/${list}/${from ?? ""}`);
+  },
+  async held(name: string): Promise<number> {
+    return devices.get(name)!.held();
   },
   /** Writes notes to a list of scope 1, and resolves once they are durable on the device. */
   async put(name: string, list: string, titles: string[]): Promise<void> {

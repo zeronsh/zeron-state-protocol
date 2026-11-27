@@ -52,6 +52,8 @@ export interface Device {
   relay(key: string, url: string): Promise<void>;
   /** Who is in the space. */
   members(): Promise<Member[]>;
+  /** How much it holds, about, in bytes: what a partial replica's `keep.bytes` bounds. */
+  held(): Promise<number>;
   /** Opens a pipe to the node, for a client of your own making. */
   readonly connect: Connect;
   /** A client of the node. */
