@@ -375,3 +375,52 @@ try {
   assert.ok(after - before < 1 << 20, `one message, after the handshake, grew the node's memory from ${before} to ${after}`);
   console.log("ok   a relay takes in no message longer than a Noise message after it");
 } finally { rmSync(tmp5, { recursive: true, force: true }); }
+
+// Bug hunt. A connection with no session ready HANDSHAKE_MS after it opened is let go of, as zspd lets go of one after
+// HANDSHAKE_WAIT: else anyone could hold sockets, and the node's memory for them, for as long as the object is awake.
+// One that is ready stays, however long it is quiet.
+const tmp6 = mkdtempSync(join(tmpdir(), "zsp-r2-"));
+try {
+  const spaceId = execFileSync(ZSPD, ["create", tmp6], { encoding: "utf8" }).trim();
+  const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
+  const sockets = new Set(), serverSockets = [];
+  const ctx = { storage: { sql: new Sql(), sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+  const doSpace = new Space(ctx, { RELAY_SECRET: relaySecret, HANDSHAKE_MS: 300 });
+  class BridgeWS {
+    static OPEN = 1; static CLOSED = 3;
+    constructor(url) {
+      this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
+      doSpace.fetch(new Request(url.replace(/^ws/, "http")));
+      const { server, pair } = nextPair; this._s = server; serverSockets.push(server);
+      pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
+      pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
+      queueMicrotask(() => { this.readyState = 1; this._emit("open", {}); });
+    }
+    _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
+    addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
+    send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+  }
+  const mod = await loadModule();
+  const vol = new MemoryVolume();
+  const st = await Store.open(vol, 16 << 20);
+  st.keep("device", readFileSync(join(tmp6, "device.key")));
+  await st.close();
+  const node = await Node.open({ volume: vol, module: mod, WebSocket: BridgeWS, log: () => {} });
+  execFileSync(ZSPD, ["relay", tmp6, relayPub, "ws://relay.local"]);
+  assert(node.adopt(readFileSync(join(tmp6, spaceId, "roster"))));
+  for (let i = 0; i < 100 && !serverSockets[0]?.attachments.at(-1)?.state; i++) await new Promise((r) => setTimeout(r, 20)); // ready, kept
+  const [device] = serverSockets;
+  assert(device?.attachments.at(-1)?.state, "the device never connected");
+  doSpace.fetch(new Request(`http://relay.local/${spaceId}`)); // and someone who says nothing
+  const { server: silent } = nextPair;
+  silent._onSend = silent._onClose = () => {};
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(silent.closed, null, "let go of before its time");
+  await new Promise((r) => setTimeout(r, 400));
+  const closed = silent.closed?.code, deviceClosed = device.closed;
+  await node.close();
+  assert.equal(closed, 1008, "a connection with no session ready was not let go of");
+  assert.equal(deviceClosed, null, "a ready connection was let go of");
+  console.log("ok   a relay lets go of a connection with no session ready in HANDSHAKE_MS, and of no other");
+} finally { rmSync(tmp6, { recursive: true, force: true }); }

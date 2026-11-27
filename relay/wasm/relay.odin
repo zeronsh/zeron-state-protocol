@@ -167,6 +167,13 @@ most :: proc "contextless" (id: u32) -> int {
 	return 0 if !ok else NOISE_MOST if c.open else zsp.HANDSHAKE_1
 }
 
+// Whether a connection has a session ready: until it has, the host lets go of it after a while (HANDSHAKE_MS).
+@(export)
+ready :: proc "contextless" (id: u32) -> bool {
+	c, ok := conns[id]
+	return ok && c.session != nil && c.session.ready
+}
+
 // A message from a connection lies in the buffer. False means close it.
 @(export)
 received :: proc "c" (id: u32, size: int) -> bool {

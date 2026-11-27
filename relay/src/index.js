@@ -69,6 +69,9 @@ export class Space extends DurableObject {
   #ending = new Set(); // connections whose input failed: let go of once what they have to hear is said, if anything is
   #kept = new Set(); // connections whose attachment holds what they are now, for waking after hibernation
   #keeping = 0; // the epoch whose keeping them again is due, if any
+  #unready = new Map(); // connection number -> when it is let go of unless its session is ready by then (HANDSHAKE_MS)
+  #handshake; // a timer, for the soonest of those
+  #handshakeAt = 0; // when it is set for
 
   constructor(ctx, env) {
     super(ctx, env);
@@ -105,6 +108,8 @@ export class Space extends DurableObject {
     }
     this.#sockets.clear();
     this.#ending.clear();
+    this.#unready.clear();
+    clearTimeout(this.#handshake), (this.#handshake = undefined), (this.#handshakeAt = 0);
     this.#unquiet();
     this.#kept.clear();
     this.#wasm = undefined;
@@ -216,10 +221,13 @@ export class Space extends DurableObject {
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({ id, space: this.#space });
     this.#sockets.set(id, server);
+    this.#unready.set(id, Date.now() + Number(this.env.HANDSHAKE_MS ?? 15000));
     const dropped = this.#unkeep();
     this.#wasm.opened(id);
-    // Nothing follows from a connection opening, but the rest hear of one let go of at once, as after any other event.
+    // Nothing follows from a connection opening, but the rest hear of one let go of at once, as after any other event;
+    // and it is timed, until its session is ready.
     if (dropped) this.#settle();
+    else this.#overdue();
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -260,6 +268,7 @@ export class Space extends DurableObject {
     if (id === undefined) return;
     this.#sockets.delete(id);
     this.#kept.delete(id);
+    this.#unready.delete(id);
     this.#unkeep();
     this.#wasm.closed(id);
     this.#settle();
@@ -268,6 +277,7 @@ export class Space extends DurableObject {
   #drop(id, ws) {
     if (!this.#sockets.delete(id)) return;
     this.#kept.delete(id);
+    this.#unready.delete(id);
     this.#wasm.closed(id);
     try {
       ws.close(1008, "");
@@ -296,6 +306,7 @@ export class Space extends DurableObject {
     const more = this.#wasm.settle();
     // What failed to be kept is said to nobody: not passed on, and no session saved as though it had been.
     if (this.#broken || this.#wasm.failed()) return void this.#fail();
+    this.#overdue();
     // One socket's end may give the others something to hear, so until nobody has anything.
     for (let said = true; said; ) {
       said = false;
@@ -337,6 +348,33 @@ export class Space extends DurableObject {
       this.#soon = true;
       this.ctx.waitUntil(new Promise((go) => setTimeout(() => (this.#soon = false, this.#settle(), go()), 0)));
     }
+  }
+
+  // A connection with no session ready HANDSHAKE_MS after it opened is let go of, as zspd lets go of one after
+  // HANDSHAKE_WAIT: its handshake stalled, its Hello or the roster it promised never came, or it waits on a policy
+  // that never answers. Else anyone could hold sockets, and the node's memory for them, as long as the object stays
+  // awake. (Asleep, such a connection is not kept, and is let go of on waking.) One timer, for the soonest.
+  #overdue() {
+    const now = Date.now();
+    let soonest = 0;
+    for (const [id, due] of this.#unready) {
+      if (this.#wasm.ready(id)) this.#unready.delete(id);
+      else if (due <= now) this.#drop(id, this.#sockets.get(id));
+      else if (!soonest || due < soonest) soonest = due;
+    }
+    if (soonest === this.#handshakeAt) return;
+    clearTimeout(this.#handshake);
+    this.#handshake = undefined;
+    this.#handshakeAt = soonest;
+    if (!soonest) return;
+    const epoch = this.#epoch;
+    this.#handshake = setTimeout(() => {
+      this.#handshake = undefined;
+      this.#handshakeAt = 0;
+      if (epoch !== this.#epoch || !this.#wasm) return;
+      this.#unkeep(); // an event like any other: what was kept is let go of before anything is done
+      this.#settle();
+    }, soonest - now);
   }
 
   // What each connection was kept as is about to be out of date: let go of, once a burst and before anything in it is

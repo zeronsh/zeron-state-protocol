@@ -74,7 +74,8 @@ wrangler deploy
 `wrangler.toml` binds the bucket as `STORE`. Settings, all optional: `STORAGE_LIMIT`, bytes of SQLite a space may use; `FULL_WAIT`;
 `CACHE_BYTES`; `PAGES_KEPT` and `BLOCKS_KEPT`, the pages and 64 KiB stretches of log kept in memory (2048 and 64); `QUIET_MS` and
 `QUIET_TAIL`, how long nothing must happen before a checkpoint, and how much log there must be to replay for one (1000 and
-262144); `STATS`, `"1"` to answer `/<space>?stats` with what a space has cost, `?probe` with how long R2 takes, and
+262144); `HANDSHAKE_MS`, how long a connection may go with no session ready before it is let go of (15000, as zspd's
+`HANDSHAKE_WAIT`); `STATS`, `"1"` to answer `/<space>?stats` with what a space has cost, `?probe` with how long R2 takes, and
 `?evict=warm|cold|empty` to start a space's node again as an evicted object does, with its cache, with all but the trees'
 tops let go of, or with nothing, for measuring. A space kept wholly in SQLite by an earlier relay is made again from its log when its object next wakes, checkpointing as
 it goes, and its log moves to R2 an extent at a time.
