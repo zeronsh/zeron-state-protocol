@@ -2716,6 +2716,156 @@ review6_reoffer_goes_at_once :: proc(t: ^testing.T) {
 	free_all(context.temp_allocator)
 }
 
+// A window that its client has gone on from below is not cut short there; and what a full replica said of less than it,
+// is not taken for the whole of it: the whole is asked for, and kept up, before it is said to be settled.
+@(test)
+review7_uncut_window_is_asked_for_whole :: proc(t: ^testing.T) {
+	state := seeded(101)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	owner, phone := s.nodes[0], s.nodes[1]
+	list := List{1 << 32 | 5, 5}
+	for i in 100 ..< 200 {
+		sim_put(&s, phone, u64(i))
+	}
+	// Held by both, and then the phone is away.
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	sim_cut(&s, 0)
+	ui := sim_client(&s, phone)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true, counts = true})
+	sim_drain(ui)
+	page := ui.watches[0]
+	sim_watch(ui, 2, list_lo(list), page.lo, 50, {data = true, live = true, back = true, counts = true})
+	sim_drain(ui)
+	sim_put(&s, owner, 165)
+	for i in 200 ..< 230 {
+		sim_put(&s, owner, u64(i))
+	}
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	sim_drain(ui)
+	find :: proc(ui: ^Session, id: u64) -> Watch {
+		for w in ui.watches {
+			if w.id == id {
+				return w
+			}
+		}
+		return {}
+	}
+	w := find(ui, 1)
+	testing.expect(t, w.lo == page.lo)
+	testing.expect(t, w.settled)
+	testing.expect_value(t, store_range(&phone.node.store, w.lo, w.hi).count, store_range(&owner.node.store, w.lo, w.hi).count)
+	// And kept up, all of it.
+	sim_put(&s, owner, 166)
+	sim_settle(&s)
+	sim_drain(ui)
+	w = find(ui, 1)
+	testing.expect_value(t, store_range(&phone.node.store, w.lo, w.hi).count, store_range(&owner.node.store, w.lo, w.hi).count)
+}
+
+// A relay does not sleep with what goes first still to be done.
+@(test)
+review7_no_sleep_with_first :: proc(t: ^testing.T) {
+	state := seeded(102)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	for i in 0 ..< 100 {
+		sim_put(&s, s.nodes[0], u64(i))
+	}
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	at := s.links[0].b // the relay's end
+	list := List{1 << 32 | 5, 5}
+	sim_watch(at, 7, list_lo(list), list_hi(list), 50, {data = true, back = true})
+	testing.expect(t, len(at.first) > 0)
+	saved: [dynamic]byte
+	defer delete(saved)
+	testing.expect(t, !session_save(at, &saved), "a relay would sleep with a window's answer still to give")
+}
+
+// A full replica that was all there was, asked of another once it reaches it, bounds its window as rows come, though
+// what it said of it before has yet to be told.
+@(test)
+review7_bounded_before_told :: proc(t: ^testing.T) {
+	state := seeded(103)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	owner := s.nodes[0]
+	list := List{1 << 32 | 5, 5}
+	for i in 0 ..< 10 {
+		sim_put(&s, owner, u64(i))
+	}
+	ui := sim_client(&s, owner)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true, counts = true})
+	sim_drain(ui)
+	testing.expect(t, ui.watches[0].settled)
+	sim_link(&s, 0, 1)
+	up := s.links[0]
+	for !up.a.ready || !up.b.ready {
+		sim_pass(&s, up.a, up.b)
+		sim_pass(&s, up.b, up.a)
+	}
+	for i in 10 ..< 410 {
+		sim_put(&s, owner, u64(i))
+	}
+	sim_drain(ui)
+	w := ui.watches[0]
+	testing.expectf(t, store_range(&owner.node.store, w.lo, w.hi).count <= 100, "a window of 50 spans %d rows", store_range(&owner.node.store, w.lo, w.hi).count)
+	testing.expect(t, !w.settled)
+}
+
+// A relay hushed is forgotten as one gone is: what it said stands for nothing once it no longer keeps it up.
+@(test)
+review7_hushed_relay_said_nothing :: proc(t: ^testing.T) {
+	state := seeded(104)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	a := s.nodes[0]
+	list := List{1 << 32 | 5, 5}
+	for i in 0 ..< 100 {
+		sim_put(&s, a, u64(i))
+	}
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	ui := sim_client(&s, a)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true, counts = true})
+	sim_settle(&s)
+	sim_drain(ui)
+	testing.expect(t, ui.watches[0].settled)
+	to_relay := s.links[0].a
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	sim_drain(ui)
+	testing.expect(t, to_relay.paused, "the relay was not hushed")
+	for it in a.node.interests {
+		for r in it.reports {
+			testing.expect(t, r.session != to_relay.id, "a relay hushed still stood for a window")
+		}
+	}
+	// The other goes: the relay is asked again, and until it answers the window is not settled.
+	sim_cut(&s, len(s.links) - 1)
+	sim_drain(ui)
+	testing.expect(t, !to_relay.paused)
+	testing.expect(t, !ui.watches[0].settled, "a window was settled while the relay it waits for had yet to answer")
+	sim_settle(&s)
+	sim_drain(ui)
+	testing.expect(t, ui.watches[0].settled)
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)

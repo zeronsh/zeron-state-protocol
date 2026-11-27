@@ -331,7 +331,9 @@ replica it reaches for its local clients' windows of limited size as a partial o
 reaches none for the scope is all there is, and says settled at once, and not settled once it asks one, until that one answers. Until one it asked has answered, what it holds may be growing fast, as while it is
 brought level, and would carry the window far past its size: so, once per burst of changes, a replica bounds such a window again, as when it was asked
 for, if it has come to span more than twice its limit, and says Synced of it. A window is never cut short, by this or by what a full replica says, on
-a side its client has gone on from with another of its own that ends, or begins, where it does: what lay between would be in neither. An owner answers a
+a side its client has gone on from with another of its own that ends, or begins, where it does: what lay between would be in neither; an answer of less
+than such a window is not taken for it, and it is asked for again, whole, as a range. A relay hushed is as one gone: what it said of windows stands for
+nothing, and what it owed them it never will say. An owner answers a
 watch of limited size, newly asked for, before whatever else it has yet to send, such as all of a scope to one it is bringing level, and after what is
 under way: it is small, and someone is waiting for it; and what it is owed, rows it is found to lack and rows asked for meanwhile, goes before what says it
 is level. Before honouring Unwatch, an owner sends what it committed while the watch stood. When a grant

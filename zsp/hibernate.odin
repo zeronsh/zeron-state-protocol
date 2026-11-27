@@ -7,7 +7,7 @@ package zsp
 @(require_results)
 session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 	n := s.node
-	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || len(s.tasks) > 0 || len(s.refused) > 0 || s.closing {
+	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || !tasks_idle(s) || len(s.refused) > 0 || s.closing {
 		return false
 	}
 	// Nor anything more that is not saved: changes it has yet to be sent (as where storage answered "not yet"), counts

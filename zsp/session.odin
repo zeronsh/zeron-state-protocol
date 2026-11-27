@@ -241,6 +241,42 @@ session_subject :: proc(s: ^Session) -> []byte {
 	return m.subject if m != nil else nil
 }
 
+// What a session said of interests stands no longer, and what it owed them it never will say, as when it is gone, or a
+// relay hushed: what is here is all that can be had of it.
+@(private)
+session_forget :: proc(s: ^Session) {
+	n := s.node
+	for &it in n.interests {
+		for r, i in it.reports {
+			if r.session != s.id {
+				continue
+			}
+			unordered_remove(&it.reports, i)
+			if len(it.reports) == 0 {
+				wanted_tell(n, &it)
+			}
+			// The last to be heard stands, though it is gone: nobody knows better. But what is here is kept up by
+			// nobody now, and is said to be no more than what is here.
+			if to := node_session(n, it.session); to != nil {
+				for &w in to.watches {
+					if w.id == it.watch.id && w.data && len(it.reports) > 0 {
+						interest_beyond(n, &it, &w)
+					} else if w.id == it.watch.id && w.data && !slice.contains(s.owed[:], it.id) {
+						// Or, of a full replica that now reaches none, all there is, as it says.
+						append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = interest_sure(n, &it)})
+					}
+				}
+			}
+			break
+		}
+	}
+	owed := slice.clone(s.owed[:], context.temp_allocator)
+	clear(&s.owed)
+	for id in owed {
+		interest_settled(n, id) // it never will: what is here is all that can be had
+	}
+}
+
 session_close :: proc(s: ^Session) {
 	n := s.node
 	for x, i in n.sessions {
@@ -277,33 +313,7 @@ session_close :: proc(s: ^Session) {
 	delete(s.first)
 	delete(s.hurried)
 	delete(s.refused)
-	for &it in n.interests {
-		for r, i in it.reports {
-			if r.session != s.id {
-				continue
-			}
-			unordered_remove(&it.reports, i)
-			if len(it.reports) == 0 {
-				wanted_tell(n, &it)
-			}
-			// The last to be heard stands, though it is gone: nobody knows better. But what is here is kept up by
-			// nobody now, and is said to be no more than what is here.
-			if to := node_session(n, it.session); to != nil {
-				for &w in to.watches {
-					if w.id == it.watch.id && w.data && len(it.reports) > 0 {
-						interest_beyond(n, &it, &w)
-					} else if w.id == it.watch.id && w.data && !slice.contains(s.owed[:], it.id) {
-						// Or, of a full replica that now reaches none, all there is, as it says.
-						append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = interest_sure(n, &it)})
-					}
-				}
-			}
-			break
-		}
-	}
-	for id in s.owed {
-		interest_settled(n, id) // it never will: what is here is all that can be had
-	}
+	session_forget(s)
 	delete(s.owed)
 	delete(s.online)
 	delete(s.as)
@@ -1063,8 +1073,15 @@ interest_bound :: proc(s: ^Session, id: u64, lo, hi: Key, before, after: int) {
 				continue
 			}
 			below, above := extended(to, w)
-			w.lo = lo if key_less(w.lo, lo) && !below else w.lo
-			w.hi = hi if key_less(hi, w.hi) && !above else w.hi
+			if (below && key_less(w.lo, lo)) || (above && key_less(hi, w.hi)) {
+				// What it said is of less than the window must show: that is asked for, as it is, again. What was said
+				// is of the asking before, and stands for nothing.
+				it.watch.lo, it.watch.hi, it.limit = w.lo, w.hi, 0
+				interest_renew(n, &it)
+				return
+			}
+			w.lo = lo if key_less(w.lo, lo) else w.lo
+			w.hi = hi if key_less(hi, w.hi) else w.hi
 			it.watch.lo, it.watch.hi, it.limit = w.lo, w.hi, 0
 			interest_beyond(n, &it, &w)
 			if it.waiting == 0 && w.settled {
@@ -1116,7 +1133,7 @@ bound_windows :: proc(s: ^Session) {
 			continue
 		}
 		for &w, i in s.watches {
-			if w.id != it.watch.id || !w.data || !w.level || w.settled {
+			if w.id != it.watch.id || !w.data || !w.level {
 				continue
 			}
 			below, above := extended(s, w)
@@ -1141,7 +1158,8 @@ bound_windows :: proc(s: ^Session) {
 	for &w, i in s.watches {
 		if moved[i] && key_less(bounds[i][0], bounds[i][1]) {
 			w.lo, w.hi = bounds[i][0], bounds[i][1]
-			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = w.settled})
+			// Not settled: it waits for an answer, though what it was said before may not have been told it yet.
+			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi})
 		}
 	}
 }
@@ -2594,23 +2612,17 @@ node_balance :: proc(n: ^Node) {
 		} else {
 			roots_send(s, afresh = true)
 		}
-		unowed := make([dynamic]u64, context.temp_allocator)
 		for &it in n.interests {
 			if interest_concerns(n, it.session, s) {
 				if hush {
 					send_unwatch(s, it.id)
-					// And what it owed it never will: as though it had gone.
-					if i, owed := slice.linear_search(s.owed[:], it.id); owed {
-						unordered_remove(&s.owed, i)
-						append(&unowed, it.id)
-					}
 				} else {
 					interest_send(s, &it)
 				}
 			}
 		}
-		for id in unowed {
-			interest_settled(n, id)
+		if hush {
+			session_forget(s) // as though it had gone
 		}
 	}
 }
@@ -2702,6 +2714,9 @@ pump :: proc(s: ^Session) {
 	if s.first_head == len(s.first) && len(s.first) > 0 {
 		clear(&s.first)
 		s.first_head = 0
+		if cap(s.first) > 64 {
+			shrink(&s.first)
+		}
 	}
 	cells_close(s)
 	if s.seq_in > s.acked_in && n.synced >= s.ack_at {

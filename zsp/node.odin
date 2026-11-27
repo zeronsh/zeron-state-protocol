@@ -639,23 +639,7 @@ interest_add :: proc(s: ^Session, w: Watch, limit: u64, back: bool) -> ^Interest
 @(private)
 interests_afresh :: proc(n: ^Node) {
 	for &it in n.interests {
-		old := it.id
-		n.next_watch += 1
-		it.id = INTEREST | n.next_watch
-		it.waiting = 0
-		clear(&it.reports)
-		for to in n.sessions {
-			for id, i in to.owed {
-				if id == old {
-					unordered_remove(&to.owed, i)
-					break
-				}
-			}
-			if interest_concerns(n, it.session, to) && !to.paused {
-				send_unwatch(to, old)
-				interest_send(to, &it, tell = false) // what is said of it follows
-			}
-		}
+		interest_renew(n, &it)
 		// What confirmed it may not stand under this roster: settled again once a full replica says so anew.
 		if it.watch.data {
 			if to := node_session(n, it.session); to != nil {
@@ -666,6 +650,29 @@ interests_afresh :: proc(n: ^Node) {
 				}
 			}
 			wanted_tell(n, &it)
+		}
+	}
+}
+
+// Asks for an interest again, by a new name, of all it concerns: what was said of it before, and is yet to be, is not of
+// this asking. What is said of it to its client is the caller's to say.
+@(private)
+interest_renew :: proc(n: ^Node, it: ^Interest) {
+	old := it.id
+	n.next_watch += 1
+	it.id = INTEREST | n.next_watch
+	it.waiting = 0
+	clear(&it.reports)
+	for to in n.sessions {
+		for id, i in to.owed {
+			if id == old {
+				unordered_remove(&to.owed, i)
+				break
+			}
+		}
+		if interest_concerns(n, it.session, to) && !to.paused {
+			send_unwatch(to, old)
+			interest_send(to, it, tell = false)
 		}
 	}
 }
