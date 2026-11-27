@@ -121,13 +121,31 @@ export async function proxy(
   let count = 0;
   let down = false;
   // Each way of each connection is a line: what is sent goes once all before it has, at the rate allowed, and arrives later.
-  const carry = (into: import("node:net").Socket, state: { swallowed: boolean }) => {
-    if (!slow) return (d: Buffer) => state.swallowed || into.write(d);
+  // And, as TCP's window does, so much at most is on its way at once: the sender waits while it is, rather than having
+  // all it has to say taken from it at once, and held here.
+  const WINDOW = 1 << 20;
+  const carry = (from: import("node:net").Socket, into: import("node:net").Socket, state: { swallowed: boolean }) => {
+    let held = 0;
+    const sent = (n: number) => {
+      held -= n;
+      if (held <= WINDOW && from.isPaused()) from.resume();
+    };
+    const holding = (n: number) => {
+      held += n;
+      if (held > WINDOW) from.pause();
+    };
+    if (!slow)
+      return (d: Buffer) => {
+        if (state.swallowed) return;
+        holding(d.length);
+        into.write(d, () => sent(d.length));
+      };
     let free = 0;
     return (d: Buffer) => {
       const now = performance.now();
       free = Math.max(free, now) + (d.length / slow.bytesPerSecond) * 1000;
-      setTimeout(() => state.swallowed || into.destroyed || into.write(d), free - now + slow.latency);
+      holding(d.length);
+      setTimeout(() => (state.swallowed || into.destroyed ? sent(d.length) : into.write(d, () => sent(d.length))), free - now + slow.latency);
     };
   };
   const server = createServer((from) => {
@@ -139,7 +157,7 @@ export async function proxy(
     const end = () => (live.delete(state), from.destroy(), there.destroy());
     state.end = end;
     live.add(state);
-    const toThere = carry(there, state);
+    const toThere = carry(from, there, state);
     let head: Buffer | undefined = secure ? Buffer.alloc(0) : undefined; // the request, until it has all come
     from.on("data", (d: Buffer) => {
       if (head) {
@@ -151,7 +169,7 @@ export async function proxy(
       }
       toThere(d);
     });
-    there.on("data", carry(from, state));
+    there.on("data", carry(there, from, state));
     from.on("close", end).on("error", end);
     there.on("close", end).on("error", end);
   });
