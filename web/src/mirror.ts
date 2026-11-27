@@ -2130,7 +2130,8 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
     for (let n = 0; n * 1000 < ids.length; n++) {
       const part = ids.slice(n * 1000, (n + 1) * 1000).map((id) => codec.hex(id));
       byId.push(
-        client.ask({ scope, table: BY_WHERE, where: where.ids(part), limit: 1000 }, (a) => {
+        // In the document's list, as every row of it is: so a node that has to fetch what a question is about knows where.
+        client.ask({ scope, table: BY_WHERE, where: where.all(where.inList(list), where.ids(part)), limit: 1000 }, (a) => {
           answers.set(`maps ${n}`, a);
           tell();
         }),
@@ -2191,7 +2192,7 @@ export function ask<S extends MapSchema<any>, const P extends Path<S>>(
     if (moved) found.move(moved.offset, moved.limit);
     // The rows on the way: whether what answers is there is theirs to say.
     questions.push(
-      client.ask({ scope, table: BY_WHERE, where: where.ids(p.chain.map((id) => codec.hex(id))), limit: 1000 }, (a) => {
+      client.ask({ scope, table: BY_WHERE, where: where.all(where.inList(list), where.ids(p.chain.map((id) => codec.hex(id)))), limit: 1000 }, (a) => {
         answers.set("chain", a);
         tell();
       }),

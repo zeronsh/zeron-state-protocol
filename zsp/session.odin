@@ -273,6 +273,9 @@ session_close :: proc(s: ^Session) {
 				continue
 			}
 			unordered_remove(&it.reports, i)
+			if len(it.reports) == 0 {
+				wanted_tell(n, &it)
+			}
 			// The last to be heard stands, though it is gone: nobody knows better. But what is here is kept up by
 			// nobody now, and is said to be no more than what is here.
 			if to := node_session(n, it.session); to != nil {
@@ -1018,6 +1021,7 @@ interest_settled :: proc(n: ^Node, id: u64) {
 		if it.waiting > 0 || to == nil {
 			return
 		}
+		wanted_tell(n, &it)
 		// Settled if a full replica has said so; otherwise none can be reached, and what is here is all there is, as
 		// is said.
 		for w in to.watches {
@@ -1968,6 +1972,36 @@ session_unwants :: proc(s: ^Session, lo, hi: Key, data := false) {
 			interest_remove(s.node, i)
 			return
 		}
+	}
+}
+
+// Whether a session wants the data of a range shown, and whether a full replica has confirmed it, and none has gone since.
+session_wanted :: proc(s: ^Session, lo, hi: Key) -> (wanted, sure: bool) {
+	for &it in s.node.interests {
+		if it.session == s.id && it.watch.id == SHOWN && it.watch.data && it.watch.lo == lo && it.watch.hi == hi {
+			return true, interest_sure(&it)
+		}
+	}
+	return false, false
+}
+
+// Whether what a full replica holds can be had here, by watching it: some session with one is ready.
+node_fetches :: proc(n: ^Node) -> bool {
+	for s in n.sessions {
+		if s.ready && s.role == .Peer && s.peer_full && !s.paused {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+wanted_tell :: proc(n: ^Node, it: ^Interest) {
+	if it.watch.id != SHOWN || !it.watch.data || n.host.questions.wanted == nil {
+		return
+	}
+	if to := node_session(n, it.session); to != nil {
+		n.host.questions.wanted(n.host.questions.data, to)
 	}
 }
 

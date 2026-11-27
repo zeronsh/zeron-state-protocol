@@ -644,6 +644,11 @@ questions :: proc() -> zsp.Questions {
 				find.finder_flow(&found.finder, call, kind, payload)
 			}
 		},
+		wanted = proc(_: rawptr, _: ^zsp.Session) {
+			if found != nil {
+				found.more = true
+			}
+		},
 	}
 }
 

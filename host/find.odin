@@ -48,6 +48,11 @@ questions :: proc(s: ^Space) -> zsp.Questions {
 				find.finder_flow(&s.found.finder, call, kind, payload)
 			}
 		},
+		wanted = proc(data: rawptr, _: ^zsp.Session) {
+			if s := (^Space)(data); s.found != nil {
+				s.found.more = true
+			}
+		},
 	}
 }
 

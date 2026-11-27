@@ -24,6 +24,25 @@ Op :: enum u8 {
 	Back   = 13, // is referred to by so many rows that …
 }
 
+// The lists a question's rows must all be in, if it names any: what it is about, and nothing beyond. Temporary memory.
+query_lists :: proc(q: ^Query) -> []zsp.List {
+	out := make([dynamic]zsp.List, context.temp_allocator)
+	add :: proc(out: ^[dynamic]zsp.List, p: ^Pred, scope: zsp.Scope) {
+		if p.op == .List && zsp.key_scope(zsp.list_lo(p.list)) == scope && !slice.contains(out[:], p.list) {
+			append(out, p.list)
+		}
+	}
+	w := &q.where_
+	if w.op == .And {
+		for &k in w.kids {
+			add(&out, &k, q.scope)
+		}
+	} else {
+		add(&out, w, q.scope)
+	}
+	return out[:]
+}
+
 Pred :: struct {
 	op:    Op,
 	col:   Column,

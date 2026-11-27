@@ -64,6 +64,10 @@ Far :: struct {
 	due:    bool, // which has yet to be passed on, there being rows in it still to come
 	have:   bool, // what is shown is an answer of theirs
 	keys:   [dynamic]zsp.Key, // the places of its rows, which are wanted here
+	// With none to ask but a full replica that cannot read, as a relay: the lists the question is about, had whole from
+	// it, so that what is here is the answer; and whether it has confirmed them all, as was last said.
+	near:   [dynamic]zsp.List,
+	sure:   bool,
 }
 
 @(private)
@@ -425,6 +429,8 @@ live_free :: proc(l: ^Live) {
 	}
 	delete(l.lives)
 	far_drop(l)
+	near_drop(l)
+	delete(l.far.near)
 	delete(l.far.source)
 	delete(l.far.tried)
 	delete(l.far.next)
@@ -758,6 +764,9 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 		if l.far.have || (l.once && l.far.call != 0) {
 			continue // another answers
 		}
+		if l.once && len(l.far.near) > 0 && !l.far.sure {
+			continue // once what it is about is had, and confirmed
+		}
 		if f.pace && (l.stale || l.renew) && time.tick_diff(now, l.due) > 0 {
 			if w, some := f.wake.?; !some || time.tick_diff(l.due, w) > 0 {
 				f.wake = l.due
@@ -873,7 +882,7 @@ answer_send :: proc(l: ^Live) {
 	page := query_page(s, &l.q, &l.rows)
 	totals := query_totals(s, &l.q, &l.rows)
 	w := make([dynamic]byte, context.temp_allocator)
-	answer_begin(l, &w, {settled = f.settled, last = l.once})
+	answer_begin(l, &w, {settled = f.settled || (len(l.far.near) > 0 && l.far.sure), last = l.once})
 	zsp.write_varint(&w, u64(l.rows.count))
 	first := max(l.rows.count - l.q.offset - len(page), 0) if l.q.from_end else min(l.q.offset, l.rows.count)
 	zsp.write_varint(&w, u64(first))
@@ -982,6 +991,11 @@ far_run :: proc(l: ^Live) {
 			}
 		}
 	}
+	if far.have {
+		near_drop(l) // another answers, and what was fetched for the question is held no longer than anything
+	} else if far.call == 0 {
+		near_run(l)
+	}
 	far_past(l)
 	if far.call != 0 && far.spent > 0 {
 		w := make([dynamic]byte, context.temp_allocator)
@@ -1011,6 +1025,49 @@ far_run :: proc(l: ^Live) {
 	if far.due && far_whole(l) {
 		far.due, far.have = false, true
 		far_say(l)
+	}
+}
+
+// Nobody to ask can read, but what it is about may be had from one that holds everything, as a relay does: the lists
+// the question names, whole, so that it is answered here, as it would be there. A question that names none is about
+// all of a scope, and is answered from what is held, and said to be.
+@(private)
+near_run :: proc(l: ^Live) {
+	f, far := l.f, &l.far
+	if len(far.near) == 0 {
+		if !zsp.node_fetches(f.n) {
+			return
+		}
+		lists := query_lists(&l.q)
+		for list in lists {
+			zsp.session_wants(l.session, zsp.list_lo(list), zsp.list_hi(list), true)
+			append(&far.near, list)
+		}
+		if len(far.near) == 0 {
+			return
+		}
+	}
+	sure := true
+	for list in far.near {
+		wanted, confirmed := zsp.session_wanted(l.session, zsp.list_lo(list), zsp.list_hi(list))
+		sure &&= wanted && confirmed
+	}
+	if sure != far.sure {
+		far.sure = sure
+		l.stale = true // said again, and so whether it is settled
+	}
+}
+
+@(private)
+near_drop :: proc(l: ^Live) {
+	far := &l.far
+	for list in far.near {
+		zsp.session_unwants(l.session, zsp.list_lo(list), zsp.list_hi(list), true)
+	}
+	clear(&far.near)
+	if far.sure {
+		far.sure = false
+		l.stale = true
 	}
 }
 

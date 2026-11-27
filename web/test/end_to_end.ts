@@ -6,7 +6,8 @@ import { spawn } from "node:child_process";
 import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
-import { Client, columns, type State } from "../src/client.ts";
+import { Client, columns, type Answer, type State } from "../src/client.ts";
+import { where as w } from "../src/ask.ts";
 import type { Connect, Wire } from "../src/node.ts";
 import { open } from "../src/nodejs.ts";
 import { live } from "./live.ts";
@@ -44,7 +45,7 @@ class Pipes {
 
 // A space as live.ts wants it: scope 1, and scope 2 signed, in which b may vouch; a goes by "ann" and b by "bob". Web
 // devices are partial replicas, as a browser's are, unless they are "full" ones.
-async function space(name: string, relay: { key: string; url: string }, sides: ("zspd" | "web" | "full")[], options: string[] = [], relayCredential?: string) {
+async function space(name: string, relay: { key: string; url: string }, sides: ("zspd" | "web" | "full")[], options: string[] = [], relayCredential?: string, noReader = false) {
   const owner = join(TMP, name + "-owner");
   const sid = zspd("create", owner);
   zspd("relay", owner, relay.key, relay.url);
@@ -52,9 +53,10 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
   const pipes = new Pipes();
   const clients: Client[] = [];
   const closers: (() => Promise<void>)[] = [];
+  let ownerNode: Awaited<ReturnType<typeof node>> | undefined;
   if (sides[0] !== "zspd") {
     // The owner is zspd's, and runs only to tell the others who belongs.
-    const n = await node("run", owner, ...options);
+    const n = (ownerNode = await node("run", owner, ...options));
     closers.push(async () => void n.p.kill());
   }
   for (const [i, kind] of sides.entries()) {
@@ -83,6 +85,11 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
     else if (kind !== "zspd") zspd("admit", owner, key, "2");
     zspd("subject", owner, key, subject);
     clients.push(new Client({ connect: pipes.wrap(connect), credential, linger: 200 }));
+  }
+  if (noReader) {
+    // Once all belong, nobody who can read holds everything: only the relay does.
+    await eventually("both may write", () => clients[0].may(2, "write") && clients[1].may(2, "write"));
+    ownerNode?.p.kill();
   }
   return { a: clients[0], b: clients[1], breakPipes: () => pipes.break(), close: () => Promise.all(closers.map((f) => f())) };
 }
@@ -343,6 +350,43 @@ const tests: Record<string, () => Promise<void>> = {
   async web_partial() {
     for (const kind of ["zspd", "cloud"]) await partialThrough(kind);
   },
+  // A space of partial devices, with no full replica that can read but a relay: what a question names the lists of is
+  // fetched through the relay, so that it is answered whole, and said to be once the relay has confirmed it; what one
+  // does not name is answered from what is held, and said to be no more than that.
+  async web_no_reader() {
+    for (const kind of ["zspd", "cloud"]) {
+      const relay = kind === "zspd" ? await node("serve", join(TMP, "nr-relay")) : await cloud();
+      const owner = join(TMP, `nr-${kind}-owner`);
+      const sid = zspd("create", owner);
+      zspd("relay", owner, relay.key, relay.url);
+      const quiet = (l: string, t: string) => l === "error" && console.error(`[web] ${t}`);
+      const [a, b] = [await open({ dir: join(TMP, `nr-${kind}-a`), udp: false, full: false, log: quiet }), await open({ dir: join(TMP, `nr-${kind}-b`), udp: false, full: false, log: quiet })];
+      for (const d of [a, b]) zspd("admit", owner, d.key, "1");
+      const o = await node("run", owner);
+      for (const d of [a, b]) await d.join(sid, relay);
+      const ca = a.client(), cb = b.client();
+      await eventually("both may write", () => ca.may(1, "write") && cb.may(1, "write"));
+      o.p.kill(); // and nobody who can read holds everything
+      const Track = { name: columns.string(16), length: columns.number(18) };
+      for (let i = 1; i <= 300; i++) void ca.write(1, (c) => c.insert(Track, "tracks", i, { name: "track " + i, length: i * 10 }));
+      await ca.write(1, (c) => c.insert(Track, "other", 1, { name: "elsewhere", length: 5000 }));
+      await new Promise((done) => setTimeout(done, 500));
+      let got: Answer<typeof Track> | undefined;
+      const asked = cb.ask({ scope: 1, table: Track, where: w.all(w.inList("tracks"), w.over("length", 2500)), order: ["-length"], limit: 10 }, (x) => (got = x));
+      await eventually("a question about a list is answered whole", () => got?.status === "ready" && got.total === 50 && got.rows[0].length === 3000, 15000);
+      void ca.write(1, (c) => c.insert(Track, "tracks", 301, { name: "new", length: 9999 }));
+      await eventually("and kept so", () => got?.total === 51 && got.rows[0].name === "new");
+      asked.stop();
+      let wide: Answer<typeof Track> | undefined;
+      const anywhere = cb.ask({ scope: 1, table: Track, where: w.over("length", 4000) }, (x) => (wide = x));
+      await eventually("one about no list is answered from what is held, and says so", () => wide?.status === "stale" && wide.total === 1 && wide.rows[0].name === "new");
+      anywhere.stop();
+      for (const c of [ca, cb]) c.close();
+      await a.close();
+      await b.close();
+      await stopAll();
+    }
+  },
   // The TypeScript client, of zspd, as the Luau client is: the same suite, the same answers.
   async zspd_clients() {
     const relay = await node("serve", join(TMP, "z-relay"));
@@ -377,12 +421,16 @@ const tests: Record<string, () => Promise<void>> = {
     await live(s);
     await s.close();
   },
-  // Structured state, by two web devices through a relay: test/mirror.ts, as luau/tests/mirror.luau is run on zspd's.
+  // Structured state, by two web devices through a relay: test/mirror.ts, as luau/tests/mirror.luau is run on zspd's; and
+  // again with nobody who can read holding everything, as in a space of browsers and a Durable Object.
   async mirror() {
     const relay = await node("serve", join(TMP, "m-relay"));
     const s = await space("m", relay, ["web", "web"]);
     await mirrorSuite(s);
     await s.close();
+    const t = await space("mn", await cloud(), ["web", "web"], [], undefined, true);
+    await mirrorSuite(t);
+    await t.close();
   },
 };
 

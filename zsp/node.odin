@@ -77,6 +77,8 @@ Questions :: struct {
 	// A call from another node, and what is said in those this node is an end of. Nothing may be said in return until later.
 	called: proc(data: rawptr, call: u64, device: Key32, scope: Scope, body: []byte),
 	flow:   proc(data: rawptr, call: u64, kind: Flow, payload: []byte),
+	// What a session wants shown may have come to be confirmed by a full replica, or be no longer: see session_wanted.
+	wanted: proc(data: rawptr, s: ^Session),
 }
 
 // The least message type that is a question.

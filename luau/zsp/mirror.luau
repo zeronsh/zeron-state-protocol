@@ -2223,7 +2223,7 @@ function mirror.ask(
 		end
 		for n = 1, math.ceil(#ids / 1000) do
 			local part = table.move(ids, (n - 1) * 1000 + 1, math.min(#ids, n * 1000), 1, {})
-			local q: any = client:ask({ scope = scope, table = { ["\0where"] = BYTES_COLUMN }, where = where.ids(part), limit = 1000 }, function(a: any)
+			local q: any = client:ask({ scope = scope, table = { ["\0where"] = BYTES_COLUMN }, where = where.all(where.in_list(list), where.ids(part)), limit = 1000 }, function(a: any)
 				answers[`maps {n}`] = a
 				tell()
 			end)
@@ -2294,7 +2294,7 @@ function mirror.ask(
 			found_handle.move(moved.offset, moved.limit)
 		end
 		-- The rows on the way: whether what answers is there is theirs to say.
-		local on_the_way: any = client:ask({ scope = scope, table = { ["\0where"] = BYTES_COLUMN }, where = where.ids(p.chain), limit = 1000 }, function(a: any)
+		local on_the_way: any = client:ask({ scope = scope, table = { ["\0where"] = BYTES_COLUMN }, where = where.all(where.in_list(list), where.ids(p.chain)), limit = 1000 }, function(a: any)
 			answers.chain = a
 			tell()
 		end)
