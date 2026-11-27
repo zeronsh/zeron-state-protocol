@@ -454,3 +454,55 @@ made_up_rosters_cost_little :: proc(t: ^testing.T) {
 		testing.expectf(t, took < 2 * time.Second, "a made-up roster of %d bytes took %v", len(forged), took)
 	}
 }
+
+// Taking Call away, or Vouch where cells are nobody's, ends no grant, and the roster that does so extends the one
+// before: nothing held is looked at again as if the one had lost to another. What does end a grant is not so taken.
+@(test)
+call_is_taken_away_in_place :: proc(t: ^testing.T) {
+	root, space := test_root()
+	a, b := test_keyring(), test_keyring()
+	defer keyring_destroy(&a)
+	defer keyring_destroy(&b)
+	none: Roster
+	d := draft_from(&none, 100)
+	home := draft_scope(&d)
+	shown := draft_scope(&d, {.Signed})
+	draft_grant(&d, a.device, a.signer, home, {.Write}).owner = true
+	draft_grant(&d, b.device, b.signer, home, {.Write, .Call, .Vouch})
+	draft_grant(&d, b.device, b.signer, shown, {.Write, .Call, .Vouch})
+	r1 := test_publish(t, &a, root, space, &d)
+	defer roster_destroy(&r1)
+	d = draft_from(&r1, 200)
+	draft_grant(&d, b.device, b.signer, home, {.Write})
+	draft_grant(&d, b.device, b.signer, shown, {.Write, .Vouch})
+	r2 := test_publish(t, &a, root, space, &d)
+	defer roster_destroy(&r2)
+	testing.expect_value(t, len(roster_member(&r2, b.device).grants), len(roster_member(&r1, b.device).grants))
+	testing.expect(t, member_rights(roster_member(&r2, b.device), home) == {.Read, .Write})
+	testing.expect(t, roster_extends(&r1, &r2))
+	// Vouch in a signed scope ends the grant, and that extends it too.
+	d = draft_from(&r2, 300)
+	draft_grant(&d, b.device, b.signer, shown, {.Write})
+	r3 := test_publish(t, &a, root, space, &d)
+	defer roster_destroy(&r3)
+	testing.expect(t, roster_extends(&r2, &r3) && len(roster_member(&r3, b.device).grants) == 3)
+	// But not one that took Write, or Vouch where it is signed, away in place, as no draft does.
+	for scope in ([]Scope{home, shown}) {
+		d = draft_from(&r2, 300)
+		for &m in d.members {
+			for &g in m.grants {
+				if m.device == b.device && g.scope == scope {
+					g.rights -= {.Write} if scope == home else {.Vouch}
+				}
+			}
+		}
+		bytes, signed := roster_sign(&a, root, &d, context.temp_allocator)
+		r, sound := roster_parse(bytes, space)
+		if scope == home {
+			testing.expect(t, signed && !sound) // and one who may read and not write where it is not signed is none
+		} else {
+			testing.expect(t, signed && sound && !roster_extends(&r2, &r))
+			roster_destroy(&r)
+		}
+	}
+}
