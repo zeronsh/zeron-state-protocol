@@ -5,6 +5,7 @@
 
 import { Client, CallFault, columns as c, type Answer, type State, type Table } from "../src/client.ts";
 import { where as w } from "../src/ask.ts";
+import * as text from "../src/text.ts";
 
 export interface Sides {
   a: Client;
@@ -61,9 +62,11 @@ export async function live({ a, b, breakPipes, say = console.log }: Sides): Prom
   await eventually("everything reaches b", () => st().rows.length === 300, 15000);
   all.stop();
   await sleep(300);
+  let shown: (() => void) | undefined; // looks at what is shown, as it is
   const window = b.window({ scope: 1, list: "chat", table: Message, size: 50 }, (s) => {
     current = s;
     told++;
+    shown?.();
   });
   await eventually("the tail arrives", () => st().status === "ready" && st().rows.length === 50 && st().before === 250);
   check(st().rows[49].stars === 1000 && st().rows[0].stars === 251 && st().after === 0, "the tail is the tail");
@@ -114,11 +117,17 @@ export async function live({ a, b, breakPipes, say = console.log }: Sides): Prom
     said += token;
     editor.append(token);
     if (i === 10) {
+      // By live frames, before the piece is sealed, a second after it began: what is first shown of them is live yet. (A
+      // piece is sealed after it is said live, and both come the same way, in order; so however slow the machine, it is.)
       const clock = now();
-      while (last().body !== said && now() - clock < 5000) await turn();
+      let live: boolean | undefined;
+      const want = said;
+      shown = () => last()?.body === want && live === undefined && (live = isLive(b, id, Message.body.slot));
+      shown();
+      while (live === undefined && now() - clock < 5000) await turn();
       started = now() - clock;
-      // At once: by live frames, long before the piece is sealed, a second after it began.
-      check(started < 500, "tokens are seen at once");
+      shown = undefined;
+      check(live === true, live === undefined ? "tokens are never seen" : "tokens are seen once sealed, not as they are typed");
     }
     if (i % 10 === 0) await sleep(5);
   }
@@ -309,7 +318,8 @@ async function questions(a: Client, b: Client): Promise<void> {
   counted.stop();
   asked.stop();
   let best!: Answer<typeof Track>;
-  const searched = b.ask({ scope: 1, table: Track, where: w.matches("words", "quick foxes", { any: true }), order: ["best"], limit: 20 }, (s) => (best = s));
+  let answered: (() => void) | undefined;
+  const searched = b.ask({ scope: 1, table: Track, where: w.matches("words", "quick foxes", { any: true }), order: ["best"], limit: 20 }, (s) => ((best = s), answered?.()));
   await eventually("the best come first", () => best.status === "ready" && best.rows.length === 20 && best.rows[0].words === "The quick brown foxes");
   const typed = best.rows[0].id;
   check(!Client.internals(a).rows.has(binaryOf(typed)), "a holds nothing it was not shown");
@@ -324,10 +334,12 @@ async function questions(a: Client, b: Client): Promise<void> {
   editor.append(" ju"); // before it is here
   await eventually("what is being edited is had", () => editor.read() === "The quick brown foxes ju");
   await sleep(100);
-  const began = now();
+  let live: boolean | undefined;
+  answered = () => live === undefined && best.rows.some((row) => row.id === typed && row.words === "The quick brown foxes jump") && (live = isLive(b, typed, Track.words.slot));
   editor.append("mp");
-  await eventually("live text shows in an answer", () => best.rows.some((row) => row.id === typed && row.words === "The quick brown foxes jump"));
-  check(now() - began < 500, "as it is typed, not once it is sealed");
+  await eventually("live text shows in an answer", () => live !== undefined);
+  answered = undefined;
+  check(live, "as it is typed, not once it is sealed");
   const other = b.text(typed, Track.words);
   other.append("!");
   await eventually("and what others write there is heard", () => editor.read() === "The quick brown foxes jump!");
@@ -369,6 +381,12 @@ async function whose(a: Client, b: Client): Promise<void> {
   await eventually("and is nobody else's", () => of.status === "ready" && of.rows.length === 0);
   other.stop();
   win.stop();
+}
+
+// Whether what a client holds of a row's text is live yet: said as it is typed, and not sealed.
+function isLive(x: Client, id: string, slot: number): boolean {
+  const t = Client.internals(x).rows.get(binaryOf(id))?.texts.get(slot);
+  return t !== undefined && text.provisional(t);
 }
 
 function binaryOf(hex: string): string {
