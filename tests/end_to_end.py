@@ -92,6 +92,18 @@ class Cloud:
         return self
 
 
+def read_kept(path):
+    """What a node keeps, read while it may be replacing it: which Windows refuses for a moment, mid-replace."""
+    for _ in range(200):
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except PermissionError:
+            time.sleep(0.01)
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def eventually(what, f, timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -270,7 +282,7 @@ def test_permissions():
     except PermissionError:
         pass
 
-    roster = lambda d: open(os.path.join(d.dir, zspd_space(a), "roster"), "rb").read()
+    roster = lambda d: read_kept(os.path.join(d.dir, zspd_space(a), "roster"))
     # An admin governs without owning; may not appoint; and, unmade, governs no more.
     zspd("admin", a.dir, zspd("key", b.dir))
     cb = b.client()
@@ -799,7 +811,7 @@ def test_roster_kept_beside_a_running_node():
     take, drawn up from a roster older than the node's, is neither kept in place of the node's nor said to be made."""
     n = Node("beside", "run", "--no-udp")
     sid = zspd("create", n.dir)
-    kept = lambda name: open(os.path.join(n.dir, sid, name), "rb").read()
+    kept = lambda name: read_kept(os.path.join(n.dir, sid, name))
     first = kept("roster")
     n.start()
     zspd("scope", n.dir)

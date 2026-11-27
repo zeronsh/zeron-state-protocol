@@ -78,7 +78,7 @@ file_in :: proc(dir, name: string) -> string {
 @(require_results)
 device_secret :: proc(dir: string) -> (secret: zsp.Key32, ok: bool) {
 	path := file_in(dir, "device.key")
-	if data, err := os.read_entire_file(path, context.temp_allocator); err == nil {
+	if data, read := read_file(path, context.temp_allocator); read {
 		copy(secret[:], data)
 		return secret, len(data) == 32
 	}
@@ -99,7 +99,7 @@ save :: proc(path: string, bytes: []byte) -> bool {
 	_, werr := os.write(f, bytes)
 	serr := os.sync(f)
 	os.close(f)
-	if werr != nil || serr != nil || os.rename(partial, path) != nil {
+	if werr != nil || serr != nil || !replace_file(partial, path) {
 		return false
 	}
 	when ODIN_OS != .Windows {
@@ -140,7 +140,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 	if !h.relay {
 		zsp.keyring_init(&s.keys, h.secret)
 		keys = &s.keys
-		if kept, err := os.read_entire_file(file_in(s.dir, "keys"), context.temp_allocator); err == nil {
+		if kept, read := read_file(file_in(s.dir, "keys"), context.temp_allocator); read {
 			zsp.keyring_load(keys, kept)
 		}
 	}
@@ -153,8 +153,8 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		report(.Info, "this store was a full replica's: it is one until it is level with another, and partial from then on")
 	}
 	zsp.node_keep(&s.node, h.keep)
-	if bytes, err := os.read_entire_file(file_in(s.dir, "roster"), context.temp_allocator); err == nil {
-		before, _ := os.read_entire_file(file_in(s.dir, "roster.old"), context.temp_allocator)
+	if bytes, read := read_file(file_in(s.dir, "roster"), context.temp_allocator); read {
+		before, _ := read_file(file_in(s.dir, "roster.old"), context.temp_allocator)
 		if !zsp.node_resume(&s.node, before, bytes) {
 			report(.Warning, "the saved roster is not sound")
 		} else if !h.relay && !zsp.node_member(&s.node) {
@@ -215,7 +215,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 roster_keep :: proc(dir: string, space: zsp.Key32, bytes: []byte) -> (this, ok: bool) {
 	serial := zsp.roster_claims(bytes, space) or_return
 	path := file_in(dir, "roster")
-	if old, err := os.read_entire_file(path, context.temp_allocator); err == nil {
+	if old, read := read_file(path, context.temp_allocator); read {
 		if kept, sound := zsp.roster_claims(old, space); sound && kept >= serial {
 			return string(old) == string(bytes), true
 		}

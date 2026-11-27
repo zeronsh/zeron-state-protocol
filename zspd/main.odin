@@ -281,8 +281,8 @@ print_key :: proc(dir: string) -> bool {
 // A line for each device: its key, what it may do, and whose it is.
 members :: proc(dir: string) -> bool {
 	space, name := read_space(dir) or_return
-	data, err := os.read_entire_file(in_dir(in_dir(dir, name), "roster"), context.temp_allocator)
-	if err != nil {
+	data, read := host.read_file(in_dir(in_dir(dir, name), "roster"), context.temp_allocator)
+	if !read {
 		return false
 	}
 	r := zsp.roster_parse(data, space) or_return
@@ -304,8 +304,8 @@ members :: proc(dir: string) -> bool {
 }
 
 read_space :: proc(dir: string) -> (space: zsp.Key32, name: string, ok: bool) {
-	data, err := os.read_entire_file(in_dir(dir, "space"), context.temp_allocator)
-	if err != nil {
+	data, read := host.read_file(in_dir(dir, "space"), context.temp_allocator)
+	if !read {
 		return
 	}
 	name = strings.trim_space(string(data))
@@ -322,16 +322,15 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 	a.space = name
 	zsp.keyring_init(&a.keys, secret)
 	path := in_dir(in_dir(dir, name), "roster")
-	data, err := os.read_entire_file(path, context.temp_allocator)
-	read: bool
-	if err == nil {
+	data, read := host.read_file(path, context.temp_allocator)
+	if read {
 		a.roster, read = zsp.roster_parse(data, space)
 	}
 	if !read {
 		say(os.stderr, "the roster kept here cannot be read\n")
 		return false
 	}
-	if kept, kerr := os.read_entire_file(in_dir(in_dir(dir, name), "keys"), context.temp_allocator); kerr == nil {
+	if kept, have_keys := host.read_file(in_dir(in_dir(dir, name), "keys"), context.temp_allocator); have_keys {
 		zsp.keyring_load(&a.keys, kept)
 	}
 	if !zsp.roster_unwrap(&a.keys, &a.roster) {
@@ -397,7 +396,7 @@ announce :: proc(dir: string, roster: []byte) -> (answered, reached: bool) {
 // it over. The one before what it keeps, if another came at once after.
 taken :: proc(space_dir: string, roster: []byte) -> bool {
 	for name in ([]string{"roster", "roster.old"}) {
-		if kept, err := os.read_entire_file(in_dir(space_dir, name), context.temp_allocator); err == nil && string(kept) == string(roster) {
+		if kept, read := host.read_file(in_dir(space_dir, name), context.temp_allocator); read && string(kept) == string(roster) {
 			return true
 		}
 	}
@@ -414,10 +413,10 @@ running_clock :: proc(dir: string) -> u64 {
 // whether it said it, and whether anything was there to speak to. It answers once it has read all that was said, and so
 // once it has taken the roster or not: not that it has taken it.
 speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool, reached: bool) {
-	address, aerr := os.read_entire_file(in_dir(dir, "address"), context.temp_allocator)
-	token, terr := os.read_entire_file(in_dir(dir, "token"), context.temp_allocator)
+	address, have_address := host.read_file(in_dir(dir, "address"), context.temp_allocator)
+	token, have_token := host.read_file(in_dir(dir, "token"), context.temp_allocator)
 	endpoint, parsed := net.parse_endpoint(string(address))
-	if aerr != nil || terr != nil || !parsed {
+	if !have_address || !have_token || !parsed {
 		return
 	}
 	socket, err := net.dial_tcp(endpoint)
@@ -515,8 +514,8 @@ space_url :: proc(url, space: string) -> string {
 
 join_from_roster :: proc(dir, file: string) -> bool {
 	_ = host.device_secret(dir) or_return
-	data, err := os.read_entire_file(file, context.temp_allocator)
-	if err != nil || len(data) < 38 {
+	data, read := host.read_file(file, context.temp_allocator)
+	if !read || len(data) < 38 {
 		return false
 	}
 	space: zsp.Key32
@@ -657,7 +656,7 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 			say(os.stderr, "could not open the space\n")
 			return 1
 		}
-		if line, err := os.read_entire_file(in_dir(dir, "relay"), context.allocator); err == nil {
+		if line, read := host.read_file(in_dir(dir, "relay"), context.allocator); read {
 			parts := strings.fields(string(line), context.temp_allocator)
 			key: zsp.Key32
 			if len(parts) != 2 {
@@ -685,7 +684,7 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 
 local_token :: proc(dir: string) -> string {
 	path := in_dir(dir, "token")
-	if data, err := os.read_entire_file(path, context.allocator); err == nil {
+	if data, read := host.read_file(path, context.allocator); read {
 		return string(data)
 	}
 	b: [24]byte

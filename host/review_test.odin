@@ -1,5 +1,6 @@
 package host
 
+import "base:runtime"
 import "core:encoding/hex"
 import "core:log"
 import "core:nbio"
@@ -7,7 +8,9 @@ import "core:net"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sync"
 import "core:testing"
+import "core:thread"
 import "core:time"
 import "../find"
 import "../pipe"
@@ -401,4 +404,70 @@ review_index_saved_by_a_whole_sync :: proc(t: ^testing.T) {
 	found_save(s)
 	testing.expect(t, !zsp.store_unsynced(&s.node.store))
 	testing.expect(t, !zsp.store_wants_checkpoint(&s.node.store), "the index saved, and the checkpoint due passed over")
+}
+
+// What is kept is kept whoever else is reading it, and read whoever is replacing it: on Windows, where a file another has
+// open cannot be replaced, nor one being replaced opened, as on any system. A writer, a reader of this host's own, and
+// another process's reader, all at once, as zspd's admin commands, tests and scanners read what a node keeps.
+@(test)
+review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-kept-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer delete(dir)
+	defer os.remove_all(dir)
+	Shared :: struct {
+		path:    string,
+		done:    bool, // atomic
+		torn:    int, // atomic: a read that was not one whole version
+		missing: int, // atomic: a read that found nothing
+	}
+	sh := Shared{path = strings.clone(file_in(dir, "roster"))} // which outlasts the temporary memory let go of below
+	defer delete(sh.path)
+	version :: proc(i: int) -> []byte {
+		b := make([]byte, 4096 + i, context.temp_allocator)
+		for &x in b {
+			x = byte(i)
+		}
+		return b
+	}
+	testing.expect(t, save(sh.path, version(0)))
+	ours := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
+		context = runtime.default_context() // temporary memory of its own
+		for !sync.atomic_load(&sh.done) {
+			data, ok := read_file(sh.path, context.temp_allocator)
+			if !ok {
+				sync.atomic_add(&sh.missing, 1)
+			} else if len(data) < 4096 || data[0] != byte(len(data) - 4096) || data[len(data) - 1] != data[0] {
+				sync.atomic_add(&sh.torn, 1)
+			}
+			free_all(context.temp_allocator)
+		}
+	})
+	// As another process reads, or a scanner: opened as the system opens a file by default, held a moment.
+	theirs := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
+		context = runtime.default_context()
+		for !sync.atomic_load(&sh.done) {
+			if f, ferr := os.open(sh.path, {.Read}); ferr == nil {
+				buf: [64]byte
+				_, _ = os.read(f, buf[:])
+				time.sleep(time.Millisecond)
+				os.close(f)
+			}
+		}
+	})
+	failed := 0
+	for i in 1 ..= 200 {
+		if !save(sh.path, version(i)) {
+			failed += 1
+		}
+		free_all(context.temp_allocator)
+	}
+	sync.atomic_store(&sh.done, true)
+	thread.join(ours)
+	thread.join(theirs)
+	thread.destroy(ours)
+	thread.destroy(theirs)
+	testing.expectf(t, failed == 0, "%d of 200 saves failed while others read", failed)
+	testing.expectf(t, sh.missing == 0 && sh.torn == 0, "reads while it was replaced: %d found nothing, %d torn", sh.missing, sh.torn)
 }
