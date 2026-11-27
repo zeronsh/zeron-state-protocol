@@ -145,6 +145,14 @@ Query :: struct {
 MAX_DEPTH :: 32
 MAX_PREDS :: 4096
 MAX_LIMIT :: 1000
+MAX_MATCH :: 4096 // bytes of text to match, in all
+MAX_SCANS :: 32 // words to match that are looked for through every word there is: with letters wrong, or inside others
+
+// What is left of what a question may ask.
+@(private)
+Budget :: struct {
+	conditions, text, scans: int,
+}
 
 // Reads a question. All it holds is made with the allocator.
 query_parse :: proc(source: []byte, allocator := context.temp_allocator) -> (q: Query, ok: bool) {
@@ -152,7 +160,7 @@ query_parse :: proc(source: []byte, allocator := context.temp_allocator) -> (q: 
 	q.source = slice.clone(source)
 	r := zsp.Reader{buf = q.source}
 	q.scope = scope_parse(&r)
-	left := MAX_PREDS
+	left := Budget{MAX_PREDS, MAX_MATCH, MAX_SCANS}
 	q.where_ = pred_parse(&r, 0, &left)
 	q.which = q.source[:r.pos]
 	orders := zsp.read_count(&r)
@@ -257,10 +265,10 @@ scope_parse :: proc(r: ^zsp.Reader) -> zsp.Scope {
 }
 
 @(private)
-pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
-	left^ -= 1
+pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^Budget) -> (p: Pred) {
+	left.conditions -= 1
 	op := zsp.read_u8(r)
-	if r.bad || op > u8(max(Op)) || depth > MAX_DEPTH || left^ < 0 {
+	if r.bad || op > u8(max(Op)) || depth > MAX_DEPTH || left.conditions < 0 {
 		r.bad = true
 		return
 	}
@@ -269,7 +277,7 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 	case .All:
 	case .And, .Or, .Not:
 		n := 1 if p.op == .Not else zsp.read_count(r)
-		if n > left^ {
+		if n > left.conditions {
 			r.bad = true
 			return
 		}
@@ -293,8 +301,8 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 		p.col = column_parse(r)
 		// Each of the set is a condition, of one byte or more, and is made many times larger than that.
 		n := zsp.read_count(r)
-		left^ -= n
-		if r.bad || left^ < 0 {
+		left.conditions -= n
+		if r.bad || left.conditions < 0 {
 			r.bad = true
 			return
 		}
@@ -320,7 +328,8 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 		mode := zsp.read_u8(r)
 		p.words.flags = Word_Flags(zsp.read_u8(r))
 		text := zsp.read_bytes(r)
-		if r.bad || p.col.kind != .Words || mode > u8(max(Word_Mode)) || len(text) > 4096 {
+		left.text -= len(text)
+		if r.bad || p.col.kind != .Words || mode > u8(max(Word_Mode)) || left.text < 0 {
 			r.bad = true
 			return
 		}
@@ -331,6 +340,11 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 			append(&all, w)
 		}
 		p.words.words = all[:]
+		// Each of those goes over every word there is, as many times as the question is answered.
+		for w in all {
+			left.scans -= 1 if p.words.flags.inside || edits_allowed(p.words.flags.edits, w.len) > 0 else 0
+		}
+		r.bad ||= left.scans < 0
 	case .Ids:
 		n := zsp.read_count(r, 16)
 		if r.bad {

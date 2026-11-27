@@ -1189,3 +1189,37 @@ extremes_are_of_their_key_alone :: proc(t: ^testing.T) {
 		testing.expectf(t, string(got) == string(values[0 if fn == .Min else 1]), "%v of them is %x", fn, got)
 	}
 }
+
+// A question looks for so many words with letters wrong, or inside others, and has so much text to match in all, and
+// no more, however it is put: each such word goes over every word there is.
+@(test)
+words_to_look_through_all_for_are_few :: proc(t: ^testing.T) {
+	match :: proc(w: ^[dynamic]byte, flags: Word_Flags, text: string) {
+		append(w, u8(Op.Match), u8(Kind.Words), 20, 0, 0, transmute(u8)flags)
+		zsp.write_bytes(w, transmute([]byte)text)
+	}
+	question :: proc(matches: int, flags: Word_Flags, text: string) -> []byte {
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, 1)
+		append(&w, u8(Op.And))
+		zsp.write_varint(&w, u64(matches))
+		for _ in 0 ..< matches {
+			match(&w, flags, text)
+		}
+		append(&w, 0, 0, 0, 10, 0)
+		return w[:]
+	}
+	fuzzy := Word_Flags{edits = 1}
+	words :: proc(n: int) -> string {
+		return strings.repeat("words ", n, context.temp_allocator)
+	}
+	for c in ([]struct {
+			matches: int,
+			flags:   Word_Flags,
+			n:       int,
+			ok:      bool,
+		}{{1, fuzzy, MAX_SCANS, true}, {1, fuzzy, MAX_SCANS + 1, false}, {MAX_SCANS + 1, fuzzy, 1, false}, {1, {inside = true}, MAX_SCANS + 1, false}, {1, {}, 600, true}, {2, {}, 400, false}}) {
+		_, ok := query_parse(question(c.matches, c.flags, words(c.n)))
+		testing.expectf(t, ok == c.ok, "%d of %d words, %v: %v", c.matches, c.n, c.flags, ok)
+	}
+}
