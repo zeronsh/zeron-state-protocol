@@ -420,6 +420,10 @@ edit_place :: proc(p: ^Pager, t: ^Tree, e: ^Edit) -> bool {
 	}
 	#reverse for step in path[:depth] {
 		up, over := page_own(p, step.no)
+		if step.at >= int(over.count) {
+			t.root = no // it could not be read again, and the pager says it failed: what was there is made again
+			return true
+		}
 		c := &children(over)[step.at]
 		c.child, c.count = no, u32(int(c.count) + delta)
 		if !e.gone && entry_less(e.key, e.sub, c.key, c.sub) {
@@ -581,6 +585,10 @@ node_join :: proc(p: ^Pager, t: ^Tree, nodes: ^[dynamic]Child, i: int) {
 	}
 	page_drop(p, a.child)
 	page_drop(p, b.child)
+	if len(joined) == 0 {
+		remove_range(nodes, i - 1, i + 1) // they were read as nothing, as pages that cannot be read are
+		return
+	}
 	nodes[i - 1] = joined[0]
 	if len(joined) > 1 {
 		nodes[i] = joined[1]
@@ -893,6 +901,10 @@ cursor_step :: proc(c: ^Cursor, way: int) -> bool {
 	}
 	for d < c.depth {
 		up := page_get(c.p, c.path[d].no)
+		if c.path[d].at < 0 || c.path[d].at >= int(up.count) {
+			// A page that could not be read is read as empty, and the pager says it failed: there is nothing more.
+			return false
+		}
 		below := children(up)[c.path[d].at].child
 		d += 1
 		c.path[d] = {below, 0}

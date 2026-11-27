@@ -288,3 +288,56 @@ numbers_sort_as_numbers :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, number_key(-0.0) == number_key(0))
 }
+
+// A page that cannot be read is read as empty, and the pager says it failed, so that the index is made again: whatever
+// goes over the tree meanwhile finds less than there was, and goes no further than there is.
+@(test)
+unreadable_pages_are_empty :: proc(t: ^testing.T) {
+	for round in 0 ..< 2 {
+		m: Memory_Disk
+		defer memory_disk_destroy(&m)
+		p: Pager
+		key: zsp.Key32
+		pager_open(&p, memory_disk(&m), key)
+		defer pager_close(&p)
+		tr := Tree{width = .Varint}
+		edits := make([dynamic]Edit, context.temp_allocator)
+		for i in u32(0) ..< (30000 if round == 0 else 2000) {
+			append(&edits, Edit{entry = {key = {u64(i) * 1600003, u64(i) * 9176}, sub = i, val = u64(i)}})
+		}
+		tree_apply(&p, &tr, edits[:])
+		root := page_get(&p, tr.root)
+		testing.expect(t, root.level >= (2 if round == 0 else 1))
+		// Every page but the root and the last of each level is as one that failed to be read.
+		keep := make(map[u32]bool, context.temp_allocator)
+		keep[tr.root] = true
+		for pg := root; pg.level > 0; {
+			last := children(pg)[pg.count - 1].child
+			if round == 0 {
+				keep[last] = true
+			}
+			pg = page_get(&p, last)
+		}
+		for no, f in p.dirty {
+			if no not_in keep {
+				f.page = {}
+			}
+		}
+		for no, f in p.open {
+			if no not_in keep {
+				f.page = {}
+			}
+		}
+		p.failed = true
+		if round == 0 {
+			c := cursor_make(&p, tr)
+			cursor_seek(&c, KEY_MAX, max(u32))
+			for _ in cursor_prev(&c) {
+			}
+			cursor_destroy(&c)
+		} else {
+			tree_apply(&p, &tr, {{entry = {key = {0, 0}}, gone = true}})
+		}
+		testing.expect(t, p.failed)
+	}
+}
