@@ -1,5 +1,6 @@
 package host
 
+import "core:strings"
 import "core:testing"
 import "../zsp"
 
@@ -148,7 +149,11 @@ heard_by :: proc(local: ^zsp.Session, h: ^Heard) {
 			_ = zsp.read_varint(&body)
 			_ = zsp.read_take(&body, 32)
 			_ = zsp.read_varint(&body)
-			append(&h.called, string(zsp.read_bytes(&body)))
+			if h.called.allocator.procedure == nil {
+				h.called.allocator = context.temp_allocator
+			}
+			// Copied: the output it is read from is taken below, and may be written over.
+			append(&h.called, strings.clone(string(zsp.read_bytes(&body)), context.temp_allocator))
 		case .Flow:
 			_ = zsp.read_varint(&body)
 			#partial switch zsp.Flow(zsp.read_u8(&body)) {
