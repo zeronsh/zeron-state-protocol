@@ -195,7 +195,8 @@ Admin :: struct {
 	space:  string,
 }
 
-// An admin or owner draws up rosters, and so must hold every scope's keys.
+// An admin or owner draws up rosters, and so must hold every scope's keys: to read, write and call in each, beside
+// whatever it may do there already, which is never taken away by this.
 appoint :: proc(a: ^Admin, key: string, owner, yes: bool) -> bool {
 	bytes := parse_hex(key, 64) or_return
 	device, signer: zsp.Key32
@@ -203,7 +204,15 @@ appoint :: proc(a: ^Admin, key: string, owner, yes: bool) -> bool {
 	copy(signer[:], bytes[32:])
 	if yes {
 		for s in a.draft.scopes {
-			zsp.draft_grant(&a.draft, device, signer, s.id, {.Read, .Write, .Call})
+			rights := zsp.Rights{.Read, .Write, .Call}
+			for m in a.draft.members {
+				for g in m.grants {
+					if m.device == device && g.scope == s.id && g.until == 0 {
+						rights += g.rights
+					}
+				}
+			}
+			zsp.draft_grant(&a.draft, device, signer, s.id, rights)
 		}
 	}
 	for &m in a.draft.members {

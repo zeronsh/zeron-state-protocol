@@ -578,6 +578,19 @@ def test_strangers_are_let_go():
     k.close()
 
 
+def test_appointed_keep_their_rights():
+    """Made an admin, or an owner, a device may read, write and call in every scope, and still do whatever else it might:
+    vouch, where it could."""
+    d, other = Node("appointing").dir, Node("appointed").dir
+    zspd("create", d)
+    key = zspd("key", other)
+    zspd("admit", d, key, "1", "vouch")
+    for appoint in (["admin", d, key], ["owner", d, key]):
+        zspd(*appoint)
+        line = next(l for l in zspd("members", d).splitlines() if l.startswith(key))
+        assert " 1:rwcv " in line, (appoint[0], line)
+
+
 def test_limits():
     relay, (a, b) = space("aa", "ab")
     ca, cb = a.client(), b.client()
