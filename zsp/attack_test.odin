@@ -1884,3 +1884,55 @@ wants_cost_little :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, l.most <= 2 * len(w), "made %d bytes at once of a frame of %d", l.most, len(w))
 }
+
+@(private, thread_local)
+signalled: [dynamic]Key32
+
+// A signal, of whatever kind, is taken only from a member, and only through a relay this device dialled: not from one
+// who is no member, though it seals it soundly, nor from one who brings it as if it were a relay.
+@(test)
+signals_are_from_members_through_relays :: proc(t: ^testing.T) {
+	state := seeded(85)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 1, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_link(&s, 0, 2)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	via_relay, direct := s.links[0].a, s.links[1].a
+	testing.expect(t, via_relay.peer_relay && !direct.peer_relay)
+	defer delete(signalled)
+	a.node.host.signal = proc(_: rawptr, from: Key32, _: []byte) {
+		append(&signalled, from)
+	}
+	stranger := test_keyring()
+	defer keyring_destroy(&stranger)
+	signal :: proc(from: ^Keyring, to: Key32, stamp: Stamp) -> []byte {
+		to := to
+		key, _ := signal_key(from, to)
+		bind: [64]byte
+		copy(bind[:], from.device[:])
+		copy(bind[32:], to[:])
+		iv := aead_nonce(stamp, 0, LIVE_KIND + 1)
+		w := make([dynamic]byte, context.temp_allocator)
+		at := frame_begin(&w, .Signal)
+		append(&w, ..from.device[:])
+		write_u8(&w, u8(Post.Plain))
+		write_stamp(&w, stamp)
+		aead_append(&w, key, &iv, bind[:], transmute([]byte)string("here"))
+		frame_end(&w, at)
+		return w[:]
+	}
+	stamp := node_stamp(&a.node)
+	for x in ([]struct {
+			from:    ^Keyring,
+			session: ^Session,
+		}{{&stranger, via_relay}, {&stranger, direct}, {&b.keys, direct}, {&b.keys, via_relay}}) {
+		testing.expect(t, session_input(x.session, signal(x.from, a.keys.device, stamp)))
+	}
+	testing.expect_value(t, len(signalled), 1)
+	testing.expect(t, len(signalled) == 1 && signalled[0] == b.keys.device)
+}
