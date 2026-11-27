@@ -535,6 +535,16 @@ function Client._receive(self: Client, data: buffer | string)
 		local fine, why = pcall(handle, self, r)
 		if not fine then
 			if why ~= codec.Malformed then
+				-- What the code of whoever was told of it threw is theirs, and theirs alone: the pipe is read on from the
+				-- frame after, on a turn of its own, as though it had not been thrown, rather than losing the rest.
+				if self.wire == wire then
+					self.input = string.sub(s, at)
+					self.host.defer(function()
+						if self.wire == wire then
+							self:_receive("")
+						end
+					end)
+				end
 				error(why, 0)
 			end
 			-- Nonsense from the pipe ends the pipe and nothing else.
@@ -666,11 +676,18 @@ end
 
 -- ---------------------------------------------------------------- observing things that are not windows
 
+-- Each hears, whatever another does: one that throws does so on a turn of its own, never in the middle of what a pipe
+-- said, where all that came after it would be lost.
 function Client._tell(self: Client, what: string, value: any)
 	local set = self.watchers[what]
 	if set then
 		for f in table.clone(set) do
-			f(value)
+			local fine, why = pcall(f, value)
+			if not fine then
+				self.host.defer(function()
+					error(why, 0)
+				end)
+			end
 		end
 	end
 end

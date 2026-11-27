@@ -623,6 +623,61 @@ function piecesOf(h: ReturnType<typeof harness>, slot: number): [stamp: string, 
   spoilt.stop(), early.stop(), later.stop();
 }
 
+// What hears of the pipe hears all of it, whatever one of them does: one that throws does so on a turn of its own, and
+// what came after it down the pipe, the questions asked again and the others that hear, are all as they would be.
+{
+  const h = harness();
+  h.run();
+  const heard: boolean[] = [];
+  h.client.on("status", (up) => {
+    if (up) throw new Error("a listener's own");
+  });
+  h.client.on("status", (up) => heard.push(up));
+  h.client.ask({ scope: 1, table: Note }, () => {});
+  const frame = (kind: number, body: string) => {
+    const w = codec.writer();
+    codec.putBytes(w, b(ch(kind) + body));
+    return s(codec.written(w));
+  };
+  const chunk = frame(ROSTER, rep("\0", 8) + "\x01\x07" + rep("k", 32)) + frame(12, rep("d", 32) + "\x03who");
+  const from = h.self.said.length;
+  h.self.receive(b(chunk)); // the roster and what followed it, at once
+  assert(h.client.ready && heard.join() === "false,true", `heard ${heard}`);
+  assert.equal(h.client.devices.length, 1, "what came after it was lost");
+  assert.equal(h.client.devices[0].subject, "who");
+  assert.throws(() => h.run(), /a listener's own/);
+  h.run();
+  assert(h.self.said.slice(from).some((x) => x.kind === ASK), "the question was not asked again");
+  h.self.receive(b(frame(12, "")));
+  assert.equal(h.client.devices.length, 0, "the pipe was not read on");
+}
+
+// And what any other code told of the pipe throws is its own: the pipe is read on from the frame after, on a turn of its
+// own, as if it had not been thrown, rather than losing the rest and reading what comes after as nonsense.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const frame = (kind: number, body: string) => {
+    const w = codec.writer();
+    codec.putBytes(w, b(ch(kind) + body));
+    return s(codec.written(w));
+  };
+  let throwing = true;
+  const stop = h.client.follow(() => {
+    if (throwing) throw new Error("a follower's own");
+  });
+  const row = "\0\0\0\x01" + rep("\x07", 12);
+  assert.throws(() => h.self.receive(b(frame(CELLS, "\0" + cellOf(row, 3, 16, 1, "t")) + frame(12, rep("d", 32) + "\x03who"))), /a follower's own/);
+  throwing = false;
+  h.run();
+  const devices = () => h.client.devices.length;
+  assert.equal(devices(), 1, "what came after it was lost");
+  h.self.receive(b(frame(12, "")));
+  assert(h.client.ready && devices() === 0 && h.self.closes === 0, "the pipe was not read on");
+  stop();
+}
+
 // A row an editor has open that moves within its window, or from one window to another, is never without one to show
 // it: no question is asked for it, as one would be once nothing shows it.
 {

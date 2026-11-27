@@ -706,7 +706,15 @@ export class Client {
       try {
         this.#handle(codec.u8(r), r);
       } catch (e) {
-        if (!(e instanceof codec.Malformed)) throw e;
+        if (!(e instanceof codec.Malformed)) {
+          // What the code of whoever was told of it threw is theirs, and theirs alone: the pipe is read on from the frame
+          // after, on a turn of its own, as though it had not been thrown, rather than losing the rest.
+          if (this.#wire === wire) {
+            this.#input = s.slice(at);
+            this.#host.defer(() => this.#wire === wire && this.#receive(new Uint8Array(0)));
+          }
+          throw e;
+        }
         // Nonsense from the pipe ends the pipe and nothing else.
         this.#input = new Uint8Array(0);
         this.#faulted = true;
@@ -818,9 +826,20 @@ export class Client {
 
   // ---------------------------------------------------------------- observing things that are not windows
 
+  // Each hears, whatever another does: one that throws does so on a turn of its own, never in the middle of what a pipe
+  // said, where all that came after it would be lost.
   #tell<E extends Event>(what: E, value: Told[E]): void {
     const set = this.#watchers.get(what);
-    if (set) for (const f of [...set]) f(value);
+    if (!set) return;
+    for (const f of [...set]) {
+      try {
+        f(value);
+      } catch (e) {
+        this.#host.defer(() => {
+          throw e;
+        });
+      }
+    }
   }
 
   /**

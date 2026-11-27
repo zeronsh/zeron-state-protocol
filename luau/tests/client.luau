@@ -832,6 +832,78 @@ do
 	later.stop()
 end
 
+-- What hears of the pipe hears all of it, whatever one of them does: one that throws does so on a turn of its own, and
+-- what came after it down the pipe, the questions asked again and the others that hear, are all as they would be.
+do
+	local ASK = 32
+	local h = harness()
+	h.run()
+	local heard = {}
+	h.client:on("status", function(up)
+		if up then
+			error("a listener's own", 0)
+		end
+	end)
+	h.client:on("status", function(up)
+		table.insert(heard, tostring(up))
+	end)
+	h.client:ask({ scope = 1, table = Note }, function() end)
+	local function frame(kind: number, body: string): string
+		local w = codec.writer()
+		codec.put_bytes(w, string.char(kind) .. body)
+		return codec.string(w)
+	end
+	local chunk = frame(ROSTER, string.rep("\0", 8) .. "\1\7" .. string.rep("k", 32)) .. frame(12, string.rep("d", 32) .. "\3who")
+	local from = #h.self.said
+	h.self.receive(chunk) -- the roster and what followed it, at once
+	assert(h.client.ready and table.concat(heard, ",") == "false,true", `heard {table.concat(heard, ",")}`)
+	assert(#h.client.devices == 1 and h.client.devices[1].subject == "who", "what came after it was lost")
+	local fine, why = pcall(h.run)
+	assert(not fine and why == "a listener's own", `it was {why}`)
+	h.run()
+	local asked = false
+	for i = from + 1, #h.self.said do
+		asked = asked or h.self.said[i].kind == ASK
+	end
+	assert(asked, "the question was not asked again")
+	h.self.receive(frame(12, ""))
+	assert(#h.client.devices == 0, "the pipe was not read on")
+end
+
+-- And what any other code told of the pipe throws is its own: the pipe is read on from the frame after, on a turn of its
+-- own, as if it had not been thrown, rather than losing the rest and reading what comes after as nonsense.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local function frame(kind: number, body: string): string
+		local w = codec.writer()
+		codec.put_bytes(w, string.char(kind) .. body)
+		return codec.string(w)
+	end
+	local function cell(id: string): string
+		local w = codec.writer()
+		codec.put(w, "\3" .. id .. "\16" .. string.rep("\0", 15) .. "\1")
+		codec.put_bytes(w, "t")
+		return codec.string(w)
+	end
+	local throwing = true
+	local stop = h.client:follow(function()
+		if throwing then
+			error("a follower's own", 0)
+		end
+	end)
+	local row = "\0\0\0\1" .. string.rep("\7", 12)
+	local fine, why = pcall(h.self.receive, frame(CELLS, "\0" .. cell(row)) .. frame(12, string.rep("d", 32) .. "\3who"))
+	assert(not fine and why == "a follower's own", `it was {why}`)
+	throwing = false
+	h.run()
+	assert(#h.client.devices == 1, "what came after it was lost")
+	h.self.receive(frame(12, ""))
+	assert(h.client.ready and #h.client.devices == 0 and h.self.closes == 0, "the pipe was not read on")
+	stop()
+end
+
 -- A row an editor has open that moves within its window, or from one window to another, is never without one to show
 -- it: no question is asked for it, as one would be once nothing shows it.
 do
