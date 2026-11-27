@@ -571,9 +571,9 @@ session_settle_membership :: proc(s: ^Session) {
 		return
 	}
 	send_roster(s)
-	if s.promised <= n.roster.serial {
+	if s.promised <= n.roster.serial && !(n.keys == nil && n.roster.serial == 0) {
 		session_authorize(s)
-	} // else a newer roster is on its way, and decides
+	} // else a newer roster is on its way, and decides; or, to a relay that knows none, whoever brings one first
 }
 
 // Peers get the roster; open sessions get what it means for them.

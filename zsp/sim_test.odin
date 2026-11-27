@@ -26,6 +26,7 @@ Sim_Node :: struct {
 	skew:   i64, // of its clock, in milliseconds
 	ui:     ^Session, // of a partial replica: a client of its own, watching this and that
 	relayed: [dynamic]Sim_Relayed, // sessions for calls, carried through a relay
+	bare:   bool, // joined, and given no roster yet: as one that has only its space's id and its relay's
 }
 
 // A session for calls with a device reached only through a relay, its bytes carried in links' packets there. (The
@@ -232,7 +233,7 @@ sim_boot :: proc(s: ^Sim, x: ^Sim_Node) {
 	}
 	if x.roster != nil {
 		assert(node_resume(&x.node, x.roster_old, x.roster) && !x.node.failed)
-	} else if !x.relay {
+	} else if !x.relay && !x.bare {
 		assert(node_adopt(&x.node, s.roster))
 	}
 	x.node.host.data = x

@@ -274,7 +274,8 @@ carries (§13), which carries everything else already. Both ends say 8, or the s
 
 The accepting host decides from the credential and the proven key whether to serve the connection (§16); until it has, later frames
 wait. Then, between peers, whichever has the newer roster sends it (one no older than it said, or the session ends), and each verifies that the other is a member with a grant in
-force, or is a relay it chose to dial:
+force, or is a relay it chose to dial. A relay that knows no roster yet can verify nobody, and turns nobody away for that: the session waits, saying nothing, until a roster comes,
+from its peer or from anyone, and is verified then:
 
 ```
 2 Roster   the document                                                       between peers
