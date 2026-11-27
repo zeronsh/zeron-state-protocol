@@ -381,7 +381,8 @@ roster_sweep :: proc(n: ^Node, old: ^Roster) -> (swept: bool) {
 	return
 }
 
-// What a roster has made unlawful in one scope: cells later than `from`, or, of scopes there are no more, all.
+// What a roster may have made unlawful in one scope: cells later than `from`, looked at from `from` itself on, so that
+// from 0 is all of them, those made at the first moment there is among them; or, of scopes there are no more, all.
 @(private)
 Sweep_Plan :: struct {
 	scope: Scope,
@@ -481,7 +482,7 @@ sweep_step :: proc(n: ^Node, old: ^Roster, budget: int) -> (done: bool) {
 		seen += 1
 		if plan.gone {
 			append(&lost, leaf)
-		} else if leaf.key[3] > plan.from {
+		} else if leaf.key[3] >= plan.from { // from it on: from 0, all, those of the first moment among them
 			append(&late, leaf)
 		}
 	}

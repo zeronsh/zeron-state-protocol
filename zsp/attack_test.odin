@@ -2027,6 +2027,14 @@ a_scope_made_again_is_not_the_one_that_went :: proc(t: ^testing.T) {
 	testing.expect(t, node_adopt(&writer, lost))
 	writer.now = now + 2000
 	gone := place(&writer, 2)
+	// And one made at the first moment there is, as a row born then may be.
+	first := Id{2 << 32, 0x12345}
+	{
+		body: [24]byte
+		put_u64(body[:], 2 << 32 | 1)
+		put_u64(body[8:], 1)
+		testing.expect(t, node_write(&writer, {{first, PLACE, .Place, {time = 0, salt = 42}, body[:]}}))
+	}
 	relay_disk: Memory_Disk
 	defer memory_disk_destroy(&relay_disk)
 	lazy := memory_disk(&relay_disk)
@@ -2059,7 +2067,7 @@ a_scope_made_again_is_not_the_one_that_went :: proc(t: ^testing.T) {
 		session_close(sr)
 	}
 	sync(t, &writer, &relay, admin.device)
-	testing.expect(t, row_places(&relay.store, gone).count > 0)
+	testing.expect(t, row_places(&relay.store, gone).count > 0 && row_places(&relay.store, first).count > 0)
 	// The one that won comes, and with it the sweep of the scope that went, a job; and before it is done, the roster
 	// after it, which makes a second scope again.
 	testing.expect(t, node_adopt(&writer, won))
@@ -2077,7 +2085,92 @@ a_scope_made_again_is_not_the_one_that_went :: proc(t: ^testing.T) {
 	testing.expect(t, len(relay.sweep.plans) == 0)
 	testing.expect(t, row_places(&relay.store, kept).count > 0)
 	testing.expect_value(t, row_places(&relay.store, gone).count, 0)
+	testing.expect_value(t, row_places(&relay.store, first).count, 0)
 	testing.expect_value(t, store_range(&relay.store, scope_lo(2), scope_hi(2)).count, 1)
+}
+
+// Of two rosters drawn up at once, what was sealed under a key only the one that lost had is dropped wherever it was
+// held, by a node that sweeps as it takes a roster as by one whose sweep is a job: that made at the first moment there
+// is too.
+@(test)
+the_first_moment_is_swept_too :: proc(t: ^testing.T) {
+	root, space := test_root()
+	admin := test_keyring()
+	defer keyring_destroy(&admin)
+	now := u64(1_700_000_000_000)
+	none: Roster
+	d := draft_from(&none, now << 16)
+	one := draft_scope(&d)
+	m := draft_grant(&d, admin.device, admin.signer, one, {.Write})
+	m.owner = true
+	r1, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	w_disk: Memory_Disk
+	defer memory_disk_destroy(&w_disk)
+	writer: Node
+	testing.expect(t, node_init(&writer, memory_disk(&w_disk), space, &admin, true))
+	defer node_destroy(&writer)
+	writer.now = now
+	testing.expect(t, node_adopt(&writer, r1))
+	// Two drawn up at once, each with a new key for the scope.
+	d = draft_from(&writer.roster, (now + 1000) << 16)
+	d.scopes[0].rotate = true
+	lost, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	won: []byte
+	for {
+		d = draft_from(&writer.roster, (now + 1000) << 16)
+		d.scopes[0].rotate = true
+		won, _ = roster_sign(&admin, root, &d, context.temp_allocator)
+		a, _ := roster_claims(lost, space)
+		b, _ := roster_claims(won, space)
+		if b > a {
+			break
+		}
+	}
+	testing.expect(t, node_adopt(&writer, lost))
+	writer.now = now + 2000
+	body: [24]byte
+	put_u64(body[:], 1 << 32 | 1)
+	put_u64(body[8:], 1)
+	first, later := Id{1 << 32, 0xaaaa}, node_id(&writer, one)
+	testing.expect(t, node_write(&writer, {{first, PLACE, .Place, {time = 0, salt = 88}, body[:]}}))
+	testing.expect(t, node_write(&writer, {{later, PLACE, .Place, node_stamp(&writer), body[:]}}))
+	accept :: proc(_: rawptr, s: ^Session, _: []byte) {session_accept(s)}
+	writer.host.authenticate = accept
+	for lazy in ([]bool{false, true}) {
+		relay_disk: Memory_Disk
+		defer memory_disk_destroy(&relay_disk)
+		disk := memory_disk(&relay_disk)
+		if lazy {
+			disk.missed = proc(_: rawptr) -> int {return 0}
+		}
+		relay: Node
+		testing.expect(t, node_init(&relay, disk, space, nil, true))
+		defer node_destroy(&relay)
+		relay.host.authenticate = accept
+		relay.now = writer.now
+		testing.expect(t, node_adopt(&relay, lost))
+		for node_retry(&relay) {}
+		sw := session_open(&writer, .Peer, true, {0 = 9}, nil, true)
+		sr := session_open(&relay, .Peer, false, admin.device)
+		for _ in 0 ..< 50 {
+			out := session_output(sw)
+			testing.expect(t, session_input(sr, out))
+			session_sent(sw, len(out))
+			back := session_output(sr)
+			testing.expect(t, session_input(sw, back))
+			session_sent(sr, len(back))
+			if len(out) == 0 && len(back) == 0 {
+				break
+			}
+		}
+		session_close(sw)
+		session_close(sr)
+		testing.expect(t, row_places(&relay.store, first).count > 0 && row_places(&relay.store, later).count > 0)
+		testing.expect(t, node_adopt(&relay, won))
+		for node_retry(&relay) {}
+		testing.expectf(t, row_places(&relay.store, first).count == 0, "lazy %v: made at the first moment, and kept", lazy)
+		testing.expectf(t, row_places(&relay.store, later).count == 0, "lazy %v: made later, and kept", lazy)
+	}
 }
 
 @(private, thread_local)
