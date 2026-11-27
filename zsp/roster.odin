@@ -520,7 +520,11 @@ roster_extends :: proc(old, new: ^Roster) -> bool {
 		}
 		for g, j in was.grants {
 			now := m.grants[j]
-			if now.scope != g.scope || (now.until != g.until && g.until != 0) || g.rights - now.rights != {} {
+			// Call, and Vouch where cells are nobody's, are taken away without ending the grant: nothing written
+			// hangs on them.
+			info := roster_scope(old, g.scope)
+			kept := Rights{.Read, .Write, .Vouch} if info != nil && .Signed in info.flags else Rights{.Read, .Write}
+			if now.scope != g.scope || (now.until != g.until && g.until != 0) || (g.rights - now.rights) & kept != {} {
 				return false
 			}
 		}

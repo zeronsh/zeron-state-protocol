@@ -132,7 +132,8 @@ members sealed under it they seal again.
 
 Rights are bits: 1 Read, 2 Write, 4 Call, 8 Vouch: to be believed about for whom one writes and calls (§4, §12); a grant with any other is invalid. Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
 invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
-a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed; and so does taking Vouch away in a signed scope. `closed`
+a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed; and so does taking Vouch away in a signed scope. Anything else is
+taken away in place, nothing written hanging on it. `closed`
 says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
 `subject` is the consumer's name for whomever the device belongs to, opaque here. A roster that does not begin `"zsp-r1"` is none. A roster is at most 2²² − 64 bytes. Members are never removed, only their grants
 ended, so that a member's index is for ever.
@@ -186,7 +187,8 @@ On adopting a roster, and on starting with one it has not yet held its cells aga
 it ends. In an unsigned scope, one that is no longer acceptable is sealed again, with the same stamp, under the key in force at that stamp's
 time, by a replica that can open it, since someone may merely not have heard; in a signed scope, by its author alone, for a void key, or for a bundle that names more than its author may still kill, which it puts together again, with
 the same stamp, of only what it may name and had the right to write; otherwise it is dropped.
-A roster that does not extend the one held (a prefix of whose members, grants, keys and times it keeps) won over it: then everything held is looked at. A partial replica that may have written there offers again
+A roster that does not extend the one held (a prefix of whose members, grants, keys and times it keeps, the grants with all their rights but Call, and
+Vouch where a scope is not signed) won over it: then everything held is looked at. A partial replica that may have written there offers again
 all it holds in that scope, for who took it may be gone. Then, whatever the roster changed, each device watches afresh, partial ones under new ids. A device's clock moves past
 the end of everything that has ended, but for what is too far ahead. Where a cell is
 held already, another body for the same identity is ignored.
