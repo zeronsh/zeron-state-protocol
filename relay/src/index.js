@@ -165,14 +165,18 @@ export class Space extends DurableObject {
     let lost = false;
     for (const ws of this.ctx.getWebSockets()) {
       const { id, state } = ws.deserializeAttachment() ?? {};
+      // Its number is never given to another, though it is told to go: its close, and whatever it was still sending,
+      // may yet be heard of.
+      if (id >= this.#next) this.#next = id + 1;
       if (!state || !this.#put(state, (n) => exports.load(id, n))) {
-        ws.close(1012, "resume by reconnecting");
+        try {
+          ws.close(1012, "resume by reconnecting");
+        } catch {} // already gone
         lost = true;
         continue;
       }
       this.#sockets.set(id, ws);
       this.#kept.add(id); // what it was kept as is what it is: out of date as soon as anything happens
-      this.#next = Math.max(this.#next, id + 1);
     }
     if (lost) this.#unkeep(), exports.present(), this.#settle();
   }
@@ -216,8 +220,14 @@ export class Space extends DurableObject {
   }
 
   webSocketMessage(ws, message) {
-    if (!this.#wasm) return void ws.close(1011, FULL); // what came before it was let go
-    const { id } = ws.deserializeAttachment();
+    if (!this.#wasm) {
+      try {
+        ws.close(1011, FULL); // what came before it was let go
+      } catch {} // already gone
+      return;
+    }
+    const id = this.#own(ws);
+    if (id === undefined) return; // let go of, and still being heard from: nothing it says is anyone's
     this.#unkeep();
     // Its last words, if any, are said by #settle, and only once what it came to is kept: else, nothing is said at all.
     if (typeof message === "string" || !this.#put(new Uint8Array(message), (n) => this.#wasm.received(id, n))) this.#ending.add(id);
@@ -232,9 +242,16 @@ export class Space extends DurableObject {
     this.#gone(ws);
   }
 
+  // Its number, while it is the connection of that number: not once it has been let go of.
+  #own(ws) {
+    const id = ws.deserializeAttachment()?.id;
+    return this.#sockets.get(id) === ws ? id : undefined;
+  }
+
   #gone(ws) {
-    const { id } = ws.deserializeAttachment();
-    if (!this.#sockets.delete(id)) return;
+    const id = this.#own(ws);
+    if (id === undefined) return;
+    this.#sockets.delete(id);
     this.#kept.delete(id);
     this.#unkeep();
     this.#wasm.closed(id);

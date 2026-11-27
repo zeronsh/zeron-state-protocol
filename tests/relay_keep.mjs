@@ -246,3 +246,36 @@ const until = async (f) => { for (let i = 0; i < 2000 && !f(); i++) await new Pr
     console.log("ok   a relay resumes only connections it kept itself");
   } finally { await r.close(); }
 }
+
+// Bug hunt. Woken with connections it did not keep, which it tells to reconnect, one of them already closed: telling
+// that one throws, and nothing else is the worse for it; and no connection that comes next is given the number of one
+// told to go, whose close, and whatever it was still sending, the runtime may yet hand over. Those are let go of; the
+// one with its number is not.
+{
+  const r = await relayWith(3);
+  try {
+    const [wsA, wsB, wsC] = r.serverSockets, [clientA] = r.clients;
+    await new Promise((go) => setTimeout(go, 300));
+    assert(kept(wsA) && kept(wsB) && kept(wsC), "all kept while quiet");
+    for (const ws of [wsB, wsC]) ws._att = { id: ws._att.id, space: ws._att.space }; // not kept, as when opened in the burst before
+    wsC.close = () => { throw new Error("socket already closed"); };
+    const closedA = wsA.closed;
+    r.doSpace = new Space(r.ctx, r.env);
+    assert.deepEqual(wsA.closed, closedA, "woken, it resumed the one it kept");
+    assert.equal(wsB.closed?.code, 1012, "and told the other to reconnect");
+    for (let i = 0; i < 200 && r.serverSockets.length < 4; i++) await new Promise((go) => setTimeout(go, 50)); // in its own time
+    const wsB2 = r.serverSockets[3];
+    assert(wsB2, "it reconnected");
+    for (let i = 0; i < 100 && !kept(wsB2); i++) await new Promise((go) => setTimeout(go, 20)); // and is level
+    r.doSpace.webSocketMessage(wsB, new Uint8Array(64)); // what the one told to go was still sending
+    assert.equal(wsB2.closed, null, "the one that reconnected was let go of for what the other sent");
+    r.doSpace.webSocketClose(wsB); // and its close, heard of at last
+    r.doSpace.webSocketClose(wsC);
+    await clientA.write(1, (ch) => ch.insert(schema, "items", 1, { body: new Uint8Array(64).fill(1) }));
+    for (let i = 0; i < 100 && r.states[1].rows.length !== 1; i++) await new Promise((go) => setTimeout(go, 20));
+    assert.equal(r.states[1].rows.length, 1, "what is said after reaches the one that reconnected");
+    assert.equal(wsB2.closed, null);
+    assert.equal(r.serverSockets.length, 4, "without its reconnecting again");
+    console.log("ok   a relay woken never gives a connection the number of one it told to go");
+  } finally { await r.close(); }
+}
