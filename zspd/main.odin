@@ -259,8 +259,37 @@ to_hex :: proc(b: []byte) -> string {
 	return string(hex.encode(b, context.temp_allocator))
 }
 
+// The directory, held while a command changes what a node there keeps: which space it is of, and where it meets the
+// others. A node running there is left to itself, and the command fails; none starts meanwhile, nor does another such
+// command make what this one is making. The commands that change a space's roster speak to the node running there
+// instead, or keep the roster themselves with none running (see amend); those that only read, read files that are only
+// ever replaced whole.
+Held :: struct {
+	start: host.File_Lock,
+	lock:  host.Dir_Lock,
+}
+
+hold :: proc(dir: string) -> (held: Held, ok: bool) {
+	held.start = host.dir_starting(dir) or_return
+	lock, locked := host.dir_hold(dir)
+	if !locked {
+		host.dir_started(held.start)
+		return
+	}
+	held.lock = lock
+	return held, true
+}
+
+let_go :: proc(held: Held) {
+	host.dir_unlock(held.lock)
+	host.dir_started(held.start)
+}
+
+// Makes a space here, unless there is one already.
 create :: proc(dir: string) -> bool {
-	secret := host.device_secret(dir) or_return
+	held := hold(dir) or_return
+	defer let_go(held)
+	secret := host.device_secret(dir, true) or_return
 	if os.exists(in_dir(dir, "space")) {
 		say(os.stderr, "there is a space here already\n")
 		return false
@@ -329,15 +358,36 @@ read_space :: proc(dir: string) -> (space: zsp.Key32, name: string, ok: bool) {
 	return space, name, true
 }
 
-// Publishes an amended roster: to disk, to the node running here, and through it to everyone.
+// Publishes an amended roster: to the node running here, and through it to everyone; or, with none running, to disk,
+// for the node to read when it starts. Which it is, the directory's lock says (see host/hold.odin), not whether anything
+// answers where a node once said it listens, which may be another by now: a node that is starting is waited for until it
+// has said where it listens, and none starts while the roster is kept here. One running that does not answer is told
+// nothing, and nothing is changed: kept here beside it, a roster would be taken only at its next start, and roster.old
+// would by then not be the one it followed.
 amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []string) -> bool) -> bool {
-	secret := host.device_secret(dir) or_return
 	space, name := read_space(dir) or_return
+	start := host.dir_starting(dir) or_return
+	lock, held, kind := host.dir_try(dir)
+	running := held == .In_Use
+	if running {
+		host.dir_started(start) // and so it has said where it listens
+	}
+	defer if !running {
+		host.dir_started(start) // once the roster is kept, which a node starting meanwhile waits for
+	}
+	defer if held == .Held {
+		host.dir_unlock(lock)
+	}
+	if !running && held != .Held {
+		host.hold_report(dir, held, kind)
+		return false
+	}
+	secret := host.device_secret(dir, held == .Held) or_return
 	a: Admin
 	a.space = name
 	zsp.keyring_init(&a.keys, secret)
-	path := in_dir(in_dir(dir, name), "roster")
-	data, read := host.read_file(path, context.temp_allocator)
+	space_dir := in_dir(dir, name)
+	data, read := host.read_file(in_dir(space_dir, "roster"), context.temp_allocator)
 	if read {
 		a.roster, read = zsp.roster_parse(data, space)
 	}
@@ -345,7 +395,7 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 		say(os.stderr, "the roster kept here cannot be read\n")
 		return false
 	}
-	if kept, have_keys := host.read_file(in_dir(in_dir(dir, name), "keys"), context.temp_allocator); have_keys {
+	if kept, have_keys := host.read_file(in_dir(space_dir, "keys"), context.temp_allocator); have_keys {
 		zsp.keyring_load(&a.keys, kept)
 	}
 	if !zsp.roster_unwrap(&a.keys, &a.roster) {
@@ -356,7 +406,9 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 		say(os.stderr, "this device is not an admin of the space\n")
 		return false
 	}
-	a.draft = zsp.draft_from(&a.roster, max(host.now_ms() << 16, host.clock_of(in_dir(dir, name)), running_clock(dir)))
+	// No earlier than anything the store has seen: as the node running here says, whose store is its alone; or as the
+	// store says, nobody running it.
+	a.draft = zsp.draft_from(&a.roster, max(host.now_ms() << 16, running_clock(dir) if running else host.clock_of(space_dir)))
 	change(&a, args) or_return
 	bytes, signed := zsp.roster_sign(&a.keys, a.keys.root, &a.draft, context.temp_allocator)
 	if !signed {
@@ -367,29 +419,25 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 		say(os.stderr, "that would make an unsound roster: only signed scopes may have readers who do not write\n")
 		return false
 	}
-	// A node running here keeps what it takes, and the roster it follows, itself: kept here first, roster.old would be
-	// this one by the time the node kept it, and one the node would not take would be kept in place of the one it has.
-	answered, reached := announce(dir, bytes)
-	space_dir := in_dir(dir, name)
-	switch {
-	case !reached:
-		kept, ok := host.roster_keep(space_dir, space, bytes, data) // for the node to read when it starts
+	if !running {
+		kept, ok := host.roster_keep(space_dir, space, bytes, data)
 		if !ok {
 			say(os.stderr, "could not keep the roster\n")
 		} else if !kept {
 			say(os.stderr, "the roster kept here was changed meanwhile, as by another command: nothing was changed\n")
 		}
 		return kept
+	}
+	// The node running here keeps what it takes, and the roster it follows, itself: kept here first, roster.old would be
+	// this one by the time the node kept it, and one the node would not take would be kept in place of the one it has.
+	answered, _ := announce(dir, bytes)
+	switch {
 	case taken(space_dir, bytes):
 		return true
 	case answered:
 		say(os.stderr, "the node running here would not take it: it has a later roster, or one this does not follow from; nothing was changed\n")
-		return false
-	}
-	if kept, _ := host.roster_keep(space_dir, space, bytes, data); kept {
-		say(os.stderr, "the node running here did not say it has the change: it takes it when it next starts\n")
-	} else {
-		say(os.stderr, "the node running here did not say it has the change, nor could it be kept here: nothing was changed\n")
+	case:
+		say(os.stderr, "the node running here did not answer: nothing was changed\n")
 	}
 	return false
 }
@@ -501,7 +549,9 @@ speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool, reached: bo
 }
 
 join :: proc(dir, space, relay_key, url: string) -> bool {
-	_ = host.device_secret(dir) or_return
+	held := hold(dir) or_return
+	defer let_go(held)
+	_ = host.device_secret(dir, true) or_return
 	_ = parse_hex(space, 32) or_return
 	_ = parse_hex(relay_key, 32) or_return
 	relay_url(space_url(url, space)) or_return
@@ -531,7 +581,9 @@ space_url :: proc(url, space: string) -> string {
 }
 
 join_from_roster :: proc(dir, file: string) -> bool {
-	_ = host.device_secret(dir) or_return
+	held := hold(dir) or_return
+	defer let_go(held)
+	_ = host.device_secret(dir, true) or_return
 	data, read := host.read_file(file, context.temp_allocator)
 	if !read || len(data) < 38 {
 		return false
@@ -544,7 +596,13 @@ join_from_roster :: proc(dir, file: string) -> bool {
 	if merr := os.make_directory_all(in_dir(dir, name)); merr != nil && !os.is_dir(in_dir(dir, name)) {
 		return false
 	}
-	host.save(in_dir(in_dir(dir, name), "roster"), data) or_return
+	// As any roster is kept: never one older than is kept here, which would undo what was done since.
+	if kept, ok := host.roster_keep(in_dir(dir, name), space, data); !ok {
+		return false
+	} else if !kept {
+		say(os.stderr, "a later roster of the space is kept here already: nothing was changed\n")
+		return false
+	}
 	return host.save(in_dir(dir, "space"), transmute([]byte)name)
 }
 
@@ -660,6 +718,15 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	config.listen = at
 
 	stop_signals_held()
+	// Starting, as the commands beside it see, until it has said where it listens: they wait for that, and none takes
+	// it for a node that is not running meanwhile. See host/hold.odin.
+	start, starting := host.dir_starting(dir)
+	if !starting {
+		return 1
+	}
+	defer if starting {
+		host.dir_started(start)
+	}
 	h: host.Host
 	if !host.host_init(&h, config) {
 		return 1
@@ -667,6 +734,10 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	defer stop_over()
 	defer host.host_destroy(&h)
 	defer stop_done()
+	// Where it listens is said only while it is there: once it is not, another may listen there.
+	defer if !relay {
+		os.remove(in_dir(dir, "address"))
+	}
 	stop_on_signal(rawptr(&h)) // let go of, by stop_done, before h is
 	if !relay {
 		space, _, have := read_space(dir)
@@ -695,10 +766,12 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	bound, _ := net.bound_endpoint(h.listener)
 	address := net.endpoint_to_string(bound, context.temp_allocator)
 	if !relay && (policy.token == "" || !host.save(in_dir(dir, "address"), transmute([]byte)address)) {
-		// Without them, an admin command could not find this node, and would keep a roster beside it it never took.
+		// Without them, an admin command could not speak to this node, and so could change nothing.
 		say(os.stderr, "could not keep this node's address and token\n")
 		return 1
 	}
+	host.dir_started(start)
+	starting = false
 	say(os.stdout, to_hex(h.device[:]), " listening on ws://", address, "\n")
 	host.links_announce(&h)
 	return 0 if host.host_run(&h) else 1

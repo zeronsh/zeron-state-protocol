@@ -140,6 +140,13 @@ zspd join ~/.zsp <space> <relay key> ws://host:8787 && zspd run ~/.zsp     # and
 zspd admin ~/.zsp <that>                    # let it admit others; `off` to take that back
 ```
 
+A directory is one node's at a time: a second `zspd run` or `serve` there, or a Node device (`open({ dir })`), is told the store is
+in use and touches nothing, and a node killed lets go of it with its process. The commands that change a space's roster speak to the
+node running there, or with none keep the roster for it to read when it starts; `create`, `join` and `peer`, which change what a
+node there keeps, fail while one runs. Keep the directory on a disk of the machine's own: a lock on a file system other machines share may not hold, and
+zspd and Node refuse one they can tell is (NFS, SMB, AFS, 9p, cluster file systems, shared folders of virtual machines, network
+drives on Windows, and on macOS whatever the system does not call local). See host/hold.odin.
+
 ```luau
 local zsp = require("zsp")
 

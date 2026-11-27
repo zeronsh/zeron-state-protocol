@@ -139,6 +139,25 @@ def read_kept(path):
         return f.read()
 
 
+def hold(path):
+    """Holds a store's directory as a node does (host/hold.odin), to stand for one; until what it returns is closed."""
+    f = open(os.path.join(path, "lock"), "a+b")
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(f.fileno(), 1 << 30, os.SEEK_SET)
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 512)
+    elif sys.platform.startswith("linux"):
+        import fcntl
+
+        fcntl.fcntl(f, fcntl.F_OFD_SETLK, struct.pack("hhqqi", fcntl.F_WRLCK, os.SEEK_SET, 1 << 30, 512, 0))
+    else:
+        import fcntl
+
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return f
+
+
 def eventually(what, f, timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -796,6 +815,7 @@ def test_busy_node_takes_change():
     """A change made beside a running node that is slow to answer is held out to it until it says it has it."""
     d = Node("busy").dir
     sid = zspd("create", d)
+    held = hold(d)
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(4)
@@ -874,6 +894,7 @@ def test_busy_node_takes_change():
     t.start()
     p = subprocess.run([BIN, "scope", d], capture_output=True, text=True, timeout=60)
     server.close()
+    held.close()
     assert p.returncode == 0, p.stderr
     assert len(hung_up) == 2 and not any(hung_up), hung_up  # asked its clock, then handed the change, waiting each time
     kinds = [[kind for kind, _ in frames(h)] for h in heard]
@@ -905,6 +926,187 @@ def test_roster_kept_beside_a_running_node():
     os.remove(os.path.join(n.dir, "address"))
     zspd("scope", n.dir)
     assert kept("roster.old") == second and kept("roster") != second
+
+
+def test_one_node_to_a_store():
+    """A store's directory is one node's at a time. A second, a device's or a relay's, is told it is in use and touches
+    nothing: two would each write over what the other wrote to the one log, and acknowledge what was lost, and the second
+    would say where it listens in place of the first, so that the admin commands spoke to it alone. So are the commands
+    that change what a node there keeps. Those that only read, or change the roster beside a running node, go on as ever.
+    A node killed lets go of it with its process, and the next starts at once, with all that was acknowledged."""
+    n = Node("held", "run", "--no-udp")
+    sid = zspd("create", n.dir)
+    roster = os.path.join(TMP, "held-roster")
+    shutil.copy(os.path.join(n.dir, sid, "roster"), roster)
+    n.start()
+    address = read_kept(os.path.join(n.dir, "address"))
+    c = n.client()
+    for i in range(50):
+        c.put(1, "chat", i, [b"%d" % i])
+    c.until(lambda: c.acked == c.seq)
+    for mode in ("run", "serve"):
+        p = subprocess.run([BIN, mode, n.dir, "--listen=127.0.0.1:0", "--no-udp"], capture_output=True, text=True, timeout=30)
+        assert p.returncode == 1 and "in use by another process" in p.stderr, (mode, p.returncode, p.stderr)
+    for args in (["create"], ["join", sid, "00" * 32, "ws://localhost:1"], ["peer", roster]):
+        p = subprocess.run([BIN, args[0], n.dir, *args[1:]], capture_output=True, text=True, timeout=30)
+        assert p.returncode == 1 and "in use by another process" in p.stderr, (args[0], p.returncode, p.stderr)
+    assert read_kept(os.path.join(n.dir, "address")) == address, "where the node listens was said to be elsewhere"
+    assert zspd_space(n) == sid
+    other = Node("held-other")
+    zspd("admit", n.dir, zspd("key", other.dir), "1")  # beside the running node, as ever
+    assert zspd("key", n.dir) and len(zspd("members", n.dir).splitlines()) == 2
+
+    n.stop()  # killed, never politely
+    n.start()
+    c = n.client()
+    c.watch(1, 1, "chat")
+    c.until(lambda: 1 in c.windows and len(c.list(1, "chat")) == 50)
+
+
+def starting(path):
+    """Holds a directory as a node starting does, or a command that keeps what is there (host/hold.odin's START_FILE)."""
+    f = open(os.path.join(path, "start.lock"), "a+b")
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(f.fileno(), 0, os.SEEK_SET)
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return f
+
+
+def waits(args, until):
+    """Whether a command waits while a node starts, and is done once it has: as `until` lets it."""
+    p = subprocess.Popen([BIN, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        p.wait(timeout=1)
+        return False, p.communicate()
+    except subprocess.TimeoutExpired:
+        until()
+        return True, p.communicate(timeout=30)
+
+
+def made(name):
+    """A device's directory with a space made in it: its path and the space's name."""
+    d = os.path.join(TMP, name)
+    return d, zspd("create", d)
+
+
+def test_key_made_once():
+    """A device's key is made once, however many make it at once: one made beside a node or command making it, which then
+    made a space, would leave the device out of its own space for good. A command finding one being made waits for it."""
+    d = os.path.join(TMP, "key-once")
+    os.makedirs(d)
+    s, lock = starting(d), hold(d)  # as a command making it
+    key = os.urandom(32)
+
+    def made():
+        with open(os.path.join(d, "device.key"), "wb") as f:
+            f.write(key)
+        lock.close()
+        s.close()
+
+    waited, (out, err) = waits(["key", d], made)
+    assert waited, "a key was made while another was being made: " + out + err
+    assert out.strip() == zspd("key", d)
+
+
+def test_space_made_once():
+    """A space is made once, however many make it at once: of two made, one would be orphaned. One making it while another
+    is waits for it, and then finds it made."""
+    d = os.path.join(TMP, "space-once")
+    os.makedirs(d)
+    s = starting(d)  # as another command making it
+    waited, (out, err) = waits(["create", d], s.close)
+    assert waited, "a space was made while another was being made: " + out + err
+    assert out.strip() == zspd_space(Node("space-once"))
+    assert refused("create", d)
+
+
+def test_change_with_no_node():
+    """With no node running, a change is kept for the node to read when it starts, and no store is made for it: whatever
+    listens where a node once did is not spoken to, nor taken for the node, which would fail the change and keep it."""
+    d, sid = made("no-node")
+    squatter = socket.socket()
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(4)
+    squatter.settimeout(0.2)
+    with open(os.path.join(d, "address"), "w") as f:
+        f.write("127.0.0.1:%d" % squatter.getsockname()[1])
+    with open(os.path.join(d, "token"), "w") as f:  # as a node that ran here left them
+        f.write("t")
+    p = subprocess.run([BIN, "scope", d], capture_output=True, text=True, timeout=30)
+    spoken = True
+    try:
+        squatter.accept()
+    except socket.timeout:
+        spoken = False
+    squatter.close()
+    assert p.returncode == 0 and not spoken, (p.returncode, p.stderr, spoken)
+    assert " 2:rwc" in zspd("members", d)
+    assert not os.path.exists(os.path.join(d, sid, "tree")), "a store was made for a command that only looks"
+
+
+def test_peer_keeps_no_older_roster():
+    """A roster given to peer is kept as any is, never in place of a later one, which would undo what was done since."""
+    d, sid = made("peer-older")
+    roster = os.path.join(TMP, "peer-older-roster")
+    shutil.copy(os.path.join(d, sid, "roster"), roster)
+    zspd("scope", d)
+    p = subprocess.run([BIN, "peer", d, roster], capture_output=True, text=True, timeout=30)
+    assert p.returncode == 1 and "later roster" in p.stderr, (p.returncode, p.stderr)
+    assert " 2:rwc" in zspd("members", d)
+
+
+def test_change_waits_for_a_starting_node():
+    """A change made as a node starts is the node's to take, once it has said where it listens: kept on disk meanwhile, it
+    would be beside a node that had read the roster before; and one that does not answer then changes nothing. Nor is the
+    store of a node running opened beside it, to learn the time, which the node is asked."""
+    d, sid = made("starting-node")
+    s, lock = starting(d), hold(d)  # as a node starting, that will never answer
+    before = read_kept(os.path.join(d, sid, "roster"))
+    waited, (out, err) = waits(["scope", d], s.close)
+    lock.close()
+    assert waited, "a change was made while a node was starting: " + out + err
+    assert "did not answer" in err and read_kept(os.path.join(d, sid, "roster")) == before, err
+    assert not os.path.exists(os.path.join(d, sid, "tree")), "a running node's store was opened beside it"
+
+
+def test_node_waits_for_a_command():
+    """A node starting while a command keeps what is in its directory waits for the command, rather than be refused."""
+    d, _ = made("waits-node")
+    s, lock = starting(d), hold(d)
+    n = Node("waits-node", "run", "--no-udp")
+    started = Thread(target=n.start)
+    started.start()
+    time.sleep(0.5)
+    assert n.p is not None and n.p.poll() is None, "a node starting while a command kept what is here was refused"
+    lock.close()
+    s.close()
+    started.join()
+    n.stop()
+
+
+def test_stopped_node_says_nowhere():
+    """A node told to stop, as a service manager or Ctrl+Break tells it, says nowhere that it listens once it has: another
+    may listen there by then."""
+    d, _ = made("stopped-node")
+    nt = os.name == "nt"
+    p = subprocess.Popen(
+        [BIN, "run", d, "--listen=127.0.0.1:0", "--no-udp"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if nt else 0,
+    )
+    procs.append(p)
+    assert "listening" in p.stdout.readline() and os.path.exists(os.path.join(d, "address"))
+    if nt:
+        os.kill(p.pid, signal.CTRL_BREAK_EVENT)
+    else:
+        p.terminate()
+    assert p.wait(timeout=20) == 0, p.returncode
+    assert not os.path.exists(os.path.join(d, "address")), "a node that stopped still says where it listens"
 
 
 def test_relay_full():
