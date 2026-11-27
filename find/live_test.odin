@@ -930,6 +930,74 @@ words_renewed_at_once :: proc(t: ^testing.T) {
 	}
 }
 
+// And so of a question that joins another scope, where only that one changes: what it joins is read again, and the
+// question is answered afresh once it is, not judged meanwhile against what is being made.
+@(test)
+joined_words_renewed_at_once :: proc(t: ^testing.T) {
+	state := rand.create(96)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	f: Finder
+	pages: Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+	f.settled, f.pace = true, false
+	c := client_open(&w, &f)
+	defer {
+		zsp.session_close(c.session)
+		finder_close(&f)
+		client_free(&c)
+		memory_disk_destroy(&pages)
+	}
+	write :: proc(t: ^testing.T, w: ^World, id: zsp.Id, slot: zsp.Slot, body: []byte) {
+		w.node.now += 10
+		testing.expect(t, zsp.node_write(&w.node, {{id, slot, .Value, zsp.node_stamp(&w.node), body}}))
+	}
+	place :: proc(t: ^testing.T, w: ^World, scope: zsp.Scope) -> zsp.Id {
+		id := zsp.node_id(&w.node, scope)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(scope, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+		return id
+	}
+	target, noise := place(t, &w, 2), place(t, &w, 2)
+	write(t, &w, target, 20, transmute([]byte)string("orange"))
+	write(t, &w, noise, 20, transmute([]byte)string("noise"))
+	parent := place(t, &w, 1)
+	to: [16]byte
+	zsp.put_u64(to[:], target[0])
+	zsp.put_u64(to[8:], target[1])
+	write(t, &w, parent, 17, to[:])
+	q := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&q, 1)
+	append(&q, u8(Op.Ref), u8(Kind.Id), 17, 0, 2) // whose 17 is a row of scope 2
+	append(&q, u8(Op.Match), u8(Kind.Words), 20, 0, 0, 0, 5)
+	append(&q, "apple")
+	append(&q, 0, 0, 0, 50, 0)
+	client_ask(t, &c, 1, q[:])
+	for !finder_run(&f, 1 << 16) {
+	}
+	client_hear_out(t, &c, &f)
+	testing.expect(t, 1 in c.answers && c.answers[1].total == 0)
+	apple := false
+	for i in 0 ..< 4 * DEAD {
+		write(t, &w, noise, 20, transmute([]byte)fmt.tprintf("noise%d", i))
+		if i % 3 == 0 {
+			apple = !apple
+			write(t, &w, target, 20, transmute([]byte)string("apple" if apple else "orange"))
+		}
+		for !finder_run(&f, 1 << 16) {
+		}
+		client_hear_out(t, &c, &f)
+		if !testing.expectf(t, 1 in c.answers && c.answers[1].total == (1 if apple else 0), "edit %d: %v, and it holds %v", i, c.answers[1] if 1 in c.answers else Told{}, apple) {
+			return
+		}
+	}
+}
+
 // What is dear to answer is answered no more often than it is worth, but is in the end.
 @(test)
 dear_answers_are_paced :: proc(t: ^testing.T) {
