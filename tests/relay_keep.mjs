@@ -279,3 +279,23 @@ const until = async (f) => { for (let i = 0; i < 2000 && !f(); i++) await new Pr
     console.log("ok   a relay woken never gives a connection the number of one it told to go");
   } finally { await r.close(); }
 }
+
+// Bug hunt. A connection whose attachment cannot be let go of when another connects is let go of itself: and the others
+// hear that it went at once, not when something next happens, and so are kept again once quiet.
+{
+  const r = await relayWith(2);
+  try {
+    const [wsA, wsB] = r.serverSockets;
+    await new Promise((go) => setTimeout(go, 300));
+    assert(kept(wsA) && kept(wsB), "both kept while quiet");
+    wsA.serializeAttachment = () => { throw new Error("socket already closed"); };
+    wsA._onClose = () => {}; // nor does its device hear of it, and reconnect: nothing else happens
+    const sentB = wsB.sent.length;
+    r.doSpace.fetch(new Request(`http://relay.local/${r.spaceId}`)); // another connects
+    assert.equal(wsA.closed?.code, 1008, "the one that could not be let go of was");
+    assert(wsB.sent.length > sentB, "the other heard nothing of it");
+    await new Promise((go) => setTimeout(go, 300));
+    assert(kept(wsB), "and was not kept again once quiet");
+    console.log("ok   a relay that lets a connection go as another connects tells the rest at once");
+  } finally { await r.close(); }
+}

@@ -214,8 +214,10 @@ export class Space extends DurableObject {
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({ id, space: this.#space });
     this.#sockets.set(id, server);
-    this.#unkeep();
+    const dropped = this.#unkeep();
     this.#wasm.opened(id);
+    // Nothing follows from a connection opening, but the rest hear of one let go of at once, as after any other event.
+    if (dropped) this.#settle();
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -336,23 +338,26 @@ export class Space extends DurableObject {
   // done, so that waking in its midst reconnects rather than resumes from it, and never seals again under a nonce it
   // has used. Kept again once the burst is over, rather than after every message, which cost a fifth of what the
   // object could pass on. A connection whose attachment cannot be let go of is let go of itself: nothing more is said
-  // to it.
+  // to it. Whether any was: what follows from that is for #settle to say.
   #unkeep() {
+    let dropped = false;
     for (const [id, ws] of this.#sockets) {
       if (!this.#kept.delete(id)) continue;
       try {
         ws.serializeAttachment({ id, space: this.#space });
       } catch {
         this.#drop(id, ws);
+        dropped = true;
       }
     }
-    if (this.#keeping === this.#epoch) return;
+    if (this.#keeping === this.#epoch) return dropped;
     const epoch = (this.#keeping = this.#epoch);
     this.ctx.waitUntil(new Promise((go) => setTimeout(() => {
       if (this.#keeping === epoch) this.#keeping = 0;
       if (epoch === this.#epoch) this.#keep();
       go();
     }, KEEP_AFTER)));
+    return dropped;
   }
 
   #keep() {
