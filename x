@@ -67,11 +67,8 @@ web_test() {
 		[ $t = store ] && args=../build/node-small.wasm
 		(node test/$t.ts $args >../build/web-$t.log 2>&1 || echo web-$t >>../build/failed) &
 	done
-	# And the tabs after the browsers, rather than beside them: one Chrome at a time, as a small machine has room for.
-	wait $!
-	(node test/tabs.ts >../build/web-tabs.log 2>&1 || echo web-tabs >>../build/failed) &
 	wait
-	for t in text mirror_model mirror_interop store end_to_end browsers tabs; do
+	for t in text mirror_model mirror_interop store end_to_end browsers; do
 		cat ../build/web-$t.log
 	done
 }
@@ -136,6 +133,9 @@ test)
 	fi
 	wait $web || true
 	cat build/web.log
+	# Tabs as browsers treat them, last and alone: they hold back a Chrome's tabs, restart relays and fill pages, and beside
+	# anything that times what it sees would make it late.
+	(cd web && node test/tabs.ts) || echo web-tabs >>build/failed
 	[ ! -f build/failed ]
 	;;
 build)
