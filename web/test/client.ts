@@ -2948,4 +2948,98 @@ for (const evil of ["future", "endless"]) {
   assert.equal(seen.rows.length, 0, "what was not said is gone");
 }
 
+// A cell that is nonsense, or one a node would not keep, makes no row and tells no one of any: not a row not held, which
+// would be held then for nothing (for good, while a question is asked), nor one held and shown, which is as it was.
+{
+  const ghost = "\0\0\0\x01\0\0\0\x01" + rep("g", 8), y = "\0\0\0\x01\0\0\0\x01" + rep("y", 8);
+  let n = 0;
+  const cell = (id: string, kind: number, slot: number, body: string, time = "\0\0\x6b\x4a") => {
+    const w = codec.writer();
+    codec.putBinary(w, ch(kind) + id + ch(slot) + time + ch(0, ++n, 0, 0) + rep("s", 8));
+    codec.putBytes(w, b(body));
+    return s(codec.written(w));
+  };
+  const piece = rep("p", 8) + "\x01" + rep("\0", 12) + "\x02hi";
+  const cases: [string, (tag: string) => string, boolean][] = [
+    ["a cell cut short after its row", () => ch(3) + ghost, true],
+    ["a value in slot 5", () => cell(ghost, 3, 5, "x"), true],
+    ["a place in slot 0 of a row shown", (tag) => cell(y, 2, 0, tag + codec.u64(2)), true],
+    ["a place in another scope's list", (tag) => cell(ghost, 2, 1, "\0\0\0\x02" + tag.slice(4) + codec.u64(1)), false],
+    ["a bundle of no stamps, of a row shown", () => cell(y, 5, 17, "\0\0\0\0"), false],
+    ["a piece of a time no clock reaches", () => cell(ghost, 4, 17, piece, "\x80\0\0\0"), false],
+  ];
+  for (const [what, bad, ends] of cases) {
+    const h = harness();
+    h.run();
+    h.greet();
+    let shown = 0;
+    h.client.window({ scope: 1, list: "a", table: Note }, () => shown++);
+    h.run();
+    const tag = h.client.tag(1, "a");
+    h.tell(CELLS, "\0" + cell(y, 2, 1, tag + codec.u64(1)) + cell(y, 3, 16, "titled"));
+    h.client.ask({ scope: 1, table: Note, limit: 5 }, () => {}); // while which a row let go of is kept a while
+    h.run();
+    const followed: string[] = [];
+    h.client.follow((id) => followed.push(id));
+    const before = shown;
+    h.tell(CELLS, "\0" + bad(tag));
+    assert.equal(h.self.closes, ends ? 1 : 0, `${what}: the pipe`);
+    assert.deepEqual(followed, [], `${what}: a row was told of`);
+    assert.equal(h.client.held(codec.hex(ghost)), undefined, `${what}: a row was made of it`);
+    if (!ends) assert.equal(shown, before, `${what}: what is shown was shown again`);
+  }
+}
+
+// The bytes of long cells just heard, kept to make texts of while what was heard is shown, are not kept of cells passed
+// over, nor once a message ends in nonsense, when nothing may be shown for a while.
+{
+  const y = "\0\0\0\x01\0\0\0\x01" + rep("y", 8);
+  let n = 0;
+  const cell = (kind: number, body: string, time: string) => {
+    const w = codec.writer();
+    codec.putBinary(w, ch(kind) + y + ch(17) + time + ch(0, ++n, 0, 0) + rep("s", 8));
+    codec.putBytes(w, b(body));
+    return s(codec.written(w));
+  };
+  const long = rep("p", 8) + "\x01" + rep("\0", 12) + ch(0xac, 0x02) + rep("x", 300);
+  for (const [what, body] of [
+    ["passed over", cell(4, long, "\x80\0\0\0")],
+    ["before nonsense", cell(4, long, "\0\0\x6b\x4a") + ch(3)],
+  ]) {
+    const h = harness();
+    h.run();
+    h.greet();
+    const w = codec.writer();
+    codec.putBytes(w, b(ch(CELLS) + "\0" + body));
+    h.self.receive(codec.written(w).slice()); // and nothing more done: nothing is shown
+    assert.equal(Client.internals(h.client).heardBytes, 0, `${what}: its bytes are kept`);
+  }
+}
+
+// A change that fails, in rows where no editor had anything open, tells nothing of them: they are as they were, and were
+// shown so.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let shown = 0;
+  h.client.window({ scope: 1, list: "a", table: Note }, () => shown++);
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  const followed: string[] = [];
+  h.client.follow((x) => followed.push(x));
+  const before = shown;
+  assert.throws(() =>
+    h.client.write(1, (change) => {
+      change.set(id, Note, { title: "nope" });
+      throw new Error("not after all");
+    }),
+  );
+  h.run();
+  assert.deepEqual(followed, [], "a row was told of");
+  assert.equal(shown, before, "what is shown was shown again");
+}
+
 console.log("ok");

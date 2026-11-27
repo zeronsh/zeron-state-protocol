@@ -927,6 +927,7 @@ export class Client {
 
   #lost(): void {
     const well = this.#ready && !this.#faulted;
+    this.#forgetHeard();
     this.#wire = undefined;
     this.#ready = false;
     this.#authors.clear();
@@ -1177,7 +1178,7 @@ export class Client {
         }
       }
     } finally {
-      if (this.#heardBytes > 0) this.#heardBodies.clear(), (this.#heardBytes = 0);
+      this.#forgetHeard();
     }
   }
 
@@ -1187,6 +1188,12 @@ export class Client {
     this.#input = rest && rest.length > 0 ? [rest.slice()] : [];
     this.#inputBytes = rest?.length ?? 0;
     this.#inputWants = wants;
+  }
+
+  // The bodies of long cells just heard are let go of: once what was heard is shown, or the pipe is ended without it being
+  // so. (A text made later reads them from their cells.)
+  #forgetHeard(): void {
+    if (this.#heardBytes > 0) this.#heardBodies.clear(), (this.#heardBytes = 0);
   }
 
   #receive(data: Uint8Array): void {
@@ -1906,6 +1913,9 @@ export class Client {
     const touched = new Set<Stored>();
     try {
       this.#readCells(r, touched);
+    } catch (e) {
+      this.#forgetHeard(); // nonsense ends the pipe, and nothing may be shown soon
+      throw e;
     } finally {
       this.#placeAll(touched);
     }
@@ -1918,7 +1928,10 @@ export class Client {
     const rows = this.#rows;
     const saying = this.#saying();
     let id = "";
+    // The row, once held: one is made, and is touched, only for a cell that is kept, so that nothing is made or told of
+    // for what is nonsense or passed over.
     let row: Stored | undefined;
+    let last: Stored | undefined; // touched last
     while (pos < len) {
       const tag = buf[pos++];
       if (tag < 128) {
@@ -1926,10 +1939,9 @@ export class Client {
         id = codec.binary(buf, pos, pos + 16);
         pos += 16;
         row = rows.get(id);
-        if (!row) rows.set(id, (row = newRow(id)));
-        touched.add(row);
+      } else if (id === "") {
+        throw new codec.Malformed(); // the same row as no row before it
       }
-      if (row === undefined) throw new codec.Malformed();
       if (pos + 17 > len) throw new codec.Malformed();
       const slot = buf[pos];
       const at = pos + 1;
@@ -1954,7 +1966,7 @@ export class Client {
       // One held already, as a node says whole rows again when any of them changes: known by its stamp and kind, and passed
       // over without anything made of it. Another body for what is held is no news (SPEC.md 4), but of a bundle, which a node
       // may say again with less of it: that is looked at where it is.
-      if (!(tag & 64) && !row.dead) {
+      if (!(tag & 64) && row !== undefined && !row.dead) {
         const v = slotOf(row, slot);
         if (v !== undefined) {
           const stamp = codec.binary(buf, at, at + 16);
@@ -1966,6 +1978,7 @@ export class Client {
           if (fine && held !== undefined && held.charCodeAt(0) === tag % 64 && (tag % 64 !== BUNDLE || held.length === 17 + size)) {
             if (tag % 64 !== BUNDLE || sameBody(held, buf, pos, size)) {
               pos += size;
+              if (row !== last) touched.add((last = row)); // said again, it is placed again, as where it is may be news
               if (saying) this.#said(id, stamp);
               continue;
             }
@@ -1978,10 +1991,7 @@ export class Client {
       scratch.set(buf.subarray(at, at + 16), 1);
       scratch.set(buf.subarray(pos, pos + size), 17);
       const c = codec.binary(scratch, 0, 17 + size);
-      if ((tag % 64 === PIECE || tag % 64 === BUNDLE) && size > SLAB / 4 && this.#heardBytes + size <= HEARD_MOST) {
-        this.#heardBodies.set(c, buf.slice(pos, pos + size));
-        this.#heardBytes += size;
-      }
+      const from = pos;
       pos += size;
       let author: Device | undefined;
       if (tag & 64) {
@@ -1990,6 +2000,12 @@ export class Client {
         pos = r.pos;
       }
       if (!shaped(id, slot, c)) continue; // what a node would not keep is passed over, as it would be
+      if (row === undefined) rows.set(id, (row = newRow(id)));
+      if (row !== last) touched.add((last = row));
+      if ((tag % 64 === PIECE || tag % 64 === BUNDLE) && size > SLAB / 4 && this.#heardBytes + size <= HEARD_MOST) {
+        this.#heardBodies.set(c, buf.slice(from, from + size));
+        this.#heardBytes += size;
+      }
       // What it says of the time, as late as anything heard of.
       const time = u32At(c, 1) * 65536 + ((c.charCodeAt(5) << 8) | c.charCodeAt(6));
       const n = (c.charCodeAt(7) << 8) | c.charCodeAt(8);
@@ -2710,8 +2726,14 @@ export class Client {
   }
 
   /** What is held, for tests: rows, questions, windows and pages, by what this client and its node call them. */
-  static internals(c: Client): { rows: ReadonlyMap<string, Stored>; asked: ReadonlyMap<number, unknown>; windows: ReadonlyMap<string, unknown>; pages: ReadonlyMap<number, unknown> } {
-    return { rows: c.#rows, asked: c.#asked, windows: c.#windows, pages: c.#pages };
+  static internals(c: Client): {
+    rows: ReadonlyMap<string, Stored>;
+    asked: ReadonlyMap<number, unknown>;
+    windows: ReadonlyMap<string, unknown>;
+    pages: ReadonlyMap<number, unknown>;
+    heardBytes: number;
+  } {
+    return { rows: c.#rows, asked: c.#asked, windows: c.#windows, pages: c.#pages, heardBytes: c.#heardBytes };
   }
 
   // ---------------------------------------------------------------- writing
@@ -2819,7 +2841,10 @@ export class Client {
     const fresh = new Set<string>(); // rows made here
     const rows = new Set<string>();
     // How each row was before this touched it, so that a change that throws leaves nothing behind.
-    const before = new Map<string, { existed: boolean; slots: (number | Cells | undefined)[]; authors: Map<string, Device> | undefined; dead: boolean; texts: Set<number> }>();
+    const before = new Map<
+      string,
+      { existed: boolean; slots: (number | Cells | undefined)[]; authors: Map<string, Device> | undefined; dead: boolean; texts: Set<number>; sealed: boolean }
+    >();
     const mine = this.#mine(scope); // whose what this change writes is, the same throughout,
     const now = Math.floor(this.#host.now()); // and when
     const touch = (id: string, slot: number): Stored => {
@@ -2831,10 +2856,11 @@ export class Client {
       if (!was) {
         // What editors have open in it goes first, and stands, whatever becomes of this change: so what is put back is
         // as it was with that, and nothing the node has heard is taken back here.
-        if (row.texts) for (const [s, t] of row.texts) if (t.open) this.#seal(row, s);
+        let sealed = false;
+        if (row.texts) for (const [s, t] of row.texts) if (t.open && this.#seal(row, s)) sealed = true;
         const slots = row.slots.map((v) => (v instanceof Map ? new Map(v) : v));
         const authors = row.authors ? new Map(row.authors) : undefined;
-        before.set(id, (was = { existed: existed !== undefined, slots, authors, dead: row.dead, texts: new Set() }));
+        before.set(id, (was = { existed: existed !== undefined, slots, authors, dead: row.dead, texts: new Set(), sealed }));
       }
       was.texts.add(slot);
       return row;
@@ -2857,9 +2883,10 @@ export class Client {
         if (row.lives?.size === 0) row.lives = undefined;
         unview(row);
         if (!was.existed && row.pages === 0 && !row.held && !this.#isPending(id)) this.#rows.delete(id);
-        else back.add(row);
+        else if (was.sealed) back.add(row);
       }
-      // What editors had open in the rows it touched was sealed, and stands: those rows are shown as they now are.
+      // What editors had open in the rows it touched was sealed, and stands: those rows are shown as they now are. The rest
+      // are as they were, and were shown so: nothing is told of them.
       this.#placeAll(back);
     };
     const put = (row: string, slot: number, kind: number, body: Uint8Array) => {

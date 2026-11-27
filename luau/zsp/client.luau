@@ -1983,7 +1983,10 @@ function Client._read_cells(self: Client, r: codec.Reader, touched: { [Stored]: 
 	local saying = self:_saying()
 	local id = ""
 	local scope = 0 -- of the row, as four bytes are read from a buffer
+	-- The row, once held: one is made, and is touched, only for a cell that is kept, so that nothing is made or told of for
+	-- what is nonsense or passed over.
 	local row: Stored? = nil
+	local last: Stored? = nil -- touched last
 	while pos < len do
 		local tag = buffer.readu8(buf, pos)
 		pos += 1
@@ -1994,9 +1997,8 @@ function Client._read_cells(self: Client, r: codec.Reader, touched: { [Stored]: 
 			id = buffer.readstring(buf, pos, 16)
 			scope = buffer.readu32(buf, pos)
 			pos += 16
-			row = rows[id] or self:_row(id)
-			touched[row :: Stored] = true
-		elseif not row then
+			row = rows[id]
+		elseif id == "" then
 			error(malformed, 0) -- the same row as no row before it
 		end
 		if pos + 18 > len then -- slot, stamp, and a length
@@ -2068,6 +2070,13 @@ function Client._read_cells(self: Client, r: codec.Reader, touched: { [Stored]: 
 		end
 		if fine == false or (fine == nil and not shaped(id, slot, c)) then
 			continue -- what a node would not keep is passed over, as it would be
+		end
+		if not row then
+			row = self:_row(id)
+		end
+		if row ~= last then
+			last = row
+			touched[row :: Stored] = true
 		end
 		-- As late as anything heard of.
 		local known = self.clock_ms
@@ -3243,9 +3252,10 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			if row then
 				-- What editors have open in the row is their own writing, sent whatever becomes of this change: first, then,
 				-- so that undoing the change cannot take it back, and what the change writes over it is later.
+				local sealed = false
 				for k, t in row.texts or {} do
-					if t.open ~= "" then
-						self:_seal(row, k)
+					if t.open ~= "" and self:_seal(row, k) then
+						sealed = true
 					end
 				end
 				local slots = {}
@@ -3255,7 +3265,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 					end
 				end
 				local authors = row.authors
-				was = { dead = row.dead, slots = slots, authors = if authors then table.clone(authors) else nil, touched = {} }
+				was = { dead = row.dead, slots = slots, authors = if authors then table.clone(authors) else nil, touched = {}, sealed = sealed }
 			else
 				was = false
 			end
@@ -3346,7 +3356,8 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	end)
 	if not ok then
 		-- All or nothing: whatever was done here is undone, and nothing is said. What editors had open in the rows it
-		-- touched was sealed, and stands: those rows are shown as they now are.
+		-- touched was sealed, and stands: those rows are shown as they now are. The rest are as they were, and were shown
+		-- so: nothing is told of them.
 		local back: { [Stored]: boolean } = {}
 		for id, was in saved do
 			local row = self.rows[id]
@@ -3377,7 +3388,9 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 					end
 				end
 				unview(row)
-				back[row] = true
+				if was.sealed then
+					back[row] = true
+				end
 			elseif row then
 				-- Nothing of it was held before, and nothing of this change is.
 				if row.dead then

@@ -4618,4 +4618,98 @@ do
 	assert(made > 0 and stopped == made, `{made} asked and {stopped} stopped`)
 end
 
+-- A cell that is nonsense, or one a node would not keep, makes no row and tells no one of any: not a row not held, which
+-- would be held then for nothing (for good, while a question is asked), nor one held and shown, which is as it was.
+do
+	local ghost, y = string.pack(">I4I4", 1, 1) .. string.rep("g", 8), string.pack(">I4I4", 1, 1) .. string.rep("y", 8)
+	local n = 0
+	local function cell(id: string, kind: number, slot: number, body: string, time: string?): string
+		n += 1
+		local w = codec.writer()
+		codec.put_u8(w, kind)
+		codec.put(w, id)
+		codec.put_u8(w, slot)
+		codec.put(w, (time or string.pack(">I4", 27466)) .. string.pack(">I2I2", n, 0) .. string.rep("s", 8))
+		codec.put_bytes(w, body)
+		return codec.string(w)
+	end
+	local piece = string.rep("p", 8) .. "\1" .. string.rep("\0", 12) .. "\2hi"
+	local cases: { { what: string, bad: (string) -> string, ends: boolean } } = {
+		{ what = "a cell cut short after its row", bad = function()
+			return "\3" .. ghost
+		end, ends = true },
+		{ what = "a value in slot 5", bad = function()
+			return cell(ghost, 3, 5, "x")
+		end, ends = true },
+		{ what = "a place in slot 0 of a row shown", bad = function(tag)
+			return cell(y, 2, 0, tag .. codec.u64(2))
+		end, ends = true },
+		{ what = "a place in another scope's list", bad = function(tag)
+			return cell(ghost, 2, 1, string.pack(">I4", 2) .. string.sub(tag, 5) .. codec.u64(1))
+		end, ends = false },
+		{ what = "a bundle of no stamps, of a row shown", bad = function()
+			return cell(y, 5, 17, string.pack(">I4", 0))
+		end, ends = false },
+		{ what = "a piece of a time no clock reaches", bad = function()
+			return cell(ghost, 4, 17, piece, "\128\0\0\0")
+		end, ends = false },
+	}
+	for _, case in cases do
+		local h = harness()
+		h.run()
+		h.greet()
+		local shown = 0
+		h.client:window({ scope = 1, list = "a", table = Note }, function()
+			shown += 1
+		end)
+		h.run()
+		local tag = h.client:_tag(1, "a")
+		h.tell(CELLS, "\0" .. cell(y, 2, 1, tag .. codec.u64(1)) .. cell(y, 3, 16, "titled"))
+		h.client:ask({ scope = 1, table = Note, limit = 5 }, function() end) -- while which a row let go of is kept a while
+		h.run()
+		local followed = 0
+		h.client:follow(function()
+			followed += 1
+		end)
+		local before = shown
+		h.tell(CELLS, "\0" .. case.bad(tag))
+		assert(h.self.closes == (if case.ends then 1 else 0), `{case.what}: the pipe`)
+		assert(followed == 0, `{case.what}: a row was told of`)
+		assert(h.client:held(ghost) == nil, `{case.what}: a row was made of it`)
+		assert(case.ends or shown == before, `{case.what}: what is shown was shown again`)
+	end
+end
+
+-- A change that fails, in rows where no editor had anything open, tells nothing of them: they are as they were, and were
+-- shown so.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local shown = 0
+	h.client:window({ scope = 1, list = "a", table = Note }, function()
+		shown += 1
+	end)
+	h.run()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	local followed = 0
+	h.client:follow(function()
+		followed += 1
+	end)
+	local before = shown
+	assert(not pcall(function()
+		h.client:write(1, function(change)
+			change.set(id, Note, { title = "nope" })
+			error("not after all")
+		end)
+	end))
+	h.run()
+	assert(followed == 0, "a row was told of")
+	assert(shown == before, "what is shown was shown again")
+end
+
 print("ok")
