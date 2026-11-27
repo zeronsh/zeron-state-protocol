@@ -840,7 +840,148 @@ const DEVICE = "d".repeat(64);
   assert(h.client.ready && devices() === 0 && served === 1 && h.self.closes === 0, "the pipe was not read on");
 }
 {
-  // Questions asked meanwhile, as by code that waited for one asked once, are asked once each.
+  // Nothing is told to what was stopped, cancelled or closed since, even while others are being told, nor told as it was
+// once it is otherwise.
+{
+  // An observer that closes the client: the rest hear of it as it is then, once, and never as it was.
+  const h = harness();
+  h.run();
+  h.greet();
+  const log: string[] = [];
+  h.client.on("status", (up) => log.push(`status ${up}`));
+  let armed = false;
+  for (const name of ["one", "two"]) {
+    h.client.window({ scope: 1, list: "a", table: Note }, (st) => {
+      log.push(`${name} ${st.status}`);
+      if (armed && st.status === "ready") (armed = false), h.client.close(), log.push("closed");
+    });
+  }
+  h.client.window({ scope: 1, list: "b", table: Note }, (st) => log.push(`other ${st.status}`));
+  h.run();
+  const pages = h.self.said.filter((x) => x.kind === WATCH).map(watchOf);
+  log.length = 0;
+  armed = true;
+  h.self.receive(b(pages.map(([id, , lo, hi]) => syncedOf(id, lo, hi)).join("")));
+  h.run();
+  const closed = log.indexOf("closed");
+  assert(closed > 0, log.join());
+  for (const line of log.slice(closed)) assert(!line.endsWith("ready") || line === "other ready", `${line} after it closed: ${log}`);
+  for (const line of new Set(log)) assert.equal(log.filter((x) => x === line).length, 1, `${line} twice: ${log}`);
+  assert(log.includes("two stale") && log.includes("other stale"), log.join());
+}
+{
+  // A listener of "status" that closes the client: the rest are told it is down, not that it is up.
+  const h = harness();
+  h.run();
+  const log: string[] = [];
+  h.client.on("status", (up) => {
+    log.push(`one ${up}`);
+    if (up) h.client.close();
+  });
+  h.client.on("status", (up) => log.push(`two ${up}`));
+  h.greet();
+  h.run();
+  assert.equal(log.join(), "one false,two false,one true,one false,two false");
+}
+{
+  // Observers, listeners and followers stopped by one told before them are not told; and followers are told nothing more
+  // of what a frame says once one of them closes the client.
+  const h = harness();
+  h.run();
+  h.greet();
+  let armed = false, second = 0;
+  const handles: { stop: () => void }[] = [];
+  handles.push(h.client.window({ scope: 1, list: "a", table: Note }, () => armed && handles[1].stop()));
+  handles.push(h.client.window({ scope: 1, list: "a", table: Note }, () => armed && second++));
+  let heard = 0;
+  let off = () => {};
+  h.client.on("status", (up) => !up && off());
+  off = h.client.on("status", (up) => !up && heard++);
+  h.run();
+  const [id, , lo, hi] = watchOf(h.last(WATCH)!);
+  armed = true;
+  h.self.receive(b(syncedOf(id, lo, hi)));
+  h.run();
+  assert.equal(second, 0, "a stopped observer was told");
+  const followed: string[] = [];
+  let unfollow = () => {};
+  h.client.follow((row) => {
+    followed.push(row);
+    unfollow();
+    if (followed.length === 1) h.client.close();
+  });
+  unfollow = h.client.follow(() => followed.push("stopped"));
+  const tag = h.client.tag(1, "a");
+  const placed = (n: number) => cellOf("\0\0\0\x01" + rep("\x07", 11) + ch(n), 2, 1, n, tag + rep("\0", 7) + ch(n));
+  h.self.receive(b(frameOf(CELLS, "\0" + placed(1) + placed(2) + placed(3))));
+  h.run();
+  assert.equal(followed.length, 1, `followed ${followed}`);
+  assert.equal(heard, 0, "a listener stopped was told");
+}
+{
+  // A call that could not be made is told so on a turn of its own, unless it is cancelled first; and a client closed
+  // first tells it then, as it does every call it had.
+  const h = harness();
+  h.run();
+  const told: string[] = [];
+  const one = h.client.call(DEVICE, 1, "m", "x");
+  one.onfault = (f) => told.push(`one ${f}`);
+  one.cancel();
+  const two = h.client.call(DEVICE, 1, "m", "x");
+  two.onfault = (f) => told.push(`two ${f}`);
+  h.run();
+  assert.equal(told.join(), "two unreachable");
+  h.self.closed(); // and with no pipe to let go of, as while one is dialled again
+  h.run();
+  const three = h.client.call(DEVICE, 1, "m", "x");
+  three.onfault = (f) => told.push(`three ${f}`);
+  h.client.close();
+  assert.equal(told.join(), "two unreachable,three unreachable", "it was not told as the client closed");
+  h.run();
+  assert.equal(told.length, 2, "it was told again");
+}
+{
+  // Nor is a call that is lost told so once cancelled by another told first.
+  const h = harness();
+  h.run();
+  h.greet();
+  const told: string[] = [];
+  const one = h.client.call(DEVICE, 1, "m", "x"), two = h.client.call(DEVICE, 1, "m", "x");
+  one.onfault = (f) => (told.push(`one ${f}`), two.cancel());
+  two.onfault = (f) => told.push(`two ${f}`);
+  h.run();
+  h.self.closed();
+  h.run();
+  assert.equal(told.join(), "one lost");
+}
+{
+  // A window stopped, and let go of, asks for nothing more of what it was stopped on.
+  const h = harness();
+  h.run();
+  h.greet();
+  const win = h.client.window({ scope: 1, list: "a", table: Note, size: 2 }, () => {});
+  h.run();
+  const [id, , lo, hi] = watchOf(h.last(WATCH)!);
+  const w = codec.writer();
+  codec.putVarint(w, id);
+  codec.putU8(w, 1);
+  codec.putKey(w, lo);
+  codec.putKey(w, hi);
+  codec.putVarint(w, 5);
+  codec.putVarint(w, 5);
+  h.self.receive(b(frameOf(SYNCED, s(codec.written(w)))));
+  h.run();
+  win.stop();
+  h.laters();
+  h.run();
+  const from = h.self.said.length;
+  win.loadAfter();
+  win.loadBefore();
+  win.visible(0, 1);
+  h.run();
+  assert.deepEqual(h.self.said.slice(from).map((x) => x.kind), [], "a window let go of asked for more");
+}
+// Questions asked meanwhile, as by code that waited for one asked once, are asked once each.
   const h = harness();
   h.run();
   for (let i = 0; i < 5; i++) h.client.ask({ scope: 1, table: Note }, () => {});

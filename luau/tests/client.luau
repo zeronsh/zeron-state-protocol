@@ -1139,6 +1139,239 @@ do
 	h.self.receive(call_of(2) .. frame_of(12, ""))
 	assert(h.client.ready and #h.client.devices == 0 and served == 1 and h.self.closes == 0, "the pipe was not read on")
 end
+-- Nothing is told to what was stopped, cancelled or closed since, even while others are being told, nor told as it was
+-- once it is otherwise.
+do
+	-- An observer that closes the client: the rest hear of it as it is then, once, and never as it was.
+	local h = harness()
+	h.run()
+	h.greet()
+	local log: { string } = {}
+	h.client:on("status", function(up)
+		table.insert(log, `status {up}`)
+	end)
+	local armed = false
+	for _, name in { "one", "two" } do
+		h.client:window({ scope = 1, list = "a", table = Note }, function(st)
+			table.insert(log, `{name} {st.status}`)
+			if armed and st.status == "ready" then
+				armed = false
+				h.client:close()
+				table.insert(log, "closed")
+			end
+		end)
+	end
+	h.client:window({ scope = 1, list = "b", table = Note }, function(st)
+		table.insert(log, `other {st.status}`)
+	end)
+	h.run()
+	local chunk = {}
+	for _, x in h.self.said do
+		if x.kind == WATCH then
+			local id, _, lo, hi = watch_of(x)
+			table.insert(chunk, synced_of(id, lo, hi))
+		end
+	end
+	table.clear(log)
+	armed = true
+	h.self.receive(table.concat(chunk))
+	h.run()
+	local closed = table.find(log, "closed") :: number
+	assert(closed, table.concat(log, ","))
+	local seen: { [string]: boolean } = {}
+	for i, line in log do
+		assert(not seen[line], `{line} twice: {table.concat(log, ",")}`)
+		seen[line] = true
+		if i > closed then
+			assert(string.sub(line, -5) ~= "ready" or line == "other ready", `{line} after it closed: {table.concat(log, ",")}`)
+		end
+	end
+	assert(seen["other stale"] and (seen["one stale"] and seen["two stale"]), table.concat(log, ","))
+end
+do
+	-- A listener of "status" that closes the client: the rest are told it is down, not that it is up.
+	local h = harness()
+	h.run()
+	local log: { string } = {}
+	local function listener(up: boolean, name: string)
+		table.insert(log, `{name} {up}`)
+		if up then
+			h.client:close()
+		end
+	end
+	-- Whichever is told first closes the client; the other is told it is down.
+	h.client:on("status", function(up)
+		listener(up, "a")
+	end)
+	h.client:on("status", function(up)
+		listener(up, "b")
+	end)
+	h.greet()
+	h.run()
+	local trues = 0
+	for _, line in log do
+		if string.find(line, "true", 1, true) then
+			trues += 1
+		end
+	end
+	assert(trues == 1, `told {table.concat(log, ",")}`)
+	assert(string.find(log[#log], "false", 1, true), `told {table.concat(log, ",")}`)
+end
+do
+	-- Observers, listeners and followers stopped by one told before them are not told; and followers are told nothing more
+	-- of what a frame says once one of them closes the client.
+	local h = harness()
+	h.run()
+	h.greet()
+	local armed = false
+	local told = { 0, 0 }
+	local handles: { any } = {}
+	for i = 1, 2 do
+		handles[i] = h.client:window({ scope = 1, list = "a", table = Note }, function()
+			if armed then
+				told[i] += 1
+				handles[3 - i].stop() -- whichever is told first stops the other
+			end
+		end)
+	end
+	local heard = 0
+	local offs: { () -> () } = {}
+	for i = 1, 2 do
+		offs[i] = h.client:on("status", function(up)
+			if not up then
+				heard += 1
+				offs[3 - i]()
+			end
+		end)
+	end
+	h.run()
+	heard = 0
+	local id, _, lo, hi = watch_of(h.last(WATCH))
+	armed = true
+	h.self.receive(synced_of(id, lo, hi))
+	h.run()
+	assert(told[1] + told[2] == 1, `told {told[1]} and {told[2]}`)
+	local followed = 0
+	local unfollow = function() end
+	h.client:follow(function()
+		followed += 1
+		unfollow()
+		if followed == 1 then
+			h.client:close()
+		end
+	end)
+	unfollow = h.client:follow(function()
+		followed += 100
+	end)
+	local tag = h.client:_tag(1, "a")
+	local function placed(n: number): string
+		return cell_of("\0\0\0\1" .. string.rep("\7", 11) .. string.char(n), 2, 1, n, tag .. string.rep("\0", 7) .. string.char(n))
+	end
+	h.self.receive(frame_of(CELLS, "\0" .. placed(1) .. placed(2) .. placed(3)))
+	h.run()
+	assert(followed == 1, `followed {followed}`)
+	assert(heard == 1, `{heard} heard it was down`)
+end
+do
+	-- A call that could not be made is told so on a turn of its own, unless it is cancelled first; and a client closed
+	-- first tells it then, as it does every call it had.
+	local h = harness()
+	h.run()
+	local told: { string } = {}
+	local one = h.client:call(DEVICE, 1, "m", "x")
+	one.on_fault = function(f)
+		table.insert(told, `one {f}`)
+	end
+	one.cancel()
+	local two = h.client:call(DEVICE, 1, "m", "x")
+	two.on_fault = function(f)
+		table.insert(told, `two {f}`)
+	end
+	h.run()
+	assert(table.concat(told, ",") == "two unreachable", table.concat(told, ","))
+	h.self.closed() -- and with no pipe to let go of, as while one is dialled again
+	h.run()
+	local three = h.client:call(DEVICE, 1, "m", "x")
+	three.on_fault = function(f)
+		table.insert(told, `three {f}`)
+	end
+	h.client:close()
+	assert(table.concat(told, ",") == "two unreachable,three unreachable", "it was not told as the client closed")
+	h.run()
+	assert(#told == 2, "it was told again")
+end
+do
+	-- Nor is a call that is lost told so once cancelled by another told first.
+	local h = harness()
+	h.run()
+	h.greet()
+	local told: { string } = {}
+	local calls = { h.client:call(DEVICE, 1, "m", "x"), h.client:call(DEVICE, 1, "m", "x") }
+	for i = 1, 2 do
+		calls[i].on_fault = function(f)
+			table.insert(told, `{i} {f}`)
+			calls[3 - i].cancel() -- whichever is told first
+		end
+	end
+	h.run()
+	h.self.closed()
+	h.run()
+	assert(#told == 1, table.concat(told, ","))
+end
+do
+	-- What waits for this client and is let be by whoever ran it, closed or cancelled, is let be by this client too.
+	local h = harness()
+	h.run()
+	h.greet()
+	local waiting = coroutine.create(function()
+		h.client:fetch({ scope = 1, table = Note })
+	end)
+	coroutine.resume(waiting)
+	h.run()
+	coroutine.close(waiting)
+	local w = codec.writer()
+	codec.put_varint(w, codec.varint(codec.reader((h.last(FETCH) :: any).body)))
+	codec.put_u8(w, 1)
+	for _ = 1, 4 do
+		codec.put_varint(w, 0)
+	end
+	h.self.receive(frame_of(ANSWER, codec.string(w)))
+	h.run()
+	local asking = coroutine.create(function()
+		h.client:request(DEVICE, 1, "m", "x")
+	end)
+	coroutine.resume(asking)
+	coroutine.close(asking)
+	h.client:close()
+	h.run()
+end
+do
+	-- A window stopped, and let go of, asks for nothing more of what it was stopped on.
+	local h = harness()
+	h.run()
+	h.greet()
+	local win = h.client:window({ scope = 1, list = "a", table = Note, size = 2 }, function() end)
+	h.run()
+	local id, _, lo, hi = watch_of(h.last(WATCH))
+	local w = codec.writer()
+	codec.put_varint(w, id)
+	codec.put_u8(w, 1)
+	codec.put_key(w, lo)
+	codec.put_key(w, hi)
+	codec.put_varint(w, 5)
+	codec.put_varint(w, 5)
+	h.self.receive(frame_of(SYNCED, codec.string(w)))
+	h.run()
+	win.stop()
+	h.laters()
+	h.run()
+	local from = #h.self.said
+	win.load_after()
+	win.load_before()
+	win.visible(1, 2)
+	h.run()
+	assert(#h.self.said == from, "a window let go of asked for more")
+end
 do
 	-- Questions asked meanwhile, as by code that waited for one asked once, are asked once each.
 	local ASK = 32

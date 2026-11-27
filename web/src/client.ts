@@ -362,6 +362,11 @@ interface Asked {
   changed: boolean;
 }
 
+interface Follower {
+  readonly f: (id: string) => void;
+  on: boolean; // until it is stopped, even while the rest are being told
+}
+
 interface LiveCall {
   call: Call;
   side: number;
@@ -501,11 +506,13 @@ export class Client {
   #unacked = new Map<string, number>(); // rows in pending, and how often
   #out = codec.writer();
   #flushing = false;
+  #tells = new Map<Event, number>(); // what was told of each, so far: one told again within another is told afresh
+  #faults = new Map<LiveCall, Fault>(); // calls to be told of their end, unless cancelled first
   #calls = new Map<number, LiveCall>(); // ours
   #answers = new Map<number, LiveCall>(); // of others
   #nextCall = 0;
   #handlers = new Map<string, (call: Call, data: Uint8Array) => void>();
-  #followers: readonly ((id: string) => void)[] = []; // made anew as they change: what is being told stays as it was
+  #followers: readonly Follower[] = []; // made anew as they change: what is being told stays as it was
   #typing = new Set<Stored>(); // rows with live text to send
   #tags = new Map<string, string>(); // of lists, by their scope, its key and their name
   #bulk?: Map<Win, Entry[]>; // rows to add to windows, all at once
@@ -571,9 +578,10 @@ export class Client {
     this.#ready = false;
     this.#authors.clear();
     // All of this client's own first, the next pipe asked for too: then those told of it, whatever they do.
-    const calls = [...this.#calls.values(), ...this.#answers.values()];
-    this.#calls.clear();
-    this.#answers.clear();
+    for (const set of [this.#calls, this.#answers]) {
+      for (const live of set.values()) this.#faults.set(live, "lost");
+      set.clear();
+    }
     for (const window of this.#windows.values()) {
       for (const page of window.pages) page.settled = false;
       this.#touch(window);
@@ -594,7 +602,7 @@ export class Client {
       this.#failures++;
       this.#after(wait, () => this.#dial());
     }
-    for (const c of calls) if (c.call.onfault) this.#hand(c.call.onfault, "lost", c.call);
+    for (const live of [...this.#faults.keys()]) this.#fault(live);
     this.#tell("status", false);
   }
 
@@ -609,6 +617,7 @@ export class Client {
     // Nothing is left to be done later: a closed client keeps nothing awake.
     for (const cancel of [...this.#timers]) cancel();
     for (const a of [...this.#asked.values()]) this.#fetched(a);
+    for (const live of [...this.#faults.keys()]) this.#fault(live); // calls never made end here, as those made do
   }
 
   // Runs f later, unless the client is closed first; returns a way to cancel it.
@@ -839,10 +848,17 @@ export class Client {
     }
   }
 
-  // Each hears, whatever another does.
+  // Each hears, whatever another does, if it is hearing still; and once something else is told of the same, as "status" is
+  // by close(), the rest hear that, rather than what is no longer so.
   #tell<E extends Event>(what: E, value: Told[E]): void {
     const set = this.#watchers.get(what);
-    if (set) for (const f of [...set]) this.#hand(f, value);
+    if (!set) return;
+    const told = (this.#tells.get(what) ?? 0) + 1;
+    this.#tells.set(what, told);
+    for (const f of [...set]) {
+      if (this.#tells.get(what) !== told) return;
+      if (set.has(f)) this.#hand(f, value);
+    }
   }
 
   /**
@@ -942,9 +958,11 @@ export class Client {
     this.#hand(own, win.bare ? (undefined as unknown as State<T>) : this.#state(win));
     let stopped = false;
     return Object.freeze({
-      visible: (first: number, last: number) => this.#visible(win, first, last),
-      loadBefore: () => this.#loadBefore(win),
-      loadAfter: () => this.#loadAfter(win),
+      // A window stopped is looked at no more by whoever stopped it: what they ask of it then asks for nothing, as it may
+      // be let go of already, and a page asked for of it would be watched for good.
+      visible: (first: number, last: number) => void (stopped || this.#visible(win, first, last)),
+      loadBefore: () => void (stopped || this.#loadBefore(win)),
+      loadAfter: () => void (stopped || this.#loadAfter(win)),
       entries: () => win.entries,
       stop: () => {
         if (stopped) return;
@@ -1260,7 +1278,11 @@ export class Client {
   #publish(window: Win): void {
     window.changed = false;
     const state = window.bare ? (undefined as unknown as State<any>) : this.#state(window);
-    for (const f of [...window.observers]) this.#hand(f, state);
+    // Only to those observing still, and only while it is so: once it changes, the rest are told of it as it is then.
+    for (const f of [...window.observers]) {
+      if (window.changed) return;
+      if (window.observers.has(f)) this.#hand(f, state);
+    }
   }
 
   // A row as the application sees it: one frozen object, the same one until something in it changes.
@@ -1404,7 +1426,7 @@ export class Client {
   // Puts a row where its placements say, in every window, and takes it from where they do not. Followers hear of it
   // first, unless they have been told already.
   #place(row: Stored, told = false): void {
-    if (!told) for (const f of this.#followers) this.#hand(f, row.hex);
+    if (!told) this.#follow(row);
     const keys: string[] = [];
     if (!row.dead) {
       for (let slot = 1; slot <= 15; slot++) {
@@ -1464,7 +1486,7 @@ export class Client {
       for (const row of rows) this.#place(row);
       return;
     }
-    for (const row of rows) for (const f of this.#followers) this.#hand(f, row.hex);
+    for (const row of rows) this.#follow(row);
     const bulk = new Map<Win, Entry[]>();
     this.#bulk = bulk;
     for (const row of rows) this.#place(row, true);
@@ -1926,9 +1948,17 @@ export class Client {
 
   /** Hears of every row that changes, here or anywhere, by its id. Returns a way to stop. */
   follow(f: (id: string) => void): () => void {
-    const own = (id: string) => f(id); // its own, though the same function follow twice
+    const own: Follower = { f, on: true }; // its own, though the same function follow twice
     this.#followers = [...this.#followers, own];
-    return () => void (this.#followers = this.#followers.filter((x) => x !== own));
+    return () => {
+      own.on = false;
+      this.#followers = this.#followers.filter((x) => x !== own);
+    };
+  }
+
+  // Followers hear of a row, those following still, while the client is open: one closed within it tells no more.
+  #follow(row: Stored): void {
+    for (const x of this.#followers) if (x.on && !this.#closed) this.#hand(x.f, row.hex);
   }
 
   /** A row as it is held: its cells by slot and stamp, or undefined. Not to be changed. */
@@ -2191,6 +2221,7 @@ export class Client {
         }
       },
       cancel: () => {
+        if (this.#faults.delete(live)) return; // ended already, and not yet told: it is not told now
         if (!over()) {
           set.delete(id);
           this.#flow(id, side, F_CANCEL);
@@ -2215,6 +2246,14 @@ export class Client {
     };
     set.set(id, live);
     return live;
+  }
+
+  // Tells a call of its end, if it is to be told still.
+  #fault(live: LiveCall): void {
+    const fault = this.#faults.get(live);
+    if (fault === undefined) return;
+    this.#faults.delete(live);
+    if (live.call.onfault) this.#hand(live.call.onfault, fault, live.call);
   }
 
   // Credits what was taken: the other side may send as much more. A reader that keeps up gets a longer window, as the host
@@ -2263,8 +2302,10 @@ export class Client {
     const first = toBytes(data);
     if (!this.#ready || first.length > CALL_WINDOW) {
       this.#calls.delete(id);
-      const fault: Fault = this.#ready ? "overrun" : "unreachable";
-      this.#host.defer(() => live.call.onfault?.(fault));
+      // Told on a turn of its own, once it can have been given its callbacks: unless it is cancelled first, or the client
+      // is closed, which tells it at once.
+      this.#faults.set(live, this.#ready ? "overrun" : "unreachable");
+      this.#host.defer(() => this.#fault(live));
       return live.call;
     }
     live.credit -= first.length;

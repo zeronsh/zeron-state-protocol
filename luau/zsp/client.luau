@@ -160,6 +160,8 @@ export type Call_Options = {
 	-- answered might say 1, a bulk copy 6.
 	urgency: number?,
 }
+type Follower = { f: (string) -> (), on: boolean } -- on until it is stopped, even while the rest are being told
+
 type Live_Call = {
 	call: Call,
 	side: number,
@@ -283,11 +285,13 @@ local function new_client(host: Host)
 		unacked = {} :: { [string]: number }, -- rows in pending, and how often
 		out = codec.writer(),
 		flushing = false,
+		tells = {} :: { [string]: number }, -- what was told of each, so far: one told again within another is told afresh
+		faults = {} :: { [Live_Call]: string }, -- calls to be told of their end, unless cancelled first
 		calls = {} :: { [number]: Live_Call }, -- ours
 		answers = {} :: { [number]: Live_Call }, -- of others
 		next_call = 0,
 		handlers = {} :: { [string]: (Call, string) -> () },
-		followers = {} :: { (string) -> () }, -- made anew as they change: what is being told stays as it was
+		followers = {} :: { Follower }, -- made anew as they change: what is being told stays as it was
 		typing = {} :: { [Stored]: boolean }, -- rows with live text to send
 		tags = {} :: { [number]: { key: string, lists: { [string]: string } } }, -- of lists, by their scope, while its key is the same
 		bulk = nil :: { [Window]: { { key: string, row: Stored } } }?, -- rows to add to windows, all at once
@@ -347,10 +351,9 @@ function Client._lost(self: Client)
 	self.ready = false
 	table.clear(self.authors)
 	-- All of this client's own first, the next pipe asked for too: then those told of it, whatever they do.
-	local calls = {}
 	for _, set in { self.calls, self.answers } do
-		for _, c in set do
-			table.insert(calls, c)
+		for _, live in set do
+			self.faults[live] = "lost"
 		end
 		table.clear(set)
 	end
@@ -381,10 +384,8 @@ function Client._lost(self: Client)
 			self:_dial()
 		end)
 	end
-	for _, c in calls do
-		if c.call.on_fault then
-			self:_hand(c.call.on_fault, "lost")
-		end
+	for live in table.clone(self.faults) do
+		self:_fault(live)
 	end
 	self:_tell("status", false)
 end
@@ -412,6 +413,9 @@ function Client.close(self: Client)
 	end
 	for _, a in table.clone(self.asked) do
 		self:_fetched(a) -- as far as it got
+	end
+	for live in table.clone(self.faults) do
+		self:_fault(live) -- calls never made end here, as those made do
 	end
 end
 
@@ -699,18 +703,31 @@ end
 -- never done in the middle of what this client does, and what it throws is thrown there.
 function Client._resume(self: Client, thread: thread)
 	self.host.defer(function()
-		local fine, why = coroutine.resume(thread)
-		if not fine then
-			error(why, 0)
+		-- Only one that waits still: one closed or cancelled meanwhile by whoever ran it is let be. What is thrown is the
+		-- thread's own.
+		if coroutine.status(thread) == "suspended" then
+			local fine, why = coroutine.resume(thread)
+			if not fine then
+				error(why, 0)
+			end
 		end
 	end)
 end
 
--- Each hears, whatever another does.
+-- Each hears, whatever another does, if it is hearing still; and once something else is told of the same, as "status" is
+-- by close(), the rest hear that, rather than what is no longer so.
 function Client._tell(self: Client, what: string, value: any)
 	local set = self.watchers[what]
-	if set then
-		for f in table.clone(set) do
+	if not set then
+		return
+	end
+	local told = (self.tells[what] or 0) + 1
+	self.tells[what] = told
+	for f in table.clone(set) do
+		if self.tells[what] ~= told then
+			return
+		end
+		if set[f] then
 			self:_hand(f, value)
 		end
 	end
@@ -835,14 +852,22 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 
 	return table.freeze({
 		-- The rows now on screen, by position. Loads what is near, lets go of what is far.
+		-- A window stopped is looked at no more by whoever stopped it: what they ask of it then asks for nothing, as it may
+		-- be let go of already, and a page asked for of it would be watched for good.
 		visible = function(first: number, last: number)
-			self:_visible(window, first, last)
+			if not stopped then
+				self:_visible(window, first, last)
+			end
 		end,
 		load_before = function()
-			self:_load_before(window)
+			if not stopped then
+				self:_load_before(window)
+			end
 		end,
 		load_after = function()
-			self:_load_after(window)
+			if not stopped then
+				self:_load_after(window)
+			end
 		end,
 		-- The rows as they are held, in order: for what is built on the client, such as a mirror.
 		entries = function(): { { key: string, row: Stored } }
@@ -1270,8 +1295,14 @@ end
 function Client._publish(self: Client, window: Window)
 	window.changed = false
 	local state = if window.bare then nil :: any else self:_state(window)
+	-- Only to those observing still, and only while it is so: once it changes, the rest are told of it as it is then.
 	for f in table.clone(window.observers) do
-		self:_hand(f, state)
+		if window.changed then
+			return
+		end
+		if window.observers[f] then
+			self:_hand(f, state)
+		end
 	end
 end
 
@@ -1542,9 +1573,7 @@ end
 -- first, unless they have been told already.
 function Client._place(self: Client, row: Stored, told: boolean?)
 	if not told then
-		for _, f in self.followers do
-			self:_hand(f, row.id)
-		end
+		self:_follow(row)
 	end
 	-- Where its placements put it: most often in one place, which needs no table of them.
 	local first: string? = nil
@@ -1638,9 +1667,7 @@ function Client._place_all(self: Client, rows: { [Stored]: boolean })
 		return
 	end
 	for row in rows do
-		for _, f in self.followers do
-			self:_hand(f, row.id)
-		end
+		self:_follow(row)
 	end
 	local bulk: { [Window]: { { key: string, row: Stored } } } = {}
 	self.bulk = bulk
@@ -2254,18 +2281,26 @@ end
 
 -- Hears of every row that changes, here or anywhere, by its id. Returns a way to stop.
 function Client.follow(self: Client, f: (string) -> ()): () -> ()
-	local function own(id: string) -- its own, though the same function follow twice
-		f(id)
-	end
+	local own: Follower = { f = f, on = true } -- its own, though the same function follow twice
 	local list = table.clone(self.followers)
 	table.insert(list, own)
 	self.followers = list
 	return function()
+		own.on = false
 		local i = table.find(self.followers, own)
 		if i then
 			local rest = table.clone(self.followers)
 			table.remove(rest, i)
 			self.followers = rest
+		end
+	end
+end
+
+-- Followers hear of a row, those following still, while the client is open: one closed within it tells no more.
+function Client._follow(self: Client, row: Stored)
+	for _, x in self.followers do
+		if x.on and not self.closed then
+			self:_hand(x.f, row.id)
 		end
 	end
 end
@@ -2597,6 +2632,10 @@ function Client._call(self: Client, id: number, side: number, device: string, me
 			end
 		end,
 		cancel = function()
+			if self.faults[live] then
+				self.faults[live] = nil -- ended already, and not yet told: it is not told now
+				return
+			end
 			if not over() then
 				set[id] = nil
 				self:_flow(id, side, F_CANCEL)
@@ -2648,6 +2687,18 @@ function Client._drain(self: Client, id: number, live: Live_Call)
 	end
 end
 
+-- Tells a call of its end, if it is to be told still.
+function Client._fault(self: Client, live: Live_Call)
+	local fault = self.faults[live]
+	if fault == nil then
+		return
+	end
+	self.faults[live] = nil
+	if live.call.on_fault then
+		self:_hand(live.call.on_fault, fault)
+	end
+end
+
 -- Credits what is done with. A window used up quickly grows, to 4 MiB, so that a long path is kept full by a reader that
 -- keeps up; one that does not never gets more than it has room for.
 function Client._consume(self: Client, id: number, live: Live_Call, n: number)
@@ -2693,11 +2744,11 @@ function Client.call(self: Client, device: string, scope: number, method: string
 	local live = self:_call(id, 0, device, method)
 	if not self.ready or #data > CALL_WINDOW then
 		self.calls[id] = nil
-		local fault = if self.ready then "overrun" else "unreachable" -- as things are now, not when it is told
+		-- Told on a turn of its own, once it can have been given its callbacks: unless it is cancelled first, or the client
+		-- is closed, which tells it at once. As things are now, not when it is told.
+		self.faults[live] = if self.ready then "overrun" else "unreachable"
 		self.host.defer(function()
-			if live.call.on_fault then
-				live.call.on_fault(fault)
-			end
+			self:_fault(live)
 		end)
 		return live.call
 	end
