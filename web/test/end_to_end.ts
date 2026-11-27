@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
-import { Client, columns, type Answer, type State } from "../src/client.ts";
+import { Client, columns, type Answer, type Host, type State } from "../src/client.ts";
 import { where as w } from "../src/ask.ts";
 import type { Connect, Wire } from "../src/node.ts";
 import { open } from "../src/nodejs.ts";
@@ -45,7 +45,15 @@ class Pipes {
 
 // A space as live.ts wants it: scope 1, and scope 2 signed, in which b may vouch; a goes by "ann" and b by "bob". Web
 // devices are partial replicas, as a browser's are, unless they are "full" ones.
-async function space(name: string, relay: { key: string; url: string }, sides: ("zspd" | "web" | "full")[], options: string[] = [], relayCredential?: string, noReader = false) {
+async function space(
+  name: string,
+  relay: { key: string; url: string },
+  sides: ("zspd" | "web" | "full")[],
+  options: string[] = [],
+  relayCredential?: string,
+  noReader = false,
+  firstAfter?: Host["after"], // the first side's client's timers, should a test want them otherwise
+) {
   const owner = join(TMP, name + "-owner");
   const sid = zspd("create", owner);
   zspd("relay", owner, relay.key, relay.url);
@@ -84,7 +92,7 @@ async function space(name: string, relay: { key: string; url: string }, sides: (
     if (i === 1) zspd("admit", owner, key, "2", "vouch");
     else if (kind !== "zspd") zspd("admit", owner, key, "2");
     zspd("subject", owner, key, subject);
-    clients.push(new Client({ connect: pipes.wrap(connect), credential, linger: 200 }));
+    clients.push(new Client({ connect: pipes.wrap(connect), credential, linger: 200, ...(i === 0 && firstAfter ? { after: firstAfter } : {}) }));
   }
   if (noReader) {
     // Once all belong, nobody who can read holds everything: only the relay does.
@@ -285,30 +293,20 @@ const tests: Record<string, () => Promise<void>> = {
   async late_reader() {
     for (const kind of ["zspd", "cloud"]) {
       const relay = kind === "zspd" ? await node("serve", join(TMP, "lr-relay")) : await cloud();
-      const s = await space("lr-" + kind, relay, ["web", "zspd"]);
+      // The writer seals no piece of itself: what the late reader is shown can only have come live, however slow the machine.
+      const s = await space("lr-" + kind, relay, ["web", "zspd"], [], undefined, false, () => () => {});
       const Note = { title: columns.string(16), body: columns.text(17) };
       await eventually("it may write", () => s.a.may(1, "write") && s.b.may(1, "read"));
       let id = "";
       await s.a.write(1, (change) => (id = change.insert(Note, "late", 1, { title: "note" })));
       const editor = s.a.text(id, Note.body);
-      const typed = Date.now();
-      editor.append("typed before anyone looked"); // its piece is sealed a second from now, and no sooner
+      editor.append("typed before anyone looked");
       await new Promise((done) => setTimeout(done, 200)); // said, and dropped, as nobody looked
       let shown: string | undefined;
-      const looked = Date.now();
       const w = s.b.window({ scope: 1, list: "late", table: Note }, (state) => (shown = state.rows[0]?.body));
-      await eventually("what was typed before it looked", () => shown === "typed before anyone looked");
-      const seen = Date.now();
-      const began = Date.now();
-      editor.append(", and after"); // in the same piece if that is not sealed yet, else in one of its own
-      const sealed = began < typed + 1000 ? typed + 1000 : began + 1000;
-      await eventually("and what is typed after", () => shown === "typed before anyone looked, and after");
-      const done = Date.now();
-      // A piece is sealed a second after it began, and no sooner: what is shown before then was live. (Not a bound on
-      // how soon after looking: that is all the while a slow machine takes to open the window.)
-      if (seen >= typed + 1000 || done >= sealed) {
-        throw new Error(`${kind}: shown ${seen - looked} ms after looking and ${done - began} ms after typing, ${seen - typed} and ${done - typed} ms after the piece began: once sealed, not live`);
-      }
+      await eventually(`${kind}: what was typed before it looked, live`, () => shown === "typed before anyone looked");
+      editor.append(", and after"); // in the same piece, which is never sealed
+      await eventually(`${kind}: and what is typed after, live`, () => shown === "typed before anyone looked, and after");
       editor.close();
       w.stop();
       await s.close();
