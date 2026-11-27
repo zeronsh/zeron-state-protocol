@@ -2094,6 +2094,84 @@ review3_becoming_dialled :: proc(t: ^testing.T) {
 	testing.expect(t, laptop.node.whole)
 }
 
+// Something refused before a device becoming partial has sent all it has, however early, means it is not level on that
+// session; and what a peer says it refused is not taken on trust into the outbox. (Review 4, 1, 2.)
+@(test)
+review4_refused_early :: proc(t: ^testing.T) {
+	for way in 0 ..< 2 {
+		state := seeded(71)
+		context.random_generator = rand.default_random_generator(&state)
+		s: Sim
+		sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+		defer sim_destroy(&s)
+		dev := s.nodes[1]
+		dev.node.now = sim_now(&s, dev)
+		big_value := make([]byte, 16 << 10)
+		defer delete(big_value)
+		for i in 0 ..< (6 if way == 0 else 1) {
+			sim_put(&s, dev, u64(i))
+			scan := tree_scan(&dev.node, dev.node.shelf, KEY_MIN, KEY_MAX)
+			last: Key
+			for leaf in tree_next(&scan) {
+				last = leaf.key
+			}
+			row := key_row(last)
+			testing.expect(t, node_write(&dev.node, {{row, DATA, .Value, node_stamp(&dev.node), big_value}}))
+		}
+		sim_restart(&s, dev, full = false)
+		sim_link(&s, 1, 2)
+		l := s.links[0]
+		f: [dynamic]byte
+		defer delete(f)
+		if way == 0 {
+			// The first cells have gone, and there is more to send.
+			for _ in 0 ..< 1000 {
+				if l.a.seq_out > 0 || l.a.level_at > 0 {
+					break
+				}
+				sim_pass(&s, l.a, l.b)
+				sim_pass(&s, l.b, l.a)
+			}
+			testing.expect(t, l.a.seq_out > 0 && l.a.level_at == 0, "never between")
+			// Whatever of a frame from the relay is on its way arrives whole first: frames are cut up as they go.
+			for len(l.a.input) > 0 {
+				out := session_output(l.b)
+				if len(out) == 0 {
+					break
+				}
+				copied := slice.clone(out, context.temp_allocator)
+				session_sent(l.b, len(out))
+				testing.expect(t, session_input(l.a, copied))
+			}
+			testing.expect(t, l.a.level_at == 0 && len(l.a.input) == 0, "no longer between")
+			scan := tree_scan(&dev.node, dev.node.cells, KEY_MIN, KEY_MAX)
+			leaf, _ := tree_next(&scan)
+			at := frame_begin(&f, .Ack)
+			write_varint(&f, l.a.seq_out)
+			write_pair(&f, Id{leaf.key[0], leaf.key[1]})
+			frame_end(&f, at)
+			session_input(l.a, f[:])
+			sim_settle(&s)
+			testing.expect(t, !dev.node.whole, "level, though something was refused")
+		} else {
+			testing.expect(t, sim_to_level(&s, l))
+			at := frame_begin(&f, .Ack)
+			write_varint(&f, 0)
+			for i in 0 ..< 500 {
+				write_pair(&f, Id{u64(1) << 32 | 7, u64(i)})
+			}
+			frame_end(&f, at)
+			session_input(l.a, f[:])
+			n := 0
+			scan := tree_scan(&dev.node, dev.node.outbox, KEY_MIN, KEY_MAX)
+			for _ in tree_next(&scan) {
+				n += 1
+			}
+			testing.expectf(t, n < 10, "a peer put %d rows in the outbox", n)
+		}
+	}
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)

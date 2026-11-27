@@ -61,6 +61,7 @@ Session :: struct {
 	settled:   bool, // none
 	told:      bool, // and the responder has been told that all of it was sent
 	level_at:  u64, // the last cells sent by then, plus one, if what was watched whole was every scope this one writes in
+	refused_out: bool, // something sent under these whole-scope watches was refused: never level by them
 	acked_out: u64, // the last cells the peer has said are durable
 	hushed:    u64, // roster serial under which it was paused
 	paused:    bool, // everyone who could write is reachable without this session
@@ -743,6 +744,7 @@ roots_drop :: proc(s: ^Session) {
 	s.settled = false
 	s.told = false
 	s.level_at = 0 // nor does what was sent for them make it level
+	s.refused_out = false
 }
 
 // ---------------------------------------------------------------- watching
@@ -1773,15 +1775,11 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 	if len(refused) == 0 {
 		s.acked_out = max(s.acked_out, seq) // durable there, all of it
 		node_level(s)
-	} else if s.level_at != 0 {
-		// Something was refused, killed there by what it holds: not level on this session, whatever is acknowledged
-		// later; and what was refused is offered again, there or elsewhere.
+	} else {
+		// Something was refused, killed there by what it holds, whenever: not level on this session under these
+		// watches, whatever is acknowledged later. It stays a full replica, and is brought level whole again.
+		s.refused_out = true
 		s.level_at = 0
-		if node_tracks(n) {
-			for row in refused {
-				tree_put(n, &n.outbox, {row[0], row[1], 0, 0, 0}, {})
-			}
-		}
 	}
 	done := 0
 	for done < len(s.unacked) && s.unacked[done].seq <= seq {
@@ -2479,7 +2477,7 @@ pump :: proc(s: ^Session) {
 		at := frame_begin(&s.out, .Synced)
 		append(&s.out, 0, 1, 0, 0, 0, 0)
 		frame_end(&s.out, at)
-		if roots_whole(s) {
+		if roots_whole(s) && !s.refused_out {
 			s.level_at = s.seq_out + 1
 			node_level(s)
 		}

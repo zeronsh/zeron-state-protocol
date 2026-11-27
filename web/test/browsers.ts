@@ -422,6 +422,19 @@ const partialBench = async () => {
     const via = { key: relay.key, url: through.url };
     const s = await space(`pb-${results.length}`, via);
     // The space: the owner writes it all, and a full device beside the relay, unthrottled, sees that it is all there.
+    // Every device to be measured is made, and admitted, before anything is written: what is measured is what it takes a
+    // device to have what it wants, not what it takes the owner to say it belongs, through the same slow network.
+    const made = new Map<string, { node?: Awaited<ReturnType<typeof openNode>>; page?: Page; dir: string; store: string }>();
+    for (const full of [false, true]) {
+      const dir = join(TMP, `pb-${results.length}-node-${full}`);
+      const d = await openNode({ dir, udp: false, full, log: () => {} });
+      s.admit(d.key, "n", false);
+      const p = await page();
+      const store = `pb-${results.length}-${full}`;
+      const { key } = await call<{ key: string }>(p, "device", store, undefined, full);
+      s.admit(key, "c", false);
+      made.set(String(full), { node: d, page: p, dir, store });
+    }
     const writer = new Client({ connect: zspdConnect(s.o.address), credential: token(s.owner) });
     await eventually("the writer may write", () => writer.may(1, "write"));
     const began = performance.now();
@@ -459,9 +472,8 @@ const partialBench = async () => {
     // Each device, made from nothing, joins through the network and is asked for the end of the list and a text.
     for (const full of [false, true]) {
       // In Node.
-      const dir = join(TMP, `pb-${results.length}-node-${full}`);
-      const d = await openNode({ dir, udp: false, full, log: () => {} });
-      s.admit(d.key, "n", false);
+      const m = made.get(String(full))!;
+      const dir = m.dir, d = m.node!;
       const t0 = performance.now();
       await d.join(s.sid, via);
       const c = d.client();
@@ -486,11 +498,8 @@ const partialBench = async () => {
       c.close();
       await d.close();
       // In Chrome.
-      const p = await page();
-      const store = `pb-${results.length}`;
+      const p = m.page!, store = m.store;
       const before = await call<number>(p, "estimate");
-      const { key } = await call<{ key: string }>(p, "device", store, undefined, full);
-      s.admit(key, "c", false);
       const t2 = performance.now();
       await call(p, "join", store, s.sid, via);
       const ctail = await call<number>(p, "timeTail", store, "big", 50, `note ${ROWS - 1}`, WAIT);
