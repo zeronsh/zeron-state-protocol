@@ -493,6 +493,75 @@ for (const what of ["move", "delete"]) {
   assert(pieces > 4000 + 16, "it was said in too few pieces");
 }
 
+// The pieces of a text's slot an editor said, in order: their stamps and bodies.
+function piecesOf(h: ReturnType<typeof harness>, slot: number): [stamp: string, body: Uint8Array][] {
+  const out: [string, Uint8Array][] = [];
+  for (const x of h.self.said) {
+    if (x.kind !== CELLS) continue;
+    const r = codec.reader(b(x.body));
+    codec.varint(r);
+    while (r.pos < r.len) {
+      const tag = codec.u8(r);
+      if (tag < 128) codec.take(r, 16);
+      const at = codec.u8(r), stamp = codec.takeBinary(r, 16), body = codec.bytes(r);
+      if ((tag & 63) === 4 && at === slot) out.push([stamp, body.slice()]);
+    }
+  }
+  return out;
+}
+
+// A piece ends where a character does, wherever what is typed or deleted at once is cut: whoever has the pieces so far
+// reads whole characters, and what they type after the last goes after a whole one. Typed in one go, a character at a
+// time, and deleted across many spans, with every place a cut can fall in one.
+{
+  const whole = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  const fresh = () => s(Uint8Array.from({ length: 8 }, () => Math.floor(Math.random() * 256)));
+  for (const one of ["é", "€", "😀"]) {
+    const width = new TextEncoder().encode(one).length;
+    for (let p = 0; p < width; p++) {
+      const h = harness();
+      h.run();
+      h.greet();
+      h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+      h.run();
+      let id = "";
+      void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+      h.run();
+      const editor = h.client.text(id, Note.body);
+      const typed = "x".repeat(p) + one.repeat(Math.ceil(140000 / width));
+      editor.append(typed);
+      editor.commit();
+      let left = typed;
+      if (p === 0) {
+        // And one at a time, each a span of its own, and all of it deleted at once.
+        for (let i = 0; i < 8000; i++) editor.insert(0, one);
+        editor.delete(0, typed.length + 8000 * one.length);
+        left = "";
+      }
+      editor.close();
+      h.run();
+      assert.equal(editor.read(), left);
+      const pieces = piecesOf(h, 17);
+      assert(pieces.length >= (p === 0 ? 6 : 3), `said in ${pieces.length} pieces`);
+      const t = text.create();
+      let was = "";
+      for (const [i, [stamp, body]] of pieces.entries()) {
+        text.apply(t, 4, stamp, body);
+        const now = whole.decode(text.content(t)); // or a character was cut
+        if (i === 0) assert(now.length > 0 && typed.startsWith(now), "the first piece is not what was typed");
+        // Who had this piece last, and typed after it, typed after a whole character, as all the rest find it.
+        const other = text.create();
+        for (const [st, bo] of pieces.slice(0, i + 1)) text.apply(other, 4, st, bo);
+        text.insert(other, text.len(other), "X", fresh);
+        for (const [st, bo] of pieces.slice(i + 1)) text.apply(other, 4, st, bo);
+        whole.decode(text.content(other));
+        was = now;
+      }
+      assert.equal(was, left);
+    }
+  }
+}
+
 // An editor of a row held for nothing but what this client wrote in another of its columns waits, as for one not held at
 // all, for the row: what it does is done to the text the row has.
 {

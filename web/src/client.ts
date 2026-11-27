@@ -1832,11 +1832,21 @@ export class Client {
       if (!Number.isSafeInteger(n) || n < 0) throw new RangeError("no such position");
     };
     // Types bytes in as many pieces as they need, each sealed once full: a live frame says the whole of what an open piece
-    // says, and a node passes over one longer than it carries.
+    // says, and a node passes over one longer than it carries. A piece ends where a character does, and one that has no
+    // room for the next is sealed without it: else whoever saw the piece alone would read half a character, and what they
+    // typed after it would go between its halves, for good.
     const type = (t: text.Text, from: number, bytes: Uint8Array) => {
       for (let k = 0; k < bytes.length; ) {
-        if (t.size + INSERT_MOST >= PIECE_MOST) this.#seal(row, slot);
-        const n = Math.min(bytes.length - k, PIECE_MOST - INSERT_MOST - t.size);
+        let n = bytes.length - k;
+        const room = PIECE_MOST - INSERT_MOST - t.size;
+        if (n > room) {
+          n = room > 0 ? room : 0;
+          for (let back = 0; back < 3 && n > 0 && (bytes[k + n] & 0xc0) === 0x80; back++) n--; // to where it begins
+          if (n === 0) {
+            this.#seal(row, slot);
+            continue;
+          }
+        }
         text.insert(t, from + k, bytes.subarray(k, k + n), fresh);
         k += n;
       }

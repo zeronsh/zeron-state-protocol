@@ -2098,14 +2098,26 @@ function Client.text(self: Client, id: string, col: Column)
 		end
 	end
 	-- Types bytes in as many pieces as they need, each sealed once full: a live frame says the whole of what an open piece
-	-- says, and a node passes over one longer than it carries.
+	-- says, and a node passes over one longer than it carries. A piece ends where a character does, and one that has no
+	-- room for the next is sealed without it: else whoever saw the piece alone would read half a character, and what they
+	-- typed after it would go between its halves, for good.
 	local function type_in(t: text.Text, from: number, s: string)
 		local k = 0
 		while k < #s do
-			if t.size + INSERT_MOST >= PIECE_MOST then
-				self:_seal(row, slot)
+			local n = #s - k
+			local room = PIECE_MOST - INSERT_MOST - t.size
+			if n > room then
+				n = if room > 0 then room else 0
+				local back = 0
+				while back < 3 and n > 0 and bit32.band(string.byte(s, k + n + 1), 0xC0) == 0x80 do -- to where it begins
+					n -= 1
+					back += 1
+				end
+				if n == 0 then
+					self:_seal(row, slot)
+					continue
+				end
 			end
-			local n = math.min(#s - k, PIECE_MOST - INSERT_MOST - t.size)
 			text.insert(t, from + k, if k == 0 and n == #s then s else string.sub(s, k + 1, k + n), fresh)
 			k += n
 		end

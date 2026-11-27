@@ -659,6 +659,99 @@ do
 	assert(pieces > 4000 + 16, "it was said in too few pieces")
 end
 
+-- The pieces of a text's slot an editor said, in order: their stamps and bodies.
+local function pieces_of(h: any, slot: number): { { string } }
+	local out = {}
+	for _, x in h.self.said do
+		if x.kind == CELLS then
+			local r = codec.reader(x.body)
+			codec.varint(r)
+			while r.pos < r.len do
+				local tag = codec.u8(r)
+				if tag < 128 then
+					codec.take(r, 16)
+				end
+				local at = codec.u8(r)
+				local stamp = codec.take(r, 16)
+				local body = codec.bytes(r)
+				if tag % 64 == 4 and at == slot then
+					table.insert(out, { stamp, body })
+				end
+			end
+		end
+	end
+	return out
+end
+
+-- A piece ends where a character does, wherever what is typed or deleted at once is cut: whoever has the pieces so far
+-- reads whole characters, and what they type after the last goes after a whole one. Typed in one go, a character at a
+-- time, and deleted across many spans, with every place a cut can fall in one.
+do
+	local text = require("../zsp/text")
+	local function fresh(): string
+		local out = {}
+		for i = 1, 8 do
+			out[i] = string.char(math.random(0, 255))
+		end
+		return table.concat(out)
+	end
+	for _, one in { "é", "€", "😀" } do
+		local width = #one
+		for p = 0, width - 1 do
+			local h = harness()
+			h.run()
+			h.greet()
+			h.client:window({ scope = 1, list = "a", table = Note }, function() end)
+			h.run()
+			local id = ""
+			h.client:write(1, function(change)
+				id = change.insert(Note, "a", 1, { title = "t" })
+			end)
+			h.run()
+			local editor = h.client:text(id, Note.body)
+			local typed = string.rep("x", p) .. string.rep(one, math.ceil(140000 / width))
+			editor.append(typed)
+			editor.commit()
+			local left = typed
+			if p == 0 then
+				-- And one at a time, each a span of its own, and all of it deleted at once.
+				for _ = 1, 8000 do
+					editor.insert(0, one)
+				end
+				editor.delete(0, #typed + 8000 * width)
+				left = ""
+			end
+			editor.close()
+			h.run()
+			assert(editor.read() == left, "what was typed is not there")
+			local pieces = pieces_of(h, 17)
+			assert(#pieces >= (if p == 0 then 6 else 3), `said in {#pieces} pieces`)
+			local t = text.new()
+			local was = ""
+			for i, piece in pieces do
+				text.apply(t, 4, piece[1], piece[2])
+				local now = text.read(t)
+				assert(utf8.len(now), "a character was cut")
+				if i == 1 then
+					assert(#now > 0 and string.sub(typed, 1, #now) == now, "the first piece is not what was typed")
+				end
+				-- Who had this piece last, and typed after it, typed after a whole character, as all the rest find it.
+				local other = text.new()
+				for k = 1, i do
+					text.apply(other, 4, pieces[k][1], pieces[k][2])
+				end
+				text.insert(other, text.len(other), "X", fresh)
+				for k = i + 1, #pieces do
+					text.apply(other, 4, pieces[k][1], pieces[k][2])
+				end
+				assert(utf8.len(text.read(other)), "what was typed after a piece went inside a character")
+				was = now
+			end
+			assert(was == left)
+		end
+	end
+end
+
 -- An editor of a row held for nothing but what this client wrote in another of its columns waits, as for one not held at
 -- all, for the row: what it does is done to the text the row has.
 do
