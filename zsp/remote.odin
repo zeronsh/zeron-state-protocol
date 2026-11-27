@@ -198,6 +198,7 @@ Remote :: struct {
 	next_op:       u32,
 	ops:           map[u32]^Remote_Op,
 	want_pages:    map[Page_No]struct{},
+	asked:         map[Page_No]struct{}, // of those, what a step read first: named, and so in its pack, until fetched
 	want_blocks:   map[u64]struct{},
 	getting_pages: map[u64]u32, // a run's first page -> op
 	getting_blocks: map[u64]u32, // a block -> op
@@ -308,6 +309,7 @@ remote_close :: proc(r: ^Remote) {
 	delete(r.flushing)
 	delete(r.ops)
 	delete(r.want_pages)
+	delete(r.asked)
 	delete(r.want_blocks)
 	delete(r.getting_pages)
 	delete(r.getting_blocks)
@@ -431,6 +433,11 @@ remote_page :: proc(data: rawptr, no: Page_No) -> ^Page {
 	}
 	free(pg)
 	r.want_pages[no] = {}
+	// Read by a step that has read nothing in place of what was not at hand: the page is named, and must be in its pack.
+	// Else what stood in may have named it, and it may be nothing.
+	if s := r.store; s != nil && s.pager.step && !step_doubtful(s) {
+		r.asked[no] = {}
+	}
 	remote_miss(r)
 	return &EMPTY_PAGE
 }
@@ -647,11 +654,13 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 	switch op.kind {
 	case .Get_Pages:
 		first := op.number << PACK_SHIFT | op.off / PAGE_SIZE
-		for i in 0 ..< op.len / PAGE_SIZE / PAGE_RUN {
+		pages := op.len / PAGE_SIZE
+		for i in 0 ..< pages / PAGE_RUN {
 			delete_key(&r.getting_pages, first + i * PAGE_RUN)
 		}
 		if !ok {
-			return // asked for again by whoever still wants it
+			remote_asked(r, first, pages) // asked for again by whoever still wants it
+			return
 		}
 		got := 0
 		for at := 0; at + PAGE_SIZE <= len(bytes); at += PAGE_SIZE {
@@ -683,9 +692,12 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 		}
 		if sound > 0 {
 			remote_keep(r, first, bytes[:sound * PAGE_SIZE])
-		} else if got == 0 && absent && s != nil && !remote_deleted(r, {op.number, true}) {
-			// A page that is named and not there: the store cannot be read. (Of a pack deleted since it was asked for,
-			// it is no longer named: whatever asked for it will ask for something else.)
+		}
+		// A page that is named and not there, in a pack not there at all, or cut short, or damaged: the store cannot be
+		// read, and asking again would only find the same, at once, for ever. (Of a pack deleted since it was asked
+		// for, it is no longer named: whatever asked for it will ask for something else.)
+		missing := remote_asked(r, first, pages) || absent
+		if missing && s != nil && !remote_deleted(r, {op.number, true}) {
 			s.failed = true
 		}
 	case .Get_Log:
@@ -773,6 +785,37 @@ remote_done :: proc(r: ^Remote, id: u32, ok: bool, absent := false, bytes: []byt
 			}
 		}
 	}
+}
+
+// Lets go of what steps asked for of the pages fetched from first on: whether any of it is not at hand now. By whichever
+// is fewer, those asked for or those fetched: seldom more than one is asked for, and a fetch may be hundreds.
+@(private)
+remote_asked :: proc(r: ^Remote, first, pages: u64) -> (missing: bool) {
+	if len(r.asked) == 0 {
+		return
+	}
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	these := make([dynamic]Page_No, context.temp_allocator)
+	if u64(len(r.asked)) < pages {
+		for no in r.asked {
+			if no >= first && no < first + pages {
+				append(&these, no)
+			}
+		}
+	} else {
+		for no in first ..< first + pages {
+			if no in r.asked {
+				append(&these, no)
+			}
+		}
+	}
+	for no in these {
+		delete_key(&r.asked, no)
+		if no not_in r.pages && no not_in r.flushing {
+			missing = true
+		}
+	}
+	return
 }
 
 @(private)

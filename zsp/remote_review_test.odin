@@ -1421,3 +1421,51 @@ review_little_room_small_writes_no_checkpoint :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, x.remote.stats.checkpoints == before, "%d checkpoints for 20 small writes: tail %d, local_from %d, uploaded %d", x.remote.stats.checkpoints - before, store_tail(&x.store), x.remote.local_from, x.remote.uploaded)
 }
+
+// Bug hunt. A pack cut short after its first page, or damaged past it: a page a step reads, named and not there, fails
+// the store, as a pack not there at all does, rather than be asked for again and again, at once each time, for ever.
+@(test)
+review_broken_pack_fails :: proc(t: ^testing.T) {
+	for cut in ([?]bool{true, false}) {
+		x: Remote_Store
+		defer model_host_destroy(&x.host)
+		remote_store_open(t, &x)
+		for store_work(&x.store) {}
+		for i in u64(0) ..< 200 {
+			review_commit(&x.store, {review_cell(i + 1, 1, 10 + i, {byte(i)})})
+		}
+		x.remote.want_checkpoint = true
+		remote_store_settle(t, &x)
+		latest := Remote_Object{x.remote.kept_gen, true}
+		remote_store_close(&x)
+		for kind in Cached {
+			for _, b in x.host.cache[kind] {
+				delete(b)
+			}
+			clear(&x.host.cache[kind])
+		}
+		pack := x.host.objects[latest]
+		testing.expect(t, len(pack) > 2 * PAGE_SIZE)
+		if cut {
+			x.host.objects[latest] = pack[:PAGE_SIZE]
+		} else {
+			slice.fill(pack[PAGE_SIZE:], 0xff)
+		}
+		remote_store_open(t, &x)
+		defer remote_store_close(&x)
+		gets := x.host.class_b
+		for tries := 0; tries < 100 && !x.store.failed; tries += 1 {
+			st := store_begin(&x.store)
+			_ = census(&x.store)
+			missed := store_missed(&x.store, &st)
+			store_end(&x.store, &st, !missed)
+			testing.expect(t, missed, "read what is not there")
+			remote_ops(&x.remote)
+			model_tick(&x.host, &x.remote, 1 << 20)
+			free_all(context.temp_allocator)
+		}
+		gets = x.host.class_b - gets
+		testing.expectf(t, x.store.failed, "a pack %s: not failed, after %d gets", "cut short" if cut else "damaged", gets)
+		testing.expectf(t, gets <= 4, "a pack %s: %d gets", "cut short" if cut else "damaged", gets)
+	}
+}

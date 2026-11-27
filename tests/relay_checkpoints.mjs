@@ -168,3 +168,89 @@ const schema = { body: columns.bytes(16) };
     await end();
   }
 }
+
+// Bug hunt. A pack in R2 cut short, or damaged, wholly or past its first page: what a device then asks for is not in it,
+// and the relay fails as for a pack not there at all, rather than ask R2 for it again and again for ever, at once each
+// time, as R2 answered.
+for (const broken of ["cut short after its first page", "damaged", "damaged past its first page"]) {
+  const tmp = mkdtempSync(join(tmpdir(), "zsp-ckpt-"));
+  try {
+    const spaceId = execFileSync(ZSPD, ["create", tmp], { encoding: "utf8" }).trim();
+    const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
+    const objects = new Map();
+    let breaking = false, gets = 0;
+    const bucket = {
+      async put(key, body) { objects.set(key, new Uint8Array(body).slice()); },
+      async delete(keys) { for (const k of keys) objects.delete(k); },
+      async get(key, { range }) {
+        await new Promise((r) => setTimeout(r, 1));
+        const b = objects.get(key);
+        if (!b) return null;
+        let part = b.slice(range.offset, range.offset + range.length);
+        if (breaking && key.includes("/p/")) {
+          if (++gets > 50) return null; // as though not there, so that it ends
+          if (broken.startsWith("cut short")) {
+            // After its first page, as R2 would answer for it: what there is of a range, and of one past its end, an error.
+            if (range.offset >= 4096) throw new Error("The requested range is not satisfiable");
+            part = part.slice(0, 4096 - range.offset);
+          } else {
+            part = part.map((x, i) => (broken === "damaged" || range.offset + i >= 4096 ? 0xff : x));
+          }
+        }
+        return { arrayBuffer: async () => part.buffer };
+      },
+    };
+    const sockets = new Set(), servers = [];
+    const env = { RELAY_SECRET: relaySecret, STORE: bucket, PAGES_KEPT: "0", CACHE_BYTES: "0", QUIET_MS: "20", QUIET_TAIL: "1", STATS: "1" };
+    const ctx = { storage: { sql: new Sql(), sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+    const doSpace = new Space(ctx, env);
+    class BridgeWS {
+      static OPEN = 1; static CLOSED = 3;
+      constructor(url) {
+        this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
+        const turned = doSpace.fetch(new Request(url.replace(/^ws/, "http"))).status !== 200; // 101, as mocked
+        if (turned) return void queueMicrotask(() => { this.readyState = 3; this._emit("close", { code: 1006, reason: "" }); });
+        const { server, pair } = nextPair; this._s = server; servers.push(server);
+        pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
+        pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
+        queueMicrotask(() => { this.readyState = 1; this._emit("open", {}); });
+      }
+      _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
+      addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
+      send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
+      close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+    }
+    const mod = await loadModule();
+    const vol = new MemoryVolume();
+    const st = await Store.open(vol, 16 << 20);
+    st.keep("device", readFileSync(join(tmp, "device.key")));
+    await st.close();
+    const writer = await Node.open({ volume: vol, module: mod, WebSocket: BridgeWS, log: () => {} });
+    const reader = await Node.open({ volume: new MemoryVolume(), module: mod, WebSocket: BridgeWS, log: () => {}, full: false }); // asks of the trees
+    execFileSync(ZSPD, ["relay", tmp, relayPub, "ws://relay.local"]);
+    execFileSync(ZSPD, ["admit", tmp, reader.key, "1"]);
+    const roster = readFileSync(join(tmp, spaceId, "roster"));
+    const table = { k: columns.string(16) };
+    assert(writer.adopt(roster));
+    const a = new Client({ connect: writer.connect.bind(writer) });
+    for (let i = 0; i < 100 && !a.ready; i++) await new Promise((r) => setTimeout(r, 10));
+    await a.write(1, (ch) => { for (let i = 1; i <= 300; i++) ch.insert(table, "items", i, { k: `row ${i} ${"x".repeat(200)}` }); }); // pages of it
+    const packed = () => [...objects].some(([k, v]) => k.includes("/p/") && v.length > 16 * 4096); // the rows, checkpointed
+    for (let i = 0; i < 200 && !packed(); i++) await new Promise((r) => setTimeout(r, 25));
+    assert(packed(), "no pack of the rows was put");
+    a.close();
+    await writer.close(); // so that nobody who can read is there to answer, and the relay answers from its trees
+    await doSpace.fetch(new Request(`http://relay.local/${spaceId}?evict=empty`)); // read from R2
+    breaking = true;
+    assert(reader.adopt(roster));
+    const b = new Client({ connect: reader.connect.bind(reader) });
+    const list = b.window({ scope: 1, list: "items", table, size: 10 }, () => {});
+    for (let i = 0; i < 200 && gets <= 50 && !servers.some((w) => w.closed?.code === 1011); i++) await new Promise((r) => setTimeout(r, 10));
+    const asked = gets;
+    list.stop(); b.close();
+    await reader.close();
+    assert.ok(asked <= 4, `a pack ${broken}: asked for ${asked} times`);
+    assert.ok(servers.some((w) => w.closed?.code === 1011), `a pack ${broken}: the relay did not fail`);
+    console.log(`ok   a relay with a pack ${broken} fails, asking for it ${asked} time(s)`);
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+}
