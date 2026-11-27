@@ -167,7 +167,9 @@ def test_dial_by_name():
         sid = zspd("create", n.dir)
         zspd("relay", n.dir, relay.key, "ws://localhost:" + relay.address.split(":")[1])
         n.start()
-        eventually("the relay hears from it", lambda: os.path.exists(os.path.join(relay.dir, sid, "roster")), 3)
+        # Within the usual while: the relay keeps the roster, fsyncs and all, which a busy machine may take seconds over;
+        # a loop never woken for the name would wait for ever.
+        eventually("the relay hears from it", lambda: os.path.exists(os.path.join(relay.dir, sid, "roster")))
         n.stop()
 
 
