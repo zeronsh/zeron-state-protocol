@@ -31,6 +31,8 @@ export interface Datagrams {
   /** Every packet that comes, from an address as 16 bytes, IPv4 mapped, and a port. */
   listen(receive: (ip: Uint8Array, port: number, data: Uint8Array) => void): void;
   send(ip: Uint8Array, port: number, data: Uint8Array): void;
+  /** The same to everyone on a network, by a socket that may broadcast, which `send`'s should not: `send` if not said. */
+  announce?(ip: Uint8Array, port: number, data: Uint8Array): void;
   /** This machine's addresses, each with its network's broadcast address if it is IPv4. */
   interfaces(): { ip: Uint8Array; broadcast?: Uint8Array }[];
   close(): void;
@@ -652,6 +654,11 @@ export class Node {
         else if (c?.kind === "client" && c.open) (c.open = false), this.#deliveries.push([c, new Uint8Array(0)]);
       },
       udp_send: (ip: number, port: number, ptr: number, len: number) => guard(() => this.#options.datagrams?.send(view(ip, 16).slice(), port, view(ptr, len).slice()), undefined),
+      udp_announce: (ip: number, port: number, ptr: number, len: number) =>
+        guard(() => {
+          const d = this.#options.datagrams;
+          (d?.announce ?? d?.send)?.call(d, view(ip, 16).slice(), port, view(ptr, len).slice());
+        }, undefined),
       udp_interfaces: (into: number, most: number) => {
         const list = (this.#options.datagrams?.interfaces() ?? []).slice(0, most);
         const b = view(into, 20 * list.length);

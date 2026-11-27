@@ -516,7 +516,11 @@ of urgency 3 or below. A sender should serve streams most urgent first, and with
 had lately nothing to send. Out-of-order data, held, is bounded by these windows.
 
 The device with the lesser key dials. Devices that share a relay swap candidate addresses, 18 bytes each (IPv6 or mapped IPv4, then port, big-endian), in signals of kind 0, and
-both send to all of the other's at once. On a local network a device broadcasts from its link socket, at start and a few times soon after, to UDP port 9083, and a device that hears it and should be dialled answers that socket with the same: 0x44 ‖ salt (8) ‖
+both send to all of the other's at once. A device sends nothing to, and answers nothing from, an address that is not one peer's: port 0, 0/8, 224/4 and
+above, IPv6's groups (ff00::/8), its link- and site-local addresses (fe80::/10, fec0::/10), whose link or site 18 bytes cannot name, and ::/96 but ::1; and
+its link socket may not broadcast, so that no address a member names, as its network's own broadcast address, reaches everyone on it. On a local network a
+device broadcasts by a socket of its own instead, at start and a few times soon after, to UDP port 9083, and a device that hears it and should be dialled
+answers with the same at the link port the beacon names, at the address it came from: 0x44 ‖ salt (8) ‖
 XChaCha20-Poly1305 under derive(space, "zsp-beacon"), nonce 0 (8) ‖ salt ‖ 0 ‖ 0x42 ‖ 0 (6), of device (32) ‖ link port (2, big-endian), no associated data. A beacon is bound to no time, so anyone may say an old one
 again: a device that hears one from a device it has a link to asks after the link, and only if nothing comes back on it for a
 few seconds (3, here) does it act as though it had no link, the dialler knocking where the beacon says and the other answering it in kind;

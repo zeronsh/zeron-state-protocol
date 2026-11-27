@@ -16,6 +16,8 @@ foreign import host "host"
 foreign host {
 	// A packet to an address: 16 bytes of IPv6, IPv4 mapped, and a port.
 	udp_send :: proc(ip: [^]byte, port: u32, ptr: [^]byte, len: int) ---
+	// The same to everyone on a network, by what may broadcast, which what udp_send sends by may not.
+	udp_announce :: proc(ip: [^]byte, port: u32, ptr: [^]byte, len: int) ---
 	// This machine's addresses: for each, 16 bytes of it and 4 of its network's broadcast address, zero for none. Returns how many.
 	udp_interfaces :: proc(into: [^]byte, most: int) -> int ---
 }
@@ -92,7 +94,9 @@ links_open :: proc "c" (port: int, size: int) {
 		a: pipe.Address
 		copy(a.ip[:], message[:16])
 		a.port = u16(message[16]) << 8 | u16(message[17])
-		udp.stun = a
+		if pipe.address_usable(a) {
+			udp.stun = a
+		}
 	}
 	node.host.signal = links_signalled
 	node.host.presence = proc(_: rawptr, online: []zsp.Key32) {
@@ -125,6 +129,9 @@ packet :: proc "c" (size: int) {
 
 @(private)
 udp_input :: proc(packet: []byte, from: pipe.Address) {
+	if !pipe.address_usable(from) {
+		return // from nowhere a packet could be sent back to, as port 0, or everyone: answered by nothing, nor believed
+	}
 	if pipe.is_stun(packet) {
 		reply: [pipe.STUN_REPLY]byte
 		if out := pipe.stun_answer(packet, from, reply[:]); out != nil {
@@ -458,11 +465,15 @@ beacon_send :: proc(to: Maybe(pipe.Address) = nil) {
 		send_to(packet, a)
 		return
 	}
-	send_to(packet, pipe.address_v4(255, 255, 255, 255, BEACON_PORT))
+	say :: proc(packet: []byte, to: pipe.Address) {
+		to := to
+		udp_announce(&to.ip[0], u32(to.port), raw_data(packet), len(packet))
+	}
+	say(packet, pipe.address_v4(255, 255, 255, 255, BEACON_PORT))
 	// And on interfaces that are not the default one.
 	for i in interfaces() {
 		if all, ok := i.broadcast.?; ok {
-			send_to(packet, all)
+			say(packet, all)
 		}
 	}
 }
@@ -491,7 +502,7 @@ beacon_heard :: proc(packet: []byte, from: pipe.Address) {
 		}
 		if !peer_dials(p) && (new || time.tick_since(p.heard) >= ANNOUNCE_AFTER / 2) {
 			p.heard = time.tick_now()
-			beacon_send(from)
+			beacon_send(at)
 		}
 		return
 	}
@@ -499,7 +510,7 @@ beacon_heard :: proc(packet: []byte, from: pipe.Address) {
 	clear(&p.candidates)
 	append(&p.candidates, at)
 	if !peer_dials(p) {
-		beacon_send(from) // so that it knows to; its own socket, for others may share the port
+		beacon_send(at) // so that it knows to: where it says it is, its own socket, for others may share the port it says from
 	}
 	peer_knock(p)
 }

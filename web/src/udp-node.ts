@@ -70,16 +70,23 @@ export async function nodeDatagrams(options: UdpOptions = {}): Promise<Datagrams
     v4.close();
     throw new Error("could not bind a UDP port");
   }
-  v4.setBroadcast(true);
   v4.on("message", hear);
   const port = v4.address().port;
   // Where one socket covers both families this bind fails, harmlessly.
   let v6: Socket | undefined = createSocket({ type: "udp6", ipv6Only: true });
   if (await bind(v6, port)) v6.on("message", hear);
   else v6.close(), (v6 = undefined);
+  // Beacons go out by a socket of their own, the only one that may broadcast: so that nothing sent where a peer says
+  // reaches everyone on a network, as its own broadcast address would, which only the system knows to refuse. It hears
+  // those nearby, at BEACON_PORT, which others here share; or where it cannot, it has a port of its own, and only says.
   let beacon: Socket | undefined = createSocket({ type: "udp4", reuseAddr: true });
-  if (await bind(beacon, BEACON_PORT)) beacon.on("message", hear);
-  else beacon.close(), (beacon = undefined);
+  if (!(await bind(beacon, BEACON_PORT))) {
+    beacon.close();
+    beacon = createSocket({ type: "udp4" });
+    if (!(await bind(beacon, 0))) beacon.close(), (beacon = undefined);
+  }
+  beacon?.setBroadcast(true);
+  beacon?.on("message", hear);
   let stun: { ip: Uint8Array; port: number } | undefined;
   if (stunAt) {
     try {
@@ -103,6 +110,13 @@ export async function nodeDatagrams(options: UdpOptions = {}): Promise<Datagrams
         s?.send(data, to, address, () => {}); // an unreachable peer is the link's to notice
       } catch {
         // as unreachable
+      }
+    },
+    announce: (ip, to, data) => {
+      try {
+        beacon?.send(data, to, stringOf(ip).address, () => {});
+      } catch {
+        // as lost
       }
     },
     interfaces: () => {

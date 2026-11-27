@@ -240,7 +240,9 @@ tls_writes_nothing_before_open :: proc(t: ^testing.T) {
 	testing.expectf(t, len(w) == hello && tls.send.n == 0, "%d bytes written in state %v", len(w) - hello, tls.state)
 }
 
-// An address packets can go to as to one peer: never port 0, nor nobody, nor a group, nor everyone.
+// An address packets can go to as to one peer: never port 0, nor nobody, nor a group, nor everyone; nor an IPv6 address
+// that is one only on a link or site these bytes do not name, nor IPv4 in IPv6's deprecated form. An IPv4 link-local
+// one is, as two machines on a cable have.
 @(test)
 addresses_usable :: proc(t: ^testing.T) {
 	v6: Address
@@ -250,10 +252,16 @@ addresses_usable :: proc(t: ^testing.T) {
 	group.ip[0] = 0xff
 	nobody: Address
 	nobody.port = 9
-	for a, i in ([]Address{address_v4(192, 168, 1, 2, 9), address_v4(127, 0, 0, 1, 1), v6}) {
+	this_machine := Address{ip = {15 = 1}, port = 9}
+	link, site, below := v6, v6, v6
+	link.ip[0], link.ip[1] = 0xfe, 0x80
+	site.ip[0], site.ip[1] = 0xfe, 0xc0
+	below.ip[0], below.ip[1] = 0xfe, 0x7f // fe00::/9, which is neither
+	compatible := Address{ip = {12 = 192, 13 = 168, 14 = 1, 15 = 2}, port = 9}
+	for a, i in ([]Address{address_v4(192, 168, 1, 2, 9), address_v4(127, 0, 0, 1, 1), v6, this_machine, address_v4(169, 254, 3, 4, 9), below}) {
 		testing.expectf(t, address_usable(a), "%d: %v refused", i, a)
 	}
-	for a, i in ([]Address{address_v4(192, 168, 1, 2, 0), address_v4(0, 0, 0, 0, 9), address_v4(255, 255, 255, 255, 9), address_v4(224, 0, 0, 1, 9), group, nobody}) {
+	for a, i in ([]Address{address_v4(192, 168, 1, 2, 0), address_v4(0, 0, 0, 0, 9), address_v4(255, 255, 255, 255, 9), address_v4(224, 0, 0, 1, 9), group, nobody, link, site, compatible}) {
 		testing.expectf(t, !address_usable(a), "%d: %v taken", i, a)
 	}
 }

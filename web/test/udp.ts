@@ -25,5 +25,20 @@ loopback[10] = loopback[11] = 0xff;
 loopback.set([127, 0, 0, 1], 12);
 udp.send(loopback, udp.port, Uint8Array.of(1, 2, 3));
 assert.deepEqual([...(await heard)], [1, 2, 3]);
+
+// What goes to a peer goes by a socket that may not broadcast, so that no address a member names, as its network's own
+// broadcast address, reaches everyone on it; beacons go by one that may. Where the loopback network has one: Linux's.
+if (process.platform === "linux") {
+  const everyone = create("udp4");
+  await new Promise<void>((done) => everyone.bind(0, "0.0.0.0", done));
+  const got: string[] = [];
+  everyone.on("message", (m) => got.push(String(m)));
+  const all = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 255, 255, 255);
+  udp.send(all, everyone.address().port, new TextEncoder().encode("as to a peer"));
+  udp.announce!(all, everyone.address().port, new TextEncoder().encode("to everyone"));
+  await new Promise((done) => setTimeout(done, 300));
+  assert.deepEqual(got, ["to everyone"]);
+  everyone.close();
+}
 udp.close();
 console.log("ok");

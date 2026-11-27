@@ -88,7 +88,6 @@ udp_open :: proc(h: ^Host, port: int) -> bool {
 		return false
 	}
 	net.set_blocking(u.socket, false)
-	net.set_option(u.socket, .Broadcast, true)
 	net.set_option(u.socket, .Receive_Buffer_Size, i32(1 << 20))
 	if at, e := net.bound_endpoint(u.socket); e == nil {
 		u.port = at.port
@@ -105,24 +104,37 @@ udp_open :: proc(h: ^Host, port: int) -> bool {
 		}
 	}
 	if !h.relay {
+		// Beacons go out by a socket of their own, the only one that may broadcast: so that nothing sent where a peer
+		// says, as to a member's candidates, reaches everyone on a network, as its own broadcast address would (as
+		// 192.168.1.255, or 127.255.255.255), which only the system knows to refuse. It hears those nearby, at
+		// BEACON_PORT, which others on this machine share; or where it cannot, it has a port of its own, and only says.
 		if u.beacon, err = nbio.create_udp_socket(.IP4); err == nil {
 			net.set_option(u.beacon, .Reuse_Address, true)
 			port_share(u.beacon)
-			if berr := net.bind(u.beacon, {net.IP4_Any, BEACON_PORT}); berr == nil {
-				net.set_blocking(u.beacon, false)
-				u.have_beacon = true
-				udp_listen(h, u.beacon)
-			} else {
+			if berr := net.bind(u.beacon, {net.IP4_Any, BEACON_PORT}); berr != nil {
 				report(.Debug, "cannot listen for those nearby: ", fmt.tprint(berr))
 				net.close(u.beacon)
+				if u.beacon, err = nbio.create_udp_socket(.IP4); err == nil && net.bind(u.beacon, {net.IP4_Any, 0}) != nil {
+					net.close(u.beacon)
+					err = .Insufficient_Resources
+				}
+			}
+			if err == nil {
+				net.set_blocking(u.beacon, false)
+				net.set_option(u.beacon, .Broadcast, true)
+				u.have_beacon = true
+				udp_listen(h, u.beacon) // and what comes to it is heard as any packet is
 			}
 		}
 	}
 	u.open = true
 	if h.stun != "" {
 		// Resolved once, up front; a host without a name server still has its local addresses.
-		if ep4, _, rerr := net.resolve(h.stun); rerr == nil {
-			u.stun, u.have_stun = ep4, ep4.address != nil
+		if ep4, _, rerr := net.resolve(h.stun); rerr == nil && ep4.address != nil {
+			u.stun, u.have_stun = ep4, pipe.address_usable(address_from(ep4))
+			if !u.have_stun {
+				report(.Warning, "the STUN server's address is no one to ask: ", net.endpoint_to_string(ep4, context.temp_allocator))
+			}
 		}
 	}
 	return true
@@ -201,8 +213,8 @@ udp_send :: proc(h: ^Host, packet: []byte, to: pipe.Address) {
 @(private)
 udp_input :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 	u := &h.udp
-	if len(packet) == 0 {
-		return
+	if len(packet) == 0 || !pipe.address_usable(from) {
+		return // from nowhere a packet could be sent back to, as port 0, or everyone: answered by nothing, nor believed
 	}
 	if pipe.is_stun(packet) {
 		reply: [pipe.STUN_REPLY]byte
@@ -607,8 +619,11 @@ beacon_send :: proc(s: ^Space, to: Maybe(pipe.Address) = nil) {
 		udp_send(s.host, packet, a)
 		return
 	}
+	if !u.have_beacon {
+		return
+	}
 	say :: proc(u: ^Udp, packet: []byte, at: net.IP4_Address) {
-		_, err := net.send_udp(u.socket, packet, {at, BEACON_PORT})
+		_, err := net.send_udp(u.beacon, packet, {at, BEACON_PORT})
 		if err != nil {
 			report(.Debug, "cannot announce to ", net.address_to_string(at, context.temp_allocator), ": ", fmt.tprint(err))
 		}
@@ -651,7 +666,7 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 			}
 			if !peer_dials(p) && (new || time.tick_since(p.heard) >= ANNOUNCE_AFTER / 2) {
 				p.heard = time.tick_now()
-				beacon_send(s, from)
+				beacon_send(s, at)
 			}
 			return
 		}
@@ -659,7 +674,7 @@ beacon_heard :: proc(h: ^Host, packet: []byte, from: pipe.Address) {
 		clear(&p.candidates)
 		append(&p.candidates, at)
 		if !peer_dials(p) {
-			beacon_send(s, from) // so that it knows to; its own socket, for others may share the port
+			beacon_send(s, at) // so that it knows to: where it says it is, its own socket, for others may share the port it says from
 		}
 		peer_knock(p)
 		return

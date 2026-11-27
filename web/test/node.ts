@@ -895,6 +895,65 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   }
 }
 
+// What a node sends is only ever where one peer could be. A beacon is answered where it says its device is, from the
+// address it came from, not at that address's port, which may be anyone's, as the shared port beacons are said from
+// is; nothing from port 0 or nobody is answered at all, a beacon nor a request for this machine's outside address; and
+// beacons go to everyone only by what may broadcast, never by what packets for peers go by.
+{
+  const owner = join(TMP, "answers-owner");
+  const space = execFileSync(BIN, ["create", owner], { encoding: "utf8" }).trim();
+  const loopback = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1);
+  const nobody = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0);
+  type Sent = { ip: number[]; to: number; type: number; data: Uint8Array; announced: boolean };
+  const sent = new Map<number, Sent[]>();
+  const hear = new Map<number, (ip: Uint8Array, port: number, data: Uint8Array) => void>();
+  const datagrams = (port: number) => {
+    sent.set(port, []);
+    const put = (announced: boolean) => (ip: Uint8Array, to: number, data: Uint8Array) =>
+      sent.get(port)!.push({ ip: [...ip.subarray(12)], to, type: data[0], data: data.slice(), announced });
+    return {
+      port,
+      interfaces: () => [{ ip: loopback, broadcast: Uint8Array.of(127, 255, 255, 255) }],
+      send: put(false),
+      announce: put(true),
+      listen: (receive: (ip: Uint8Array, port: number, data: Uint8Array) => void) => void hear.set(port, receive),
+      close: () => void hear.delete(port),
+    };
+  };
+  const a = await Node.open({ volume: new MemoryVolume(), module, datagrams: datagrams(40001), log: () => {} });
+  const b = await Node.open({ volume: new MemoryVolume(), module, datagrams: datagrams(40002), log: () => {} });
+  execFileSync(BIN, ["admit", owner, a.key, "1"]);
+  execFileSync(BIN, ["admit", owner, b.key, "1"]);
+  const roster = readFileSync(join(owner, space, "roster"));
+  assert(a.adopt(roster) && b.adopt(roster));
+  // The one with the lesser key dials; the other answers a beacon with its own, so that the first knows to.
+  const [sayerPort, answererPort] = a.id < b.id ? [40001, 40002] : [40002, 40001];
+  const wait = (ms: number) => new Promise((done) => setTimeout(done, ms));
+  for (let i = 0; i < 200 && !sent.get(sayerPort)!.some((p) => p.type === 0x44); i++) await wait(10);
+  const beacon = sent.get(sayerPort)!.find((p) => p.type === 0x44);
+  assert(beacon, "no beacon was said");
+  const all = [...sent.values()].flat();
+  assert(all.every((p) => p.announced === (p.ip.join() === "255,255,255,255" || p.ip.join() === "127,255,255,255")), "a broadcast sent as to a peer, or the other way");
+  const out = sent.get(answererPort)!;
+  const answer = hear.get(answererPort)!;
+  out.length = 0;
+  answer(loopback, 50000, beacon.data); // from a port that may be anyone's, saying it is at sayerPort
+  answer(loopback, 0, beacon.data);
+  await wait(300);
+  assert(!out.some((p) => p.to === 50000 || p.to === 0), `answered where a beacon came from, not where it said: ${out.map((p) => p.to)}`);
+  assert(out.some((p) => p.to === sayerPort && p.type === 0x44), "a beacon went unanswered");
+  const ask = new Uint8Array(20);
+  ask[1] = 1;
+  ask.set([0x21, 0x12, 0xa4, 0x42], 4);
+  out.length = 0;
+  answer(nobody, 0, ask);
+  answer(nobody, 50001, ask);
+  answer(loopback, 50002, ask);
+  await wait(100);
+  assert.deepEqual(out.filter((p) => p.type === 1).map((p) => p.to), [50002], "asked from nowhere, and answered there");
+  await Promise.all([a.close(), b.close()]);
+}
+
 // Where a relay keeps a space, a proxy's query staying at the end.
 assert.equal(spaceUrl("wss://relay.example/", "ab"), "wss://relay.example/ab");
 assert.equal(spaceUrl("wss://relay.example/zsp?key=1", "ab"), "wss://relay.example/zsp/ab?key=1");

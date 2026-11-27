@@ -19,27 +19,40 @@ address_v4 :: proc(a, b, c, d: byte, port: u16) -> Address {
 	return {{10 = 0xff, 11 = 0xff, 12 = a, 13 = b, 14 = c, 15 = d}, port}
 }
 
-// Whether packets can be sent to an address as to one peer: a port, and one host, not none, nor every one, nor a group.
+// Whether packets can be sent to an address as to one peer: a port, and one host, not none, nor every one, nor a group;
+// and one these 18 bytes say all of. Not then an IPv6 address of a link's (fe80::/10) or a site's (fec0::/10, long
+// deprecated), which is that only with the link or site named, which they cannot be, and which no device offers.
+// IPv4's link-local addresses (169.254/16) are a link's too, but need none named: they are all two machines on one cable
+// without DHCP have, and are offered. A network's own broadcast address (as 192.168.1.255), which only its network
+// knows, is refused by the socket links send by, which may not broadcast: see udp_open.
 @(require_results)
 address_usable :: proc(a: Address) -> bool {
 	if a.port == 0 {
 		return false
 	}
-	if address_is_v4(a) {
-		// 0/8 is this network, 224/4 groups, 240/4 reserved and its last address everyone.
-		return a.ip[12] != 0 && a.ip[12] < 224
+	// As two words, big-endian: asked of every packet that comes.
+	a := a
+	hi := endian.unchecked_get_u64be(a.ip[:8])
+	lo := endian.unchecked_get_u64be(a.ip[8:])
+	switch {
+	case hi == 0 && lo >> 32 == 0xffff:
+		// IPv4. 0/8 is this network, 224/4 groups, 240/4 reserved and its last address everyone.
+		first := byte(lo >> 24)
+		return first != 0 && first < 224
+	case hi >> 56 == 0xff:
+		return false // ff00::/8, groups
+	case hi >> 55 == 0xfe << 1 | 1:
+		return false // fe80::/10 and fec0::/10
+	case hi == 0 && lo >> 32 == 0:
+		return lo == 1 // of ::/96, only this machine: not nobody, nor IPv4 in the form deprecated long ago
 	}
-	return a.ip != {} && a.ip[0] != 0xff // nobody; and ff00::/8, groups
+	return true
 }
 
 @(require_results)
 address_is_v4 :: proc(a: Address) -> bool {
-	for b, i in a.ip {
-		if i < 10 && b != 0 {
-			return false
-		}
-	}
-	return a.ip[10] == 0xff && a.ip[11] == 0xff
+	a := a
+	return endian.unchecked_get_u64be(a.ip[:8]) == 0 && endian.unchecked_get_u32be(a.ip[8:]) == 0xffff
 }
 
 stun_request :: proc() -> (packet: [STUN_REQUEST]byte) {
