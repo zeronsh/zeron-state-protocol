@@ -658,7 +658,7 @@ def test_durable_object():
 def test_busy_node_takes_change():
     """A change made beside a running node that is slow to answer is held out to it until it says it has it."""
     d = Node("busy").dir
-    zspd("create", d)
+    sid = zspd("create", d)
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(4)
@@ -695,6 +695,10 @@ def test_busy_node_takes_change():
                 got += conn.recv(4096)
             heard.append(got)
             time.sleep(3)
+            for kind, body in frames(got):
+                if kind == 2:  # kept, as a node keeps a roster it takes before it answers
+                    with open(os.path.join(d, sid, "roster"), "wb") as f:
+                        f.write(body)
             conn.setblocking(False)
             try:
                 hung_up.append(conn.recv(1, socket.MSG_PEEK) == b"")
@@ -704,13 +708,6 @@ def test_busy_node_takes_change():
             answer = bytes([9, 2]) + (1).to_bytes(8, "big")
             conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" + bytes([0x82, len(answer)]) + answer)
             conn.close()
-
-    t = Thread(target=busy, daemon=True)
-    t.start()
-    p = subprocess.run([BIN, "scope", d], capture_output=True, text=True, timeout=60)
-    server.close()
-    assert p.returncode == 0, p.stderr
-    assert len(hung_up) == 2 and not any(hung_up), hung_up  # asked its clock, then handed the change, waiting each time
 
     def frames(said):
         # The client's one WebSocket message, unmasked, as the protocol's frames: each a varint length, then its kind.
@@ -722,7 +719,7 @@ def test_busy_node_takes_change():
             n, at = int.from_bytes(data[2:10], "big"), 10
         mask, at = data[at : at + 4], at + 4
         body = bytes(b ^ mask[i % 4] for i, b in enumerate(data[at : at + n]))
-        kinds, r = [], 0
+        said, r = [], 0
         while r < len(body):
             size, shift = 0, 0
             while True:
@@ -732,11 +729,45 @@ def test_busy_node_takes_change():
                 shift += 7
                 if byte < 128:
                     break
-            kinds.append(body[r])
+            said.append((body[r], body[r + 1 : r + size]))
             r += size
-        return kinds
+        return said
 
-    assert frames(heard[0]) == [1] and frames(heard[1]) == [1, 2], [frames(h) for h in heard]  # a greeting; then with the roster
+    t = Thread(target=busy, daemon=True)
+    t.start()
+    p = subprocess.run([BIN, "scope", d], capture_output=True, text=True, timeout=60)
+    server.close()
+    assert p.returncode == 0, p.stderr
+    assert len(hung_up) == 2 and not any(hung_up), hung_up  # asked its clock, then handed the change, waiting each time
+    kinds = [[kind for kind, _ in frames(h)] for h in heard]
+    assert kinds == [[1], [1, 2]], kinds  # a greeting; then with the roster
+
+
+def test_roster_kept_beside_a_running_node():
+    """A change made beside a running node is kept by it, and the roster it follows as roster.old; one that it will not
+    take, drawn up from a roster older than the node's, is neither kept in place of the node's nor said to be made."""
+    n = Node("beside", "run", "--no-udp")
+    sid = zspd("create", n.dir)
+    kept = lambda name: open(os.path.join(n.dir, sid, name), "rb").read()
+    first = kept("roster")
+    n.start()
+    zspd("scope", n.dir)
+    second = kept("roster")
+    assert second != first and kept("roster.old") == first
+    zspd("scope", n.dir)
+    assert kept("roster.old") == second
+    zspd("scope", n.dir)
+    # As another admin command drawn up from what was kept two changes ago would be: it has a scope fewer than the node's.
+    with open(os.path.join(n.dir, sid, "roster"), "wb") as f:
+        f.write(second)
+    p = subprocess.run([BIN, "scope", n.dir], capture_output=True, text=True)
+    assert p.returncode != 0 and "would not take it" in p.stderr, (p.returncode, p.stderr)
+    assert kept("roster") == second, "a roster the node would not take was kept"
+    # And with no node running, it is kept here, for the node to read when it starts.
+    n.stop()
+    os.remove(os.path.join(n.dir, "address"))
+    zspd("scope", n.dir)
+    assert kept("roster.old") == second and kept("roster") != second
 
 
 def test_relay_full():

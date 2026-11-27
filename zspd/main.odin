@@ -340,21 +340,45 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 		say(os.stderr, "that would make an unsound roster: only signed scopes may have readers who do not write\n")
 		return false
 	}
-	host.save(in_dir(in_dir(dir, name), "roster.old"), data) or_return
-	host.save(path, bytes) or_return
-	return announce(dir, bytes)
+	// A node running here keeps what it takes, and the roster it follows, itself: kept here first, roster.old would be
+	// this one by the time the node kept it, and one the node would not take would be kept in place of the one it has.
+	answered, reached := announce(dir, bytes)
+	space_dir := in_dir(dir, name)
+	switch {
+	case !reached:
+		return host.roster_keep(space_dir, space, bytes) // for the node to read when it starts
+	case taken(space_dir, bytes):
+		return true
+	case answered:
+		say(os.stderr, "the node running here would not take it: it has a later roster, or one this does not follow from; nothing was changed\n")
+		return false
+	}
+	host.roster_keep(space_dir, space, bytes)
+	say(os.stderr, "the node running here did not say it has the change: it takes it when it next starts\n")
+	return false
 }
 
-// Hands a roster to the node running here, if one is, so that the change takes effect at once. One that is there but
-// does not say it has it, as a busy one may not at once, is asked again; and if it never does, that is said.
-announce :: proc(dir: string, roster: []byte) -> bool {
+// Hands a roster to the node running here, if one is, so that the change takes effect at once: whether it answered,
+// having read it, and whether there was one. One that is there but does not answer, as a busy one may not at once, is
+// asked again.
+announce :: proc(dir: string, roster: []byte) -> (answered, reached: bool) {
 	for _ in 0 ..< 3 {
-		_, confirmed, reached := speak(dir, roster)
-		if confirmed || !reached {
-			return true // taken; or no node runs here, and it reads the roster when it starts
+		_, answered, reached = speak(dir, roster)
+		if answered || !reached {
+			return
 		}
 	}
-	say(os.stderr, "the node running here did not say it has the change: it takes it when it next starts\n")
+	return
+}
+
+// Whether the node running here has taken a roster, as what it keeps says: it keeps one before it answers whoever handed
+// it over. The one before what it keeps, if another came at once after.
+taken :: proc(space_dir: string, roster: []byte) -> bool {
+	for name in ([]string{"roster", "roster.old"}) {
+		if kept, err := os.read_entire_file(in_dir(space_dir, name), context.temp_allocator); err == nil && string(kept) == string(roster) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -365,7 +389,8 @@ running_clock :: proc(dir: string) -> u64 {
 }
 
 // Greets the node running here, with a roster if there is one to hand over, and hears what it says back: its clock,
-// whether it said it, and whether anything was there to speak to.
+// whether it said it, and whether anything was there to speak to. It answers once it has read all that was said, and so
+// once it has taken the roster or not: not that it has taken it.
 speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool, reached: bool) {
 	address, aerr := os.read_entire_file(in_dir(dir, "address"), context.temp_allocator)
 	token, terr := os.read_entire_file(in_dir(dir, "token"), context.temp_allocator)

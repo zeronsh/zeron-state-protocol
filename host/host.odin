@@ -167,10 +167,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		roster       = proc(data: rawptr, bytes: []byte) {
 			s := (^Space)(data)
 			file_disk_make(&s.disk)
-			if old, err := os.read_entire_file(file_in(s.dir, "roster"), context.temp_allocator); err == nil {
-				save(file_in(s.dir, "roster.old"), old)
-			}
-			save(file_in(s.dir, "roster"), bytes)
+			roster_keep(s.dir, s.node.space, bytes)
 			if serial, ok := zsp.roster_claims(bytes, s.node.space); ok && debugging() {
 				report(.Debug, "roster ", fmt.tprintf("%x", serial), " taken and kept")
 			}
@@ -192,6 +189,21 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 	}
 	append(&h.spaces, s)
 	return s
+}
+
+// Keeps a space's roster in its directory, and the one it follows as roster.old, unless what is kept there is it already,
+// or later: as when whoever handed it over kept it first, or a later one is on its way to the node. Never the other way,
+// which would make roster.old the newer, or keep one older than is had. Whether the roster kept is this one.
+roster_keep :: proc(dir: string, space: zsp.Key32, bytes: []byte) -> bool {
+	serial := zsp.roster_claims(bytes, space) or_return
+	path := file_in(dir, "roster")
+	if old, err := os.read_entire_file(path, context.temp_allocator); err == nil {
+		if kept, ok := zsp.roster_claims(old, space); ok && kept >= serial {
+			return string(old) == string(bytes)
+		}
+		save(file_in(dir, "roster.old"), old) or_return
+	}
+	return save(path, bytes)
 }
 
 @(private)
