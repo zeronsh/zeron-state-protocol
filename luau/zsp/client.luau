@@ -2479,9 +2479,10 @@ function Client.call(self: Client, device: string, scope: number, method: string
 	local live = self:_call(id, 0, device, method)
 	if not self.ready or #data > CALL_WINDOW then
 		self.calls[id] = nil
+		local fault = if self.ready then "overrun" else "unreachable" -- as things are now, not when it is told
 		self.host.defer(function()
 			if live.call.on_fault then
-				live.call.on_fault(if self.ready then "overrun" else "unreachable")
+				live.call.on_fault(fault)
 			end
 		end)
 		return live.call

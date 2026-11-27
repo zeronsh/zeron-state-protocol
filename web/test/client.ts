@@ -881,6 +881,18 @@ for (const code of [2, 3]) {
   assert.equal(h.self.connects, 1, "and it was dialled again");
 }
 
+// A call made before the node has said what this client may do cannot be made, and is told so as it was when it was
+// made, though the node says it before the call is told.
+{
+  const h = harness();
+  h.run();
+  const call = h.client.call(codec.hex(rep("d", 32)), 1, "m", "");
+  let fault = "";
+  call.onfault = (f) => (fault = f);
+  h.greet();
+  assert.equal(fault, "unreachable");
+}
+
 // What is sent for an answer waits for it, and what another answer shows outlives the one that stops.
 {
   const h = harness();

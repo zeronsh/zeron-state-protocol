@@ -725,6 +725,20 @@ do
 	end
 end
 
+-- A call made before the node has said what this client may do cannot be made, and is told so as it was when it was
+-- made, though the node says it before the call is told.
+do
+	local h = harness()
+	h.run()
+	local call = h.client:call(string.rep("d", 32), 1, "m", "")
+	local fault = ""
+	call.on_fault = function(f)
+		fault = f
+	end
+	h.greet()
+	assert(fault == "unreachable", `told {fault}`)
+end
+
 -- What is sent for an answer waits for it, and what another answer shows outlives the one that stops.
 do
 	local ASK, UNASK, ANSWER = 32, 33, 34
