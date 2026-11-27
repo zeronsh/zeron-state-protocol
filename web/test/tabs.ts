@@ -132,9 +132,14 @@ const tests: Record<string, () => Promise<void>> = {
     await eventually(async () => (await follower.evaluate("localStorage.getItem('cached')")) !== null);
     expectEqual(await follower.evaluate("localStorage.getItem('cached')"), "true", "the leader was put in the back/forward cache");
     expectEqual(await within(10000, call(follower, "put", "bf", "notes", ["two"]).then(() => "written")), "written", "written while it is cached");
+    await eventually(async () => (await leader.evaluate("location.pathname").catch(() => "")) === "/elsewhere", "it is elsewhere");
+    await leader.evaluate("window.__left = 1, 1"); // on the page it went to
     await leader.evaluate("history.back(), 1");
-    await eventually(async () => (await follower.evaluate("localStorage.getItem('restored')")) !== null);
-    expectEqual(await follower.evaluate("localStorage.getItem('restored')"), "true", "and taken from it again");
+    // Taken from the cache, as most often; or, as a browser may let go of what it cached whenever it likes, loaded again.
+    await eventually(async () => (await leader.evaluate("typeof window.zsp === 'object' && window.__left === undefined").catch(() => false)) === true, "it is back");
+    const restored = (await follower.evaluate("localStorage.getItem('restored')")) === "true";
+    console.log(`     back ${restored ? "from the back/forward cache" : "loaded again, the browser having let go of what it cached"}`);
+    if (!restored) await call(leader, "device", "bf");
     await call(leader, "put", "bf", "notes", ["three"]);
     expectEqual((await call<string[]>(follower, "titles", "bf", "notes", 3)).join(), "one,two,three", "and by the leader, back");
   },
