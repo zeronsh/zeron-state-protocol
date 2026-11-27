@@ -594,6 +594,34 @@ for (const bad of [
   assert.equal(text.read(h.client.heldText(id, Note.body.slot)!), "typed");
 }
 
+// A change that edits a row not held, and fails, leaves nothing held of it; and one that writes over what an editor has
+// typed and not sealed writes over it here as at the node, where what the editor typed comes first.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  h.run();
+  const unheld = "00000001" + "6b49d200" + "756e68656c642121";
+  assert.throws(() =>
+    h.client.write(1, (change) => {
+      change.edit(unheld, 17, (t, fresh) => text.insert(t, 0, "x", fresh));
+      throw new Error("not after all");
+    }),
+  );
+  assert.equal(h.client.held(unheld), undefined, "what failed left a row held");
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t", body: "start" })));
+  h.run();
+  const editor = h.client.text(id, Note.body);
+  editor.append(" typed");
+  void h.client.write(1, (change) => change.set(id, Note, { body: "over" }));
+  h.run();
+  assert.equal(editor.read(), "over", "what was written over");
+  assert.deepEqual([...h.client.held(id)!.slots.get(17)!.values()].map((c) => c.kind), [3], "what was typed outlived what was written over it");
+  editor.close();
+}
+
 // What is asked of it is checked before anything is done: ids, devices and slots of the wrong size, and typos that are not
 // a whole number; and text is what was written, a byte order mark and all.
 {

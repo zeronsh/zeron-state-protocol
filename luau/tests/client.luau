@@ -1333,6 +1333,45 @@ do
 	assert(h.self.waits[#h.self.waits] == 0.1, "and was slow to after a pipe that was well")
 end
 
+-- A change that edits a row not held, and fails, leaves nothing held of it; and one that writes over what an editor has
+-- typed and not sealed writes over it here as at the node, where what the editor typed comes first.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	h.client:window({ scope = 1, list = "a", table = Note }, function() end)
+	h.run()
+	local unheld = "\0\0\0\1" .. string.pack(">I4", 1800000000) .. "unheld!!"
+	assert(not pcall(function()
+		h.client:write(1, function(change)
+			change.edit(unheld, 17, function(t, fresh)
+				zsp.Text.insert(t, 0, "x", fresh)
+			end)
+			error("not after all")
+		end)
+	end))
+	assert(h.client:held(unheld) == nil, "what failed left a row held")
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 1, { title = "t", body = "start" })
+	end)
+	h.run()
+	local editor = h.client:text(id, Note.body)
+	editor.append(" typed")
+	h.client:write(1, function(change)
+		change.set(id, Note, { body = "over" })
+	end)
+	h.run()
+	assert(editor.read() == "over", `what was written over is {editor.read()}`)
+	local cells = 0
+	for _, c in (h.client:held(id) :: any).slots[17] do
+		cells += 1
+		assert(c.kind == 3, "what was typed outlived what was written over it")
+	end
+	assert(cells == 1)
+	editor.close()
+end
+
 -- Before the scope is known every map's id is nothing: two maps are not taken for one another meanwhile.
 do
 	local h = harness()

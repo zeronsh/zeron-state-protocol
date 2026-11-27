@@ -2211,45 +2211,40 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	local cells: { Written } = {}
 	local fresh: { [string]: boolean } = {} -- rows made here
 	local rows: { [string]: boolean } = {}
-	-- Each row as it was before this change touched it, to be put back if the change is not made after all: false for
-	-- one this change made.
-	local saved: { [string]: any } = {}
-	local function keep(id: string, slot: number)
+	-- Each row as it was before this change touched it, to be put back if the change is not made after all.
+	local saved: { [string]: { existed: boolean, dead: boolean, slots: { [number]: { [string]: Cell } }, touched: { [number]: boolean } } } = {}
+	local function keep(id: string, slot: number): Stored
 		local was = saved[id]
-		if was == nil then
-			local row = self.rows[id]
-			if row then
-				-- What editors have open in the row is their own writing, sent whatever becomes of this change: first, then,
-				-- so that undoing the change cannot take it back.
-				for k, t in row.texts do
-					if t.open ~= "" then
-						self:_seal(row, k)
-					end
+		local existed = self.rows[id]
+		local row = existed or self:_row(id)
+		if not was then
+			-- What editors have open in the row is their own writing, sent whatever becomes of this change: first, then,
+			-- so that undoing the change cannot take it back, and what the change writes over it is later.
+			for k, t in row.texts do
+				if t.open ~= "" then
+					self:_seal(row, k)
 				end
-				local slots = {}
-				for k, cs in row.slots do
-					slots[k] = table.clone(cs)
-				end
-				was = { dead = row.dead, slots = slots, touched = {} }
-			else
-				was = false
 			end
+			local slots = {}
+			for k, cs in row.slots do
+				slots[k] = table.clone(cs)
+			end
+			was = { existed = existed ~= nil, dead = row.dead, slots = slots, touched = {} }
 			saved[id] = was
 		end
-		if was then
-			was.touched[slot] = true
-		end
+		was.touched[slot] = true
+		return row
 	end
 	local function put(row: string, slot: number, kind: number, body: string)
 		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 192 bytes")
 		if not sound(kind, slot, body) then
 			error(`no cell of kind {kind} goes in slot {slot}`, 0) -- as a column made by hand may say
 		end
+		local stored = keep(row, slot)
 		local stamp = self:_stamp(row)
-		keep(row, slot)
 		rows[row] = true
 		table.insert(cells, { row = row, slot = slot, kind = kind, stamp = stamp, body = body })
-		self:_accept(self:_row(row), slot, kind, stamp, body, self:_mine(scope))
+		self:_accept(stored, slot, kind, stamp, body, self:_mine(scope))
 	end
 	local function set(id: string, schema: Table, values: { [string]: any })
 		for name, value in values do
@@ -2300,11 +2295,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		edit = function(id, slot, f)
 			assert(slot >= 16 and slot <= 255, "data slots are 16 to 255")
 			writable(id)
-			local row = self:_row(id)
-			if row.texts[slot] and row.texts[slot].open ~= "" then
-				self:_seal(row, slot) -- what an editor has open goes first
-			end
-			keep(id, slot)
+			local row = keep(id, slot) -- and what an editor has open in it goes first, and stands
 			local t = self:_text(row, slot)
 			f(t, function(): string
 				return self.host.random(8)
@@ -2325,9 +2316,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		-- All or nothing: whatever was done here is undone, and nothing is said.
 		for id, was in saved do
 			local row = self.rows[id]
-			if not was then
-				self.rows[id] = nil
-			elseif row then
+			if row then
 				row.dead = was.dead
 				row.slots = was.slots
 				for slot in was.touched do
@@ -2335,6 +2324,9 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 					row.lives[slot] = nil
 				end
 				unview(row)
+				if not was.existed and row.pages == 0 and next(row.held) == nil and not self:_pending(id) then
+					self.rows[id] = nil
+				end
 			end
 		end
 		error(why, 0)
