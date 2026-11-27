@@ -1338,16 +1338,23 @@ end
 local function cells_of(self: Client, r: codec.Reader, touched: { [Stored]: boolean })
 	codec.varint(r)
 	local id = ""
-	while r.pos < r.len do
-		local tag = codec.u8(r)
-		if tag < 128 then
-			id = codec.take(r, 16)
-		end
-		if id == "" then
+	local buf, len = r.buf, r.len
+	while r.pos < len do
+		-- What every cell begins with, read at once, as all of it is there or the cell is not: the most of what is read.
+		local pos = r.pos
+		local tag = buffer.readu8(buf, pos)
+		if pos + (if tag < 128 then 34 else 18) > len then
 			error(codec.Malformed, 0)
 		end
-		local slot = codec.u8(r)
-		local stamp = codec.take(r, 16)
+		if tag < 128 then
+			id = buffer.readstring(buf, pos + 1, 16)
+			pos += 16
+		elseif id == "" then
+			error(codec.Malformed, 0)
+		end
+		local slot = buffer.readu8(buf, pos + 1)
+		local stamp = buffer.readstring(buf, pos + 2, 16)
+		r.pos = pos + 18
 		local body = codec.bytes(r)
 		local author: Device? = nil
 		if bit32.btest(tag, 64) then
