@@ -237,6 +237,37 @@ const tests: Record<string, () => Promise<void>> = {
     expectEqual(await call<string>(p, "deviceOrError", "rs"), "ok");
     expectEqual((await call<string[]>(p, "titles", "rs", "notes", put.length)).join(), put.join(), "everything written in the storm");
   },
+  // The tab running the device is left for another page, and gone back to: its worker closes every file of the store itself,
+  // having made durable what it held, before it is stopped; another tab has the store meanwhile; and the first has it again
+  // once the other has gone, the files held a while after, as Chromium has been seen to hold them.
+  async tab_away_back() {
+    const leader = await page();
+    const follower = await page(); // which hears all the leader's worker says of its files
+    await leader.preamble(files({ who: "leader" }));
+    await call(leader, "device", "ab");
+    await call(leader, "create", "ab");
+    await call(leader, "put", "ab", "notes", ["one"]);
+    await follower.preamble(files({ who: "follower", lag: 150 }));
+    await call(follower, "device", "ab");
+    await leader.evaluate(`addEventListener('pagehide', (e) => localStorage.setItem('left', String(e.persisted)));
+      window.__here = 1;
+      location.href = '/elsewhere', 1`);
+    await eventually(async () => (await follower.evaluate("localStorage.getItem('left')")) !== null, "it left");
+    expectEqual(await within(10000, call(follower, "put", "ab", "notes", ["two"]).then(() => "written")), "written", "written while it is away");
+    const [had] = await filesSaid(follower, "leader");
+    if (!had || had.opened === 0 || had.closed !== had.opened) throw new Error(`the leader's worker, stopped as its tab left, closed ${had?.closed} of the ${had?.opened} files it opened itself`);
+    await eventually(async () => (await leader.evaluate("location.pathname").catch(() => "")) === "/elsewhere", "it is elsewhere");
+    await leader.preamble(files({ who: "leader again", lag: 150 }));
+    await leader.evaluate("history.back(), 1");
+    await eventually(async () => (await leader.evaluate("typeof window.zsp === 'object' && location.pathname === '/'").catch(() => false)) === true, "it is back");
+    if ((await leader.evaluate("window.__here === 1")) !== true) await call(leader, "device", "ab"); // loaded again, not cached
+    await call(leader, "put", "ab", "notes", ["three"]);
+    await gone(follower);
+    await call(leader, "put", "ab", "notes", ["four"]);
+    expectEqual((await call<string[]>(leader, "titles", "ab", "notes", 4)).join(), "one,two,three,four");
+    const again = await filesSaid(leader, "leader again");
+    if (!again.some((f) => f.held > 0)) throw new Error("the files were not held after the follower went, as the test meant them to be");
+  },
   // A tab's worker is stopped without a word, as a crash stops it, and the device opened again at once: the files are let go
   // of as the browser stops it, and its next worker opens them, though they are held a while after it has the lock. Held
   // for ever, as Chromium has been seen to hold them until it is restarted, the store is said to be locked, in time, and is

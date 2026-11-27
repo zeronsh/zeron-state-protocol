@@ -79,6 +79,9 @@ export class Store {
   #chain: Promise<void> = Promise.resolve(); // removals and openings, in the order they were asked for
   #closed = false;
   #abandoned = false;
+  #isShut = false; // its files closed
+  #pagesDirty = false; // written since they were last made durable
+  #findDirty = false;
   /** How often the ways round a file not yet open were taken: for tests, which must see that they were. */
   static readonly counts = { held: 0, journaled: 0, replayed: 0 };
   /** Called when something that was waiting for a file is done, should anyone want to know. */
@@ -442,12 +445,14 @@ export class Store {
   pageWrite(no: number, bytes: Uint8Array): boolean {
     const block = bytes.length === PAGE ? bytes : new Uint8Array(PAGE);
     if (block !== bytes) block.set(bytes);
+    this.#pagesDirty = true;
     return this.#tree.write(block, no * PAGE) === PAGE;
   }
 
   pageSync(): boolean {
     try {
       this.#tree.flush();
+      this.#pagesDirty = false;
       return true;
     } catch (e) {
       this.failure ??= e;
@@ -460,12 +465,14 @@ export class Store {
   }
 
   findWrite(no: number, bytes: Uint8Array): boolean {
+    this.#findDirty = true;
     return this.#find.write(bytes, no * PAGE) === bytes.length;
   }
 
   findSync(): boolean {
     try {
       this.#find.flush();
+      this.#findDirty = false;
       return true;
     } catch {
       return false; // it can always be made again
@@ -490,23 +497,41 @@ export class Store {
   letGo(): void {
     this.#abandoned = true;
     this.#closed = true;
-    for (const f of this.#segments.values()) f.close();
-    this.#segments.clear();
-    for (const [a, b] of this.#kept.values()) a.file.close(), b.file.close();
-    this.#kept.clear();
-    this.#tree.close();
-    this.#find.close();
-    this.#journal.close();
-    this.volume.close?.();
+    this.#shut();
+  }
+
+  /**
+   * Makes durable what was written, and closes every file at once, as a worker about to be stopped must, for it cannot
+   * wait: what is being opened is closed as it comes, and nothing more is opened or removed.
+   */
+  closeNow(): void {
+    if (!this.#abandoned) {
+      // What fails here fails as it would at the next sync: nothing said to be durable depends on it, and every file is
+      // closed whatever it does.
+      this.logSync();
+      if (this.#pagesDirty) this.pageSync();
+      if (this.#findDirty) this.findSync();
+    }
+    this.letGo();
   }
 
   /** Closes every file, once whatever was being opened or removed is done. */
   async close(): Promise<void> {
     this.#closed = true;
     await this.#chain;
+    this.#shut();
+  }
+
+  // Closes every file it has, once, whichever way it is let go of; and lets go of the volume, which gives up waiting for
+  // any file being opened.
+  #shut(): void {
+    if (this.#isShut) return;
+    this.#isShut = true;
     for (const f of this.#segments.values()) f.close();
     this.#segments.clear();
+    this.#dirty.clear();
     for (const [a, b] of this.#kept.values()) a.file.close(), b.file.close();
+    this.#kept.clear();
     this.#tree.close();
     this.#find.close();
     this.#journal.close();

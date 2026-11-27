@@ -27,11 +27,12 @@ export interface Options {
 }
 
 /**
- * What a tab tells its worker: to open the store, a pipe, a question; and to say when so many milliseconds are up, or no
- * longer, for a tab's timers are held back while it is hidden and a worker's are not.
+ * What a tab tells its worker: to open the store, a pipe, a question; to say when so many milliseconds are up, or no
+ * longer, for a tab's timers are held back while it is hidden and a worker's are not; and that it is about to be stopped.
  */
 export type Command =
   | { open: Options }
+  | { away: true }
   | { connect: MessagePort }
   | { ask: number; op: Op; args: unknown[] }
   | { after: number; ms: number }
@@ -112,7 +113,8 @@ const timers = new Map<number, ReturnType<typeof setTimeout>>(); // the tab's
 
 self.onmessage = async (e: MessageEvent<Command>) => {
   const c = e.data;
-  if ("open" in c) open(c.open);
+  if ("away" in c) away();
+  else if ("open" in c) open(c.open);
   else if ("connect" in c) connect(c.connect);
   else if ("after" in c) {
     const id = c.after;
@@ -123,6 +125,8 @@ self.onmessage = async (e: MessageEvent<Command>) => {
 
 let options: Options;
 let contending = false; // in line for the store, or running it
+let leaving = false; // about to be stopped: the store is let go of, and never had again
+let letGo: (() => void) | undefined; // ends the running of the node here, closed or put away, and so the hold on the store
 
 /** What went wrong, as a tab is told it: the error's name too, where it is one an application may tell apart. */
 export type Failure = { message: string; name?: string };
@@ -191,38 +195,57 @@ const AHEAD = 2 ** 40; // ms, some thirty years: more than any clock is wrong by
 // store whose storage failed is run again once it can be, and one that cannot be is tried no more often than its clients
 // dial, which they do less and less often while they cannot.
 function contend(): void {
-  if (contending) return;
+  if (contending || leaving) return;
   contending = true;
   const o = options;
   void navigator.locks.request("zsp:" + o.name, async () => {
-    let failed: Promise<Error>;
+    if (leaving) return;
+    let node: Node;
+    let ended: Promise<Error | undefined>; // failed, or closed or put away
     try {
       const volume = await OpfsVolume.at("zsp/" + o.name);
       const module = await loadModule(o.wasm ? new URL(o.wasm, self.location.href) : undefined);
       // Partial unless told otherwise: a browser holds what its tabs watch and ask about, not the whole space.
       const given = newest;
-      const node = await Node.open({ volume, module, full: o.full === true, keep: o.keep, credential: given?.credential });
-      failed = new Promise((done) => (node.onFailure = done));
+      node = await Node.open({ volume, module, full: o.full === true, keep: o.keep, credential: given?.credential });
+      ended = new Promise((done) => ((node.onFailure = done), (letGo = () => done(undefined))));
       if (newest !== given) node.setCredential(newest!.credential); // given while it opened
-      device = node;
     } catch (error) {
       contending = false;
       fail(failure(error));
       return;
     }
-    breakCarried();
-    channel.postMessage({ leader: true } satisfies Shout);
-    tellSpace();
-    // What this worker itself was waiting to hear, it now answers: but what the one before may have done already, it says
-    // may have been.
-    for (const [id, s] of unheard) if ("ask" in s) heard({ answer: id, ...(gone(id, s.op) ?? answer(s.op, s.args)) });
-    // Held until the worker is gone with its tab, or until the node stops of itself: then every tab is told, and another
-    // worker may have the store, and try.
-    const error = await failed;
-    device = undefined;
-    contending = false;
-    fail(failure(error));
+    if (leaving) void node.closeNow(), letGo!(); // put away as it opened
+    else {
+      device = node;
+      breakCarried();
+      channel.postMessage({ leader: true } satisfies Shout);
+      tellSpace();
+      // What this worker itself was waiting to hear, it now answers: but what the one before may have done already, it says
+      // may have been.
+      for (const [id, s] of unheard) if ("ask" in s) heard({ answer: id, ...(gone(id, s.op) ?? answer(s.op, s.args)) });
+    }
+    // Held until the worker is gone with its tab, or the node is closed or put away; or until it stops of itself: then
+    // every tab is told, and another worker may have the store, and try.
+    const error = await ended;
+    letGo = undefined;
+    if (device === node) device = undefined;
+    if (error) {
+      contending = false;
+      fail(failure(error));
+    }
   });
+}
+
+// Its tab is about to stop it, as the tab is frozen or left: the node is stopped, what it holds made durable, and every file
+// closed, at once, for nothing after this is sure to be run; and the lock let go of, unless the worker is stopped first,
+// which lets go of it anyway. Chrome runs what was sent a worker before it stops it, and so this.
+function away(): void {
+  leaving = true;
+  const d = device;
+  device = undefined;
+  void d?.closeNow();
+  letGo?.();
 }
 
 // Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
@@ -260,6 +283,7 @@ async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: 
       const d = device;
       device = undefined;
       await d.close().catch(() => {});
+      letGo?.(); // and so the store, its files all closed
     }
     return {};
   }

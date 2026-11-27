@@ -579,6 +579,16 @@ export class Node {
     return (this.#closing ??= this.#close());
   }
 
+  /**
+   * Stops the node and closes the store at once, making durable what it was given, as a worker about to be stopped must,
+   * for it cannot wait: what is being opened is closed as it comes.
+   */
+  closeNow(): void {
+    if (!this.#closing) this.#stop();
+    this.#store.closeNow();
+    this.#closing ??= Promise.resolve();
+  }
+
   async #close(): Promise<void> {
     this.#stop();
     await this.store.close();

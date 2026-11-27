@@ -45,6 +45,11 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   // The worker: none while the tab is frozen or put away in the back/forward cache, for a frozen worker holds the store,
   // and every tab of the origin would wait for this one to come back. It is stopped as the tab is, for it cannot stop
   // itself in time, and that lets go of the store as a closed tab does; and it is started again when the tab is back.
+  // Told first, it closes the store's files itself, having made durable what it holds, before it lets go of the store's
+  // lock: Chrome runs what was sent a worker before it stops it, as it did every time this was measured, the tab frozen,
+  // left, closed or reloaded, the worker busy or not, while a worker that is not stopped is frozen in the midst of whatever
+  // it was doing, the store held. Stopped as it did it, the browser closes the files, and the next to open the store waits
+  // for it to have (./volume-opfs.ts).
   let worker: Worker | undefined;
   let state: "running" | "away" | "closed" = "running";
   let asked = 0;
@@ -98,11 +103,15 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   // What may be asked again of the next worker, as having been done or not it is the same; anything else may have been
   // done, and is not done twice.
   const again = new Set<Op>(["identity", "member", "members", "usage"]);
+  const stop = () => {
+    worker?.postMessage({ away: true } satisfies Command);
+    worker?.terminate();
+    worker = undefined;
+  };
   const away = () => {
     if (state !== "running") return;
     state = "away";
-    worker?.terminate();
-    worker = undefined;
+    stop();
     for (const [id, a] of answers) {
       if (a.op === "close") answers.delete(id), a.resolve(undefined); // stopped, as a closed tab's is
       else if (a.op === "credential") answers.delete(id), a.resolve(undefined); // given anew by the next worker, not taken by this
@@ -140,8 +149,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     // Nobody has a device to close: the worker, and with it any lock or file it holds, is let go of here.
     unlisten();
     state = "closed";
-    worker?.terminate();
-    worker = undefined;
+    stop();
     throw e;
   }
   space ??= identity.space;

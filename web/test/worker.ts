@@ -107,6 +107,9 @@ class Dir {
 }
 const root = new Dir("");
 
+/** The handles open in a store's directory. */
+const held = (store: string) => [...open].filter((h) => h.file.path.startsWith(`/zsp/${store}/`)).length;
+
 // Web Locks: one holder of a name at a time, the rest in line, in order.
 const locks = new Set<string>();
 const lines = new Map<string, (() => void)[]>();
@@ -169,6 +172,10 @@ async function worker() {
   };
 }
 const answered = (said: Report[], id: number) => said.find((r) => "answer" in r && r.answer === id) as { answer: number; value?: unknown; error?: string; name?: string } | undefined;
+async function until(what: string, f: () => boolean, ms = 5000): Promise<void> {
+  for (const t = performance.now(); !f(); await sleep(1)) if (performance.now() - t > ms) throw new Error(`not in time: ${what}`);
+}
+
 // ---------------------------------------------------------------- a file held by another
 
 // Taken once whatever holds it lets go, after a try or a few; held as it was in Chromium before, the same.
@@ -236,6 +243,18 @@ const answered = (said: Report[], id: number) => said.find((r) => "answer" in r 
 }
 
 // ---------------------------------------------------------------- the worker
+
+// Put away, as its tab is frozen or left: every file is closed at once, as the worker is told, for nothing after is sure to
+// be run; and the lock let go of once nothing is being opened.
+{
+  const w = await worker();
+  await w.tell({ open: { name: "away" } });
+  await w.tell({ ask: 1, op: "create", args: [] });
+  assert(held("away") > 10);
+  void w.tell({ away: true });
+  assert.equal(held("away"), 0, "files left open as it was put away");
+  await until("the lock is let go of", () => !locks.has("zsp:away"));
+}
 
 console.log("ok");
 process.exit(0); // the workers' channels, which a browser closes with them
