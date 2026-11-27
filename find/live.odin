@@ -994,6 +994,35 @@ far_run :: proc(l: ^Live) {
 		}
 		far_drop(l)
 	}
+	// An answer given up on is so before another is asked: so that, in the same turn, another is, or what was fetched
+	// is watched for it, rather than what is held being said to be the answer.
+	if far.next != nil {
+		next := far.next
+		far.next = nil
+		defer delete(next)
+		r := zsp.Reader{buf = next}
+		flags := Answer_Flags(zsp.read_u8(&r))
+		switch {
+		case flags == {waiting = true}: // what is here will do until it is done
+		case u8(flags) > 1 || !far_sound(l, r) || !far_wants(l, &r):
+			zsp.node_flow(f.n, far.call, .Cancel)
+			far.call = 0
+			append(&far.tried, far.device)
+			far_drop(l)
+		case:
+			delete(far.answer)
+			far.answer, next = next, nil
+			far.due = true
+		}
+	}
+	if far.due && l.once && far_missing(l) {
+		// It named a row where a full replica says there is none: it will not come there, and the answer is not one. (An
+		// answer that stays is put right by the next, as what is here is said meanwhile: it is waited for.)
+		zsp.node_flow(f.n, far.call, .Cancel)
+		far.call = 0
+		append(&far.tried, far.device)
+		far_drop(l)
+	}
 	reach := zsp.node_reach(f.n)
 	#reverse for device, i in far.tried {
 		if !slice.contains(reach, device) {
@@ -1025,33 +1054,6 @@ far_run :: proc(l: ^Live) {
 		zsp.write_varint(&w, u64(far.spent))
 		zsp.node_flow(f.n, far.call, .Credit, w[:])
 		far.spent = 0
-	}
-	if far.next != nil {
-		next := far.next
-		far.next = nil
-		defer delete(next)
-		r := zsp.Reader{buf = next}
-		flags := Answer_Flags(zsp.read_u8(&r))
-		switch {
-		case flags == {waiting = true}: // what is here will do until it is done
-		case u8(flags) > 1 || !far_sound(l, r) || !far_wants(l, &r):
-			zsp.node_flow(f.n, far.call, .Cancel)
-			far.call = 0
-			append(&far.tried, far.device)
-			far_drop(l)
-		case:
-			delete(far.answer)
-			far.answer, next = next, nil
-			far.due = true
-		}
-	}
-	if far.due && l.once && far_missing(l) {
-		// It named a row where a full replica says there is none: it will not come there, and the answer is not one. (An
-		// answer that stays is put right by the next, as what is here is said meanwhile: it is waited for.)
-		zsp.node_flow(f.n, far.call, .Cancel)
-		far.call = 0
-		append(&far.tried, far.device)
-		far_drop(l)
 	}
 	if far.due && far_whole(l) {
 		far.due, far.have = false, true

@@ -1259,6 +1259,126 @@ moved_questions_let_go_of_what_nobody_answers :: proc(t: ^testing.T) {
 }
 
 @(private, thread_local)
+phantoms_said, phantoms_unsound: int
+
+// A Fetch whose answer from afar is given up on, as one that names a row where a full replica says there is none, or
+// one that is no answer at all, asks another that can answer it, there and then: it is not answered with what is held while one can be asked.
+@(test)
+a_fetch_given_up_on_asks_another :: proc(t: ^testing.T) {
+	for round in 0 ..< 2 {
+		state := rand.create(115)
+		context.random_generator = rand.default_random_generator(&state)
+		good, p: World
+		for x in ([]^World{&good, &p}) {
+			for &b in x.secret {
+				b = byte(rand.uint32())
+			}
+			zsp.keyring_init(&x.keys, x.secret)
+		}
+		liar_secret, root: zsp.Key32
+		for &b in liar_secret {
+			b = byte(rand.uint32())
+		}
+		for &b in root {
+			b = byte(rand.uint32())
+		}
+		liar_keys: zsp.Keyring
+		zsp.keyring_init(&liar_keys, liar_secret)
+		defer zsp.keyring_destroy(&liar_keys)
+		none: zsp.Roster
+		d := zsp.draft_from(&none, 1)
+		scope := zsp.draft_scope(&d)
+		m := zsp.draft_grant(&d, good.keys.device, good.keys.signer, scope, {.Write})
+		m.owner = true
+		zsp.draft_grant(&d, p.keys.device, p.keys.signer, scope, {.Read, .Write})
+		zsp.draft_grant(&d, liar_keys.device, liar_keys.signer, scope, {.Read, .Write})
+		ok: bool
+		good.roster, ok = zsp.roster_sign(&good.keys, root, &d)
+		testing.expect(t, ok)
+		good.space = zsp.ed25519_public(root)
+		world_start(t, &good)
+		p.roster, p.space = slice.clone(good.roster), good.space
+		world_start(t, &p, false)
+		defer world_destroy(&good)
+		defer world_destroy(&p)
+		liar_disk: zsp.Memory_Disk
+		defer zsp.memory_disk_destroy(&liar_disk)
+		liar: zsp.Node
+		testing.expect(t, zsp.node_init(&liar, zsp.memory_disk(&liar_disk), good.space, &liar_keys, true, 64))
+		defer zsp.node_destroy(&liar)
+		testing.expect(t, zsp.node_adopt(&liar, good.roster))
+		for i in 0 ..< 3 {
+			good.node.now += 1000
+			id := zsp.node_id(&good.node, scope)
+			b: [24]byte
+			l := list_of(scope, 0)
+			zsp.put_u64(b[:], l[0])
+			zsp.put_u64(b[8:], l[1])
+			zsp.put_u64(b[16:], u64(i))
+			testing.expect(t, zsp.node_write(&good.node, {{id, zsp.PLACE, .Place, zsp.node_stamp(&good.node), b[:]}}))
+		}
+		p.node.now, liar.now = good.node.now, good.node.now
+		f, g: Finder
+		pages: [2]Memory_Disk
+		finder_open(&f, &good.node, memory_disk(&pages[0]), good.secret)
+		finder_open(&g, &p.node, memory_disk(&pages[1]), p.secret)
+		f.settled = true
+		elsewhere := client_open(&good, &f)
+		c := client_open(&p, &g)
+		accept :: proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+			zsp.session_accept(s, nil if s.role == .Peer else {{0, {.Read, .Write}, 0}})
+		}
+		good.node.host.authenticate, p.node.host.authenticate, liar.host.authenticate = accept, accept, accept
+		// One answers at once with a row that is nowhere.
+		phantoms_said, phantoms_unsound = 0, round
+		liar.host.questions = {
+			data = &liar,
+			called = proc(data: rawptr, call: u64, _: zsp.Key32, _: zsp.Scope, _: []byte) {
+				phantoms_said += 1
+				out := make([dynamic]byte, context.temp_allocator)
+				append(&out, 1 if phantoms_unsound == 0 else 9) // or what is no answer at all
+				zsp.write_varint(&out, 1)
+				zsp.write_varint(&out, 0)
+				zsp.write_varint(&out, 1)
+				zsp.write_key(&out, {1 << 32 | 9, 1, 42, 1 << 32 | 99, 777})
+				zsp.write_varint(&out, 0)
+				zsp.node_flow((^zsp.Node)(data), call, .Data, out[:])
+			},
+		}
+		lying := [2]^zsp.Session{zsp.session_open(&p.node, .Peer, true, liar_keys.device), zsp.session_open(&liar, .Peer, false, p.keys.device)}
+		link := link_make(&p, &good)
+		defer {
+			for x in ([]^zsp.Session{link[0], link[1], lying[0], lying[1], c.session, elsewhere.session}) {
+				zsp.session_close(x)
+			}
+			finder_close(&f)
+			finder_close(&g)
+			client_free(&c)
+			client_free(&elsewhere)
+			for &x in pages {
+				memory_disk_destroy(&x)
+			}
+		}
+		turn :: proc(t: ^testing.T, links: [2][2]^zsp.Session, f, g: ^Finder) {
+			for _ in 0 ..< 100 {
+				for l in links {
+					link_pass(t, l, max(int))
+				}
+				finder_run(f)
+				finder_run(g)
+			}
+		}
+		turn(t, {lying, link}, &f, &g)
+		testing.expect(t, lying[0].ready && link[0].ready)
+		client_ask(t, &c, 1, []byte{1, 0, 0, 0, 0, 50, 0}, FETCH)
+		turn(t, {lying, link}, &f, &g)
+		client_hear_out(t, &c, &g)
+		testing.expectf(t, phantoms_said == 1, "the one that names what is nowhere was asked %d times", phantoms_said) // first, as it was first reached
+		testing.expectf(t, 1 in c.answers && c.answers[1].flags & 1 != 0 && c.answers[1].total == 3 && len(c.answers[1].ids) == 3, "%v", c.answers[1] if 1 in c.answers else Told{})
+	}
+}
+
+@(private, thread_local)
 far_called: u64
 
 // An answer from afar that names a row where a full replica says there is none is no answer: what is here is.
