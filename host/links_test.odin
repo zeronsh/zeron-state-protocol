@@ -88,18 +88,32 @@ a_device_started_again_is_found_again :: proc(t: ^testing.T) {
 			defer net.close(watch)
 			net.set_option(watch, .Receive_Timeout, 200 * time.Millisecond)
 			bound, _ := net.bound_endpoint(watch)
-			// As a process gone without a word looks from here: what the link sends goes to a socket nobody reads.
+			// As a process gone without a word looks from here: what the link sends goes to a socket nobody reads, and
+			// nothing comes back on it. Both ends are turned away, for the other is still running, and anything it sent
+			// that arrived would be taken for an answer and turn this end back to it (peer_heard). Until nothing still on
+			// its way between them has undone either.
 			void, verr := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 			testing.expect(t, verr == nil)
 			defer net.close(void)
 			if silent {
-				world_run(&w, proc(_: ^World, _: rawptr) -> bool {return false}, nil, 200 * time.Millisecond) // what it said last, heard
-				for x in w.hosts[here].udp.links {
-					if x.device == w.keys[there].device {
-						gone, _ := net.bound_endpoint(void)
-						x.address = address_from(gone)
+				gone, _ := net.bound_endpoint(void)
+				turned := false
+				for _ in 0 ..< 10 {
+					turned = true
+					for pair in ([2][2]int{{here, there}, {there, here}}) {
+						for x in w.hosts[pair[0]].udp.links {
+							if x.device == w.keys[pair[1]].device && x.address != address_from(gone) {
+								x.address = address_from(gone)
+								turned = false
+							}
+						}
 					}
+					if turned {
+						break
+					}
+					world_run(&w, proc(_: ^World, _: rawptr) -> bool {return false}, nil, 200 * time.Millisecond) // what is on its way, heard
 				}
+				testing.expect(t, turned, "the link stays turned away")
 			}
 			beacon := zsp.beacon_seal(&world_space(&w, there).node, bound.port)
 			beacon_heard(&w.hosts[here], beacon, address_from(net.Endpoint{net.IP4_Loopback, 9}))
