@@ -1526,6 +1526,44 @@ what_comes_while_merging_is_there :: proc(t: ^testing.T) {
 	}
 }
 
+// Rows go that nothing said had gone while a scope's rows were being put in order, and some of that was done: it is
+// begun again from nothing, and nothing of what was gone over before is there after.
+@(test)
+what_goes_while_merging_is_gone :: proc(t: ^testing.T) {
+	state := rand.create(110)
+	context.random_generator = rand.default_random_generator(&state)
+	for keep in ([]int{0, 1}) {
+		w: World
+		world_make(t, &w)
+		defer world_destroy(&w)
+		put :: proc(t: ^testing.T, w: ^World) {
+			w.node.now += 1000
+			id := zsp.node_id(&w.node, 1)
+			append(&w.rows, id)
+			b := make([]byte, 24, context.temp_allocator)
+			l := list_of(1, 0)
+			zsp.put_u64(b, l[0])
+			zsp.put_u64(b[8:], l[1])
+			testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+		}
+		for _ in 0 ..< 300 {
+			put(t, &w)
+		}
+		index_follow(&w.x)
+		s := index_want_scope(&w.x, 1)
+		for s.filling == nil || s.ids.root == 0 {
+			testing.expect(t, !index_step(&w.x, 1))
+		}
+		zsp.store_lose(&w.node.store, w.rows[keep:])
+		index_finish(&w.x)
+		check_index(t, &w)
+		put(t, &w)
+		index_finish(&w.x)
+		check_index(t, &w)
+		testing.expect_value(t, tree_total(&w.x, s.ids).count, keep + 1)
+	}
+}
+
 // What cannot be synced is not made over and over; and what has fallen far behind is followed a little at a time.
 @(test)
 index_is_patient :: proc(t: ^testing.T) {
