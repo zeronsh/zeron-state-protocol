@@ -320,3 +320,48 @@ review_unkept_keys_stop_the_host :: proc(t: ^testing.T) {
 		testing.expectf(t, h.stopping, "%s not kept, and the host goes on", what)
 	}
 }
+
+// What ends the handshake may come in one read with the first of the session, as a relay that speaks at once sends it:
+// the frames after it are a session's, as long as a session's may be.
+@(test)
+review_session_follows_the_handshake_at_once :: proc(t: ^testing.T) {
+	h: Host
+	h.secret[0] = 1
+	theirs: zsp.Key32
+	theirs[0] = 2
+	sp: Space
+	sp.host = &h
+	m: zsp.Memory_Disk
+	defer zsp.memory_disk_destroy(&m)
+	space: zsp.Key32
+	space[0] = 3
+	testing.expect(t, zsp.node_init(&sp.node, zsp.memory_disk(&m), space, nil, true))
+	defer zsp.node_destroy(&sp.node)
+	d: Dialer
+	d.space, d.key = &sp, zsp.x25519_public(theirs)
+	s: Stream
+	s.host, s.dialer, s.space, s.phase = &h, &d, &sp, .Noise
+	s.handshake = new(zsp.Handshake)
+	first, ok := zsp.handshake_start(s.handshake, h.secret, d.key, space)
+	testing.expect(t, ok)
+	second, channel, answered := zsp.handshake_answer(theirs, space, first[:])
+	testing.expect(t, answered)
+	// The start of a session's frame longer than any handshake's message, which the session holds until the rest comes.
+	plain: [300]byte
+	plain[0], plain[1] = 0xe8, 0x07 // a frame of 1000 bytes
+	sealed := make([dynamic]byte, context.temp_allocator)
+	zsp.channel_seal(&channel, &sealed, plain[:])
+	wire := make([dynamic]byte, context.temp_allocator)
+	pipe.ws_put(&wire, .Binary, second[:], false)
+	pipe.ws_put(&wire, .Binary, sealed[:], false)
+	took := stream_input(&s, wire[:])
+	testing.expect(t, took && s.session != nil && len(s.session.input) == len(plain), "the session's first frame, come with the handshake's last, was refused")
+	if s.session != nil {
+		zsp.session_close(s.session)
+	}
+	free(s.handshake)
+	delete(s.in_buf)
+	delete(s.pieces)
+	delete(s.out)
+	delete(s.pong)
+}

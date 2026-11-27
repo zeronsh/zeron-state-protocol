@@ -205,9 +205,10 @@ stream_input :: proc(s: ^Stream, bytes: []byte) -> bool {
 		stream_greeted(s, &head) or_return
 		used += head.size
 	}
-	// Before a session, nothing larger than a handshake's message is said; nor held, however long a frame says it is.
-	most := pipe.MAX_MESSAGE if s.phase == .Open else pipe.CONTROL_MAX
 	for {
+		// Before a session, nothing larger than a handshake's message is said; nor held, however long a frame says it
+		// is. Asked of each frame, for the one that ends the handshake may come with the first of the session.
+		most := pipe.MAX_MESSAGE if s.phase == .Open else pipe.CONTROL_MAX
 		op, payload, n, fin, result := pipe.ws_take(s.in_buf[used:], most)
 		switch result {
 		case .More:
