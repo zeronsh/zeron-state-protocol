@@ -29,6 +29,7 @@ const ZERO40 = "\0".repeat(40);
 const PIECE_BYTES = 4096; // a piece is sealed at this size,
 const PIECE_MS = 1000; // or this long after it began,
 const LIVE_MS = 10000; // and live text unconfirmed for this long is dropped
+const LEAP_MS = 15 * 60 * 1000; // a node refuses a stamp further ahead of its clock than this
 
 const utf8 = new TextEncoder();
 const fromUtf8 = new TextDecoder("utf-8", { ignoreBOM: true }); // a byte order mark, if one was written, is read
@@ -377,6 +378,7 @@ interface Written {
 
 interface Pending {
   seq: number;
+  scope: number;
   body: Uint8Array;
   rows: string[];
   done: () => void;
@@ -468,7 +470,8 @@ export class Client {
   #hangUp: () => void = () => {};
   #ready = false;
   #closed = false;
-  #failures = 0;
+  #failures = 0; // pipes in a row that never came up, or that the node found fault with
+  #faulted = false; // this pipe has: the node said so, or said nonsense
   #input = new Uint8Array(0);
   #clockMs = 0;
   #clockN = 0;
@@ -530,6 +533,7 @@ export class Client {
     };
     this.#input = new Uint8Array(0);
     this.#out = codec.writer();
+    this.#faulted = false;
     const wire = this.#host.connect((data) => {
       if (!over) this.#receive(data);
     }, closed);
@@ -553,6 +557,7 @@ export class Client {
   }
 
   #lost(): void {
+    const well = this.#ready && !this.#faulted;
     this.#wire = undefined;
     this.#ready = false;
     this.#authors.clear();
@@ -576,6 +581,9 @@ export class Client {
     this.#sweep();
     this.#tell("status", false);
     if (!this.#closed) {
+      // Soon after a pipe that was well; later and later after each that never came up, or that the node found fault
+      // with, since what this client says it would say again.
+      if (well) this.#failures = 0;
       const wait = Math.min(100 * 2 ** this.#failures, 10000);
       this.#failures++;
       this.#host.after(wait, () => this.#dial());
@@ -651,6 +659,7 @@ export class Client {
         if (p - at > 5) {
           // no frame is so long
           this.#input = new Uint8Array(0);
+          this.#faulted = true;
           this.#hangUp();
           return;
         }
@@ -671,6 +680,7 @@ export class Client {
         if (!(e instanceof codec.Malformed)) throw e;
         // Nonsense from the pipe ends the pipe and nothing else.
         this.#input = new Uint8Array(0);
+        this.#faulted = true;
         this.#hangUp();
         return;
       }
@@ -719,6 +729,7 @@ export class Client {
       }
       case ERROR: {
         const code = codec.u8(r);
+        this.#faulted = true;
         this.#closed = code === 2 || code === 3; // refused, or speaking another language: trying again is no use
         this.#tell("error", code);
         return;
@@ -754,10 +765,15 @@ export class Client {
       return;
     }
     this.#ready = true;
-    this.#failures = 0;
-    // Say again whatever the last pipe was told: what is served, unacknowledged and watched.
+    // Say again whatever the last pipe was told: what is served, unacknowledged and watched. What this client may no
+    // longer write in is let go of, never to be durable: a node would refuse it, and this client with it, for good.
     for (const key of this.#handlers.keys()) this.#serve(key, true);
-    for (const p of this.#pending) {
+    for (const p of [...this.#pending]) {
+      if (!this.may(p.scope, "write")) {
+        this.#pending.splice(this.#pending.indexOf(p), 1);
+        this.#settle(p);
+        continue;
+      }
       const w = codec.writer();
       codec.putVarint(w, p.seq);
       codec.put(w, p.body);
@@ -1684,7 +1700,7 @@ export class Client {
   #seal(row: Stored, slot: number): void {
     const t = row.texts.get(slot);
     if (!t || t.open === "") return;
-    const stamp = this.#stamp();
+    const stamp = this.#stamp(row.id);
     const body = text.close(t, stamp);
     if (body) {
       merge(row, slot, PIECE, stamp, body, this.#mine(codec.u32Of(row.id)));
@@ -1698,6 +1714,7 @@ export class Client {
     if (!col.text) throw new Error("not a text column");
     const slot = col.slot;
     const bin = rowId(id);
+    const scope = codec.u32Of(bin);
     let early: (() => void)[] | undefined = this.#rows.has(bin) ? undefined : []; // what is done before there is a row to do it to
     const row = this.#row(bin);
     row.held.set(slot, (row.held.get(slot) ?? 0) + 1);
@@ -1721,6 +1738,7 @@ export class Client {
     };
     const edit = (f: (t: text.Text) => void) => {
       if (closed || row.dead) throw new Error("the text is closed");
+      this.#mayWrite(bin, scope);
       if (early) {
         early.push(() => f(this.#text(row, slot)));
         return;
@@ -1817,7 +1835,10 @@ export class Client {
     if (ms > this.#clockMs || (ms === this.#clockMs && n > this.#clockN)) (this.#clockMs = ms), (this.#clockN = n);
   }
 
-  #stamp(): string {
+  // A stamp for a cell of a row: no earlier than the row was made, for no cell is older than its row.
+  #stamp(row: string): string {
+    const born = codec.u32Of(row, 4) * 1000;
+    if (born > this.#clockMs) (this.#clockMs = born), (this.#clockN = 0);
     const ms = Math.floor(this.#host.now());
     if (ms > this.#clockMs) (this.#clockMs = ms), (this.#clockN = 0);
     else if (this.#clockN < 65535) this.#clockN++;
@@ -1825,7 +1846,18 @@ export class Client {
     return stampTime(this.#clockMs, this.#clockN) + codec.binary(this.#host.random(8));
   }
 
+  // A row this client may write in now, as far as it knows: what a node refuses, it refuses for good, ending the pipe and
+  // this client with it. One made later than a stamp of this client's may be ahead of the clock is never written.
+  #mayWrite(bin: string, scope: number): void {
+    if (codec.u32Of(bin) !== scope) throw new RangeError("that row is of another scope");
+    if (this.#ready && !this.may(scope, "write")) throw new Error("this client may not write there");
+    if (codec.u32Of(bin, 4) * 1000 > Math.floor(this.#host.now()) + LEAP_MS) throw new RangeError("that row was made later than any clock may yet say");
+  }
+
   #sendCells(cells: Written[], done?: () => void): void {
+    const scope = codec.u32Of(cells[0].row);
+    // What this client may no longer write in, since it began, is never said: a node refuses it, and this client with it.
+    if (this.#ready && !this.may(scope, "write")) return;
     const w = codec.writer();
     let last = "";
     const rows: string[] = [];
@@ -1844,7 +1876,7 @@ export class Client {
     }
     const body = codec.written(w).slice();
     const seq = ++this.#seq;
-    this.#pending.push({ seq, body, rows, done: done ?? (() => {}) });
+    this.#pending.push({ seq, scope, body, rows, done: done ?? (() => {}) });
     if (this.#ready) {
       const framed = codec.writer();
       codec.putVarint(framed, seq);
@@ -1856,14 +1888,19 @@ export class Client {
   #onAck(seq: number): void {
     while (this.#pending.length > 0 && this.#pending[0].seq <= seq) {
       const p = this.#pending.shift()!;
-      for (const id of p.rows) {
-        const n = this.#unacked.get(id)! - 1;
-        if (n > 0) this.#unacked.set(id, n);
-        else this.#unacked.delete(id);
-        const row = this.#rows.get(id);
-        if (n === 0 && row && row.pages === 0 && row.held.size === 0) this.#rows.delete(id);
-      }
+      this.#settle(p);
       p.done();
+    }
+  }
+
+  // What was written is pending no more: its rows are let go of, unless something else holds them.
+  #settle(p: Pending): void {
+    for (const id of p.rows) {
+      const n = this.#unacked.get(id)! - 1;
+      if (n > 0) this.#unacked.set(id, n);
+      else this.#unacked.delete(id);
+      const row = this.#rows.get(id);
+      if (n === 0 && row && row.pages === 0 && row.held.size === 0) this.#rows.delete(id);
     }
   }
 
@@ -1909,8 +1946,9 @@ export class Client {
     };
     const put = (row: string, slot: number, kind: number, body: Uint8Array) => {
       if (body.length > MAX_OPEN) throw new RangeError("a value may be 1 MiB at most, less 192 bytes");
+      if (!sound(kind, slot, body)) throw new RangeError(`no cell of kind ${kind} goes in slot ${slot}`); // as a column made by hand may say
       const stored = touch(row, slot);
-      const stamp = this.#stamp();
+      const stamp = this.#stamp(row);
       rows.add(row);
       cells.push({ row, slot, kind, stamp, body });
       this.#accept(stored, slot, kind, stamp, body, this.#mine(scope));
@@ -1932,7 +1970,12 @@ export class Client {
       const tag = this.tag(scope, list);
       put(bin, slot ?? 1, PLACE, codec.bytesOf(tag + codec.u64(order)));
     };
-    const idOf = rowId;
+    // A row of this scope: what a change does to a row of another is refused, and the whole change with it, by any node.
+    const idOf = (id: string): string => {
+      const bin = rowId(id);
+      this.#mayWrite(bin, scope);
+      return bin;
+    };
     // Done here, so that what is refused throws here; and should it throw, as if it had never been.
     let resolve!: () => void;
     const result = new Promise<void>((done) => (resolve = done));
@@ -1957,7 +2000,7 @@ export class Client {
           const row = touch(bin, slot); // and what an editor has open in it goes first, and stands
           const t = this.#text(row, slot);
           f(t, () => codec.binary(this.#host.random(8)));
-          const stamp = this.#stamp();
+          const stamp = this.#stamp(bin);
           const body = text.close(t, stamp);
           if (body) {
             if (body.length > MAX_OPEN) throw new RangeError("an edit may be 1 MiB at most, less 192 bytes");

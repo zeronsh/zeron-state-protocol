@@ -15,7 +15,7 @@ local ANSWER, FETCH = 34, 35
 type Said = { kind: number, body: string }
 
 local function harness()
-	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, closes = 0, connects = 0, sizes = {} :: { number }, partial = "" }
+	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, waits = {} :: { number }, closes = 0, connects = 0, sizes = {} :: { number }, partial = "" }
 	local function run()
 		while #self.deferred > 0 do
 			(table.remove(self.deferred, 1) :: any)()
@@ -36,8 +36,9 @@ local function harness()
 		defer = function(f: () -> ())
 			table.insert(self.deferred, f)
 		end,
-		after = function(_: number, f: () -> ())
+		after = function(seconds: number, f: () -> ())
 			table.insert(self.later, f)
+			table.insert(self.waits, seconds)
 			return function() end
 		end,
 		connect = function(receive: any, closed: any)
@@ -1053,6 +1054,150 @@ do
 	codec.put_bytes(c, body)
 	h.tell(CELLS, "\0" .. codec.string(c))
 	assert(shown.rows[1].body == "hello!typedmore", "the text is as it was")
+end
+
+-- What a node would refuse, and end the pipe for, never leaves the client, and throws where it is asked for: a row of
+-- another scope, whatever this client may do there; one made later than any clock may yet say; a cell where a column made
+-- by hand puts one that no node takes; a place no row goes in. Nothing of the change is done.
+do
+	local h = harness()
+	h.run()
+	h.tell(ROSTER, string.rep("\0", 8) .. "\1\7" .. string.rep("k", 32) .. "\2\1" .. string.rep("k", 32) .. "\3\7" .. string.rep("k", 32))
+	h.client:window({ scope = 1, list = "a", table = Note }, function() end)
+	h.run()
+	local mine = ""
+	h.client:write(1, function(change)
+		mine = change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	local theirs, other = "\0\0\0\2" .. string.pack(">I4", 1800000000) .. "12345678", "\0\0\0\3" .. string.pack(">I4", 1800000000) .. "12345678"
+	local said = #h.self.said
+	-- What is held of the rows, cell by cell.
+	local function held(): string
+		local out = {}
+		for _, id in { mine, theirs, other } do
+			local row = h.client:held(id)
+			table.insert(out, if row then "row" else "none")
+			for slot, cells in row and row.slots or {} :: any do
+				for stamp in cells do
+					table.insert(out, `{slot}:{stamp}`)
+				end
+			end
+		end
+		table.sort(out)
+		return table.concat(out, ",")
+	end
+	local function refused(scope: number, f: (any) -> (), why: string)
+		local before = held()
+		local fine, err = pcall(function()
+			h.client:write(scope, f)
+		end)
+		assert(not fine and string.find(tostring(err), why, 1, true), `refused for {err}, not {why}`)
+		assert(held() == before, "something of it was done")
+	end
+	for _, case in { { 1, theirs }, { 1, other }, { 3, mine } } do
+		local scope, id = case[1] :: number, case[2] :: string
+		refused(scope, function(change)
+			change.set(id, Note, { title = "x" })
+		end, "another scope")
+		refused(scope, function(change)
+			change.place(id, "a", 2)
+		end, "another scope")
+		refused(scope, function(change)
+			change.delete(id)
+		end, "another scope")
+		refused(scope, function(change)
+			change.edit(id, 17, function(t, fresh)
+				zsp.Text.insert(t, 0, "x", fresh)
+			end)
+		end, "another scope")
+	end
+	local later = "\0\0\0\1" .. string.pack(">I4", 1800000000 + 15 * 60 + 1) .. "12345678"
+	refused(1, function(change)
+		change.set(later, Note, { title = "x" })
+	end, "made later")
+	refused(1, function(change)
+		change.set(mine, { odd = table.freeze({ slot = 3, text = false, is = "string", encode = tostring, decode = tostring }) } :: any, { odd = "x" })
+	end, "slot 3")
+	refused(1, function(change)
+		change.place(mine, "a", 2, 0)
+	end, "slots 1 to 15")
+	refused(1, function(change)
+		change.place(mine, "a", -1)
+	end, "whole number")
+	refused(1, function(change)
+		change.set("short", Note, { title = "x" })
+	end, "16 bytes")
+	local editor = h.client:text(theirs, Note.body)
+	assert(not pcall(editor.append, "x"), "typed where it may not write")
+	editor.close()
+	h.run()
+	for k = said + 1, #h.self.said do
+		assert(h.self.said[k].kind ~= CELLS, "and something was written")
+	end
+	assert(h.client:held(later) == nil, "and is held")
+	-- A row made a little later than this client's clock, as by a device whose clock runs ahead, is written at a stamp
+	-- no earlier than it was made.
+	local soon = "\0\0\0\1" .. string.pack(">I4", 1800000060) .. "12345678"
+	h.client:write(1, function(change)
+		change.set(soon, Note, { title = "x" })
+	end)
+	h.run()
+	local written = (h.last(CELLS) :: Said).body
+	assert(codec.from_u64(string.sub(written, 20, 27)) >= 1800000060000 * 65536, "it was written before it was made")
+end
+
+-- What was written where this client may no longer write, since it was written, is not said again to the next pipe:
+-- a node would refuse it, and this client with it, for good.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	h.client:window({ scope = 1, list = "a", table = Note }, function() end)
+	h.run()
+	h.self.closed()
+	h.run()
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 1, { title = "offline" })
+	end)
+	h.run()
+	h.laters()
+	h.run()
+	local said = #h.self.said
+	h.tell(ROSTER, string.rep("\0", 8) .. "\1\5" .. string.rep("k", 32)) -- read and call, and no more
+	for k = said + 1, #h.self.said do
+		assert(h.self.said[k].kind ~= CELLS, "it was said")
+	end
+	h.self.closed()
+	h.run()
+	h.laters()
+	h.run()
+	h.greet()
+	for k = said + 1, #h.self.said do
+		assert(h.self.said[k].kind ~= CELLS, "it was said once it might be")
+	end
+end
+
+-- A pipe the node found fault with is dialled again later and later, as what this client says it would say again; one
+-- that was well, soon.
+do
+	local h = harness()
+	h.run()
+	local waits = {}
+	for _ = 1, 5 do
+		h.greet()
+		h.tell(ERROR, "\1")
+		h.self.closed()
+		h.run()
+		table.insert(waits, h.self.waits[#h.self.waits])
+		h.laters()
+		h.run()
+	end
+	assert(table.concat(waits, " ") == "0.1 0.2 0.4 0.8 1.6", `it was dialled again at once: {table.concat(waits, " ")}`)
+	h.greet()
+	h.self.closed()
+	h.run()
+	assert(h.self.waits[#h.self.waits] == 0.1, "and was slow to after a pipe that was well")
 end
 
 -- Before the scope is known every map's id is nothing: two maps are not taken for one another meanwhile.

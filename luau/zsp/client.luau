@@ -26,6 +26,7 @@ local ZERO32 = string.rep("\0", 32)
 local PIECE_BYTES = 4096 -- a piece is sealed at this size,
 local PIECE_SECONDS = 1 -- or this long after it began,
 local LIVE_SECONDS = 10 -- and live text unconfirmed for this long is dropped
+local LEAP_SECONDS = 15 * 60 -- a node refuses a stamp further ahead of its clock than this
 
 export type Wire = { send: (data: buffer) -> (), close: () -> () }
 export type Host = {
@@ -99,6 +100,7 @@ type Stored = {
 	dirty: { [number]: boolean }, -- slots with live text to send
 }
 type Said = { [string]: { [string]: boolean } }
+type Pending = { seq: number, scope: number, body: string, rows: { string }, done: () -> () }
 type Page = {
 	id: number,
 	window: Window,
@@ -244,7 +246,8 @@ local function new_client(host: Host)
 		hang_up = function() end,
 		ready = false,
 		closed = false,
-		failures = 0,
+		failures = 0, -- pipes in a row that never came up, or that the node found fault with
+		faulted = false, -- this pipe has: the node said so, or said nonsense
 		input = "",
 		clock_ms = 0,
 		clock_n = 0,
@@ -262,7 +265,7 @@ local function new_client(host: Host)
 		shapes = (setmetatable({}, { __mode = "k" }) :: any) :: { [Table]: number },
 		next_shape = 0,
 		seq = 0,
-		pending = {} :: { { seq: number, body: string, rows: { string }, done: () -> () } },
+		pending = {} :: { Pending },
 		unacked = {} :: { [string]: number }, -- rows in pending, and how often
 		out = codec.writer(),
 		flushing = false,
@@ -298,6 +301,7 @@ function Client._dial(self: Client)
 	end
 	self.input = ""
 	self.out = codec.writer()
+	self.faulted = false
 	wire = self.host.connect(function(data)
 		if not over then
 			self:_receive(data)
@@ -323,6 +327,7 @@ function Client._dial(self: Client)
 end
 
 function Client._lost(self: Client)
+	local well = self.ready and not self.faulted
 	self.wire = nil
 	self.ready = false
 	table.clear(self.authors)
@@ -351,6 +356,11 @@ function Client._lost(self: Client)
 	self:_sweep()
 	self:_tell("status", false)
 	if not self.closed then
+		-- Soon after a pipe that was well; later and later after each that never came up, or that the node found fault
+		-- with, since what this client says it would say again.
+		if well then
+			self.failures = 0
+		end
 		local wait = math.min(0.1 * 2 ^ self.failures, 10)
 		self.failures += 1
 		self.host.after(wait, function()
@@ -453,6 +463,7 @@ function Client._receive(self: Client, data: buffer | string)
 			p += 1
 			if p - at > 5 then -- no frame is so long
 				self.input = ""
+				self.faulted = true
 				self.hang_up()
 				return
 			end
@@ -476,6 +487,7 @@ function Client._receive(self: Client, data: buffer | string)
 			end
 			-- Nonsense from the pipe ends the pipe and nothing else.
 			self.input = ""
+			self.faulted = true
 			self.hang_up()
 			return
 		end
@@ -523,6 +535,7 @@ function Client._handle(self: Client, kind: number, r: codec.Reader)
 		self:_tell("devices", self.devices)
 	elseif kind == ERROR then
 		local code = codec.u8(r)
+		self.faulted = true
 		self.closed = code == 2 or code == 3 -- refused, or speaking another language: trying again is no use
 		self:_tell("error", code)
 	end
@@ -566,12 +579,17 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 		return
 	end
 	self.ready = true
-	self.failures = 0
-	-- Say again whatever the last pipe was told: what is served, unacknowledged and watched.
+	-- Say again whatever the last pipe was told: what is served, unacknowledged and watched. What this client may no
+	-- longer write in is let go of, never to be durable: a node would refuse it, and this client with it, for good.
 	for key in self.handlers do
 		self:_serve(key, true)
 	end
-	for _, p in self.pending do
+	for _, p in table.clone(self.pending) do
+		if not self:may(p.scope, "write") then
+			table.remove(self.pending, table.find(self.pending, p) :: number)
+			self:_settle(p)
+			continue
+		end
 		local w = codec.writer()
 		codec.put_varint(w, p.seq)
 		codec.put(w, p.body)
@@ -1861,7 +1879,7 @@ function Client._seal(self: Client, row: Stored, slot: number)
 	if not t or t.open == "" then
 		return
 	end
-	local stamp = self:_stamp()
+	local stamp = self:_stamp(row.id)
 	local body = text.close(t, stamp)
 	if body then
 		merge(row, slot, PIECE, stamp, body, self:_mine(string.unpack(">I4", row.id) :: any))
@@ -1874,7 +1892,9 @@ end
 -- become durable a piece at a time.
 function Client.text(self: Client, id: string, col: Column)
 	assert(col.text, "not a text column")
+	assert(type(id) == "string" and #id == 16, "a row's id is 16 bytes")
 	local slot = col.slot
+	local scope: number = string.unpack(">I4", id) :: any
 	local early: { () -> () }? = if self.rows[id] then nil else {} -- what is done before there is a row to do it to
 	local row = self:_row(id)
 	row.held[slot] = (row.held[slot] or 0) + 1
@@ -1900,6 +1920,7 @@ function Client.text(self: Client, id: string, col: Column)
 	end
 	local function edit(f: (text.Text) -> ())
 		assert(not closed and not row.dead, "the text is closed")
+		self:_may_write(id, scope)
 		if early then
 			table.insert(early, function()
 				f(self:_text(row, slot))
@@ -2008,7 +2029,12 @@ function Client._heard(self: Client, stamp: string)
 	end
 end
 
-function Client._stamp(self: Client): string
+-- A stamp for a cell of a row: no earlier than the row was made, for no cell is older than its row.
+function Client._stamp(self: Client, row: string): string
+	local born = (string.unpack(">I4", row, 5) :: any) * 1000
+	if born > self.clock_ms then
+		self.clock_ms, self.clock_n = born, 0
+	end
 	local ms = math.floor(self.host.now() * 1000)
 	if ms > self.clock_ms then
 		self.clock_ms, self.clock_n = ms, 0
@@ -2023,7 +2049,26 @@ end
 
 type Written = { row: string, slot: number, kind: number, stamp: string, body: string }
 
+-- A row this client may write in now, as far as it knows: what a node refuses, it refuses for good, ending the pipe and
+-- this client with it. One made later than a stamp of this client's may be ahead of the clock is never written.
+function Client._may_write(self: Client, id: string, scope: number)
+	if type(id) ~= "string" or #id ~= 16 then
+		error("a row's id is 16 bytes", 3)
+	elseif string.unpack(">I4", id) ~= scope then
+		error("that row is of another scope", 3)
+	elseif self.ready and not self:may(scope, "write") then
+		error("this client may not write there", 3)
+	elseif (string.unpack(">I4", id, 5) :: any) > self.host.now() + LEAP_SECONDS then
+		error("that row was made later than any clock may yet say", 3)
+	end
+end
+
 function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
+	local scope: number = string.unpack(">I4", cells[1].row) :: any
+	-- What this client may no longer write in, since it began, is never said: a node refuses it, and this client with it.
+	if self.ready and not self:may(scope, "write") then
+		return
+	end
 	local w = codec.writer()
 	local last = ""
 	local rows: { string } = {}
@@ -2044,7 +2089,7 @@ function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
 	end
 	self.seq += 1
 	local body = codec.string(w)
-	table.insert(self.pending, { seq = self.seq, body = body, rows = rows, done = done or function() end })
+	table.insert(self.pending, { seq = self.seq, scope = scope, body = body, rows = rows, done = done or function() end })
 	if self.ready then
 		local framed = codec.writer()
 		codec.put_varint(framed, self.seq)
@@ -2055,16 +2100,21 @@ end
 
 function Client._on_ack(self: Client, seq: number)
 	while #self.pending > 0 and self.pending[1].seq <= seq do
-		local p = table.remove(self.pending, 1) :: any
-		for _, id in p.rows do
-			local n = self.unacked[id] - 1
-			self.unacked[id] = if n > 0 then n else nil
-			local row = self.rows[id]
-			if n == 0 and row and row.pages == 0 and next(row.held) == nil then
-				self.rows[id] = nil
-			end
-		end
+		local p = table.remove(self.pending, 1) :: Pending
+		self:_settle(p)
 		p.done()
+	end
+end
+
+-- What was written is pending no more: its rows are let go of, unless something else holds them.
+function Client._settle(self: Client, p: Pending)
+	for _, id in p.rows do
+		local n = self.unacked[id] - 1
+		self.unacked[id] = if n > 0 then n else nil
+		local row = self.rows[id]
+		if n == 0 and row and row.pages == 0 and next(row.held) == nil then
+			self.rows[id] = nil
+		end
 	end
 end
 
@@ -2116,7 +2166,10 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	end
 	local function put(row: string, slot: number, kind: number, body: string)
 		assert(#body <= MAX_OPEN, "a value may be 1 MiB at most, less 192 bytes")
-		local stamp = self:_stamp()
+		if not sound(kind, slot, body) then
+			error(`no cell of kind {kind} goes in slot {slot}`, 0) -- as a column made by hand may say
+		end
+		local stamp = self:_stamp(row)
 		keep(row, slot)
 		rows[row] = true
 		table.insert(cells, { row = row, slot = slot, kind = kind, stamp = stamp, body = body })
@@ -2134,7 +2187,17 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 		end
 	end
 	local function place(id: string, list: string, order: number, slot: number?)
+		if type(order) ~= "number" or order < 0 or order > 9007199254740991 or order ~= math.floor(order) then
+			error("an order is a whole number from 0 to 2^53", 0)
+		elseif slot ~= nil and (type(slot) ~= "number" or slot < 1 or slot > 15 or slot ~= math.floor(slot)) then
+			error("a row is placed in slots 1 to 15", 0)
+		end
 		put(id, slot or 1, PLACE, self:_tag(scope, list) .. codec.u64(order))
+	end
+	-- A row of this scope: what a change does to a row of another is refused, and the whole change with it, by any node.
+	local function writable(id: string): string
+		self:_may_write(id, scope)
+		return id
 	end
 	local change: Change = {
 		insert = function(schema, list, order, values)
@@ -2149,13 +2212,18 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			set(id, schema, values)
 			return id
 		end,
-		set = set,
-		place = place,
+		set = function(id, schema, values)
+			set(writable(id), schema, values)
+		end,
+		place = function(id, list, order, slot)
+			place(writable(id), list, order, slot)
+		end,
 		delete = function(id)
-			put(id, 0, GRAVE, "")
+			put(writable(id), 0, GRAVE, "")
 		end,
 		edit = function(id, slot, f)
 			assert(slot >= 16 and slot <= 255, "data slots are 16 to 255")
+			writable(id)
 			local row = self:_row(id)
 			if row.texts[slot] and row.texts[slot].open ~= "" then
 				self:_seal(row, slot) -- what an editor has open goes first
@@ -2165,7 +2233,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 			f(t, function(): string
 				return self.host.random(8)
 			end)
-			local stamp = self:_stamp()
+			local stamp = self:_stamp(id)
 			local body = text.close(t, stamp)
 			if body then
 				assert(#body <= MAX_OPEN, "an edit may be 1 MiB at most, less 192 bytes")

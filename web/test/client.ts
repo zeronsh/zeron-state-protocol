@@ -33,6 +33,7 @@ function harness() {
     closed: undefined as unknown as () => void,
     deferred: [] as (() => void)[],
     later: [] as (() => void)[],
+    waits: [] as number[], // what each of those waits
     closes: 0,
     connects: 0,
     sizes: [] as number[],
@@ -46,8 +47,9 @@ function harness() {
     now: () => 1800000000000,
     random: (n) => Uint8Array.from({ length: n }, () => Math.floor(Math.random() * 256)),
     defer: (f) => self.deferred.push(f),
-    after: (_ms, f) => {
+    after: (ms, f) => {
       self.later.push(f);
+      self.waits.push(ms);
       return () => {};
     },
     connect: (receive, closed) => {
@@ -555,6 +557,102 @@ for (const bad of [
   const tag = () => rep("\0", 16);
   const typos = (n: number) => s(ask.write({ scope: 1, table: Note, where: where.matches("title", "x", { typos: n as 1 }) }, tag)[0]);
   assert.equal(typos(1.5), typos(1));
+}
+
+// What a node would refuse, and end the pipe for, never leaves the client, and throws where it is asked for: a row of
+// another scope, whatever this client may do there; one made later than any clock may yet say; a cell where a column made
+// by hand puts one that no node takes. Nothing of the change is done.
+{
+  const h = harness();
+  h.run();
+  h.tell(ROSTER, rep("\0", 8) + "\x01\x07" + rep("k", 32) + "\x02\x01" + rep("k", 32) + "\x03\x07" + rep("k", 32));
+  h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  h.run();
+  let mine = "";
+  void h.client.write(1, (change) => (mine = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  const theirs = "00000002" + "6b49d200" + "0102030405060708", other = "00000003" + "6b49d200" + "0102030405060708";
+  const said = h.self.said.length;
+  // What is held of the rows, cell by cell.
+  const held = () =>
+    [mine, theirs, other]
+      .flatMap((id) => {
+        const row = h.client.held(id);
+        return row ? ["row", ...[...row.slots].flatMap(([slot, cells]) => [...cells.keys()].map((stamp) => `${slot}:${codec.hex(stamp)}`))] : ["none"];
+      })
+      .sort()
+      .join();
+  for (const [scope, id] of [[1, theirs], [1, other], [3, mine]] as const) {
+    const before = held();
+    assert.throws(() => h.client.write(scope, (change) => change.set(id, Note, { title: "x" })), /another scope/);
+    assert.throws(() => h.client.write(scope, (change) => change.place(id, "a", 2)), /another scope/);
+    assert.throws(() => h.client.write(scope, (change) => change.delete(id)), /another scope/);
+    assert.throws(() => h.client.write(scope, (change) => change.edit(id, 17, (t, fresh) => text.insert(t, 0, "x", fresh))), /another scope/);
+    assert.equal(held(), before, "something of it was done");
+  }
+  const later = "00000001" + codec.hex(codec.u32Binary(1800000000 + 15 * 60 + 1)) + "0102030405060708";
+  assert.throws(() => h.client.write(1, (change) => change.set(later, Note, { title: "x" })), /made later/);
+  assert.throws(() => h.client.write(1, (change) => change.set(mine, { odd: { ...c.string(16), slot: 3 } }, { odd: "x" })), /slot 3/);
+  const editor = h.client.text(theirs, Note.body);
+  assert.throws(() => editor.append("x"), /may not write/);
+  editor.close();
+  h.run();
+  assert(!h.self.said.slice(said).some((x) => x.kind === CELLS), "and something was written");
+  assert(!h.client.held(later), "and is held");
+  // A row made a little later than this client's clock, as by a device whose clock runs ahead, is written at a stamp
+  // no earlier than it was made.
+  const soon = "00000001" + codec.hex(codec.u32Binary(1800000060)) + "0102030405060708";
+  void h.client.write(1, (change) => change.set(soon, Note, { title: "x" }));
+  h.run();
+  const written = b(h.last(CELLS)!.body);
+  assert(codec.fromU64(s(written.subarray(19, 27))) >= 1800000060000 * 65536, "it was written before it was made");
+}
+
+// What was written where this client may no longer write, since it was written, is not said again to the next pipe:
+// a node would refuse it, and this client with it, for good.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  h.run();
+  h.self.closed();
+  h.run();
+  void h.client.write(1, (change) => change.insert(Note, "a", 1, { title: "offline" }));
+  h.run();
+  h.laters();
+  h.run();
+  const said = h.self.said.length;
+  h.tell(ROSTER, rep("\0", 8) + "\x01\x05" + rep("k", 32)); // read and call, and no more
+  assert(!h.self.said.slice(said).some((x) => x.kind === CELLS), "it was said");
+  h.self.closed();
+  h.run();
+  h.laters();
+  h.run();
+  h.greet();
+  assert(!h.self.said.slice(said).some((x) => x.kind === CELLS), "it was said once it might be");
+}
+
+// A pipe the node found fault with is dialled again later and later, as what this client says it would say again; one
+// that was well, soon.
+{
+  const h = harness();
+  h.run();
+  const waits: number[] = [];
+  for (let i = 0; i < 5; i++) {
+    h.greet();
+    h.tell(ERROR, "\x01");
+    h.self.closed();
+    h.run();
+    waits.push(h.self.waits[h.self.waits.length - 1]);
+    h.laters();
+    h.run();
+  }
+  assert.deepEqual(waits, [100, 200, 400, 800, 1600], "it was dialled again at once");
+  h.greet();
+  h.self.closed();
+  h.run();
+  assert.equal(h.self.waits[h.self.waits.length - 1], 100, "and was slow to after a pipe that was well");
 }
 
 // A change that throws in the middle of an edit leaves nothing of the edit to be sent later; and what an editor had typed
