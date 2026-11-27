@@ -1885,6 +1885,81 @@ wants_cost_little :: proc(t: ^testing.T) {
 	testing.expectf(t, l.most <= 2 * len(w), "made %d bytes at once of a frame of %d", l.most, len(w))
 }
 
+// What a peer asks to be sent is queued as so many tasks as it said, however much the rows hold and however often it
+// asks: a run of cells a row lacks is one, and so is a range it holds nothing of.
+@(test)
+asking_queues_no_more_than_was_said :: proc(t: ^testing.T) {
+	state := seeded(87)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 1, 1, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a := s.nodes[0]
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	at_a := s.links[0].b
+	testing.expect(t, !at_a.peer_full)
+	row := node_id(&a.node, 1)
+	body: [24]byte
+	put_u64(body[:], 1 << 32 | 5)
+	put_u64(body[8:], 5)
+	cells := make([dynamic]Cell, context.temp_allocator)
+	append(&cells, Cell{row, PLACE, .Place, node_stamp(&a.node), body[:]})
+	for i in 0 ..< 49 {
+		append(&cells, Cell{row, DATA + Slot(i), .Value, node_stamp(&a.node), transmute([]byte)string("x")})
+	}
+	for _ in 0 ..< 100 {
+		append(&cells, Cell{node_id(&a.node, 1), PLACE, .Place, node_stamp(&a.node), body[:]})
+	}
+	testing.expect(t, node_write(&a.node, cells[:]))
+	tasks :: proc(s: ^Session) -> int {
+		return len(s.tasks) - s.task_head + len(s.first) - s.first_head
+	}
+	REPEATS :: 2000
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Want)
+	write_u8(&w, 1)
+	write_varint(&w, REPEATS)
+	for _ in 0 ..< REPEATS {
+		write_u64(&w, row[0])
+		write_u64(&w, row[1])
+		write_varint(&w, 1)
+		append(&w, 0, 0)
+		write_stamp(&w, {999, 999}) // that it holds what is not there
+	}
+	frame_end(&w, at)
+	before := tasks(at_a)
+	testing.expect(t, session_input(at_a, w[:]))
+	testing.expectf(t, tasks(at_a) - before <= REPEATS, "%d tasks of %d asked", tasks(at_a) - before, REPEATS)
+
+	watch := make([dynamic]byte, context.temp_allocator)
+	at = frame_begin(&watch, .Watch)
+	write_varint(&watch, 1)
+	append(&watch, 1)
+	write_key(&watch, scope_lo(1))
+	write_key(&watch, scope_hi(1))
+	write_varint(&watch, 0)
+	frame_end(&watch, at)
+	testing.expect(t, session_input(at_a, watch[:]))
+	recon := make([dynamic]byte, context.temp_allocator)
+	at = frame_begin(&recon, .Recon)
+	write_varint(&recon, 0)
+	write_key(&recon, scope_lo(1))
+	write_key(&recon, scope_hi(1))
+	append(&recon, u8(Part.Print))
+	write_varint(&recon, 0)
+	write_u64(&recon, 0)
+	write_u64(&recon, 0)
+	frame_end(&recon, at)
+	before = tasks(at_a)
+	for _ in 0 ..< 50 {
+		testing.expect(t, session_input(at_a, recon[:]))
+	}
+	testing.expectf(t, tasks(at_a) - before <= 50, "%d tasks of 50 asked", tasks(at_a) - before)
+	sim_settle(&s)
+}
+
 @(private, thread_local)
 signalled: [dynamic]Key32
 
