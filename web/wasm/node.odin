@@ -585,10 +585,12 @@ conn_drop :: proc(c: ^Conn) {
 		hangup(c.id)
 	}
 	// A session the relay was ready for and that ended of nothing but the connection going is no failure: dialled again
-	// soon. One that ended for a reason, the relay's or this end's, as a device the relay turns away has, is.
-	clean := false
+	// soon. One that ended for a reason, the relay's or this end's, as a device the relay turns away has, is. One that
+	// only waited for a roster neither end had is neither: see dialer_failed.
+	clean, waited := false, false
 	if c.session != nil {
-		clean = (c.admitted || c.session.ready || zsp.session_waited(c.session)) && c.session.fault == .None
+		clean = (c.admitted || c.session.ready) && c.session.fault == .None
+		waited = !clean && zsp.session_waited(c.session) && c.session.fault == .None
 		zsp.session_close(c.session)
 	}
 	if c.handshake != nil {
@@ -599,7 +601,7 @@ conn_drop :: proc(c: ^Conn) {
 		if clean {
 			d.failures = 0
 		}
-		dialer_failed(d)
+		dialer_failed(d, waited)
 	}
 	free(c)
 }
@@ -697,9 +699,13 @@ dial_relay :: proc(key: zsp.Key32, url: string, pinned: bool) {
 
 // Tries again, soon at first and then ever less often.
 @(private)
-dialer_failed :: proc(d: ^Dialer) {
+dialer_failed :: proc(d: ^Dialer, waited := false) {
 	wait := 200 * f64(u64(1) << uint(min(d.failures, 8)))
-	d.failures += 1
+	if waited {
+		wait = 1000 // as host/stream.odin's WAITED_REDIAL: soon after a roster comes, and never in a storm
+	} else {
+		d.failures += 1
+	}
 	jitter: [1]byte
 	crypto.rand_bytes(jitter[:])
 	d.due = now() + wait + wait * f64(jitter[0] % 64) / 128

@@ -267,8 +267,9 @@ turned_away_backs_off :: proc(t: ^testing.T) {
 }
 
 // A device that has joined, with no roster yet, waits at a relay that has none either, ready for nothing, as the relay
-// waits for it; and let go of only for waiting so long, it dials again soon, not ever later: it failed at nothing, and
-// the roster may come at any moment.
+// waits for it; and let go of only for waiting so long, it dials again in WAITED_REDIAL, not ever later: it failed at
+// nothing, and the roster may come at any moment. Nor does that count as having been let in, which would let a relay
+// that lets it go at once have it dial again at once, for ever.
 @(test)
 waiting_for_a_roster_is_no_failure :: proc(t: ^testing.T) {
 	w: World
@@ -290,5 +291,7 @@ waiting_for_a_roster_is_no_failure :: proc(t: ^testing.T) {
 	w.hosts[0].streams[0].due = time.tick_now() // as though HANDSHAKE_WAIT had passed
 	gone :: proc(w: ^World, _: rawptr) -> bool {return w.hosts[2].dialers[0].stream == nil}
 	testing.expect(t, world_run(&w, gone, nil, 5 * time.Second), "the relay never let b go")
-	testing.expectf(t, d.failures == 1, "waiting was counted a failure: %d failures, where a clean end makes it 1", d.failures)
+	testing.expectf(t, d.failures == 5, "waiting was counted a failure, or a success: %d failures, from 5", d.failures)
+	wait := time.tick_diff(time.tick_now(), d.due)
+	testing.expectf(t, wait <= WAITED_REDIAL * 3 / 2, "b dials again in %v, not soon", wait)
 }

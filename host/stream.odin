@@ -20,6 +20,9 @@ PONG_WAIT :: 15 * time.Second
 // From a connection's first byte to a session ready on it, at most: one that is not by then, its handshakes stalled or
 // never begun, as anyone may leave one, is let go of, and with it whatever it held.
 HANDSHAKE_WAIT :: 15 * time.Second
+
+// How soon a relay is dialled again after a session that only waited there for a roster neither end had: see dialer_lost.
+WAITED_REDIAL :: time.Second
 MAX_PLAIN :: 60 << 10 // per Noise message
 
 Stream :: struct {
@@ -711,10 +714,14 @@ dialer_resolved :: proc(d: ^Dialer) {
 
 // Tries again, soon at first and then ever less often.
 @(private)
-dialer_failed :: proc(d: ^Dialer) {
+dialer_failed :: proc(d: ^Dialer, waited := false) {
 	wait := 200 * time.Millisecond << uint(min(d.failures, 8))
+	if waited {
+		wait = WAITED_REDIAL
+	} else {
+		d.failures += 1
+	}
 	wait += wait * time.Duration(time.tick_now()._nsec % 64) / 128
-	d.failures += 1
 	d.state = .Waiting
 	d.due = time.tick_add(time.tick_now(), wait)
 	if debugging() {
@@ -723,15 +730,16 @@ dialer_failed :: proc(d: ^Dialer) {
 }
 
 // A session the relay was ready for and that ended of nothing but the connection going is no failure: dialled again
-// soon; nor is one that waited, as long as a relay lets it, for a roster neither end had. One that ended for a reason,
-// the relay's or this end's, as a device the relay turns away has, is: the relay is asked again ever less often, not
-// every quarter of a second for as long as it says no.
+// soon. One that ended for a reason, the relay's or this end's, as a device the relay turns away has, is: the relay is
+// asked again ever less often, not every quarter of a second for as long as it says no. And one that only waited for a
+// roster neither end had, as long as the relay let it, is neither: dialled again in WAITED_REDIAL, so that the roster
+// is heard of soon after it comes, whatever went before, and never in a storm, however soon a relay lets it go.
 @(private)
 dialer_lost :: proc(d: ^Dialer, fault: zsp.Fault, waited := false) {
 	report(.Debug, "no longer connected to the relay at ", d.source)
 	d.stream = nil
-	if (d.admitted || waited) && fault == .None {
+	if d.admitted && fault == .None {
 		d.failures = 0
 	}
-	dialer_failed(d)
+	dialer_failed(d, waited && !d.admitted && fault == .None)
 }

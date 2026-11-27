@@ -486,10 +486,11 @@ try {
   const mod = await loadModule();
   const node = await Node.open({ volume: new MemoryVolume(), module: mod, WebSocket: BridgeWS, log: () => {} });
   node.join(spaceId, { key: relayPub, url: "ws://relay.local" });
-  for (let i = 0; i < 400 && dials.length < 6; i++) await new Promise((r) => setTimeout(r, 10));
+  for (let i = 0; i < 1200 && dials.length < 6; i++) await new Promise((r) => setTimeout(r, 10));
   await node.close();
   const gaps = dials.slice(1).map((t, i) => Math.round(t - dials[i]));
-  // Turned away five times, it would wait 3.2 s or more before the sixth dial; waiting is no failure, so each is soon.
-  assert(dials.length >= 6 && gaps.every((g) => g < 2000), `dialled ${dials.length} times, at gaps of ${gaps.join(", ")} ms`);
+  // Turned away five times, it would wait 3.2 s or more before the sixth dial; waiting is no failure, so each is about a
+  // second, WAITED_REDIAL, and no sooner: a relay that lets it go at once has it dial no faster than that.
+  assert(dials.length >= 6 && gaps.every((g) => g >= 1000 && g < 2500), `dialled ${dials.length} times, at gaps of ${gaps.join(", ")} ms`);
   console.log(`ok   a web device waiting at a relay for a roster neither has dials again soon (${gaps.join(", ")} ms)`);
 } finally { rmSync(tmp7, { recursive: true, force: true }); }
