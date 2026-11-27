@@ -289,7 +289,8 @@ const tests: Record<string, () => Promise<void>> = {
     await call(b, "shout", "cl", 7);
     await call(b, "shout", "cl", { failed: 5 });
     await call(b, "shout", "cl", { credential: "poison", at: Number.MAX_VALUE, by: "z" });
-    await call(b, "shout", "cl", { credential: "poison", at: Date.now() + 3600000, by: "z" });
+    await call(b, "shout", "cl", { credential: "poison", at: Date.now() + 2 ** 41, by: "z" });
+    await call(b, "shout", "cl", { credential: "poison", at: 2 ** 52, by: "z" });
     const c = await page();
     await call(c, "device", "cl", "first"); // given now, and so newest, until b gives another
     await again("second");
@@ -357,8 +358,16 @@ const tests: Record<string, () => Promise<void>> = {
     await call(d, "setCredential", "cc", "second");
     await call(d, "put", "cc", "notes", ["two"]);
     await eventually(() => titles.split(",").includes("two"), "what a tab whose clock is behind gives is taken as newer", 20000);
+    // Given as the tab is put away, before its worker hears of it: its next worker gives it, as newest still.
+    await again("third");
+    const paused = d.workers[d.workers.length - 1]; // and so hears of nothing, until it is stopped
+    await d.cdp("Debugger.enable", {}, paused);
+    await d.cdp("Debugger.pause", {}, paused);
+    await call(d, "setCredentialAndFreeze", "cc", "third");
+    await call(d, "put", "cc", "notes", ["two again"]);
+    await eventually(() => titles.split(",").includes("two again"), "a credential given as its tab was put away is given by its next worker", 20000);
     await gone(a); // d runs it now, presenting what it gave
-    await again("second");
+    await again("third");
     await call(d, "put", "cc", "notes", ["three"]);
     await eventually(() => titles.split(",").includes("three"), "and it is presented by the tab whose clock is behind, running it", 20000);
     // And a tab opened after with none of its own presents the newest given, however far ahead of its clock.
@@ -366,7 +375,7 @@ const tests: Record<string, () => Promise<void>> = {
     await e.evaluate("(() => { const was = Date.now; Date.now = () => was() - 600000; return 1; })()");
     await call(e, "device", "cc");
     await gone(d);
-    await again("second");
+    await again("third");
     await call(e, "put", "cc", "notes", ["four"]);
     await eventually(() => titles.split(",").includes("four"), "a tab whose clock is behind presents the newest given, given ahead of it", 20000);
     watching?.close();

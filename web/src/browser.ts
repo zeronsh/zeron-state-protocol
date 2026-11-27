@@ -37,7 +37,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   // never taken for newer than what another tab gave since. By the clock workers judge it by.
   let credential = options.credential;
   let credentialAt = Date.now();
-  let begun = false; // a worker started
+  let taken = false; // by a worker this tab started: given again to the next as it was, rather than anew
   // The worker: none while the tab is frozen or put away in the back/forward cache, for a frozen worker holds the store,
   // and every tab of the origin would wait for this one to come back. It is stopped as the tab is, for it cannot stop
   // itself in time, and that lets go of the store as a closed tab does; and it is started again when the tab is back.
@@ -60,8 +60,12 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   const start = () => {
     const w = (worker = new Worker(options.worker ?? new URL("./worker.js", import.meta.url), { type: "module", name: "zsp" }));
     w.onerror = (e) => w === worker && fail(new Error(e.message || "the worker could not be started"));
+    const giving = credential;
+    let heard = false;
     w.onmessage = (e: MessageEvent<Report>) => {
       if (w !== worker) return; // one stopped as the tab went away: what was on its way from it is not so now
+      // Anything it says, it says having been opened, and so having taken what it was given, if it is the tab's still.
+      if (!heard) (heard = true), giving !== undefined && credential === giving && (taken = true);
       const r = e.data;
       if ("failed" in r) return fail(new Error(r.failed));
       if ("space" in r) return void (space = r.space);
@@ -75,8 +79,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       if (r.error !== undefined) a?.reject(new Error(r.error));
       else a?.resolve(r.value);
     };
-    w.postMessage({ open: { name, full: options.full, keep: options.keep, credential, credentialAt, credentialAgain: begun, wasm: options.wasm?.toString() } } satisfies Command);
-    begun = true; // what it gives the next it starts, it gave this one
+    w.postMessage({ open: { name, full: options.full, keep: options.keep, credential, credentialAt, credentialAgain: taken, wasm: options.wasm?.toString() } } satisfies Command);
     for (const [id, a] of answers) w.postMessage({ ask: id, op: a.op, args: a.args } satisfies Command);
     for (const port of ports.splice(0)) w.postMessage({ connect: port } satisfies Command, [port]);
     for (const [id, t] of timers) w.postMessage({ after: id, ms: Math.max(0, t.due - Date.now()) } satisfies Command);
@@ -97,7 +100,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     worker = undefined;
     for (const [id, a] of answers) {
       if (a.op === "close") answers.delete(id), a.resolve(undefined); // stopped, as a closed tab's is
-      else if (a.op === "credential") answers.delete(id), a.resolve(credentialAt); // given by the next worker, as it was given
+      else if (a.op === "credential") answers.delete(id), a.resolve(credentialAt); // given anew by the next worker, not taken by this
       else if (!again.has(a.op)) answers.delete(id), a.reject(new Error("the tab was put away as this was asked, which may or may not have been done"));
     }
     for (const breakOff of [...pipes]) breakOff(); // every client here dials again, once the tab is back
@@ -204,7 +207,9 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     setCredential: async (c: string | Uint8Array) => {
       credential = c; // for whichever worker this tab starts next
       credentialAt = Date.now();
-      credentialAt = await ask<number>("credential", c, credentialAt); // as given: no earlier than any it knew of
+      taken = false;
+      const at = await ask<number>("credential", c, credentialAt);
+      if (credential === c) (credentialAt = at), (taken = true); // as given: no earlier than any it knew of
     },
     connect,
     client: (host = {}) => new Client({ after, ...host, connect }),

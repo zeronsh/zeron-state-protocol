@@ -155,12 +155,13 @@ function present(): void {
 
 // Another tab's: taken if it is newer than any this worker knows of, unless it was given before what this worker's own tab
 // gave anew, which is then given again as newer. Anything on the channel is of this origin, which may open the device and
-// do as it likes with it anyway; but what is not a credential is not taken as one, nor one said to have been given so late
-// that what is given after it could not be counted later still. Not judged by this worker's clock, which may have been set
-// back since others' gave what they did, by however much: what is given here after it is given later anyway.
+// do as it likes with it anyway; but what is not a credential is not taken as one, nor one said to have been given further
+// ahead of any this worker knows of, or of its time, than any clock could be: what is given after it would be later still,
+// and at last too late to be counted. Judged by what it knows as much as by its clock, which may have been set back since
+// the others gave what they did: what is given here after it is given later anyway.
 function heardGiven(g: Given): void {
   if (!(typeof g.credential === "string" || g.credential instanceof Uint8Array) || typeof g.at !== "number" || typeof g.by !== "string") return;
-  if (!(g.at > 0 && g.at <= LATEST) || !newer(g)) return;
+  if (!(g.at > 0 && g.at <= Math.max(Date.now(), newest?.at ?? 0) + AHEAD) || !newer(g)) return;
   if (g.old === true && mine && mine === newest) {
     give(mine.credential, g.at + 1, true); // what this tab gave since stays the newest
     return;
@@ -170,7 +171,7 @@ function heardGiven(g: Given): void {
   present();
 }
 
-const LATEST = 2 ** 52; // past this, a millisecond more is not counted exactly, and so nothing given after could be newer
+const AHEAD = 2 ** 40; // ms, some thirty years: more than any clock is wrong by, and less than counting can be thrown out by
 
 // Gets in line for the store. Whoever holds its lock runs the node, for as long as its tab lives; one whose node stopped,
 // or never started, gets in line again when it is next wanted, by its tab asking or dialling, and tries again then: so a

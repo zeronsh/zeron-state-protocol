@@ -80,6 +80,13 @@ const zsp = {
   async join(name: string, space: string, relay: { key: string; url: string }): Promise<void> {
     await devices.get(name)!.join(space, relay);
   },
+  /** Gives a credential, and is put away and back at once, before its worker can have heard of it. */
+  async setCredentialAndFreeze(name: string, credential: string): Promise<void> {
+    const given = devices.get(name)!.setCredential(credential);
+    document.dispatchEvent(new Event("freeze"));
+    document.dispatchEvent(new Event("resume"));
+    await given;
+  },
   /** Presents this to relays from now on. */
   async setCredential(name: string, credential: string): Promise<void> {
     await devices.get(name)!.setCredential(credential);
