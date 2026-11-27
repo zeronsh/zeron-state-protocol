@@ -208,7 +208,7 @@ Orders are public to it, so derive them from time or rank rather than content.
 A slot holding text is at most one `Value` (a whole text) and `Piece`s and `Bundle`s with later stamps. The text is a function of
 that set alone. Elements are UTF-8 bytes; applications edit at character boundaries.
 
-A piece's open body is id (8, random, nonzero) ‖ operations. A bundle's, after its clear prefix, is any number of
+A piece's open body is id (8, random, nonzero) ‖ operations; one shorter than an id is no piece of the text. A bundle's, after its clear prefix, is any number of
 stamp (16) ‖ id (8) ‖ operations (bytes), ascending by stamp. A `Value` acts as a piece whose id is its salt, or 1 if that is zero, and whose one operation
 inserts its body into an empty text.
 
@@ -225,7 +225,8 @@ element, other than `left`, that hangs beneath `left`, however far down (everyth
 Each further element hangs on the right of the one before it. The text is the tree read in order: for each element, what hangs on its left, then itself,
 then what hangs on its right; what hangs on one side, each with all beneath it, in order of piece id and then of number. Whatever anyone says of
 neighbours, then, the text is a function of the set of pieces alone, and where they were honest the insertion is where it was typed. Operations apply in
-order within a piece; one that refers to what is not yet present waits, with the rest of its piece, until it is. (Two open pieces may refer to each
+order within a piece; one that refers to what is not yet present waits, with the rest of its piece, until it is. What is no operation, or refers to what its own
+piece has yet to make, never will be, and nor will the rest of its piece. (Two open pieces may refer to each
 other, so pieces are never applied all-or-nothing.)
 
 Nobody need walk the tree: siblings, each with all beneath it, lie one stretch after another, so a place is found by halving; and an ancestor at any
