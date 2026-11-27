@@ -893,6 +893,30 @@ for (const code of [2, 3]) {
   assert.equal(fault, "unreachable");
 }
 
+// One function that observes, hears or follows twice is two that do: stopping one leaves the other.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let heard = 0, seen = 0, followed = 0;
+  const hear = () => void heard++, see = () => void seen++, follow = () => void followed++;
+  const stopHearing = h.client.on("error", hear);
+  h.client.on("error", hear);
+  const one = h.client.window({ scope: 1, list: "a", table: Note }, see);
+  h.client.window({ scope: 1, list: "a", table: Note }, see);
+  const stopFollowing = h.client.follow(follow);
+  h.client.follow(follow);
+  h.run();
+  stopHearing();
+  one.stop();
+  stopFollowing();
+  heard = seen = followed = 0;
+  void h.client.write(1, (change) => change.insert(Note, "a", 1, { title: "t" }));
+  h.tell(ERROR, "\x04");
+  h.run();
+  assert.deepEqual([heard, seen, followed], [1, 1, 1], "heard, seen, followed");
+}
+
 // What is sent for an answer waits for it, and what another answer shows outlives the one that stops.
 {
   const h = harness();

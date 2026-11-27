@@ -667,7 +667,11 @@ end
 function Client.on(self: Client, what: "status" | "devices" | "self" | "error", f: (any) -> ()): () -> ()
 	local set = self.watchers[what] or {}
 	self.watchers[what] = set
-	set[f] = true
+	-- Each is its own, though the same function hear twice: stopping one stops no other.
+	local function own(value: any)
+		f(value)
+	end
+	set[own] = true
 	if what == "status" then
 		f(self.ready)
 	elseif what == "devices" then
@@ -676,7 +680,7 @@ function Client.on(self: Client, what: "status" | "devices" | "self" | "error", 
 		f(self.authors[0])
 	end
 	return function()
-		set[f] = nil
+		set[own] = nil
 	end
 end
 
@@ -751,9 +755,13 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 		linger()
 		window.linger = nil
 	end
-	window.observers[observer] = true
+	-- Each observer is its own, though the same function observe twice.
+	local function own(state: State)
+		observer(state)
+	end
+	window.observers[own] = true
 	window.watching += 1
-	observer(if window.bare then nil :: any else self:_state(window))
+	own(if window.bare then nil :: any else self:_state(window))
 	local stopped = false
 
 	return table.freeze({
@@ -776,7 +784,7 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 				return
 			end
 			stopped = true
-			window.observers[observer] = nil
+			window.observers[own] = nil
 			window.watching -= 1
 			if window.watching == 0 then
 				-- Whoever comes back soon finds it still warm.
@@ -2086,9 +2094,12 @@ end
 
 -- Hears of every row that changes, here or anywhere, by its id. Returns a way to stop.
 function Client.follow(self: Client, f: (string) -> ()): () -> ()
-	self.followers[f] = true
+	local function own(id: string) -- its own, though the same function follow twice
+		f(id)
+	end
+	self.followers[own] = true
 	return function()
-		self.followers[f] = nil
+		self.followers[own] = nil
 	end
 end
 

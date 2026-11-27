@@ -822,11 +822,13 @@ export class Client {
   on<E extends Event>(what: E, f: (value: Told[E]) => void): () => void {
     let set = this.#watchers.get(what);
     if (!set) this.#watchers.set(what, (set = new Set()));
-    set.add(f);
+    // Each is its own, though the same function hear twice: stopping one stops no other.
+    const own = (value: Told[E]) => f(value);
+    set.add(own);
     if (what === "status") (f as (v: boolean) => void)(this.#ready);
     else if (what === "devices") (f as (v: readonly Device[]) => void)(this.#devices);
     else if (what === "self" && this.#authors.has(0)) (f as (v: Device) => void)(this.#authors.get(0)!);
-    return () => void set.delete(f);
+    return () => void set.delete(own);
   }
 
   /** Whether the pipe is up and the node has said what this client may do. */
@@ -1847,8 +1849,9 @@ export class Client {
 
   /** Hears of every row that changes, here or anywhere, by its id. Returns a way to stop. */
   follow(f: (id: string) => void): () => void {
-    this.#followers.add(f);
-    return () => void this.#followers.delete(f);
+    const own = (id: string) => f(id); // its own, though the same function follow twice
+    this.#followers.add(own);
+    return () => void this.#followers.delete(own);
   }
 
   /** A row as it is held: its cells by slot and stamp, or undefined. Not to be changed. */

@@ -739,6 +739,66 @@ do
 	assert(fault == "unreachable", `told {fault}`)
 end
 
+-- A client that is closed is not connected, says so, and what it was calling is lost, at once: whether or not its host
+-- says the pipe closed, as this one does not.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local told = {}
+	h.client:on("status", function(up)
+		table.insert(told, tostring(up))
+	end)
+	local call = h.client:call(string.rep("d", 32), 1, "m", "x")
+	local fault = ""
+	call.on_fault = function(f)
+		fault = f
+	end
+	h.run()
+	h.client:close()
+	h.run()
+	assert(not h.client.ready, "it is connected")
+	assert(table.concat(told :: any, " ") == "true false", "and does not say otherwise")
+	assert(fault == "lost", `what it was calling is {fault}`)
+	h.laters()
+	h.run()
+	assert(h.self.connects == 1, "and it dials again")
+end
+
+-- One function that observes, hears or follows twice is two that do: stopping one leaves the other.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local heard, seen, followed = 0, 0, 0
+	local function hear()
+		heard += 1
+	end
+	local function see()
+		seen += 1
+	end
+	local function follow()
+		followed += 1
+	end
+	local stop_hearing = h.client:on("error", hear)
+	h.client:on("error", hear)
+	local one = h.client:window({ scope = 1, list = "a", table = Note }, see)
+	h.client:window({ scope = 1, list = "a", table = Note }, see)
+	local stop_following = h.client:follow(follow)
+	h.client:follow(follow)
+	h.run()
+	stop_hearing()
+	one.stop()
+	stop_following()
+	heard, seen, followed = 0, 0, 0
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.tell(ERROR, "\4")
+	h.run()
+	assert(heard == 1 and seen == 1 and followed == 1, `heard {heard}, seen {seen}, followed {followed}`)
+end
+
 -- What is sent for an answer waits for it, and what another answer shows outlives the one that stops.
 do
 	local ASK, UNASK, ANSWER = 32, 33, 34
