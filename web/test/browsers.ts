@@ -426,7 +426,8 @@ const partialBench = async () => {
     { name: "poor: 1.6 Mbit/s, 300 ms round trip", slow: { bytesPerSecond: 200_000, latency: 150 } },
   ];
   for (const net of networks.filter((n) => !process.env.NET || n.name.startsWith(process.env.NET))) {
-    const relay = await node("serve", join(TMP, `pb-${results.length}-relay`));
+    // A relay here, optimised; or, with CLOUD=wss://…, a Durable Object deployed, over the real network.
+    const relay = process.env.CLOUD ? await cloud() : await node("serve", join(TMP, `pb-${results.length}-relay`));
     const through = await proxy(relay.url, net.slow);
     const via = { key: relay.key, url: through.url };
     const s = await space(`pb-${results.length}`, via);
@@ -535,10 +536,67 @@ const partialBench = async () => {
   for (const r of results) console.log(`| ${r.join(" | ")} |`);
 };
 
+// Not a test, and not run unless named: `node test/browsers.ts profile [rows]`. Where a full replica in a browser spends
+// its time taking in a space: the worker's CPU profile, the functions that take most of it, and the profile kept.
+const profileSync = async () => {
+  const ROWS = Number(process.argv[3] ?? 20000), TEXTS = 20, TEXT = 400_000;
+  const Row = { title: columns.string(16), body: columns.text(17) };
+  const relay = await node("serve", join(TMP, "pf-relay"));
+  const s = await space("pf", relay);
+  const p = await page();
+  const { key } = await call<{ key: string }>(p, "device", "pf", undefined, true);
+  s.admit(key, "c", false);
+  const writer = new Client({ connect: zspdConnect(s.o.address), credential: token(s.owner) });
+  await eventually("the writer may write", () => writer.may(1, "write"));
+  const writes: Promise<void>[] = [];
+  for (let i = 0; i < ROWS; i += 1000)
+    writes.push(writer.write(1, (c) => {
+      for (let k = i; k < Math.min(i + 1000, ROWS); k++) c.insert(Row, "big", k, { title: `note ${k}`, body: `the quick brown fox jumps over the lazy dog, ${k} times over and again` });
+    }));
+  for (let i = 0; i < TEXTS; i++) writes.push(writer.write(1, (c) => c.insert(Row, "docs", i, { title: `doc ${i}`, body: "a".repeat(TEXT) })));
+  await Promise.all(writes);
+  await new Promise((done) => setTimeout(done, 5000));
+  const worker = p.workers[p.workers.length - 1];
+  await p.cdp("Profiler.enable", {}, worker);
+  await p.cdp("Profiler.setSamplingInterval", { interval: 200 }, worker);
+  await p.cdp("Profiler.start", {}, worker);
+  const t = performance.now();
+  await call(p, "join", "pf", s.sid, relay);
+  if (process.env.WINDOW) await call(p, "watch", "pf", "big", 50); // as an application would, at once
+  let held = 0;
+  for (let last = -1; ; await new Promise((done) => setTimeout(done, 500))) {
+    held = (await call<{ held: number }>(p, "usage", "pf")).held;
+    if (held === last && held > ROWS * 150) break;
+    last = held;
+  }
+  const took = performance.now() - t;
+  const { profile } = await p.cdp<{ profile: any }>("Profiler.stop", {}, worker);
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(join(ROOT, "build", "worker.cpuprofile"), JSON.stringify(profile));
+  // Self time by function, and by where it is.
+  const self = new Map<number, number>();
+  const dt = profile.timeDeltas as number[];
+  (profile.samples as number[]).forEach((id, i) => self.set(id, (self.get(id) ?? 0) + (dt[i] ?? 0)));
+  const byName = new Map<string, number>();
+  let total = 0;
+  for (const n of profile.nodes) {
+    const us = self.get(n.id) ?? 0;
+    total += us;
+    const f = n.callFrame;
+    const name = `${f.functionName || "(anonymous)"} ${(f.url as string).split("/").pop()}:${f.lineNumber}`;
+    byName.set(name, (byName.get(name) ?? 0) + us);
+  }
+  const shown = process.env.WINDOW ? await call<{ titles: string[] }>(p, "seen", "pf", "big") : undefined;
+  console.log(`     a full replica took in ${(held / 2 ** 20).toFixed(1)} MB in ${(took / 1000).toFixed(1)} s${shown ? `, its window holding ${shown.titles.length} rows` : ""}; of the worker's ${(total / 1e6).toFixed(1)} s sampled:`);
+  for (const [name, us] of [...byName].sort((a, b) => b[1] - a[1]).slice(0, 30)) console.log(`     ${((us / total) * 100).toFixed(1).padStart(5)}%  ${(us / 1e6).toFixed(2).padStart(6)} s  ${name}`);
+  writer.close();
+};
+
 async function main(): Promise<void> {
   const names = process.argv.slice(2).length > 0 ? process.argv.slice(2) : Object.keys(tests);
   if (names[0] === "bench") tests.bench = bench;
   if (names[0] === "partial") (tests.partial = partialBench), names.splice(1);
+  if (names[0] === "profile") (tests.profile = profileSync), names.splice(1);
   chrome = await Chrome.launch();
   let failed = 0;
   for (const name of names) {

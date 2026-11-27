@@ -1423,7 +1423,7 @@ review_settled_is_not_forged :: proc(t: ^testing.T) {
 	frame_end(&f, at)
 	session_input(s.links[0].a, f[:])
 	sim_settle(&s)
-	testing.expect(t, !interest_sure(&victim.node.interests[0]), "a partial peer made a window settled")
+	testing.expect(t, !interest_sure(&victim.node, &victim.node.interests[0]), "a partial peer made a window settled")
 	w := victim.node.interests[0].watch
 	testing.expect(t, key_less(w.lo, w.hi), "and made it nothing")
 	sim_link(&s, 0, 2)
@@ -2344,6 +2344,49 @@ crash_tail_lets_go :: proc(t: ^testing.T) {
 	sim_settle(&s)
 	testing.expect_value(t, store_range(&big.node.store, list_lo(list), list_hi(list)).count, 21)
 	testing.expect_value(t, phone.node.outbox.root, 0)
+}
+
+// A full replica that is being brought level, and is asked meanwhile for the end of a list, shows the end of the list,
+// as the one it is brought level by says it is: not as much as it happened to hold of the list when it was asked, and
+// all that comes after into the bargain. Its window is settled once that one has said so; and one with nobody to ask
+// is the one that says so.
+@(test)
+full_window_while_catching_up :: proc(t: ^testing.T) {
+	state := seeded(92)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, fresh := s.nodes[0], s.nodes[1]
+	list := List{1 << 32 | 5, 5}
+	for i in 0 ..< 1000 {
+		sim_put(&s, big, u64(i))
+	}
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	ui := sim_client(&s, fresh)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true})
+	// Alone, it is all there is: settled.
+	out := session_output(ui)
+	settled_now := false
+	r := Reader{buf = out}
+	for r.pos < len(out) {
+		frame := read_bytes(&r)
+		if Message(frame[0]) == .Synced {
+			f := Reader{buf = frame[1:]}
+			_ = read_varint(&f)
+			settled_now = Synced_Flags(read_u8(&f)).settled
+		}
+	}
+	session_sent(ui, len(out))
+	testing.expect(t, settled_now, "a full replica with nobody to ask did not say its window was settled")
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&fresh.node.store, KEY_MIN, KEY_MAX).count, 1000)
+	w := ui.watches[0]
+	testing.expectf(t, store_range(&fresh.node.store, w.lo, w.hi).count == 50, "the window spans %d rows, not 50", store_range(&fresh.node.store, w.lo, w.hi).count)
+	testing.expect(t, w.settled)
 }
 
 @(private)

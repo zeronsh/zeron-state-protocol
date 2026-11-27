@@ -34,6 +34,9 @@ export interface Page {
   evaluate<T = unknown>(expression: string): Promise<T>;
   /** Says how much the page's origin may store, or, with none, lets it have what it would. */
   quota(bytes?: number): Promise<void>;
+  /** The DevTools sessions of the page's workers, as they were attached, and a way to ask anything of one. */
+  readonly workers: string[];
+  cdp<T = any>(method: string, params?: object, session?: string): Promise<T>;
   close(): Promise<void>;
 }
 
@@ -109,11 +112,13 @@ export class Chrome {
     const { targetId } = await this.#send<{ targetId: string }>("Target.createTarget", { url: "about:blank" });
     const { sessionId } = await this.#send<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true });
     // What a page or any of its workers says is said.
+    const workers: string[] = [];
     const listen = (session: string, who: string) => {
       this.#sessions.set(session, (method, params) => {
         if (method === "Runtime.consoleAPICalled") say(who + params.args.map((a: any) => a.value ?? a.description ?? "").join(" "));
         else if (method === "Runtime.exceptionThrown") say(who + "uncaught: " + (params.exceptionDetails.exception?.description ?? params.exceptionDetails.text));
         else if (method === "Target.attachedToTarget") {
+          if (params.targetInfo.type === "worker") workers.push(params.sessionId);
           listen(params.sessionId, "(" + params.targetInfo.type + ") ");
           void this.#send("Runtime.enable", {}, params.sessionId);
           void this.#send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, params.sessionId);
@@ -140,6 +145,8 @@ export class Chrome {
         if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
         return r.result.value as T;
       },
+      workers,
+      cdp: (method: string, params: object = {}, session?: string) => this.#send(method, params, session ?? sessionId),
       quota: async (bytes?: number) => {
         const origin = new URL(url).origin;
         await this.#send("Storage.overrideQuotaForOrigin", bytes === undefined ? { origin } : { origin, quotaSize: bytes }, sessionId);

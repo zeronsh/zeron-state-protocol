@@ -286,7 +286,8 @@ session_close :: proc(s: ^Session) {
 					if w.id == it.watch.id && w.data && len(it.reports) > 0 {
 						interest_beyond(n, &it, &w)
 					} else if w.id == it.watch.id && w.data && !slice.contains(s.owed[:], it.id) {
-						append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi})
+						// Or, of a full replica that now reaches none, all there is, as it says.
+						append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = interest_sure(n, &it)})
 					}
 				}
 			}
@@ -846,8 +847,13 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 		if n.keys == nil {
 			up.data = false
 		}
+		if n.full && limit == 0 {
+			// What a full replica is brought level by it is sent anyway, and a window that is all of a range has no
+			// bounds to learn: asked for, it would be sent twice.
+			up.data = false
+		}
 		if it := interest_add(s, up, limit, flags.back); it != nil {
-			settled = interest_sure(&it^)
+			settled = interest_sure(n, it)
 		}
 	}
 	if !flags.data {
@@ -1058,7 +1064,7 @@ interest_settled :: proc(n: ^Node, id: u64) {
 		// is said.
 		for w in to.watches {
 			if w.id == it.watch.id {
-				append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = interest_sure(&it)})
+				append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = interest_sure(n, &it)})
 			}
 		}
 	}
@@ -1101,11 +1107,14 @@ interest_asked :: proc(s: ^Session, id: u64, lo, hi: Key, flags: Synced_Flags) -
 	return slice.contains(s.owed[:], id) // one let go of since, whose debt is still to be cleared
 }
 
-// Whether a full replica has confirmed what an interest asks for, and every one asked has answered; or it asks for
-// nothing that only a full replica could confirm.
+// Whether another full replica has confirmed what an interest asks for, and every one asked has answered; or it asks for
+// nothing that only one could confirm. A full replica that reaches none, for its scope, is the one that confirms it.
 @(private)
-interest_sure :: proc(it: ^Interest) -> bool {
-	return it.waiting == 0 && (!it.watch.data || len(it.reports) > 0)
+interest_sure :: proc(n: ^Node, it: ^Interest) -> bool {
+	if it.waiting > 0 {
+		return false
+	}
+	return !it.watch.data || len(it.reports) > 0 || (n.full && !node_fetches(n, key_scope(it.watch.lo)))
 }
 
 @(private)
@@ -2057,7 +2066,7 @@ session_wants :: proc(s: ^Session, lo, hi: Key, data := false) -> bool {
 session_unwants :: proc(s: ^Session, lo, hi: Key, data := false) {
 	for it, i in s.node.interests {
 		w := it.watch
-		if it.session == s.id && w.id == SHOWN && w.lo == lo && w.hi == hi && w.data == (data && !s.node.full) {
+		if it.session == s.id && w.id == SHOWN && w.lo == lo && w.hi == hi && w.data == (data && s.node.keys != nil) {
 			interest_remove(s.node, i)
 			return
 		}
@@ -2069,7 +2078,7 @@ session_unwants :: proc(s: ^Session, lo, hi: Key, data := false) {
 session_wanted :: proc(s: ^Session, lo, hi: Key) -> (wanted, sure, pending: bool) {
 	for &it in s.node.interests {
 		if it.session == s.id && it.watch.id == SHOWN && it.watch.data && it.watch.lo == lo && it.watch.hi == hi {
-			return true, interest_sure(&it), it.waiting > 0 || len(it.reports) > 0
+			return true, interest_sure(s.node, &it), it.waiting > 0 || len(it.reports) > 0
 		}
 	}
 	return false, false, false
@@ -2707,7 +2716,7 @@ resync :: proc(s: ^Session) {
 			append(&s.tasks, Task{kind = .Fill, lo = w.lo, hi = w.hi})
 			settled := true
 			for &it in n.interests {
-				settled &&= it.session != s.id || it.watch.id != w.id || interest_sure(&it)
+				settled &&= it.session != s.id || it.watch.id != w.id || interest_sure(n, &it)
 			}
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, settled = settled})
 		} else {

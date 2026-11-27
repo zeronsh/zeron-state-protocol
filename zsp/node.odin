@@ -615,7 +615,9 @@ interest_concerns :: proc(n: ^Node, from: u32, to: ^Session) -> bool {
 interest_add :: proc(s: ^Session, w: Watch, limit: u64, back: bool) -> ^Interest {
 	n := s.node
 	w := w
-	w.data = w.data && !n.full
+	// A full replica asks too, where it reaches another: what it holds may yet be short of what there is, as while it is
+	// brought level, and its windows are bounded and settled by what that one says. Level, it costs a fingerprint.
+	w.data = w.data && n.keys != nil
 	if (!w.data && !w.live) || len(n.interests) >= MAX_INTERESTS {
 		return nil
 	}
