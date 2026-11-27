@@ -220,7 +220,10 @@ export class Node {
     } catch (e) {
       // What it was given to own, and what it opened, are let go of: a file left open would hold the store against the next
       // to open it, as a browser's are held.
-      if (d) d.#channel?.port1.close(), (d.#store as Store | undefined)?.letGo();
+      if (d) d.#channel?.port1.close();
+      const store = d && (d.#store as Store | undefined);
+      if (store) store.letGo(); // and with it the volume
+      else options.volume.close?.();
       options.datagrams?.close();
       throw e;
     }
@@ -318,8 +321,21 @@ export class Node {
     kept.set(unhex(space));
     kept.set(unhex(relay.key), 32);
     kept.set(url, 64);
-    this.store.keep("space", kept);
     this.#start(kept);
+    this.#keepSpace(kept);
+  }
+
+  // Kept only once the node is of the space, and, made or adopted, holds its roster: should it not be, the device is of no
+  // space after all, and may be made one again, rather than of one it can never be a member of. Should it not be kept, the
+  // node stops, as for anything else it cannot keep.
+  #keepSpace(space: Uint8Array): void {
+    try {
+      this.store.keep("space", space);
+    } catch (e) {
+      const error = new Error(`storage failed: the node has stopped rather than lose what it said was durable (${e instanceof Error ? e.message : e})`);
+      this.#fail(error);
+      throw error;
+    }
   }
 
   /** Becomes a device of a space by its roster alone, as `zspd peer` does; for there is no relay, or none yet. */
@@ -330,9 +346,16 @@ export class Node {
       const wasm = this.#wasm!;
       this.#bytes(wasm.buffer(roster.length), roster.length).set(roster);
       if (roster.length < 38 || !wasm.genuine(roster.length)) return false;
-      this.store.keep("space", roster.slice(6, 38));
       this.#start(roster.slice(6, 38));
+      const taken = this.#adopt(roster);
+      if (taken) this.#keepSpace(roster.slice(6, 38));
+      return taken;
     }
+    return this.#adopt(roster);
+  }
+
+  // Whether the roster is taken and kept: a roster said not to be taken is not found taken at the next start.
+  #adopt(roster: Uint8Array): boolean {
     const wasm = this.#wasm!;
     this.#bytes(wasm.buffer(roster.length), roster.length).set(roster);
     const ok = wasm.adopt(roster.length) !== 0;
@@ -349,9 +372,9 @@ export class Node {
     const n = wasm.create();
     if (n < 32) throw new Error("could not make a space");
     const made = this.#bytes(wasm.data(), n).slice();
-    this.store.keep("space", made.subarray(0, 32));
     this.#start(made.subarray(0, 32));
-    if (!this.adopt(made.subarray(32))) throw new Error("could not take the space's first roster");
+    if (!this.#adopt(made.subarray(32))) throw new Error("could not take the space's first roster");
+    this.#keepSpace(made.subarray(0, 32));
     return this.#space!;
   }
 

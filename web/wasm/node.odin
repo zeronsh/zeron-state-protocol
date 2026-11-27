@@ -88,6 +88,7 @@ sync_due: Maybe(time.Tick)
 found: ^Found
 failed: bool
 started: bool
+kept_roster: bool // since adopting began: what says whether a roster was taken is whether it was kept
 
 @(private)
 Found :: struct {
@@ -293,6 +294,8 @@ start :: proc "c" (full: bool, age, bytes: f64) -> bool {
 			if !keep(1, raw_data(bytes), len(bytes)) {
 				report(.Error, "could not keep the roster; stopping rather than going on with what may be lost")
 				failed = true
+			} else {
+				kept_roster = true
 			}
 			dialers_refresh()
 		},
@@ -351,7 +354,16 @@ genuine :: proc "c" (size: int) -> bool {
 @(export)
 adopt :: proc "c" (size: int) -> bool {
 	context = ctx()
-	return !failed && zsp.node_adopt(&node, message[:size]) && !failed
+	return !failed && adopt_kept(message[:size])
+}
+
+// Adopts a roster: taken if it is kept, whatever happens after, for at the next start it is what the device holds; and not
+// taken if it is not, though held for now, for then it is not.
+@(private)
+adopt_kept :: proc(bytes: []byte) -> bool {
+	kept_roster = false
+	zsp.node_adopt(&node, bytes)
+	return kept_roster
 }
 
 // Keeps a session with a relay, whether or not the roster names it: how a new device reaches the first one it was
@@ -750,7 +762,9 @@ found_run :: proc(t: time.Tick) {
 @(private)
 found_save :: proc() {
 	x := &found.finder.x
-	if x.unsaved > 0 && x.tailing && zsp.store_sync(&node.store) && !find.index_save(x) {
+	// By a whole sync, which checkpoints and lets go of what is held beyond its bound when it is time to, and stops the node
+	// should it fail: not by the store's alone, after which the next tick would think there was nothing to sync.
+	if x.unsaved > 0 && x.tailing && sync() && !find.index_save(x) {
 		found.more ||= x.failed // it has to be made again
 	}
 }
@@ -1055,10 +1069,10 @@ govern :: proc "c" (op: Govern, size: int) -> int {
 		return UNSOUND
 	}
 	zsp.roster_destroy(&parsed)
-	if !zsp.node_adopt(&node, bytes) || failed {
+	if !adopt_kept(bytes) {
 		return STORAGE if failed else NOT_TAKEN
 	}
-	return result
+	return result // done, though storage failed after: the node stops, and the next start finds it done
 }
 
 // Who is in the space, into the buffer: for each member, device (32), signer (32), flags (1: 1 owner, 2 admin, 4 active),

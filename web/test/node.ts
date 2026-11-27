@@ -141,6 +141,63 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await again.close();
 }
 
+// A change to the space whose roster was kept is done, though storage failed after: what is said of it is what the next
+// start finds.
+{
+  let failing = false;
+  class Failing extends MemoryVolume {
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f || name !== "tree") return f;
+      const write = f.write.bind(f);
+      f.write = (b, at) => (failing ? (() => { throw new Error("the disk is full"); })() : write(b, at));
+      return f;
+    }
+  }
+  const volume = new Failing();
+  volume.openNow = undefined;
+  const node = await Node.open({ volume, module, log: () => {} });
+  node.create();
+  failing = true;
+  let said: number | string;
+  try {
+    said = node.scope();
+  } catch (e) {
+    said = "error: " + (e as Error).message;
+  }
+  failing = false;
+  const again = await Node.open({ volume, module, log: () => {} });
+  const next = again.scope();
+  assert(said === 2 ? next === 3 : next === 2, `said ${said}, and the next start made scope ${next}`);
+  await again.close();
+}
+
+// A space whose first roster could not be kept is not this device's: it may make another, rather than be of one it can
+// never be a member of.
+{
+  let failing = false;
+  class Failing extends MemoryVolume {
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f || !/^roster\./.test(name)) return f;
+      const write = f.write.bind(f);
+      f.write = (b, at) => (failing ? (() => { throw new Error("the disk is full"); })() : write(b, at));
+      return f;
+    }
+  }
+  const volume = new Failing();
+  volume.openNow = undefined;
+  const node = await Node.open({ volume, module, log: () => {} });
+  failing = true;
+  assert.throws(() => node.create());
+  failing = false;
+  const again = await Node.open({ volume, module, log: () => {} });
+  assert.equal(again.space, undefined, "the device is of a space whose roster it never kept");
+  assert.match(again.create(), /^[0-9a-f]{64}$/);
+  assert(again.member);
+  await again.close();
+}
+
 // And it says so at once, though files are still being opened, which a full disk may keep from ever being done: it lets
 // go of what it has open, and what is opened after is let go of as it comes.
 {
@@ -434,8 +491,12 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   assert.equal(closed, opened, "files it opened were left open");
   assert(udpClosed, "the UDP it was given was left open");
   udpClosed = false;
-  await assert.rejects(Node.open({ volume: new MemoryVolume(), module, datagrams, keep: { days: -1 } }), RangeError);
+  let volumeClosed = false;
+  const refused: MemoryVolume & { close?: () => void } = new MemoryVolume();
+  refused.close = () => void (volumeClosed = true);
+  await assert.rejects(Node.open({ volume: refused, module, datagrams, keep: { days: -1 } }), RangeError);
   assert(udpClosed, "the UDP it was given was left open, though it refused what it was told to keep");
+  assert(volumeClosed, "the volume it was given was left open, though it refused what it was told to keep");
 }
 
 // One client that throws at what it is told does not keep the node's clients from being told the rest of theirs, itself

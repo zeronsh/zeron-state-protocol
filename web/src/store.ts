@@ -247,11 +247,14 @@ export class Store {
           f.close();
           throw e;
         }
+        // The file has it all: it is the store's from now on, to be closed with it, whatever the journal can be told.
+        this.#segments.set(n, f);
         this.#held.delete(n);
         this.#forget(n, h);
+        this.onSettled?.();
+        return;
       }
       this.#segments.set(n, f);
-      if (h) this.onSettled?.();
     });
     this.#opening.set(n, opening);
   }

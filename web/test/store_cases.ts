@@ -276,4 +276,31 @@ for (const volume of [new MemoryVolume(), new NodeVolume(mkdtempSync(join(tmpdir
   assert.equal(volume.closed_, volume.open_, "a segment's file that could not be given what was held was left open");
 }
 
+// Nor is a segment's file that was given what was held of it, but whose journal could not then be told so.
+{
+  class Journal extends MemoryVolume {
+    open_ = 0;
+    closed_ = 0;
+    failing = false;
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f) return f;
+      this.open_++;
+      const close = f.close.bind(f), truncate = f.truncate.bind(f);
+      f.close = () => (this.closed_++, close());
+      if (name === "journal") f.truncate = (size) => (this.failing ? (() => { throw new Error("the disk is full"); })() : truncate(size));
+      return f;
+    }
+  }
+  const volume = new Journal({ slow: true });
+  const s = await opened(volume);
+  assert(s.logWrite(50 * SEGMENT, bytes("a", 10))); // held
+  assert(s.logSync()); // and so journaled
+  volume.failing = true;
+  for (let i = 0; i < 50 && !s.failure; i++) volume.settle(), await turn();
+  assert(s.failure, "it says that storage failed");
+  s.letGo();
+  assert.equal(volume.closed_, volume.open_, "a segment's file whose journal could not be told was left open");
+}
+
 console.log("ok");
