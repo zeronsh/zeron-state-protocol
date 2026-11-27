@@ -320,6 +320,7 @@ interface Page {
   after: number;
   limit: number; // as first asked for, until the node says what the page spans
   back: boolean;
+  keeps?: boolean; // asked for to have again what the window showed beyond the page next to it
   stale?: Said; // while being sent afresh: rows, and which cells of each are there still
 }
 
@@ -485,7 +486,11 @@ export class Client {
   #closed = false;
   #failures = 0; // pipes in a row that never came up, or that the node found fault with
   #faulted = false; // this pipe has: the node said so, or said nonsense
-  #input = new Uint8Array(0);
+  // Of a frame not yet all here, what has come: in the pieces it came in, joined once it has all come, and not each
+  // time another comes, which, of a frame of a large text coming a little at a time, would be the text over and over.
+  #input: Uint8Array[] = [];
+  #inputBytes = 0;
+  #inputWants = 0; // so many bytes at least, before a frame is whole
   #clockMs = 0;
   #clockN = 0;
   #scopes = new Map<number, { rights: number; key: Uint8Array }>();
@@ -547,7 +552,7 @@ export class Client {
       over = true;
       this.#lost();
     };
-    this.#input = new Uint8Array(0);
+    this.#hold();
     this.#out = codec.writer();
     this.#faulted = false;
     const wire = this.#host.connect((data) => {
@@ -676,12 +681,24 @@ export class Client {
     }
   }
 
+  // Keeps what has come of a frame not yet whole, which needs so many bytes at least to be: or, of none, nothing. A copy:
+  // what is given may be given again, written over, once taken.
+  #hold(rest?: Uint8Array, wants = 0): void {
+    this.#input = rest && rest.length > 0 ? [rest.slice()] : [];
+    this.#inputBytes = rest?.length ?? 0;
+    this.#inputWants = wants;
+  }
+
   #receive(data: Uint8Array): void {
     let s = data;
     if (this.#input.length > 0) {
-      s = new Uint8Array(this.#input.length + data.length);
-      s.set(this.#input);
-      s.set(data, this.#input.length);
+      this.#input.push(data.slice());
+      this.#inputBytes += data.length;
+      if (this.#inputBytes < this.#inputWants) return;
+      s = new Uint8Array(this.#inputBytes);
+      let at = 0;
+      for (const piece of this.#input) s.set(piece, at), (at += piece.length);
+      this.#hold();
     }
     let at = 0;
     while (at < s.length) {
@@ -689,13 +706,13 @@ export class Client {
       let n = 0, scale = 1, p = at;
       for (;;) {
         if (p >= s.length) {
-          this.#input = s.slice(at);
+          this.#hold(s.subarray(at), s.length - at + 1);
           return;
         }
         const b = s[p++];
         if (p - at > 5) {
           // no frame is so long
-          this.#input = new Uint8Array(0);
+          this.#hold();
           this.#faulted = true;
           this.#hangUp();
           return;
@@ -705,7 +722,7 @@ export class Client {
         scale *= 128;
       }
       if (p + n > s.length) {
-        this.#input = s.slice(at);
+        this.#hold(s.subarray(at), p + n - at);
         return;
       }
       const r = codec.reader(s.subarray(p, p + n));
@@ -718,20 +735,20 @@ export class Client {
           // What is thrown while a frame is read, as by a host, which no code of an application can be: the pipe is read on
           // from the frame after, on a turn of its own, rather than losing the rest and reading on from inside a frame.
           if (this.#wire === wire) {
-            this.#input = s.slice(at);
+            this.#hold(s.subarray(at));
             this.#host.defer(() => this.#wire === wire && this.#receive(new Uint8Array(0)));
           }
           throw e;
         }
         // Nonsense from the pipe ends the pipe and nothing else.
-        this.#input = new Uint8Array(0);
+        this.#hold();
         this.#faulted = true;
         this.#hangUp();
         return;
       }
       if (this.#wire !== wire) return; // let go of, by what it said or by whoever was told of it: nothing more is read from it
     }
-    this.#input = new Uint8Array(0);
+    this.#hold();
     this.#later();
   }
 
@@ -1055,14 +1072,18 @@ export class Client {
     }
     // A page at an end of the window may come to end short of where it was first said to, as one a partial replica
     // answered at once from what it held ends where a full one says: what the window showed beyond it is had again by
-    // the page that follows, rather than let go of unseen.
-    const cut = (lo: string, hi: string) => lo < hi && window.entries.some((e) => e.key >= lo && e.key < hi);
+    // the page that follows, rather than let go of unseen. By that page, and no more: what it was asked for to have
+    // again may lie anywhere beyond, and it may itself be answered at once with more from anywhere beyond, and be cut
+    // short in turn; a page after it, and after that, would follow what is held a page at a time, as far as it went, the
+    // window never settled, and growing all the while, as when a replica is being brought level from the far end of
+    // the list.
+    const cut = (lo: string, hi: string) => !page.keeps && lo < hi && window.entries.some((e) => e.key >= lo && e.key < hi);
     const after = page === window.pages[window.pages.length - 1] && cut(page.hi, was[1]);
     const before = page === window.pages[0] && cut(was[0], page.lo);
     // Where a full replica says the page ends, what lay past it was never known to be whole.
     this.#trim(window);
-    if (after) this.#loadAfter(window);
-    if (before) this.#loadBefore(window);
+    if (after) this.#loadAfter(window, true);
+    if (before) this.#loadBefore(window, true);
   }
 
   // A range was said over again and this row was not in it: it was moved away, or deleted, while this client was not
@@ -1107,20 +1128,22 @@ export class Client {
     return this.#unacked.has(id);
   }
 
-  #loadBefore(window: Win): void {
+  #loadBefore(window: Win, keeps = false): void {
     const first = window.pages[0];
     if (!first || first.open || !first.settled || first.before === 0 || !this.#ready) return;
     const tag = first.lo.slice(0, 16);
     const page = this.#page(window, tag + ZERO24, first.lo);
+    page.keeps = keeps;
     window.pages.unshift(page);
     this.#watch(page, window.size, true);
     this.#touch(window);
   }
 
-  #loadAfter(window: Win): void {
+  #loadAfter(window: Win, keeps = false): void {
     const last = window.pages[window.pages.length - 1];
     if (!last || last.open || !last.settled || last.after === 0 || !this.#ready) return;
     const page = this.#page(window, last.hi, codec.after(last.lo.slice(0, 16)));
+    page.keeps = keeps;
     window.pages.push(page);
     this.#watch(page, window.size, false);
     this.#touch(window);

@@ -276,6 +276,77 @@ for (const what of ["move", "delete"]) {
   }
 }
 
+// But only by the page that follows: one asked for to have again what was shown beyond another, answered at once from what
+// is held as that was, may show more beyond itself, and be cut short in turn, and so on, a page at a time, for as long as a
+// replica is being brought level from the far end of its list; the window would never be settled, and grow all the while.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let st!: State<typeof Note>;
+  h.client.window({ scope: 1, list: "a", table: Note, size: 2 }, (x) => (st = x));
+  h.run();
+  const cell = (row: string, kind: number, slot: number, n: number, body: string) => {
+    const w = codec.writer();
+    codec.putBinary(w, ch(kind) + row + ch(slot) + rep("\0", 15) + ch(n));
+    codec.putBytes(w, b(body));
+    return s(codec.written(w));
+  };
+  const rows = [1, 2, 3, 4, 5, 6].map((i) => "\0\0\0\x01" + rep(String(i), 12));
+  // Rows held, as a replica says them in answer to a page: those that lie within it.
+  const say = (which: number[]) =>
+    h.tell(CELLS, "\0" + which.map((i) => cell(rows[i - 1], 2, 1, 1, h.client.tag(1, "a") + codec.u64(i)) + cell(rows[i - 1], 3, 16, 2, `t${i}`)).join(""));
+  const [last, , lo, hi] = watchOf(h.last(WATCH)!);
+  say([1, 2, 3, 4, 5, 6]);
+  synced(h, last, 0, lo, hi); // what is held: all six
+  assert.equal(st.rows.length, 6);
+  const keys = (Client.internals(h.client) as any).windows.values().next().value.entries.map((e: { key: string }) => e.key);
+  synced(h, last, 1, keys[4], hi, 4, 0); // as a full replica says: the last two, and four before
+  const [before, , from, to] = watchOf(h.last(WATCH)!);
+  assert(before !== last && to === keys[4], "what was shown before them is asked for, as the page before");
+  say([1, 2, 3, 4]);
+  synced(h, before, 0, from, to); // answered at once from what is held: all four
+  const watches = h.self.said.filter((x) => x.kind === WATCH).length;
+  synced(h, before, 1, keys[2], keys[4], 2, 0); // as a full replica says: two, and two before
+  assert.equal(h.self.said.filter((x) => x.kind === WATCH).length, watches, "nor a page before that");
+  assert.equal(st.status, "ready");
+  assert.deepEqual(st.rows.map((r) => r.title), ["t3", "t4", "t5", "t6"]);
+}
+
+// Frames come in whatever pieces the pipe gives, a byte of a length at a time even, and are taken whole once all of each
+// has come; and what has come of a large one is joined once, when it is all there, not each time another piece of it
+// comes: a frame of 8 MB, in pieces of a kilobyte, would otherwise be 32 GB joined.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let st!: State<{ title: ReturnType<typeof c.string> }>;
+  h.client.window({ scope: 1, list: "a", table: { title: c.string(18) } }, (x) => (st = x));
+  h.run();
+  const cell = (row: string, kind: number, slot: number, n: number, body: string) => {
+    const w = codec.writer();
+    codec.putBinary(w, ch(kind) + row + ch(slot) + rep("\0", 15) + ch(n));
+    codec.putBytes(w, b(body));
+    return s(codec.written(w));
+  };
+  const frame = (row: string, order: number, title: string) => {
+    const w = codec.writer();
+    codec.putBytes(w, b(ch(CELLS) + "\0" + cell(row, 2, 1, 1, h.client.tag(1, "a") + codec.u64(order)) + cell(row, 3, 18, 2, title)));
+    return codec.written(w).slice();
+  };
+  const one = "\0\0\0\x01" + rep("1", 12), two = "\0\0\0\x01" + rep("2", 12);
+  const small = new Uint8Array([...frame(one, 1, "small"), ...frame(two, 2, "also")]);
+  for (let i = 0; i < small.length; i++) h.self.receive(small.subarray(i, i + 1));
+  h.run();
+  assert.deepEqual(st.rows.map((r) => r.title), ["small", "also"]);
+  const big = frame(one, 1, "x".repeat(8 << 20));
+  const began = performance.now();
+  for (let i = 0; i < big.length; i += 1024) h.self.receive(big.subarray(i, i + 1024));
+  h.run();
+  assert.equal(st.rows[0]?.title?.length, 8 << 20);
+  assert(performance.now() - began < 2000, `taken in ${(performance.now() - began).toFixed(0)} ms`);
+}
+
 // More said at once than a WebSocket of zspd's takes in one message, 8 MiB, goes in pieces, and arrives whole; and so it
 // does again on a pipe dialled anew, which would otherwise break every time it was said.
 {
