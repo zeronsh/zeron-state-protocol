@@ -166,7 +166,7 @@ the signature, by that member's signer, covers row ‖ slot ‖ kind ‖ stamp �
 `as` (bytes, at most 64) ‖ what was written: for whom its author wrote it, if for another than its device belongs to, and otherwise nothing.
 
 **Whose a cell is**, in a signed scope: that of whom `as` names, if a grant of the author's there includes Vouch, with `until` zero or no less than when it was written
-(of a bundle, when the latest of what it names or holds was), and `as` is not empty; otherwise its author's `subject`. Nothing is refused over it, and a relay sees none of it. In an unsigned scope a cell is nobody's. A host says for whom a local client is as it accepts it, and a node writes nothing there for
+(of a bundle, when the last of what it names was), and `as` is not empty; otherwise its author's `subject`. Nothing is refused over it, and a relay sees none of it. In an unsigned scope a cell is nobody's. A host says for whom a local client is as it accepts it, and a node writes nothing there for
 anybody else without Vouch: that is *denied*. What is sealed again keeps its `as`.
 
 A replica accepts a cell from a peer only if
@@ -209,7 +209,7 @@ A slot holding text is at most one `Value` (a whole text) and `Piece`s and `Bund
 that set alone. Elements are UTF-8 bytes; applications edit at character boundaries.
 
 A piece's open body is id (8, random, nonzero) ‖ operations; one shorter than an id is no piece of the text. A bundle's, after its clear prefix, is any number of
-stamp (16) ‖ id (8) ‖ operations (bytes), ascending by stamp. A `Value` acts as a piece whose id is its salt, or 1 if that is zero, and whose one operation
+stamp (16) ‖ id (8) ‖ operations (bytes), ascending by stamp. None is later than the last stamp the bundle names, as none is that was put together of what it names: it is no part of the text, nor of any bundle put together of the bundle, as it would else be taken for written before the bundle was. A `Value` acts as a piece whose id is its salt, or 1 if that is zero, and whose one operation
 inserts its body into an empty text.
 
 ```
