@@ -2625,9 +2625,12 @@ review6_window_gone_on_from_is_not_cut :: proc(t: ^testing.T) {
 	testing.expect(t, find(ui, 1).lo == page.lo)
 	sim_link(&s, 0, 1)
 	up := s.links[0]
+	// Until both are ready, and no more: what the relay says once its end is ready is held back, its answer too.
 	for !up.a.ready || !up.b.ready {
 		sim_pass(&s, up.a, up.b)
-		sim_pass(&s, up.b, up.a)
+		if !up.a.ready {
+			sim_pass(&s, up.b, up.a)
+		}
 	}
 	sim_put(&s, owner, 300)
 	sim_drain(ui)
@@ -2825,9 +2828,12 @@ review7_bounded_before_told :: proc(t: ^testing.T) {
 	testing.expect(t, ui.watches[0].settled)
 	sim_link(&s, 0, 1)
 	up := s.links[0]
+	// Until both are ready, and no more: what the relay says once its end is ready is held back, its answer too.
 	for !up.a.ready || !up.b.ready {
 		sim_pass(&s, up.a, up.b)
-		sim_pass(&s, up.b, up.a)
+		if !up.a.ready {
+			sim_pass(&s, up.b, up.a)
+		}
 	}
 	for i in 10 ..< 410 {
 		sim_put(&s, owner, u64(i))
@@ -3074,6 +3080,199 @@ unfilled_only_compared :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(at.out), before)
 	clear(&at.tasks)
 	at.task_head = 0
+	free_all(context.temp_allocator)
+}
+
+// A way between two sessions as a network is: so many bytes a round at most, arriving so many rounds after they went.
+@(private)
+Sim_Way :: struct {
+	line:   [dynamic]Sim_Held,
+	queued: int, // bytes on the way, not yet arrived
+}
+
+@(private)
+Sim_Held :: struct {
+	due:   int, // the round from which it may arrive
+	bytes: []byte,
+}
+
+// What the session has to say goes onto the way, all of it, as onto a socket that takes it.
+@(private)
+sim_way_send :: proc(from: ^Session, way: ^Sim_Way, round, latency: int) {
+	out := session_output(from)
+	if len(out) > 0 {
+		append(&way.line, Sim_Held{round + latency, slice.clone(out)})
+		way.queued += len(out)
+		session_sent(from, len(out))
+	}
+}
+
+// And comes off it, so many bytes a round, in order.
+@(private)
+sim_way_deliver :: proc(way: ^Sim_Way, to: ^Session, round, rate: int) {
+	budget := rate
+	for budget > 0 && len(way.line) > 0 && way.line[0].due <= round {
+		h := &way.line[0]
+		n := min(budget, len(h.bytes))
+		_ = session_input(to, h.bytes[:n])
+		budget -= n
+		way.queued -= n
+		if n == len(h.bytes) {
+			delete(h.bytes)
+			ordered_remove(&way.line, 0)
+		} else {
+			rest := slice.clone(h.bytes[n:])
+			delete(h.bytes)
+			h.bytes = rest
+		}
+	}
+}
+
+@(private)
+sim_way_destroy :: proc(way: ^Sim_Way) {
+	for h in way.line {
+		delete(h.bytes)
+	}
+	delete(way.line)
+}
+
+// A full replica brought level over a slow way (8 KiB a round of 10 ms, 150 ms each way: 10 MB takes some 1,200 rounds): whether a window its client
+// asks for meanwhile is answered soon, and when it holds everything.
+@(private)
+slow_way_run :: proc(t: ^testing.T, held: bool) -> (answered, whole: int) {
+	state := seeded(112)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	big, fresh := s.nodes[0], s.nodes[1]
+	list := List{1 << 32 | 5, 5}
+	for i in 0 ..< 5000 {
+		sim_put_big(&s, big, 5, u64(i), 2000)
+	}
+	sim_link(&s, 1, 0)
+	l := s.links[0] // fresh dials: l.a is its, l.b the other's
+	ui := sim_client(&s, fresh)
+	defer session_close(ui)
+	up, down: Sim_Way
+	defer sim_way_destroy(&up)
+	defer sim_way_destroy(&down)
+	answered, whole = -1, -1
+	for round in 0 ..< 20_000 {
+		s.now += 10
+		big.node.now = sim_now(&s, big)
+		fresh.node.now = sim_now(&s, fresh)
+		if !held {
+			l.a.peer_took, l.b.peer_took = false, false // as with a peer that says nothing of what it took
+		}
+		sim_way_send(l.a, &up, round, 15)
+		sim_way_send(l.b, &down, round, 15)
+		sim_way_deliver(&up, l.b, round, 8192)
+		sim_way_deliver(&down, l.a, round, 8192)
+		if round == 300 {
+			sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true})
+		}
+		for len(session_output(ui)) > 0 {
+			session_sent(ui, len(session_output(ui)))
+		}
+		if answered < 0 && round > 300 && len(ui.watches) > 0 && ui.watches[0].settled {
+			answered = round - 300
+		}
+		if whole < 0 && store_range(&fresh.node.store, list_lo(list), list_hi(list)).count == 5000 {
+			whole = round
+		}
+		if whole >= 0 && answered >= 0 {
+			break
+		}
+		free_all(context.temp_allocator)
+	}
+	return
+}
+
+// What is made for a peer is held to a window, so that a window asked for in the midst of bringing it level goes ahead
+// of what was made before, within a few round trips, rather than after all that lay on the way; and so that it is
+// brought level no later.
+@(test)
+held_to_a_window :: proc(t: ^testing.T) {
+	answered, whole := slow_way_run(t, held = true)
+	answered_unheld, whole_unheld := slow_way_run(t, held = false)
+	testing.expectf(t, answered >= 0 && answered <= 150, "a window was answered %d rounds after it was asked for (%d without a window)", answered, answered_unheld)
+	testing.expectf(t, answered_unheld > 600, "without a window, it was answered after %d rounds: the test does not test", answered_unheld)
+	testing.expectf(t, whole >= 0 && f64(whole) <= 1.05 * f64(whole_unheld), "brought level in %d rounds, %d without a window", whole, whole_unheld)
+}
+
+// Both ends count the same bytes: a sender, once all is said, is said to have had all it made taken; and one whose
+// peer says nothing of what it took holds nothing back, and is sent no Took.
+@(test)
+took_counts_alike :: proc(t: ^testing.T) {
+	state := seeded(110)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	for i in 0 ..< 300 {
+		sim_put_big(&s, s.nodes[0], 5, u64(i), 300)
+	}
+	sim_link(&s, 0, 3)
+	sim_link(&s, 1, 3)
+	sim_link(&s, 2, 3)
+	for _ in 0 ..< 4 {
+		sim_settle(&s)
+	}
+	for l in s.links {
+		testing.expect(t, window_held(l.a) && window_held(l.b))
+		testing.expect_value(t, l.a.acked, window_made(l.a))
+		testing.expect_value(t, l.b.acked, window_made(l.b))
+	}
+	// One that says nothing of what it took.
+	l := s.links[0]
+	l.b.peer_took = false
+	l.b.window.size = WINDOW_MIN
+	l.b.acked = 0
+	testing.expect(t, window_open(l.b))
+	before := l.b.took_out
+	_ = session_input(l.b, {})
+	sim_put(&s, s.nodes[0], 9999)
+	sim_settle(&s)
+	testing.expect_value(t, l.b.took_out, before)
+}
+
+// A relay does not sleep owing a peer word of what it took, which it holds what it sends to a window by; and woken, it
+// goes on saying what it takes to a peer that says what it took.
+@(test)
+sleeps_having_said_what_it_took :: proc(t: ^testing.T) {
+	state := seeded(113)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	l := s.links[0]
+	at := l.b // the relay's end
+	saved := make([dynamic]byte, context.temp_allocator)
+	testing.expect(t, session_save(at, &saved))
+	// Something comes, which asks for nothing back, and is taken in, but not yet said to have been.
+	f: [dynamic]byte
+	defer delete(f)
+	frame := frame_begin(&f, .Unwatch)
+	write_varint(&f, 12345)
+	frame_end(&f, frame)
+	testing.expect(t, session_input(at, f[:]))
+	clear(&saved)
+	testing.expect(t, !session_save(at, &saved), "a relay would sleep owing word of what it took")
+	for len(session_output(at)) > 0 {
+		session_sent(at, len(session_output(at)))
+	}
+	clear(&saved)
+	testing.expect(t, session_save(at, &saved))
+	sim_cut(&s, 0)
+	revived, ok := session_load(&s.nodes[1].node, saved[:])
+	testing.expect(t, ok)
+	if ok {
+		testing.expect(t, revived.peer_took)
+		session_close(revived)
+	}
 	free_all(context.temp_allocator)
 }
 

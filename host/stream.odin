@@ -363,6 +363,8 @@ stream_message :: proc(s: ^Stream, payload: []byte) -> bool {
 		stream_session(s, false)
 		return true
 	case .Open:
+		// Now, not when the loop last looked: what it says is timed by it (see zsp's window).
+		s.space.node.now = now_ms()
 		if s.role == .Open {
 			return zsp.session_input(s.session, payload)
 		}

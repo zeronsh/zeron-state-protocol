@@ -20,4 +20,5 @@ Message :: enum u8 {
 	Call     = 15,
 	Flow     = 16,
 	Author   = 17,
+	Took     = 18,
 }

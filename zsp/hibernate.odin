@@ -7,7 +7,7 @@ package zsp
 @(require_results)
 session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 	n := s.node
-	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || !tasks_idle(s) || len(s.refused) > 0 || s.closing {
+	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || !tasks_idle(s) || len(s.refused) > 0 || s.closing || s.took - min(s.took_frames + s.took_held, s.took) > s.took_said {
 		return false
 	}
 	// Nor anything more that is not saved: changes it has yet to be sent (as where storage answered "not yet"), counts
@@ -25,7 +25,7 @@ session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 	write_varint(w, u64(s.id))
 	write_u8(
 		w,
-		(1 if s.greeted else 0) | (2 if s.accepted else 0) | (4 if s.ready else 0) | (8 if s.peer_full else 0) | (16 if s.peer_relay else 0),
+		(1 if s.greeted else 0) | (2 if s.accepted else 0) | (4 if s.ready else 0) | (8 if s.peer_full else 0) | (16 if s.peer_relay else 0) | (32 if s.peer_took else 0),
 	)
 	append(w, ..s.peer[:])
 	write_varint(w, s.peer_serial)
@@ -71,6 +71,7 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 	s.ready = flags & 4 != 0
 	s.peer_full = flags & 8 != 0
 	s.peer_relay = flags & 16 != 0
+	s.peer_took = flags & 32 != 0 // and what was said to it before is taken as taken: it slept with nothing to say
 	s.peer = read_key32(&r)
 	s.peer_serial = read_varint(&r)
 	s.seq_out = read_varint(&r)
@@ -83,7 +84,7 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 		taken ||= x.id == s.id
 	}
 	// Only a session that was ready is ever saved: one said to be otherwise is not this node's either.
-	if r.bad || s.id == 0 || taken || flags & ~u8(31) != 0 || flags & 7 != 7 || m == nil || !member_active(m) {
+	if r.bad || s.id == 0 || taken || flags & ~u8(63) != 0 || flags & 7 != 7 || m == nil || !member_active(m) {
 		free(s)
 		return nil, false
 	}

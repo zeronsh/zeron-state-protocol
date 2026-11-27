@@ -140,12 +140,28 @@ export async function proxy(
         holding(d.length);
         into.write(d, () => sent(d.length));
       };
+    // In order, by one timer for the line: timers of their own, each set from a clock rounded to the millisecond, may
+    // fire out of order for chunks a fraction of a millisecond apart, and the other end take what came after for what
+    // came first.
     let free = 0;
+    const line: { due: number; d: Buffer }[] = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const drain = () => {
+      timer = undefined;
+      const now = performance.now();
+      while (line.length > 0 && line[0].due <= now) {
+        const { d } = line.shift()!;
+        if (state.swallowed || into.destroyed) sent(d.length);
+        else into.write(d, () => sent(d.length));
+      }
+      if (line.length > 0) timer = setTimeout(drain, Math.max(0, line[0].due - now));
+    };
     return (d: Buffer) => {
       const now = performance.now();
       free = Math.max(free, now) + (d.length / slow.bytesPerSecond) * 1000;
       holding(d.length);
-      setTimeout(() => (state.swallowed || into.destroyed ? sent(d.length) : into.write(d, () => sent(d.length))), free - now + slow.latency);
+      line.push({ due: free + slow.latency, d });
+      if (timer === undefined) timer = setTimeout(drain, Math.max(0, free + slow.latency - now));
     };
   };
   const server = createServer((from) => {

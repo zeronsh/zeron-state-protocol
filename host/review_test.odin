@@ -601,6 +601,7 @@ stream_takes_turns :: proc(t: ^testing.T) {
 		return
 	}
 	append(&to_a.session.tasks, zsp.Task{kind = .Fill, lo = zsp.scope_lo(1), hi = zsp.scope_hi(1)})
+	to_a.session.peer_took = false // nor held to a window, as with a peer that says nothing of what it took
 	// Given one turn, with nobody reading the other end meanwhile.
 	before := to_a.session.taken
 	h.more = false

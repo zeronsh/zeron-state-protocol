@@ -395,6 +395,7 @@ session_link :: proc(session: ^zsp.Session, l: ^pipe.Link) {
 link_heard :: proc(session: ^zsp.Session, l: ^pipe.Link, id: u64, bytes: []byte, event: pipe.Stream_Event) {
 	if id == 0 {
 		if event == .Data {
+			session.node.now = now_ms()
 			zsp.session_input(session, bytes) // its owner closes it, once it has heard why
 		}
 		return

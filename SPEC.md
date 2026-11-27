@@ -266,7 +266,7 @@ clear prefix and then plaintext; the node seals and opens on its client's behalf
 Each side first sends
 
 ```
-1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, 2 relay: which only confirms what the dialler knows; 4, of a local client, that it is told whose cells are; 8 calls) ‖ space (32) ‖ roster serial varint ‖ credential bytes
+1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, 2 relay: which only confirms what the dialler knows; 4, of a local client, that it is told whose cells are; 8 calls; 16 says what it took) ‖ space (32) ‖ roster serial varint ‖ credential bytes
 ```
 
 A session between peers with flag 8, a **calls session**, carries Hello, Roster, Call, Flow and Error and nothing else: it is begun over a link a relay
@@ -282,7 +282,19 @@ waits, saying nothing, until a roster comes, from its peer or from anyone, and i
            clock (8) ‖ n × { scope varint, rights (1, and 128 in a signed scope), list key (32) }
                                                                               to a local client: what it may do, and what it needs to
 17 Author  number varint ‖ device (32) ‖ subject bytes                        to a local client that asked: whom a number is for from now on
+18 Took    bytes varint                                                         how many more bytes have come, but those of Took
 ```
+
+**Took.** A peer that says in its Hello that it says what it took (16) says, now and then, how many more bytes of the session's
+stream have come to it, whole frames or not, but those of Took frames, and those of what has come and is not yet taken in that is,
+or may yet prove to be, of one. To such a peer, what is made is held to a window: what is made and not yet said to have come is
+kept to two and a half times the most delivered lately per millisecond, times the least round trip timed on the session (64 KiB
+at least, 256 KiB until timed); a round trip is timed from when the first byte of what the host takes is taken to when it is said
+to have come. So whatever lies between, a socket's buffers, a proxy's, a network's, holds no more than that, and what goes first
+(a window of limited size newly asked for, and what it is owed, which may go 64 KiB beyond it) is taken within about a round trip
+or two, rather than after all that was handed over before it. Changes and Fills are held to it; frames that answer or ask, and
+Ack and Took, are not. Neither end does this over a link, which carries a session on streams of its own. A window of limited size
+is asked for whole, not compared: compared, it would be had only a round trip later for each step of comparing.
 
 Whose a cell is follows it, to a local client that asked: 0x40 in its tag, and after its body the number (varint) of an Author said before. Number 0 is the client itself, said ahead of all else and again
 whenever the roster changes. When the roster changes whose anything is, all that is watched is sent again, under new numbers.

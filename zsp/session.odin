@@ -110,6 +110,14 @@ Session :: struct {
 	lane_data: rawptr,
 	lane_open: proc(data: rawptr, urgency: u8, after: u64) -> (id: u64, ok: bool),
 	taken:     u64, // bytes of `out` the host has taken, ever
+	peer_took: bool, // the peer says what it took: what is made for it is held to a window
+	took:      u64, // bytes come in, ever, whole frames or not
+	took_frames: u64, // of them, those of Took frames, which are not said to be taken
+	took_said: u64, // what was said to be taken, ever
+	took_held: u64, // of what has come and is not yet taken in, what is or may be of Took frames
+	acked:     u64, // what the peer has said it took, of what was made for it but Took frames
+	took_out:  u64, // bytes of Took frames made, which the peer does not count
+	window:    Window,
 	lane_held: int, // bytes waiting on lanes, all of them together
 }
 
@@ -148,7 +156,8 @@ Hello_Flags :: bit_field u8 {
 	relay: bool | 1,
 	authors: bool | 1, // a local client's, which wants to be told who wrote what
 	calls: bool | 1, // for calls only, over a link through a relay
-	_:     u8   | 4,
+	took:  bool | 1, // says what it took, so that what is sent to it may be held to a window (see `Window`)
+	_:     u8   | 3,
 }
 
 Task :: struct {
@@ -365,6 +374,7 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 	}
 	s.busy = true
 	defer s.busy = false
+	s.took += u64(len(bytes))
 	bytes := bytes
 	if len(s.input) > 0 {
 		append(&s.input, ..bytes)
@@ -394,10 +404,14 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 			stalled = true // and again when what it read has come
 			break
 		}
+		if Message(frame[0]) == .Took { // what says what was taken is not itself said to be
+			s.took_frames += u64(r.pos + int(n))
+		}
 		used += r.pos + int(n)
 	}
 	s.stalled = stalled
 	rest := bytes[used:]
+	s.took_held = took_held(rest)
 	if len(rest) > (MAX_STALLED if stalled else MAX_FRAME + 16) {
 		session_fail(s, .Failed if stalled else .Malformed)
 	}
@@ -436,6 +450,7 @@ session_queued :: proc(s: ^Session) -> []byte {
 session_sent :: proc(s: ^Session, n: int) {
 	s.sent += n
 	s.taken += u64(n)
+	window_sent(s)
 	if s.sent == len(s.out) {
 		s.sent = 0
 		clear(&s.out)
@@ -505,6 +520,8 @@ session_frame :: proc(s: ^Session, frame: []byte) -> Fault {
 		on_call(s, &r)
 	case .Flow:
 		on_flow(s, &r)
+	case .Took:
+		on_took(s, &r)
 	case:
 		if q := &n.host.questions; frame[0] >= QUESTION && s.role == .Open && q.asked != nil {
 			return .None if q.asked(q.data, s, frame[0], frame[1:]) else .Malformed
@@ -523,7 +540,7 @@ send_hello :: proc(s: ^Session) {
 	write_u8(&s.out, VERSION)
 	// One becoming partial is a full replica only for itself: nobody is to count on what it says it holds, nor be brought
 	// level with it as with one that will go on holding everything.
-	write_u8(&s.out, u8(Hello_Flags{full = n.full && !n.becoming && s.role != .Calls, relay = n.keys == nil, calls = s.role == .Calls}))
+	write_u8(&s.out, u8(Hello_Flags{full = n.full && !n.becoming && s.role != .Calls, relay = n.keys == nil, calls = s.role == .Calls, took = s.role == .Peer}))
 	append(&s.out, ..n.space[:])
 	write_varint(&s.out, n.roster.serial)
 	write_bytes(&s.out, s.credential)
@@ -556,6 +573,7 @@ on_hello :: proc(s: ^Session, r: ^Reader) -> Fault {
 		return .Denied
 	}
 	s.peer_full = flags.full
+	s.peer_took = flags.took && s.role == .Peer
 	s.peer_relay = s.relay && flags.relay
 	if s.relay != s.peer_relay {
 		return .Denied
@@ -801,7 +819,9 @@ send_watch :: proc(s: ^Session, id: u64, lo, hi: Key, flags: Watch_Flags, limit:
 	n := s.node
 	flags := flags
 	sum: Sum
-	if flags.data && !flags.adopt {
+	// A window of limited size is asked for whole: it is small, and compared, it would be had only after a round trip
+	// more for each step of comparing, each behind whatever lies on the way.
+	if flags.data && !flags.adopt && limit == 0 {
 		sum = store_range(&n.store, lo, hi)
 		flags.known = true
 	}
@@ -2761,10 +2781,16 @@ run_tasks :: proc(s: ^Session) -> bool {
 	for len(s.out) - s.sent < OUT_HIGH {
 		go := true
 		if s.first_head < len(s.first) {
+			if !window_open(s, first = true) {
+				break
+			}
 			s.in_first = true
 			go = unit_step(s, run_task, &s.first[s.first_head])
 			s.in_first = false
 		} else if s.task_head < len(s.tasks) {
+			if !window_open(s) {
+				break
+			}
 			go = unit_step(s, run_task, &s.tasks[s.task_head])
 		} else {
 			break
@@ -2797,7 +2823,7 @@ pump :: proc(s: ^Session) {
 	if go && (s.cursor != n.events.next || s.counts_due) {
 		// Bounded before what has changed is sent, so that what falls outside is not.
 		go = unit_step(s, proc(s: ^Session, _: ^Task) {bound_windows(s)})
-		go = go && flush_changes(s, OUT_HIGH) && unit_step(s, proc(s: ^Session, _: ^Task) {tell_counts(s)})
+		go = go && flush_changes(s, OUT_HIGH, windowed = true) && unit_step(s, proc(s: ^Session, _: ^Task) {tell_counts(s)})
 		s.counts_due &&= !go
 	}
 	go = go && run_tasks(s)
@@ -2862,11 +2888,12 @@ pump :: proc(s: ^Session) {
 		s.acked_in = s.seq_in
 		clear(&s.refused)
 	}
+	took_send(s)
 }
 
 // Sends what has changed since the session last heard. False if it stopped at something storage did not yet have.
 @(private)
-flush_changes :: proc(s: ^Session, high := max(int)) -> bool {
+flush_changes :: proc(s: ^Session, high := max(int), windowed := false) -> bool {
 	n := s.node
 	// Whoever flushes, the counts are owed until pump has told them.
 	s.counts_due ||= s.cursor != n.events.next
@@ -2877,7 +2904,7 @@ flush_changes :: proc(s: ^Session, high := max(int)) -> bool {
 	if s.cursor < n.events.first && !unit_step(s, proc(s: ^Session, _: ^Task) {resync(s)}) {
 		return false
 	}
-	for s.cursor < n.events.next && len(s.out) - s.sent < high {
+	for s.cursor < n.events.next && len(s.out) - s.sent < high && (!windowed || window_open(s)) {
 		if !unit_step(s, flush_one) {
 			return false
 		}
