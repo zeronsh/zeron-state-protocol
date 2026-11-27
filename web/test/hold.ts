@@ -5,11 +5,12 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { open } from "../src/nodejs.ts";
-import { ASIDE, FLOCK } from "../src/volume-node.ts";
+import { ASIDE, FLOCK, judgedByRoot } from "../src/volume-node.ts";
 import { BIN, ROOT, node as zspdNode, procs, zspd } from "./procs.ts";
 
 const TMP = mkdtempSync(join(tmpdir(), "zsp-hold-"));
@@ -120,6 +121,10 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
     await e.close();
     assert.match(p.stderr, IN_USE, "zspd and a device held the one directory, each where it took it to be");
     assert(!existsSync(join(TMP, "linked")), "held where the link is, not where it leads");
+    // And a part there is after a part that is not, and a `..` that takes the latter away: resolved as the former is.
+    const past = await open({ dir: join(TMP, "gone") + "/../link/../past", ...quiet });
+    await past.close();
+    assert(existsSync(join(TMP, "deep", "past", "lock")) && !existsSync(join(TMP, "past")) && !existsSync(join(TMP, "gone")));
   }
 }
 
@@ -138,14 +143,58 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
     linked = false;
   }
   if (linked) await assert.rejects(open({ dir, ...quiet }), /is not a file/);
-  const filled = join(TMP, "filled");
-  zspd("create", filled);
-  writeFileSync(join(filled, "lock"), "x".repeat(4096));
-  const d = await open({ dir: filled, ...quiet });
-  const p = spawnSync(BIN, ["run", filled, "--listen=127.0.0.1:0", "--no-udp"], { encoding: "utf8", timeout: 30000 });
-  assert.match(p.stderr, IN_USE, "a device on a lock file with something in it holds nothing");
-  await d.close();
+  // Something in it: what is no database, a database's start with nothing whole after it, and a database spoiled. It is
+  // emptied without anything here opening the file, which, closed, would let go of whatever this process holds there.
+  const sqlite = new (process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite")).DatabaseSync(join(TMP, "a-database"));
+  sqlite.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+  sqlite.close();
+  const database = readFileSync(join(TMP, "a-database"));
+  const spoiled = Buffer.from(database);
+  spoiled[100] = 0x99; // the first page's kind, which no page is
+  const fs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
+  const opened: string[] = [];
+  const watched = { openSync: fs.openSync, truncateSync: fs.truncateSync, writeFileSync: fs.writeFileSync };
+  fs.openSync = ((path: string, ...rest: unknown[]) => (opened.push(String(path)), (watched.openSync as (...a: unknown[]) => number)(path, ...rest))) as typeof fs.openSync;
+  fs.truncateSync = ((path: string, ...rest: unknown[]) => (opened.push(String(path)), (watched.truncateSync as (...a: unknown[]) => void)(path, ...rest))) as typeof fs.truncateSync;
+  for (const [name, bytes] of [["filled", Buffer.from("x".repeat(4096))], ["begun", database.subarray(0, 512)], ["spoiled", spoiled]] as const) {
+    const filled = join(TMP, name);
+    zspd("create", filled);
+    writeFileSync(join(filled, "lock"), bytes);
+    opened.length = 0;
+    syncBuiltinESMExports();
+    let d;
+    try {
+      d = await open({ dir: filled, ...quiet });
+    } finally {
+      Object.assign(fs, watched);
+      syncBuiltinESMExports();
+    }
+    assert(!opened.includes(join(filled, "lock")), `the lock file with ${name} in it was opened here: ${opened.join(", ")}`);
+    assert(!existsSync(join(filled, "lock-journal")), "the journal that emptied it was left");
+    const p = spawnSync(BIN, ["run", filled, "--listen=127.0.0.1:0", "--no-udp"], { encoding: "utf8", timeout: 30000 });
+    assert.match(p.stderr, IN_USE, `a device on a lock file with ${name} in it holds nothing`);
+    await d.close();
+  }
 }
+
+// No path is no directory: an empty one would be wherever the process happens to be.
+{
+  const here = join(TMP, "here");
+  mkdirSync(here);
+  const was = process.cwd();
+  process.chdir(here);
+  try {
+    await assert.rejects(open({ dir: "", ...quiet }), /named by no path/);
+    const p = spawnSync(BIN, ["key", ""], { encoding: "utf8", timeout: 30000 });
+    assert.notEqual(p.status, 0, "zspd took no path for where it is");
+  } finally {
+    process.chdir(was);
+  }
+  assert.deepEqual(readdirSync(here), [], "something was made where the process happened to be");
+}
+
+// A file system's kind, where Node has none for any, as on OpenBSD and NetBSD, is no reason to judge it as the root's.
+assert(!judgedByRoot(0, 0) && judgedByRoot(26, 26) && !judgedByRoot(26, 27));
 
 // What a lock file is made from is no file zspd takes for a save's left behind, which it would remove, and the lock file
 // then be made readable by everyone: so it is not removed by zspd clearing the directory, and the lock file is the

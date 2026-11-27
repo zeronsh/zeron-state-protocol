@@ -201,8 +201,13 @@ File_Lock :: distinct win32.HANDLE
 @(private)
 file_lock :: proc(path: string) -> (lock: File_Lock, ok: bool) {
 	name := win32.utf8_to_wstring(path, context.temp_allocator)
-	handle := win32.CreateFileW(name, win32.GENERIC_READ | win32.GENERIC_WRITE, win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE, nil, win32.OPEN_ALWAYS, win32.FILE_ATTRIBUTE_NORMAL, nil)
+	// The link itself, should it be one, which is then refused: never followed to wherever it leads.
+	handle := win32.CreateFileW(name, win32.GENERIC_READ | win32.GENERIC_WRITE, win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE, nil, win32.OPEN_ALWAYS, win32.FILE_ATTRIBUTE_NORMAL | win32.FILE_FLAG_OPEN_REPARSE_POINT, nil)
 	if handle == win32.INVALID_HANDLE_VALUE {
+		return
+	}
+	if !plain_file(handle) {
+		win32.CloseHandle(handle)
 		return
 	}
 	over: win32.OVERLAPPED
@@ -211,6 +216,13 @@ file_lock :: proc(path: string) -> (lock: File_Lock, ok: bool) {
 		return
 	}
 	return File_Lock(handle), true
+}
+
+// Whether what a handle has open is a file, and neither a link nor a directory.
+@(private)
+plain_file :: proc(handle: win32.HANDLE) -> bool {
+	info: win32.BY_HANDLE_FILE_INFORMATION
+	return bool(win32.GetFileInformationByHandle(handle, &info)) && info.dwFileAttributes & (win32.FILE_ATTRIBUTE_REPARSE_POINT | win32.FILE_ATTRIBUTE_DIRECTORY) == 0
 }
 
 // A store's directory held: see hold.odin.
@@ -236,8 +248,7 @@ dir_lock :: proc(path: string) -> (lock: Dir_Lock, held: Hold) {
 	if handle == win32.INVALID_HANDLE_VALUE {
 		return lock, .Failed
 	}
-	info: win32.BY_HANDLE_FILE_INFORMATION
-	if !win32.GetFileInformationByHandle(handle, &info) || info.dwFileAttributes & (win32.FILE_ATTRIBUTE_REPARSE_POINT | win32.FILE_ATTRIBUTE_DIRECTORY) != 0 {
+	if !plain_file(handle) {
 		win32.CloseHandle(handle)
 		return lock, .Failed
 	}
@@ -268,6 +279,9 @@ path_remote :: proc(path: string) -> (remote: bool, kind: string, found: bool) {
 // Where a directory is, as the system takes its path: where `..` is only ever taken as written, as it is by the system
 // (GetFullPathNameW). For this turn.
 dir_real :: proc(dir: string) -> (real: string, ok: bool) {
+	if dir == "" {
+		return // no path, which would be wherever the process happens to be, is no directory
+	}
 	whole, err := filepath.abs(dir, context.temp_allocator)
 	return whole, err == nil
 }

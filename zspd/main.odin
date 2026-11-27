@@ -86,7 +86,7 @@ run :: proc() -> int {
 	// Where the directory is as the system takes it: what is made, judged and held is that, and all is kept in it.
 	real, found := host.dir_real(args[1])
 	if !found {
-		say(os.stderr, "could not find ", args[1], "\n")
+		say(os.stderr, "no directory is named\n" if args[1] == "" else strings.concatenate({"could not find ", args[1], "\n"}, context.temp_allocator))
 		return 1
 	}
 	dir := strings.clone(real)

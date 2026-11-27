@@ -1,6 +1,6 @@
 // A directory on a disk, for Node.
 
-import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, rmSync, statfsSync, statSync, truncateSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, rmSync, statfsSync, statSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { File, Volume } from "./volume.ts";
@@ -118,6 +118,8 @@ export const ASIDE = /^lock\.[0-9a-f]{32}\.making$/;
 // A lock on a file system shared with other machines may not hold, and a store on one is refused, where that can be
 // told, before anything is made there. Returns where the directory is, as held, and what lets go of it.
 function holdDirectory(dir: string): [string, () => void] {
+  // No path, which would be wherever the process happens to be, is no directory.
+  if (dir === "") throw new Error("a store's directory is named by no path");
   // Judged as the system will take it: itself if it is there, links and all; if not, the longest part of its path that
   // is, as the system resolves it, and the rest, to be made, as written.
   const there = existsSync(dir);
@@ -164,15 +166,7 @@ function holdDirectory(dir: string): [string, () => void] {
     let aside: string | undefined;
     let name: string | URL = path;
     if (process.platform !== "win32" && !existsSync(path)) {
-      for (;;) {
-        aside = join(at, `lock.${Array.from({ length: 4 }, () => ((Math.random() * 2 ** 32) >>> 0).toString(16).padStart(8, "0")).join("")}.making`);
-        try {
-          closeSync(openSync(aside, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600));
-          break;
-        } catch (e) {
-          if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-        }
-      }
+      aside = madeAside(at, new Uint8Array(0));
       name = pathToFileURL(path);
       name.searchParams.set("modeof", aside);
     }
@@ -192,45 +186,88 @@ function holdDirectory(dir: string): [string, () => void] {
     }
   };
   const code = (e: unknown) => ((e as { errcode?: number }).errcode ?? 0) & 0xff;
-  try {
-    return [at, take()];
-  } catch (e) {
-    if (code(e) === 5 || code(e) === 6) throw inUse(); // SQLITE_BUSY, by another; SQLITE_LOCKED, by this one
-    if (code(e) !== 26) throw e;
-  }
-  // SQLITE_NOTADB: something is in it, which nothing writes, and which zspd pays no heed to. Nobody holds it, in this
-  // process or another, for SQLite takes its lock before it reads, so that would have been said first: so it is emptied,
-  // as it may then be opened, and taken again.
-  truncateSync(path, 0);
-  try {
-    return [at, take()];
-  } catch (e) {
-    if (code(e) === 5 || code(e) === 6) throw inUse();
-    throw e;
+  for (let tries = 0; ; tries++) {
+    try {
+      return [at, take()];
+    } catch (e) {
+      if (code(e) === 5 || code(e) === 6) throw inUse(); // SQLITE_BUSY, by another; SQLITE_LOCKED, by this one
+      if ((code(e) !== 26 && code(e) !== 11) || tries === 2) throw e;
+    }
+    // SQLITE_NOTADB or SQLITE_CORRUPT: something is in it, which nothing writes, and which zspd pays no heed to; and
+    // nobody held it as this looked, in this process or another, for SQLite takes its lock before it reads, and would
+    // have said so first. It is emptied by SQLite itself, as it does what a hot journal beside a database says: through
+    // its own file and under its own lock, with what it holds in this process known to it, where anything else here
+    // opening the file and closing it would let go of what this process holds there, as a process's locks are let go
+    // of. The journal says the database had no pages before, and so is to have none, and nothing more; SQLite plays it
+    // only if nobody holds the file, and removes it once played, or once it finds the file empty. Put in its place
+    // whole, it is never read half written.
+    const journal = new Uint8Array(512);
+    const header = new DataView(journal.buffer);
+    journal.set([0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]); // the journal's magic
+    // records 0, checksum seed 0, pages the database had 0, then its sector size and its page size
+    header.setUint32(20, 512);
+    header.setUint32(24, 4096);
+    const aside = madeAside(at, journal);
+    try {
+      renameSync(aside, path + "-journal");
+    } catch (e) {
+      rmSync(aside, { force: true });
+      throw e;
+    }
   }
 }
 
-// Where a directory that is not there would be, as the system takes its path: the longest part of it there is resolved
-// as the system resolves it (realpath), links and `..` and all, and the rest, which is to be made and so is no link, as
-// written, `..` taking one of its parts away. Windows takes `..` only as written.
-function resolved(dir: string): string {
-  if (process.platform === "win32") return resolve(dir);
-  const parts = (isAbsolute(dir) ? dir : process.cwd() + "/" + dir).split("/");
-  for (let n = parts.length; n >= 1; n--) {
-    let real: string;
+// A file made, holding what is given, under a name of its own that ASIDE matches, readable by its owner alone; the
+// whole of it on disk before anything takes it for what it is to be. Returns its path.
+function madeAside(dir: string, bytes: Uint8Array): string {
+  for (;;) {
+    const aside = join(dir, `lock.${Array.from({ length: 4 }, () => ((Math.random() * 2 ** 32) >>> 0).toString(16).padStart(8, "0")).join("")}.making`);
+    let fd: number;
     try {
-      real = realpathSync.native(parts.slice(0, n).join("/") || "/");
+      fd = openSync(aside, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") continue;
       throw e;
     }
-    for (const part of parts.slice(n)) {
-      if (part === "" || part === ".") continue;
-      real = part === ".." ? dirname(real) : join(real, part);
+    try {
+      if (bytes.length > 0) {
+        writeSync(fd, bytes, 0, bytes.length, 0);
+        fsyncSync(fd);
+      }
+    } finally {
+      closeSync(fd);
     }
-    return real;
+    return aside;
   }
-  return resolve(dir);
+}
+
+// Where a directory that is not there would be, as the system takes its path: a part at a time, each that is there
+// resolved as the system resolves it (realpath), links and `..` and all, from where the last led, and each that is not,
+// which is to be made and so is no link, as written, a `..` after it taking it away. Windows takes `..` only as written.
+function resolved(dir: string): string {
+  if (process.platform === "win32") return resolve(dir);
+  const real = (path: string): string | undefined => {
+    try {
+      return realpathSync.native(path);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw e;
+    }
+  };
+  let at = real(isAbsolute(dir) ? "/" : ".")!;
+  const made: string[] = [];
+  for (const part of dir.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (made.length > 0) made.pop();
+      else at = dirname(at);
+      continue;
+    }
+    const next = made.length === 0 ? real(join(at, part)) : undefined;
+    if (next !== undefined) at = next;
+    else made.push(part);
+  }
+  return join(at, ...made);
 }
 
 // The kind of file system shared with other machines a directory there is is on, if it is on one, as host/ finds it.
@@ -276,9 +313,16 @@ const REMOTE_MAGIC = new Map<number, string>([
 // asked once, as it is the same file system for as long as the machine runs; any other, each time, as what is mounted
 // where may change, and a device's number with it.
 function notLocal(dir: string): string | undefined {
-  const type = statfsSync(dir).type;
-  if (type === statfsSync("/").type) return (rootKind ??= [mountKind("/")])[0];
+  if (judgedByRoot(statfsSync(dir).type, statfsSync("/").type)) return (rootKind ??= [mountKind("/")])[0];
   return mountKind(dir);
+}
+
+/**
+ * Whether a file system is judged as the root's is, by its kind, as Node has it from statfs: never where Node says no
+ * kind at all, as on OpenBSD and NetBSD, where every file system is of kind 0, the root's and a share's alike.
+ */
+export function judgedByRoot(type: number, root: number): boolean {
+  return type !== 0 && type === root;
 }
 
 let rootKind: [string | undefined] | undefined;

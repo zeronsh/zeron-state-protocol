@@ -246,3 +246,75 @@ hold_start_against_another_thread :: proc(t: ^testing.T) {
 	thread.destroy(waiter)
 	testing.expect(t, sync.atomic_load(&second.done), "the other thread never started")
 }
+
+// No path is no directory: an empty one would be wherever the process happens to be, and it is neither judged, made nor
+// held there.
+@(test)
+hold_no_path :: proc(t: ^testing.T) {
+	_, found := dir_real("")
+	testing.expect(t, !found, "an empty path is taken for a directory")
+	lock, held, _ := dir_try("")
+	if held == .Held {
+		dir_unlock(lock)
+	}
+	testing.expectf(t, held == .Failed, "an empty path is held: %v", held)
+	logger := context.logger
+	context.logger = runtime.Logger{} // what it says of it is meant
+	_, starting := dir_starting("")
+	context.logger = logger
+	testing.expect(t, !starting, "a node is started where the process happens to be")
+}
+
+// A part there is after a part that is not, with a `..` that takes the latter away, is resolved as the system resolves
+// it, from where a link leads, and not as written.
+@(test)
+hold_exactly_where_the_system_takes_it :: proc(t: ^testing.T) {
+	when ODIN_OS != .Windows {
+		base, _ := os.temp_directory(context.temp_allocator)
+		dir, err := os.make_directory_temp(base, "zsp-hold-*", context.allocator)
+		testing.expect(t, err == nil)
+		defer delete(dir)
+		defer os.remove_all(dir)
+		inner := file_in(file_in(dir, "deep"), "inner")
+		testing.expect(t, os.make_directory_all(inner) == nil)
+		testing.expect(t, os.symlink(inner, file_in(dir, "link")) == nil)
+		lock, held, _ := dir_try(strings.concatenate({dir, "/gone/../link/../past"}, context.temp_allocator))
+		testing.expectf(t, held == .Held, "not held: %v", held)
+		if held == .Held {
+			dir_unlock(lock)
+		}
+		testing.expect(t, os.exists(file_in(file_in(file_in(dir, "deep"), "past"), LOCK_FILE)), "not held where the link leads")
+		testing.expect(t, !os.exists(file_in(dir, "past")) && !os.exists(file_in(dir, "gone")), "held where the link is")
+	}
+}
+
+// What a node starting holds is never a link, followed to wherever it leads, as no lock file here is.
+@(test)
+hold_start_never_a_link :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-hold-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer delete(dir)
+	defer os.remove_all(dir)
+	elsewhere := file_in(dir, "elsewhere")
+	testing.expect(t, os.write_entire_file(elsewhere, nil) == nil)
+	linked := link_for_test(elsewhere, file_in(dir, START_FILE))
+	when ODIN_OS == .Windows {
+		// Where this process may make no link, as on Windows unelevated and not in developer mode, it is not tried here;
+		// CI, elevated, tries it.
+		if !linked && os.get_env("CI", context.temp_allocator) == "" {
+			return
+		}
+	}
+	if !testing.expect(t, linked, "no link could be made") {
+		return
+	}
+	logger := context.logger
+	context.logger = runtime.Logger{}
+	lock, starting := dir_starting(dir)
+	context.logger = logger
+	if starting {
+		dir_started(lock)
+	}
+	testing.expect(t, !starting, "a link was followed to wherever it leads")
+}

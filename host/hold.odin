@@ -128,7 +128,7 @@ hold_report :: proc(dir: string, held: Hold, kind: string) {
 dir_starting :: proc(dir: string) -> (lock: File_Lock, ok: bool) {
 	at, remote, kind, there, real := dir_judged(dir)
 	if !real {
-		report(.Error, "could not find ", dir)
+		report(.Error, "no directory is named" if dir == "" else "could not find ", dir)
 		return
 	}
 	if remote {

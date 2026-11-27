@@ -283,7 +283,7 @@ host_init :: proc(h: ^Host, config: Config) -> (started: bool) {
 	// Where the directory is as the system takes it, which is what is made and held, and all is kept in from then on.
 	real, found := dir_real(config.dir)
 	if !found {
-		report(.Error, "could not find ", config.dir)
+		report(.Error, "no directory is named" if config.dir == "" else "could not find ", config.dir)
 		return false
 	}
 	h.dir = strings.clone(real)

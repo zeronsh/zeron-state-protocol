@@ -211,37 +211,56 @@ dir_lock :: proc(path: string) -> (lock: Dir_Lock, held: Hold) {
 	return Dir_Lock(fd), .Held
 }
 
-// Where a directory is, as the system takes its path: the longest part of it there is resolved as the system resolves
-// it, links and `..` and all (realpath), and the rest, which is to be made and so is no link, as written, `..` taking
-// one of its parts away. For this turn.
+// Where a directory is, as the system takes its path, for this turn: one there is, resolved as the system resolves it,
+// links and `..` and all (realpath); one that is not, a part at a time, each that is there resolved so from where the
+// last led, and each that is not, which is to be made and so is no link, as written, a `..` after it taking it away. No
+// path, not even an empty one, which would be wherever the process happens to be, is no directory.
 dir_real :: proc(dir: string) -> (real: string, ok: bool) {
-	parts := strings.split(dir, "/", context.temp_allocator)
-	for n := len(parts); n >= 0; n -= 1 {
-		prefix := strings.join(parts[:n], "/", context.temp_allocator)
-		if prefix == "" {
-			prefix = "/" if strings.has_prefix(dir, "/") else "."
-		}
-		resolved := posix.realpath(strings.clone_to_cstring(prefix, context.temp_allocator))
+	if dir == "" {
+		return
+	}
+	resolve :: proc(path: string) -> (real: string, there: bool, ok: bool) {
+		resolved := posix.realpath(strings.clone_to_cstring(path, context.temp_allocator))
 		if resolved == nil {
-			if posix.errno() == .ENOENT {
-				continue
-			}
-			return
+			return "", false, posix.errno() == .ENOENT
 		}
-		real = strings.clone(string(resolved), context.temp_allocator)
-		posix.free(rawptr(resolved))
-		for part in parts[n:] {
-			switch part {
-			case "", ".":
-			case "..":
-				real = filepath.dir(real)
-			case:
-				real = file_in(real, part)
-			}
-		}
+		defer posix.free(rawptr(resolved))
+		return strings.clone(string(resolved), context.temp_allocator), true, true
+	}
+	there: bool
+	if real, there = resolve(dir) or_return; there {
 		return real, true
 	}
-	return
+	if real, there = resolve("/" if strings.has_prefix(dir, "/") else ".") or_return; !there {
+		return
+	}
+	made := make([dynamic]string, context.temp_allocator) // to be made, after real
+	for part in strings.split(dir, "/", context.temp_allocator) {
+		switch part {
+		case "", ".":
+		case "..":
+			if len(made) > 0 {
+				pop(&made)
+			} else {
+				real = filepath.dir(real)
+			}
+		case:
+			if len(made) > 0 {
+				append(&made, part)
+				continue
+			}
+			next, found := resolve(file_in(real, part)) or_return
+			if found {
+				real = next
+			} else {
+				append(&made, part)
+			}
+		}
+	}
+	for part in made {
+		real = file_in(real, part)
+	}
+	return real, true
 }
 
 // The names in a directory, for this turn, as cheaply as they can be had: without asking anything of what each is.
