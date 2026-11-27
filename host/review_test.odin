@@ -632,4 +632,59 @@ one_way_to_a_relay :: proc(t: ^testing.T) {
 	}
 	world_run(&w, proc(w: ^World, _: rawptr) -> bool {return false}, within = 3 * time.Second)
 	testing.expect_value(t, up(&w), 1)
+	// The other waits on it, and sets the loop no time to look again, which would be at once, again and again.
+	for d in w.hosts[1].dialers {
+		if d.key == w.keys[0].device && d.state == .Waiting {
+			_, ok := dialer_deadline(d)
+			testing.expect(t, !ok, "a way waiting on its twin had the loop look again at once")
+		}
+	}
+}
+
+// Of two ways to one relay, both admitted at once, the one kept is let go of, as the roster drops it: the other is not
+// let go of for it, which would leave none.
+@(test)
+twins_go_one_at_a_time :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false))
+	defer world_destroy(&w)
+	other, _ := strings.replace(w.urls[0], "127.0.0.1", "localhost", 1, context.temp_allocator)
+	dial(&w.hosts[1], world_space(&w, 1), w.keys[0].device, other)
+	h := &w.hosts[1]
+	// Both dialled together: once both are taken in, and before either is said to be, the first is dropped.
+	both := false
+	start := time.tick_now()
+	for !both && time.tick_since(start) < 10 * time.Second {
+		ready := 0
+		for d in h.dialers {
+			ready += 1 if d.key == w.keys[0].device && d.state == .Up && d.stream.session != nil && d.stream.session.ready else 0
+		}
+		if ready == 2 {
+			both = true
+			break
+		}
+		for &x, i in w.hosts[:w.count] {
+			if !w.dead[i] {
+				host_settle(&x)
+			}
+		}
+		_ = nbio.tick(5 * time.Millisecond)
+		free_all(context.temp_allocator)
+	}
+	if !both {
+		return // the race was not had: one was taken in, and the other never tried
+	}
+	first, second: ^Dialer
+	for d in h.dialers {
+		if d.key == w.keys[0].device {
+			if first == nil {
+				first = d
+			} else {
+				second = d
+			}
+		}
+	}
+	first.dropped = true
+	dialers_run(h, time.tick_now())
+	testing.expect(t, !second.stream.dead, "a way to the relay was let go of for one dropped")
 }

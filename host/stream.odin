@@ -615,7 +615,7 @@ dialer_free :: proc(d: ^Dialer) {
 dialer_deadline :: proc(d: ^Dialer) -> (t: time.Tick, ok: bool) {
 	switch d.state {
 	case .Waiting:
-		return d.due, !d.dropped
+		return d.due, !d.dropped && !dialer_twin(d) // one waiting on its twin is woken by that one's going
 	case .Up:
 		wait := PONG_WAIT if d.stream.pinged else PING_IDLE
 		return time.tick_add(d.stream.quiet_at, wait), true
@@ -651,14 +651,6 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 				d.admitted = true
 				report(.Debug, "admitted by the relay at ", d.source)
 			}
-			if d.admitted && !d.dropped {
-				for x in h.dialers {
-					if x != d && x.space == d.space && x.key == d.key && x.admitted && x.state == .Up && dialer_preferred(x, d) {
-						d.stream.dead = true // the other way to it is kept
-						break
-					}
-				}
-			}
 			if d.dropped {
 				d.stream.dead = true
 				continue
@@ -667,7 +659,20 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 			quiet := time.tick_diff(d.stream.quiet_at, now)
 			if d.stream.pinged && quiet >= PONG_WAIT {
 				d.stream.dead = true
-			} else if !d.stream.pinged && quiet >= PING_IDLE && d.admitted {
+				continue
+			}
+			if d.admitted {
+				for x in h.dialers {
+					if x != d && x.space == d.space && x.key == d.key && dialer_alive(x, now) && dialer_preferred(x, d) {
+						d.stream.dead = true // the other way to it is kept
+						break
+					}
+				}
+				if d.stream.dead {
+					continue
+				}
+			}
+			if !d.stream.pinged && quiet >= PING_IDLE && d.admitted {
 				d.stream.pinged = true
 				d.stream.quiet_at = now
 				stream_put(d.stream, .Ping, nil)
@@ -681,12 +686,23 @@ dialers_run :: proc(h: ^Host, now: time.Tick) {
 // time: through two, all that came in by one would go back by the other.
 @(private)
 dialer_twin :: proc(d: ^Dialer) -> bool {
+	now := time.tick_now()
 	for x in d.host.dialers {
-		if x != d && x.space == d.space && x.key == d.key && !x.dropped && x.state == .Up && x.admitted {
+		if x != d && x.space == d.space && x.key == d.key && dialer_alive(x, now) {
 			return true
 		}
 	}
 	return false
+}
+
+// Whether a way to a relay is admitted, and still to be had: not dropped, nor dead, nor closing, nor unanswered for too
+// long, though that is yet to be seen to in its turn.
+@(private)
+dialer_alive :: proc(x: ^Dialer, now: time.Tick) -> bool {
+	if x.dropped || x.state != .Up || !x.admitted || x.stream.dead || x.stream.closing {
+		return false
+	}
+	return !x.stream.pinged || time.tick_diff(x.stream.quiet_at, now) < PONG_WAIT
 }
 
 // Of two ways to one relay, both admitted, the one kept: one named by the embedder before one the roster names; else

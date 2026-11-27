@@ -714,13 +714,24 @@ dialer_failed :: proc(d: ^Dialer, waited := false) {
 // Whether another way to the same relay is admitted: then this one is not tried. One relay is reached one way at a
 // time: through two, all that came in by one would go back by the other.
 @(private)
-dialer_twin :: proc(d: ^Dialer) -> bool {
+dialer_twin :: proc(d: ^Dialer, t: f64) -> bool {
 	for x in dialers {
-		if x != d && x.key == d.key && !x.dropped && x.conn != nil && x.conn.session != nil && x.conn.session.ready {
+		if x != d && x.key == d.key && dialer_alive(x, t) {
 			return true
 		}
 	}
 	return false
+}
+
+// Whether a way to a relay is admitted, and still to be had: not dropped, nor closing, nor unanswered for too long,
+// though that is yet to be seen to in its turn.
+@(private)
+dialer_alive :: proc(x: ^Dialer, t: f64) -> bool {
+	c := x.conn
+	if x.dropped || c == nil || c.session == nil || !c.session.ready || c.session.closing {
+		return false
+	}
+	return !c.pinged || t - c.quiet_at < pong_wait
 }
 
 // Of two ways to one relay, both admitted, the one kept: one named by whoever runs this before one the roster names;
@@ -744,7 +755,7 @@ dialers_run :: proc(t: f64) {
 		c := d.conn
 		switch {
 		case c == nil:
-			if !d.dropped && t >= d.due && !dialer_twin(d) {
+			if !d.dropped && t >= d.due && !dialer_twin(d, t) {
 				c = conn_new()
 				c.dialer = d
 				d.conn = c
@@ -753,10 +764,15 @@ dialers_run :: proc(t: f64) {
 		case d.dropped:
 			conn_drop(c)
 		case:
+			quiet := t - c.quiet_at
+			if c.pinged && quiet >= pong_wait {
+				conn_drop(c)
+				continue
+			}
 			if c.session != nil && c.session.ready {
 				c.admitted = true // not merely answered: whether that was a failure is known when it ends
 				for x in dialers {
-					if x != d && x.key == d.key && x.conn != nil && x.conn.session != nil && x.conn.session.ready && dialer_preferred(x, d) {
+					if x != d && x.key == d.key && dialer_alive(x, t) && dialer_preferred(x, d) {
 						conn_drop(c) // the other way to it is kept
 						break
 					}
@@ -765,10 +781,7 @@ dialers_run :: proc(t: f64) {
 					continue
 				}
 			}
-			quiet := t - c.quiet_at
-			if c.pinged && quiet >= pong_wait {
-				conn_drop(c)
-			} else if !c.pinged && quiet >= ping_idle {
+			if !c.pinged && quiet >= ping_idle {
 				c.pinged = true
 				c.quiet_at = t
 				ping(c.id)
@@ -998,7 +1011,7 @@ tick :: proc "c" () -> f64 {
 		sooner(&wait, f64(time.tick_diff(time.tick_now(), due)) / f64(time.Millisecond))
 	}
 	for d in dialers {
-		if d.conn == nil && !d.dropped {
+		if d.conn == nil && !d.dropped && !dialer_twin(d, t) { // one waiting on its twin is woken by that one's going
 			sooner(&wait, d.due - t)
 		} else if d.conn != nil {
 			sooner(&wait, d.conn.quiet_at + (pong_wait if d.conn.pinged else ping_idle) - t)

@@ -404,6 +404,9 @@ const tests: Record<string, () => Promise<void>> = {
     await new Promise((done) => setTimeout(done, 3000)); // the roster's way has been tried, if it is to be
     expectEqual(joined.live(), 1);
     expectEqual(named.live(), 1); // the owner's, and nobody else's
+    // And the way not taken sets the node no time to look again: it settles.
+    const settled = await Promise.race([d.node.settled().then(() => true), new Promise<boolean>((done) => setTimeout(() => done(false), 3000))]);
+    expectEqual(settled, true);
     c.close();
     await d.close();
     await stopAll();

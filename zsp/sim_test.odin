@@ -3074,7 +3074,7 @@ unfilled_only_compared :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, len(at.watches) > 0)
 	w := &at.watches[0]
-	queue(at, false, {kind = .Fill, lo = w.lo, hi = w.hi})
+	queue(at, false, {kind = .Fill, watch = w.id, lo = w.lo, hi = w.hi})
 	before := len(at.out)
 	recon_unfilled(at, w)
 	testing.expect_value(t, len(at.out), before)
@@ -3261,9 +3261,25 @@ sleeps_having_said_what_it_took :: proc(t: ^testing.T) {
 	testing.expect(t, session_input(at, f[:]))
 	clear(&saved)
 	testing.expect(t, !session_save(at, &saved), "a relay would sleep owing word of what it took")
-	for len(session_output(at)) > 0 {
-		session_sent(at, len(session_output(at)))
+	exchange :: proc(t: ^testing.T, from, to: ^Session) {
+		out := session_output(from)
+		testing.expect(t, session_input(to, out))
+		session_sent(from, len(out))
 	}
+	exchange(t, at, l.a) // it says so
+	clear(&saved)
+	testing.expect(t, session_save(at, &saved))
+	// Cells come, are kept, and are acknowledged: and until the peer says that has come, it does not sleep.
+	sim_put(&s, s.nodes[0], 2)
+	exchange(t, l.a, at)
+	testing.expect(t, node_sync(&s.nodes[1].node))
+	said := slice.clone(session_output(at), context.temp_allocator)
+	session_sent(at, len(said))
+	clear(&saved)
+	testing.expect(t, !session_save(at, &saved), "a relay would sleep with what it sent not yet said to have come")
+	testing.expect(t, session_input(l.a, said))
+	exchange(t, l.a, at)
+	exchange(t, at, l.a)
 	clear(&saved)
 	testing.expect(t, session_save(at, &saved))
 	sim_cut(&s, 0)
@@ -3273,6 +3289,78 @@ sleeps_having_said_what_it_took :: proc(t: ^testing.T) {
 		testing.expect(t, revived.peer_took)
 		session_close(revived)
 	}
+	free_all(context.temp_allocator)
+}
+
+// What is not a frame, before anything is agreed, fails the session, and does nothing more: it is not walked as frames
+// to see what of it is of Took frames, by lengths that would lead backwards, or nowhere.
+@(test)
+nonsense_is_not_walked :: proc(t: ^testing.T) {
+	state := seeded(114)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	for bytes in ([][]byte{
+		{0x80, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00}, // a length of 2^64 - 256
+		{0xf6, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00}, // of 2^64 - 10
+		{0xfb, 0xff, 0xff, 0xff, 0x0f, 0x00}, // of 2^32 - 5
+		{0x00, 0x12, 0x01, 0x00},
+	}) {
+		x := session_open(&s.nodes[1].node, .Peer, false)
+		_ = session_input(x, bytes)
+		testing.expect(t, x.closing)
+		session_close(x)
+	}
+}
+
+// One whose peer says nothing of what it took sleeps as ever: it owes no word of what it took, which it does not say.
+@(test)
+sleeps_beside_a_peer_that_says_nothing_of_it :: proc(t: ^testing.T) {
+	state := seeded(115)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	l := s.links[0]
+	l.a.peer_took, l.b.peer_took = false, false
+	sim_put(&s, s.nodes[0], 1)
+	sim_settle(&s)
+	saved := make([dynamic]byte, context.temp_allocator)
+	testing.expect(t, session_save(l.b, &saved), "a relay would not sleep beside a peer that says nothing of what it took")
+	free_all(context.temp_allocator)
+}
+
+// A watch compared afresh is compared where a Fill for another watch is still to come: that says nothing of this one,
+// nor is what says this one is level queued after it.
+@(test)
+another_watchs_fill_says_nothing :: proc(t: ^testing.T) {
+	state := seeded(116)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	for i in 0 ..< 100 {
+		sim_put(&s, s.nodes[0], u64(i))
+	}
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	at: ^Session
+	for l in s.links {
+		if l.an == 1 {
+			at = l.b
+		}
+	}
+	w := &at.watches[0]
+	queue(at, false, {kind = .Fill, watch = w.id + 12345, lo = w.lo, hi = w.hi})
+	before := len(at.out)
+	recon_unfilled(at, w)
+	testing.expect(t, len(at.out) > before, "a Fill for another watch was taken to say this one would be level")
+	clear(&at.tasks)
+	at.task_head = 0
 	free_all(context.temp_allocator)
 }
 

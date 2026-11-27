@@ -208,6 +208,7 @@ present :: proc "c" () {
 @(export)
 verdict :: proc "c" (id: u32, yes: bool) {
 	context = runtime.default_context()
+	node.now = u64(now()) // what it sends now is timed from now (see zsp's window)
 	c, ok := conns[id]
 	if !ok || c.session == nil {
 		return
@@ -239,6 +240,7 @@ closed :: proc "c" (id: u32) {
 @(export)
 settle :: proc "c" () -> int {
 	context = runtime.default_context()
+	node.now = u64(now()) // what it sends now is timed from now (see zsp's window)
 	defer free_all(context.temp_allocator)
 	if !node.store.replaying {
 		zsp.store_sync(&node.store)
@@ -275,6 +277,7 @@ ops :: proc "c" () {
 @(export)
 done :: proc "c" (id: u32, ok, absent: bool, size: int) {
 	context = runtime.default_context()
+	node.now = u64(now()) // what it sends now is timed from now (see zsp's window)
 	zsp.remote_done(&remote, id, ok, absent, message[:size])
 	free_all(context.temp_allocator)
 }

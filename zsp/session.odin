@@ -411,7 +411,9 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 	}
 	s.stalled = stalled
 	rest := bytes[used:]
-	s.took_held = took_held(rest)
+	if !s.closing {
+		s.took_held = took_held(rest)
+	}
 	if len(rest) > (MAX_STALLED if stalled else MAX_FRAME + 16) {
 		session_fail(s, .Failed if stalled else .Malformed)
 	}
@@ -946,7 +948,7 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 	case same:
 		queue(s, first, {kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
 	case !flags.known || (theirs.count == 0 && s.role == .Open):
-		queue(s, first, {kind = .Fill, lo = lo, hi = hi}, {kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
+		queue(s, first, {kind = .Fill, watch = id, lo = lo, hi = hi}, {kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
 	case:
 		recon_finish(&recon, lo, hi, theirs)
 	}
@@ -989,9 +991,10 @@ queued_task :: proc(s: ^Session, q: Queued) -> ^Task {
 	return &list[q.at] if q.at >= head && q.at < len(list) else nil
 }
 
-// Compares afresh what a watch covers, but what a Fill still to come will send as it is then, to its end: that need
-// not be, as comparing it while it is still on its way would only find it lacking, and queue it again. What says the
-// watch is level is queued after that Fill already.
+// Compares afresh what a watch covers, but what a Fill still to come for it will send as it is then, to its end: that
+// need not be, as comparing it while it is still on its way would only find it lacking, and queue it again. What says
+// the watch is level is queued after that Fill already. (A Fill for another watch says nothing of this one, nor is
+// what says this one is level queued after it.)
 @(private)
 recon_unfilled :: proc(s: ^Session, w: ^Watch) {
 	n := s.node
@@ -999,7 +1002,7 @@ recon_unfilled :: proc(s: ^Session, w: ^Watch) {
 	for which in 0 ..< 2 {
 		for at in s.fills[which][s.fills_head[which]:] {
 			t := queued_task(s, {which == 1, at})
-			if t != nil && t.kind == .Fill && key_less(t.lo, hi) && !key_less(t.hi, w.hi) {
+			if t != nil && t.kind == .Fill && t.watch == w.id && key_less(t.lo, hi) && !key_less(t.hi, w.hi) {
 				hi = t.lo if key_less(w.lo, t.lo) else w.lo
 			}
 		}
@@ -1516,7 +1519,7 @@ recon_prepare :: proc(s: ^Session, id: u64, lo, hi: Key, theirs: Sum, mine: Sum)
 recon_finish :: proc(w: ^Recon_Writer, lo, hi: Key, theirs: Sum) {
 	if theirs.count == 0 {
 		// Nothing to compare, only to send.
-		queue(w.s, w.owner && hurried(w.s, w.id), {kind = .Fill, lo = lo, hi = hi})
+		queue(w.s, w.owner && hurried(w.s, w.id), {kind = .Fill, watch = w.id if w.owner else 0, lo = lo, hi = hi})
 	}
 	recon_end(w)
 }
@@ -1577,7 +1580,7 @@ on_recon :: proc(s: ^Session, r: ^Reader) {
 			case mine == theirs:
 				recon_part(&out, hi, .Skip)
 			case theirs.count == 0:
-				push_range(s, lo, hi)
+				push_range(s, lo, hi, id if !owner_sent else 0)
 				recon_part(&out, hi, .Skip)
 			case theirs.count <= LIST_MAX && mine.count > LIST_MAX:
 				// They can name theirs more cheaply than this side can narrow it down.
@@ -1648,9 +1651,9 @@ push_row :: proc(s: ^Session, key: Key) {
 }
 
 @(private)
-push_range :: proc(s: ^Session, lo, hi: Key) {
+push_range :: proc(s: ^Session, lo, hi: Key, watch: u64) {
 	if s.peer_full {
-		queue(s, s.hurrying, {kind = .Fill, lo = lo, hi = hi})
+		queue(s, s.hurrying, {kind = .Fill, watch = watch, lo = lo, hi = hi})
 		return
 	}
 	scan := tree_scan(s.node, s.node.shelf, lo, hi)
@@ -3083,7 +3086,7 @@ resync :: proc(s: ^Session) {
 				w.lo, w.hi = bounds[i][0], bounds[i][1]
 			}
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, restart = true})
-			append(&s.tasks, Task{kind = .Fill, lo = w.lo, hi = w.hi})
+			append(&s.tasks, Task{kind = .Fill, watch = w.id, lo = w.lo, hi = w.hi})
 			settled := true
 			for &it in n.interests {
 				settled &&= it.session != s.id || it.watch.id != w.id || interest_sure(n, &it)

@@ -129,7 +129,10 @@ took_held :: proc(rest: []byte) -> (held: u64) {
 		if r.bad || r.pos >= len(rest) {
 			return held + u64(len(rest) - start) // its kind not known yet
 		}
-		end := min(r.pos + int(n), len(rest))
+		if n == 0 || n > MAX_FRAME {
+			return // no frame: the session fails on it, and nothing more is said
+		}
+		end := r.pos + int(min(n, u64(len(rest) - r.pos)))
 		if Message(rest[r.pos]) == .Took {
 			held += u64(end - start)
 		}
@@ -138,14 +141,20 @@ took_held :: proc(rest: []byte) -> (held: u64) {
 	return
 }
 
+// Whether the peer is owed word of what has come.
+@(private)
+took_owed :: proc(s: ^Session) -> bool {
+	return window_held(s) && s.took - min(s.took_frames + s.took_held, s.took) > s.took_said
+}
+
 // Says what has come in since it last said, but Took frames, if anything has: in a frame the peer does not count, nor
 // is said to have taken.
 @(private)
 took_send :: proc(s: ^Session) {
-	counted := s.took - min(s.took_frames + s.took_held, s.took)
-	if !window_held(s) || counted <= s.took_said {
+	if !took_owed(s) {
 		return
 	}
+	counted := s.took - min(s.took_frames + s.took_held, s.took)
 	cells_close(s)
 	before := len(s.out)
 	at := frame_begin(&s.out, .Took)
