@@ -1,6 +1,7 @@
 #+build !js
 package zsp
 
+import "core:fmt"
 import "core:math/rand"
 import "core:strings"
 import "core:testing"
@@ -230,6 +231,58 @@ calls_between_devices :: proc(t: ^testing.T) {
 		session_close(cb.s)
 		testing.expect(t, len(b.node.calls) == 0 && len(b.node.serving) == 0)
 		free_all(context.temp_allocator)
+	}
+}
+
+// Serving is for those who may: one that may not call does not stand in the way of one that may, nor can any client
+// serve so much that others cannot, or cannot cease to.
+@(test)
+serving_is_for_those_who_may :: proc(t: ^testing.T) {
+	state := seeded(22)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 64)
+	defer sim_destroy(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	b.node.host.authenticate = proc(_: rawptr, s: ^Session, credential: []byte) {
+		session_accept(s, {{0, {.Read} if string(credential) == "reader" else {.Read, .Write, .Call}, 0}})
+	}
+	ca, cb := Caller{s = sim_client(&s, a)}, Caller{s = sim_client(&s, b)}
+	reader := Caller{s = session_open(&b.node, .Open, false)}
+	defer caller_destroy(&ca)
+	defer caller_destroy(&cb)
+	defer caller_destroy(&reader)
+	hello := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&hello, .Hello)
+	append(&hello, VERSION, 0)
+	zero: Key32
+	append(&hello, ..zero[:])
+	write_varint(&hello, 0)
+	write_bytes(&hello, transmute([]byte)string("reader"))
+	frame_end(&hello, at)
+	testing.expect(t, session_input(reader.s, hello[:]) && .Call not_in session_rights(reader.s, 1))
+	testing.expect(t, caller_serve(&cb, 1, "echo") && caller_serve(&reader, 1, "echo"))
+	caller_call(&ca, 1, b.keys.device, 1, "echo", "hi")
+	settle(&s, &ca, &cb, &reader)
+	testing.expect(t, len(cb.calls) == 1 && len(reader.calls) == 0 && len(ca.faults) == 0)
+	full := true
+	for i in 0 ..< MAX_CALLS {
+		full &&= caller_serve(&reader, 1, fmt.tprint(i))
+	}
+	testing.expect(t, !full)
+	unserve := make([dynamic]byte, context.temp_allocator)
+	at = frame_begin(&unserve, .Serve)
+	write_varint(&unserve, 1)
+	write_u8(&unserve, 0)
+	write_bytes(&unserve, transmute([]byte)string("echo"))
+	frame_end(&unserve, at)
+	testing.expect(t, session_input(cb.s, unserve[:]) && caller_serve(&cb, 1, "another"))
+	session_close(ca.s)
+	session_close(cb.s)
+	if !reader.s.closing {
+		session_close(reader.s)
 	}
 }
 
