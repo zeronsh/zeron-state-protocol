@@ -355,9 +355,11 @@ const held: Record<string, () => Promise<void>> = {
     await call(p, "pageNode", 12000, 16);
     await page(); // and so the first is hidden
     await sleep(GRACE * 1000 + 1000);
-    const ms = await call<number>(p, "pageNodeAsk", 8000);
+    // Held back, each step would wait for the next minute; not, they take milliseconds, or a second or two on a machine
+    // that runs a hidden tab at the least priority there is, as macOS does.
+    const ms = await call<number>(p, "pageNodeAsk", 20000);
     console.log(`     a question of 12000 rows answered in ${ms.toFixed(0)} ms in a hidden page`);
-    if (ms < 0 || ms > 2000) throw new Error(`a question of a node in a hidden page was answered ${ms < 0 ? "not in 8 s" : `after ${ms.toFixed(0)} ms`}`);
+    if (ms < 0) throw new Error("a question of a node in a hidden page was not answered in 20 s: held back between its steps");
   },
   // A node in a hidden page, rather than a worker, whose client waits for room: another client is answered at once.
   async tab_hidden_node() {
