@@ -34,6 +34,7 @@ Finder :: struct {
 	backs:   [dynamic]^Held, // columns by which questions ask what refers to a row, each once
 	before:  map[u32][dynamic]Anchor, // what rows being gone over had there
 	changed: [dynamic]Changed,
+	batch:   u64, // of those, counted
 	settled: bool, // this node is a full replica
 	again:   [dynamic]^zsp.Session, // to be told everything afresh
 	calls:   [dynamic]Called, // questions from partial replicas, not yet looked at
@@ -111,6 +112,7 @@ Live :: struct {
 	stale:   bool, // the page may have changed
 	renew:   bool, // and so may all of it
 	waited:  int, // the last said of how much of the index is made
+	judged:  u64, // the batch of changes it was last found whole for
 }
 
 finder_open :: proc(f: ^Finder, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
@@ -474,6 +476,7 @@ finder_after :: proc(data: rawptr, s: ^Scope, row: u32, id: zsp.Id, slots: ^Slot
 finder_done :: proc(data: rawptr) {
 	f := (^Finder)(data)
 	if len(f.changed) > 0 {
+		f.batch += 1
 		for l in f.others {
 			if l.joined {
 				live_touched(l)
@@ -515,6 +518,15 @@ live_changed :: proc(l: ^Live, c: ^Changed) {
 	}
 	if c.s.id != l.q.scope {
 		return
+	}
+	if l.judged != l.f.batch {
+		// What it asks of may be being made again, and what is in it now mean nothing: answered afresh. (Once a batch,
+		// which nothing is made again during.)
+		if !query_ready(&l.f.x, &l.q) {
+			l.renew = true
+			return
+		}
+		l.judged = l.f.batch
 	}
 	was := set_has(&l.rows, c.row)
 	now := !c.gone && pred_holds(c.s, &l.q.where_, c.row)
