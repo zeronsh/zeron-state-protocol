@@ -392,6 +392,7 @@ export class Node {
 
   /** Lets a device, by the key it says, read a scope, and unless said otherwise write and call there. */
   admit(key: string, scope: number, rights: Rights = { write: true, call: true }): void {
+    Node.#scope(scope, 1);
     const b = new Uint8Array(69);
     b.set(Node.#parseKey(key, 64));
     new DataView(b.buffer).setUint32(64, scope, true);
@@ -401,6 +402,7 @@ export class Node {
 
   /** Ends a device's grants, by its key or id, in a scope or every scope; the scope's key changes, so that it can read nothing written after. */
   revoke(key: string, scope = 0): void {
+    Node.#scope(scope, 0);
     const b = new Uint8Array(36);
     b.set(Node.#device(key));
     new DataView(b.buffer).setUint32(32, scope, true);
@@ -479,6 +481,12 @@ export class Node {
       throw new Error(bytes === 64 ? "a device's key is 128 hex digits, as `key` gives it" : "a key is 64 hex digits");
     }
     return unhex(key);
+  }
+
+  // A scope's number as the 32 bits it is on the wire, or a refusal: never 2^32 taken for 0, which is every scope, nor 1.5
+  // for 1, as setUint32 would take them.
+  static #scope(scope: number, least: number): void {
+    if (!Number.isInteger(scope) || scope < least || scope > 0xffffffff) throw new RangeError(`no such scope: ${scope}`);
   }
 
   #govern(op: number, payload: Uint8Array): number {

@@ -72,6 +72,29 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await node.close();
 }
 
+// A scope is named by the number it is, and one the space has: 2^32 is not 0, which is every scope, nor 2^32 + 1 scope 1,
+// nor 1.5 scope 1; and a scope the space has not is no scope to admit to or revoke from.
+{
+  const node = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  const other = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  node.create();
+  node.admit(other.key, 1);
+  const grants = () => JSON.stringify([...node.members().find((m) => m.id === other.id)!.grants]);
+  const before = grants();
+  for (const scope of [2 ** 32, 2 ** 32 + 1, 1.5, -1, NaN, Infinity]) {
+    assert.throws(() => node.revoke(other.key, scope), RangeError, `revoke from ${scope}`);
+    assert.throws(() => node.admit(other.key, scope), RangeError, `admit to ${scope}`);
+  }
+  assert.throws(() => node.admit(other.key, 0), RangeError, "admit to every scope");
+  assert.throws(() => node.admit(other.key, 99), /no such member, or no sense/, "admit to a scope the space has not");
+  assert.throws(() => node.revoke(other.key, 99), /no such member, or no sense/, "revoke from a scope the space has not");
+  assert.equal(grants(), before, "what it may do was changed by a scope that is none");
+  node.revoke(other.key, 1);
+  assert.notEqual(grants(), before, "and a scope it has is revoked from as ever");
+  await other.close();
+  await node.close();
+}
+
 // What it cannot keep of the space, it does not go on without: keys it could not keep would be lost at the next start, and
 // with them everything sealed under them, so the change is refused, the node stops, and nothing more is said durable.
 {

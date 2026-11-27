@@ -961,6 +961,17 @@ Govern :: enum u32 {
 	Relay, // key (32), and the rest: its URL, the space's place there included
 }
 
+// Whether the space a roster is being drawn up for has a scope by this number.
+@(private)
+draft_has :: proc(d: ^zsp.Draft, scope: zsp.Scope) -> bool {
+	for s in d.scopes {
+		if s.id == scope {
+			return true
+		}
+	}
+	return false
+}
+
 // Why governing failed.
 NOT_STARTED :: -1
 NO_SUCH :: -2 // nonsense, or no such member
@@ -1017,13 +1028,21 @@ govern :: proc "c" (op: Govern, size: int) -> int {
 			return NO_SUCH // a right nobody knows: the roster would be none
 		}
 		rights := transmute(zsp.Rights)b[68] + {.Read}
-		zsp.draft_grant(&d, key(b, 0), key(b, 32), zsp.Scope(u32le(b, 64)), rights)
+		scope := zsp.Scope(u32le(b, 64))
+		if !draft_has(&d, scope) {
+			return NO_SUCH // a scope the space has not: never one a number may be taken for
+		}
+		zsp.draft_grant(&d, key(b, 0), key(b, 32), scope, rights)
 	case .Revoke:
 		device := key(b, 0)
 		if m := zsp.roster_member(&node.roster, device); m == nil || m.owner {
 			return NO_SUCH // an owner holds the key that is the space, and nothing can take that back
 		}
-		zsp.draft_revoke(&d, device, zsp.Scope(u32le(b, 32)))
+		scope := zsp.Scope(u32le(b, 32))
+		if scope != 0 && !draft_has(&d, scope) {
+			return NO_SUCH // 0 is every scope; any other must be one the space has
+		}
+		zsp.draft_revoke(&d, device, scope)
 	case .Subject:
 		device := key(b, 0)
 		found_it := false
