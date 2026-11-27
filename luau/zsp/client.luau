@@ -2155,7 +2155,7 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 				assert(#body <= MAX_OPEN, "an edit may be 1 MiB at most, less 192 bytes")
 				rows[id] = true
 				table.insert(cells, { row = id, slot = slot, kind = PIECE, stamp = stamp, body = body })
-				merge(row, slot, PIECE, stamp, body)
+				merge(row, slot, PIECE, stamp, body, self:_mine(scope))
 				unview(row)
 			end
 		end,

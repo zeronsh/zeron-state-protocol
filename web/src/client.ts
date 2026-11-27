@@ -1957,7 +1957,7 @@ export class Client {
             if (body.length > MAX_OPEN) throw new RangeError("an edit may be 1 MiB at most, less 192 bytes");
             rows.add(bin);
             cells.push({ row: bin, slot, kind: PIECE, stamp, body });
-            merge(row, slot, PIECE, stamp, body);
+            merge(row, slot, PIECE, stamp, body, this.#mine(scope));
             row.views.clear();
           }
         },

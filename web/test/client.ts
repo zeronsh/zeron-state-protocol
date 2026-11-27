@@ -866,6 +866,26 @@ for (const bad of [
   assert.equal(h.self.said.length, quiet, "and none other is said");
 }
 
+// What a change types in a text, in a scope that says whose things are, is this client's at once, as what it sets is.
+{
+  const Signed = { title: c.string(16), by: c.author(16), body: c.text(17), writers: c.authors(17) };
+  const h = harness();
+  h.run();
+  h.tell(ROSTER, rep("\0", 8) + "\x02\x87" + rep("k", 32));
+  h.tell(AUTHOR, "\0" + rep("d", 32) + "\x02me");
+  let seen!: State<typeof Signed>;
+  h.client.window({ scope: 2, list: "a", table: Signed }, (x) => (seen = x));
+  h.run();
+  void h.client.write(2, (change) => {
+    const id = change.insert(Signed, "a", 1, { title: "t" });
+    change.edit(id, Signed.body.slot, (t, fresh) => text.insert(t, 0, "typed", fresh));
+  });
+  h.run();
+  const row = (seen as State<typeof Signed>).rows[0];
+  assert(row.body === "typed" && row.by === "me");
+  assert.deepEqual(row.writers, ["me"], "what was typed is nobody's until the node says");
+}
+
 // What a roster has made unlawful goes from the rows it was in, as they are said over again; and no more than that.
 {
   const h = harness();

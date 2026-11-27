@@ -808,6 +808,30 @@ do
 	assert(h.last(SERVE))
 end
 
+-- What a change types in a text, in a scope that says whose things are, is this client's at once, as what it sets is.
+do
+	local Signed = { title = zsp.string(16), by = zsp.author(16), body = zsp.text(17), writers = zsp.authors(17) }
+	local h = harness()
+	h.run()
+	h.tell(ROSTER, string.rep("\0", 8) .. "\2\135" .. string.rep("k", 32))
+	h.tell(17, "\0" .. string.rep("d", 32) .. "\2me")
+	local seen: any
+	h.client:window({ scope = 2, list = "a", table = Signed }, function(x)
+		seen = x
+	end)
+	h.run()
+	h.client:write(2, function(change)
+		local id = change.insert(Signed, "a", 1, { title = "t" })
+		change.edit(id, Signed.body.slot, function(t, fresh)
+			zsp.Text.insert(t, 0, "typed", fresh)
+		end)
+	end)
+	h.run()
+	local row = seen.rows[1]
+	assert(row.body == "typed" and row.by == "me")
+	assert(#row.writers == 1 and row.writers[1] == "me", "what was typed is nobody's until the node says")
+end
+
 -- What a roster has made unlawful goes from the rows it was in, as they are said over again; and no more than that.
 do
 	local ANSWER = 34
