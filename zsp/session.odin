@@ -1057,6 +1057,23 @@ interest_bound :: proc(s: ^Session, id: u64, lo, hi: Key, before, after: int) {
 				}
 			}
 		}
+		// On a side its client has gone on from, a window is not cut short: an answer of less than it, to its asking with
+		// a limit, is not taken for it, and it is asked for again, once, whole, as a range; and any other of less than it,
+		// which nobody asked as it was asked would say, is not believed.
+		for w in to.watches {
+			if w.id != it.watch.id || !w.data {
+				continue
+			}
+			below, above := extended(to, w)
+			if (below && key_less(w.lo, lo)) || (above && key_less(hi, w.hi)) {
+				if it.limited && slice.contains(s.owed[:], id) {
+					it.watch.lo, it.watch.hi, it.limit = w.lo, w.hi, 0
+					interest_renew(n, &it)
+					append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi}) // not settled
+				}
+				return
+			}
+		}
 		mine: ^Report
 		for &r in it.reports {
 			if r.session == s.id {
@@ -1071,14 +1088,6 @@ interest_bound :: proc(s: ^Session, id: u64, lo, hi: Key, before, after: int) {
 		for &w in to.watches {
 			if w.id != it.watch.id || !w.data {
 				continue
-			}
-			below, above := extended(to, w)
-			if (below && key_less(w.lo, lo)) || (above && key_less(hi, w.hi)) {
-				// What it said is of less than the window must show: that is asked for, as it is, again. What was said
-				// is of the asking before, and stands for nothing.
-				it.watch.lo, it.watch.hi, it.limit = w.lo, w.hi, 0
-				interest_renew(n, &it)
-				return
 			}
 			w.lo = lo if key_less(w.lo, lo) else w.lo
 			w.hi = hi if key_less(hi, w.hi) else w.hi

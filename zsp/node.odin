@@ -94,6 +94,7 @@ Interest :: struct {
 	session: u32,
 	watch:   Watch,
 	limit:   u64,
+	limited: bool, // asked for, by its name now, with a limit
 	back:    bool,
 	waiting: int, // upstreams yet to settle
 	reports: [dynamic]Report, // what full replicas last said of it
@@ -622,7 +623,7 @@ interest_add :: proc(s: ^Session, w: Watch, limit: u64, back: bool) -> ^Interest
 		return nil
 	}
 	n.next_watch += 1
-	append(&n.interests, Interest{id = INTEREST | n.next_watch, session = s.id, watch = w, limit = limit, back = back})
+	append(&n.interests, Interest{id = INTEREST | n.next_watch, session = s.id, watch = w, limit = limit, limited = limit > 0, back = back})
 	it := &n.interests[len(n.interests) - 1]
 	if w.data {
 		used_stamp(n, w.lo, w.hi)
@@ -661,6 +662,7 @@ interest_renew :: proc(n: ^Node, it: ^Interest) {
 	old := it.id
 	n.next_watch += 1
 	it.id = INTEREST | n.next_watch
+	it.limited = it.limit > 0
 	it.waiting = 0
 	clear(&it.reports)
 	for to in n.sessions {

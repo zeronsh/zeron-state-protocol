@@ -2866,6 +2866,74 @@ review7_hushed_relay_said_nothing :: proc(t: ^testing.T) {
 	testing.expect(t, ui.watches[0].settled)
 }
 
+// A peer that says, again and again, that a window gone on from is less than it is, is not believed: the window is not
+// asked for again on its word, nor are what others said of it forgotten.
+@(test)
+review8_narrow_answers_not_believed :: proc(t: ^testing.T) {
+	state := seeded(105)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 1, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	phone := s.nodes[2]
+	list := List{1 << 32 | 5, 5}
+	for i in 100 ..< 200 {
+		sim_put(&s, phone, u64(i))
+	}
+	sim_link(&s, 2, 0)
+	sim_link(&s, 2, 1)
+	sim_settle(&s)
+	ui := sim_client(&s, phone)
+	defer session_close(ui)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 50, {data = true, live = true, back = true, counts = true})
+	sim_settle(&s)
+	sim_drain(ui)
+	page := ui.watches[0]
+	testing.expect(t, page.settled)
+	sim_watch(ui, 2, list_lo(list), page.lo, 50, {data = true, live = true, back = true, counts = true})
+	sim_settle(&s)
+	sim_drain(ui)
+	it := &phone.node.interests[0]
+	for &x in phone.node.interests {
+		if x.watch.id == 1 {
+			it = &x
+		}
+	}
+	id, reports := it.id, len(it.reports)
+	testing.expect_value(t, reports, 2)
+	// A key within the window, past where it begins.
+	inside: Key
+	scan := tree_scan(&phone.node, phone.node.shelf, page.lo, page.hi)
+	seen := 0
+	for leaf in tree_next(&scan) {
+		if seen == 10 {
+			inside = leaf.key
+			break
+		}
+		seen += 1
+	}
+	rogue := s.links[1].a // the phone's end of the link to the second
+	for _ in 0 ..< 5 {
+		f: [dynamic]byte
+		at := frame_begin(&f, .Synced)
+		write_varint(&f, it.id)
+		flags := Synced_Flags{settled = true}
+		write_u8(&f, u8(flags))
+		write_key(&f, inside)
+		write_key(&f, list_hi(list))
+		write_varint(&f, 60)
+		write_varint(&f, 0)
+		frame_end(&f, at)
+		testing.expect(t, session_input(rogue, f[:]))
+		delete(f)
+		sim_drain(ui)
+	}
+	testing.expect(t, it.id == id, "a window was asked for again on the word of one that was not asked")
+	testing.expect_value(t, len(it.reports), reports)
+	testing.expect(t, ui.watches[0].settled)
+	free_all(context.temp_allocator)
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)
