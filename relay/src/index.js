@@ -412,6 +412,9 @@ export class Space extends DurableObject {
 
 let policy;
 
+// A WebSocket among the protocols an Upgrade asks for, in any case, as RFC 6455 has it.
+const WEBSOCKET = /(?:^|,)\s*websocket\s*(?:,|$)/i;
+
 /**
  * A Worker that routes each space to its object.
  *
@@ -428,7 +431,7 @@ export function relay({ authenticate, admit } = {}) {
       if (pathname === "/") return new Response(publicKey(env.RELAY_SECRET) + "\n");
       if (!/^\/[0-9a-f]{64}$/.test(pathname)) return new Response("no such space\n", { status: 404 });
       if (env.STATS === "1" && /[?&](stats|evict|probe)\b/.test(request.url)) return env.SPACE.get(env.SPACE.idFromName(pathname.slice(1))).fetch(request);
-      if (request.headers.get("Upgrade") !== "websocket") return new Response("expected a WebSocket\n", { status: 426 });
+      if (!WEBSOCKET.test(request.headers.get("Upgrade") ?? "")) return new Response("expected a WebSocket\n", { status: 426 });
       if (admit && !(await admit({ request, space: pathname.slice(1), env }))) return new Response("not here\n", { status: 403 });
       return env.SPACE.get(env.SPACE.idFromName(pathname.slice(1))).fetch(request);
     },

@@ -291,3 +291,20 @@ try {
   assert(kept("roster.old").equals(first), "the one before the latest was lost to it");
   console.log("ok   a relay with no room for a roster keeps the two before it as they were");
 } finally { rmSync(tmp4, { recursive: true, force: true }); }
+
+// Bug hunt. A WebSocket asked for as RFC 6455 has it, in any case, and among other protocols: let through to its space,
+// and nothing else is.
+{
+  const at = `https://relay.example/${"ab".repeat(32)}`;
+  const env = { RELAY_SECRET: "11".repeat(32), SPACE: { idFromName: (name) => name, get: () => ({ fetch: async () => new Response("let through") }) } };
+  const worker = relay();
+  for (const upgrade of ["websocket", "WebSocket", "WEBSOCKET", "h2c, websocket", "websocket ,h2c"]) {
+    const { status } = await worker.fetch(new Request(at, { headers: { Upgrade: upgrade } }), env);
+    assert.equal(status, 200, `a WebSocket asked for with Upgrade: ${upgrade} turned away with ${status}`);
+  }
+  for (const upgrade of [undefined, "h2c", "websockets", "web socket"]) {
+    const { status } = await worker.fetch(new Request(at, upgrade && { headers: { Upgrade: upgrade } }), env);
+    assert.equal(status, 426, `Upgrade: ${upgrade} let through`);
+  }
+  console.log("ok   a relay lets a WebSocket through however RFC 6455 lets it be asked for");
+}
