@@ -127,18 +127,24 @@ async function cache_is_sound(seed) {
   const { rand, host, memory, sql } = harness(seed, { CACHE_BYTES: String(300000) });
   host.log_write(0, 0, 1); // made
   const at = (kind, key, i) => ((kind * 977 + key * 131 + i * 7) ^ (key >> 3)) & 255; // what lies there
+  const dropped = [new Set(), new Set(), new Set()]; // places let go of, and not put since: pages, or bytes of the log
   for (let round = 0; round < 600; round++) {
     const kind = rand(3), paged = kind !== 1;
     if (rand(3) === 0) {
       const key = rand(5000), len = paged ? (1 + rand(20)) * 4096 : 1 + rand(30000);
       for (let i = 0; i < len; i++) memory[i] = paged ? at(kind, key + Math.floor(i / 4096), i % 4096) : at(1, key + i, 0);
       host.cache_put(kind, key, 0, len);
+      for (const p of dropped[kind]) if (p >= key && p < key + (paged ? len / 4096 : len)) dropped[kind].delete(p);
     } else if (rand(10) === 0) {
-      const lo = rand(5000);
-      host.cache_drop(kind, lo, lo + rand(500));
+      const lo = rand(5000), hi = lo + rand(500);
+      host.cache_drop(kind, lo, hi);
+      for (let p = lo; p < hi; p++) dropped[kind].add(p);
     } else {
       const key = rand(5000), len = paged ? 4048 : 1 + rand(100);
       if (host.cache_get(kind, key, 1 << 21, len)) {
+        for (let i = 0; i < (paged ? 1 : len); i++) {
+          assert.ok(!dropped[kind].has(key + i), `seed ${seed} round ${round}: the cache answered for ${kind}:${key + i}, let go of`);
+        }
         for (let i = 0; i < len; i++) {
           const want = paged ? at(kind, key, i) : at(1, key + i, 0);
           assert.equal(memory[(1 << 21) + i], want, `seed ${seed} round ${round}: the cache answered wrongly for ${kind}:${key}+${i}`);
@@ -148,6 +154,14 @@ async function cache_is_sound(seed) {
   }
   const sum = (k) => sql.exec(`SELECT coalesce(sum(length(data)), 0) AS n FROM cache${k}`).one().n;
   assert.ok(sum(0) + sum(1) + sum(2) <= 300000, `seed ${seed}: the cache holds ${sum(0)} + ${sum(1)} + ${sum(2)}, past its budget`);
+  // Each place in one run at most: else the run a place is in may not be the one found for it, and is paid for twice.
+  for (const kind of [0, 1, 2]) {
+    const rows = sql.exec(`SELECT key, length(data) AS n FROM cache${kind} ORDER BY key`).toArray();
+    for (let i = 1; i < rows.length; i++) {
+      const end = rows[i - 1].key + (kind === 1 ? rows[i - 1].n : rows[i - 1].n / 4096);
+      assert.ok(end <= rows[i].key, `seed ${seed}: cached runs at ${rows[i - 1].key} and ${rows[i].key} of ${kind} overlap`);
+    }
+  }
 }
 
 // Full: what must be kept fails when it cannot be, and what may be forgotten is quietly not kept.
@@ -524,6 +538,42 @@ async function cache_trimmed_on_opening(seed) {
   assert.ok(n <= 1 << 19, `${n} bytes of pages kept, past their share`);
 }
 
+// Bug hunt. Runs of pages put across one another, as reads of a pack may be, in either order: each page is found in
+// whichever run it was put with, and paid for once; and a run let go of in part, from within, is let go of there.
+async function cached_runs_overlap_once(seed) {
+  const runs = (puts) => {
+    const { host, memory, sql } = harness(seed, { CACHE_BYTES: String(16 << 20) });
+    host.log_write(0, 0, 1);
+    for (const [first, n] of puts) {
+      for (let i = 0; i < n * 4096; i++) memory[i] = (first + (i >> 12)) & 255;
+      host.cache_put(0, first, 0, n * 4096);
+    }
+    const hit = (no) => host.cache_get(0, no, 1 << 21, 4096) === 1 && memory[1 << 21] === (no & 255);
+    return { host, memory, hit, bytes: sql.exec("SELECT coalesce(sum(length(data)), 0) AS n FROM cache0").one().n };
+  };
+  // Runs put, each its first page and how many: then every page from lo to hi is found, and no more paid for.
+  for (const [puts, lo, hi] of [
+    [[[16, 16], [0, 64]], 0, 64],
+    [[[0, 64], [16, 16]], 0, 64],
+    [[[0, 32], [16, 32]], 0, 48],
+    [[[40, 40], [16, 32]], 16, 80],
+    [[[8, 8], [24, 8], [0, 40]], 0, 40],
+  ]) {
+    const { hit, bytes } = runs(puts);
+    for (let no = lo; no < hi; no++) assert.ok(hit(no), `after ${JSON.stringify(puts)}, page ${no} is not found`);
+    assert.equal(bytes, (hi - lo) * 4096, `after ${JSON.stringify(puts)}, ${bytes / 4096} pages paid for, of ${hi - lo}`);
+  }
+  const { host, memory, hit } = runs([[0, 64]]);
+  host.cache_drop(0, 16, 32);
+  assert.ok(!hit(20), "a page let go of is found");
+  assert.ok(hit(15), "and what lies before it is not");
+  memory.fill(0xab, 0, 16384);
+  host.cache_put(1, 0, 0, 16384); // of the log, by the byte
+  host.cache_drop(1, 4096, 16384);
+  assert.equal(host.cache_get(1, 4096, 1 << 21, 4096), 0, "bytes of the log let go of are found");
+  assert.equal(host.cache_get(1, 0, 1 << 21, 4096), 1);
+}
+
 // Bug hunt. Whose space it is is kept before anything else is: where there was no room for it, nothing else is kept
 // either, and the first write that finds room keeps it first, whether by the same storage or by storage opened again.
 async function space_kept_first(seed) {
@@ -563,5 +613,6 @@ for (let seed = first; seed < first + seeds; seed++) {
   if (seed === first) await long_run_kept_in_part(seed);
   if (seed === first) await cache_trimmed_on_opening(seed);
   if (seed === first) await space_kept_first(seed);
+  if (seed === first) await cached_runs_overlap_once(seed);
 }
 console.log(`ok   relay storage held to its model over ${seeds} seeds`);

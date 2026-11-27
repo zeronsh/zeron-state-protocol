@@ -278,26 +278,59 @@ export class Storage {
     }
   }
 
+  // Runs never overlap, so that the one a place is in is the last to begin at or before it, and nothing is paid for
+  // twice. What lies at a place never changes: what is cached already is not cached again, and a run held whole by
+  // this one gives way to it.
   #cache_put(kind, key, bytes) {
-    const budget = this.#share(kind);
+    const budget = this.#share(kind), unit = kind === 1 ? 1 : PAGE;
     // A run longer than a row may be, or than there is room for, is kept as far as it fits: its first pages, whole.
     const most = Math.min(CACHE_ROW, budget);
     if (bytes.length > most) bytes = bytes.subarray(0, kind === 1 ? most : most - (most % PAGE));
     if (bytes.length === 0) return;
-    // What lies at a place never changes: a run already cached there at least as long holds all of this.
-    const [longer] = this.#read(`SELECT 1 AS x FROM cache${kind} WHERE key = ? AND length(data) >= ?`, key, bytes.length);
-    if (longer) return;
+    let end = key + bytes.length / unit;
+    // In one read: the run before, if it runs on into this, and those that begin within.
+    const rows = this.#read(
+      `SELECT key, length(data) AS n FROM cache${kind} WHERE key >= coalesce((SELECT max(key) FROM cache${kind} WHERE key < ?), ?) AND key < ? AND key + length(data) / ${unit} > ? ORDER BY key`,
+      key, key, end, key,
+    );
+    const held = [];
+    for (const r of rows) {
+      const to = r.key + r.n / unit;
+      if (r.key < key) {
+        if (to >= end) return; // all of it is cached already
+        bytes = bytes.subarray((to - key) * unit);
+        key = to;
+      } else if (to > end) {
+        end = r.key; // what lies from here on is cached already
+        break;
+      } else {
+        held.push(r);
+      }
+    }
+    if (end <= key) return;
+    bytes = bytes.subarray(0, (end - key) * unit);
     try {
+      for (const r of held) {
+        this.#shrink(`DELETE FROM cache${kind} WHERE key = ?`, r.key);
+        this.#cached[kind] -= r.n;
+      }
       this.#trim(kind, bytes.length);
-      const [had] = this.#read(`SELECT length(data) AS n FROM cache${kind} WHERE key = ?`, key);
-      this.write(`INSERT INTO cache${kind} VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET data = excluded.data`, key, bytes.slice());
-      this.#cached[kind] += bytes.length - (had?.n ?? 0);
+      this.write(`INSERT INTO cache${kind} VALUES (?, ?)`, key, bytes.slice());
+      this.#cached[kind] += bytes.length;
     } catch (e) {
       if (!(e instanceof Full)) throw e;
     }
   }
 
+  // Lets go of lo <= place < hi: a run that begins before and runs on into it is cut short where it begins.
   #cache_drop(kind, lo, hi) {
+    const unit = kind === 1 ? 1 : PAGE;
+    const [before] = this.#read(`SELECT key, length(data) AS n FROM cache${kind} WHERE key < ? ORDER BY key DESC LIMIT 1`, lo);
+    if (before && before.key + before.n / unit > lo) {
+      const n = (lo - before.key) * unit;
+      this.#shrink(`UPDATE cache${kind} SET data = substr(data, 1, ?) WHERE key = ?`, n, before.key);
+      this.#cached[kind] -= before.n - n;
+    }
     const [row] = this.#read(`SELECT coalesce(sum(length(data)), 0) AS n FROM cache${kind} WHERE key >= ? AND key < ?`, lo, hi);
     if (row.n === 0) return;
     this.#shrink(`DELETE FROM cache${kind} WHERE key >= ? AND key < ?`, lo, hi);
