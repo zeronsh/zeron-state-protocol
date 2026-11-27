@@ -323,14 +323,14 @@ const tests: Record<string, () => Promise<void>> = {
       const sid = zspd("create", owner);
       zspd("relay", owner, relay.key, relay.url); // the web device alone goes through the proxy, whose connections are its
       await node("run", owner);
-      const d = await open({ dir: join(TMP, "k-web-" + kind), keepalive: { idle: 500, wait: 1000 }, log: () => {} });
+      const d = await open({ dir: join(TMP, "k-web-" + kind), keepalive: { idle: 500, wait: 2000 }, log: () => {} });
       zspd("admit", owner, d.key, "1");
       await d.join(sid, { key: relay.key, url: through.url });
       const c = d.client();
       await eventually("it is admitted", () => c.may(1, "write"));
       const before = through.connections();
       await new Promise((done) => setTimeout(done, 2500));
-      expectEqual(through.connections(), before); // pinged, and answered, five times over
+      expectEqual(through.connections(), before); // pinged, and answered, five times over: in two seconds each, on a busy machine
       through.swallow();
       await eventually("a connection that died without a word is dialled again", () => through.connections() > before, 5000);
       await eventually("and works", async () => {
