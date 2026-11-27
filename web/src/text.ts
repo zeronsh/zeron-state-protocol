@@ -57,6 +57,8 @@ export type Text = {
   cache: string | null;
   content: Uint8Array<ArrayBuffer> | null; // the bytes that are there, once asked for
   visible: number; // how many
+  before: number[]; // visible bytes before each span, as far as known: to `known`, and not past what changed since
+  known: number;
   version: number; // counts changes, that whoever reads it may know whether to again
 };
 
@@ -87,6 +89,8 @@ export function create(): Text {
     cache: null,
     content: null,
     visible: 0,
+    before: [],
+    known: -1,
     version: 0,
   };
 }
@@ -219,12 +223,44 @@ function label(t: Text, i: number): void {
   spans[i].label = l;
 }
 
+// What is known of how much is visible before each span holds no further than a span that changed.
+function changed(t: Text, i: number): void {
+  if (i < t.known) t.known = i;
+}
+
+// The first span at or after which the visible bytes reach pos (from 1), or one past the last: found by halving what is
+// known of how much is visible before each, and counting only what changed since. So typing in one place, or at the
+// end, counts a span or two, however long the text.
+function seek(t: Text, pos: number): number {
+  const spans = t.spans, before = t.before;
+  const n = spans.length;
+  let known = t.known;
+  if (known < 0) (before[0] = 0), (known = 0);
+  while (known < n) {
+    const s = spans[known];
+    const reach = before[known] + (s.dead ? 0 : s.len);
+    if (reach >= pos) break;
+    before[++known] = reach;
+  }
+  t.known = known;
+  if (known >= n) return n;
+  let lo = 0, hi = known;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const s = spans[mid];
+    if (before[mid] + (s.dead ? 0 : s.len) >= pos) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
 function split(t: Text, i: number, n: number): void {
   const s = t.spans[i];
   if (n === 0 || n >= s.len) return;
   const tail: Span = { piece: s.piece, home: s.home, offset: s.offset + n, len: s.len - n, dead: s.dead, label: 0 };
   t.spans.splice(i + 1, 0, tail);
   s.len = n;
+  changed(t, i);
   label(t, i + 1);
   const p = s.home;
   const at = seat(p, s.offset);
@@ -394,6 +430,7 @@ function insertRun(t: Text, id: string, bytes: Uint8Array, lpiece: string, loffs
     if (b.piece === id && b.offset + b.len === offset && !b.dead) {
       b.len += bytes.length;
       t.visible += bytes.length;
+      changed(t, at - 1);
       t.hint = at - 1;
       return;
     }
@@ -401,6 +438,7 @@ function insertRun(t: Text, id: string, bytes: Uint8Array, lpiece: string, loffs
   const made: Span = { piece: id, home: p, offset, len: bytes.length, dead: false, label: 0 };
   spans.splice(at, 0, made);
   t.visible += bytes.length;
+  changed(t, at);
   label(t, at);
   p.spans.push(made); // the newest of its piece, so the last
   t.hint = at;
@@ -412,7 +450,7 @@ function kill(t: Text, piece: string, offset: number, count: number): void {
     const i = rightOf(t, piece, offset);
     split(t, i, count);
     const s = t.spans[i];
-    if (!s.dead) t.visible -= s.len;
+    if (!s.dead) (t.visible -= s.len), changed(t, i);
     s.dead = true;
     offset += s.len;
     count -= s.len;
@@ -691,22 +729,17 @@ export function insert(t: Text, pos: number, bytes: Uint8Array | string, fresh: 
   let lo = 0;
   let rp = "";
   let ro = 0;
-  let seen = 0;
   let i = 0;
-  while (i < spans.length && seen < pos) {
-    let s = spans[i];
-    if (!s.dead) {
-      if (seen + s.len >= pos) {
-        split(t, i, pos - seen);
-        s = spans[i];
-        lp = s.piece;
-        lo = s.offset + s.len - 1;
-        i++;
-        break;
-      }
-      seen += s.len;
+  if (pos > 0) {
+    // The span the byte before it is in; past the end, it is put between the start and the end.
+    i = seek(t, pos);
+    if (i < spans.length) {
+      split(t, i, pos - t.before[i]);
+      const s = spans[i];
+      lp = s.piece;
+      lo = s.offset + s.len - 1;
+      i++;
     }
-    i++;
   }
   if (i < spans.length) {
     rp = spans[i].piece;
@@ -721,7 +754,9 @@ export function erase(t: Text, pos: number, count: number, fresh: () => string):
   begin(t, fresh);
   touch(t);
   const spans = t.spans;
-  let i = 0;
+  // From the span the first byte is in.
+  let i = seek(t, pos + 1);
+  if (i < spans.length) pos -= t.before[i];
   while (i < spans.length && count > 0) {
     let s = spans[i];
     if (s.dead) {
@@ -738,6 +773,7 @@ export function erase(t: Text, pos: number, count: number, fresh: () => string):
       s = spans[i];
       s.dead = true;
       t.visible -= s.len;
+      changed(t, i);
       recordDelete(t, s);
       count -= s.len;
       i++;
@@ -810,6 +846,7 @@ export function remove(t: Text, id: string, count: number, fresh: () => string):
     if (!s.dead) {
       s.dead = true;
       t.visible -= s.len;
+      changed(t, i);
       recordDelete(t, s);
     }
     offset += s.len;

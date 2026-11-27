@@ -336,4 +336,39 @@ console.log(
   `${SEEDS} seeds, ${ops} steps (${threw} throwing in both), ${steps} steps in finding places: text.ts ${(ran - began).toFixed(0)} ms, ` +
     `text.luau ${(replayed - ran).toFixed(0)} ms`,
 );
+// Typing at the end of a long text, or on at one place in it, looks at a few of its spans each time, however many it has:
+// what moves them along, to make room among them, is not counted.
+{
+  const r = random(7);
+  let n = 0;
+  const fresh = () => codec.u32Binary(0) + codec.u32Binary(++n);
+  const t = text.create();
+  for (let k = 0; k < 4000; k++) {
+    text.insert(t, r.int(0, text.len(t)), "a", fresh);
+    text.close(t, codec.u64(k * 65536) + "stamp" + codec.u32Binary(k) + "...");
+  }
+  let looked = 0, moving = false;
+  t.spans = new Proxy(t.spans, {
+    get: (spans, key, self) => {
+      if (key === "splice") {
+        return (...args: [number, number, ...unknown[]]) => {
+          moving = true;
+          try {
+            return Array.prototype.splice.apply(self, args);
+          } finally {
+            moving = false;
+          }
+        };
+      }
+      if (!moving && typeof key === "string" && key >= "0" && key <= "9") looked++;
+      return Reflect.get(spans, key, self);
+    },
+  });
+  for (let k = 0; k < 200; k++) text.insert(t, text.len(t), "x", fresh);
+  const at = Math.floor(text.len(t) / 2);
+  for (let k = 0; k < 200; k++) text.insert(t, at + k, "y", fresh);
+  for (let k = 0; k < 100; k++) text.erase(t, at + 100, 1, fresh);
+  assert(looked / 500 < 100, `${looked / 500} spans looked at for each of 500 edits, of ${t.spans.length}`);
+}
+
 console.log("ok");

@@ -1413,6 +1413,43 @@ do
 	assert(asked({ typos = 1.5 }) ~= asked({ typos = 1, inside = true }), "and not one inside words")
 end
 
+-- Typing at the end of a long text, or on at one place in it, costs no more than in a short one: its length is kept, and
+-- where a place is, is found from what is known of the spans before it, not by counting them all again.
+do
+	local Text = zsp.Text
+	local function typing(spans: number): number
+		local seed = 7
+		local function rnd(n: number): number
+			seed = (seed * 16807) % 2147483647
+			return seed % n
+		end
+		local n = 0
+		local function fresh(): string
+			n += 1
+			return string.pack(">I8", n)
+		end
+		local t = Text.new()
+		for k = 1, spans do
+			Text.insert(t, rnd(Text.len(t) + 1), "a", fresh)
+			Text.close(t, string.pack(">I8I8", k * 65536, k))
+		end
+		local began = os.clock()
+		for _ = 1, 2000 do
+			Text.insert(t, Text.len(t), "x", fresh)
+		end
+		local at = Text.len(t) // 2
+		for k = 0, 1999 do
+			Text.insert(t, at + k, "y", fresh)
+		end
+		for _ = 1, 1000 do
+			Text.delete(t, at + 1000, 1, fresh)
+		end
+		return os.clock() - began
+	end
+	local short, long = typing(250), typing(8000)
+	assert(long < short * 5, `{long * 1000} ms in a text of 8000 spans, {short * 1000} ms in one of 250`)
+end
+
 -- ---------------------------------------------------------------- calls
 
 -- Calls against a node made of nothing, which plays the device called and whoever calls this client: what the client
