@@ -898,6 +898,13 @@ network_converges :: proc(t: ^testing.T) {
 	sim_worlds(t, .Quick)
 }
 
+// A world in which a device becoming partial was acknowledged what it had still to send of a row, which, its cell
+// killed meanwhile, sent nothing: the row stayed in its outbox, though held, until it next connected.
+@(test)
+network_converges_seed_98 :: proc(t: ^testing.T) {
+	sim_worlds(t, .Slow, 98, 1)
+}
+
 // And through relays whose storage holds only some of what they keep at hand, fetching the rest as it is wanted.
 @(test)
 network_converges_through_slow_relays :: proc(t: ^testing.T) {
@@ -911,12 +918,10 @@ network_converges_through_remote_relays :: proc(t: ^testing.T) {
 }
 
 @(private)
-sim_worlds :: proc(t: ^testing.T, lazy: Sim_Storage) {
-	SEEDS :: #config(ZSP_SEEDS, 6)
-	FIRST :: #config(ZSP_FIRST_SEED, 0)
+sim_worlds :: proc(t: ^testing.T, lazy: Sim_Storage, first := #config(ZSP_FIRST_SEED, 0), seeds := #config(ZSP_SEEDS, 6)) {
 	missed, writes, reads := 0, 0, 0
-	defer testing.expectf(t, lazy == .Quick || (missed > 100 && writes > 10 && reads > 10), "the relays missed %d reads, wrote %d times and read %d times", missed, writes, reads)
-	for seed in FIRST ..< FIRST + SEEDS {
+	defer testing.expectf(t, lazy == .Quick || seeds < 6 || (missed > 100 && writes > 10 && reads > 10), "the relays missed %d reads, wrote %d times and read %d times", missed, writes, reads)
+	for seed in first ..< first + seeds {
 		state := seeded(u64(seed) + 100 + 200 * u64(lazy))
 		context.random_generator = rand.default_random_generator(&state)
 		s: Sim
@@ -2280,6 +2285,65 @@ review5_let_go_once :: proc(t: ^testing.T) {
 	testing.expect_value(t, store_range(&phone.node.store, list_lo(list), list_hi(list)).count, 0)
 	testing.expectf(t, phone.node.forgot - forgot == 6, "forgot %d cells of 6", phone.node.forgot - forgot)
 	_ = held
+}
+
+// After a crash, what a partial replica's log has to say of what it held since its last checkpoint is replayed: what it
+// was given by others it may let go of, offline, as anything; only what its own clients wrote is kept until a full
+// replica holds it.
+@(test)
+crash_tail_lets_go :: proc(t: ^testing.T) {
+	state := seeded(91)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, phone := s.nodes[0], s.nodes[1]
+	list := List{1 << 32 | 5, 5}
+	for i in 0 ..< 20 {
+		sim_put(&s, big, u64(i))
+	}
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	testing.expect(t, store_checkpoint(&phone.node.store))
+	ui := sim_client(&s, phone)
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 0, {data = true})
+	sim_settle(&s)
+	session_close(ui)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&phone.node.store, list_lo(list), list_hi(list)).count, 20)
+	// It writes, while it reaches nobody, and then loses its power: none of this was checkpointed.
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	sim_put(&s, phone, 1000)
+	testing.expect(t, store_sync(&phone.node.store))
+	node_destroy(&phone.node)
+	keyring_destroy(&phone.keys)
+	keyring_init(&phone.keys, phone.secret)
+	if phone.kept != nil {
+		testing.expect(t, keyring_load(&phone.keys, phone.kept))
+	}
+	sim_boot(&s, phone)
+	n := 0
+	scan := tree_scan(&phone.node, phone.node.outbox, KEY_MIN, KEY_MAX)
+	for _ in tree_next(&scan) {
+		n += 1
+	}
+	testing.expectf(t, n == 1, "%d rows in the outbox, of which one is its own", n)
+	// Days later, still offline: what others wrote goes, and what it wrote stays.
+	node_keep(&phone.node, {age = 1000, bytes = 0})
+	for node_retain(&phone.node) {} // as it starts: when it last watched the list was lost with the rest, and is now
+	s.now += 100_000
+	phone.node.now = sim_now(&s, phone)
+	for node_retain(&phone.node) {}
+	testing.expect_value(t, store_range(&phone.node.store, list_lo(list), list_hi(list)).count, 1)
+	// And once it reaches a full replica, that is had there too.
+	sim_link(&s, 1, 2)
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&big.node.store, list_lo(list), list_hi(list)).count, 21)
+	testing.expect_value(t, phone.node.outbox.root, 0)
 }
 
 @(private)

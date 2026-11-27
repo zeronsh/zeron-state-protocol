@@ -87,6 +87,7 @@ Session :: struct {
 	acked_in:  u64,
 	refused:   [dynamic]Id, // rows something of which was not taken since
 	unacked:   [dynamic]Unacked,
+	reoffer:   [dynamic]Id, // kept for what was still to be sent of them, which may yet send nothing: offered again after
 	owed:      [dynamic]u64, // interests this peer has yet to say are level
 	online:    [dynamic]Key32, // latest presence
 	as:        string, // owned; whom the host says a local client is for
@@ -267,6 +268,7 @@ session_close :: proc(s: ^Session) {
 	delete(s.tasks)
 	delete(s.watches)
 	delete(s.unacked)
+	delete(s.reoffer)
 	delete(s.refused)
 	for &it in n.interests {
 		for r, i in it.reports {
@@ -1797,18 +1799,27 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 	for v in s.unacked[done:] {
 		owed[v.row] = true
 	}
-	for t in s.tasks[s.task_head:] {
-		if t.kind == .Row || t.kind == .Cell {
-			owed[t.row] = true
-		}
-	}
 	for i := s.cursor; i < n.events.next; i += 1 {
 		if c := ring_at(&n.events, i); c.origin != s.id { // what came from there does not go back
 			owed[c.row] = true
 		}
 	}
+	tasked := make(map[Id]bool, context.temp_allocator)
+	for t in s.tasks[s.task_head:] {
+		if t.kind == .Row || t.kind == .Cell {
+			tasked[t.row] = true
+		}
+	}
 	for u in s.unacked[:done] {
-		if u.row not_in owed {
+		switch {
+		case u.row in owed:
+		case u.row in tasked:
+			// Something of it is still to be sent, which is acknowledged in its turn: unless, as of a cell killed since,
+			// it sends nothing, and nothing would then say it is held. So it is offered again once all that is sent.
+			if !slice.contains(s.reoffer[:], u.row) {
+				append(&s.reoffer, u.row)
+			}
+		case:
 			tree_delete(n, &n.outbox, {u.row[0], u.row[1], 0, 0, 0})
 		}
 	}
@@ -2481,6 +2492,18 @@ pump :: proc(s: ^Session) {
 			s.level_at = s.seq_out + 1
 			node_level(s)
 		}
+	}
+	if go && s.task_head == len(s.tasks) && len(s.reoffer) > 0 {
+		for row in s.reoffer {
+			pending := false
+			for u in s.unacked {
+				pending ||= u.row == row
+			}
+			if _, kept := tree_get(n, n.outbox, {row[0], row[1], 0, 0, 0}); kept && !pending && node_tracks(n) {
+				append(&s.tasks, Task{kind = .Row, row = row})
+			}
+		}
+		clear(&s.reoffer)
 	}
 	if s.task_head == len(s.tasks) && len(s.tasks) > 0 {
 		clear(&s.tasks)

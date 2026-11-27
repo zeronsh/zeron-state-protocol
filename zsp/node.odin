@@ -124,6 +124,11 @@ node_init :: proc(n: ^Node, disk: Disk, space: Key32, keys: ^Keyring, full: bool
 		n.whole = false
 		store_checkpoint(&n.store) or_return
 	}
+	if keys != nil && n.generation == 0 {
+		// Written down at once, as a full replica's or a partial one's: so that a store is never taken for one whose
+		// every record its own clients wrote, but because it says so.
+		store_checkpoint(&n.store) or_return
+	}
 	if n.own && !n.whole {
 		// What it was given or wrote as a full replica, or before there were outboxes, may be held by nobody else, and
 		// is not named in the outbox: it goes on as a full replica until it is level with one, and so has offered all
@@ -551,12 +556,13 @@ node_may_write :: proc(n: ^Node, scope: Scope) -> bool {
 
 @(private)
 node_commit :: proc(n: ^Node, cells: []Cell, from: ^Session) -> int {
-	accepted := store_commit(&n.store, cells, from.id if from != nil else 0)
+	local := from == nil || from.role == .Open
+	accepted := store_commit(&n.store, cells, from.id if from != nil else 0, own = node_tracks(n) && local)
 	if len(n.typing) > 0 {
 		typing_committed(n, cells)
 	}
 	// What its clients write: no peer forgets what it gives this one, which says it is not full however it serves.
-	if accepted > 0 && node_tracks(n) && (from == nil || from.role == .Open) {
+	if accepted > 0 && node_tracks(n) && local {
 		for c in cells {
 			tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
 		}

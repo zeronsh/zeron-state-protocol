@@ -31,6 +31,7 @@ Store :: struct {
 	repair:      Tree, // rows whose shelf entries are to be sought out, where storage may answer "not yet"
 	used:        Tree, // of a partial replica: each list it holds rows of, to when it was last watched: see retain.odin
 	own:         bool, // its clients write here, and the outbox is kept
+	unmarked:    bool, // a record was replayed that its clients did not write, or that says nothing of whose it is
 	whole:       bool, // the outbox names all that this replica wrote and no full one is known to hold
 	whole_kept:  bool, // as the last checkpoint says
 	stale:       ^[dynamic]Id, // when set, collects rows whose offered cells were dominated
@@ -160,9 +161,6 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 	s.repair.root = best.repair
 	s.used.root = tail.used
 	s.whole, s.whole_kept = tail.flags.whole, tail.flags.whole
-	if best.generation == 0 && s.own {
-		s.whole = true // nothing was ever written here: there is nothing it could have missed
-	}
 	s.next = max(best.next, HEADER_PAGES)
 	if s.remote != nil {
 		s.next = TEMP_PAGES // pages are numbered for where they go only at a checkpoint
@@ -176,7 +174,13 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 		return true
 	}
 	find_free(s)
-	return replay(s)
+	replay(s) or_return
+	if best.generation == 0 && s.own && !s.unmarked {
+		// Never written down, and all that was written here, if anything, its own clients wrote and its outbox names: it
+		// can have missed nothing.
+		s.whole = true
+	}
+	return true
 }
 
 // Forgets everything not yet flushed. Call store_flush, or store_checkpoint, first.
@@ -415,20 +419,38 @@ record_at :: proc(b: []byte) -> int {
 	return n if record_sum(b[RECORD_HEAD:][:n]) == get_u32(b[4:]) else 0
 }
 
+// What a store's own clients wrote ends its record with this, where a cell would begin, as none can: so it is known again
+// when the log is replayed after a crash, which is when the outbox may have lost what it had of it. Whatever reads a
+// record without knowing of it stops there, as it would at anything that is not a cell, having read every cell before.
+OWN_MARK :: u8(0)
+
 @(private)
 replay_record :: proc(s: ^Store, pos: u64, body: []byte) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	r := Reader{buf = body}
 	row: Id
+	applied := make([dynamic]Id, context.temp_allocator)
+	own := false
 	for r.pos < len(r.buf) {
+		if r.pos == len(r.buf) - 1 && r.buf[r.pos] == OWN_MARK {
+			own = true
+			break
+		}
 		c := read_cell(&r, row) or_break
 		row = c.row
 		off := pos + RECORD_HEAD + u64(r.pos - len(c.body))
 		if !apply(s, &c, off, 0, true) {
 			waste_add(s, off, len(c.body))
-		} else if s.own {
-			// Whether it was acknowledged, or written here at all, is not recorded; offering it again is harmless.
-			tree_put(s, &s.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
+		} else {
+			append(&applied, c.row)
+		}
+	}
+	s.unmarked ||= !own
+	if own && s.own {
+		// Its clients wrote it, after the outbox was last written down: whether a full replica has acknowledged it since
+		// is not known, and so it is offered again. What came from peers is held as anything is, and may be let go of.
+		for id in applied {
+			tree_put(s, &s.outbox, {id[0], id[1], 0, 0, 0}, {})
 		}
 	}
 }
@@ -446,7 +468,7 @@ store_tail :: proc(s: ^Store) -> u64 {
 // What a commit of these cells may come to. A caller passing on what it was sent must check.
 @(require_results)
 record_size :: proc(cells: []Cell) -> int {
-	size := RECORD_HEAD
+	size := RECORD_HEAD + 1 // and, perhaps, OWN_MARK
 	for &c in cells {
 		size += 48 + len(c.body)
 	}
@@ -455,7 +477,7 @@ record_size :: proc(cells: []Cell) -> int {
 
 // Merges cells into the store and returns how many were news. The accepted ones become one atomic
 // log record; stale ones cost nothing.
-store_commit :: proc(s: ^Store, cells: []Cell, origin: u32 = 0) -> (accepted: int) {
+store_commit :: proc(s: ^Store, cells: []Cell, origin: u32 = 0, own := false) -> (accepted: int) {
 	size := record_size(cells)
 	assert(size <= MAX_RECORD)
 	tail := store_tail(s)
@@ -486,6 +508,9 @@ store_commit :: proc(s: ^Store, cells: []Cell, origin: u32 = 0) -> (accepted: in
 	if accepted == 0 {
 		resize(&s.buf, start)
 		return
+	}
+	if own {
+		append(&s.buf, OWN_MARK)
 	}
 	body := s.buf[start + RECORD_HEAD:]
 	put_u32(s.buf[start:], u32(len(body)))
