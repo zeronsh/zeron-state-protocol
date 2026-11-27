@@ -576,7 +576,7 @@ on_hello :: proc(s: ^Session, r: ^Reader) -> Fault {
 	if flags.calls != (s.role == .Calls) {
 		return .Denied
 	}
-	s.peer_full = flags.full
+	s.peer_full = flags.full && s.role == .Peer // a replica is a peer: a client or a call that says so is not one
 	s.peer_took = flags.took && s.role == .Peer
 	s.peer_relay = s.relay && flags.relay
 	if s.relay != s.peer_relay {

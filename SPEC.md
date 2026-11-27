@@ -266,7 +266,7 @@ clear prefix and then plaintext; the node seals and opens on its client's behalf
 Each side first sends
 
 ```
-1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, 2 relay: which only confirms what the dialler knows; 4, of a local client, that it is told whose cells are; 8 calls; 16 says what it took) ‖ space (32) ‖ roster serial varint ‖ credential bytes
+1 Hello    version = 1 (1) ‖ flags (1: 1 full replica, believed only of a peer, 2 relay: which only confirms what the dialler knows; 4, of a local client, that it is told whose cells are; 8 calls; 16 says what it took) ‖ space (32) ‖ roster serial varint ‖ credential bytes
 ```
 
 A session between peers with flag 8, a **calls session**, carries Hello, Roster, Call, Flow and Error and nothing else: it is begun over a link a relay

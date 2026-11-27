@@ -3518,6 +3518,43 @@ dialled_outbox_survives_the_ring :: proc(t: ^testing.T) {
 	}
 }
 
+// A client that says it is a full replica is not taken for one: only a peer may be. Else a partial replica would send it
+// its outbox, and take out of it whatever the client acknowledged, never to reach a full replica. (Review 6 of the
+// window: peer_full, given weight on any session of a replica with an outbox.)
+@(test)
+a_client_is_no_replica :: proc(t: ^testing.T) {
+	state := seeded(120)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 0, partial = 1, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	dev := s.nodes[0]
+	sim_put(&s, dev, 1)
+	testing.expect(t, dev.node.outbox.root != 0, "nothing in the outbox")
+	ui := session_open(&dev.node, .Open, false)
+	defer session_close(ui)
+	hello: [dynamic]byte
+	defer delete(hello)
+	at := frame_begin(&hello, .Hello)
+	append(&hello, VERSION, 1) // a full replica, it says
+	zero: Key32
+	append(&hello, ..zero[:])
+	write_varint(&hello, 0)
+	write_bytes(&hello, transmute([]byte)string("let me in"))
+	frame_end(&hello, at)
+	testing.expect(t, session_input(ui, hello[:]))
+	_ = session_output(ui)
+	testing.expect(t, ui.ready, "the client was not let in")
+	testing.expect(t, !ui.peer_full, "a client was taken for a full replica")
+	testing.expect_value(t, len(ui.unacked), 0)
+	// Nor told of what it watches nothing of, as a full replica is.
+	for len(session_output(ui)) > 0 {
+		session_sent(ui, len(session_output(ui)))
+	}
+	sim_put(&s, dev, 2)
+	testing.expect_value(t, len(session_output(ui)), 0)
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)
