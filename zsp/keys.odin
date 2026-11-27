@@ -286,31 +286,10 @@ cell_author :: proc(r: ^Roster, c: ^Cell, by: By) -> (device: Key32, subject: []
 	}
 	m := &r.members[by.member - 1]
 	subject = m.subject
-	if len(by.as) > 0 && member_vouches(m, row_scope(c.row), cell_latest(c)) {
+	if len(by.as) > 0 && member_vouches(m, row_scope(c.row), cell_reach(c)) {
 		subject, vouched = by.as, true
 	}
 	return m.device, subject, vouched, true
-}
-
-// When the latest of what an open cell names or holds was written. A bundle may hold what it does not name, as a forger
-// would have it, and is whose it says only if all of it is.
-@(private)
-cell_latest :: proc(c: ^Cell) -> (latest: u64) {
-	latest = cell_reach(c)
-	if c.kind != .Bundle {
-		return
-	}
-	rd := Reader{buf = c.body, pos = clear_size(.Bundle, c.body)}
-	for rd.pos < len(rd.buf) {
-		stamp := read_stamp(&rd)
-		_ = read_u64(&rd)
-		_ = read_bytes(&rd)
-		if rd.bad {
-			break
-		}
-		latest = max(latest, stamp.time)
-	}
-	return
 }
 
 // Whether a member is believed about whom it speaks for, or was at some time.

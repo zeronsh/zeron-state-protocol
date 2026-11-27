@@ -1839,9 +1839,16 @@ a_bundle_names_nothing_later_than_its_right :: proc(t: ^testing.T) {
 	testing.expect(t, cell_valid(&forged) && cell_seal(&c.keys, &c.node.roster, &forged, 0, transmute([]byte)string("ceo")))
 	testing.expect(t, cell_authentic(&a.node.roster, &forged))
 	by: By
+	// It may write, but what it holds is later than all it names, as nothing put together of what it names is: and so it
+	// would be taken for written before it was, by whoever looks again only at what came after a right ended. It is
+	// nothing of the text, nor of a bundle put together of it.
 	testing.expect(t, cell_open(&a.keys, &a.node.roster, &forged, &by))
-	_, subject, vouched, known := cell_author(&a.node.roster, &forged, by)
-	testing.expect(t, known && !vouched && string(subject) != "ceo")
+	nothing: Text
+	defer text_destroy(&nothing)
+	testing.expect_value(t, text_apply(&nothing, &forged), Text_Result.Same)
+	again := text_bundle({forged})
+	defer delete(again.body)
+	testing.expect_value(t, len(again.body), clear_size(.Bundle, again.body))
 	// What it holds from while it could vouch, it is believed about, as it would be had it written it then.
 	honest := make([dynamic]byte, context.temp_allocator)
 	write_u32(&honest, 1)
@@ -1850,10 +1857,10 @@ a_bundle_names_nothing_later_than_its_right :: proc(t: ^testing.T) {
 	write_stamp(&honest, early)
 	write_u64(&honest, 78)
 	write_bytes(&honest, ops[:])
-	again := Cell{row, DATA, .Bundle, node_stamp(&c.node), honest[:]}
-	testing.expect(t, cell_valid(&again) && cell_seal(&c.keys, &c.node.roster, &again, 0, transmute([]byte)string("ceo")))
-	testing.expect(t, cell_open(&a.keys, &a.node.roster, &again, &by))
-	_, subject, vouched, known = cell_author(&a.node.roster, &again, by)
+	early_one := Cell{row, DATA, .Bundle, node_stamp(&c.node), honest[:]}
+	testing.expect(t, cell_valid(&early_one) && cell_seal(&c.keys, &c.node.roster, &early_one, 0, transmute([]byte)string("ceo")))
+	testing.expect(t, cell_open(&a.keys, &a.node.roster, &early_one, &by))
+	_, subject, vouched, known := cell_author(&a.node.roster, &early_one, by)
 	testing.expect(t, known && vouched && string(subject) == "ceo")
 }
 

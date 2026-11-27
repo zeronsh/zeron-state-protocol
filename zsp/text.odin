@@ -191,6 +191,10 @@ text_apply :: proc(t: ^Text, c: ^Cell) -> Text_Result {
 		return text_piece(t, get_u64(c.body), c.stamp, c.body[8:])
 	case .Bundle:
 		r := Reader{buf = c.body, pos = clear_size(.Bundle, c.body)}
+		if r.pos > len(r.buf) || get_u32(c.body) == 0 {
+			return .Same
+		}
+		last := bundle_at(c.body, int(get_u32(c.body)) - 1)
 		out := Text_Result.Same
 		for r.pos < len(r.buf) {
 			stamp := read_stamp(&r)
@@ -199,7 +203,9 @@ text_apply :: proc(t: ^Text, c: ^Cell) -> Text_Result {
 			if r.bad {
 				break
 			}
-			if !stamp_less(t.base, stamp) {
+			// Nor anything later than the last it names, as nothing put together of what it names is: it would be
+			// taken for written before the bundle was.
+			if !stamp_less(t.base, stamp) || stamp_less(last, stamp) {
 				continue
 			}
 			switch text_piece(t, id, stamp, ops) {
@@ -1137,6 +1143,7 @@ text_bundle :: proc(cells: []Cell, allocator := context.allocator) -> (out: Cell
 				append(&names, bundle_at(c.body, i))
 			}
 			r := Reader{buf = c.body, pos = clear_size(.Bundle, c.body)}
+			last := bundle_at(c.body, int(get_u32(c.body)) - 1)
 			for r.pos < len(r.buf) {
 				stamp := read_stamp(&r)
 				id := read_u64(&r)
@@ -1144,7 +1151,9 @@ text_bundle :: proc(cells: []Cell, allocator := context.allocator) -> (out: Cell
 				if r.bad {
 					break // what cannot be read was nothing of the text, nor will be
 				}
-				append(&inner, Inner{stamp, id, ops})
+				if !stamp_less(last, stamp) { // and what is later than it names was nothing of it either
+					append(&inner, Inner{stamp, id, ops})
+				}
 			}
 		}
 		out.row, out.slot = c.row, c.slot
