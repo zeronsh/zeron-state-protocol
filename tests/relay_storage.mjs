@@ -25,11 +25,13 @@ class Sql {
   constructor() {
     this.db = new DatabaseSync(":memory:");
     this.written = 0;
+    this.full = null; // which writes find no room, if any
   }
   get databaseSize() {
     return this.db.prepare("PRAGMA page_count").get().page_count * this.db.prepare("PRAGMA page_size").get().page_size;
   }
   exec(query, ...args) {
+    if (this.full?.(query, args)) throw new Error("SQLITE_FULL: database or disk is full");
     const st = this.db.prepare(query);
     let rows = [], changes = 0;
     if (/^\s*(SELECT|PRAGMA)/i.test(query)) {
@@ -522,6 +524,27 @@ async function cache_trimmed_on_opening(seed) {
   assert.ok(n <= 1 << 19, `${n} bytes of pages kept, past their share`);
 }
 
+// Bug hunt. Whose space it is is kept before anything else is: where there was no room for it, nothing else is kept
+// either, and the first write that finds room keeps it first, whether by the same storage or by storage opened again.
+async function space_kept_first(seed) {
+  for (const reopened of [false, true]) {
+    const { sql, host, space } = harness(seed);
+    sql.full = (query, args) => /INSERT INTO kept/.test(query) && args[0] === "space";
+    assert.equal(host.log_write(0, 0, 10), 0, "kept with no room for whose space it is");
+    assert.equal(host.log_end(), 0);
+    sql.full = null;
+    const open = () => new Storage({ storage: { sql, sync: async () => {} }, waitUntil() {} }, { STORE: new Bucket(random(seed), 0) });
+    let writer = host;
+    if (reopened) {
+      const s = open(), memory = new Uint8Array(16);
+      s.open(space);
+      writer = s.imports((ptr, len) => memory.subarray(ptr, ptr + len), space);
+    }
+    assert.equal(writer.log_write(0, 0, 10), 1);
+    assert.deepEqual(open().kept("space"), space, `whose space it is not kept with what was${reopened ? ", opened again" : ""}`);
+  }
+}
+
 for (let seed = first; seed < first + seeds; seed++) {
   await log_matches(seed);
   await cache_is_sound(seed);
@@ -539,5 +562,6 @@ for (let seed = first; seed < first + seeds; seed++) {
   if (seed === first) await log_read_a_row_once(seed);
   if (seed === first) await long_run_kept_in_part(seed);
   if (seed === first) await cache_trimmed_on_opening(seed);
+  if (seed === first) await space_kept_first(seed);
 }
 console.log(`ok   relay storage held to its model over ${seeds} seeds`);

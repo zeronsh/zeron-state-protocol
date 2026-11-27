@@ -22,7 +22,8 @@ export class Storage {
   #sql;
   #bucket;
   #prefix = "";
-  #made = false;
+  #made = false; // its tables are there
+  #named = false; // and whose space it is is kept
   #tail; // the log's last row, if it may grow: { off, bytes, len }
   #rows = []; // rows of the log lately read, latest first: { off, bytes }. What lies at an offset changes only once cut
   #cached = [0, 0, 0]; // bytes: of pages, of the log, of tops
@@ -50,15 +51,19 @@ export class Storage {
     return this.#made;
   }
 
-  // Nothing is stored until someone admitted has something to store: merely knocking leaves no trace.
+  // Nothing is stored until someone admitted has something to store: merely knocking leaves no trace. Whose space it
+  // is is kept before anything else: with no room for it, nothing else is, and the next write keeps it first.
   make(space) {
-    if (this.#made) return;
+    if (this.#named) return;
     this.#prefix = hex(space) + "/";
-    this.#sql.exec("CREATE TABLE IF NOT EXISTS log (off INTEGER PRIMARY KEY, data BLOB) STRICT");
-    this.#sql.exec("CREATE TABLE IF NOT EXISTS kept (name TEXT PRIMARY KEY, data BLOB) STRICT");
-    this.#tables();
-    this.#made = true; // the tables are there, whatever comes of what follows
-    this.keep("space", space);
+    if (!this.#made) {
+      this.#sql.exec("CREATE TABLE IF NOT EXISTS log (off INTEGER PRIMARY KEY, data BLOB) STRICT");
+      this.#sql.exec("CREATE TABLE IF NOT EXISTS kept (name TEXT PRIMARY KEY, data BLOB) STRICT");
+      this.#tables();
+      this.#made = true; // the tables are there, whatever comes of what follows
+    }
+    if (!this.kept("space")) this.keep("space", space);
+    this.#named = true;
   }
 
   // What there must be, made unless it is there already: past any limit, as it takes nothing when it is.
