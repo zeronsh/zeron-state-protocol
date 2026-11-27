@@ -552,6 +552,32 @@ def test_knocking_leaves_no_trace():
         k.close()
 
 
+def test_strangers_are_let_go():
+    """A relay serving only some spaces refuses an upgrade to any other before anything is opened for it; and one that
+    serves any lets go of a connection on which no session is ready within HANDSHAKE_WAIT, fifteen seconds, as anyone may
+    leave one: nothing else need happen for it to."""
+    allowed = os.urandom(32).hex()
+    relay = Node("strangers-relay", "serve", "--no-udp", "--allow=" + allowed).start()
+    k = knock(relay.address, "/" + allowed)
+    k.close()
+    host, port = relay.address.split(":")
+    other = socket.create_connection((host, int(port)))
+    other.sendall(
+        f"GET /{os.urandom(32).hex()} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".encode()
+    )
+    other.settimeout(10)
+    assert other.recv(500) == b"", "a space not served was answered"
+    other.close()
+    idle = Node("idle-relay", "serve", "--no-udp").start()
+    k = knock(idle.address, "/" + os.urandom(32).hex())
+    k.settimeout(30)
+    start = time.monotonic()
+    assert k.recv(500) == b"", "said something"
+    assert 10 < time.monotonic() - start < 25, time.monotonic() - start
+    k.close()
+
+
 def test_limits():
     relay, (a, b) = space("aa", "ab")
     ca, cb = a.client(), b.client()

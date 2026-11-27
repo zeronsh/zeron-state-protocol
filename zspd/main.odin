@@ -548,6 +548,15 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 		udp_port     = 0,
 		data         = &policy,
 		authenticate = authenticate,
+		serves       = proc(data: rawptr, space: zsp.Key32) -> bool {
+			p := (^Policy)(data)
+			for id in p.spaces {
+				if id == space {
+					return true
+				}
+			}
+			return len(p.spaces) == 0
+		},
 	}
 	listen := "0.0.0.0:8787" if relay else "127.0.0.1:0"
 	for a in args {

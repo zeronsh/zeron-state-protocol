@@ -17,6 +17,9 @@ import "../zsp"
 OUT_HIGH :: 256 << 10
 PING_IDLE :: 45 * time.Second // keeps middleboxes and edges from forgetting a quiet connection
 PONG_WAIT :: 15 * time.Second
+// From a connection's first byte to a session ready on it, at most: one that is not by then, its handshakes stalled or
+// never begun, as anyone may leave one, is let go of, and with it whatever it held.
+HANDSHAKE_WAIT :: 15 * time.Second
 MAX_PLAIN :: 60 << 10 // per Noise message
 
 Stream :: struct {
@@ -31,6 +34,7 @@ Stream :: struct {
 	},
 	handshake: ^zsp.Handshake,
 	channel:   zsp.Channel,
+	id:        zsp.Key32, // of the space asked for, which on a relay is opened only once the peer has proved a key
 	space:     ^Space,
 	session:   ^zsp.Session,
 	role:      zsp.Role,
@@ -48,6 +52,7 @@ Stream :: struct {
 	recv_op:   ^nbio.Operation,
 	send_op:   ^nbio.Operation,
 	quiet_at:  time.Tick, // last heard from
+	due:       time.Tick, // to have a session ready by, until it has: see HANDSHAKE_WAIT
 	pinged:    bool,
 	closing:   bool,
 }
@@ -61,6 +66,8 @@ stream_new :: proc(h: ^Host, socket: net.TCP_Socket) -> ^Stream {
 	net.set_option(socket, .TCP_Nodelay, true)
 	append(&h.streams, s)
 	s.quiet_at = time.tick_now()
+	s.due = time.tick_add(s.quiet_at, HANDSHAKE_WAIT)
+	h.handshaking += 1
 	stream_listen(s)
 	return s
 }
@@ -73,6 +80,17 @@ stream_accepted :: proc(op: ^nbio.Operation, h: ^Host) {
 		return
 	}
 	stream_new(h, op.accept.client)
+}
+
+// Whether a stream still handshaking may go on: it has a session ready by now, and is no longer timed, or it has time.
+@(private)
+stream_due :: proc(s: ^Stream, now: time.Tick) -> bool {
+	if s.session != nil && s.session.ready {
+		s.due = {}
+		s.host.handshaking -= 1
+		return true
+	}
+	return time.tick_diff(now, s.due) > 0
 }
 
 // Where two polls wait on one socket, Windows completes whichever was made first, whichever of them it was
@@ -109,6 +127,9 @@ stream_close :: proc(s: ^Stream) {
 	}
 	if s.session != nil {
 		session_end(s.session)
+	}
+	if s.due != {} {
+		h.handshaking -= 1
 	}
 	if s.dialer != nil {
 		dialer_lost(s.dialer)
@@ -273,16 +294,17 @@ stream_greeted :: proc(s: ^Stream, head: ^pipe.Http) -> bool {
 		return false
 	}
 	if len(path) == 65 {
-		id: zsp.Key32
 		bytes := hex.decode(transmute([]byte)path[1:], context.temp_allocator) or_return
-		copy(id[:], bytes)
+		copy(s.id[:], bytes)
 		for x in h.spaces {
-			if x.node.space == id {
+			if x.node.space == s.id {
 				s.space = x
 			}
 		}
-		if s.space == nil && h.relay {
-			s.space = space_open(h, id)
+		// A relay opens a space nobody is in only for a peer that has proved a key (stream_message), and one it does not
+		// serve for nobody.
+		if s.space == nil && (!h.relay || (h.serves != nil && !h.serves(h.data, s.id))) {
+			return false
 		}
 		s.phase = .Noise
 	} else {
@@ -294,9 +316,6 @@ stream_greeted :: proc(s: ^Stream, head: ^pipe.Http) -> bool {
 		s.space = h.spaces[0]
 		s.role = .Open
 		s.phase = .Open
-	}
-	if s.space == nil {
-		return false
 	}
 	stream_raw(s, transmute([]byte)pipe.ws_response(head.key))
 	if s.role == .Open {
@@ -326,7 +345,13 @@ stream_message :: proc(s: ^Stream, payload: []byte) -> bool {
 			return true
 		}
 		second: [zsp.HANDSHAKE_2]byte
-		second, s.channel = zsp.handshake_answer(s.host.secret, s.space.node.space, payload) or_return
+		second, s.channel = zsp.handshake_answer(s.host.secret, s.id, payload) or_return
+		if s.space == nil {
+			s.space = space_open(s.host, s.id) // or found open, by another meanwhile
+			if s.space == nil {
+				return false
+			}
+		}
 		stream_put(s, .Binary, second[:])
 		stream_session(s, false)
 		return true

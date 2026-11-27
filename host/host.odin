@@ -29,6 +29,9 @@ Config :: struct {
 	// Authentication, which is wholly the embedder's: see zsp.Host.authenticate. `data` is passed back.
 	data:         rawptr,
 	authenticate: proc(data: rawptr, s: ^zsp.Session, credential: []byte),
+	// On a relay, whether it serves a space at all: asked before anything is opened for it, or said to whoever asks for
+	// it. Nil for any.
+	serves:       proc(data: rawptr, space: zsp.Key32) -> bool,
 }
 
 Host :: struct {
@@ -37,6 +40,7 @@ Host :: struct {
 	device:       zsp.Key32,
 	spaces:       [dynamic]^Space,
 	streams:      [dynamic]^Stream,
+	handshaking:  int, // of them, with no session ready yet
 	listener:     net.TCP_Socket,
 	dialers:      [dynamic]^Dialer,
 	udp:          Udp,
@@ -388,6 +392,10 @@ host_settle :: proc(h: ^Host) {
 	}
 	// Last, so that what links had to say through relays goes out at once.
 	#reverse for s in h.streams {
+		if s.due != {} && !stream_due(s, now) {
+			stream_close(s)
+			continue
+		}
 		stream_flush(s)
 	}
 	if h.relay {
@@ -438,6 +446,13 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 			ms := now_ms()
 			wait := min(at - min(at, ms), 24 * 3600 * 1000) // and looked at again in a day, which is soon enough
 			earliest(&due, &ok, time.tick_add(time.tick_now(), time.Duration(wait) * time.Millisecond))
+		}
+	}
+	if h.handshaking > 0 {
+		for s in h.streams {
+			if s.due != {} {
+				earliest(&due, &ok, s.due)
+			}
 		}
 	}
 	if t := links_deadline(h); t != 0 {

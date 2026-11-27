@@ -1,8 +1,12 @@
 package host
 
+import "core:nbio"
+import "core:net"
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import "core:testing"
+import "core:time"
 import "../pipe"
 import "../zsp"
 
@@ -210,4 +214,52 @@ review_disk_forgets_open_segments :: proc(t: ^testing.T) {
 	}
 	end, got = read(dropped, 0, 4)
 	testing.expectf(t, end == 4 && got == "new!", "after a drop: end %d, %q", end, got)
+}
+
+// A relay opens nothing for a stranger that has only asked for a space: not for one it does not serve, which is refused
+// at once; nor for any other, until a key is proved. And a connection on which no session is ready within
+// HANDSHAKE_WAIT, as anyone may leave one, is let go of.
+@(test)
+review_relay_opens_nothing_for_strangers :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-strangers-*", context.temp_allocator)
+	testing.expect(t, err == nil)
+	defer os.remove_all(dir)
+	h: Host
+	testing.expect(t, host_init(&h, {dir = dir, relay = true, full = true, listen = net.Endpoint{net.IP4_Loopback, 0}}))
+	defer host_destroy(&h)
+	at, _ := net.bound_endpoint(h.listener)
+	// What the relay says to an upgrade, if anything, before it closes.
+	ask :: proc(h: ^Host, at: net.Endpoint) -> (said: string, socket: net.TCP_Socket) {
+		buf := make([]byte, 512, context.temp_allocator)
+		socket, _ = net.dial_tcp(at)
+		net.set_blocking(socket, false)
+		request := pipe.ws_request("x", strings.concatenate({"/", strings.repeat("ab", 32, context.temp_allocator)}, context.temp_allocator))
+		net.send_tcp(socket, transmute([]byte)request)
+		for start := time.tick_now(); time.tick_since(start) < 5 * time.Second; {
+			host_settle(h)
+			_ = nbio.tick(5 * time.Millisecond)
+			n, rerr := net.recv_tcp(socket, buf)
+			if rerr == .Would_Block {
+				continue
+			}
+			return string(buf[:n]) if n > 0 else "closed", socket
+		}
+		return "", socket
+	}
+	h.serves = proc(_: rawptr, _: zsp.Key32) -> bool {return false}
+	said, refused := ask(&h, at)
+	net.close(refused)
+	testing.expectf(t, said == "closed", "a space not served: %q", said)
+	h.serves = nil
+	said2, waiting := ask(&h, at)
+	defer net.close(waiting)
+	testing.expectf(t, strings.contains(said2, " 101 "), "a space served: %q", said2)
+	testing.expectf(t, len(h.spaces) == 0, "%d spaces opened for a stranger that proved nothing", len(h.spaces))
+	testing.expect_value(t, len(h.streams), 1)
+	if len(h.streams) == 1 {
+		h.streams[0].due = time.tick_now() // as though HANDSHAKE_WAIT had passed
+		host_settle(&h)
+		testing.expectf(t, len(h.streams) == 0 && h.handshaking == 0, "%d streams, %d handshaking, after HANDSHAKE_WAIT", len(h.streams), h.handshaking)
+	}
 }
