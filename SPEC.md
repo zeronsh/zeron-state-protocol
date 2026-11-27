@@ -164,8 +164,8 @@ row ‖ slot ‖ kind ‖ clear prefix. The bracketed parts exist in signed scop
 the signature, by that member's signer, covers row ‖ slot ‖ kind ‖ stamp ‖ body short of the signature. In a signed scope the plaintext is
 `as` (bytes, at most 64) ‖ what was written: for whom its author wrote it, if for another than its device belongs to, and otherwise nothing.
 
-**Whose a cell is**, in a signed scope: that of whom `as` names, if a grant of the author's there includes Vouch, with `until` zero or no less than when it was written, and `as` is not
-empty; otherwise its author's `subject`. Nothing is refused over it, and a relay sees none of it. In an unsigned scope a cell is nobody's. A host says for whom a local client is as it accepts it, and a node writes nothing there for
+**Whose a cell is**, in a signed scope: that of whom `as` names, if a grant of the author's there includes Vouch, with `until` zero or no less than when it was written
+(of a bundle, when the latest of what it names or holds was), and `as` is not empty; otherwise its author's `subject`. Nothing is refused over it, and a relay sees none of it. In an unsigned scope a cell is nobody's. A host says for whom a local client is as it accepts it, and a node writes nothing there for
 anybody else without Vouch: that is *denied*. What is sealed again keeps its `as`.
 
 A replica accepts a cell from a peer only if
@@ -177,13 +177,15 @@ A replica accepts a cell from a peer only if
 - where the replica holds the scope's key, the seal opens. Otherwise garbage could win by claiming a late stamp.
 
 A cell was **written** at its stamp time, but a bundle when the first of what it names was: its author may put together what it had a right to write after that right has ended,
-as may well be before it hears. Whoever opens a bundle in a signed scope passes over what its author had no right to write at that stamp's time, or has none now.
+as may well be before it hears. Yet a bundle kills all it names, and so in a signed scope its author's grant must also stand at the time of the last of them, or
+it is not acceptable: whoever may no longer write cannot, by naming first something from before, kill what was written since. Whoever opens a bundle in a signed scope passes over what its author had no right to write at that stamp's time, or has none now.
 
 In a signed scope authority travels with the cell, so anyone may carry it. In an unsigned scope, to hold the key is to be a writer.
 
 On adopting a roster, and on starting with one it has not yet held its cells against, a replica looks again at cells later than any epoch or grant
 it ends. In an unsigned scope, one that is no longer acceptable is sealed again, with the same stamp, under the key in force at that stamp's
-time, by a replica that can open it, since someone may merely not have heard; in a signed scope, by its author alone, for a void key; otherwise it is dropped.
+time, by a replica that can open it, since someone may merely not have heard; in a signed scope, by its author alone, for a void key, or for a bundle that names more than its author may still kill, which it puts together again, with
+the same stamp, of only what it may name and had the right to write; otherwise it is dropped.
 A roster that does not extend the one held (a prefix of whose members, grants, keys and times it keeps) won over it: then everything held is looked at. A partial replica that may have written there offers again
 all it holds in that scope, for who took it may be gone. Then, whatever the roster changed, each device watches afresh, partial ones under new ids. A device's clock moves past
 the end of everything that has ended, but for what is too far ahead. Where a cell is
