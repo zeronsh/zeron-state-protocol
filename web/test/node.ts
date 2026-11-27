@@ -895,6 +895,46 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   }
 }
 
+// A relay that turns this device away, as one does a device whose clock is far ahead of its own, is asked again ever
+// less often: not every quarter of a second for as long as it says no, its session having been ready first.
+{
+  const { spawn } = await import("node:child_process");
+  const relay = spawn(BIN, ["serve", join(TMP, "refusing-relay"), "--listen=127.0.0.1:0", "--no-udp"], { stdio: ["ignore", "pipe", "ignore"] });
+  const realNow = Date.now;
+  try {
+    const said: string = await new Promise((done) => relay.stdout!.once("data", (d) => done(String(d))));
+    const [, key, address] = said.match(/(\w{64}) listening on ws:\/\/(\S+)/)!;
+    const owner = join(TMP, "refused-owner");
+    const space = execFileSync(BIN, ["create", owner], { encoding: "utf8" }).trim();
+    execFileSync(BIN, ["relay", owner, key, `ws://${address}`]);
+    Date.now = () => realNow() + 20 * 60 * 1000; // a quarter of an hour and more ahead of the relay's
+    const volume = new MemoryVolume();
+    const prep = await Node.open({ volume, module, log: () => {} });
+    execFileSync(BIN, ["admit", owner, prep.key, "1"]);
+    assert(prep.adopt(readFileSync(join(owner, space, "roster"))));
+    const writer = new Client({ connect: prep.connect });
+    while (!writer.may(1, "write")) await new Promise((done) => setTimeout(done, 1));
+    await writer.write(1, (change) => change.insert({ title: columns.string(16) }, "items", 1, { title: "from later" }));
+    writer.close();
+    await prep.close();
+    let dials = 0;
+    class Counting extends WebSocket {
+      constructor(url: string | URL, protocols?: string | string[]) {
+        super(url, protocols);
+        dials++;
+      }
+    }
+    const node = await Node.open({ volume, module, log: () => {}, WebSocket: Counting });
+    await new Promise((done) => setTimeout(done, 2800));
+    await node.close();
+    // 200, 400, 800 ms apart and more, with up to half again of each: four at most in 2.8 s, where it was eleven.
+    assert(dials >= 1 && dials <= 5, `the relay was dialled ${dials} times in 2.8 s`);
+  } finally {
+    Date.now = realNow;
+    relay.kill("SIGKILL");
+  }
+}
+
 // What a node sends is only ever where one peer could be. A beacon is answered where it says its device is, from the
 // address it came from, not at that address's port, which may be anyone's, as the shared port beacons are said from
 // is; nothing from port 0 or nobody is answered at all, a beacon nor a request for this machine's outside address; and

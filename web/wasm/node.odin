@@ -58,6 +58,7 @@ Conn :: struct {
 	quiet_at:  f64, // last heard from
 	pinged:    bool,
 	gone:      bool, // the host has been told to let go of it
+	admitted:  bool, // its session has been ready
 }
 
 Dialer :: struct {
@@ -583,7 +584,11 @@ conn_drop :: proc(c: ^Conn) {
 	if !c.gone {
 		hangup(c.id)
 	}
+	// A session the relay was ready for and that ended of nothing but the connection going is no failure: dialled again
+	// soon. One that ended for a reason, the relay's or this end's, as a device the relay turns away has, is.
+	clean := false
 	if c.session != nil {
+		clean = (c.admitted || c.session.ready) && c.session.fault == .None
 		zsp.session_close(c.session)
 	}
 	if c.handshake != nil {
@@ -591,6 +596,9 @@ conn_drop :: proc(c: ^Conn) {
 	}
 	if d := c.dialer; d != nil {
 		d.conn = nil
+		if clean {
+			d.failures = 0
+		}
 		dialer_failed(d)
 	}
 	free(c)
@@ -713,7 +721,7 @@ dialers_run :: proc(t: f64) {
 			conn_drop(c)
 		case:
 			if c.session != nil && c.session.ready {
-				d.failures = 0 // admitted, not merely answered
+				c.admitted = true // not merely answered: whether that was a failure is known when it ends
 			}
 			quiet := t - c.quiet_at
 			if c.pinged && quiet >= pong_wait {
