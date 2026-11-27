@@ -36,7 +36,7 @@ import "core:path/filepath"
 // a while, so that neither takes the other for a node that is running, nor is kept from the directory by the other. Its
 // lock is flock's (file_lock), held against another thread of the process as against another process.
 
-LOCK_FILE :: "lock"
+LOCK_FILE :: ".lock" // hidden, as what nothing else is to open
 LOCK_AT :: 1 << 30 // SQLite's PENDING_BYTE: bytes nothing is ever written to, there or here
 LOCK_SIZE :: 512 // its pending byte, its reserved byte, and its 510 shared bytes
 START_FILE :: "start.lock"

@@ -219,13 +219,23 @@ machines, where a lock may not hold, is refused, as zspd refuses it. The lock fi
 owner alone, and what is in it is nothing.
 
 **On Linux, nothing else in a device's process may open its lock file while it runs.** SQLite's lock there is a POSIX record lock,
-which the kernel holds for the process, not for the file opened: should anything else in the process open `<dir>/lock` and close it
+which the kernel holds for the process, not for the file opened: should anything else in the process open `<dir>/.lock` and close it
 again, as `fs.cp` of the device's directory would, or anything that reads every file in it, the kernel lets go of the lock while
 the device runs, another process may then open the store beside it, and nothing says so. Nothing in zsp opens it but SQLite, which
 keeps its own files open while it holds locks for just this reason, and another device of the same process on the directory goes
-through SQLite too, and is refused. Node offers no other lock (no `flock`, no lock of an open file description, nothing held by a
-handle) and no way to see that a lock was let go of, so this is beyond Node without native code. Copy a device's directory only once
-it is closed. On Windows the lock is the handle's, and on macOS the open file's, and they hold whatever else is opened.
+through SQLite too, and is refused. The file is hidden, `.lock`, so that what reads a directory's files but not its hidden ones
+leaves it alone. Copy a device's directory only once it is closed. On Windows the lock is the handle's, and on macOS the open file's,
+and they hold whatever else is opened.
+
+Node 24 offers no other lock: `node:fs` has no `flock` nor `fcntl`, the SQLite it is built with has no `unix-flock` file system, and
+`node:wasi` is WASI preview1, which has no locks. Node 26.1 has `node:ffi`, through which `fcntl(F_OFD_SETLK)` takes the very lock zspd
+takes, and holds it whatever else of the process opens the file; but it is experimental, says so on every start, cannot call a
+function of variable arguments as `fcntl` is (called as one of three, it works on x86-64 and arm64 Linux, and is undefined elsewhere),
+is refused under the permission model without `--allow-ffi`, and is missing from builds without libffi and from every Node before
+26.1. A native addon would take it anywhere, at the cost of a build or prebuilt binaries for each platform, an install step, and
+native code in what is now a package of TypeScript and WebAssembly alone; and a process held beside the device to hold the lock would
+need a program that takes zspd's lock, which only zspd is, and Node does not ship. So it is as it is, until `node:ffi` is stable and
+can call `fcntl` as it is declared.
 
 ## Links
 

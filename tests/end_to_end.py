@@ -141,7 +141,7 @@ def read_kept(path):
 
 def hold(path):
     """Holds a store's directory as a node does (host/hold.odin), to stand for one; until what it returns is closed."""
-    f = open(os.path.join(path, "lock"), "a+b")
+    f = open(os.path.join(path, ".lock"), "a+b")
     if os.name == "nt":
         import msvcrt
 

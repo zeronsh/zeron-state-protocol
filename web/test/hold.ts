@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { open } from "../src/nodejs.ts";
-import { ASIDE, FLOCK, judgedByRoot } from "../src/volume-node.ts";
+import { ASIDE, FLOCK, judgedByRoot, LOCK } from "../src/volume-node.ts";
 import { BIN, ROOT, node as zspdNode, procs, zspd } from "./procs.ts";
 
 const TMP = mkdtempSync(join(tmpdir(), "zsp-hold-"));
@@ -49,7 +49,7 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
   assert.equal(b.key, key, "the same device, as it was");
   await b.close();
   if (process.platform !== "win32") {
-    assert.equal(statSync(join(dir, "lock")).mode & 0o777, 0o600, "the lock file can be held by others, and so the store kept from its own");
+    assert.equal(statSync(join(dir, LOCK)).mode & 0o777, 0o600, "the lock file can be held by others, and so the store kept from its own");
   }
 }
 
@@ -109,7 +109,7 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
 {
   const d = await open({ dir: join(TMP, "none", "..", "roundabout"), ...quiet });
   await d.close();
-  assert(existsSync(join(TMP, "roundabout", "lock")) && !existsSync(join(TMP, "none")), "a directory its path only passes through was made");
+  assert(existsSync(join(TMP, "roundabout", LOCK)) && !existsSync(join(TMP, "none")), "a directory its path only passes through was made");
   if (process.platform !== "win32") {
     mkdirSync(join(TMP, "deep", "inner"), { recursive: true });
     symlinkSync(join(TMP, "deep", "inner"), join(TMP, "link"));
@@ -124,7 +124,7 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
     // And a part there is after a part that is not, and a `..` that takes the latter away: resolved as the former is.
     const past = await open({ dir: join(TMP, "gone") + "/../link/../past", ...quiet });
     await past.close();
-    assert(existsSync(join(TMP, "deep", "past", "lock")) && !existsSync(join(TMP, "past")) && !existsSync(join(TMP, "gone")));
+    assert(existsSync(join(TMP, "deep", "past", LOCK)) && !existsSync(join(TMP, "past")) && !existsSync(join(TMP, "gone")));
   }
 }
 
@@ -136,7 +136,7 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
   writeFileSync(join(TMP, "elsewhere"), "");
   let linked = true;
   try {
-    symlinkSync(join(TMP, "elsewhere"), join(dir, "lock"));
+    symlinkSync(join(TMP, "elsewhere"), join(dir, LOCK));
   } catch (e) {
     // Where this process may make no link, as on Windows unelevated, it is not tried here; CI, elevated, tries it.
     if (process.platform !== "win32" || (e as NodeJS.ErrnoException).code !== "EPERM" || process.env.CI) throw e;
@@ -159,7 +159,7 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
   for (const [name, bytes] of [["filled", Buffer.from("x".repeat(4096))], ["begun", database.subarray(0, 512)], ["spoiled", spoiled]] as const) {
     const filled = join(TMP, name);
     zspd("create", filled);
-    writeFileSync(join(filled, "lock"), bytes);
+    writeFileSync(join(filled, LOCK), bytes);
     opened.length = 0;
     syncBuiltinESMExports();
     let d;
@@ -169,8 +169,8 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
       Object.assign(fs, watched);
       syncBuiltinESMExports();
     }
-    assert(!opened.includes(join(filled, "lock")), `the lock file with ${name} in it was opened here: ${opened.join(", ")}`);
-    assert(!existsSync(join(filled, "lock-journal")), "the journal that emptied it was left");
+    assert(!opened.includes(join(filled, LOCK)), `the lock file with ${name} in it was opened here: ${opened.join(", ")}`);
+    assert(!existsSync(join(filled, LOCK + "-journal")), "the journal that emptied it was left");
     const p = spawnSync(BIN, ["run", filled, "--listen=127.0.0.1:0", "--no-udp"], { encoding: "utf8", timeout: 30000 });
     assert.match(p.stderr, IN_USE, `a device on a lock file with ${name} in it holds nothing`);
     await d.close();
@@ -202,16 +202,16 @@ assert(!judgedByRoot(0, 0) && judgedByRoot(26, 26) && !judgedByRoot(26, 27));
 {
   const dir = join(TMP, "aside");
   mkdirSync(dir);
-  assert(!/\.[0-9a-f]{32}\.new$/.test("lock.0123456789abcdef0123456789abcdef.making") && ASIDE.test("lock.0123456789abcdef0123456789abcdef.making"));
-  const aside = join(dir, "lock.0123456789abcdef0123456789abcdef.making");
+  assert(!/\.[0-9a-f]{32}\.new$/.test(".lock.0123456789abcdef0123456789abcdef.making") && ASIDE.test(".lock.0123456789abcdef0123456789abcdef.making"));
+  const aside = join(dir, ".lock.0123456789abcdef0123456789abcdef.making");
   writeFileSync(aside, "");
   zspd("key", dir); // which clears what saves left behind
   assert(existsSync(aside), "zspd removed what a lock file is being made from");
   rmSync(aside);
   const d = await open({ dir, ...quiet });
   await d.close();
-  if (process.platform !== "win32") assert.equal(statSync(join(dir, "lock")).mode & 0o777, 0o600);
-  assert.deepEqual(readdirSync(dir).filter((n) => n.startsWith("lock.")), [], "what the lock file was made from was left");
+  if (process.platform !== "win32") assert.equal(statSync(join(dir, LOCK)).mode & 0o777, 0o600);
+  assert.deepEqual(readdirSync(dir).filter((n) => n.startsWith(LOCK + ".")), [], "what the lock file was made from was left");
 }
 
 // Where Node takes flock's lock is where zspd does, as host/hold_bsd.odin is built.

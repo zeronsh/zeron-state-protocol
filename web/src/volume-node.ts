@@ -96,10 +96,16 @@ export const FLOCK = new Set<string>(["darwin", "freebsd", "openbsd", "netbsd"])
  * What a lock file is made from is named so: as no save's staging file is (host/staging.odin), so that zspd, which removes
  * those it finds held by nobody, never removes one, which Node cannot hold as a save does.
  */
-export const ASIDE = /^lock\.[0-9a-f]{32}\.making$/;
+export const ASIDE = /^\.lock\.[0-9a-f]{32}\.making$/;
+
+/**
+ * A store's lock file, in its directory, as host/hold.odin names it: hidden, as what nothing but whoever holds the store is
+ * to open, so that what reads a directory's files but not its hidden ones leaves it alone.
+ */
+export const LOCK = ".lock";
 
 // A store's directory is one node's at a time, as host/hold.odin says: two writing one log at once each write over what
-// the other wrote, and each acknowledges what is lost. So it is held, by a lock on its file "lock" that the kernel lets go
+// the other wrote, and each acknowledges what is lost. So it is held, by a lock on its file ".lock" that the kernel lets go
 // of when the process ends, however it ends: the lock zspd takes, so that each keeps the other out too. Node has no way
 // of its own to take it. On Linux and Windows it is taken through the SQLite Node is built with, which keeps its locks on
 // the very bytes zspd locks there: its pending, reserved and shared bytes, at 2^30. Where zspd takes flock's lock, it is
@@ -110,10 +116,11 @@ export const ASIDE = /^lock\.[0-9a-f]{32}\.making$/;
 // anything that reads every file in it), the kernel lets go of the lock while the device runs, and another process may
 // then open the store beside it, and nothing says so. Nothing here ever opens the lock file but SQLite, which keeps its own
 // files open while it holds locks for that reason; another device of this process on the directory goes through SQLite
-// too, and is refused. Node has no other lock (no flock, no open file description's lock, no LockFileEx-like handle lock),
-// nor any way to see that one was let go of: that is beyond Node without native code. So, on Linux, nothing else in the
-// process may open a running device's lock file: copy a device's directory only once it is closed. Windows' locks are the
-// handle's and macOS' are the open file's, so there they hold whatever else is opened.
+// too, and is refused; and it is hidden, `.lock`, so that what reads a directory's files but not its hidden ones leaves it
+// alone. Node 24 has no other lock, nor any way to see one let go of; Node 26's node:ffi could take zspd's own, but is
+// experimental, and cannot call fcntl as declared (see docs/web.md). So, on Linux, nothing else in the process may open a
+// running device's lock file: copy a device's directory only once it is closed. Windows' locks are the handle's and
+// macOS' are the open file's, so there they hold whatever else is opened.
 //
 // A lock on a file system shared with other machines may not hold, and a store on one is refused, where that can be
 // told, before anything is made there. Returns where the directory is, as held, and what lets go of it.
@@ -129,7 +136,7 @@ function holdDirectory(dir: string): [string, () => void] {
   const kind = shared(judged);
   if (kind) throw new Error(`${dir} is on a file system shared with other machines (${kind}), where its lock may not hold: keep the store on a disk of this machine's own`);
   if (!there) mkdirSync(at, { recursive: true, mode: 0o700 });
-  const path = join(at, "lock");
+  const path = join(at, LOCK);
   const inUse = () => new Error(`this store is in use by another process: ${dir}`);
   const notFile = () => new Error(`${path} is not a file: a store's lock file is never a link, nor anything but a file`);
   // Nothing but a file, never a link followed to wherever it leads, readable by its owner alone, as zspd holds it to: one
@@ -221,7 +228,7 @@ function holdDirectory(dir: string): [string, () => void] {
 // whole of it on disk before anything takes it for what it is to be. Returns its path.
 function madeAside(dir: string, bytes: Uint8Array): string {
   for (;;) {
-    const aside = join(dir, `lock.${Array.from({ length: 4 }, () => ((Math.random() * 2 ** 32) >>> 0).toString(16).padStart(8, "0")).join("")}.making`);
+    const aside = join(dir, `${LOCK}.${Array.from({ length: 4 }, () => ((Math.random() * 2 ** 32) >>> 0).toString(16).padStart(8, "0")).join("")}.making`);
     let fd: number;
     try {
       fd = openSync(aside, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
