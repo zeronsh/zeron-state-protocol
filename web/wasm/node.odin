@@ -588,7 +588,7 @@ conn_drop :: proc(c: ^Conn) {
 	// soon. One that ended for a reason, the relay's or this end's, as a device the relay turns away has, is.
 	clean := false
 	if c.session != nil {
-		clean = (c.admitted || c.session.ready) && c.session.fault == .None
+		clean = (c.admitted || c.session.ready || zsp.session_waited(c.session)) && c.session.fault == .None
 		zsp.session_close(c.session)
 	}
 	if c.handshake != nil {

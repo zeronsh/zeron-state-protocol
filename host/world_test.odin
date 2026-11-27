@@ -29,7 +29,7 @@ World :: struct {
 }
 
 @(private)
-world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = {.Read, .Write, .Call}, relays := 1) -> bool {
+world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = {.Read, .Write, .Call}, relays := 1, bare_b := false) -> bool {
 	w.t = t
 	w.count = 3 if relays == 1 else 4
 	base, terr := os.temp_directory(context.temp_allocator)
@@ -68,7 +68,9 @@ world_init :: proc(t: ^testing.T, w: ^World, udp := true, grant_b: zsp.Rights = 
 	for i in 1 ..= 2 {
 		dir, _ := filepath.join({dirs[i], name}, context.temp_allocator)
 		os.make_directory_all(dir)
-		save(file_in(dir, "roster"), roster) or_return
+		if i != 2 || !bare_b { // b, bare, has joined: it has the space's id and its relay's, and no roster yet
+			save(file_in(dir, "roster"), roster) or_return
+		}
 	}
 	which := [2]int{0, 3}
 	for i in which[:relays] {

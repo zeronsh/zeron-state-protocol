@@ -4,41 +4,66 @@ package zsp
 import "core:slice"
 import "core:testing"
 
+// b, of a world of a, b and a relay, as having joined: it has the keys it had, and nothing of the space but its id.
+@(private = "file")
+bare_b :: proc(t: ^testing.T, s: ^Sim) {
+	sim_init(t, s, full = 2, partial = 0, relays = 1, ring = 64)
+	b := s.nodes[1]
+	testing.expect(t, s.nodes[2].node.roster.serial == 0, "the relay knows a roster already")
+	testing.expect(t, len(b.keys.scopes) > 0, "b has no scope's key, as one that held one would")
+	node_destroy(&b.node)
+	memory_disk_destroy(&b.disk)
+	b.disk = {}
+	delete(b.roster)
+	delete(b.roster_old)
+	b.roster, b.roster_old = nil, nil
+	b.bare = true
+	sim_boot(s, b)
+	testing.expect(t, b.node.roster.serial == 0)
+	sim_link(s, 1, 2) // b dials the relay, before anyone who has the roster does
+	sim_settle(s)
+	b_to_relay, relay_to_b := s.links[0].a, s.links[0].b
+	// Neither end can judge the other, and neither says anything it could only say ready: no watch of a scope b has
+	// a key of, which the relay would refuse.
+	testing.expectf(t, relay_to_b.fault == .None && !relay_to_b.closing, "the relay turned b away: %v", relay_to_b.fault)
+	testing.expectf(t, b_to_relay.fault == .None && !b_to_relay.closing, "b gave up on the relay: %v", b_to_relay.fault)
+	testing.expect(t, !relay_to_b.ready, "the relay took b for a member with no roster to say so")
+	testing.expect(t, !b_to_relay.ready, "b took itself for admitted with no roster to say so")
+	testing.expect(t, session_waited(b_to_relay) && session_waited(relay_to_b))
+}
+
 // A relay that knows no roster yet cannot say who belongs, and so says nothing yet: a device that has joined, with no
 // roster either, waits there until a member brings one, and is admitted the moment it comes. Turned away instead, it
 // would ask again only after a while that grows each time, however soon the roster came.
 @(test)
 review_relay_without_roster_waits :: proc(t: ^testing.T) {
 	s: Sim
-	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
+	bare_b(t, &s)
 	defer sim_destroy(&s)
-	a, b, relay := s.nodes[0], s.nodes[1], s.nodes[2]
-	testing.expect(t, relay.node.roster.serial == 0, "the relay knows a roster already")
-	// b has joined: it has its own keys, and nothing of the space but its id.
-	node_destroy(&b.node)
-	memory_disk_destroy(&b.disk)
-	b.disk = {}
-	delete(b.roster)
-	delete(b.roster_old)
-	delete(b.kept)
-	b.roster, b.roster_old, b.kept = nil, nil, nil
-	keyring_destroy(&b.keys)
-	keyring_init(&b.keys, b.secret)
-	b.bare = true
-	sim_boot(&s, b)
-	testing.expect(t, b.node.roster.serial == 0)
-
-	sim_link(&s, 1, 2) // b dials the relay, before anyone who has the roster does
-	sim_settle(&s)
-	to_b := s.links[0].b
-	testing.expectf(t, to_b.fault == .None && !to_b.closing, "the relay turned b away: %v", to_b.fault)
-	testing.expect(t, !to_b.ready, "the relay took b for a member with no roster to say so")
-
+	a, b := s.nodes[0], s.nodes[1]
+	b_to_relay, relay_to_b := s.links[0].a, s.links[0].b
 	sim_link(&s, 0, 2) // a brings the roster
 	sim_settle(&s)
-	testing.expect(t, to_b.ready && to_b.fault == .None, "b was not admitted when the roster came")
+	testing.expect(t, relay_to_b.ready && relay_to_b.fault == .None, "b was not admitted when the roster came")
+	testing.expect(t, b_to_relay.ready && b_to_relay.fault == .None, "b did not take itself for admitted when the roster came")
 	testing.expectf(t, b.node.roster.serial == a.node.roster.serial, "b has roster %x, not %x", b.node.roster.serial, a.node.roster.serial)
 	testing.expect(t, node_member(&b.node), "b is not a member by it")
+}
+
+// And one that comes to have the roster itself, as given it here, says so to the relay it waits at, and both are ready
+// at once, on the one connection.
+@(test)
+review_device_brings_the_roster_it_waited_for :: proc(t: ^testing.T) {
+	s: Sim
+	bare_b(t, &s)
+	defer sim_destroy(&s)
+	b := s.nodes[1]
+	b_to_relay, relay_to_b := s.links[0].a, s.links[0].b
+	testing.expect(t, node_adopt(&b.node, s.roster))
+	sim_settle(&s)
+	testing.expect(t, b_to_relay.ready && b_to_relay.fault == .None, "b did not take itself for admitted once it had the roster")
+	testing.expect(t, relay_to_b.ready && relay_to_b.fault == .None, "the relay did not admit b once b brought the roster")
+	testing.expect(t, s.nodes[2].node.roster.serial == b.node.roster.serial, "the relay did not take the roster b brought")
 }
 
 @(private = "file")

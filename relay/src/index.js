@@ -109,7 +109,7 @@ export class Space extends DurableObject {
     this.#sockets.clear();
     this.#ending.clear();
     this.#unready.clear();
-    clearTimeout(this.#handshake), (this.#handshake = undefined), (this.#handshakeAt = 0);
+    this.#unhandshake();
     this.#unquiet();
     this.#kept.clear();
     this.#wasm = undefined;
@@ -268,7 +268,7 @@ export class Space extends DurableObject {
     if (id === undefined) return;
     this.#sockets.delete(id);
     this.#kept.delete(id);
-    this.#unready.delete(id);
+    this.#ready(id);
     this.#unkeep();
     this.#wasm.closed(id);
     this.#settle();
@@ -277,7 +277,7 @@ export class Space extends DurableObject {
   #drop(id, ws) {
     if (!this.#sockets.delete(id)) return;
     this.#kept.delete(id);
-    this.#unready.delete(id);
+    this.#ready(id);
     this.#wasm.closed(id);
     try {
       ws.close(1008, "");
@@ -350,6 +350,17 @@ export class Space extends DurableObject {
     }
   }
 
+  // A connection is timed no longer: ready, or gone. With none left to time, nothing keeps the object awake for them.
+  #ready(id) {
+    if (this.#unready.delete(id) && this.#unready.size === 0) this.#unhandshake();
+  }
+
+  #unhandshake() {
+    clearTimeout(this.#handshake);
+    this.#handshake = undefined;
+    this.#handshakeAt = 0;
+  }
+
   // A connection with no session ready HANDSHAKE_MS after it opened is let go of, as zspd lets go of one after
   // HANDSHAKE_WAIT: its handshake stalled, its Hello or the roster it promised never came, or it waits on a policy
   // that never answers. Else anyone could hold sockets, and the node's memory for them, as long as the object stays
@@ -358,13 +369,12 @@ export class Space extends DurableObject {
     const now = Date.now();
     let soonest = 0;
     for (const [id, due] of this.#unready) {
-      if (this.#wasm.ready(id)) this.#unready.delete(id);
+      if (this.#wasm.ready(id)) this.#ready(id);
       else if (due <= now) this.#drop(id, this.#sockets.get(id));
       else if (!soonest || due < soonest) soonest = due;
     }
     if (soonest === this.#handshakeAt) return;
-    clearTimeout(this.#handshake);
-    this.#handshake = undefined;
+    this.#unhandshake();
     this.#handshakeAt = soonest;
     if (!soonest) return;
     const epoch = this.#epoch;
@@ -430,6 +440,9 @@ export class Space extends DurableObject {
       this.#epoch++;
       this.#sockets.clear();
       this.#kept.clear();
+      this.#ending.clear();
+      this.#unready.clear(); // those not ready are let go of on waking, as not kept
+      this.#unhandshake();
       this.#storage.cancel();
       if (how === "cold" || how === "empty") this.#storage.forget(how === "empty");
       this.#begin() && this.#settle();

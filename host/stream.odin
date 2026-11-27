@@ -126,6 +126,7 @@ stream_close :: proc(s: ^Stream) {
 		nbio.remove(s.send_op)
 	}
 	fault := s.session.fault if s.session != nil else .None
+	waited := s.session != nil && zsp.session_waited(s.session)
 	if s.session != nil {
 		session_end(s.session)
 	}
@@ -133,7 +134,7 @@ stream_close :: proc(s: ^Stream) {
 		h.handshaking -= 1
 	}
 	if s.dialer != nil {
-		dialer_lost(s.dialer, fault)
+		dialer_lost(s.dialer, fault, waited)
 	}
 	if s.tls != nil {
 		pipe.tls_destroy(s.tls)
@@ -722,13 +723,14 @@ dialer_failed :: proc(d: ^Dialer) {
 }
 
 // A session the relay was ready for and that ended of nothing but the connection going is no failure: dialled again
-// soon. One that ended for a reason, the relay's or this end's, as a device the relay turns away has, is: the relay is
-// asked again ever less often, not every quarter of a second for as long as it says no.
+// soon; nor is one that waited, as long as a relay lets it, for a roster neither end had. One that ended for a reason,
+// the relay's or this end's, as a device the relay turns away has, is: the relay is asked again ever less often, not
+// every quarter of a second for as long as it says no.
 @(private)
-dialer_lost :: proc(d: ^Dialer, fault: zsp.Fault) {
+dialer_lost :: proc(d: ^Dialer, fault: zsp.Fault, waited := false) {
 	report(.Debug, "no longer connected to the relay at ", d.source)
 	d.stream = nil
-	if d.admitted && fault == .None {
+	if (d.admitted || waited) && fault == .None {
 		d.failures = 0
 	}
 	dialer_failed(d)

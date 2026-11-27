@@ -93,7 +93,7 @@ try {
     _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
     addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
     send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
-    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; queueMicrotask(() => { sockets.delete(this._s); doSpace.webSocketClose(this._s); }); } } // after what was sent before it, as a WebSocket's close comes
   }
 
   const mod = await loadModule();
@@ -160,7 +160,7 @@ try {
     _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
     addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
     send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
-    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; queueMicrotask(() => { sockets.delete(this._s); doSpace.webSocketClose(this._s); }); } } // after what was sent before it, as a WebSocket's close comes
   }
   const mod = await loadModule();
   const volA = new MemoryVolume();
@@ -220,7 +220,7 @@ try {
       const b = typeof d === "string" ? d : new Uint8Array(d).slice();
       queueMicrotask(() => { try { doSpace.webSocketMessage(this._s, b); } catch (e) { thrown.push(e.message); } });
     }
-    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; queueMicrotask(() => { sockets.delete(this._s); doSpace.webSocketClose(this._s); }); } } // after what was sent before it, as a WebSocket's close comes
   }
   const mod = await loadModule();
   const vol = new MemoryVolume();
@@ -259,7 +259,7 @@ try {
     _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
     addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
     send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
-    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; queueMicrotask(() => { sockets.delete(this._s); doSpace.webSocketClose(this._s); }); } } // after what was sent before it, as a WebSocket's close comes
   }
   const mod = await loadModule();
   const vol = new MemoryVolume();
@@ -352,7 +352,7 @@ try {
     _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
     addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
     send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
-    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; queueMicrotask(() => { sockets.delete(this._s); doSpace.webSocketClose(this._s); }); } } // after what was sent before it, as a WebSocket's close comes
   }
   const mod = await loadModule();
   const vol = new MemoryVolume();
@@ -399,7 +399,7 @@ try {
     _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
     addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
     send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
-    close() { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(this._s); doSpace.webSocketClose(this._s); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; queueMicrotask(() => { sockets.delete(this._s); doSpace.webSocketClose(this._s); }); } } // after what was sent before it, as a WebSocket's close comes
   }
   const mod = await loadModule();
   const vol = new MemoryVolume();
@@ -424,3 +424,72 @@ try {
   assert.equal(deviceClosed, null, "a ready connection was let go of");
   console.log("ok   a relay lets go of a connection with no session ready in HANDSHAKE_MS, and of no other");
 } finally { rmSync(tmp6, { recursive: true, force: true }); }
+
+// Bug hunt. Nothing keeps the object awake for connections no longer timed: one let go of for what it sent, or all of
+// them as the object is evicted, leaves no HANDSHAKE_MS timer behind.
+{
+  const live = new Map(), st = globalThis.setTimeout, ct = globalThis.clearTimeout;
+  globalThis.setTimeout = (f, ms, ...a) => { const h = st(() => { live.delete(h); f(...a); }, ms); live.set(h, ms); return h; };
+  globalThis.clearTimeout = (h) => { live.delete(h); ct(h); };
+  const long = () => [...live.values()].filter((ms) => ms >= 30_000).length;
+  try {
+    const sockets = new Set();
+    const ctx = { storage: { sql: new Sql(), sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+    const doSpace = new Space(ctx, { RELAY_SECRET: "11".repeat(32), STATS: "1", HANDSHAKE_MS: 60_000 });
+    const at = `http://relay.local/${"ab".repeat(32)}`;
+    doSpace.fetch(new Request(at));
+    const { server: bad } = nextPair;
+    bad._onSend = bad._onClose = () => {};
+    assert.equal(long(), 1, "a connection not ready was not timed");
+    doSpace.webSocketMessage(bad, new Uint8Array(50).buffer); // no handshake
+    assert.equal(bad.closed?.code, 1008);
+    assert.equal(long(), 0, "a timer was left for a connection let go of");
+    doSpace.fetch(new Request(at));
+    const { server: waiting } = nextPair;
+    waiting._onSend = waiting._onClose = () => {};
+    sockets.add(waiting);
+    assert.equal(long(), 1);
+    await doSpace.fetch(new Request(at + "?evict=warm"));
+    assert.equal(long(), 0, "a timer was left for connections an eviction let go of");
+    console.log("ok   a relay keeps no timer for connections it no longer times");
+  } finally {
+    globalThis.setTimeout = st;
+    globalThis.clearTimeout = ct;
+  }
+}
+
+// Bug hunt. A web device that has joined, with no roster yet, waits at a relay that has none either; let go of only for
+// waiting so long, it dials again soon, not ever later: it failed at nothing, and the roster may come at any moment.
+const tmp7 = mkdtempSync(join(tmpdir(), "zsp-r2-"));
+try {
+  const spaceId = execFileSync(ZSPD, ["create", tmp7], { encoding: "utf8" }).trim();
+  const relaySecret = "11".repeat(32), relayPub = publicKey(relaySecret);
+  const sockets = new Set(), dials = [];
+  const ctx = { storage: { sql: new Sql(), sync: async () => {} }, setWebSocketAutoResponse() {}, getWebSockets: () => [...sockets], acceptWebSocket: (w) => sockets.add(w), waitUntil() {} };
+  const doSpace = new Space(ctx, { RELAY_SECRET: relaySecret, HANDSHAKE_MS: 50 });
+  class BridgeWS {
+    static OPEN = 1; static CLOSED = 3;
+    constructor(url) {
+      dials.push(performance.now());
+      this.readyState = 0; this.binaryType = "arraybuffer"; this.bufferedAmount = 0; this._l = new Map();
+      doSpace.fetch(new Request(url.replace(/^ws/, "http")));
+      const { server, pair } = nextPair; this._s = server;
+      pair.onMsg = (b) => { if (this.readyState === 1) this._emit("message", { data: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) }); };
+      pair.onClose = (code, reason) => { if (this.readyState !== 3) { this.readyState = 3; sockets.delete(server); this._emit("close", { code, reason }); } };
+      queueMicrotask(() => { this.readyState = 1; this._emit("open", {}); });
+    }
+    _emit(t, ev) { this["on" + t]?.(ev); for (const f of this._l.get(t) ?? []) f(ev); }
+    addEventListener(t, f) { (this._l.get(t) ?? this._l.set(t, new Set()).get(t)).add(f); }
+    send(d) { if (this.readyState === 1) { const b = typeof d === "string" ? d : new Uint8Array(d).slice(); queueMicrotask(() => doSpace.webSocketMessage(this._s, b)); } }
+    close() { if (this.readyState !== 3) { this.readyState = 3; queueMicrotask(() => { sockets.delete(this._s); doSpace.webSocketClose(this._s); }); } } // after what was sent before it, as a WebSocket's close comes
+  }
+  const mod = await loadModule();
+  const node = await Node.open({ volume: new MemoryVolume(), module: mod, WebSocket: BridgeWS, log: () => {} });
+  node.join(spaceId, { key: relayPub, url: "ws://relay.local" });
+  for (let i = 0; i < 400 && dials.length < 6; i++) await new Promise((r) => setTimeout(r, 10));
+  await node.close();
+  const gaps = dials.slice(1).map((t, i) => Math.round(t - dials[i]));
+  // Turned away five times, it would wait 3.2 s or more before the sixth dial; waiting is no failure, so each is soon.
+  assert(dials.length >= 6 && gaps.every((g) => g < 2000), `dialled ${dials.length} times, at gaps of ${gaps.join(", ")} ms`);
+  console.log(`ok   a web device waiting at a relay for a roster neither has dials again soon (${gaps.join(", ")} ms)`);
+} finally { rmSync(tmp7, { recursive: true, force: true }); }

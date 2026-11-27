@@ -265,3 +265,30 @@ turned_away_backs_off :: proc(t: ^testing.T) {
 		testing.expectf(t, d.failures >= 3, "host %d: %d failures counted in three seconds of being turned away", i, d.failures)
 	}
 }
+
+// A device that has joined, with no roster yet, waits at a relay that has none either, ready for nothing, as the relay
+// waits for it; and let go of only for waiting so long, it dials again soon, not ever later: it failed at nothing, and
+// the roster may come at any moment.
+@(test)
+waiting_for_a_roster_is_no_failure :: proc(t: ^testing.T) {
+	w: World
+	testing.expect(t, world_init(t, &w, udp = false, bare_b = true))
+	defer world_destroy(&w)
+	world_kill(&w, 1) // the only one with the roster is away
+	waiting :: proc(w: ^World, _: rawptr) -> bool {
+		d := w.hosts[2].dialers[0]
+		return d.stream != nil && d.stream.session != nil && zsp.session_waited(d.stream.session) && len(w.hosts[0].streams) == 1 && w.hosts[0].streams[0].session != nil && zsp.session_waited(w.hosts[0].streams[0].session)
+	}
+	testing.expect(t, world_run(&w, waiting, nil, 5 * time.Second), "b and the relay never came to wait for a roster")
+	d := w.hosts[2].dialers[0]
+	if d.stream == nil || len(w.hosts[0].streams) != 1 {
+		return
+	}
+	testing.expect(t, !d.stream.session.ready && d.stream.session.fault == .None, "b took itself for admitted with no roster")
+	testing.expect(t, !w.hosts[0].streams[0].session.ready, "the relay took b for a member with no roster")
+	d.failures = 5 // as after some failing before; a failure now would make it 6
+	w.hosts[0].streams[0].due = time.tick_now() // as though HANDSHAKE_WAIT had passed
+	gone :: proc(w: ^World, _: rawptr) -> bool {return w.hosts[2].dialers[0].stream == nil}
+	testing.expect(t, world_run(&w, gone, nil, 5 * time.Second), "the relay never let b go")
+	testing.expectf(t, d.failures == 1, "waiting was counted a failure: %d failures, where a clean end makes it 1", d.failures)
+}
