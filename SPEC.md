@@ -316,7 +316,8 @@ and every other part of its own, for as long as it runs a node on it, and one th
 lock taken on a file system shared with other machines may not be seen by them, or may be lost while held, so a store is kept on a
 disk of the machine's own, and an implementation refuses a store it can tell is not.
 
-A peer that is a full replica is sent everything its dialler commits. Otherwise a session is sent what it watches. A partial replica keeps owing a row
+A peer that is a full replica is sent everything its dialler commits, and everything a partial replica, or one becoming
+partial, commits, whoever dialled: what such a one owes is what it has not yet said. Otherwise a session is sent what it watches. A partial replica keeps owing a row
 named in an Ack.
 
 If an offered cell was refused because something had killed it, the receiver sends back the row as it has it: the sender held something

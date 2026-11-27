@@ -3464,16 +3464,16 @@ behind_on_what_it_never_sees :: proc(t: ^testing.T) {
 }
 
 // A replica with an outbox, partial or becoming so, dialled by a full peer, that writes again what it sent while the
-// peer's acknowledgment of it is on its way, and so much more that the ring lets go of that, sends it again: for what
-// fell off the ring is not known to have been sent, and is not taken out of the outbox when what came before it is
-// acknowledged. (Review 4 of the window, 1: whatever lies in no window of the peer's is still the outbox's.)
+// peer's acknowledgment of it is on its way, sends it: as it would to a full peer it dialled, at once, whatever window of
+// the peer's it lies in or none; and, should the ring let go of it first, again, for it is not known to have been sent.
+// Neither is taken out of the outbox when what came before is acknowledged. (Review 4 of the window, 1; review 5, 1.)
 @(test)
 dialled_outbox_survives_the_ring :: proc(t: ^testing.T) {
-	for way in 0 ..< 2 {
+	for way in 0 ..< 4 {
 		state := seeded(119)
 		context.random_generator = rand.default_random_generator(&state)
 		s: Sim
-		if way == 0 {
+		if way % 2 == 0 {
 			sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 16)
 		} else {
 			sim_init(t, &s, full = 1, partial = 1, relays = 0, ring = 16)
@@ -3484,9 +3484,10 @@ dialled_outbox_survives_the_ring :: proc(t: ^testing.T) {
 		scan := tree_scan(&dev.node, dev.node.shelf, KEY_MIN, KEY_MAX)
 		leaf, _ := tree_next(&scan)
 		row := key_row(leaf.key)
-		if way == 0 {
+		if way % 2 == 0 {
 			sim_restart(&s, dev, full = false) // becoming partial
 		}
+		overflow := way < 2
 		sim_link(&s, 0, 1) // the desk dials
 		l := s.links[0]
 		has :: proc(x: ^Sim_Node, row: Id) -> bool {
@@ -3505,13 +3506,15 @@ dialled_outbox_survives_the_ring :: proc(t: ^testing.T) {
 		s.now += 3
 		dev.node.now = sim_now(&s, dev)
 		testing.expect(t, node_write(&dev.node, {{row, DATA, .Value, node_stamp(&dev.node), transmute([]byte)string("again")}}))
-		for i in 0 ..< 30 {
-			sim_put(&s, dev, u64(10 + i))
+		if overflow {
+			for i in 0 ..< 30 {
+				sim_put(&s, dev, u64(10 + i))
+			}
 		}
-		testing.expect(t, l.b.cursor < dev.node.store.events.first, "the ring kept it all")
+		testing.expect(t, (l.b.cursor < dev.node.store.events.first) == overflow, "the ring kept it all, or did not")
 		_ = session_output(l.b)
 		sim_settle(&s)
-		testing.expectf(t, row_print(&desk.node.store, row) == row_print(&dev.node.store, row), "what was written again never came, %s", "becoming partial" if way == 0 else "partial")
+		testing.expectf(t, row_print(&desk.node.store, row) == row_print(&dev.node.store, row), "what was written again never came, %s, %s", "becoming partial" if way % 2 == 0 else "partial", "the ring overflowing" if overflow else "the ring keeping it")
 	}
 }
 

@@ -2942,15 +2942,14 @@ flush_one :: proc(s: ^Session, _: ^Task) {
 // Such as the session of a client with a window on a text, of a replica taking in, from its peer, a change at a time,
 // so many that they fall off the ring before the client's turn comes: were it to compare whenever any did, what it
 // shows would be said over, whole, every time. One not ready yet cannot tell what it will be told, and misses
-// whatever is not its own. Nor can one that sends an outbox to a full peer: whatever was written, in any window or none,
-// may be what the outbox owes once what came before it is acknowledged (see on_ack), and is not known to have been sent.
+// whatever is not its own.
 @(private)
 node_dropped :: proc(data: rawptr, c: ^Change, at: u64) {
 	n := (^Node)(data)
 	for s in n.sessions {
 		if s.cursor <= at && !s.missed && c.origin != s.id {
 			was, now, _ := change_seen(s, c)
-			s.missed = !s.ready || (node_tracks(n) && s.peer_full) || was || now
+			s.missed = !s.ready || was || now
 		}
 	}
 }
@@ -2960,7 +2959,10 @@ node_dropped :: proc(data: rawptr, c: ^Change, at: u64) {
 change_seen :: proc(s: ^Session, c: ^Change) -> (was, now, level: bool) {
 	// Was the row in view before, and is the peer sure to hold it whole?
 	// A row that was nowhere until now was in nobody's, and may have cells that came before it did.
-	now = s.initiator && s.peer_full
+	// A full peer is told everything: by one that dialled it; and by one with an outbox, whoever dialled, whatever the
+	// peer watches, for what the outbox owes is what the cursor has not passed (see on_ack), and a change passed unsaid
+	// would be taken out of it, unsent, once what came before was acknowledged.
+	now = (s.initiator || node_tracks(s.node)) && s.peer_full
 	was = now && (len(c.before) > 0 || len(c.after) == 0)
 	level = was && s.settled
 	for &w in s.watches {
