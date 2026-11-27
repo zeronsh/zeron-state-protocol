@@ -323,10 +323,14 @@ amend :: proc(dir: string, args: []string, change: proc(a: ^Admin, args: []strin
 	zsp.keyring_init(&a.keys, secret)
 	path := in_dir(in_dir(dir, name), "roster")
 	data, err := os.read_entire_file(path, context.temp_allocator)
-	if err != nil {
+	read: bool
+	if err == nil {
+		a.roster, read = zsp.roster_parse(data, space)
+	}
+	if !read {
+		say(os.stderr, "the roster kept here cannot be read\n")
 		return false
 	}
-	a.roster = zsp.roster_parse(data, space) or_return
 	if kept, kerr := os.read_entire_file(in_dir(in_dir(dir, name), "keys"), context.temp_allocator); kerr == nil {
 		zsp.keyring_load(&a.keys, kept)
 	}
