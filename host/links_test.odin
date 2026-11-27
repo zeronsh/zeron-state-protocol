@@ -66,12 +66,24 @@ knocks_are_heard_once :: proc(t: ^testing.T) {
 	peer_answer(&h, old[:n], from)
 	testing.expect(t, pipe.link_answers(p.answer, new[:n]))
 
+	// What a member says of where it is, it is sent to only where that could be it: never port 0, nor everyone.
+	h.udp.open = true
+	blob: [3 * 18]byte
+	for &a, i in ([]pipe.Address{pipe.address_v4(10, 0, 0, 1, 0), pipe.address_v4(255, 255, 255, 255, 9), pipe.address_v4(10, 0, 0, 2, 9)}) {
+		copy(blob[i * 18:], a.ip[:])
+		blob[i * 18 + 16], blob[i * 18 + 17] = byte(a.port >> 8), byte(a.port)
+	}
+	links_signalled(&s, other.device, blob[:])
+	testing.expectf(t, len(p.candidates) == 1 && p.candidates[0] == pipe.address_v4(10, 0, 0, 2, 9), "candidates %v", p.candidates[:])
+	h.udp.open = false
+
 	// A device the roster no longer admits is answered no more, however well it was known: nor is anything kept of it,
 	// once the change is seen.
 	gone := zsp.draft_from(&s.node.roster, 2)
 	zsp.draft_revoke(&gone, other.device, 0)
 	revoked, signed := zsp.roster_sign(&ours, root, &gone, context.temp_allocator)
 	testing.expect(t, signed && zsp.node_adopt(&s.node, revoked))
+
 	newer, _ := knock(t, &h, &s, theirs, 300)
 	peer_answer(&h, newer[:n], from)
 	testing.expect(t, !pipe.link_answers(p.answer, newer[:n]), "a revoked device's knock was answered")

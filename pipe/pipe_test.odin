@@ -239,3 +239,21 @@ tls_writes_nothing_before_open :: proc(t: ^testing.T) {
 	tls_write(&tls, transmute([]byte)string("ping"), &w)
 	testing.expectf(t, len(w) == hello && tls.send.n == 0, "%d bytes written in state %v", len(w) - hello, tls.state)
 }
+
+// An address packets can go to as to one peer: never port 0, nor nobody, nor a group, nor everyone.
+@(test)
+addresses_usable :: proc(t: ^testing.T) {
+	v6: Address
+	v6.ip = {0 = 0x20, 1 = 0x01, 15 = 1}
+	v6.port = 9
+	group := v6
+	group.ip[0] = 0xff
+	nobody: Address
+	nobody.port = 9
+	for a, i in ([]Address{address_v4(192, 168, 1, 2, 9), address_v4(127, 0, 0, 1, 1), v6}) {
+		testing.expectf(t, address_usable(a), "%d: %v refused", i, a)
+	}
+	for a, i in ([]Address{address_v4(192, 168, 1, 2, 0), address_v4(0, 0, 0, 0, 9), address_v4(255, 255, 255, 255, 9), address_v4(224, 0, 0, 1, 9), group, nobody}) {
+		testing.expectf(t, !address_usable(a), "%d: %v taken", i, a)
+	}
+}

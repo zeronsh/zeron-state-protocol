@@ -388,7 +388,7 @@ peer_send_candidates :: proc(p: ^Peer) {
 	w := make([dynamic]byte, context.temp_allocator)
 	put :: proc(w: ^[dynamic]byte, a: pipe.Address) {
 		a := a
-		if len(w) >= MAX_CANDIDATES * 18 {
+		if len(w) >= MAX_CANDIDATES * 18 || !pipe.address_usable(a) {
 			return
 		}
 		append(w, ..a.ip[:])
@@ -424,7 +424,9 @@ links_signalled :: proc(_: rawptr, from: zsp.Key32, blob: []byte) {
 		a: pipe.Address
 		copy(a.ip[:], blob[at:])
 		a.port = u16(blob[at + 16]) << 8 | u16(blob[at + 17])
-		append(&p.candidates, a)
+		if pipe.address_usable(a) { // nothing is sent where it could reach nobody, or everybody
+			append(&p.candidates, a)
+		}
 	}
 	peer_offer(p)
 	peer_knock(p)
@@ -478,6 +480,9 @@ beacon_heard :: proc(packet: []byte, from: pipe.Address) {
 	}
 	at := from
 	at.port = u16(port)
+	if !pipe.address_usable(at) {
+		return // a beacon that says it is nowhere
+	}
 	if p.knocks > 0 {
 		// Heard by another road, which may be the one that works; or again, our answer having been lost.
 		new := !slice.contains(p.candidates[:], at)

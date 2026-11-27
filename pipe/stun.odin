@@ -19,6 +19,19 @@ address_v4 :: proc(a, b, c, d: byte, port: u16) -> Address {
 	return {{10 = 0xff, 11 = 0xff, 12 = a, 13 = b, 14 = c, 15 = d}, port}
 }
 
+// Whether packets can be sent to an address as to one peer: a port, and one host, not none, nor every one, nor a group.
+@(require_results)
+address_usable :: proc(a: Address) -> bool {
+	if a.port == 0 {
+		return false
+	}
+	if address_is_v4(a) {
+		// 0/8 is this network, 224/4 groups, 240/4 reserved and its last address everyone.
+		return a.ip[12] != 0 && a.ip[12] < 224
+	}
+	return a.ip != {} && a.ip[0] != 0xff // nobody; and ff00::/8, groups
+}
+
 @(require_results)
 address_is_v4 :: proc(a: Address) -> bool {
 	for b, i in a.ip {

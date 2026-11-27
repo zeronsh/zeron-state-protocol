@@ -771,6 +771,48 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   await Promise.all([a.close(), again.close(), c.close()]);
 }
 
+// A member that says it is at port 0, or anywhere that is nobody, is sent nothing there: it is knocked for only where it
+// could be.
+{
+  const owner = join(TMP, "nowhere-owner");
+  const space = execFileSync(BIN, ["create", owner], { encoding: "utf8" }).trim();
+  const ip = Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1);
+  const hear = new Map<number, (ip: Uint8Array, port: number, data: Uint8Array) => void>();
+  const sent: number[] = []; // ports a sent to
+  // b says it is at port 0, and the network of nothing carries what it says from 40002.
+  const datagrams = (port: number, says: number) => ({
+    port: says,
+    interfaces: () => [{ ip, broadcast: Uint8Array.of(127, 0, 0, 255) }],
+    send(_to: Uint8Array, to: number, data: Uint8Array) {
+      const at = to === 9083 ? (port === 40001 ? 40002 : 40001) : to;
+      if (port === 40001) sent.push(at);
+      const receive = hear.get(at);
+      if (receive) queueMicrotask(() => receive(ip, port, data.slice()));
+    },
+    listen(receive: (ip: Uint8Array, port: number, data: Uint8Array) => void) {
+      hear.set(port, receive);
+    },
+    close() {
+      hear.delete(port);
+    },
+  });
+  // a dials, being the lesser key: so that, hearing b, it knocks where b says it is.
+  let a: Node, b: Node;
+  for (;;) {
+    a = await Node.open({ volume: new MemoryVolume(), module, datagrams: datagrams(40001, 40001), log: () => {} });
+    b = await Node.open({ volume: new MemoryVolume(), module, datagrams: datagrams(40002, 0), log: () => {} });
+    if (a.id < b.id) break;
+    await Promise.all([a.close(), b.close()]);
+  }
+  execFileSync(BIN, ["admit", owner, a.key, "1"]);
+  execFileSync(BIN, ["admit", owner, b.key, "1"]);
+  const roster = readFileSync(join(owner, space, "roster"));
+  assert(a.adopt(roster) && b.adopt(roster));
+  await new Promise((done) => setTimeout(done, 1000));
+  assert(!sent.includes(0), `sent to port 0: ${sent.filter((p) => p === 0).length} packets`);
+  await Promise.all([a.close(), b.close()]);
+}
+
 // Where a relay keeps a space, a proxy's query staying at the end.
 assert.equal(spaceUrl("wss://relay.example/", "ab"), "wss://relay.example/ab");
 assert.equal(spaceUrl("wss://relay.example/zsp?key=1", "ab"), "wss://relay.example/zsp/ab?key=1");
