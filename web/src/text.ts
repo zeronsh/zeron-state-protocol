@@ -631,6 +631,12 @@ function readRef(r: codec.Reader, id: string): string {
   return piece;
 }
 
+// What a reference to what is not here says: to wait for another piece, or, of this one, nonsense.
+function own(piece: string, id: string): false {
+  if (piece === id) throw new codec.Malformed("a reference to what this piece has not made");
+  return false;
+}
+
 // One operation: the reader is left after it, or false is returned if it refers to what is not here. What is not an
 // operation at all throws Malformed.
 function applyOp(t: Text, id: string, r: codec.Reader): boolean {
@@ -641,7 +647,9 @@ function applyOp(t: Text, id: string, r: codec.Reader): boolean {
     const rp = readRef(r, id);
     const ro = refOffset;
     const bytes = codec.bytes(r);
-    if (!present(t, lp, lo, 1) || !present(t, rp, ro, 1)) return false;
+    // What this piece has yet to make, it never will before it is wanted: that is nonsense, not something to wait for.
+    if (!present(t, lp, lo, 1)) return own(lp, id);
+    if (!present(t, rp, ro, 1)) return own(rp, id);
     if (bytes.length > 0) insertRun(t, id, bytes, lp, lo, rp, ro);
   } else if (op === EXTEND) {
     const bytes = codec.bytes(r);
@@ -653,7 +661,7 @@ function applyOp(t: Text, id: string, r: codec.Reader): boolean {
     const fo = refOffset;
     const count = codec.varint(r);
     if (fp === "" || count > MOST) throw new codec.Malformed("bad deletion");
-    if (!present(t, fp, fo, count)) return false;
+    if (!present(t, fp, fo, count)) return own(fp, id);
     kill(t, fp, fo, count);
   } else {
     throw new codec.Malformed("no such operation");
@@ -750,6 +758,10 @@ export function apply(t: Text, kind: number, stamp: string, body: Uint8Array): R
     if (body.length < 4) return "same";
     const r = codec.reader(body);
     const n = codec.u32(r);
+    if (n === 0 || 4 + n * 16 > body.length) return "same";
+    // Nor anything later than the last it names, as nothing put together of what it names is: it would be taken for
+    // written before the bundle was.
+    const last = codec.binary(body, 4 + (n - 1) * 16, 4 + n * 16);
     r.pos = 4 + n * 16;
     let out: Result = "same";
     while (r.pos < r.len) {
@@ -762,7 +774,7 @@ export function apply(t: Text, kind: number, stamp: string, body: Uint8Array): R
         if (e instanceof codec.Malformed) break;
         throw e;
       }
-      if (inner > t.base) {
+      if (inner > t.base && inner <= last) {
         const result = applyPiece(t, id, inner, ops);
         if (result === "rebuild") return "rebuild";
         else if (result === "changed" || (result === "waiting" && out === "same")) out = result;

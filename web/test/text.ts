@@ -277,25 +277,34 @@ for (let seed = FIRST; seed < FIRST + LONG; seed++) {
   seeds.push({ seed: 1_000_000 + seed, ops, out: world.out });
 }
 // What does not read as operations is nothing, and waits for nothing, since nothing that comes could make it read: an
-// operation there is none of, a reference of no kind, a deletion from the start, an extension of nothing. What refers to
-// what is not here waits for it, and once that has come is done as far as it reads. Held to text.luau as every seed is.
+// operation there is none of, a reference of no kind, a deletion from the start, an extension of nothing, a reference
+// to what its own piece has yet to make. What refers to what is not here waits for it, and once that has come is done as
+// far as it reads. And a bundle is only what it names: nothing in it later than the last of those, nor anything at all
+// if it names none. Held to text.luau as every seed is.
 {
   const world = new World();
   const ops: Op[] = [];
   const waits: number[] = [];
-  const ref = (piece: string) => "\x02" + piece + "\0";
+  const ref = (piece: string, offset = 0) => "\x02" + piece + String.fromCharCode(offset);
   const insert = (left: string, bytes: string) => "\x01" + left + "\0" + String.fromCharCode(bytes.length) + bytes;
-  const bodies = [
-    "a".repeat(8) + "\x07",
-    "b".repeat(8) + insert("\0", "ab") + "\x01\x05",
-    "c".repeat(8) + insert(ref("d".repeat(8)), "x"),
-    "e".repeat(8) + insert(ref("d".repeat(8)), "y") + "\x03\0\x01",
-    "f".repeat(8) + "\x02\x01z",
-    "d".repeat(8) + insert("\0", "d"),
+  const stamp = (k: number) => codec.u64((k + 1) * 65536) + "salt" + String.fromCharCode(k) + "...";
+  const entry = (k: number, body: string) => stamp(k) + body.slice(0, 8) + String.fromCharCode(body.length - 8) + body.slice(8);
+  const cells: [kind: number, body: string][] = [
+    [4, "a".repeat(8) + "\x07"],
+    [4, "b".repeat(8) + insert("\0", "ab") + "\x01\x05"],
+    [4, "c".repeat(8) + insert(ref("d".repeat(8)), "x")],
+    [4, "e".repeat(8) + insert(ref("d".repeat(8)), "y") + "\x03\0\x01"],
+    [4, "f".repeat(8) + "\x02\x01z"],
+    [4, "d".repeat(8) + insert("\0", "d")],
+    [4, "g".repeat(8) + insert("\x01\x05", "b")], // after what this piece has not made
+    [4, "h".repeat(8) + insert(ref("h".repeat(8), 3), "b")], // and so, named
+    [4, "i".repeat(8) + insert("\0", "q") + "\x03\x01\x03\x01"], // the deletion of it
+    [5, "\0\0\0\x01" + stamp(9) + entry(9, "j".repeat(8) + insert("\0", "J")) + entry(10, "k".repeat(8) + insert("\0", "K"))],
+    [5, "\0\0\0\0" + entry(11, "l".repeat(8) + insert("\0", "L"))],
   ];
-  bodies.forEach((body, k) => {
+  cells.forEach(([kind, body], k) => {
     for (const op of [
-      { o: "cell", w: 0, kind: 4, stamp: codec.hex(codec.u64((k + 1) * 65536) + "salt" + String.fromCharCode(k) + "..."), body: codec.hex(codec.bytesOf(body)) },
+      { o: "cell", w: 0, kind, stamp: codec.hex(stamp(k + 20)), body: codec.hex(codec.bytesOf(body)) },
       { o: "apply", w: 0, c: k },
     ] as Op[]) {
       ops.push(op);
@@ -304,8 +313,9 @@ for (let seed = FIRST; seed < FIRST + LONG; seed++) {
     waits.push(world.writers[0].waiting.length);
   });
   world.end();
-  assert.deepEqual(waits, [0, 0, 1, 2, 2, 0], "what waits");
-  assert.equal(text.read(world.writers[0]).length, 5);
+  assert.deepEqual(waits, [0, 0, 1, 2, 2, 0, 0, 0, 0, 0, 0], "what waits");
+  const read = text.read(world.writers[0]);
+  assert(read.length === 7 && read.includes("q") && read.includes("J") && !read.includes("K") && !read.includes("L"), `the text is ${read}`);
   seeds.push({ seed: 0, ops, out: world.out });
 }
 const ran = performance.now();

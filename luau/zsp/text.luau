@@ -623,6 +623,14 @@ local function read_ref(r: codec.Reader, id: string): (string, number)
 	return piece, offset
 end
 
+-- What a reference to what is not here says: to wait for another piece, or, of this one, nonsense.
+local function own(piece: string, id: string): boolean
+	if piece == id then
+		malformed()
+	end
+	return false
+end
+
 -- One operation: the reader is left after it, or false is returned if it refers to what is not here. What is not an
 -- operation at all raises codec.Malformed.
 local function apply_op(t: Text, id: string, r: codec.Reader): boolean
@@ -631,8 +639,11 @@ local function apply_op(t: Text, id: string, r: codec.Reader): boolean
 		local lp, lo = read_ref(r, id)
 		local rp, ro = read_ref(r, id)
 		local bytes = codec.bytes(r)
-		if not has(t, lp, lo, 1) or not has(t, rp, ro, 1) then
-			return false
+		-- What this piece has yet to make, it never will before it is wanted: that is nonsense, not something to wait for.
+		if not has(t, lp, lo, 1) then
+			return own(lp, id)
+		elseif not has(t, rp, ro, 1) then
+			return own(rp, id)
 		end
 		if #bytes > 0 then
 			insert_run(t, id, bytes, lp, lo, rp, ro)
@@ -653,7 +664,7 @@ local function apply_op(t: Text, id: string, r: codec.Reader): boolean
 			malformed()
 		end
 		if not has(t, fp, fo, count) then
-			return false
+			return own(fp, id)
 		end
 		kill(t, fp, fo, count)
 	else
@@ -775,6 +786,12 @@ function text.apply(t: Text, kind: number, stamp: string, body: string): Result
 		end
 		local r = codec.reader(body)
 		local n: number = string.unpack(">I4", body) :: any
+		if n == 0 or 4 + n * 16 > #body then
+			return "same"
+		end
+		-- Nor anything later than the last it names, as nothing put together of what it names is: it would be taken for
+		-- written before the bundle was.
+		local last = string.sub(body, 5 + (n - 1) * 16, 4 + n * 16)
 		r.pos = 4 + n * 16
 		local out: Result = "same"
 		while r.pos < r.len do
@@ -788,7 +805,7 @@ function text.apply(t: Text, kind: number, stamp: string, body: string): Result
 			if not fine then
 				break
 			end
-			if inner > t.base then
+			if inner > t.base and inner <= last then
 				local result = apply_piece(t, id, inner, ops)
 				if result == "rebuild" then
 					return "rebuild"

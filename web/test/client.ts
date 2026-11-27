@@ -502,7 +502,7 @@ for (const nonsense of [rep("\x80", 310) + "\0", "\0", "\x03\x02\0\0", "\x0c\x08
   const place = (row: string) => cell(row, 2, 1, 1, h.client.tag(1, "a") + codec.u64(1));
   // Two entries, each typing a letter, the second cut short.
   const entry = (k: number, letter: string) => rep("\0", 15) + ch(k) + codec.u64(k) + ch(5) + "\x01\0\0\x01" + letter;
-  const bundle = "\0\0\0\x01" + rep("\0", 15) + ch(1) + entry(4, "a") + entry(5, "b").slice(0, 20);
+  const bundle = "\0\0\0\x02" + rep("\0", 15) + ch(4) + rep("\0", 15) + ch(5) + entry(4, "a") + entry(5, "b").slice(0, 20);
   h.tell(CELLS, "\0" + place(one) + cell(one, 3, 16, 2, "{not json") + cell(one, 3, 18, 3, "ok") + cell(one, 5, 17, 9, bundle));
   h.tell(CELLS, "\0" + place(two) + cell(two, 3, 16, 2, "") + cell(two, 3, 18, 3, "also"));
   assert.equal(shown().rows.length, 2);
@@ -1209,10 +1209,12 @@ for (const code of [2, 3]) {
   const place = (row: string) => cell(row, 2, 1, 1, h.client.tag(1, "a") + codec.u64(1));
   const piece = (n: number, ...parts: string[]) => {
     let out = "";
+    let names = "";
     parts.forEach((p, i) => {
+      names += rep("\0", 15) + ch(n + i + 1);
       out += rep("\0", 15) + ch(n + i + 1) + codec.u64(n + i + 1) + ch(4 + p.length) + "\x01\0\0" + ch(p.length) + p;
     });
-    return "\0\0\0\x01" + rep("\0", 15) + ch(n) + out;
+    return "\0\0\0" + ch(parts.length) + names + out;
   };
   const answer = (...ids: string[]) => h.tell(ANSWER, "\x01\x01" + ch(ids.length) + "\0" + ch(ids.length) + ids.join("") + "\0");
   h.tell(CELLS, "\0" + place(one) + cell(one, 3, 16, 2, "kept") + cell(one, 3, 17, 3, "gone"));

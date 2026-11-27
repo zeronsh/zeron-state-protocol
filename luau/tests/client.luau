@@ -1117,11 +1117,12 @@ do
 		return cell(row, 2, 1, 1, h.client:_tag(1, "a") .. codec.u64(1))
 	end
 	local function piece(n: number, ...: string): string
-		local out = {}
+		local names, out = {}, {}
 		for i, s in { ... } do
+			table.insert(names, string.rep("\0", 15) .. string.char(n + i))
 			table.insert(out, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" .. string.char(n + i) .. codec.u64(n + i) .. string.char(4 + #s) .. "\1\0\0" .. string.char(#s) .. s)
 		end
-		return "\0\0\0\1" .. string.rep("\0", 15) .. string.char(n) .. table.concat(out)
+		return "\0\0\0" .. string.char(#names) .. table.concat(names) .. table.concat(out)
 	end
 	local function answer(...: string)
 		h.tell(ANSWER, "\1\1" .. string.char(select("#", ...)) .. "\0" .. string.char(select("#", ...)) .. table.concat({ ... }) .. "\0")
