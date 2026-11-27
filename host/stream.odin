@@ -702,6 +702,9 @@ dialer_alive :: proc(x: ^Dialer, now: time.Tick) -> bool {
 	if x.dropped || x.state != .Up || !x.admitted || x.stream.dead || x.stream.closing {
 		return false
 	}
+	if x.stream.session == nil || !x.stream.session.ready || x.stream.session.closing {
+		return false // ending, though its stream has yet to see to it
+	}
 	return !x.stream.pinged || time.tick_diff(x.stream.quiet_at, now) < PONG_WAIT
 }
 

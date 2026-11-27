@@ -684,6 +684,12 @@ twins_go_one_at_a_time :: proc(t: ^testing.T) {
 			}
 		}
 	}
+	// One whose session is ending, though its stream has yet to see to it, is no way to keep either.
+	ending := first.stream.session
+	first.admitted = true
+	zsp.session_refuse(ending)
+	dialers_run(h, time.tick_now())
+	testing.expect(t, !second.stream.dead, "a way to the relay was let go of for one whose session is ending")
 	first.dropped = true
 	dialers_run(h, time.tick_now())
 	testing.expect(t, !second.stream.dead, "a way to the relay was let go of for one dropped")

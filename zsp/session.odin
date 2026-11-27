@@ -170,6 +170,7 @@ Task :: struct {
 	settled: bool,
 	restart: bool,
 	denied:  bool,
+	owed:    bool, // of a Fill: to the watch `watch` of the peer's, what is said of which is queued after it
 	row:     Id,
 	watch:   u64,
 	lo, hi:  Key,
@@ -948,7 +949,7 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 	case same:
 		queue(s, first, {kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
 	case !flags.known || (theirs.count == 0 && s.role == .Open):
-		queue(s, first, {kind = .Fill, watch = id, lo = lo, hi = hi}, {kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
+		queue(s, first, {kind = .Fill, watch = id, owed = true, lo = lo, hi = hi}, {kind = .Synced, watch = id, lo = lo, hi = hi, settled = settled})
 	case:
 		recon_finish(&recon, lo, hi, theirs)
 	}
@@ -1002,7 +1003,7 @@ recon_unfilled :: proc(s: ^Session, w: ^Watch) {
 	for which in 0 ..< 2 {
 		for at in s.fills[which][s.fills_head[which]:] {
 			t := queued_task(s, {which == 1, at})
-			if t != nil && t.kind == .Fill && t.watch == w.id && key_less(t.lo, hi) && !key_less(t.hi, w.hi) {
+			if t != nil && t.kind == .Fill && t.owed && t.watch == w.id && key_less(t.lo, hi) && !key_less(t.hi, w.hi) {
 				hi = t.lo if key_less(w.lo, t.lo) else w.lo
 			}
 		}
@@ -1067,6 +1068,14 @@ on_unwatch :: proc(s: ^Session, id: u64) {
 		if w.id == id {
 			unordered_remove(&s.watches, i)
 			break
+		}
+	}
+	// What was queued for it is owed to it no longer: nor to what may come by its name.
+	for which in 0 ..< 2 {
+		for at in s.fills[which][s.fills_head[which]:] {
+			if t := queued_task(s, {which == 1, at}); t != nil && t.kind == .Fill && t.watch == id {
+				t.owed = false
+			}
 		}
 	}
 	// What was hurried of it goes on first; what may replace it is not hurried for it.
@@ -1519,7 +1528,7 @@ recon_prepare :: proc(s: ^Session, id: u64, lo, hi: Key, theirs: Sum, mine: Sum)
 recon_finish :: proc(w: ^Recon_Writer, lo, hi: Key, theirs: Sum) {
 	if theirs.count == 0 {
 		// Nothing to compare, only to send.
-		queue(w.s, w.owner && hurried(w.s, w.id), {kind = .Fill, watch = w.id if w.owner else 0, lo = lo, hi = hi})
+		queue(w.s, w.owner && hurried(w.s, w.id), {kind = .Fill, watch = w.id, owed = w.owner, lo = lo, hi = hi})
 	}
 	recon_end(w)
 }
@@ -1580,7 +1589,7 @@ on_recon :: proc(s: ^Session, r: ^Reader) {
 			case mine == theirs:
 				recon_part(&out, hi, .Skip)
 			case theirs.count == 0:
-				push_range(s, lo, hi, id if !owner_sent else 0)
+				push_range(s, lo, hi, id, !owner_sent)
 				recon_part(&out, hi, .Skip)
 			case theirs.count <= LIST_MAX && mine.count > LIST_MAX:
 				// They can name theirs more cheaply than this side can narrow it down.
@@ -1651,9 +1660,9 @@ push_row :: proc(s: ^Session, key: Key) {
 }
 
 @(private)
-push_range :: proc(s: ^Session, lo, hi: Key, watch: u64) {
+push_range :: proc(s: ^Session, lo, hi: Key, watch: u64, owed: bool) {
 	if s.peer_full {
-		queue(s, s.hurrying, {kind = .Fill, watch = watch, lo = lo, hi = hi})
+		queue(s, s.hurrying, {kind = .Fill, watch = watch, owed = owed, lo = lo, hi = hi})
 		return
 	}
 	scan := tree_scan(s.node, s.node.shelf, lo, hi)
@@ -3086,7 +3095,7 @@ resync :: proc(s: ^Session) {
 				w.lo, w.hi = bounds[i][0], bounds[i][1]
 			}
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, restart = true})
-			append(&s.tasks, Task{kind = .Fill, watch = w.id, lo = w.lo, hi = w.hi})
+			append(&s.tasks, Task{kind = .Fill, watch = w.id, owed = true, lo = w.lo, hi = w.hi})
 			settled := true
 			for &it in n.interests {
 				settled &&= it.session != s.id || it.watch.id != w.id || interest_sure(n, &it)

@@ -3074,7 +3074,7 @@ unfilled_only_compared :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, len(at.watches) > 0)
 	w := &at.watches[0]
-	queue(at, false, {kind = .Fill, watch = w.id, lo = w.lo, hi = w.hi})
+	queue(at, false, {kind = .Fill, watch = w.id, owed = true, lo = w.lo, hi = w.hi})
 	before := len(at.out)
 	recon_unfilled(at, w)
 	testing.expect_value(t, len(at.out), before)
@@ -3355,10 +3355,61 @@ another_watchs_fill_says_nothing :: proc(t: ^testing.T) {
 		}
 	}
 	w := &at.watches[0]
-	queue(at, false, {kind = .Fill, watch = w.id + 12345, lo = w.lo, hi = w.hi})
+	queue(at, false, {kind = .Fill, watch = w.id + 12345, owed = true, lo = w.lo, hi = w.hi})
 	before := len(at.out)
 	recon_unfilled(at, w)
 	testing.expect(t, len(at.out) > before, "a Fill for another watch was taken to say this one would be level")
+	clear(&at.tasks)
+	at.task_head = 0
+	free_all(context.temp_allocator)
+}
+
+// A Fill this end queued as a watcher, of its own watch, says nothing of the peer's watch of the same number, though it
+// is 0; nor does one queued for a watch since let go of, of a watch by the same name after.
+@(test)
+fills_are_owed_by_name_and_standing :: proc(t: ^testing.T) {
+	state := seeded(117)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	for i in 0 ..< 100 {
+		sim_put(&s, s.nodes[0], u64(i))
+	}
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	at := s.links[0].b // the first's end; the second dialled
+	list := List{1 << 32 | 5, 5}
+	find :: proc(s: ^Session, id: u64) -> ^Watch {
+		for &w in s.watches {
+			if w.id == id {
+				return &w
+			}
+		}
+		return nil
+	}
+	// The peer's watch 0, and a Fill of this end's own, as a watcher, also numbered 0.
+	sim_watch(at, 0, list_lo(list), list_hi(list), 0, {data = true})
+	for len(session_output(at)) > 0 {
+		session_sent(at, len(session_output(at)))
+	}
+	queue(at, false, {kind = .Fill, watch = 0, owed = false, lo = list_lo(list), hi = list_hi(list)})
+	before := len(at.out)
+	recon_unfilled(at, find(at, 0))
+	testing.expect(t, len(at.out) > before, "a Fill of this end's own watch 0 was taken for the peer's")
+	clear(&at.tasks)
+	at.task_head = 0
+	// The peer's watch 5, let go of with its Fill still to come, and asked for again.
+	sim_watch(at, 5, list_lo(list), list_hi(list), 0, {data = true})
+	f: [dynamic]byte
+	defer delete(f)
+	frame := frame_begin(&f, .Unwatch)
+	write_varint(&f, 5)
+	frame_end(&f, frame)
+	testing.expect(t, session_input(at, f[:]))
+	for x in at.tasks[at.task_head:] {
+		testing.expect(t, x.kind != .Fill || x.watch != 5 || !x.owed, "a Fill for a watch let go of is still owed to its name")
+	}
 	clear(&at.tasks)
 	at.task_head = 0
 	free_all(context.temp_allocator)
