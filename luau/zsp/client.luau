@@ -1384,10 +1384,13 @@ function Client._rebuild(self: Client, row: Stored, slot: number)
 	unview(row)
 end
 
--- Puts a row where its placements say, in every window, and takes it from where they do not.
-function Client._place(self: Client, row: Stored)
-	for f in self.followers do
-		f(row.id)
+-- Puts a row where its placements say, in every window, and takes it from where they do not. Followers hear of it
+-- first, unless they have been told already.
+function Client._place(self: Client, row: Stored, told: boolean?)
+	if not told then
+		for f in self.followers do
+			f(row.id)
+		end
 	end
 	local keys = {}
 	if not row.dead then
@@ -1451,21 +1454,34 @@ function Client._place(self: Client, row: Stored)
 end
 
 -- Places rows, each once. Many at once go into windows at once: sorted together, rather than each moving all after it.
+-- Followers hear of them all first, so that whatever they do of it is done before any row is half put, as one held
+-- where it goes and not yet among the rows there.
 function Client._place_all(self: Client, rows: { [Stored]: boolean })
 	local many = 0
 	for _ in rows do
 		many += 1
 		if many > 64 then
-			self.bulk = {}
 			break
 		end
 	end
-	for row in rows do
-		self:_place(row)
+	if many <= 64 then
+		for row in rows do
+			self:_place(row)
+		end
+		return
 	end
-	local bulk = self.bulk
+	for row in rows do
+		for f in self.followers do
+			f(row.id)
+		end
+	end
+	local bulk: { [Window]: { { key: string, row: Stored } } } = {}
+	self.bulk = bulk
+	for row in rows do
+		self:_place(row, true)
+	end
 	self.bulk = nil
-	for window, add in bulk or {} :: any do
+	for window, add in bulk do
 		for _, e in add do
 			table.insert(window.entries, e)
 		end

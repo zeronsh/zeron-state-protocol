@@ -283,6 +283,58 @@ do
 	assert(#st.rows == 10, "rows were let go of")
 end
 
+-- Many rows placed at once, while a follower moves or deletes one of them as it hears of it: every row is where it is held
+-- to be, once, and the one deleted nowhere.
+do
+	for _, what in { "move", "delete" } do
+		local h = harness()
+		h.run()
+		h.greet()
+		local list = h.client:window({ scope = 1, list = "items", table = Note, size = 100 }, function() end)
+		h.run()
+		local first, heard = "", 0
+		h.client:follow(function(id)
+			heard += 1
+			if heard == 1 then
+				first = id
+			elseif heard == 2 then
+				h.client:write(1, function(change)
+					if what == "move" then
+						change.place(first, "items", 999)
+					else
+						change.delete(first)
+					end
+				end)
+			end
+		end)
+		h.client:write(1, function(change)
+			for i = 1, 70 do
+				change.insert(Note, "items", i, { title = `r{i}` })
+			end
+		end)
+		h.run()
+		local entries = list.entries()
+		local window = (next(h.client.windows) and select(2, next(h.client.windows))) :: any
+		local at = 0
+		for _ in window.at do
+			at += 1
+		end
+		assert(at == #entries, "held where it is not")
+		for i, e in entries do
+			assert(i == 1 or entries[i - 1].key < e.key, "out of order")
+			assert(window.at[e.row] == e.key, "held where it is not")
+		end
+		if what == "move" then
+			assert(#entries == 70 and entries[70].row.id == first, "not moved")
+		else
+			assert(#entries == 69, "deleted, and still there")
+			for _, e in entries do
+				assert(e.row.id ~= first, "deleted, and still there")
+			end
+		end
+	end
+end
+
 -- More said at once than a WebSocket of zspd's takes in one message, 8 MiB, goes in pieces, and arrives whole; and so it
 -- does again on a pipe dialled anew, which would otherwise break every time it was said.
 do

@@ -233,6 +233,39 @@ function cellOf(row: string, kind: number, slot: number, n: number, body: string
   assert.equal(st.rows.length, 10, "rows were let go of");
 }
 
+// Many rows placed at once, while a follower moves or deletes one of them as it hears of it: every row is where it is held
+// to be, once, and the one deleted nowhere.
+for (const what of ["move", "delete"]) {
+  const h = harness();
+  h.run();
+  h.greet();
+  h.client.window({ scope: 1, list: "items", table: Note, size: 100 }, () => {});
+  h.run();
+  let first = "", heard = 0;
+  h.client.follow((id) => {
+    if (++heard === 1) first = id;
+    else if (heard === 2) void h.client.write(1, (change) => (what === "move" ? change.place(first, "items", 999) : change.delete(first)));
+  });
+  void h.client.write(1, (change) => {
+    for (let i = 1; i <= 70; i++) change.insert(Note, "items", i, { title: `r${i}` });
+  });
+  h.run();
+  const window = (Client.internals(h.client).windows as ReadonlyMap<string, { entries: { key: string; row: { hex: string } }[]; at: Map<unknown, string> }>)
+    .values()
+    .next().value!;
+  const keys = window.entries.map((e) => e.key);
+  assert.deepEqual(keys, [...keys].sort(), "out of order");
+  assert.equal(window.entries.length, window.at.size, "held where it is not");
+  for (const e of window.entries) assert.equal(window.at.get(e.row), e.key, "held where it is not");
+  if (what === "move") {
+    assert.equal(window.entries.length, 70);
+    assert.equal(window.entries[69].row.hex, first, "not moved");
+  } else {
+    assert.equal(window.entries.length, 69);
+    assert(!window.entries.some((e) => e.row.hex === first), "deleted, and still there");
+  }
+}
+
 // More said at once than a WebSocket of zspd's takes in one message, 8 MiB, goes in pieces, and arrives whole; and so it
 // does again on a pipe dialled anew, which would otherwise break every time it was said.
 {

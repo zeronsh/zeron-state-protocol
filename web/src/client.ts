@@ -1323,9 +1323,10 @@ export class Client {
     row.views.clear();
   }
 
-  // Puts a row where its placements say, in every window, and takes it from where they do not.
-  #place(row: Stored): void {
-    for (const f of this.#followers) f(row.hex);
+  // Puts a row where its placements say, in every window, and takes it from where they do not. Followers hear of it
+  // first, unless they have been told already.
+  #place(row: Stored, told = false): void {
+    if (!told) for (const f of this.#followers) f(row.hex);
     const keys: string[] = [];
     if (!row.dead) {
       for (let slot = 1; slot <= 15; slot++) {
@@ -1375,16 +1376,21 @@ export class Client {
   }
 
   // Places rows, each once. Many at once go into windows at once: sorted together, rather than each moving all after it.
+  // Followers hear of them all first, so that whatever they do of it is done before any row is half put, as one held
+  // where it goes and not yet among the rows there.
   #placeAll(rows: Set<Stored>): void {
-    if (rows.size > 64) this.#bulk = new Map();
-    for (const row of rows) this.#place(row);
-    const bulk = this.#bulk;
+    if (rows.size <= 64) {
+      for (const row of rows) this.#place(row);
+      return;
+    }
+    for (const row of rows) for (const f of this.#followers) f(row.hex);
+    const bulk = new Map<Win, Entry[]>();
+    this.#bulk = bulk;
+    for (const row of rows) this.#place(row, true);
     this.#bulk = undefined;
-    if (bulk) {
-      for (const [window, add] of bulk) {
-        window.entries.push(...add);
-        window.entries.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0));
-      }
+    for (const [window, add] of bulk) {
+      window.entries.push(...add);
+      window.entries.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0));
     }
   }
 
