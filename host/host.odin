@@ -214,8 +214,9 @@ space_close :: proc(s: ^Space) {
 	if !zsp.store_sync(&s.node.store) {
 		report(.Error, "could not sync the log")
 	}
-	// Leaving a short tail to replay is cheaper than writing pages for it.
-	if zsp.store_tail(&s.node.store) - s.node.checkpoint > 1 << 20 || s.node.whole != s.node.whole_kept {
+	// Leaving a short tail to replay is cheaper than writing pages for it, for a relay; a device's, however little was
+	// written since, for what it let go of, and when lists were last watched, are written down only so.
+	if s.node.keys != nil || zsp.store_tail(&s.node.store) - s.node.checkpoint > 1 << 20 {
 		zsp.store_checkpoint(&s.node.store)
 	}
 	zsp.node_destroy(&s.node)
@@ -422,7 +423,8 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 			earliest(&due, &ok, time.tick_now())
 		} else if at := zsp.node_retain_due(&s.node); at != 0 {
 			ms := now_ms()
-			earliest(&due, &ok, time.tick_add(time.tick_now(), time.Duration(at - min(at, ms)) * time.Millisecond))
+			wait := min(at - min(at, ms), 24 * 3600 * 1000) // and looked at again in a day, which is soon enough
+			earliest(&due, &ok, time.tick_add(time.tick_now(), time.Duration(wait) * time.Millisecond))
 		}
 	}
 	if t := links_deadline(h); t != 0 {

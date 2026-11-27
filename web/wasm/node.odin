@@ -266,7 +266,7 @@ start :: proc "c" (full: bool, age, bytes: f64) -> bool {
 	if node.becoming {
 		report(.Info, "this store was a full replica's: it is one until it is level with another, and partial from then on")
 	}
-	zsp.node_keep(&node, {u64(age), u64(bytes)})
+	zsp.node_keep(&node, {u64(min(age, 1e15)), u64(min(bytes, 1e18))})
 	node.host = {
 		keep = proc(_: rawptr, bytes: []byte) {
 			// Keys learnt and not kept are lost at the next start, and with them all sealed under them: storage has failed.
@@ -377,7 +377,8 @@ stop :: proc "c" () {
 		free(c)
 	}
 	clear(&conns)
-	if zsp.store_sync(&node.store) && (zsp.store_tail(&node.store) - node.checkpoint > 1 << 20 || node.whole != node.whole_kept) {
+	// However little was written since: what was let go of, and when lists were last watched, are written down only so.
+	if zsp.store_sync(&node.store) {
 		zsp.store_checkpoint(&node.store)
 	}
 	zsp.node_destroy(&node)

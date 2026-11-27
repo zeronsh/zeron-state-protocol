@@ -24,23 +24,38 @@ Op :: enum u8 {
 	Back   = 13, // is referred to by so many rows that …
 }
 
-// The lists a question's rows must all be in, if it names any: what it is about, and nothing beyond. Temporary memory.
-query_lists :: proc(q: ^Query) -> []zsp.List {
-	out := make([dynamic]zsp.List, context.temp_allocator)
-	add :: proc(out: ^[dynamic]zsp.List, p: ^Pred, scope: zsp.Scope) {
-		if p.op == .List && zsp.key_scope(zsp.list_lo(p.list)) == scope && !slice.contains(out[:], p.list) {
-			append(out, p.list)
+// A list a question's rows must all be in, if it names one, and if nothing else is what it is about: then the list,
+// whole, is all that answering it needs. Not so of one that turns on rows elsewhere, which a join does.
+query_list :: proc(q: ^Query) -> (list: zsp.List, ok: bool) {
+	joins :: proc(p: ^Pred) -> bool {
+		if p.op == .Ref || p.op == .Back {
+			return true
 		}
+		for &k in p.kids {
+			if joins(&k) {
+				return true
+			}
+		}
+		return false
 	}
 	w := &q.where_
+	if joins(w) {
+		return
+	}
+	in_scope :: proc(p: ^Pred, scope: zsp.Scope) -> bool {
+		return p.op == .List && zsp.key_scope(zsp.list_lo(p.list)) == scope
+	}
+	if in_scope(w, q.scope) {
+		return w.list, true
+	}
 	if w.op == .And {
 		for &k in w.kids {
-			add(&out, &k, q.scope)
+			if in_scope(&k, q.scope) {
+				return k.list, true // every row of the answer is in it, whatever other lists it must be in
+			}
 		}
-	} else {
-		add(&out, w, q.scope)
 	}
-	return out[:]
+	return
 }
 
 Pred :: struct {

@@ -116,15 +116,28 @@ node_init :: proc(n: ^Node, disk: Disk, space: Key32, keys: ^Keyring, full: bool
 	n.keys = keys
 	n.full = full
 	n.next_id = 1
-	n.own = keys != nil
+	n.own = keys != nil && !full
 	store_open(&n.store, disk, ring) or_return
-	if !full && n.own && !n.whole {
-		// What it wrote as a full replica, or before outboxes were kept whatever a replica was, may be held by nobody
-		// else, and is not named in the outbox: it goes on as a full replica until it is level with one, and so has
-		// offered all it holds, and is a partial one from its next start. See node_level.
+	if keys != nil && full && n.whole {
+		// A full replica says it holds what others give it, and they forget it: its outbox names none of that, and is
+		// said not to be whole before anything is said at all.
+		n.whole = false
+		store_checkpoint(&n.store) or_return
+	}
+	if n.own && !n.whole {
+		// What it was given or wrote as a full replica, or before there were outboxes, may be held by nobody else, and
+		// is not named in the outbox: it goes on as a full replica until it is level with one, and so has offered all
+		// it holds; it keeps its outbox from then on, and is a partial one from its next start. See node_level.
 		n.full, n.becoming = true, true
 	}
 	return true
+}
+
+// Whether this replica keeps on record what it is given to hold that nobody else may: a partial one, what its clients
+// write; and one becoming partial, once it is level with a full one, what peers who will forget it give it too.
+@(require_results)
+node_tracks :: proc(n: ^Node) -> bool {
+	return n.own && (!n.full || n.whole)
 }
 
 node_destroy :: proc(n: ^Node) {
@@ -363,7 +376,7 @@ sweep_step :: proc(n: ^Node, old: ^Roster, budget: int) -> (done: bool) {
 	if !w.started {
 		w.started = true
 		w.cursor = scope_lo(plan.scope)
-		if info != nil && !n.full && node_wrote(n, info) {
+		if info != nil && node_tracks(n) && node_wrote(n, info) {
 			// Whoever took what this holds may be among those who have gone, and may have told nobody.
 			scan := tree_scan(n, n.shelf, scope_lo(plan.scope), scope_hi(plan.scope))
 			for leaf in tree_next(&scan) {
@@ -421,7 +434,7 @@ sweep_step :: proc(n: ^Node, old: ^Roster, budget: int) -> (done: bool) {
 			// Someone who had heard already may have refused it, and will take it now.
 			places := row_places(&n.store, c.row)
 			ring_push(&n.events, {c.row, c.slot, c.kind, c.stamp, 0}, &places, &places)
-			if n.own {
+			if node_tracks(n) {
 				tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
 			}
 		} else {
@@ -542,7 +555,10 @@ node_commit :: proc(n: ^Node, cells: []Cell, from: ^Session) -> int {
 	if len(n.typing) > 0 {
 		typing_committed(n, cells)
 	}
-	if accepted > 0 && n.own && (from == nil || from.role == .Open) {
+	// What its clients write; and, once it is becoming partial, what a peer that is not a relay gives it as to a full
+	// replica, which the peer then forgets.
+	takes := from == nil || from.role == .Open || (n.full && from.role == .Peer && !from.relay && !from.peer_relay)
+	if accepted > 0 && node_tracks(n) && takes {
 		for c in cells {
 			tree_put(n, &n.outbox, {c.row[0], c.row[1], 0, 0, 0}, {})
 		}
@@ -558,8 +574,8 @@ node_sync :: proc(n: ^Node) -> bool {
 	}
 	if store_wants_checkpoint(&n.store) {
 		store_checkpoint(&n.store) or_return
-		retain_grown(n)
 	}
+	retain_grown(n)
 	return true
 }
 
@@ -634,6 +650,17 @@ interests_afresh :: proc(n: ^Node) {
 				interest_send(to, &it)
 			}
 		}
+		// What confirmed it may not stand under this roster: settled again once a full replica says so anew.
+		if it.watch.data {
+			if to := node_session(n, it.session); to != nil {
+				for w in to.watches {
+					if w.id == it.watch.id && w.data {
+						append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi})
+					}
+				}
+			}
+			wanted_tell(n, &it)
+		}
 	}
 }
 
@@ -644,6 +671,7 @@ interest_remove :: proc(n: ^Node, i: int) {
 	unordered_remove(&n.interests, i)
 	if it.watch.data {
 		used_stamp(n, it.watch.lo, it.watch.hi)
+		retain_released(n)
 	}
 	for to in n.sessions {
 		if interest_concerns(n, it.session, to) {
@@ -675,7 +703,8 @@ interest_send :: proc(to: ^Session, it: ^Interest) {
 roots_whole :: proc(s: ^Session) -> bool {
 	n := s.node
 	for &k in n.keys.scopes {
-		if node_may_write(n, k.scope) && !slice.contains(s.roots[:], k.scope) {
+		// Every one it holds keys for, whether or not it may write there now: it may have, before.
+		if !slice.contains(s.roots[:], k.scope) {
 			return false
 		}
 	}
@@ -692,6 +721,7 @@ node_level :: proc(s: ^Session) {
 		return
 	}
 	n.whole = true // and, if it is becoming partial, it is one from its next start
+	store_checkpoint(&n.store) // so said before anything it takes from now on is counted on
 }
 
 // Rows awaiting their first full replica go out again on every new connection to one.

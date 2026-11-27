@@ -759,6 +759,9 @@ finder_run :: proc(f: ^Finder, budget := 500) -> bool {
 	if f.x.failed {
 		return false
 	}
+	for l in f.live {
+		near_check(l)
+	}
 	now := time.tick_now()
 	for l in f.live {
 		if l.far.have || (l.once && l.far.call != 0) {
@@ -993,8 +996,8 @@ far_run :: proc(l: ^Live) {
 	}
 	if far.have {
 		near_drop(l) // another answers, and what was fetched for the question is held no longer than anything
-	} else if far.call == 0 {
-		near_run(l)
+	} else {
+		near_run(l, start = far.call == 0) // and while one is being asked, whether what was fetched is still confirmed
 	}
 	far_past(l)
 	if far.call != 0 && far.spent > 0 {
@@ -1032,22 +1035,30 @@ far_run :: proc(l: ^Live) {
 // the question names, whole, so that it is answered here, as it would be there. A question that names none is about
 // all of a scope, and is answered from what is held, and said to be.
 @(private)
-near_run :: proc(l: ^Live) {
+near_run :: proc(l: ^Live, start: bool) {
 	f, far := l.f, &l.far
-	if len(far.near) == 0 {
-		if !zsp.node_fetches(f.n) {
-			return
-		}
-		lists := query_lists(&l.q)
-		for list in lists {
-			zsp.session_wants(l.session, zsp.list_lo(list), zsp.list_hi(list), true)
-			append(&far.near, list)
-		}
-		if len(far.near) == 0 {
-			return
-		}
+	if !zsp.node_fetches(f.n) {
+		near_drop(l) // nobody to fetch from: what is held is the answer, and a Fetch is given it
+		return
 	}
-	sure := true
+	if len(far.near) == 0 {
+		list, named := query_list(&l.q)
+		if !start || !named || !zsp.session_wants(l.session, zsp.list_lo(list), zsp.list_hi(list), true) {
+			return // no more may be watched: what is held is the answer, as it would be with nobody to ask
+		}
+		append(&far.near, list)
+	}
+}
+
+// Whether what was fetched is confirmed, and all of it found: then, and only then, an answer is settled, for it is the
+// whole answer. Looked at once what has come has been found, so that what is still coming does not unsettle it.
+@(private)
+near_check :: proc(l: ^Live) {
+	far := &l.far
+	if len(far.near) == 0 {
+		return
+	}
+	sure := index_level(&l.f.x)
 	for list in far.near {
 		wanted, confirmed := zsp.session_wanted(l.session, zsp.list_lo(list), zsp.list_hi(list))
 		sure &&= wanted && confirmed

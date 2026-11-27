@@ -22,6 +22,9 @@ Keep :: struct {
 // Here, by default: a month, and 256 MiB.
 KEEP_DEFAULT :: Keep{30 * 24 * 3600 * 1000, 256 << 20}
 
+// What may be said, beyond which it is as good as for ever, and no bound: so that nothing reckoned from it wraps.
+KEEP_MOST :: Keep{100 * 366 * 24 * 3600 * 1000, 1 << 60}
+
 // What a cell costs to keep beyond its body: its entry in a tree, and its head in the log, about.
 CELL_COST :: 64
 
@@ -38,6 +41,8 @@ Retain :: struct {
 	at:      int, // of those, the one being let go of
 	row_at:  Key, // and how far in it
 	left:    u64, // what was held when it was last done, so that what is held and cannot go is not gone over again and again
+	ended:   u64, // when it was last done
+	forgot:  u64, // the store's count of what it forgot, as the pass began
 }
 
 @(private)
@@ -55,7 +60,7 @@ store_held :: proc(s: ^Store) -> u64 {
 
 // Says what is kept, and looks again at once.
 node_keep :: proc(n: ^Node, keep: Keep) {
-	n.keep = keep
+	n.keep = {min(keep.age, KEEP_MOST.age), min(keep.bytes, KEEP_MOST.bytes)}
 	n.retain.due = n.now if n.now > 0 else 1
 }
 
@@ -136,7 +141,7 @@ node_retain :: proc(n: ^Node) -> (more: bool) {
 			r.due = n.now + 1000 // what a roster made unlawful is gone over first; then this
 			return false
 		}
-		r.running, r.over, r.cursor = true, false, KEY_MIN
+		r.running, r.over, r.cursor, r.forgot = true, false, KEY_MIN, n.forgot
 	}
 	if !r.over {
 		if retain_by_age(n) {
@@ -164,7 +169,25 @@ retain_grown :: proc(n: ^Node) {
 		return
 	}
 	if held := store_held(&n.store); held > n.keep.bytes && held > n.retain.left + n.keep.bytes / 8 {
-		n.retain.due = max(n.now, 1)
+		retain_soon(n)
+	}
+}
+
+// A watch was let go of: what it held on to may go, if what is held is more than may be.
+@(private)
+retain_released :: proc(n: ^Node) {
+	if retaining(n) && !n.retain.running && n.keep.bytes > 0 && store_held(&n.store) > n.keep.bytes {
+		n.retain.left = 0
+		retain_soon(n)
+	}
+}
+
+// At once, but no more than once a second, however much is let go of by however many.
+@(private)
+retain_soon :: proc(n: ^Node) {
+	at := max(n.now, n.retain.ended + 1000, 1)
+	if n.retain.due == 0 || n.retain.due > at {
+		n.retain.due = at
 	}
 }
 
@@ -172,8 +195,12 @@ retain_grown :: proc(n: ^Node) {
 @(private)
 retain_done :: proc(n: ^Node) {
 	r := &n.retain
+	if n.forgot != r.forgot {
+		// Written down at once, so that what went stays gone however the node stops, and its room is had again.
+		store_checkpoint(&n.store)
+	}
 	retain_reset(r)
-	r.due, r.left = 0, store_held(&n.store)
+	r.due, r.left, r.ended = 0, store_held(&n.store), n.now
 	soonest := max(u64)
 	empty := make([dynamic]Key, context.temp_allocator) // lists nothing is held of any more, as when all moved away
 	scan := tree_scan(n, n.used, KEY_MIN, KEY_MAX)
@@ -196,7 +223,7 @@ retain_done :: proc(n: ^Node) {
 @(private)
 retain_reset :: proc(r: ^Retain) {
 	delete(r.lists)
-	r^ = {due = r.due, left = r.left}
+	r^ = {due = r.due, left = r.left, ended = r.ended}
 }
 
 // A step over the shelf, a list at a time, letting go of lists nobody has watched for long enough. True while there

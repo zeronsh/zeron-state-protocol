@@ -543,7 +543,7 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 			if mib != "" {
 				m, mok = strconv.parse_f64(mib)
 			}
-			if !dok || !mok || !(d >= 0 && d <= 1e6) || !(m >= 0 && m <= 1e9) {
+			if !dok || !mok || !(d >= 0 && d <= 36500) || !(m >= 0 && m <= 1e9) {
 				os.write_string(os.stderr, USAGE)
 				return 2
 			}

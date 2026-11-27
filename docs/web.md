@@ -87,10 +87,11 @@ the memory its node has.
 in as ever. After a restart it is the same. What it never watched it does not have until it is back: open what you will want
 on a plane before you board.
 
-**A device may be either, from one start to the next, and loses nothing.** Every replica keeps what its clients wrote on record
-until a full replica says it holds it, so one that was full and is now partial offers what nobody else has, and one that was
-partial and is now full fetches the rest. A store kept before this was so, opened partial, goes on as a full replica until it is
-level with one, and is partial from its next start. The tabs of an origin share one device, and whichever runs it opens it as
+**A device may be either, from one start to the next, and loses nothing.** One that was partial and is now full fetches the
+rest. One that was full, and so has said it holds what others then forgot, goes on as a full replica, though opened partial,
+until it is level with another full replica, which then holds all it held that it lacked; and it is partial from its next
+start. So is a store kept before there were partial browsers: its first session after is a full replica's, as every one of
+its sessions was before. The tabs of an origin share one device, and whichever runs it opens it as
 it says: give them all the same options.
 
 ## How it is put together

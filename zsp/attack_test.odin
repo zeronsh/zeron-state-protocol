@@ -1695,6 +1695,7 @@ echoes_are_not_owed :: proc(t: ^testing.T) {
 	c := Cell{{leaf.key[0], leaf.key[1]}, DATA, .Value, node_stamp(&a.node), nil}
 	testing.expect(t, cell_seal(&a.keys, &a.node.roster, &c))
 	testing.expect(t, session_input(at_phone, raw_cells({c})))
+	at_a.seq_out = max(at_a.seq_out, 1) // as it would be, had it sent that itself, for the phone acknowledges it
 	testing.expect(t, session_input(at_phone, ack))
 	sim_settle(&s)
 	testing.expect_value(t, phone.node.outbox.root, 0)

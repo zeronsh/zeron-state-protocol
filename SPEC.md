@@ -329,10 +329,13 @@ has gone since: a partial replica that can reach none says Synced without it, of
 the last that had goes, it says Synced without it again. Before honouring Unwatch, an owner sends what it committed while the watch stood. When a grant
 ends, its watches end with Synced *denied*; to a local client, a new Roster comes first.
 
-A **full replica** watches, on each session it dials, every scope it can read, whole. A **partial replica** watches what its local clients watch. Every
-replica keeps what its clients wrote on record until a full replica acknowledges it, and a partial one offers it again on every session with one; so a
-device may be either, from one start to the next, and lose nothing. One whose store cannot vouch for that record, as one kept before there was any, is
-a full replica, though asked to be partial, until a full replica it brought level has said it holds all it was sent. When all a dialler's whole-scope watches are level, and it has sent all the other
+A **full replica** watches, on each session it dials, every scope it can read, whole. A **partial replica** watches what its local clients watch, and
+keeps what it wrote on record until a full replica acknowledges it, offering it again on every session with one. A full replica's acknowledgement is
+counted on, and what it acknowledged forgotten: so a store that last served as a full one is a full replica, though asked to be partial, until a full
+replica it brought level, in every scope it holds keys for, has said it holds all it was sent; from then on it keeps on record, too, what peers that
+are not relays give it, and it is partial from its next start. So a device may be either, from one start to the next, and lose nothing. A peer's
+Synced for an interest is believed only from a full replica asked for it, of a range within its scope; an Ack of more than was sent ends the session
+as *malformed*. When all a dialler's whole-scope watches are level, and it has sent all the other
 lacked, it says so: Synced with id 0, settled, empty keys and zero counts. The other heeds it from a full replica that has such a watch here. When the
 roster changes, all of these are asked for afresh: either end may have dropped one under a roster the other never heard.
 

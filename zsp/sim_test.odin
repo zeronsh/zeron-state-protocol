@@ -1160,8 +1160,8 @@ partial_replica :: proc(t: ^testing.T) {
 }
 
 // A device that was a full replica and is now a partial one loses nothing it wrote meanwhile, however long ago its store
-// was checkpointed; and the other way about. One whose store does not say that its outbox is whole, as one kept before
-// every replica kept one, goes on as a full replica until it is level with another, and is partial from then on.
+// was checkpointed, for it goes on as a full replica until it is level with another, and is partial from its next start;
+// and the other way about. So does one whose store was kept before there were outboxes.
 @(test)
 partial_after_full :: proc(t: ^testing.T) {
 	state := seeded(12)
@@ -1174,16 +1174,20 @@ partial_after_full :: proc(t: ^testing.T) {
 		return store_range(&x.node.store, KEY_MIN, KEY_MAX).count
 	}
 
-	// A full replica writes while it reaches nobody, its store is checkpointed, and it starts again as a partial one.
+	// A full replica writes while it reaches nobody, its store is checkpointed, and it starts again as a partial one: a
+	// full one until it is level, and partial at its next start.
 	for i in 0 ..< 20 {
 		sim_put(&s, laptop, u64(i))
 	}
 	sim_restart(&s, laptop, full = false)
-	testing.expect(t, !laptop.node.full)
+	testing.expect(t, laptop.node.full && laptop.node.becoming && !laptop.node.whole)
 	sim_link(&s, 0, 2)
 	sim_link(&s, 1, 2)
 	sim_settle(&s)
 	testing.expect_value(t, count(big), 20)
+	testing.expect(t, laptop.node.whole)
+	sim_restart(&s, laptop, full = false)
+	testing.expect(t, !laptop.node.full && !laptop.node.becoming)
 	testing.expect_value(t, laptop.node.outbox.root, 0)
 
 	// A partial replica writes while it reaches nobody, and starts again as a full one, and then as a partial one.
@@ -1195,6 +1199,7 @@ partial_after_full :: proc(t: ^testing.T) {
 	}
 	sim_restart(&s, laptop, full = true)
 	sim_restart(&s, laptop, full = false)
+	testing.expect(t, laptop.node.becoming)
 	sim_link(&s, 0, 2)
 	sim_link(&s, 1, 2)
 	sim_settle(&s)
@@ -1353,10 +1358,304 @@ partial_lets_go :: proc(t: ^testing.T) {
 	grow(&s, phone, 5)
 	testing.expect(t, node_retain_due(&phone.node) > phone.node.now)
 	grow(&s, phone, 2000)
-	testing.expect_value(t, node_retain_due(&phone.node), phone.node.now)
+	testing.expect(t, node_retain_due(&phone.node) <= phone.node.now)
 	retain(&s, phone, 1)
 	// It has nothing to do until the next list comes of age.
 	testing.expectf(t, node_retain_due(&phone.node) > phone.node.now, "due %v now %v running %v", node_retain_due(&phone.node), phone.node.now, phone.node.retain.running)
+}
+
+// A full replica that has said it holds what a partial one wrote, which therefore forgets it, and then starts again
+// as a partial one itself, still offers it: nobody else may have it. (Review 1, 1.)
+@(test)
+review_full_takes_what_it_acks :: proc(t: ^testing.T) {
+	state := seeded(41)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, laptop, phone := s.nodes[0], s.nodes[1], s.nodes[2]
+	sim_link(&s, 2, 1) // the phone and the laptop, directly, and no relay
+	sim_settle(&s)
+	sim_put(&s, phone, 7)
+	sim_settle(&s)
+	testing.expect_value(t, phone.node.outbox.root, 0)
+	testing.expect_value(t, store_range(&laptop.node.store, KEY_MIN, KEY_MAX).count, 1)
+	sim_restart(&s, laptop, full = false)
+	sim_link(&s, 1, 3)
+	sim_link(&s, 0, 3)
+	sim_link(&s, 2, 3)
+	sim_settle(&s)
+	testing.expect_value(t, store_range(&big.node.store, KEY_MIN, KEY_MAX).count, 1)
+}
+
+// What says a window is settled is a full replica that was asked, with bounds within it; nothing else is believed, nor
+// passed on. (Review 1, 2.)
+@(test)
+review_settled_is_not_forged :: proc(t: ^testing.T) {
+	state := seeded(42)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 0, partial = 2, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	victim := s.nodes[0]
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	ui := sim_client(&s, victim)
+	defer session_close(ui)
+	list := List{1 << 32 | 5, 5}
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 0, {data = true, live = true})
+	sim_settle(&s)
+	testing.expect(t, len(victim.node.interests) == 1)
+	f: [dynamic]byte
+	defer delete(f)
+	at := frame_begin(&f, .Synced)
+	write_varint(&f, victim.node.interests[0].id)
+	write_u8(&f, 1) // settled
+	write_key(&f, list_hi(list))
+	write_key(&f, list_lo(list))
+	write_varint(&f, 0)
+	write_varint(&f, 0)
+	frame_end(&f, at)
+	session_input(s.links[0].a, f[:])
+	sim_settle(&s)
+	testing.expect(t, !interest_sure(&victim.node.interests[0]), "a partial peer made a window settled")
+	w := victim.node.interests[0].watch
+	testing.expect(t, key_less(w.lo, w.hi), "and made it nothing")
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	for l in s.links {
+		testing.expect(t, !l.a.closing && !l.b.closing, "and broke a session with a relay")
+	}
+}
+
+// What a partial replica lets go of stays gone, though it is stopped at once after, as a host stops it. (Review 1, 3.)
+@(test)
+review_letting_go_is_kept :: proc(t: ^testing.T) {
+	state := seeded(43)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, phone := s.nodes[0], s.nodes[1]
+	for i in 0 ..< 50 {
+		sim_put(&s, big, u64(i))
+	}
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	node_keep(&phone.node, {age = 1000, bytes = 0})
+	ui := sim_client(&s, phone)
+	list := List{1 << 32 | 5, 5}
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 0, {data = true})
+	sim_settle(&s)
+	testing.expect(t, store_checkpoint(&phone.node.store))
+	session_close(ui)
+	sim_settle(&s)
+	s.now += 5000
+	phone.node.now = sim_now(&s, phone)
+	for node_retain(&phone.node) {}
+	testing.expect_value(t, store_range(&phone.node.store, list_lo(list), list_hi(list)).count, 0)
+	// Stopped as a host stops it, with nothing written since but what letting go did.
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	testing.expect(t, store_sync(&phone.node.store))
+	node_destroy(&phone.node)
+	keyring_destroy(&phone.keys)
+	keyring_init(&phone.keys, phone.secret)
+	if phone.kept != nil {
+		testing.expect(t, keyring_load(&phone.keys, phone.kept))
+	}
+	sim_boot(&s, phone)
+	testing.expect_value(t, store_range(&phone.node.store, list_lo(list), list_hi(list)).count, 0)
+}
+
+// A full replica's outbox, filled again from its log when it starts, is emptied once it is level with another: it does
+// not grow from one start to the next. (Review 1, 7A.)
+@(test)
+review_full_outbox_empties :: proc(t: ^testing.T) {
+	state := seeded(44)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	laptop := s.nodes[1]
+	for i in 0 ..< 20 {
+		sim_put(&s, laptop, u64(i))
+	}
+	sim_link(&s, 1, 2)
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	testing.expect_value(t, laptop.node.outbox.root, 0)
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	testing.expect(t, store_sync(&laptop.node.store))
+	node_destroy(&laptop.node)
+	keyring_destroy(&laptop.keys)
+	keyring_init(&laptop.keys, laptop.secret)
+	if laptop.kept != nil {
+		testing.expect(t, keyring_load(&laptop.keys, laptop.kept))
+	}
+	sim_boot(&s, laptop)
+	sim_link(&s, 1, 2)
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	testing.expect_value(t, laptop.node.outbox.root, 0)
+}
+
+// A window a full replica has said is settled, and which then goes before the client has been told so, is told that it
+// is not, last of all. (Review 1, 8A.)
+@(test)
+review_settled_race :: proc(t: ^testing.T) {
+	state := seeded(45)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	phone := s.nodes[1]
+	sim_put(&s, s.nodes[0], 1)
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	ui := sim_client(&s, phone)
+	defer session_close(ui)
+	list := List{1 << 32 | 5, 5}
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 0, {data = true})
+	session_sent(ui, len(session_output(ui)))
+	sim_link(&s, 1, 2)
+	// What the relay says reaches the phone, which has yet to tell its client.
+	for _ in 0 ..< 50 {
+		for l in s.links {
+			sim_pass(&s, l.a, l.b)
+			sim_pass(&s, l.b, l.a)
+		}
+	}
+	for len(s.links) > 0 {
+		sim_cut(&s, 0)
+	}
+	out := session_output(ui)
+	r := Reader{buf = out}
+	last: Maybe(bool)
+	for r.pos < len(out) {
+		frame := read_bytes(&r)
+		if Message(frame[0]) == .Synced {
+			f := Reader{buf = frame[1:]}
+			if read_varint(&f) == 1 {
+				last = Synced_Flags(read_u8(&f)).settled
+			}
+		}
+	}
+	session_sent(ui, len(out))
+	testing.expectf(t, last == false, "last said of the window: settled %v", last)
+}
+
+// When a roster leaves nobody who can read a scope among those a partial replica reaches, its windows there are told
+// that they are no longer settled. (Review 1, 8B.)
+@(test)
+review_settled_roster :: proc(t: ^testing.T) {
+	state := seeded(46)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 1, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	owner, helper, phone := s.nodes[0], s.nodes[1], s.nodes[2]
+	sim_put(&s, helper, 1)
+	sim_link(&s, 2, 1)
+	sim_settle(&s)
+	ui := sim_client(&s, phone)
+	defer session_close(ui)
+	list := List{1 << 32 | 5, 5}
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 0, {data = true})
+	sim_settle(&s)
+	session_sent(ui, len(session_output(ui)))
+	owner.node.now = sim_now(&s, owner)
+	d := draft_from(&owner.node.roster, max(owner.node.clock, owner.node.now << 16))
+	d.random = sim_random
+	draft_revoke(&d, helper.keys.device, 1)
+	bytes, ok := roster_sign(&owner.keys, s.root, &d)
+	defer delete(bytes)
+	testing.expect(t, ok && node_adopt(&owner.node, bytes) && node_adopt(&phone.node, bytes) && node_adopt(&helper.node, bytes))
+	sim_settle(&s)
+	out := session_output(ui)
+	r := Reader{buf = out}
+	last: Maybe(bool)
+	for r.pos < len(out) {
+		frame := read_bytes(&r)
+		if Message(frame[0]) == .Synced {
+			f := Reader{buf = frame[1:]}
+			if read_varint(&f) == 1 {
+				last = Synced_Flags(read_u8(&f)).settled
+			}
+		}
+	}
+	session_sent(ui, len(out))
+	testing.expectf(t, last == false, "last said of the window: settled %v", last)
+}
+
+// An Ack of more than was sent makes no sense, and the session ends: it is not believed. (Review 1, 9B.)
+@(test)
+review_ack_beyond :: proc(t: ^testing.T) {
+	state := seeded(47)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	f: [dynamic]byte
+	defer delete(f)
+	at := frame_begin(&f, .Ack)
+	write_varint(&f, max(u64))
+	frame_end(&f, at)
+	testing.expect(t, !session_input(s.links[0].a, f[:]), "an Ack of what was never sent was taken")
+}
+
+// What is kept, however long it is said to be, is no longer than may be reckoned with: nothing wraps, and nothing is
+// looked at again and again for having wrapped. (Review 1, 10.)
+@(test)
+review_keep_bounds :: proc(t: ^testing.T) {
+	state := seeded(48)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	phone := s.nodes[1]
+	node_keep(&phone.node, {age = max(u64), bytes = max(u64)})
+	for node_retain(&phone.node) {}
+	sim_put(&s, phone, 1)
+	due := node_retain_due(&phone.node)
+	testing.expectf(t, due == 0 || due > phone.node.now + 24 * 3600 * 1000, "due %v at %v", due, phone.node.now)
+}
+
+// Once nothing holds on to what is held beyond what may be, it is let go of soon, and not a month later. (Review 1, 11.)
+@(test)
+review_over_when_let_go :: proc(t: ^testing.T) {
+	state := seeded(49)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 1, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	big, phone := s.nodes[0], s.nodes[1]
+	for i in 0 ..< 200 {
+		sim_put(&s, big, u64(i))
+	}
+	sim_link(&s, 0, 2)
+	sim_link(&s, 1, 2)
+	sim_settle(&s)
+	ui := sim_client(&s, phone)
+	list := List{1 << 32 | 5, 5}
+	sim_watch(ui, 1, list_lo(list), list_hi(list), 0, {data = true})
+	sim_settle(&s)
+	node_keep(&phone.node, {age = 30 * 24 * 3600 * 1000, bytes = store_held(&phone.node.store) / 4})
+	for node_retain(&phone.node) {}
+	testing.expect_value(t, store_range(&phone.node.store, list_lo(list), list_hi(list)).count, 200)
+	session_close(ui)
+	sim_settle(&s)
+	s.now += 2000
+	phone.node.now = sim_now(&s, phone)
+	testing.expectf(t, node_retain_due(&phone.node) <= phone.node.now, "due %v, now %v", node_retain_due(&phone.node), phone.node.now)
+	for node_retain(&phone.node) {}
+	testing.expect(t, store_held(&phone.node.store) <= phone.node.keep.bytes)
 }
 
 // Forgets what is in the outbox, as a store kept before full replicas kept one would never have had it.

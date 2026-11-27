@@ -80,10 +80,10 @@ def eventually(what, f, timeout=10):
     raise AssertionError("never: " + what)
 
 
-def space(*names, udp=(), relay=None, options=()):
-    """A relay and devices that share scope 1."""
+def space(*names, udp=(), relay=None, options=(), partial={}):
+    """A relay and devices that share scope 1; some partial replicas from the first, and perhaps keeping what they say."""
     relay = relay or Node(names[0] + "-relay", "serve", "--no-udp").start()
-    devices = [Node(n, "run", *options, *([] if n in udp else ["--no-udp"])) for n in names]
+    devices = [Node(n, "run", *options, *([] if n in udp else ["--no-udp"]), *partial.get(n, ())) for n in names]
     sid = zspd("create", devices[0].dir)
     url = getattr(relay, "url", None) or "ws://localhost:" + relay.address.split(":")[1]
     zspd("relay", devices[0].dir, relay.key, url)
@@ -270,10 +270,7 @@ def test_permissions():
 
 
 def test_partial():
-    relay, (a, b) = space("l", "m")
-    b.stop()
-    b.options.append("--partial")
-    b.start()
+    relay, (a, b) = space("l", "m", partial={"m": ["--partial"]})
     ca, cb = a.client(), b.client()
     for i in range(300):
         ca.put(1, "feed", i, [b"x" * 100])
@@ -291,10 +288,7 @@ def test_partial():
 def test_partial_keeps():
     """A partial replica lets go of what nobody has watched for long enough, says that what it shows while it reaches
     nobody is only what it holds, and has what it let go of again once it is watched."""
-    relay, (a, b) = space("pk", "pl")
-    b.stop()
-    b.options += ["--partial", "--keep=0.00002"]  # about 1.7 seconds
-    b.start()
+    relay, (a, b) = space("pk", "pl", partial={"pl": ["--partial", "--keep=0.00002"]})  # about 1.7 seconds
     ca = a.client()
     for i in range(50):
         ca.put(1, "old", i, [b"x" * 100])
@@ -469,10 +463,7 @@ def test_questions():
 def test_questions_passed_on():
     """A device that holds little has one that holds everything answer, whichever way it is reached."""
     for names, udp in ((("bc", "bd"), ()), (("be", "bf"), ("be", "bf"))):
-        relay, (a, b) = space(*names, udp=udp)
-        b.stop()
-        b.options.append("--partial")
-        b.start()
+        relay, (a, b) = space(*names, udp=udp, partial={names[1]: ["--partial"]})
         ca, cb = a.client(), b.client()
         rows = [ca.put(1, "people", i, [b"person %d" % i]) for i in range(300)]
         ca.until(lambda: ca.acked == ca.seq)

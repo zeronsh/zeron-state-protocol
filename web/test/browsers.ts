@@ -427,15 +427,17 @@ const partialBench = async () => {
     const began = performance.now();
     const writes: Promise<void>[] = [];
     for (let i = 0; i < ROWS; i += 1000)
-      writes.push(writer.write(1, (c) => {
+      console.log(`     PHASE write ${i} ${ms(performance.now() - began)}`), writes.push(writer.write(1, (c) => {
         for (let k = i; k < Math.min(i + 1000, ROWS); k++) c.insert(Row, "big", k, { title: `note ${k}`, body: `the quick brown fox jumps over the lazy dog, ${k} times over and again` });
       }));
     for (let i = 0; i < TEXTS; i++) writes.push(writer.write(1, (c) => c.insert(Row, "docs", i, { title: `doc ${i}`, body: String.fromCharCode(97 + (i % 26)).repeat(TEXT) })));
     await Promise.all(writes);
+    console.log(`     PHASE written ${ms(performance.now() - began)}`);
     const check = await openNode({ dir: join(TMP, `pb-${results.length}-check`), udp: false, log: () => {} });
     s.admit(check.key, "check", false);
     await check.join(s.sid, relay);
     await eventually("the relay has it all", async () => (await check.usage()).held > ROWS * 150 + TEXTS * TEXT, 900000);
+    console.log(`     PHASE relay has it ${ms(performance.now() - began)}`);
     let all = 0;
     await eventually("and the device beside it all of it", async () => {
       const held = (await check.usage()).held;

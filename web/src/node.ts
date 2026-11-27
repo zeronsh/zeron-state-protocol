@@ -131,6 +131,7 @@ const REFUSED: Record<number, string> = {
 const HIGH = 256 << 10; // bytes in flight to a pipe before the node waits for it
 const KEEP_DAYS = 30; // what a partial replica keeps of what nobody here watches, unless told otherwise
 const KEEP_BYTES = 256 * 2 ** 20;
+const KEEP_MOST_DAYS = 36500; // a hundred years, as good as for ever
 const DAY = 24 * 3600 * 1000;
 const LONGEST = 2 ** 31 - 1; // ms a timer may be set for: one set for longer goes off at once
 const PIECE = 64 << 10; // of what a client says, handed to the node at a time
@@ -179,8 +180,8 @@ export class Node {
     this.#options = options;
     const keep = options.keep === false ? { days: 0, bytes: 0 } : (options.keep ?? {});
     this.#keep = { age: (keep.days ?? KEEP_DAYS) * DAY, bytes: keep.bytes ?? KEEP_BYTES };
-    if (!(this.#keep.age >= 0 && this.#keep.bytes >= 0 && this.#keep.age < Infinity && this.#keep.bytes < Infinity)) {
-      throw new RangeError("what is kept is kept for so many days, and so many bytes, of none or more");
+    if (!(this.#keep.age >= 0 && this.#keep.bytes >= 0 && this.#keep.age <= KEEP_MOST_DAYS * DAY && this.#keep.bytes <= Number.MAX_SAFE_INTEGER)) {
+      throw new RangeError(`what is kept is kept for so many days, of none to ${KEEP_MOST_DAYS}, and so many bytes, of none or more`);
     }
     const wasm = this.#instantiate();
     if (options.keepalive) wasm.keepalive(options.keepalive.idle, options.keepalive.wait);

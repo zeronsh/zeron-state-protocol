@@ -267,7 +267,7 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
 }
 
 // What it keeps is said in days and bytes, of none or more.
-for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinity }]) {
+for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinity }, { days: 1e15 }, { bytes: 2 ** 60 }]) {
   await assert.rejects(Node.open({ volume: new MemoryVolume(), module, full: false, keep, log: () => {} }), RangeError);
 }
 

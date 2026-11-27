@@ -282,7 +282,7 @@ session_close :: proc(s: ^Session) {
 				for &w in to.watches {
 					if w.id == it.watch.id && w.data && len(it.reports) > 0 {
 						interest_beyond(n, &it, &w)
-					} else if w.id == it.watch.id && w.data && w.settled && !slice.contains(s.owed[:], it.id) {
+					} else if w.id == it.watch.id && w.data && !slice.contains(s.owed[:], it.id) {
 						append(&to.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi})
 					}
 				}
@@ -679,7 +679,7 @@ session_authorize :: proc(s: ^Session) {
 				}
 			}
 		}
-		if !n.full && s.peer_full {
+		if node_tracks(n) && s.peer_full {
 			outbox_send(s)
 		}
 		return
@@ -687,7 +687,7 @@ session_authorize :: proc(s: ^Session) {
 	s.ready = true
 	s.cursor = n.events.next
 	roots_send(s)
-	if !n.full && s.peer_full {
+	if node_tracks(n) && s.peer_full {
 		outbox_send(s)
 	}
 	for &it in n.interests {
@@ -909,8 +909,8 @@ on_synced :: proc(s: ^Session, r: ^Reader) {
 	flags := Synced_Flags(read_u8(r))
 	lo, hi := read_key(r), read_key(r)
 	before, after := int(read_varint(r) & 0xffff_ffff), int(read_varint(r) & 0xffff_ffff)
-	if r.bad {
-		return
+	if r.bad || !interest_asked(s, id, lo, hi, flags) {
+		return // nobody else's to say: not believed, nor passed on
 	}
 	if !flags.denied {
 		interest_bound(s, id, lo, hi, before, after)
@@ -1030,6 +1030,37 @@ interest_settled :: proc(n: ^Node, id: u64) {
 			}
 		}
 	}
+}
+
+// Whether a peer may say how an interest stands: a full replica asked for its data, and still owing an answer or having
+// answered before, of a range within the scope asked about.
+@(private)
+interest_asked :: proc(s: ^Session, id: u64, lo, hi: Key, flags: Synced_Flags) -> bool {
+	if !s.peer_full || flags.restart {
+		return false
+	}
+	for &it in s.node.interests {
+		if it.id != id {
+			continue
+		}
+		if flags.denied {
+			return slice.contains(s.owed[:], id)
+		}
+		scope := key_scope(it.watch.lo)
+		if !it.watch.data || !key_less(lo, hi) || key_scope(lo) != scope || key_less(scope_hi(scope), hi) {
+			return false
+		}
+		if slice.contains(s.owed[:], id) {
+			return true
+		}
+		for r in it.reports {
+			if r.session == s.id {
+				return true
+			}
+		}
+		return false
+	}
+	return slice.contains(s.owed[:], id) // one let go of since, whose debt is still to be cleared
 }
 
 // Whether a full replica has confirmed what an interest asks for, and every one asked has answered; or it asks for
@@ -1577,7 +1608,7 @@ emit_cell :: proc(s: ^Session, c: ^Cell) {
 			}
 		}
 	}
-	if n.own && s.peer_full {
+	if node_tracks(n) && s.peer_full {
 		if _, ok := tree_get(n, n.outbox, {c.row[0], c.row[1], 0, 0, 0}); ok {
 			append(&s.unacked, Unacked{s.seq_out, c.row})
 		}
@@ -1699,6 +1730,10 @@ on_ack :: proc(s: ^Session, r: ^Reader) {
 		append(&refused, read_pair(r, Id))
 	}
 	if r.bad {
+		return
+	}
+	if seq > s.seq_out {
+		r.bad = true // what was never sent cannot be durable
 		return
 	}
 	s.acked_out = max(s.acked_out, seq)
@@ -1961,8 +1996,8 @@ SHOWN :: max(u64) // the window of an interest in what an answer shows
 
 // Wants what is typed in a range of places streamed here, for what a client is shown in answers; and if this is a
 // partial replica, perhaps what is there too.
-session_wants :: proc(s: ^Session, lo, hi: Key, data := false) {
-	interest_add(s, {id = SHOWN, lo = lo, hi = hi, live = true, data = data}, 0, false)
+session_wants :: proc(s: ^Session, lo, hi: Key, data := false) -> bool {
+	return interest_add(s, {id = SHOWN, lo = lo, hi = hi, live = true, data = data}, 0, false) != nil
 }
 
 session_unwants :: proc(s: ^Session, lo, hi: Key, data := false) {
@@ -2615,7 +2650,8 @@ resync :: proc(s: ^Session) {
 		if n.full {
 			s.paused = false
 			roots_send(s, afresh = true)
-		} else {
+		}
+		if node_tracks(n) {
 			outbox_send(s)
 		}
 	}
