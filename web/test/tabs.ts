@@ -303,14 +303,18 @@ const tests: Record<string, () => Promise<void>> = {
     await again("second"); // b dials again, presenting the newest
     await call(b, "put", "cl", "notes", ["four"]);
     await eventually(() => titles === "one,two,three,four", "what a tab back from being frozen gave before is not taken as newer", 20000);
-    // The clock is set back an hour, in c and its worker, as a machine's may be: what c gives now is still newest.
-    const back = "(() => { const was = Date.now; Date.now = () => was() - 3600000; return 1; })()";
-    await c.evaluate(back);
-    await c.cdp("Runtime.evaluate", { expression: back }, c.workers[c.workers.length - 1]);
+    // The machine's clock is set back five minutes, in every tab and worker, as a clock put right is: what c gives now is
+    // still the newest, and so taken by b, which runs the device. (Less than the quarter of an hour a relay allows a clock
+    // to be wrong by: a machine set back further would be refused by relays anyway.)
+    const back = "(() => { const was = Date.now; Date.now = () => was() - 300000; return 1; })()";
+    for (const p of [b, c]) {
+      await p.evaluate(back);
+      await p.cdp("Runtime.evaluate", { expression: back }, p.workers[p.workers.length - 1]);
+    }
     await again("third");
     await call(c, "setCredential", "cl", "third");
-    await call(b, "put", "cl", "notes", ["five"]); // by b, whose clock, and so the order it puts notes in, is as it was
-    await eventually(() => titles === "one,two,three,four,five", "what is given after the clock was set back is presented", 20000);
+    await call(b, "put", "cl", "notes", ["five"]); // put in the list as of five minutes ago, by the clock as it is now
+    await eventually(() => titles.split(",").includes("five"), "what is given after the clock was set back is presented", 20000);
     expectEqual(said.filter((l) => /uncaught/i.test(l)), [], "nonsense on the channel was thrown at");
     watching?.close();
   },

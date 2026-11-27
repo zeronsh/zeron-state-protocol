@@ -37,6 +37,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   // never taken for newer than what another tab gave since. By the clock workers judge it by.
   let credential = options.credential;
   let credentialAt = Date.now();
+  let begun = false; // a worker started
   // The worker: none while the tab is frozen or put away in the back/forward cache, for a frozen worker holds the store,
   // and every tab of the origin would wait for this one to come back. It is stopped as the tab is, for it cannot stop
   // itself in time, and that lets go of the store as a closed tab does; and it is started again when the tab is back.
@@ -74,7 +75,8 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       if (r.error !== undefined) a?.reject(new Error(r.error));
       else a?.resolve(r.value);
     };
-    w.postMessage({ open: { name, full: options.full, keep: options.keep, credential, credentialAt, wasm: options.wasm?.toString() } } satisfies Command);
+    w.postMessage({ open: { name, full: options.full, keep: options.keep, credential, credentialAt, credentialAgain: begun, wasm: options.wasm?.toString() } } satisfies Command);
+    begun = true; // what it gives the next it starts, it gave this one
     for (const [id, a] of answers) w.postMessage({ ask: id, op: a.op, args: a.args } satisfies Command);
     for (const port of ports.splice(0)) w.postMessage({ connect: port } satisfies Command, [port]);
     for (const [id, t] of timers) w.postMessage({ after: id, ms: Math.max(0, t.due - Date.now()) } satisfies Command);

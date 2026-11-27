@@ -20,6 +20,8 @@ export interface Options {
   credential?: string | Uint8Array;
   /** When the tab gave it, by Date.now(): what a tab gave later is presented rather than what it gave before. */
   credentialAt?: number;
+  /** That the tab gave it before, to a worker it has since started again in this one's place. */
+  credentialAgain?: boolean;
   /** Where node.wasm is, if not beside this script. */
   wasm?: string;
 }
@@ -78,11 +80,14 @@ const AGAIN = new Set<Op>(["identity", "member", "members", "usage"]);
 
 // The credential to present to relays: whichever a tab gave last, of those this worker has heard of. Every worker hears
 // of every one given while it lives, and asks those there before it for the newest they know as it begins: so whichever
-// runs the node next has the newest there is. `at` is when its tab gave it, by the one clock every context of a machine
-// shares; `by` breaks ties. A tab that starts its worker again gives what it gave as it gave it, then: not as newer; one
-// given anew is given as newer than any its worker knows of.
-type Given = { credential: string | Uint8Array; at: number; by: string };
+// runs the node next has the newest there is. `at` orders them, a clock of the machine's own and of what was given before:
+// what is given anew is given no earlier than the time, nor than anything its worker has heard of, set back though the
+// machine's clock may be; `by` breaks ties. What is said again, `old`, as a worker answers one that has just begun or as a
+// tab starts its worker again, was given before: what a tab gave anew stays newer than any such, which its worker hears of
+// only after, and is given again as newer still should it be said to be older.
+type Given = { credential: string | Uint8Array; at: number; by: string; old?: boolean };
 let newest: Given | undefined;
+let mine: Given | undefined; // what this worker's tab gave anew, while it is the newest given
 const me = crypto.randomUUID();
 
 /** How long a pipe carried to the leader waits to hear from it, before it is broken off and its client dials again. */
@@ -119,17 +124,20 @@ function open(o: Options): void {
   channel = new BroadcastChannel("zsp:" + o.name);
   channel.onmessage = (e: MessageEvent<Shout>) => heard(e.data);
   channel.postMessage({ credentials: true } satisfies Shout);
-  if (o.credential !== undefined) give(o.credential, o.credentialAt ?? Date.now());
+  if (o.credential !== undefined) give(o.credential, o.credentialAt ?? Date.now(), o.credentialAgain !== true);
   contend();
 }
 
-// This tab's credential, as its tab gave it: to the node, if it runs here, and to every other worker, if it is the newest.
-function give(credential: string | Uint8Array, at: number): void {
-  const given: Given = { credential, at, by: me };
-  if (!newer(given)) return;
+// This tab's credential: to the node, if it runs here, and to every other worker. Given anew, it is the newest; given again,
+// it is as it was given, and only if it is the newest still. Returns when it is said to have been given.
+function give(credential: string | Uint8Array, at: number, anew: boolean): number {
+  const given: Given = anew ? { credential, at: Math.max(at, (newest?.at ?? 0) + 1), by: me } : { credential, at, by: me, old: true };
+  if (!anew && !newer(given)) return given.at;
   newest = given;
+  mine = anew ? given : undefined;
   present();
   channel.postMessage(given satisfies Shout);
+  return given.at;
 }
 
 function newer(g: Given): boolean {
@@ -145,17 +153,23 @@ function present(): void {
   }
 }
 
-// Another tab's: taken if it is newer than any this worker knows of. Anything on the channel is of this origin, which may
-// open the device and do as it likes with it anyway; but what is not a credential is not taken as one.
-// Nor is one said to have been given later than now, which would be presented for good, whatever was given after it.
+// Another tab's: taken if it is newer than any this worker knows of, unless it was given before what this worker's own tab
+// gave anew, which is then given again as newer. Anything on the channel is of this origin, which may open the device and
+// do as it likes with it anyway; but what is not a credential is not taken as one, nor one said to have been given so far
+// ahead of any other that nothing given after it could be newer.
 function heardGiven(g: Given): void {
   if (!(typeof g.credential === "string" || g.credential instanceof Uint8Array) || typeof g.at !== "number" || typeof g.by !== "string") return;
-  if (!(g.at > 0 && g.at <= Date.now() + SKEW) || !newer(g)) return;
+  if (!(g.at > 0 && g.at <= Math.max(Date.now(), newest?.at ?? 0) + AHEAD) || !newer(g)) return;
+  if (g.old === true && mine && mine === newest) {
+    give(mine.credential, g.at + 1, true); // what this tab gave since stays the newest
+    return;
+  }
   newest = { credential: g.credential, at: g.at, by: g.by };
+  if (g.old !== true) mine = undefined; // given since, by another
   present();
 }
 
-const SKEW = 1000; // ms one context's clock may be ahead of another's on one machine, as their reckoning of a moment differs
+const AHEAD = 60_000; // ms what is given may be ahead of the newest a worker knows of, as clocks and what they heard differ
 
 // Gets in line for the store. Whoever holds its lock runs the node, for as long as its tab lives; one whose node stopped,
 // or never started, gets in line again when it is next wanted, by its tab asking or dialling, and tries again then: so a
@@ -222,10 +236,7 @@ async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: 
     const c = args[0];
     const at = args[1];
     if (!(typeof c === "string" || c instanceof Uint8Array) || typeof at !== "number") return { error: "a credential is a string or bytes" };
-    // Given now, and so after any given before that this worker knows of, though the clock was set back since.
-    const given = Math.max(at, (newest?.at ?? 0) + 1);
-    give(c, given);
-    return { value: given };
+    return { value: give(c, at, true) }; // given now, and so after any this worker knows of
   }
   if (op === "close") {
     // This tab's device goes: if this worker runs the node, it is stopped as it should be, what it holds written down,
@@ -337,7 +348,7 @@ function heard(s: Shout): void {
   } else if ("by" in s) {
     heardGiven(s);
   } else if ("credentials" in s) {
-    if (newest) channel.postMessage(newest satisfies Shout); // to one that has just begun, and so to all, who know it or not
+    if (newest) channel.postMessage({ ...newest, old: true } satisfies Shout); // to one that has just begun, and so to all
   } else if ("taking" in s) {
     if (typeof s.taking === "string" && waiting.has(s.taking)) taken.add(s.taking);
   } else if ("answer" in s) {
