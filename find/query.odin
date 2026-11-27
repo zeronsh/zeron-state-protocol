@@ -291,7 +291,14 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 		}
 	case .In:
 		p.col = column_parse(r)
-		p.set = make([]Bound, zsp.read_count(r))
+		// Each of the set is a condition, of one byte or more, and is made many times larger than that.
+		n := zsp.read_count(r)
+		left^ -= n
+		if r.bad || left^ < 0 {
+			r.bad = true
+			return
+		}
+		p.set = make([]Bound, n)
 		r.bad ||= p.col.kind == .Words
 		for &b in p.set {
 			b = bound_parse(r, p.col.kind)
@@ -325,9 +332,8 @@ pred_parse :: proc(r: ^zsp.Reader, depth: int, left: ^int) -> (p: Pred) {
 		}
 		p.words.words = all[:]
 	case .Ids:
-		n := zsp.read_count(r)
-		if n > (len(r.buf) - r.pos) / 16 {
-			r.bad = true
+		n := zsp.read_count(r, 16)
+		if r.bad {
 			return
 		}
 		p.ids = make([]zsp.Id, n)

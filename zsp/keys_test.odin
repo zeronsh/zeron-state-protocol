@@ -5,8 +5,10 @@ import "core:crypto"
 import "core:crypto/ecdh"
 import "core:crypto/noise"
 import "core:crypto/ed25519"
+import "core:mem"
 import "core:slice"
 import "core:testing"
+import "core:time"
 
 @(private)
 test_keyring :: proc() -> (k: Keyring) {
@@ -358,4 +360,97 @@ small_order_keys_share_nothing :: proc(t: ^testing.T) {
 	bytes, signed := roster_sign(&a, root, &d, context.temp_allocator)
 	_, sound := roster_parse(bytes, space)
 	testing.expect(t, signed && !sound)
+}
+
+// The most made at once through it.
+@(private)
+Largest :: struct {
+	backing: mem.Allocator,
+	most:    int,
+}
+
+@(private)
+largest_allocator :: proc(l: ^Largest) -> mem.Allocator {
+	return {proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+			l := (^Largest)(data)
+			l.most = max(l.most, size)
+			return l.backing.procedure(l.backing.data, mode, size, alignment, old, old_size, loc)
+		}, l}
+}
+
+// Anyone may bring a roster, made up but for the charter, which is the space's own: until its signature is found to be
+// bad, what is made of it is not much larger than it, and nothing is done that takes much longer than reading it.
+@(test)
+made_up_rosters_cost_little :: proc(t: ^testing.T) {
+	root, space := test_root()
+	a := test_keyring()
+	defer keyring_destroy(&a)
+	none: Roster
+	d := draft_from(&none, 100)
+	draft_grant(&d, a.device, a.signer, draft_scope(&d), {.Write}).owner = true
+	genuine, signed := roster_sign(&a, root, &d, context.temp_allocator)
+	r, sound := roster_parse(genuine, space)
+	testing.expect(t, signed && sound)
+	defer roster_destroy(&r)
+	Forged :: struct {
+		scopes, grants, members, claimed, padding: int,
+	}
+	forge :: proc(r: ^Roster, f: Forged) -> []byte {
+		w := make([dynamic]byte, context.temp_allocator)
+		append(&w, ROSTER_MAGIC)
+		append(&w, ..r.space[:])
+		write_bytes(&w, r.charter)
+		write_varint(&w, r.serial + 1)
+		write_varint(&w, u64(f.scopes))
+		for i in 1 ..= f.scopes {
+			write_varint(&w, u64(i))
+			append(&w, 0)
+			write_varint(&w, 1)
+			commit: Key32
+			crypto.rand_bytes(commit[:])
+			append(&w, ..commit[:])
+		}
+		write_varint(&w, u64(f.claimed))
+		for i in 0 ..< f.members {
+			keys: [64]byte
+			crypto.rand_bytes(keys[:])
+			append(&w, ..keys[:])
+			write_bytes(&w, nil)
+			grants := f.grants if i == 0 else 0
+			write_varint(&w, u64(grants))
+			for g in 1 ..= grants {
+				write_varint(&w, u64(g))
+				append(&w, transmute(u8)Rights{.Read, .Write})
+				write_varint(&w, 0)
+			}
+		}
+		for _ in 0 ..< f.padding {
+			append(&w, 0)
+		}
+		write_varint(&w, 0)
+		eph: Key32
+		crypto.rand_bytes(eph[:])
+		append(&w, ..eph[:])
+		write_varint(&w, 0)
+		resize(&w, len(w) + 64) // no signature
+		return w[:]
+	}
+	// So many members said to be there, as there are bytes.
+	big := forge(&r, {claimed = 200_000, padding = 200_000})
+	l := Largest{backing = context.allocator}
+	{
+		context.allocator = largest_allocator(&l)
+		_, sound = roster_parse(big, space)
+	}
+	testing.expect(t, !sound)
+	testing.expectf(t, l.most <= 2 * len(big), "made %d bytes at once of a roster of %d", l.most, len(big))
+	// A great many members, and a great many scopes each with a grant.
+	for f in ([]Forged{{members = 60_000, claimed = 60_000}, {scopes = 60_000, grants = 60_000, members = 1, claimed = 1}}) {
+		forged := forge(&r, f)
+		began := time.tick_now()
+		_, sound = roster_parse(forged, space)
+		took := time.tick_since(began)
+		testing.expect(t, !sound)
+		testing.expectf(t, took < 2 * time.Second, "a made-up roster of %d bytes took %v", len(forged), took)
+	}
 }
