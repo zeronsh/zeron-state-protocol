@@ -76,7 +76,8 @@ Scope :: struct {
 @(private)
 Filling :: struct {
 	bulk:  [4]Bulk,
-	id:    zsp.Id, // gone over so far
+	id:    zsp.Id, // gone over so far,
+	begun: bool, // once one has been: before, the least id there can be may be a row's
 	row:   u32, // the next
 	merging: bool, // all of them are, and
 	ended: int, // so many trees are whole
@@ -701,17 +702,18 @@ scope_step :: proc(s: ^Scope, budget: int) -> bool {
 	n := s.x.n
 	left := budget
 	if !f.merging {
-		scan := zsp.tree_scan(&n.store, n.cells, {f.id[0], f.id[1], max(u64), max(u64), max(u64)}, {(u64(s.id) + 1) << 32, 0, 0, 0, 0})
+		from := zsp.Key{f.id[0], f.id[1], max(u64), max(u64), max(u64)} if f.begun else {f.id[0], f.id[1], 0, 0, 0}
+		scan := zsp.tree_scan(&n.store, n.cells, from, {(u64(s.id) + 1) << 32, 0, 0, 0, 0})
 		for leaf in zsp.tree_next(&scan) {
 			id := zsp.Id{leaf.key[0], leaf.key[1]}
-			if id == f.id {
+			if f.begun && id == f.id {
 				continue
 			}
 			if left <= 0 {
 				return false
 			}
 			left -= 1
-			f.id = id
+			f.id, f.begun = id, true
 			runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 			if row_there(s, id) {
 				row_admit(s, id)
