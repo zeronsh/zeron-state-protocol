@@ -34,6 +34,7 @@ function harness() {
     deferred: [] as (() => void)[],
     later: [] as (() => void)[],
     waits: [] as number[], // what each of those waits
+    timers: 0, // of those, how many are neither done nor cancelled
     closes: 0,
     connects: 0,
     sizes: [] as number[],
@@ -48,9 +49,15 @@ function harness() {
     random: (n) => Uint8Array.from({ length: n }, () => Math.floor(Math.random() * 256)),
     defer: (f) => self.deferred.push(f),
     after: (ms, f) => {
-      self.later.push(f);
+      let live = true;
+      self.timers++;
+      self.later.push(() => {
+        if (live) (live = false), self.timers--, f();
+      });
       self.waits.push(ms);
-      return () => {};
+      return () => {
+        if (live) (live = false), self.timers--;
+      };
     },
     connect: (receive, closed) => {
       self.connects++;
@@ -743,6 +750,54 @@ for (const bad of [
   h.laters();
   h.run();
   assert.equal(h.self.connects, 1, "and does not dial again");
+}
+
+// A client that is closed leaves nothing to be done later, whatever was to be: a window to let go of, a piece to seal,
+// live text to give up on. What an editor had typed is said first, sealed.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const list = h.client.window({ scope: 1, list: "a", table: Note }, () => {});
+  h.run();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  const editor = h.client.text(id, Note.body);
+  editor.append("typed");
+  h.run();
+  const w = codec.writer();
+  codec.putBinary(w, codec.binaryFromHex(id));
+  codec.putU8(w, 17);
+  codec.putBinary(w, rep("v", 8));
+  codec.putVarint(w, 0);
+  codec.putBinary(w, rep("\0", 16));
+  codec.putBinary(w, "\x01\0\0\x02hi");
+  h.tell(9, s(codec.written(w))); // live text, which is given up on if never sealed
+  list.stop();
+  assert(h.self.timers >= 3, `${h.self.timers} things to do`);
+  const cells = h.self.said.filter((x) => x.kind === CELLS).length;
+  h.client.close();
+  assert.equal(h.self.timers, 0, "something was left to be done");
+  assert.equal(h.self.said.filter((x) => x.kind === CELLS).length, cells + 1, "what was typed was not said");
+}
+
+// A node that refuses this client, or speaks another language, closes it: questions asked once are answered as far as
+// they got, and nothing is left to be done later, nor dialled again.
+for (const code of [2, 3]) {
+  const h = harness();
+  h.run();
+  h.greet();
+  let got: Answer<typeof Note> | undefined;
+  void h.client.fetch({ scope: 1, table: Note }).then((x) => (got = x));
+  h.run();
+  h.tell(ERROR, ch(code));
+  await tick();
+  assert.equal(got?.status, "loading", "what was asked once was never answered");
+  assert(!h.client.ready && h.self.timers === 0, "something was left to be done");
+  h.laters();
+  h.run();
+  assert.equal(h.self.connects, 1, "and it was dialled again");
 }
 
 // What is sent for an answer waits for it, and what another answer shows outlives the one that stops.

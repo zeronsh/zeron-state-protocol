@@ -501,6 +501,7 @@ export class Client {
   #typing = new Set<Stored>(); // rows with live text to send
   #tags = new Map<string, string>(); // of lists, by their scope, its key and their name
   #bulk?: Map<Win, Entry[]>; // rows to add to windows, all at once
+  #timers = new Set<() => void>(); // what is to be done later, by the ways to cancel each
 
   constructor(host: Host) {
     const credential = host.credential ?? new Uint8Array();
@@ -586,16 +587,36 @@ export class Client {
       if (well) this.#failures = 0;
       const wait = Math.min(100 * 2 ** this.#failures, 10000);
       this.#failures++;
-      this.#host.after(wait, () => this.#dial());
+      this.#after(wait, () => this.#dial());
     }
   }
 
   /** Lets go of the pipe, saying first whatever is still to be said. Questions asked once are answered as far as they got. */
   close(): void {
+    if (this.#closed) return;
     this.#closed = true;
+    // What editors have typed and not yet sealed is still to be said.
+    if (this.#ready) for (const row of this.#rows.values()) for (const [slot, t] of row.texts) if (t.open !== "") this.#seal(row, slot);
     this.#flush();
     this.#hangUp();
+    // Nothing is left to be done later: a closed client keeps nothing awake.
+    for (const cancel of [...this.#timers]) cancel();
     for (const a of [...this.#asked.values()]) this.#fetched(a);
+  }
+
+  // Runs f later, unless the client is closed first; returns a way to cancel it.
+  #after(ms: number, f: () => void): () => void {
+    if (this.#closed) return () => {};
+    let stop = (): void => {};
+    const cancel = (): void => {
+      if (this.#timers.delete(cancel)) stop();
+    };
+    this.#timers.add(cancel);
+    stop = this.#host.after(ms, () => {
+      this.#timers.delete(cancel);
+      f();
+    });
+    return cancel;
   }
 
   #frame(kind: number, w?: codec.Writer): void {
@@ -730,8 +751,8 @@ export class Client {
       case ERROR: {
         const code = codec.u8(r);
         this.#faulted = true;
-        this.#closed = code === 2 || code === 3; // refused, or speaking another language: trying again is no use
         this.#tell("error", code);
+        if (code === 2 || code === 3) this.close(); // refused, or speaking another language: trying again is no use
         return;
       }
     }
@@ -894,7 +915,7 @@ export class Client {
         win.watching--;
         if (win.watching === 0) {
           // Whoever comes back soon finds it still warm.
-          win.linger = this.#host.after(this.#host.linger, () => this.#forget(win));
+          win.linger = this.#after(this.#host.linger, () => this.#forget(win));
         }
       },
     });
@@ -1651,7 +1672,7 @@ export class Client {
 
   // Live text whose writer vanished before sealing it is not text.
   #expire(row: Stored, slot: number): void {
-    this.#host.after(LIVE_MS, () => {
+    this.#after(LIVE_MS, () => {
       const last = row.lives.get(slot);
       const t = row.texts.get(slot);
       if (last === undefined || !t) return;
@@ -1730,7 +1751,7 @@ export class Client {
     let timer: (() => void) | undefined;
     const schedule = () => {
       if (!timer) {
-        timer = this.#host.after(PIECE_MS, () => {
+        timer = this.#after(PIECE_MS, () => {
           timer = undefined;
           this.#seal(row, slot);
         });

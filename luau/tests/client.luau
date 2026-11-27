@@ -15,7 +15,7 @@ local ANSWER, FETCH = 34, 35
 type Said = { kind: number, body: string }
 
 local function harness()
-	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, waits = {} :: { number }, closes = 0, connects = 0, sizes = {} :: { number }, partial = "" }
+	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, waits = {} :: { number }, timers = 0, closes = 0, connects = 0, sizes = {} :: { number }, partial = "" }
 	local function run()
 		while #self.deferred > 0 do
 			(table.remove(self.deferred, 1) :: any)()
@@ -37,9 +37,23 @@ local function harness()
 			table.insert(self.deferred, f)
 		end,
 		after = function(seconds: number, f: () -> ())
-			table.insert(self.later, f)
+			-- Of what is to be done later, how much is neither done nor cancelled.
+			local live = true
+			self.timers += 1
+			table.insert(self.later, function()
+				if live then
+					live = false
+					self.timers -= 1
+					f()
+				end
+			end)
 			table.insert(self.waits, seconds)
-			return function() end
+			return function()
+				if live then
+					live = false
+					self.timers -= 1
+				end
+			end
 		end,
 		connect = function(receive: any, closed: any)
 			self.connects += 1
@@ -589,6 +603,60 @@ do
 		h.tell(CELLS, "\0" .. cell(one, 2, 1, 1, h.client:_tag(1, "a") .. codec.u64(1)) .. bad(two))
 		assert(h.self.closes == 1, "the pipe was not let go of")
 		assert(#seen.rows == 1, "what came before it was not shown")
+	end
+end
+
+-- A client that is closed leaves nothing to be done later, whatever was to be: a window to let go of, a piece to seal,
+-- live text to give up on. What an editor had typed is said first, sealed.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local list = h.client:window({ scope = 1, list = "a", table = Note }, function() end)
+	h.run()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	local editor = h.client:text(id, Note.body)
+	editor.append("typed")
+	h.run()
+	-- Live text, which is given up on if never sealed.
+	h.tell(9, id .. "\17" .. string.rep("v", 8) .. "\0" .. string.rep("\0", 16) .. "\1\0\0\2hi")
+	list.stop()
+	assert(h.self.timers >= 3, `{h.self.timers} things to do`)
+	local function cells(): number
+		local n = 0
+		for _, x in h.self.said do
+			n += if x.kind == CELLS then 1 else 0
+		end
+		return n
+	end
+	local before = cells()
+	h.client:close()
+	assert(h.self.timers == 0, "something was left to be done")
+	assert(cells() == before + 1, "what was typed was not said")
+end
+
+-- A node that refuses this client, or speaks another language, closes it: questions asked once are answered as far as
+-- they got, and nothing is left to be done later, nor dialled again.
+do
+	for _, code in { 2, 3 } do
+		local h = harness()
+		h.run()
+		h.greet()
+		local got: any = nil
+		coroutine.wrap(function()
+			got = h.client:fetch({ scope = 1, table = Note })
+		end)()
+		h.run()
+		h.tell(ERROR, string.char(code))
+		assert(got and got.status == "loading", "what was asked once was never answered")
+		assert(not h.client.ready and h.self.timers == 0, "something was left to be done")
+		h.laters()
+		h.run()
+		assert(h.self.connects == 1, "and it was dialled again")
 	end
 end
 

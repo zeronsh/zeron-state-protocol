@@ -277,6 +277,7 @@ local function new_client(host: Host)
 		typing = {} :: { [Stored]: boolean }, -- rows with live text to send
 		tags = {} :: { [string]: string }, -- of lists, by their scope, its key and their name
 		bulk = nil :: { [Window]: { { key: string, row: Stored } } }?, -- rows to add to windows, all at once
+		timers = {} :: { [() -> ()]: boolean }, -- what is to be done later, by the ways to cancel each
 	}, Client)
 	self:_dial()
 	return self
@@ -363,19 +364,56 @@ function Client._lost(self: Client)
 		end
 		local wait = math.min(0.1 * 2 ^ self.failures, 10)
 		self.failures += 1
-		self.host.after(wait, function()
+		self:_after(wait, function()
 			self:_dial()
 		end)
 	end
 end
 
 function Client.close(self: Client)
+	if self.closed then
+		return
+	end
 	self.closed = true
+	-- What editors have typed and not yet sealed is still to be said.
+	if self.ready then
+		for _, row in self.rows do
+			for slot, t in row.texts do
+				if t.open ~= "" then
+					self:_seal(row, slot)
+				end
+			end
+		end
+	end
 	self:_flush()
 	self.hang_up()
+	-- Nothing is left to be done later: a closed client keeps nothing awake.
+	for cancel in table.clone(self.timers) do
+		cancel()
+	end
 	for _, a in table.clone(self.asked) do
 		self:_fetched(a) -- as far as it got
 	end
+end
+
+-- Runs f later, unless the client is closed first; returns a way to cancel it.
+function Client._after(self: Client, seconds: number, f: () -> ()): () -> ()
+	if self.closed then
+		return function() end
+	end
+	local stop: () -> () = function() end
+	local function cancel()
+		if self.timers[cancel] then
+			self.timers[cancel] = nil
+			stop()
+		end
+	end
+	self.timers[cancel] = true
+	stop = self.host.after(seconds, function()
+		self.timers[cancel] = nil
+		f()
+	end)
+	return cancel
 end
 
 function Client._frame(self: Client, kind: number, w: codec.Writer?)
@@ -536,8 +574,10 @@ function Client._handle(self: Client, kind: number, r: codec.Reader)
 	elseif kind == ERROR then
 		local code = codec.u8(r)
 		self.faulted = true
-		self.closed = code == 2 or code == 3 -- refused, or speaking another language: trying again is no use
 		self:_tell("error", code)
+		if code == 2 or code == 3 then
+			self:close() -- refused, or speaking another language: trying again is no use
+		end
 	end
 end
 
@@ -739,7 +779,7 @@ function Client.window(self: Client, query: Query, observer: (State) -> ())
 			window.watching -= 1
 			if window.watching == 0 then
 				-- Whoever comes back soon finds it still warm.
-				window.linger = self.host.after(self.host.linger or 5, function()
+				window.linger = self:_after(self.host.linger or 5, function()
 					self:_forget(window)
 				end)
 			end
@@ -1823,7 +1863,7 @@ end
 
 -- Live text whose writer vanished before sealing it is not text.
 function Client._expire(self: Client, row: Stored, slot: number)
-	self.host.after(LIVE_SECONDS, function()
+	self:_after(LIVE_SECONDS, function()
 		local last = row.lives[slot]
 		local t = row.texts[slot]
 		if not last or not t then
@@ -1912,7 +1952,7 @@ function Client.text(self: Client, id: string, col: Column)
 	local timer: (() -> ())? = nil
 	local function schedule()
 		if not timer then
-			timer = self.host.after(PIECE_SECONDS, function()
+			timer = self:_after(PIECE_SECONDS, function()
 				timer = nil
 				self:_seal(row, slot)
 			end)
