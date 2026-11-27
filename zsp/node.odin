@@ -242,9 +242,10 @@ node_take :: proc(n: ^Node, r: Roster) -> bool {
 			send_roster(s) // and to one whose own, older, is still on its way
 		}
 		if !s.ready {
-			// One that waits for a roster, as at a relay that knew none, has it now, whoever brought it, if it is as new
-			// as the one the peer said it has.
-			if s.greeted && s.accepted && !s.closing && s.role != .Open && s.promised <= n.roster.serial {
+			// At a relay, one that waits for a roster, as one that knew none, has it now, whoever brought it, if it is as
+			// new as the one the peer said it has. (A device's waits for its peer's own: it judges whether it is still a
+			// member itself, by that.)
+			if n.keys == nil && s.greeted && s.accepted && !s.closing && s.role == .Peer && s.promised <= n.roster.serial {
 				session_authorize(s)
 			}
 			continue

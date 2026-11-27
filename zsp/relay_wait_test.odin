@@ -1,6 +1,7 @@
 #+build !js
 package zsp
 
+import "core:slice"
 import "core:testing"
 
 // A relay that knows no roster yet cannot say who belongs, and so says nothing yet: a device that has joined, with no
@@ -38,4 +39,147 @@ review_relay_without_roster_waits :: proc(t: ^testing.T) {
 	testing.expect(t, to_b.ready && to_b.fault == .None, "b was not admitted when the roster came")
 	testing.expectf(t, b.node.roster.serial == a.node.roster.serial, "b has roster %x, not %x", b.node.roster.serial, a.node.roster.serial)
 	testing.expect(t, node_member(&b.node), "b is not a member by it")
+}
+
+@(private = "file")
+hello_frame :: proc(space: Key32, serial: u64, calls := false) -> []byte {
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Hello)
+	write_u8(&w, VERSION)
+	write_u8(&w, u8(Hello_Flags{full = !calls, calls = calls}))
+	space := space
+	append(&w, ..space[:])
+	write_varint(&w, serial)
+	write_bytes(&w, nil)
+	frame_end(&w, at)
+	return w[:]
+}
+
+@(private = "file")
+roster_frame :: proc(bytes: []byte) -> []byte {
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Roster)
+	append(&w, ..bytes)
+	frame_end(&w, at)
+	return w[:]
+}
+
+// Rosters for these tests: three members of scope 1, and then one that revokes the second.
+@(private = "file")
+Three :: struct {
+	root, space:  Key32,
+	keys:         [3]Keyring,
+	r1, r2_b:     []byte,
+	serial:       u64, // of the second that revokes
+}
+
+@(private = "file")
+three_init :: proc(x: ^Three) {
+	x.root = Key32{0 = 11, 1 = 22}
+	x.space = ed25519_public(x.root)
+	for &k, i in x.keys {
+		keyring_init(&k, Key32{1 = u8(i + 1)})
+	}
+	none: Roster
+	d := draft_from(&none, 1000 << 16)
+	scope := draft_scope(&d)
+	for &k in x.keys {
+		draft_grant(&d, k.device, k.signer, scope, {.Read, .Write, .Call})
+	}
+	ok: bool
+	x.r1, ok = roster_sign(&x.keys[0], x.root, &d)
+	assert(ok)
+	r1, _ := roster_parse(x.r1, x.space)
+	defer roster_destroy(&r1)
+	d3 := draft_from(&r1, 2000 << 16)
+	draft_revoke(&d3, x.keys[1].device, scope)
+	x.r2_b, ok = roster_sign(&x.keys[0], x.root, &d3)
+	assert(ok)
+	r2, _ := roster_parse(x.r2_b, x.space)
+	defer roster_destroy(&r2)
+	x.serial = r2.serial
+}
+
+@(private = "file")
+three_destroy :: proc(x: ^Three) {
+	for &k in x.keys {
+		keyring_destroy(&k)
+	}
+	delete(x.r1)
+	delete(x.r2_b)
+}
+
+// A relay that sleeps keeps only sessions that are ready: one that has not yet said hello, or whose peer said it has a
+// roster newer than the relay's and has not yet shown it, is not taken for ready when the relay wakes, by the roster the
+// relay has then or by an older one the peer shows; it connects again.
+@(test)
+review_hibernation_keeps_only_ready_sessions :: proc(t: ^testing.T) {
+	x: Three
+	three_init(&x)
+	defer three_destroy(&x)
+	disk: Memory_Disk
+	defer memory_disk_destroy(&disk)
+	n: Node
+	testing.expect(t, node_init(&n, memory_disk(&disk), x.space, nil, true))
+	defer node_destroy(&n)
+	n.now = 3000
+	testing.expect(t, node_adopt(&n, x.r1))
+	saved := make([dynamic]byte, context.temp_allocator)
+
+	silent := session_open(&n, .Peer, false, x.keys[2].device)
+	testing.expect(t, !session_save(silent, &saved), "a session that has not said hello was kept")
+
+	waiting := session_open(&n, .Peer, false, x.keys[1].device)
+	testing.expect(t, session_input(waiting, hello_frame(x.space, x.serial + 100)))
+	session_sent(waiting, len(session_output(waiting)))
+	testing.expect(t, waiting.greeted && waiting.accepted && !waiting.ready)
+	clear(&saved)
+	testing.expect(t, !session_save(waiting, &saved), "a session waiting for the roster its peer promised was kept")
+
+	// And one saved so, as by an earlier version, is not woken; saved ready, it is.
+	ready := session_open(&n, .Peer, false, x.keys[1].device)
+	ready.greeted, ready.accepted, ready.ready, ready.cursor = true, true, true, n.events.next
+	session_sent(ready, len(session_output(ready)))
+	clear(&saved)
+	testing.expect(t, session_save(ready, &saved))
+	session_close(ready)
+	flags := 1 // after the id's varint
+	for saved[flags - 1] & 0x80 != 0 {
+		flags += 1
+	}
+	unready := slice.clone(saved[:], context.temp_allocator)
+	unready[flags] &~= 4
+	_, woke := session_load(&n, unready)
+	testing.expect(t, !woke, "a session saved as not ready was woken")
+	again, woke_ready := session_load(&n, saved[:])
+	testing.expect(t, woke_ready, "a session saved ready was not woken")
+	if woke_ready {
+		session_close(again)
+	}
+}
+
+// A device judges, by the roster its peer itself shows, both the peer and whether it still belongs: one that waits for a
+// peer's roster is not taken for ready by another's, as one revoking this device.
+@(test)
+review_device_waits_for_its_peers_roster :: proc(t: ^testing.T) {
+	x: Three
+	three_init(&x)
+	defer three_destroy(&x)
+	disk: Memory_Disk
+	defer memory_disk_destroy(&disk)
+	n: Node
+	testing.expect(t, node_init(&n, memory_disk(&disk), x.space, &x.keys[1], true))
+	defer node_destroy(&n)
+	n.now = 3000
+	testing.expect(t, node_adopt(&n, x.r1) && node_member(&n))
+	owner := session_open(&n, .Peer, false, x.keys[0].device)
+	peer := session_open(&n, .Peer, false, x.keys[2].device)
+	calls := session_open(&n, .Calls, false, x.keys[2].device)
+	testing.expect(t, session_input(owner, hello_frame(x.space, x.serial)))
+	testing.expect(t, session_input(peer, hello_frame(x.space, x.serial)))
+	testing.expect(t, session_input(calls, hello_frame(x.space, x.serial, calls = true)))
+	_ = session_input(owner, roster_frame(x.r2_b)) // which revokes this device, and so ends this session
+	testing.expect(t, !node_member(&n))
+	testing.expectf(t, !peer.ready, "a peer's session was taken for ready on a device no longer a member")
+	testing.expectf(t, !calls.ready, "a session for calls was taken for ready on a device no longer a member")
 }

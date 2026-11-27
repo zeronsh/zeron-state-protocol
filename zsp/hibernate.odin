@@ -11,9 +11,10 @@ session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 		return false
 	}
 	// Nor anything more that is not saved: changes it has yet to be sent (as where storage answered "not yet"), counts
-	// owed for them, a comparison owed, an acknowledgement owed, or the host's verdict on it. Better it reconnects than
-	// misses any.
-	if s.cursor != n.events.next || s.counts_due || s.recompare || s.seq_in > s.acked_in || (s.greeted && !s.accepted) {
+	// owed for them, a comparison owed, an acknowledgement owed, or anything short of its being ready: its Hello, the
+	// host's verdict on it, or the roster its peer said it had, which is not kept. Better it reconnects than misses any,
+	// or than wakes taken for what it never proved.
+	if s.cursor != n.events.next || s.counts_due || s.recompare || s.seq_in > s.acked_in || (s.greeted && !s.accepted) || !s.ready {
 		return false
 	}
 	// Nor a call it carries, which is not saved: woken, the node would number its next call as one the other side still
@@ -81,7 +82,8 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 	for x in n.sessions {
 		taken ||= x.id == s.id
 	}
-	if r.bad || s.id == 0 || taken || flags & ~u8(31) != 0 || (s.ready && (m == nil || !member_active(m))) {
+	// Only a session that was ready is ever saved: one said to be otherwise is not this node's either.
+	if r.bad || s.id == 0 || taken || flags & ~u8(31) != 0 || flags & 7 != 7 || m == nil || !member_active(m) {
 		free(s)
 		return nil, false
 	}
