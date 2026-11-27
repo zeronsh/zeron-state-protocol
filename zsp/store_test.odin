@@ -17,6 +17,44 @@ seeded :: proc(seed: u64) -> rand.Default_Random_State {
 	return rand.create(seed)
 }
 
+// Keys put in order before others already there, as the end of a list had first and then all that comes before it, fill
+// their pages, as keys put at the end do: not each page left half empty, as splitting in halves would leave it.
+@(test)
+tree_runs_fill_their_pages :: proc(t: ^testing.T) {
+	m: Memory_Disk
+	defer memory_disk_destroy(&m)
+	s: Store
+	testing.expect(t, store_open(&s, memory_disk(&m)))
+	defer store_close(&s)
+	tr: Tree
+	for i in 10_000 ..< 10_050 {
+		tree_put(&s, &tr, Key{u64(i), 0, 0, 0, 0}, {})
+	}
+	for i in 0 ..< 10_000 {
+		tree_put(&s, &tr, Key{u64(i), 0, 0, 0, 0}, {})
+	}
+	leaves :: proc(p: ^Pager, no: Page_No) -> int {
+		pg := page(p, no)
+		if pg.level == 0 {
+			return 1
+		}
+		n := 0
+		for b in pg.branch[:pg.count] {
+			n += leaves(p, b.child)
+		}
+		return n
+	}
+	scan := tree_scan(&s, tr, KEY_MIN, KEY_MAX)
+	want := u64(0)
+	for leaf in tree_next(&scan) {
+		testing.expect_value(t, leaf.key[0], want)
+		want += 1
+	}
+	testing.expect_value(t, want, 10_050)
+	least := (10_050 + LEAF_CAP - 1) / LEAF_CAP
+	testing.expectf(t, leaves(&s, tr.root) <= least + 2, "%d leaves, where %d would hold them", leaves(&s, tr.root), least)
+}
+
 @(test)
 tree_matches_model :: proc(t: ^testing.T) {
 	state := seeded(1)

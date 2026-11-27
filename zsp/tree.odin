@@ -57,6 +57,7 @@ Pager :: struct {
 
 Tree :: struct {
 	root: Page_No, // zero when empty
+	last: Key, // the key last put, kept only while open: where a run of puts is going (see put)
 }
 
 @(require_results)
@@ -203,9 +204,11 @@ tree_put :: proc(p: ^Pager, t: ^Tree, key: Key, val: Print) {
 		pg.leaf[0] = {key, val}
 		pg.count = 1
 		t.root = no
+		t.last = key
 		return
 	}
-	left, split, right := put(p, t.root, &key, val)
+	left, split, right, _ := put(p, t.root, &key, val, t.last)
+	t.last = key
 	t.root = left
 	if right.child != 0 {
 		no, pg := page_new(p, page(p, left).level + 1)
@@ -217,8 +220,12 @@ tree_put :: proc(p: ^Pager, t: ^Tree, key: Key, val: Print) {
 	}
 }
 
+// A page that is full splits in two halves; but appended to, at the right edge, it stays full and the new key begins
+// another; and put to where the key last put went, just after it, as keys in order are put before others already there
+// (the end of a list, had first, and then all that comes before it), it splits there, and the run goes on in the left
+// page until it is full, and then in pages of its own, each left full: in halves, every one would stay half empty.
 @(private)
-put :: proc(p: ^Pager, no: Page_No, key: ^Key, val: Print) -> (left: Page_No, split: Key, right: Branch) {
+put :: proc(p: ^Pager, no: Page_No, key: ^Key, val: Print, last: Key) -> (left: Page_No, split: Key, right: Branch, run: bool) {
 	pg: ^Page
 	left, pg = page_own(p, no)
 
@@ -235,13 +242,13 @@ put :: proc(p: ^Pager, no: Page_No, key: ^Key, val: Print) -> (left: Page_No, sp
 			pg.count += 1
 			return
 		}
-		// Appending at the right edge leaves the full page full.
-		at := n if i == n else n / 2
+		run = i > 0 && i < n && pg.leaf[i - 1].key == last
+		at := n if i == n else i if run else n / 2
 		r_no, r := page_new(p, 0)
 		r.count = u16(copy(r.leaf[:], pg.leaf[at:n]))
 		pg.count = u16(at)
 		into, j := pg, i
-		if i >= at {
+		if i >= at && !run {
 			into, j = r, i - at
 		}
 		m := int(into.count)
@@ -254,7 +261,7 @@ put :: proc(p: ^Pager, no: Page_No, key: ^Key, val: Print) -> (left: Page_No, sp
 	}
 
 	i := branch_find(pg, key)
-	child, child_split, child_right := put(p, pg.branch[i].child, key, val)
+	child, child_split, child_right, child_run := put(p, pg.branch[i].child, key, val, last)
 	pg.branch[i] = branch_of(pg.branch[i].key, child, page(p, child))
 	if child_right.child == 0 {
 		return
@@ -268,7 +275,8 @@ put :: proc(p: ^Pager, no: Page_No, key: ^Key, val: Print) -> (left: Page_No, sp
 		pg.count += 1
 		return
 	}
-	at := n if i == n else n / 2
+	run = child_run && i < n
+	at := n if i == n else i if run else n / 2
 	r_no, r := page_new(p, pg.level)
 	r.count = u16(copy(r.branch[:], pg.branch[at:n]))
 	pg.count = u16(at)

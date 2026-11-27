@@ -413,6 +413,8 @@ const bench = async () => {
 // end of a list is shown, how soon a large text is, and what each comes to hold, in memory and in storage.
 const partialBench = async () => {
   const ROWS = Number(process.argv[3] ?? 100000), TEXTS = 20, TEXT = 400_000, WAIT = 300_000;
+  // With LINGER=ms, what is held is measured so long after it is all there, once the store has had time to tidy up.
+  const linger = () => new Promise((done) => setTimeout(done, Number(process.env.LINGER ?? 0)));
   const Row = { title: columns.string(16), body: columns.text(17) };
   const { open: openNode } = await import("../src/nodejs.ts");
   const { readdirSync, statSync } = await import("node:fs");
@@ -506,7 +508,11 @@ const partialBench = async () => {
       });
       // And then, once a full one holds everything, and a partial one has had a while: what it holds, in memory and on disk.
       const whole = await settle(full, () => d.usage().then((u) => u.held), t0);
+      await linger();
       const u = await d.usage();
+      if (process.env.DU)
+        for (const e of readdirSync(dir, { withFileTypes: true, recursive: true }))
+          if (e.isFile()) console.log(`     ${join(e.parentPath, e.name).slice(dir.length)} ${mb(statSync(join(e.parentPath, e.name)).size)}`);
       results.push([net.name, "Node", full ? "full" : "partial", ms(tail), ms(text), whole, mb(u.held), mb(u.memory), mb(du(dir))]);
       console.log("     " + results[results.length - 1].join(" | "));
       c.close();
@@ -526,6 +532,7 @@ const partialBench = async () => {
       const ctailAll = ctail < 0 ? -1 : performance.now() - t2;
       const ctext = await call<number>(p, "timeText", store, "docs", TEXT, WAIT);
       const cwhole = await settle(full, () => call<{ held: number }>(p, "usage", store).then((u) => u.held), t2);
+      await linger();
       if (profiled) await summarise((await p.cdp<{ profile: any }>("Profiler.stop", {}, profiled)).profile);
       const cu = await call<{ held: number; memory: number }>(p, "usage", store);
       const after = await call<number>(p, "estimate");
