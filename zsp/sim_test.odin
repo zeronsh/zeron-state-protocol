@@ -3238,7 +3238,8 @@ took_counts_alike :: proc(t: ^testing.T) {
 }
 
 // A relay does not sleep owing a peer word of what it took, which it holds what it sends to a window by; and woken, it
-// goes on saying what it takes to a peer that says what it took.
+// goes on saying what it takes to a peer that says what it took. It may sleep with what it sent yet to be said to have
+// come: woken, that much is yet to be said, and what the peer says of it is taken for it, not for what is sent after.
 @(test)
 sleeps_having_said_what_it_took :: proc(t: ^testing.T) {
 	state := seeded(113)
@@ -3269,24 +3270,31 @@ sleeps_having_said_what_it_took :: proc(t: ^testing.T) {
 	exchange(t, at, l.a) // it says so
 	clear(&saved)
 	testing.expect(t, session_save(at, &saved))
-	// Cells come, are kept, and are acknowledged: and until the peer says that has come, it does not sleep.
+	// Cells come, are kept, and are acknowledged: and it may sleep before the peer says that has come.
 	sim_put(&s, s.nodes[0], 2)
 	exchange(t, l.a, at)
 	testing.expect(t, node_sync(&s.nodes[1].node))
 	said := slice.clone(session_output(at), context.temp_allocator)
 	session_sent(at, len(said))
+	in_flight := window_in_flight(at)
+	testing.expect(t, in_flight > 0, "nothing on its way")
 	clear(&saved)
-	testing.expect(t, !session_save(at, &saved), "a relay would sleep with what it sent not yet said to have come")
-	testing.expect(t, session_input(l.a, said))
-	exchange(t, l.a, at)
-	exchange(t, at, l.a)
-	clear(&saved)
-	testing.expect(t, session_save(at, &saved))
+	testing.expect(t, session_save(at, &saved), "a relay would not sleep with what it sent not yet said to have come")
 	sim_cut(&s, 0)
 	revived, ok := session_load(&s.nodes[1].node, saved[:])
 	testing.expect(t, ok)
 	if ok {
 		testing.expect(t, revived.peer_took)
+		testing.expect_value(t, window_in_flight(revived), in_flight)
+		testing.expect_value(t, revived.window.held, 0) // nothing timed: a round trip across a sleep is not the way's
+		// The peer says it took it: and then nothing is on its way.
+		took: [dynamic]byte
+		defer delete(took)
+		at := frame_begin(&took, .Took)
+		write_varint(&took, in_flight)
+		frame_end(&took, at)
+		testing.expect(t, session_input(revived, took[:]))
+		testing.expect_value(t, window_in_flight(revived), 0)
 		session_close(revived)
 	}
 	free_all(context.temp_allocator)

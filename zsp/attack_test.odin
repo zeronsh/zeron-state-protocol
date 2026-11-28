@@ -364,7 +364,7 @@ only_what_was_saved_is_resumed :: proc(t: ^testing.T) {
 		return w[:]
 	}
 	flags := saved[1] if at_relay.id < 128 else saved[2]
-	for bad in ([][]byte{odd(saved[:], 0, flags), odd(saved[:], u64(at_relay.id), flags), odd(saved[:], 999, flags | 64), odd(saved[:], 999, flags | 128)}) {
+	for bad in ([][]byte{odd(saved[:], 0, flags), odd(saved[:], u64(at_relay.id), flags), odd(saved[:], 999, flags & ~u8(4)), odd(saved[:], 999, flags | 128)}) {
 		revived, ok := session_load(&relay.node, bad)
 		testing.expect(t, !ok)
 		if ok {

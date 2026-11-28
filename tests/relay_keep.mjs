@@ -202,6 +202,31 @@ const until = async (f) => { for (let i = 0; i < 2000 && !f(); i++) await new Pr
   } finally { await r.close(); }
 }
 
+// Evicted with what it sent to a device not yet said by it to have come, as on a busy machine, where the device's word
+// of it is still on its way: the connection is kept even so, and woken, it goes on, what it sent then taken for what it
+// was, and what is said after reaching it.
+{
+  const r = await relayWith(2, { STATS: "1" });
+  try {
+    const [, wsB] = r.serverSockets, [clientA] = r.clients;
+    const held = [];
+    const handle = r.doSpace.webSocketMessage.bind(r.doSpace);
+    r.doSpace.webSocketMessage = (ws, m) => (ws === wsB ? held.push(m) : handle(ws, m)); // B's word, on its way
+    await clientA.write(1, (ch) => ch.insert(schema, "items", 1, { body: new Uint8Array(64).fill(1) }));
+    assert(await until(() => r.states[1].rows.length === 1), "B had what was written");
+    await r.doSpace.fetch(new Request(`http://relay.local/${r.spaceId}?evict`));
+    delete r.doSpace.webSocketMessage;
+    for (const m of held) await r.doSpace.webSocketMessage(wsB, m);
+    await new Promise((go) => setTimeout(go, 400));
+    const live = r.ctx.getWebSockets();
+    assert(live.includes(wsB) && kept(wsB), "evicted before B said what it took, its connection was not kept: it had to dial again");
+    assert(live.length === 2 && live.every(kept), `and then ${live.filter(kept).length} of ${live.length} kept`);
+    await clientA.write(1, (ch) => ch.insert(schema, "items", 2, { body: new Uint8Array(64).fill(2) }));
+    assert(await until(() => r.states[1].rows.length === 2), "and what is said after waking reaches it");
+    console.log("ok   a relay evicted before a device said what it took keeps its connection to it");
+  } finally { await r.close(); }
+}
+
 // With PR #5's checkpoint once writing stops: the burst is over, the checkpoint taken when quiet, and only then are
 // the connections kept, as they are after it; an object woken from that resumes both, and goes on.
 {

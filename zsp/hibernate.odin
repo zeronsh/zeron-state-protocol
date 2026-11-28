@@ -7,7 +7,8 @@ package zsp
 @(require_results)
 session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 	n := s.node
-	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || !tasks_idle(s) || len(s.refused) > 0 || s.closing || took_owed(s) || (window_held(s) && window_in_flight(s) > 0) {
+	// Nor owing word of what it took: the peer, its window shut, might wait for it while this sleeps waiting for the peer.
+	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || !tasks_idle(s) || len(s.refused) > 0 || s.closing || took_owed(s) {
 		return false
 	}
 	// Nor anything more that is not saved: changes it has yet to be sent (as where storage answered "not yet"), counts
@@ -22,16 +23,22 @@ session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 	if node_calling(n, s) {
 		return false
 	}
+	// What was sent and is yet to be said to have been taken is kept, as so much made and none of it taken: what the peer
+	// says of it once this wakes is taken for it, not for what is sent after. Not its round trips, which are timed afresh.
+	in_flight := window_in_flight(s) if window_held(s) else 0
 	write_varint(w, u64(s.id))
 	write_u8(
 		w,
-		(1 if s.greeted else 0) | (2 if s.accepted else 0) | (4 if s.ready else 0) | (8 if s.peer_full else 0) | (16 if s.peer_relay else 0) | (32 if s.peer_took else 0),
+		(1 if s.greeted else 0) | (2 if s.accepted else 0) | (4 if s.ready else 0) | (8 if s.peer_full else 0) | (16 if s.peer_relay else 0) | (32 if s.peer_took else 0) | (64 if in_flight > 0 else 0),
 	)
 	append(w, ..s.peer[:])
 	write_varint(w, s.peer_serial)
 	write_varint(w, s.seq_out)
 	write_varint(w, s.seq_in)
 	write_varint(w, s.acked_in)
+	if in_flight > 0 {
+		write_varint(w, in_flight)
+	}
 	for &x in s.watches {
 		write_varint(w, x.id)
 		interest: u64
@@ -71,12 +78,18 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 	s.ready = flags & 4 != 0
 	s.peer_full = flags & 8 != 0
 	s.peer_relay = flags & 16 != 0
-	s.peer_took = flags & 32 != 0 // and what was said to it before is taken as taken: it slept with nothing to say
+	s.peer_took = flags & 32 != 0
 	s.peer = read_key32(&r)
 	s.peer_serial = read_varint(&r)
 	s.seq_out = read_varint(&r)
 	s.seq_in = read_varint(&r)
 	s.acked_in = read_varint(&r)
+	in_flight: u64
+	if flags & 64 != 0 {
+		in_flight = read_varint(&r)
+	}
+	// So much made and not yet said to have been taken, none of it timed.
+	s.taken, s.window.counted, s.window.next = in_flight, in_flight, in_flight
 	s.cursor = n.events.next
 	m := roster_member(&n.roster, s.peer)
 	taken := false // another session has its id: what was saved is not this node's
@@ -84,7 +97,8 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 		taken ||= x.id == s.id
 	}
 	// Only a session that was ready is ever saved: one said to be otherwise is not this node's either.
-	if r.bad || s.id == 0 || taken || flags & ~u8(63) != 0 || flags & 7 != 7 || m == nil || !member_active(m) {
+	in_flight_bad := flags & 64 != 0 && (flags & 32 == 0 || in_flight == 0 || in_flight > 2 * WINDOW_MAX)
+	if r.bad || s.id == 0 || taken || flags & ~u8(127) != 0 || flags & 7 != 7 || in_flight_bad || m == nil || !member_active(m) {
 		free(s)
 		return nil, false
 	}
