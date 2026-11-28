@@ -395,3 +395,30 @@ checkpoint_under_way_holds_only_so_much :: proc(t: ^testing.T) {
 	testing.expect(t, census(&s) == want && !s.failed)
 	store_close(&s)
 }
+
+// A checkpoint under way that storage failed under is not finished, however it is asked to be: no header is written,
+// nothing more counted on, and nothing dropped.
+@(test)
+a_failed_store_finishes_no_checkpoint :: proc(t: ^testing.T) {
+	for step in 0 ..< 2 {
+		p: Power_Disk
+		defer power_destroy(&p)
+		s: Store
+		testing.expect(t, store_open(&s, power_disk(&p)))
+		body := [4]byte{1, 2, 3, 4}
+		store_commit(&s, {{row = {1 << 32, 1}, slot = 16, kind = .Value, stamp = {1, 0}, body = body[:]}})
+		testing.expect(t, store_checkpoint_start(&s) && s.flight.step == .Durable)
+		if step == 1 {
+			for s.flight.step == .Durable && len(p.asks) > 0 {
+				testing.expect(t, power_answer(&p, &s, 0))
+			}
+			testing.expect(t, s.flight.step == .Header)
+		}
+		writes := p.seq
+		generation, synced := s.generation, s.synced
+		s.failed = true
+		testing.expect(t, !store_checkpoint(&s))
+		testing.expect(t, p.seq == writes && s.generation == generation && s.synced == synced, "nothing more written or counted on")
+		store_close(&s)
+	}
+}

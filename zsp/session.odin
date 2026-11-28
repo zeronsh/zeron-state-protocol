@@ -445,6 +445,9 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 @(require_results)
 session_output :: proc(s: ^Session) -> []byte {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	if s.node.failed {
+		return nil // storage failed: nothing more is said, whoever asks, of what may be lost
+	}
 	if s.ready && !s.closing {
 		pump(s)
 	}
@@ -453,6 +456,9 @@ session_output :: proc(s: ^Session) -> []byte {
 
 // What is queued for the peer already, without making more: for a host to send in the midst of the session's work.
 session_queued :: proc(s: ^Session) -> []byte {
+	if s.node.failed {
+		return nil
+	}
 	cells_close(s) // whole frames only: cells being gathered are ended here, and go on in another
 	return s.out[s.sent:]
 }
@@ -2029,7 +2035,9 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 		} else if _, held := tree_get(&n.store, n.cells, cell_key(c.row, c.slot, c.kind, c.stamp)); held {
 			continue // whatever it says, it goes no further: most often, it came by two roads
 		} else if !cell_welcome(s, c) {
-			if len(s.refused) == 0 || s.refused[len(s.refused) - 1] != c.row {
+			// Each row once a frame, and once a run of frames, but never across what an acknowledgement owed already says
+			// (ack_prior): that one says it of its own frames, and this of these.
+			if len(s.refused) == s.ack_prior.refused || s.refused[len(s.refused) - 1] != c.row {
 				append(&s.refused, c.row)
 			}
 			if len(s.refused) > MAX_REFUSED {
@@ -2197,7 +2205,7 @@ send_live :: proc(s: ^Session, l: ^Live, whole := false) -> bool {
 	write_stamp(&s.out, l.stamp)
 	append(&s.out, ..l.body)
 	frame_end(&s.out, at)
-	if s.datagram != nil && s.datagram(s.datagram_data, s.out[start:]) {
+	if s.datagram != nil && !s.node.failed && s.datagram(s.datagram_data, s.out[start:]) {
 		resize(&s.out, start)
 	}
 	return true
@@ -2901,7 +2909,9 @@ pump :: proc(s: ^Session) {
 		clear(&s.queued)
 	}
 	cells_close(s)
-	if s.seq_in > s.acked_in && n.synced >= s.ack_at {
+	if n.failed {
+		// Nothing is acknowledged once storage has failed: what was written may be lost.
+	} else if s.seq_in > s.acked_in && n.synced >= s.ack_at {
 		at := frame_begin(&s.out, .Ack)
 		write_varint(&s.out, s.seq_in)
 		for row in s.refused {

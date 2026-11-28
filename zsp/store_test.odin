@@ -517,3 +517,24 @@ committed_meanwhile_is_synced_next :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.synced, store_tail(&s))
 	testing.expect_value(t, len(a.tokens), 0) // and nothing more, with nothing more to make durable
 }
+
+// Once storage has failed, nothing more is said: no acknowledgement, of what was synced before or not, and nothing else,
+// whatever path asks, as what was written may be lost.
+@(test)
+nothing_is_said_once_storage_failed :: proc(t: ^testing.T) {
+	state := seeded(42)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 0, ring = 64)
+	defer sim_destroy(&s)
+	x := s.nodes[0]
+	c := reader_open(x, "as ann")
+	defer reader_close(&c)
+	_ = session_output(c.s)
+	session_sent(c.s, len(session_output(c.s)))
+	reader_write(x, &c, 1, "one")
+	testing.expect(t, store_sync(&x.node.store))
+	x.node.failed = true // as a checkpoint after it might find
+	testing.expect_value(t, len(session_output(c.s)), 0)
+	testing.expect_value(t, len(session_queued(c.s)), 0)
+}
