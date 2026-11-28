@@ -3,7 +3,7 @@
 // Nothing runs unless something happened: an idle device sets no timer but the one that pings its relays.
 
 import { Store } from "./store.ts";
-import { StoreLocked, type Volume } from "./volume.ts";
+import { StoreLocked, Uncertain, type Volume } from "./volume.ts";
 
 /** A pipe to a node: what a client sends and is sent. */
 export interface Wire {
@@ -182,6 +182,7 @@ export class Node {
   #failure?: Error;
   #waiting: (() => void)[] = [];
   #onFailure?: (error: Error) => void;
+  #keepsFailed = 0; // keys and rosters that could not be kept, which may or may not be found kept at the next start
   #toldFailure = false;
 
   /**
@@ -361,10 +362,13 @@ export class Node {
     }
   }
 
-  // A space this device was becoming one of, and is not, for what makes it so could not be kept: the node stops at once,
-  // as of no space, and is of none at the next start either.
-  #unkept(why: string): Error {
-    const error = new Error(`storage failed: the node has stopped rather than be of a space it did not keep (${why})`);
+  // A space this device was becoming one of, and is not, for what makes it so could not be kept: the node stops at once, as
+  // of no space. At the next start it may be of it all the same, for what was written of it may be read back, its flush
+  // failed: so it is Uncertain.
+  #unkept(why: string, written = true): Error {
+    const error = written
+      ? new Uncertain(`storage failed: the node has stopped rather than be of a space it may not have kept (${why})`)
+      : new Error(`storage failed: the node has stopped rather than be of a space it did not keep (${why})`);
     this.#space = undefined;
     this.#fail(error);
     return error;
@@ -379,19 +383,30 @@ export class Node {
       this.#bytes(wasm.buffer(roster.length), roster.length).set(roster);
       if (roster.length < 38 || !wasm.genuine(roster.length)) return false;
       this.#start(roster.slice(6, 38));
-      if (!this.#adopt(roster)) return this.#unkept("its first roster could not be kept"), false;
+      const failed = this.#keepsFailed;
+      if (!this.#adopt(roster, false)) {
+        const error = this.#unkept("its first roster could not be kept", this.#keepsFailed !== failed);
+        if (error instanceof Uncertain) throw error;
+        return false; // as before: refused, nothing of it written
+      }
       this.#keepSpace(roster.slice(6, 38));
       return true;
     }
     return this.#adopt(roster);
   }
 
-  // Whether the roster is taken and kept: a roster said not to be taken is not found taken at the next start.
-  #adopt(roster: Uint8Array): boolean {
+  // Whether the roster is taken and kept: a roster said not to be taken is not found taken at the next start. One that
+  // could not be kept as it was taken may be found taken all the same: Uncertain, thrown unless the caller says so itself.
+  #adopt(roster: Uint8Array, throws = true): boolean {
     const wasm = this.#wasm!;
+    const failed = this.#keepsFailed;
     this.#bytes(wasm.buffer(roster.length), roster.length).set(roster);
     const ok = wasm.adopt(roster.length) !== 0;
     this.#kick();
+    if (this.#keepsFailed !== failed) {
+      if (!throws) return false;
+      throw new Uncertain("storage failed as the roster was taken: it may or may not have been");
+    }
     return ok;
   }
 
@@ -405,7 +420,8 @@ export class Node {
     if (n < 32) throw new Error("could not make a space");
     const made = this.#bytes(wasm.data(), n).slice();
     this.#start(made.subarray(0, 32));
-    if (!this.#adopt(made.subarray(32))) throw this.#unkept("could not take the space's first roster");
+    const failed = this.#keepsFailed;
+    if (!this.#adopt(made.subarray(32), false)) throw this.#unkept("could not take the space's first roster", this.#keepsFailed !== failed);
     this.#keepSpace(made.subarray(0, 32));
     return this.#space!;
   }
@@ -517,9 +533,13 @@ export class Node {
   #govern(op: number, payload: Uint8Array): number {
     this.#working();
     const wasm = this.#wasm!;
+    // Storage that had failed before refuses the change before it is begun; storage failing as it is made may leave what was
+    // written of it to be read back at the next start, its flush failed.
+    const failedBefore = this.#keepsFailed > 0 || this.#store.failure !== undefined;
     this.#bytes(wasm.buffer(payload.length), payload.length).set(payload);
     const r = wasm.govern(op, payload.length);
     this.#kick();
+    if (r === -7 && !failedBefore) throw new Uncertain(`${REFUSED[r]}, as this was done: it may or may not have been`);
     if (r < 0) throw new Error(REFUSED[r] ?? "the roster could not be changed");
     return r;
   }
@@ -662,12 +682,12 @@ export class Node {
       if (this.#options.log) this.#options.log(level, text);
       else if (level !== "debug") console[level === "warning" ? "warn" : level === "info" ? "log" : "error"]("zsp:", text);
     };
-    const guard = <T>(f: () => T, otherwise: T): T => {
+    const guard = <T>(f: () => T, otherwise: T | (() => T)): T => {
       try {
         return f();
       } catch (e) {
         log("error", String(e));
-        return otherwise;
+        return typeof otherwise === "function" ? (otherwise as () => T)() : otherwise;
       }
     };
     const decoder = new TextDecoder();
@@ -684,7 +704,8 @@ export class Node {
       find_read: (no: number, ptr: number) => guard(() => this.#store.findRead(no, view(ptr, 4096)), false),
       find_write: (no: number, ptr: number, len: number) => guard(() => this.#store.findWrite(no, view(ptr, len)), false),
       find_sync: () => this.#store.findSync(),
-      keep: (what: number, ptr: number, len: number) => guard(() => (this.#store.keep(what === 0 ? "keys" : "roster", view(ptr, len).slice()), true), false),
+      // Counted should it fail, for what was written of it may be read back at the next start, its flush failed.
+      keep: (what: number, ptr: number, len: number) => guard(() => (this.#store.keep(what === 0 ? "keys" : "roster", view(ptr, len).slice()), true), () => (this.#keepsFailed++, false)),
       now: () => Date.now(),
       dial: (id: number, ptr: number, len: number) => this.#dial(id, decoder.decode(view(ptr, len))),
       send: (id: number, ptr: number, len: number) => this.#send(id, view(ptr, len)),

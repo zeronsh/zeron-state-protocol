@@ -178,7 +178,7 @@ const zsp = {
   async scopeLater(name: string): Promise<void> {
     void devices.get(name)!.scope().then(
       (n) => asked.push(String(n)),
-      (e: Error) => asked.push("error: " + e.message),
+      (e: Error) => asked.push(`error: ${e.name}: ${e.message}`), // Uncertain told apart
     );
   },
   async asked(): Promise<string[]> {

@@ -70,6 +70,11 @@ export class OpfsVolume implements Volume {
   #files = new Set<OpfsFile>(); // open
   /** How many things have been done to its files, tries included: that whoever uses it is getting on, not stuck. */
   steps = 0;
+  /**
+   * How often a file of it failed to be written, cut short or flushed: what was being made durable then may or may not be,
+   * for what was written of it may be read back once the store is opened again, though its flush failed.
+   */
+  failures = 0;
 
   private constructor(dir: FileSystemDirectoryHandle) {
     this.#dir = dir;
@@ -105,7 +110,7 @@ export class OpfsVolume implements Volume {
       h.close(); // let go of as it was had: closed with the rest
       throw new Error("the store was let go of as its file " + name + " was opened");
     }
-    const f = new OpfsFile(h, () => this.#files.delete(f));
+    const f = new OpfsFile(h, () => this.#files.delete(f), () => void this.failures++);
     this.#files.add(f);
     return f;
   }
@@ -153,10 +158,22 @@ export class OpfsVolume implements Volume {
 class OpfsFile implements File {
   #h: SyncHandle;
   #closed: () => void;
+  #failed: () => void;
 
-  constructor(h: SyncHandle, closed: () => void) {
+  constructor(h: SyncHandle, closed: () => void, failed: () => void) {
     this.#h = h;
     this.#closed = closed;
+    this.#failed = failed;
+  }
+
+  // What changes the file, counted should it throw.
+  #change<T>(f: () => T): T {
+    try {
+      return f();
+    } catch (e) {
+      this.#failed();
+      throw e;
+    }
   }
 
   read(into: Uint8Array, at: number): number {
@@ -164,13 +181,15 @@ class OpfsFile implements File {
   }
 
   write(bytes: Uint8Array, at: number): number {
-    let put = 0;
-    while (put < bytes.length) {
-      const n = this.#h.write(bytes.subarray(put), { at: at + put });
-      if (n <= 0) throw new Error("the file system would take no more");
-      put += n;
-    }
-    return put;
+    return this.#change(() => {
+      let put = 0;
+      while (put < bytes.length) {
+        const n = this.#h.write(bytes.subarray(put), { at: at + put });
+        if (n <= 0) throw new Error("the file system would take no more");
+        put += n;
+      }
+      return put;
+    });
   }
 
   size(): number {
@@ -178,11 +197,11 @@ class OpfsFile implements File {
   }
 
   truncate(size: number): void {
-    this.#h.truncate(size);
+    this.#change(() => this.#h.truncate(size));
   }
 
   flush(): void {
-    this.#h.flush();
+    this.#change(() => this.#h.flush());
   }
 
   close(): void {

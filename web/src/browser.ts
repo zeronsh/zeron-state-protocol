@@ -13,13 +13,14 @@ const handledClose = (f: () => Promise<void>): Promise<void> => {
 import type { Device, Relay } from "./index.ts";
 import type { Connect, Member, Rights } from "./node.ts";
 import { storePath } from "./volume-opfs.ts";
-import { StoreLocked } from "./volume.ts";
+import { StoreLocked, Uncertain } from "./volume.ts";
 import type { Command, Op, Report, Say } from "./worker.ts";
 
 export * from "./index.ts";
 
 // What the worker said went wrong, as the error it was.
-const errorOf = (message: string, name?: string): Error => (name === "StoreLocked" ? new StoreLocked(message) : new Error(message));
+const errorOf = (message: string, name?: string): Error =>
+  name === "StoreLocked" ? new StoreLocked(message) : name === "Uncertain" ? new Uncertain(message) : new Error(message);
 
 export interface OpenOptions {
   /**
@@ -86,22 +87,45 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   };
 
   // Of the worker as it is now: its storage failed, or the store is locked, as it last said, and it has answered nothing
-  // since; and the worker that could not be started, or threw, which answers nothing it is asked. A worker started anew is
-  // neither.
+  // since. A worker started anew has not. And why there is no worker, one having thrown as it started: nothing can be asked.
   let failed = false;
-  let dead: Worker | undefined;
+  let unstarted: Error | undefined;
   let quitting: AbortController | undefined; // as the device closes: gives up on what its clients have still to deliver
+  // Told that the node has stopped: whatever it was asked, its worker has answered already, before saying so.
   const fail = (error: Error) => {
     failed = true;
     quitting?.abort(); // what the device's clients deliver, as it closes, may never be: they give up on it, saying so
-    for (const a of answers.values()) a.reject(error);
-    answers.clear();
     options.onFailure?.(error);
+  };
+  // A worker that threw is gone, and answers nothing: it is stopped, every pipe it carried is broken, so that its clients
+  // dial again, and what it was asked is settled here. One that had started may have been doing it, which is Uncertain;
+  // what may be asked again is asked of a worker started anew, as one that had started is; one that never started did
+  // nothing, and nothing more can be asked of it, nor dialled, but is said to fail.
+  const threw = (w: Worker, error: Error, started: boolean) => {
+    if (w !== worker) return;
+    worker = undefined;
+    w.terminate();
+    const next = started && state === "running"; // started anew, as it would be once the tab is back
+    const uncertain = new Uncertain(`${error.message}, as this was asked: it may or may not have been done`);
+    for (const [id, a] of answers) {
+      if (next && again.has(a.op)) continue; // asked of the next
+      answers.delete(id);
+      if (a.op === "close" || (started && a.op === "credential")) a.resolve(undefined); // stopped, as a closed tab's is; given anew by the next
+      else a.reject(started && !again.has(a.op) ? uncertain : error);
+    }
+    for (const breakOff of [...pipes.keys()]) breakOff();
+    fail(error);
+    if (next) start();
+    else if (!started) {
+      unstarted = error;
+      for (const port of ports.splice(0)) port.close(); // dialled for a worker that will never be
+    }
   };
   const start = () => {
     const w = (worker = new Worker(options.worker ?? new URL("./worker.js", import.meta.url), { type: "module", name: "zsp" }));
     failed = false;
-    w.onerror = (e) => w === worker && ((dead = w), fail(new Error(e.message || "the worker could not be started")));
+    unstarted = undefined;
+    w.onerror = (e) => threw(w, new Error(e.message || "the worker could not be started"), heard);
     const giving = credential;
     let heard = false;
     w.onmessage = (e: MessageEvent<Report>) => {
@@ -133,6 +157,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   const ask = <T>(op: Op, ...args: unknown[]): Promise<T> =>
     new Promise((resolve, reject) => {
       if (state === "closed") return reject(new Error("the device is closed"));
+      if (unstarted) return reject(unstarted);
       answers.set(++asked, { op, args, resolve: resolve as (v: unknown) => void, reject });
       worker?.postMessage({ ask: asked, op, args } satisfies Command); // or once it is started again
     });
@@ -165,7 +190,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     for (const [id, a] of answers) {
       if (a.op === "close") answers.delete(id), a.resolve(undefined); // stopped, as a closed tab's is
       else if (a.op === "credential") answers.delete(id), a.resolve(undefined); // given anew by the next worker, not taken by this
-      else if (!again.has(a.op)) answers.delete(id), a.reject(new Error("the tab was put away as this was asked, which may or may not have been done"));
+      else if (!again.has(a.op)) answers.delete(id), a.reject(new Uncertain("the tab was put away as this was asked, which may or may not have been done"));
     }
     for (const breakOff of [...pipes.keys()]) breakOff(); // every client here dials again, once the tab is back
   };
@@ -224,7 +249,8 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   };
 
   const connect: Connect & { [madeOn]?: (c: Client) => void } = (receive, closed) => {
-    if (state === "closed") return undefined;
+    if (state === "closed" || unstarted) return undefined; // no node to dial
+
     const { port1, port2 } = new MessageChannel();
     let open = true;
     const end = () => {
@@ -285,9 +311,9 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       space = await ask<string>("join", s, relay);
     },
     adopt: async (roster: Uint8Array) => {
-      const taken = await ask<boolean>("adopt", roster);
-      space = (await ask<{ space?: string }>("identity")).space;
-      return taken;
+      const adopted = await ask<{ taken: boolean; space?: string }>("adopt", roster); // and the space it is of, with it
+      space = adopted.space;
+      return adopted.taken;
     },
     member: () => ask<boolean>("member"),
     create: async () => (space = await ask<string>("create")),
@@ -327,14 +353,15 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
         // Listened for until it is closed: a tab frozen or left as its worker closes the store stops the worker then, as
         // ever, which would else be frozen holding it.
         const w = worker;
-        if (w && state === "running" && w !== dead) await ask<void>("close").catch(() => {});
+        if (w && state === "running") await ask<void>("close").catch(() => {});
         unlisten();
         state = "closed";
         w?.terminate();
         worker = undefined;
         for (const breakOff of [...pipes.keys()]) breakOff(); // its clients told, as the worker that carried their pipes is gone
         for (const port of ports.splice(0)) port.close(); // dialled while away, for a worker that will never be
-        for (const a of answers.values()) a.reject(new Error("the device is closed"));
+        // What was asked as it closed, and not answered, may have been done: Uncertain, but what may be asked again either way.
+        for (const a of answers.values()) a.reject(again.has(a.op) ? new Error("the device is closed") : new Uncertain("the device was closed as this was asked, which may or may not have been done"));
         answers.clear();
         // Closed all the same: but what its clients never delivered is said, all of it, rather than nothing.
         const lost = settled.flatMap((r) => (r.status === "rejected" ? [r.reason as Error] : []));

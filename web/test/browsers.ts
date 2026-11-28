@@ -242,8 +242,11 @@ const tests: Record<string, () => Promise<void>> = {
     await eventually("the follower runs it", async () => (await call<string>(follower, "memberOrError", "fa")) === "true");
     const said = (await call<string[]>(follower, "asked"))[0];
     const next = await call<string>(follower, "scopeOrError", "fa");
-    // Either it was done, and said so, or it was not done at all.
-    expectEqual(next, said.startsWith("error") ? "2" : "3");
+    // Either it was done, and said so; or it was not done at all, and said to have failed; or, its storage failing as it
+    // did it, it may or may not have been, and said to be Uncertain: never said to have failed, and done.
+    if (said.startsWith("error: Uncertain")) {
+      if (next !== "2" && next !== "3") throw new Error(`said to be Uncertain, the next scope is ${next}`);
+    } else if (next !== (said.startsWith("error") ? "2" : "3")) throw new Error(`said ${said}, and the next scope is ${next}`);
   },
   // And what a worker was asked while it opened the store, when the opening fails, is not done by the next either.
   async browser_failed_opening() {
