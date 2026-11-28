@@ -304,9 +304,10 @@ loop_keeps_an_operation_kqueue_may_still_name :: proc(t: ^testing.T) {
 				s.later += 1
 			})
 		}
-		// ...and the read's timer due before that call.
-		time.sleep(30 * time.Millisecond)
-	}, timeout = 10 * time.Millisecond)
+		// ...and the read's timer due before that call. Long enough a timeout that what is sent comes first, however busy
+		// the machine: with 10 ms, on a busy Linux runner, the read timed out first.
+		time.sleep(350 * time.Millisecond)
+	}, timeout = 300 * time.Millisecond)
 	testing.expect(t, nbio.tick(0) == nil)
 	net.send_tcp(peer, {1, 2, 3})
 	start := time.tick_now()
@@ -481,9 +482,11 @@ loop_keeps_one_timeout_for_a_read_of_all :: proc(t: ^testing.T) {
 	}
 	r: Read
 	buf: [10]byte
+	// A timeout long enough that both pieces come first, however busy the machine.
+	submitted := time.tick_now()
 	nbio.recv_poly(socket, {buf[:]}, &r, proc(op: ^nbio.Operation, r: ^Read) {
 		r^ = {true, op.recv.err != nil, op.recv.received}
-	}, all = true, timeout = 300 * time.Millisecond)
+	}, all = true, timeout = time.Second)
 	testing.expect(t, nbio.tick(0) == nil)
 	net.send_tcp(peer, {1, 2, 3, 4, 5})
 	for _ in 0 ..< 5 {
@@ -496,7 +499,7 @@ loop_keeps_one_timeout_for_a_read_of_all :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, r.done && !r.error && r.n == 10, "the read ended %v, with an error %v, %d bytes", r.done, r.error, r.n)
 	// Past when the timeout would have come: nothing is left to fire.
-	for time.tick_since(start) < 600 * time.Millisecond {
+	for time.tick_since(submitted) < 1300 * time.Millisecond {
 		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
 	}
 }
