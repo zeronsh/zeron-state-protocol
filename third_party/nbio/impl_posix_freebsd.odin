@@ -23,6 +23,19 @@ posix_sendfile :: proc(fd: Handle, s: TCP_Socket, offset, nbytes: int) -> (sent:
 	return
 }
 
+// ZSP: a socket had close-on-exec as it is made, as is one accepted (posix_socket, posix_accept).
+POSIX_SOCK_CLOEXEC :: 0x10000000
+posix_accept4 :: proc(s: posix.FD) -> posix.FD {
+	foreign lib {
+		accept4 :: proc(s: posix.FD, address: ^posix.sockaddr, address_len: ^posix.socklen_t, flags: i32) -> posix.FD ---
+	}
+	return accept4(s, nil, nil, POSIX_SOCK_CLOEXEC)
+}
+
+posix_create_socket_error :: proc() -> Create_Socket_Error {
+	return net._create_socket_error(freebsd.Errno(posix.errno()))
+}
+
 posix_listen_error :: proc() -> Listen_Error {
 	return net._listen_error(freebsd.Errno(posix.errno()))
 }

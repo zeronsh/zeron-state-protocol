@@ -12,6 +12,7 @@ import "core:time"
 Socket_Option :: enum {
 	Reuse_Address,       // bool
 	Reuse_Port,          // bool, where the system has it apart from Reuse_Address (macOS, the BSDs)
+	Exclusive_Address,   // bool, Windows only (SO_EXCLUSIVEADDRUSE): a port nothing else may bind while this has it
 	Broadcast,           // bool
 	TCP_Nodelay,         // bool
 	Receive_Buffer_Size, // int, bytes: what the system grants may differ (see socket_option)
@@ -36,7 +37,7 @@ Socket_Option_Error :: enum {
 @(private="file")
 kind :: proc(option: Socket_Option) -> typeid {
 	switch option {
-	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay: return bool
+	case .Reuse_Address, .Reuse_Port, .Exclusive_Address, .Broadcast, .TCP_Nodelay: return bool
 	case .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size: return int
 	case .Receive_Timeout:                                      return time.Duration
 	}

@@ -111,10 +111,11 @@ staging_remove_unheld :: proc(path: string) {
 // What may wait for as long as anything else takes, as a lock, may be interrupted by a signal, which a handler without
 // SA_RESTART lets end the wait: it is begun again. And so is whatever else might be, on whatever file system.
 
+// Every file here close-on-exec, as it is opened: no process this one starts is handed it (see host_hands_a_child_nothing).
 @(private = "file")
 open_file :: proc(name: cstring, flags: posix.O_Flags) -> (fd: posix.FD) {
 	for {
-		fd = posix.open(name, flags, posix.mode_t{.IRUSR, .IWUSR})
+		fd = posix.open(name, flags + {.CLOEXEC}, posix.mode_t{.IRUSR, .IWUSR})
 		if fd >= 0 || posix.errno() != .EINTR {
 			return
 		}

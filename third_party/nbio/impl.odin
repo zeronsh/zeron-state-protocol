@@ -111,7 +111,13 @@ _listen_tcp :: proc(
 	socket = create_tcp_socket(family, l, loc) or_return
 	defer if err != nil { close(socket, l=l) }
 
-	set_socket_option(socket, .Reuse_Address, true)
+	// ZSP: as core:net's listen_tcp: a port its last owner died holding, in TIME_WAIT, may be had again at once; but on
+	// Windows, where SO_REUSEADDR would let another bind it from under this one, it is this one's alone.
+	when ODIN_OS == .Windows {
+		set_socket_option(socket, .Exclusive_Address, true)
+	} else {
+		set_socket_option(socket, .Reuse_Address, true)
+	}
 
 	bind(socket, endpoint) or_return
 

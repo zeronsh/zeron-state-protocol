@@ -15,6 +15,7 @@ name :: proc(option: Socket_Option) -> (level: i32, opt: posix.Sock_Option, ok: 
 		} else {
 			return posix.SOL_SOCKET, posix.Sock_Option(0x0200), true // SO_REUSEPORT, on macOS and the BSDs alike
 		}
+	case .Exclusive_Address:   return 0, nil, false // Windows'
 	case .Broadcast:           return posix.SOL_SOCKET, .BROADCAST, true
 	case .TCP_Nodelay:         return posix.IPPROTO_TCP, posix.Sock_Option(posix.TCP_NODELAY), true
 	case .Receive_Buffer_Size: return posix.SOL_SOCKET, .RCVBUF, true
@@ -84,7 +85,7 @@ _socket_option :: proc(s: net.Socket, option: Socket_Option) -> (value: Socket_O
 		} else {
 			value = time.Duration(x.tv_sec) * time.Second + time.Duration(x.tv_usec) * time.Microsecond
 		}
-	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay, .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size:
+	case .Reuse_Address, .Reuse_Port, .Exclusive_Address, .Broadcast, .TCP_Nodelay, .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size:
 		if option == .Receive_Buffer_Size_Forced {
 			opt = .RCVBUF
 		}

@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -301,6 +301,43 @@ assert(!judgedByRoot(0, 0) && judgedByRoot(26, 26) && !judgedByRoot(26, 27));
 {
   const built = /^#\+build (.*)$/m.exec(readFileSync(join(ROOT, "host/hold_bsd.odin"), "utf8"))![1].split(",").map((s) => s.trim());
   assert.deepEqual([...FLOCK].sort(), built.sort());
+}
+
+// A process the embedder starts while a device is open, as one that execs a helper, is handed none of its store's files,
+// its lock file's among them: Node starts it as most do, with every descriptor that may be inherited inherited (on
+// Windows, every inheritable handle). So once the device is closed, though that process lives on, the store is another's
+// to have at once; and on Linux and macOS the child is seen to hold nothing of it. As host/inherit_test.odin holds zspd's.
+{
+  const dir = realpathSync(mkdtempSync(join(TMP, "inherit-")));
+  const a = await open({ dir, ...quiet });
+  await a.create();
+  const child = process.platform === "win32" ? spawn("ping", ["-n", "60", "127.0.0.1"], { stdio: "ignore" }) : spawn("/bin/sleep", ["60"], { stdio: "ignore" });
+  procs.push(child);
+  await new Promise((done, failed) => (child.once("spawn", done), child.once("error", failed)));
+  let held: string[] = [];
+  if (process.platform === "linux") {
+    held = readdirSync(`/proc/${child.pid}/fd`).flatMap((fd) => {
+      try {
+        const to = readlinkSync(`/proc/${child.pid}/fd/${fd}`);
+        return to.startsWith(dir) ? [`${fd}: ${to}`] : [];
+      } catch {
+        return [];
+      }
+    });
+  } else if (process.platform === "darwin") {
+    const said = spawnSync("lsof", ["-n", "-P", "-p", String(child.pid), "-F", "fn"], { encoding: "utf8" });
+    assert.equal(said.status, 0, `lsof: ${said.stderr}`);
+    let fd = "";
+    for (const line of said.stdout.split("\n")) {
+      if (line.startsWith("f")) fd = line.slice(1);
+      else if (line.startsWith("n") && line.includes(dir)) held.push(`${fd}: ${line.slice(1)}`);
+    }
+  }
+  assert.deepEqual(held, [], "the child holds the store's files");
+  await a.close();
+  const b = await open({ dir, ...quiet }); // at once, the child living on
+  await b.close();
+  await killed(child);
 }
 
 // A directory on a file system shared with other machines: refused, with nothing made there.
