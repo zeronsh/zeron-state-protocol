@@ -41,15 +41,25 @@ files_read_whole :: proc(t: ^testing.T) {
 		path:   string,
 		done:   bool, // atomic
 		shrunk: int, // atomic: to more than nothing, while it was read
+		opened: os.Error, // by the writer, before it began
 	}
 	sh := Shared{path = path}
 	writer := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
 		context = runtime.default_context()
-		f, ferr := os.open(sh.path, {.Read, .Write, .Trunc})
-		if ferr != nil {
+		// Emptied by a truncation of its own, not by opening it so: core:os on Windows asks for FILE_GENERIC_WRITE, which
+		// TRUNCATE_EXISTING refuses as an invalid parameter, wanting GENERIC_WRITE itself, so that the writer never began.
+		f, ferr := os.open(sh.path, {.Read, .Write})
+		if ferr == nil {
+			ferr = os.truncate(f, 0)
+		}
+		sh.opened = ferr
+		if f == nil {
 			return
 		}
 		defer os.close(f)
+		if ferr != nil {
+			return
+		}
 		chunk: [3001]byte
 		size := 0
 		for round := 0; !sync.atomic_load(&sh.done); round += 1 {
@@ -99,6 +109,7 @@ files_read_whole :: proc(t: ^testing.T) {
 	thread.join(writer)
 	thread.destroy(writer)
 	testing.expectf(t, failed == 0 && wrong == 0, "of %d reads while it changed, %d failed and %d were not what it held", reads, failed, wrong)
+	testing.expectf(t, sh.opened == nil, "the writer could not begin: %v", sh.opened)
 	testing.expectf(t, sh.shrunk >= 3, "the file was shrunk to more than nothing only %d times while it was read", sh.shrunk)
 }
 
