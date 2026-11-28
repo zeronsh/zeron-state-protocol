@@ -296,6 +296,7 @@ class Client:
         if b" 101 " not in head.split(b"\r\n")[0]:
             raise ConnectionError(head.split(b"\r\n")[0].decode())
         self.clock = self.seq = self.acked = 0
+        self.refused = []  # rows an Ack said were refused, written where this client may not write
         self.scopes = {}  # number -> (rights, list key)
         self.rows = {}  # id -> {(slot, kind, stamp): body}
         self.windows = {}  # watch id -> dict(lo, hi, before, after, settled)
@@ -382,6 +383,11 @@ class Client:
             self.authors[number] = (r.take(32), r.bytes())
         elif kind == ACK:
             self.acked = r.varint()
+            # Rows the node took none of, written where this client may not write: never durable, and said so.
+            refused = [r.take(16) for _ in range((len(body) - r.pos) // 16)]
+            if refused:
+                self.refused += refused
+                raise PermissionError(f"refused: {len(refused)} rows")
         elif kind == SYNCED:
             window, flags = r.varint(), r.u8()
             self.windows[window] = dict(

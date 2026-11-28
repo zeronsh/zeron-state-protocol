@@ -414,6 +414,8 @@ interface Barrier {
 }
 
 const handled = <T>(p: Promise<T>): Promise<T> => (p.catch(() => {}), p); // whoever does not wait for it is not thrown at
+// Why what was written in a scope never will be durable: its right there ended, as the node said, before it took it.
+const noLongerWrites = () => new Error("this client may no longer write there");
 
 /**
  * Seals what every editor of a client has typed and sends it, there and then: for a browser's device, as its tab is put
@@ -973,7 +975,7 @@ export class Client {
       case ANSWER:
         return this.#onAnswer(r);
       case ACK:
-        return this.#onAck(codec.varint(r));
+        return this.#onAck(r);
       case FLOW:
         return this.#onFlow(r);
       case CALL:
@@ -1028,8 +1030,11 @@ export class Client {
       this.#scopes.set(scope, { rights, key: codec.take(r, 32).slice() });
     }
     if (this.#ready) {
+      // Rights have changed. What was written where this client may no longer write is let go of at once, never to be
+      // durable, and not said if it is yet to be: a node refuses it, and only it. What it wrote elsewhere goes on.
+      this.#refuseUnwritable();
       if (this.#closed) return;
-      // Rights have changed: windows waiting for this one open.
+      // Windows waiting for this one open.
       for (const window of this.#windows.values()) {
         if (window.denied && this.#scopes.has(window.scope)) {
           for (const page of window.pages) this.#watch(page);
@@ -1044,11 +1049,11 @@ export class Client {
     }
     this.#ready = true;
     // Say again whatever the last pipe was told: what is served, unacknowledged and watched. What this client may no
-    // longer write in is let go of, never to be durable: a node would refuse it, and this client with it, for good.
+    // longer write in is let go of, never to be durable: a node would refuse it.
     if (!this.#closed) for (const key of this.#handlers.keys()) this.#serve(key, true);
     for (const p of [...this.#pending]) {
       if (!this.may(p.scope, "write")) {
-        this.#fail(p, new Error("this client may no longer write there"));
+        this.#fail(p, noLongerWrites());
         continue;
       }
       const w = codec.writer();
@@ -1063,6 +1068,31 @@ export class Client {
     }
     for (const a of [...this.#asked.values()]) this.#ask(a, a.question, true); // and none asked meanwhile, twice
     this.#tell("status", true);
+  }
+
+  // What is pending where this client may write no longer, as the node has just said, fails now, and what of it is yet to
+  // be said is not: the rest goes on as it was.
+  #refuseUnwritable(): void {
+    const unsaid = new Set<number>();
+    for (const p of [...this.#pending]) {
+      if (this.may(p.scope, "write")) continue;
+      unsaid.add(p.seq);
+      this.#fail(p, noLongerWrites());
+    }
+    if (unsaid.size === 0 || this.#out.pos === 0) return;
+    // Frames are whole in what is yet to be said: those Cells are left out, and the rest kept as it was, in order.
+    const was = codec.written(this.#out);
+    const out = codec.writer(was.length);
+    const r = codec.reader(was);
+    while (r.pos < r.len) {
+      const at = r.pos;
+      const n = codec.varint(r);
+      const frame = codec.reader(was.subarray(r.pos, r.pos + n));
+      r.pos += n;
+      if (codec.u8(frame) === CELLS && unsaid.has(codec.varint(frame))) continue;
+      codec.put(out, was.subarray(at, r.pos));
+    }
+    this.#out = out;
   }
 
   // ---------------------------------------------------------------- observing things that are not windows
@@ -2254,8 +2284,8 @@ export class Client {
     return stampTime(this.#clockMs, this.#clockN) + codec.binary(this.#host.random(8));
   }
 
-  // A row this client may write in now, as far as it knows: what a node refuses, it refuses for good, ending the pipe and
-  // this client with it. One made later than a stamp of this client's may be ahead of the clock is never written; one made
+  // A row this client may write in now, as far as it knows: what a node refuses never is durable, and is refused here
+  // rather than said. One made later than a stamp of this client's may be ahead of the clock is never written; one made
   // a little ahead of this client's clock sets it on, as no cell is older than its row.
   #mayWrite(bin: string, scope: number, may = false): void {
     if (codec.u32Of(bin) !== scope) throw new RangeError("that row is of another scope");
@@ -2269,8 +2299,8 @@ export class Client {
 
   #sendCells(cells: Written[], done?: () => void, fail?: (e: Error) => void): void {
     const scope = codec.u32Of(cells[0].row);
-    // What this client may no longer write in, since it began, is never said: a node refuses it, and this client with it. It
-    // is not delivered, and whoever waits for it is told so, or, should nobody yet, whoever next waits for what was written.
+    // What this client may no longer write in, since it began, is never said: a node refuses it. It is not delivered, and
+    // whoever waits for it is told so, or, should nobody yet, whoever next waits for what was written.
     if (this.#ready && !this.may(scope, "write")) {
       const e = new Error("this client may no longer write there: what it wrote there is not delivered");
       this.#owed ??= e;
@@ -2308,9 +2338,19 @@ export class Client {
     }
   }
 
-  #onAck(seq: number): void {
+  // Durable, all of it up to there, but for what the node refused: written where this client may no longer write, its right
+  // having ended as it came, and named by its rows. That never will be, and is said so; the rest is.
+  #onAck(r: codec.Reader): void {
+    const seq = codec.varint(r);
+    const refused = new Set<string>();
+    while (r.pos < r.len) refused.add(codec.takeBinary(r, 16));
     while (this.#pending.length > 0 && this.#pending[0].seq <= seq) {
-      const p = this.#pending.shift()!;
+      const p = this.#pending[0];
+      if (refused.size > 0 && p.rows.some((id) => refused.has(id))) {
+        this.#fail(p, noLongerWrites());
+        continue;
+      }
+      this.#pending.shift();
       this.#settle(p);
       p.done();
     }

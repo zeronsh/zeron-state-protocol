@@ -1027,6 +1027,36 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   await Promise.all([a.close(), b.close()]);
 }
 
+// A client's right to write in one scope ends as it writes there and in another, the two crossing the new roster: only what
+// it wrote in that scope is lost, and said to be. The node refuses no more than that, and the client neither gives up on
+// what it wrote elsewhere nor stops dialling.
+{
+  const owner = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  owner.create();
+  const two = owner.scope();
+  const node = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  owner.admit(node.key, 1);
+  owner.admit(node.key, two);
+  const roster = () => owner.store.kept("roster").latest!;
+  assert(node.adopt(roster()));
+  const client = new Client({ connect: node.connect });
+  const errors: number[] = [];
+  client.on("error", (code) => errors.push(code));
+  while (!client.may(1, "write") || !client.may(two, "write")) await new Promise((done) => setTimeout(done, 1));
+  let one = false, other = false;
+  void client.write(1, (change) => change.insert({}, "x", 1, {})).then(() => (one = true));
+  void client.write(two, (change) => change.insert({}, "x", 1, {})).then(() => (other = true));
+  owner.revoke(node.key, 1); // as both are on their way
+  assert(node.adopt(roster()));
+  for (let i = 0; i < 200 && !other; i++) await new Promise((done) => setTimeout(done, 5));
+  assert.deepEqual(errors, [], "the node refused the client");
+  assert(client.ready && other && !one, `ready ${client.ready}, delivered ${one}, ${other}`);
+  assert(!client.may(1, "write") && client.may(two, "write"));
+  await client.write(two, (change) => change.insert({}, "x", 2, {})); // and goes on
+  await assert.rejects(client.close(), /no longer write/);
+  await Promise.all([node.close(), owner.close()]);
+}
+
 // Where a relay keeps a space, a proxy's query staying at the end.
 assert.equal(spaceUrl("wss://relay.example/", "ab"), "wss://relay.example/ab");
 assert.equal(spaceUrl("wss://relay.example/zsp?key=1", "ab"), "wss://relay.example/zsp/ab?key=1");

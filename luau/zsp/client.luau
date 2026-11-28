@@ -33,6 +33,8 @@ local PIECE_SECONDS = 1 -- or this long after it began,
 local LIVE_SECONDS = 10 -- and live text unconfirmed for this long is dropped
 local LEAP_SECONDS = 15 * 60 -- a node refuses a stamp further ahead of its clock than this
 local NOWHERE = "no such position"
+-- Why what was written in a scope never will be durable: its right there ended, as the node said, before it took it.
+local NO_LONGER_WRITES = "this client may no longer write there"
 
 export type Wire = { send: (data: buffer) -> (), close: () -> () }
 export type Host = {
@@ -711,6 +713,9 @@ function Client._flush(self: Client)
 		end
 	end
 	local out = self.out
+	if self.abandoned then
+		out.pos = 0 -- a client given up on, or refused for good, sends nothing more
+	end
 	if out.pos > 0 and self.wire then
 		-- A piece at a time, for a pipe is a stream of bytes, and its messages may be no bigger than zspd's WebSockets take,
 		-- 8 MiB: a burst of writes bigger than that, said again every time the pipe is dialled, would break it every time.
@@ -825,7 +830,7 @@ function Client._handle(self: Client, kind: number, r: codec.Reader)
 	elseif kind == ANSWER then
 		self:_on_answer(r)
 	elseif kind == ACK then
-		self:_on_ack(codec.varint(r))
+		self:_on_ack(r)
 	elseif kind == FLOW then
 		self:_on_flow(r)
 	elseif kind == CALL then
@@ -878,10 +883,13 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 		self.scopes[scope] = { rights = rights, key = codec.take(r, 32) }
 	end
 	if self.ready then
+		-- Rights have changed. What was written where this client may no longer write is let go of at once, never to be
+		-- durable, and not said if it is yet to be: a node refuses it, and only it. What it wrote elsewhere goes on.
+		self:_refuse_unwritable()
 		if self.closed then
 			return
 		end
-		-- Rights have changed: windows waiting for this one open.
+		-- Windows waiting for this one open.
 		for _, window in self.windows do
 			if window.denied and self.scopes[window.scope] then
 				for _, page in window.pages do
@@ -904,7 +912,7 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 	end
 	self.ready = true
 	-- Say again whatever the last pipe was told: what is served, unacknowledged and watched. What this client may no
-	-- longer write in is let go of, never to be durable: a node would refuse it, and this client with it, for good.
+	-- longer write in is let go of, never to be durable: a node would refuse it.
 	if not self.closed then
 		for key in self.handlers do
 			self:_serve(key, true)
@@ -912,7 +920,7 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 	end
 	for _, p in table.clone(self.pending) do
 		if not self:may(p.scope, "write") then
-			self:_fail(p, "this client may no longer write there")
+			self:_fail(p, NO_LONGER_WRITES)
 			continue
 		end
 		local w = codec.writer()
@@ -936,6 +944,37 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 		self:_ask(a, nil, true)
 	end
 	self:_tell("status", true)
+end
+
+-- What is pending where this client may write no longer, as the node has just said, fails now, and what of it is yet to be
+-- said is not: the rest goes on as it was.
+function Client._refuse_unwritable(self: Client)
+	local unsaid: { [number]: boolean } = {}
+	local any = false
+	for _, p in table.clone(self.pending) do
+		if not self:may(p.scope, "write") then
+			unsaid[p.seq] = true
+			any = true
+			self:_fail(p, NO_LONGER_WRITES)
+		end
+	end
+	if not any or self.out.pos == 0 then
+		return
+	end
+	-- Frames are whole in what is yet to be said: those Cells are left out, and the rest kept as it was, in order.
+	local was = codec.string(self.out)
+	local out = codec.writer()
+	local r = codec.reader(was)
+	while r.pos < r.len do
+		local at = r.pos
+		local n = codec.varint(r)
+		local frame = codec.reader(string.sub(was, r.pos + 1, r.pos + n))
+		r.pos += n
+		if not (codec.u8(frame) == CELLS and unsaid[codec.varint(frame)]) then
+			codec.put(out, string.sub(was, at + 1, r.pos))
+		end
+	end
+	self.out = out
 end
 
 -- ---------------------------------------------------------------- observing things that are not windows
@@ -2652,8 +2691,8 @@ end
 
 type Written = { row: string, slot: number, kind: number, stamp: string, body: string }
 
--- A row this client may write in now, as far as it knows: what a node refuses, it refuses for good, ending the pipe and
--- this client with it. One made later than a stamp of this client's may be ahead of the clock is never written; one made
+-- A row this client may write in now, as far as it knows: what a node refuses never is durable, and is refused here rather
+-- than said. One made later than a stamp of this client's may be ahead of the clock is never written; one made
 -- a little ahead of this client's clock sets it on, as no cell is older than its row.
 function Client._may_write(self: Client, id: string, scope: number, may: boolean?)
 	if type(id) ~= "string" or #id ~= 16 then
@@ -2674,8 +2713,8 @@ end
 
 function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
 	local scope: number = string.unpack(">I4", cells[1].row) :: any
-	-- What this client may no longer write in, since it began, is never said: a node refuses it, and this client with it. It
-	-- is not delivered, and whoever next waits for what was written is told so.
+	-- What this client may no longer write in, since it began, is never said: a node refuses it. It is not delivered, and
+	-- whoever next waits for what was written is told so.
 	if self.ready and not self:may(scope, "write") then
 		local why = "this client may no longer write there: what it wrote there is not delivered"
 		self.owed = self.owed or why
@@ -2720,10 +2759,32 @@ function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
 	end
 end
 
--- Each write acknowledged is let go of, and whoever waits for it is told on a turn of its own, as a promise is kept.
-function Client._on_ack(self: Client, seq: number)
+-- Each write acknowledged is let go of, and whoever waits for it is told on a turn of its own, as a promise is kept: durable,
+-- all of it up to there, but for what the node refused, written where this client may no longer write, its right having
+-- ended as it came, and named by its rows. That never will be, and is said so; the rest is.
+function Client._on_ack(self: Client, r: codec.Reader)
+	local seq = codec.varint(r)
+	local refused: { [string]: boolean }? = nil
+	while r.pos < r.len do
+		refused = refused or {}
+		;(refused :: { [string]: boolean })[codec.take(r, 16)] = true
+	end
 	while #self.pending > 0 and self.pending[1].seq <= seq do
-		local p = table.remove(self.pending, 1) :: Pending
+		local p = self.pending[1]
+		local lost = false
+		if refused then
+			for _, id in p.rows do
+				if refused[id] then
+					lost = true
+					break
+				end
+			end
+		end
+		if lost then
+			self:_fail(p, NO_LONGER_WRITES)
+			continue
+		end
+		table.remove(self.pending, 1)
 		self:_settle(p)
 		if p.done then
 			self.host.defer(p.done)

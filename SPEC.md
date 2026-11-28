@@ -333,6 +333,12 @@ and it says that what it sent will never be durable, rather than nothing, only o
 refuses it with Error 2 or 3, or a scope it may no longer write in, or its application giving up on it. A text it has open is sealed as it ends, whether or not a
 session is up. It tells its application that something it wrote is durable only once an Ack covers it.
 
+A right to write is a scope's, and so is its refusal. A node takes none of a local client's Cells with a cell in a scope where the client, or its
+device, may not write, or where the device may not vouch for whom the client writes, as when the roster changed as they came: it names the frame's
+rows in the Ack, and the session goes on, and so does all the client writes elsewhere. Error 2 is for a client that may do nothing at all. A local
+client lets go of what an Ack names, never to be durable, and the rest of what it covers is durable; and as it hears that it may no longer write in a
+scope, it lets go at once of what it wrote there, and says none of it it has yet to.
+
 If an offered cell was refused because something had killed it, the receiver sends back the row as it has it: the sender held something
 old and would not otherwise hear.
 

@@ -13,6 +13,8 @@ Reader_Client :: struct {
 	devices: map[u32]Key32,
 	by:      map[Id]u32, // who wrote what is in slot 16
 	body:    map[Id]string,
+	refused: [dynamic]Id, // rows Acks said were not taken
+	seq:     u64, // of the last Cells it sent
 }
 
 @(private)
@@ -42,6 +44,7 @@ reader_close :: proc(c: ^Reader_Client) {
 	delete(c.devices)
 	delete(c.by)
 	delete(c.body)
+	delete(c.refused)
 	c^ = {}
 }
 
@@ -60,6 +63,12 @@ reader_hear :: proc(t: ^testing.T, c: ^Reader_Client) {
 				delete(old)
 			}
 			c.authors[number] = strings.clone(string(read_bytes(&f)))
+			testing.expect(t, read_done(&f))
+		case .Ack:
+			_ = read_varint(&f)
+			for f.pos < len(f.buf) {
+				append(&c.refused, read_pair(&f, Id))
+			}
 			testing.expect(t, read_done(&f))
 		case .Cells:
 			_ = read_varint(&f)
@@ -100,7 +109,8 @@ reader_write :: proc(x: ^Sim_Node, c: ^Reader_Client, scope: Scope, text: string
 	put_u64(body[8:], list[1])
 	w := make([dynamic]byte, context.temp_allocator)
 	at := frame_begin(&w, .Cells)
-	write_varint(&w, 1)
+	c.seq += 1
+	write_varint(&w, c.seq)
 	place := Cell{row, 1, .Place, node_stamp(&x.node), body[:]}
 	value := Cell{row, 16, .Value, node_stamp(&x.node), transmute([]byte)text}
 	write_cell(&w, &place, false)
@@ -183,10 +193,11 @@ authors_are_who_they_are :: proc(t: ^testing.T) {
 	testing.expect(t, open not_in other.by && other.body[open] == "anyone's")
 	testing.expect(t, plain.body[first] == "mine" && len(plain.by) == 0 && len(plain.authors) == 0)
 
-	// A device that may not vouch writes for nobody else, whatever its host says, nor in their name.
-	_ = reader_write(b, &gate, SHOWN, "not yet")
-	testing.expect(t, gate.s.closing && gate.s.fault == .Denied)
-	reader_close(&gate)
+	// A device that may not vouch writes for nobody else, whatever its host says, nor in their name: what it says is
+	// refused, and said to be, in one scope; its session goes on, and so does what it writes in another.
+	not_yet := reader_write(b, &gate, SHOWN, "not yet")
+	hear(t, &s, &gate)
+	testing.expect(t, !gate.s.closing && len(gate.refused) == 1 && gate.refused[0] == not_yet)
 	forged: Id
 	{
 		b.node.now += 1000
@@ -201,12 +212,11 @@ authors_are_who_they_are :: proc(t: ^testing.T) {
 		testing.expect(t, !node_write(&b.node, {{forged, 17, .Value, node_stamp(&b.node), nil}}, make([]byte, MAX_AS + 1, context.temp_allocator)))
 	}
 	// Where nobody is told, it is nobody's business.
-	gate = reader_open(b, "as zoe")
-	hear(t, &s, &gate)
 	fine := reader_write(b, &gate, HOME, "anyone's too")
 	hear(t, &s, &other, &gate)
 	testing.expect_value(t, other.authors[other.by[forged]], "server")
 	testing.expect(t, other.body[fine] == "anyone's too" && !gate.s.closing)
+	testing.expect(t, not_yet not_in other.body, "what was refused was written")
 
 	// It is let.
 	change(t, &s, proc(s: ^Sim, d: ^Draft) {
@@ -244,8 +254,9 @@ authors_are_who_they_are :: proc(t: ^testing.T) {
 	reader_watch(&again, 1, SHOWN)
 	hear(t, &s, &again)
 	testing.expect_value(t, again.authors[again.by[zoe]], "zoe")
-	_ = reader_write(b, &gate, SHOWN, "no more")
-	testing.expect(t, gate.s.closing)
+	no_more := reader_write(b, &gate, SHOWN, "no more")
+	hear(t, &s, &gate)
+	testing.expect(t, !gate.s.closing && gate.refused[len(gate.refused) - 1] == no_more)
 	// So is what was put together since, of what was written then.
 	{
 		m := roster_member(&e.node.roster, b.keys.device)
@@ -363,4 +374,55 @@ callers_are_who_they_are :: proc(t: ^testing.T) {
 		caller_destroy(&ours)
 		session_close(cb.s)
 	}
+}
+
+// A local client's right to write in one scope ends as it writes there and in another: what it said in that scope, as it
+// crossed the new roster, is refused, and named in the Ack; the session goes on, and what it wrote in the other is taken.
+// Neither it nor anything else it wrote is refused for good.
+@(test)
+a_scope_written_in_no_longer_refuses_only_that :: proc(t: ^testing.T) {
+	state := seeded(37)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 1, ring = 64)
+	defer sim_destroy(&s)
+	HOME :: Scope(1)
+	SHOWN :: Scope(2) // the first two write
+	a, b := s.nodes[0], s.nodes[1]
+	for i in 0 ..< 2 {
+		sim_link(&s, i, 2)
+	}
+	sim_settle(&s)
+	writer, other := reader_open(b, "let me in"), reader_open(a, "let me in")
+	defer reader_close(&writer)
+	defer reader_close(&other)
+	reader_watch(&other, 1, HOME)
+	reader_watch(&other, 2, SHOWN)
+	for _ in 0 ..< 3 {
+		sim_settle(&s)
+		reader_hear(t, &writer)
+		reader_hear(t, &other)
+	}
+	// b may no longer write in SHOWN, and has heard so before what its client wrote there comes.
+	{
+		a.node.now = sim_now(&s, a)
+		d := draft_from(&a.node.roster, max(a.node.clock, a.node.now << 16))
+		d.random = sim_random
+		draft_grant(&d, b.keys.device, b.keys.signer, SHOWN, {.Read})
+		bytes, ok := roster_sign(&a.keys, s.root, &d)
+		defer delete(bytes)
+		testing.expect(t, ok && node_adopt(&a.node, bytes) && node_adopt(&b.node, bytes))
+	}
+	shown := reader_write(b, &writer, SHOWN, "too late")
+	testing.expectf(t, !writer.s.closing && writer.s.fault == .None, "a write where it may no longer refused the client: %v", writer.s.fault)
+	home := reader_write(b, &writer, HOME, "in time")
+	for _ in 0 ..< 3 {
+		sim_settle(&s)
+		reader_hear(t, &writer)
+		reader_hear(t, &other)
+	}
+	testing.expect(t, !writer.s.closing, "and ended it after")
+	testing.expectf(t, len(writer.refused) == 1 && writer.refused[0] == shown, "refused %v", writer.refused[:])
+	testing.expect(t, other.body[home] == "in time", "what it wrote where it may was not taken")
+	testing.expect(t, shown not_in other.body, "what it wrote where it may not was")
 }
