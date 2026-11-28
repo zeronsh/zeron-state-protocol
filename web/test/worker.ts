@@ -863,6 +863,50 @@ async function firstTurnWrites(store: string): Promise<void> {
   for (const c of [first, again]) c.port1.close();
 }
 
+// Every way whoever holds the store changes, as the others see it: the one before goes saying nothing, as one closed, put
+// away or gone with its tab does, its worker stopped or its renderer crashed, all alike to them; or says it failed, and goes.
+// And the next to hold it is another worker, there and opening the store slowly, or the one waiting. Each way, what waited on
+// the one before is waited on it no more, and the next is waited on afresh: asked whether it is there before anything is given
+// up on, though the one before was asked and said nothing; and what is asked of it is answered.
+for (const [i, { before, next }] of [
+  { before: "says nothing", next: "another worker" },
+  { before: "says it failed", next: "another worker" },
+  { before: "says nothing", next: "the one waiting" },
+  { before: "says it failed", next: "the one waiting" },
+].entries()) {
+  const store = `holder-change-${i}`;
+  let gone!: () => void;
+  void request(`zsp:${store}`, () => new Promise<void>((done) => (gone = done))); // asked whether it is there, it says nothing
+  const tree = next === "another worker" ? pause(store, "tree") : undefined;
+  const b = tree && (await worker());
+  await b?.tell({ open: { name: store } }); // and so next in line
+  const a = await worker();
+  await a.tell({ open: { name: store } });
+  let anyone = 0;
+  let here = 0;
+  const spy = new Channel(`zsp:${store}`);
+  spy.onmessage = (e) => void ((e.data as { anyone?: true }).anyone && anyone++, (e.data as { here?: true }).here && here++);
+  void a.tell({ ask: 1, op: "identity", args: [] });
+  await until("the holder is asked whether it is there", () => anyone === 1, 2 * 3000);
+  if (before === "says it failed") spy.postMessage({ failed: "the disk is full" });
+  gone();
+  let ask = 1;
+  if (before === "says it failed") {
+    await until("its tab is told", () => a.said.some((r) => "failed" in r));
+    void a.tell({ ask: (ask = 2), op: "identity", args: [] }); // as its tab wants the device again
+  }
+  if (tree) {
+    await tree.reached;
+    await until("the next holder is asked whether it is there, and says so", () => anyone === 2 && here === 1, 2 * 3000);
+    tree.release();
+  }
+  await until("what was asked is answered", () => answered(a.said, ask) !== undefined, 3000);
+  assert.equal(answered(a.said, ask)?.error, undefined, `the one before ${before}, the next being ${next}: ${JSON.stringify(a.said)}`);
+  await a.tell({ ask: 9, op: "close", args: [] });
+  await b?.tell({ ask: 9, op: "close", args: [] });
+  spy.close();
+}
+
 // A worker holding the store that is stuck opening it, waiting on a file that never opens, does not say it is there, but
 // for once, as it is first asked: what waits on it is given up on. Many waiting on it ask whether it is there, as one does
 // at a time, for a worker that hears another ask need not ask too: what the holder says, every worker hears.

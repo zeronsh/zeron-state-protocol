@@ -81,6 +81,7 @@ type Shout =
   | Given // a credential a tab has given, for whichever worker runs the node now and later
   | { credentials: true } // a worker that has just begun, asking to be told the newest given before it
   | { anyone: true } // a worker whose asks nobody has answered: whoever holds the store says it is there
+  | { holding: true } // a worker has the store's lock, and is opening the store: whoever had it before has let go of it
   | { here: true }; // the worker that holds the store, opening it or running it
 
 // What may be asked again of the next leader, as having been done or not it is the same: anything else, asked of one that
@@ -240,6 +241,7 @@ function contend(): void {
     if (leaving) return;
     holding = true;
     holderChanged(); // what waited on whoever held the store waits on this worker now, which answers it or says it failed
+    channel.postMessage({ holding: true } satisfies Shout); // and on every other, which waits on this one now
     saidStage = -1; // and, holding it anew, it has said nothing of how far it has got
     try {
       await hold(o);
@@ -284,7 +286,6 @@ async function hold(o: Options): Promise<void> {
   if (leaving) stopNow(node), letGo!(); // closed or put away as it opened
   else if (!stopped) {
     device = node;
-    breakCarried();
     holderChanged(); // what waited on this worker has it here now
     channel.postMessage({ leader: true } satisfies Shout);
     tellSpace();
@@ -347,8 +348,8 @@ const away = () => void leave();
 // Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
 function fail(f: Failure): void {
   failedAsks(f);
-  breakCarried(); // to one that is gone, or none: every client dials again, and so this worker is wanted, and tries again
-  holderChanged(); // what waited on this worker is answered: it failed
+  // What waited on this worker is answered, it having failed: every client dials again, and so it is wanted, and tries again.
+  holderChanged();
   tellAll({ failed: f.message, name: f.name });
 }
 
@@ -518,11 +519,19 @@ function unlisten(): void {
   holderHeard = probeHeard = false;
 }
 
-// Whoever held the store is waited on no more, however it went: it said it failed, another has opened the store since, or
-// it was this worker, which has come to hold the store, opened its node or failed. All of waiting on it ends here, what
-// waited on it, the silence, and that it was asked whether it is there and said nothing; and what is still waiting, asks
-// said again to the next, waits on that one afresh, asked whether it is there before it is given up on.
+// Whoever holds the store has changed, or has answered, or failed, all that waited on it. Its lock is had by one at a time,
+// and whoever has it says so as it does, however the one before went: so every change of holder is heard by every worker,
+// and comes here. The ways it changes, and what each worker hears of it:
+//   the holder fails, as it opens or after: it says so, { failed }; and the next to have the lock says so, { holding };
+//   it is closed, put away, or gone with its tab, its worker stopped or its renderer crashed: nothing; but the next says so;
+//   it never lets go, hung: nothing, and what waits on it is given up on (listen), this worker staying in line;
+//   this worker has the lock (contend), and then opens its node, or fails (hold);
+//   the next, once it has opened its node, says so, { leader }, and answers what was asked of the one before, asked again.
+// Each ends all of waiting on the one before: the pipes carried to it, which it serves no more, what was sent it, the
+// silence, and that it was asked whether it is there and said nothing. What is still waiting waits on the next afresh,
+// asked whether it is there before it is given up on. (test/worker.ts goes through each of these.)
 function holderChanged(): void {
+  breakCarried();
   unlisten();
   listen();
 }
@@ -551,21 +560,21 @@ function heard(s: Shout): void {
     if (typeof s.failed !== "string") return;
     const f: Failure = { message: s.failed, ...(s.name === "StoreLocked" ? { name: s.name } : {}) };
     failedAsks(f);
-    breakCarried();
     holderChanged();
     tell({ failed: f.message, name: f.name });
   } else if ("space" in s) {
     if (s.space !== undefined && typeof s.space !== "string") return;
     tell({ space: s.space });
+  } else if ("holding" in s) {
+    holderChanged();
   } else if ("leader" in s) {
-    breakCarried(); // to one that is gone
+    holderChanged(); // what was carried to one that is gone, or to this one as it opened, which served none of it
     for (const [id, u] of [...unheard]) {
       if ("open" in u) continue;
       const lost = "ask" in u ? gone(id, u.op) : undefined;
       if (lost) heard({ answer: id, ...lost });
       else channel.postMessage(u);
     }
-    holderChanged();
   } else if ("by" in s) {
     heardGiven(s);
   } else if ("credentials" in s) {
