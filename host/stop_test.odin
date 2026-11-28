@@ -35,6 +35,7 @@ host_stops_however_told :: proc(t: ^testing.T) {
 		st := Stopping{dir = dir, how = how}
 		// What the host says of its failing is meant, and not heard: core:thread gives a thread not given a context
 		// runtime.default_context(), whose logger says nothing.
+		// lint-thread: given no T, it says none of the test's failures; what its host's loop calls back is the host's
 		runner := thread.create_and_start_with_poly_data(&st, proc(st: ^Stopping) {
 			h: Host
 			// Listening, so that the loop has something to wait for, and would wait for ever.

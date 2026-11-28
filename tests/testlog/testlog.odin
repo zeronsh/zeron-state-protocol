@@ -5,7 +5,8 @@
 // core/testing/logging.odin, `if level >= .Error { t.error_count += 1 }`), and a test with any fails. What a test says
 // fails it, testing.expect, expectf, expect_value, fail and fail_now, is said so, through core:log, to context.logger,
 // at .Error, at the caller's location (`location = loc`, `loc := #caller_location`): a line of a `_test.odin` file, as
-// only those, and this, may import core:testing (./x check), and this says none. A failed assertion, a signal, a
+// only those, and this, may import core:testing, and this says none; and as no location is made by hand, in a test nor in
+// what it runs, nor given core:testing but where it is said from (./x check). A failed assertion, a signal, a
 // timeout and memory leaked are counted otherwise, by the runner itself, whatever the logger; though what an assertion
 // says, it says at .Fatal, and is heard. So a test that sets context.logger to anything that is not the runner's loses
 // every failure it says; and one that passes on only some of what is said loses whatever is not passed on.
@@ -85,9 +86,9 @@ heard :: proc(q: ^Quiet, what: string) -> bool {
 	return false
 }
 
-// Whether a message said there is passed on by a logger quieting what.
+// Whether a message said from a line of the file at file_path is passed on by a logger quieting what.
 @(private)
-passed_on :: proc(what: What, level: runtime.Logger_Level, location: runtime.Source_Code_Location) -> bool {
+passed_on :: proc(what: What, level: runtime.Logger_Level, file_path: string) -> bool {
 	if level >= .Fatal {
 		return true
 	}
@@ -95,7 +96,7 @@ passed_on :: proc(what: What, level: runtime.Logger_Level, location: runtime.Sou
 	case .Below_Errors:
 		return level >= .Error
 	case .Code_Under_Test:
-		return strings.has_suffix(location.file_path, "_test.odin")
+		return strings.has_suffix(file_path, "_test.odin")
 	}
 	return true
 }
@@ -123,7 +124,7 @@ around :: proc(q: ^Quiet, runner: runtime.Logger, what: What, keep: bool) -> run
 @(private)
 quiet_proc :: proc(data: rawptr, level: runtime.Logger_Level, text: string, options: runtime.Logger_Options, location := #caller_location) {
 	q := (^Quiet)(data)
-	if passed_on(q.what, level, location) {
+	if passed_on(q.what, level, location.file_path) {
 		if level >= q.runner.lowest_level {
 			q.runner.procedure(q.runner.data, level, text, q.runner.options, location)
 		}
