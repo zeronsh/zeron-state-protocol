@@ -311,8 +311,14 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> (err: General_Error) {
 
 		debug(avl.len(&l.timeouts), "timeouts", "threshold", curr)
 
-		iter := avl.iterator(&l.timeouts, .Forward)
-		for node in avl.iterator_next(&iter) {
+		// ZSP: the first, each time, its node out of the tree before it is completed. Upstream walked the tree with an
+		// iterator, which holds the next node while one is completed: a callback that removed that next timeout freed
+		// it under the iterator, which went on from freed memory.
+		for {
+			node := avl.first(&l.timeouts)
+			if node == nil {
+				break
+			}
 			op := node.value
 			cexpires := time.diff(curr, op.timeout._impl.expires)
 
@@ -320,18 +326,16 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> (err: General_Error) {
 
 			removed := op._impl.timeout == (^Operation)(REMOVED)
 			done    := cexpires <= 0
+			if !removed && !done {
+				break
+			}
+			avl.remove_node(&l.timeouts, node)
 			if removed {
 				debug("timeout removed!")
-			} else if done {
+			} else {
 				debug("timeout done!")
 				handle_completed(op)
 			}
-			if removed || done {
-				avl.remove_node(&l.timeouts, node)
-				continue
-			}
-
-			break
 		}
 
 		// Don't merge this with the previous iteration because the `handle_completed` in that one might queue
@@ -975,6 +979,7 @@ accept_exec :: proc(op: ^Operation) -> Op_Result {
 	{
 		ep, err := bound_endpoint(op.accept.socket)
 		if err != nil {
+			op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 			op.accept.err = net._accept_error()
 			return .Done
 		}
@@ -986,6 +991,7 @@ accept_exec :: proc(op: ^Operation) -> Op_Result {
 
 	client, err := _create_socket(op.l, family, .TCP)
 	if err != nil {
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		op.accept.err = net._accept_error()
 		return .Done
 	}
@@ -1005,12 +1011,13 @@ accept_exec :: proc(op: ^Operation) -> Op_Result {
 		&op._impl.over,
 	) {
 		// ZSP: only ERROR_IO_PENDING leaves the operation to complete later. Any other failure is its result now, and
-		// no completion will come for it: upstream took one that left `over.Internal` set for pending too, and waited
-		// for ever.
+		// no completion will come for it: upstream took one that left `over.Internal` at STATUS_PENDING, as each does,
+		// or set otherwise, for one under way, and waited for ever (odin-lang/Odin#8644).
 		if left_pending() {
 			link_timeout(op, op.accept.expires)
 			return .Pending
 		}
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		op.accept.err = net._accept_error()
 	}
 
@@ -1020,7 +1027,7 @@ accept_exec :: proc(op: ^Operation) -> Op_Result {
 accept_callback :: proc(op: ^Operation) {
 	assert(op.type == .Accept)
 
-	defer if op.accept.err != nil {
+	defer if op.accept.err != nil && op.accept.client != 0 { // ZSP: no socket closed that was never made
 		win.closesocket(win.SOCKET(op.accept.client))
 	}
 
@@ -1053,6 +1060,7 @@ accept_callback :: proc(op: ^Operation) {
 		listener := win.SOCKET(op.accept.socket)
 		// ZSP: checked; without it, the socket is one that shutdown, getpeername and the rest fail on.
 		if win.setsockopt(win.SOCKET(op.accept.client), win.SOL_SOCKET, win.SO_UPDATE_ACCEPT_CONTEXT, &listener, size_of(listener)) != 0 {
+			op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 			op.accept.err = net._accept_error()
 		}
 
@@ -1065,6 +1073,7 @@ accept_callback :: proc(op: ^Operation) {
 		fallthrough
 
 	case:
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		op.accept.err = net._accept_error()
 	}
 }
@@ -1082,6 +1091,7 @@ dial_exec :: proc(op: ^Operation) -> (result: Op_Result) {
 	family := family_from_endpoint(op.dial.endpoint)
 	osocket, socket_err := _create_socket(op.l, family, .TCP)
 	if socket_err != nil {
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		op.dial.err = socket_err
 		return .Done
 	}
@@ -1091,9 +1101,10 @@ dial_exec :: proc(op: ^Operation) -> (result: Op_Result) {
 	sockaddr := endpoint_to_sockaddr({IP6_Any if family == .IP6 else net.IP4_Any, 0})
 	res      := win.bind(win.SOCKET(op.dial.socket), &sockaddr, size_of(sockaddr))
 	if res < 0 {
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		op.dial.err = net._bind_error()
 		// ZSP: closed by dial_callback, as every failed dial's socket is: closing it here too closed it twice, the
-		// second time whatever socket had been given the same handle meanwhile.
+		// second time whatever socket had been given the same handle meanwhile (odin-lang/Odin#8645).
 		return .Done
 	}
 
@@ -1113,12 +1124,13 @@ dial_exec :: proc(op: ^Operation) -> (result: Op_Result) {
 		&op._impl.over,
 	) {
 		// ZSP: only ERROR_IO_PENDING leaves the operation to complete later. Any other failure is its result now, and
-		// no completion will come for it: upstream took one that left `over.Internal` set for pending too, and waited
-		// for ever.
+		// no completion will come for it: upstream took one that left `over.Internal` at STATUS_PENDING, as each does,
+		// or set otherwise, for one under way, and waited for ever (odin-lang/Odin#8644).
 		if left_pending() {
 			link_timeout(op, op.dial.expires)
 			return .Pending
 		}
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		op.dial.err = net._dial_error()
 	}
 
@@ -1128,7 +1140,7 @@ dial_exec :: proc(op: ^Operation) -> (result: Op_Result) {
 dial_callback :: proc(op: ^Operation) {
 	assert(op.type == .Dial)
 
-	defer if op.dial.err != nil {
+	defer if op.dial.err != nil && op.dial.socket != 0 { // ZSP: no socket closed that was never made
 		win.closesocket(win.SOCKET(op.dial.socket))
 	}
 
@@ -1142,6 +1154,7 @@ dial_callback :: proc(op: ^Operation) {
 		// enables getsockopt, setsockopt, getsockname, getpeername, etc.
 		// ZSP: checked, as for an accepted socket.
 		if win.setsockopt(win.SOCKET(op.dial.socket), win.SOL_SOCKET, win.SO_UPDATE_CONNECT_CONTEXT, nil, 0) != 0 {
+			op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 			op.dial.err = net._dial_error()
 		}
 
@@ -1149,6 +1162,7 @@ dial_callback :: proc(op: ^Operation) {
 		op.dial.err = Dial_Error.Timeout
 
 	case:
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		op.dial.err = net._dial_error()
 	}
 }
@@ -1171,24 +1185,21 @@ read_exec :: proc(op: ^Operation) -> Op_Result {
 		&op._impl.over,
 	) {
 		assert(read == 0)
-		if is_pending(op._impl.over) {
-			link_timeout(op, op.read.expires)
-			return .Pending
-		} else if op._impl.over.Internal == nil {
-			err := win.GetLastError()
-			if is_incomplete(win.System_Error(err)) {
-				link_timeout(op, op.read.expires)
-				return .Pending
-			}
-			op.read.err = FS_Error(err)
-		} else {
-			// The read completed synchronously with a failure status. `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`
-			// only suppresses the completion packet on success, so one is still queued for
-			// this. Returning `.Done` here would complete the operation a second time, on an
-			// Operation that has already been recycled into the pool.
+		// ZSP: as for sockets (see left_pending): only ERROR_IO_PENDING leaves it to complete later. A read that fails
+		// as it is made leaves `over.Internal` at STATUS_PENDING, and no completion comes for it (measured: a file
+		// opened only to write, read); upstream took it for one under way, or for one whose completion would come.
+		err := win.GetLastError()
+		if win.System_Error(err) == .IO_PENDING {
 			link_timeout(op, op.read.expires)
 			return .Pending
 		}
+		op.system_error = u16(err)
+		if win.System_Error(err) == .HANDLE_EOF && op.read.read == 0 {
+			op.read.err = .EOF
+		} else {
+			op.read.err = FS_Error(err)
+		}
+		return .Done
 	}
 
 	assert(uintptr(read) == uintptr(op._impl.over.InternalHigh))
@@ -1252,20 +1263,15 @@ write_exec :: proc(op: ^Operation) -> Op_Result {
 		&op._impl.over,
 	) {
 		assert(written == 0)
-		if is_pending(op._impl.over) {
-			link_timeout(op, op.write.expires)
-			return .Pending
-		} else if op._impl.over.Internal == nil {
-			err := win.GetLastError()
-			if is_incomplete(win.System_Error(err)) {
-				link_timeout(op, op.write.expires)
-				return .Pending
-			}
-			op.write.err = FS_Error(err)
-		} else {
+		// ZSP: as for a read.
+		err := win.GetLastError()
+		if win.System_Error(err) == .IO_PENDING {
 			link_timeout(op, op.write.expires)
 			return .Pending
 		}
+		op.system_error = u16(err)
+		op.write.err = FS_Error(err)
+		return .Done
 	}
 
 	assert(uintptr(written) == uintptr(op._impl.over.InternalHigh))
@@ -1351,12 +1357,13 @@ recv_exec :: proc(op: ^Operation) -> Op_Result {
 
 	if status == win.SOCKET_ERROR {
 		// ZSP: only ERROR_IO_PENDING leaves the operation to complete later. Any other failure is its result now, and
-		// no completion will come for it: upstream took one that left `over.Internal` set for pending too, and waited
-		// for ever.
+		// no completion will come for it: upstream took one that left `over.Internal` at STATUS_PENDING, as each does,
+		// or set otherwise, for one under way, and waited for ever (odin-lang/Odin#8644).
 		if left_pending() {
 			link_timeout(op, op.recv.expires)
 			return .Pending
 		}
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		switch _ in op.recv.socket {
 		case TCP_Socket: op.recv.err = net._tcp_recv_error()
 		case UDP_Socket: op.recv.err = net._udp_recv_error()
@@ -1388,6 +1395,7 @@ recv_callback :: proc(op: ^Operation) -> Op_Result {
 		}
 		fallthrough
 	case:
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		switch _ in op.recv.socket {
 		case TCP_Socket: op.recv.err = net._tcp_recv_error()
 		case UDP_Socket: op.recv.err = net._udp_recv_error()
@@ -1471,12 +1479,13 @@ send_exec :: proc(op: ^Operation) -> Op_Result {
 
 	if status == win.SOCKET_ERROR {
 		// ZSP: only ERROR_IO_PENDING leaves the operation to complete later. Any other failure is its result now, and
-		// no completion will come for it: upstream took one that left `over.Internal` set for pending too, and waited
-		// for ever.
+		// no completion will come for it: upstream took one that left `over.Internal` at STATUS_PENDING, as each does,
+		// or set otherwise, for one under way, and waited for ever (odin-lang/Odin#8644).
 		if left_pending() {
 			link_timeout(op, op.send.expires)
 			return .Pending
 		}
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		switch _ in op.send.socket {
 		case TCP_Socket: op.send.err = net._tcp_send_error()
 		case UDP_Socket: op.send.err = net._udp_send_error()
@@ -1508,6 +1517,7 @@ send_callback :: proc(op: ^Operation) -> Op_Result {
 		}
 		fallthrough
 	case:
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		switch _ in op.send.socket {
 		case TCP_Socket: op.send.err = net._tcp_send_error()
 		case UDP_Socket: op.send.err = net._udp_send_error()
@@ -1564,15 +1574,13 @@ sendfile_exec :: proc(op: ^Operation) -> Op_Result {
 		nil,
 		0,
 	) {
-		if is_pending(op._impl.over) || (op._impl.over.Internal == nil && is_incomplete(win.System_Error(win.GetLastError()))) {
-			link_timeout(op, op.sendfile.expires)
-			return .Pending
-		} else if op._impl.over.Internal == nil {
-			op.sendfile.err = net._tcp_send_error()
-		} else {
+		// ZSP: as for a send (see left_pending).
+		if left_pending() {
 			link_timeout(op, op.sendfile.expires)
 			return .Pending
 		}
+		op.system_error = u16(win.WSAGetLastError())
+		op.sendfile.err = net._tcp_send_error()
 	}
 
 	return .Done
@@ -1883,7 +1891,9 @@ wsa_get_result :: proc(socket: win.SOCKET, over: win.OVERLAPPED) -> (n: int, err
 }
 
 // ZSP: whether an overlapped call that returned failure was only left to complete later, as Winsock says by
-// ERROR_IO_PENDING alone. Its error is left where the `_error` procedures read it.
+// ERROR_IO_PENDING alone. One that failed as it was made leaves `over.Internal` at STATUS_PENDING all the same, and
+// no completion comes for it (measured, for WSARecv and WSASend on a reset connection): so `over` says nothing of
+// which it was. Its error is left where the `_error` procedures read it.
 left_pending :: proc() -> bool {
 	return win.System_Error(win.WSAGetLastError()) == .IO_PENDING
 }

@@ -43,6 +43,11 @@ Operation :: struct {
 	cb:              Callback,
 	user_data:       [MAX_USER_ARGUMENTS + 1]rawptr,
 	detached:        bool,
+	// ZSP: the system's own code for the failure the operation ended with (WSAGetLastError on Windows, errno elsewhere),
+	// taken where it failed: what the error the operation gives keeps of it is a category, and the system's last error
+	// read later, in the callback, may be another's by then. 0 where the system said nothing of it. Each such code is
+	// below 65536; in the padding after `detached`, so that an operation is no larger.
+	system_error:    u16,
 	type:            Operation_Type,
 	using specifics: Specifics,
 

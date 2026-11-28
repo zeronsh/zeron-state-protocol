@@ -30,6 +30,12 @@ _Event_Loop :: struct {
 	// These ops did not block so can call back next tick.
 	completed: queue.Queue(^Operation),
 	kqueue:    kq.KQ,
+	// ZSP: operations done with, held from the pool until the changes queued for kqueue by the time they were done with
+	// (the deletion of a timer of theirs among them) have been given to it: until then kqueue may still name them, and
+	// what it says of them is ignored. Counted by changes queued and changes given, in order.
+	retired:   [dynamic]^Operation,
+	queued:    u64,
+	given:     u64,
 }
 
 @(private="package")
@@ -49,6 +55,7 @@ _Operation :: struct {
 
 	flags:  Operation_Flags,
 	result: i64,
+	given_at: u64, // ZSP: for a retired operation, the changes given by which it may go back to the pool
 }
 
 @(private="package")
@@ -107,6 +114,7 @@ _init :: proc(l: ^Event_Loop, allocator: mem.Allocator) -> (rerr: General_Error)
 	l.submitted.allocator = allocator
 	l.overflow.data.allocator = allocator
 	l.completed.data.allocator = allocator
+	l.retired.allocator = allocator
 
 	kqueue, err := kq.kqueue()
 	if err != nil {
@@ -128,6 +136,7 @@ _init :: proc(l: ^Event_Loop, allocator: mem.Allocator) -> (rerr: General_Error)
 @(private="package")
 _destroy :: proc(l: ^Event_Loop) {
 	delete(l.submitted)
+	delete(l.retired)
 	queue.destroy(&l.overflow)
 	queue.destroy(&l.completed)
 	posix.close(l.kqueue)
@@ -177,6 +186,7 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> General_Error {
 		results_buf: [128]kq.KEvent
 		results := kevent(l, results_buf[:], ts_pointer) or_return
 
+		l.given += u64(len(l.pending)) // ZSP: see _Event_Loop.retired
 		clear(&l.pending)
 		// ZSP: moved over only while there is room. Upstream took one from the overflow before finding there was none,
 		// and dropped it: a change kqueue was never given, as an operation added that never completes.
@@ -187,6 +197,7 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> General_Error {
 		l.now = time.now()
 
 		handle_results(l, results)
+		release_retired(l)
 
 		if len(results) < len(results_buf) {
 			break
@@ -250,6 +261,11 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> General_Error {
 
 			op := cast(^Operation)event.udata
 			assert(op != nil)
+			if .Retired in op._impl.flags {
+				// ZSP: done with, and told of before kqueue heard it was: nothing it says of it is acted on.
+				event.filter = kq.Filter(FILTER_IGNORE)
+				continue
+			}
 			assert(op.type != .None)
 
 			if is_internal_timeout(event.filter, op) {
@@ -558,6 +574,7 @@ Operation_Flag :: enum {
 	For_Kernel,
 	EOF,
 	Error,
+	Retired, // ZSP: done with, and waiting for kqueue to have been told so: see _Event_Loop.retired
 }
 Operation_Flags :: bit_set[Operation_Flag]
 
@@ -572,6 +589,19 @@ Queue_Identifier :: struct {
 
 handle_completed :: proc(op: ^Operation) {
 	debug("handling", op.type)
+
+	if .Removed in op._impl.flags {
+		// ZSP: a removed operation does nothing more, whatever came for it: its callback is not called, so nobody would
+		// have what it read, accepted or connected. Upstream went on with it, reading into a buffer its owner may have
+		// let go of, and leaving what it accepted or connected open. What it holds already is let go of.
+		let_go(op)
+		#partial switch op.type {
+		case .Send: bufs_delete(&op.send._impl.bufs, op.send.bufs, op.l.allocator)
+		case .Recv: bufs_delete(&op.recv._impl.bufs, op.recv.bufs, op.l.allocator)
+		}
+		cleanup(op)
+		return
+	}
 
 	result: Op_Result
 	#partial switch op.type {
@@ -634,11 +664,54 @@ handle_completed :: proc(op: ^Operation) {
 	cleanup :: proc(op: ^Operation) {
 		if .Has_Timeout in op._impl.flags {
 			remove_link_timeout(op)
+			// ZSP: kqueue has its timer, with this operation in it, until the deletion just queued is given to it, which
+			// may be ticks away when the queue is full: it goes back to the pool only then (see _Event_Loop.retired).
+			// Upstream put it back at once, and a timer firing meanwhile handed the loop an operation freed or reused.
+			if !op.detached {
+				op._impl.flags += {.Retired}
+				op._impl.given_at = op.l.queued
+				append(&op.l.retired, op)
+				return
+			}
 		}
 		if !op.detached {
 			pool.put(&op.l.operation_pool, op)
 		}
 	}
+}
+
+// ZSP: what a removed operation holds that its callback would have been handed, let go of, as nobody else will.
+let_go :: proc(op: ^Operation) {
+	#partial switch op.type {
+	case .Accept:
+		// Accepted as it was made; one that failed closed what it had.
+		if .Done in op._impl.flags && op.accept.err == nil && op.accept.client > 0 {
+			posix.close(posix.FD(op.accept.client))
+		}
+	case .Dial:
+		// Connecting yet, or connected as it was made; one that failed as it was made closed its socket.
+		if op.dial.socket > 0 && (.Done not_in op._impl.flags || op.dial.err == nil) {
+			posix.close(posix.FD(op.dial.socket))
+		}
+	case .Open:
+		if .Done in op._impl.flags && op.open.err == nil && op.open.handle > 0 {
+			posix.close(op.open.handle)
+		}
+	}
+}
+
+// ZSP: retired operations whose timers kqueue has now been told to delete go back to the pool.
+release_retired :: proc(l: ^Event_Loop) {
+	kept := 0
+	for op in l.retired {
+		if op._impl.given_at <= l.given {
+			pool.put(&l.operation_pool, op)
+		} else {
+			l.retired[kept] = op
+			kept += 1
+		}
+	}
+	resize(&l.retired, kept)
 }
 
 @(require_results)
@@ -662,10 +735,12 @@ accept_exec :: proc(op: ^Operation) -> Op_Result {
 			return .Pending
 		}
 
+		op.system_error = u16(posix.errno()) // ZSP: see Operation.system_error
 		return .Done
 	}
 
 	if err := net.set_blocking(op.accept.client, false); err != nil {
+		op.system_error = u16(posix.errno()) // ZSP: see Operation.system_error
 		op.accept.err = posix_accept_error()
 	}
 
@@ -691,6 +766,7 @@ dial_exec :: proc(op: ^Operation) -> Op_Result {
 		posix.getsockopt(posix.FD(op.dial.socket), posix.SOL_SOCKET, .ERROR, &err, &size)
 		if err != nil {
 			posix.errno(err)
+			op.system_error = u16(err) // ZSP: see Operation.system_error
 			op.dial.err = posix_dial_error()
 		}
 		return .Done
@@ -704,6 +780,7 @@ dial_exec :: proc(op: ^Operation) -> Op_Result {
 	family := family_from_endpoint(op.dial.endpoint)
 	osocket, socket_err := _create_socket(op.l, family, .TCP)
 	if socket_err != nil {
+		op.system_error = u16(posix.errno()) // ZSP: see Operation.system_error
 		op.dial.err = socket_err
 		return .Done
 	}
@@ -718,6 +795,7 @@ dial_exec :: proc(op: ^Operation) -> Op_Result {
 			return .Pending
 		}
 
+		op.system_error = u16(posix.errno()) // ZSP: see Operation.system_error
 		op.dial.err = posix_dial_error()
 		return .Done
 	}
@@ -803,6 +881,7 @@ send_exec :: proc(op: ^Operation) -> Op_Result {
 			return .Pending
 		}
 
+		op.system_error = u16(posix.errno()) // ZSP: see Operation.system_error
 		switch _ in op.send.socket {
 		case TCP_Socket: op.send.err = posix_tcp_send_error()
 		case UDP_Socket: op.send.err = posix_udp_send_error()
@@ -864,6 +943,7 @@ recv_exec :: proc(op: ^Operation) -> Op_Result {
 			return .Pending
 		}
 
+		op.system_error = u16(posix.errno()) // ZSP: see Operation.system_error
 		if is_tcp {
 			op.recv.err = posix_tcp_recv_error()
 		} else {
@@ -1199,6 +1279,7 @@ add_pending :: proc(op: ^Operation, filter: kq.Filter, ident: uintptr) {
 }
 
 append_pending :: #force_inline proc(l: ^Event_Loop, ev: kq.KEvent) {
+	l.queued += 1 // ZSP: see _Event_Loop.retired
 	if append(&l.pending, ev) == 0 {
 		warn("queue is full, adding to overflow, should QUEUE_SIZE be increased?")
 		_, err := queue.append(&l.overflow, ev)

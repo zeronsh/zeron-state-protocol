@@ -1,10 +1,18 @@
 # core:nbio, carried here for now
 
 **Temporary.** This is Odin's `core:nbio` as the `dev-2026-11` release has it (tag commit `e28f5d1ff420`, the release
-CI installs), with the changes below and nothing else. Every change is marked `ZSP:` in the source. Drop the copy, and
-import `core:nbio` again, once an Odin release fixes
-[odin-lang/Odin#8642](https://github.com/odin-lang/Odin/issues/8642) (the runtime's `__dynamic_map_entry`) and the
-defects below.
+CI installs), with the changes below and nothing else. Every change is marked `ZSP:` in the source.
+
+Drop the copy, and import `core:nbio` again, once an Odin release fixes all three of:
+
+- [odin-lang/Odin#8642](https://github.com/odin-lang/Odin/issues/8642): the runtime's `__dynamic_map_entry` can give
+  back another key's slot, which on macOS and the BSDs loses kqueue operations;
+- [odin-lang/Odin#8644](https://github.com/odin-lang/Odin/issues/8644): on Windows, a read or write of a connection its
+  peer reset never completes;
+- [odin-lang/Odin#8645](https://github.com/odin-lang/Odin/issues/8645): on Windows, a dial whose bind fails closes its
+  socket twice, the second time whatever socket was given that handle meanwhile;
+
+and has the rest below, or they are kept as fixes of ours.
 
 It is under Odin's license, in `LICENSE` beside it.
 
@@ -23,31 +31,48 @@ within a second with the release's `core:nbio`, and passes with this copy.
 
 ## What differs from the release
 
-- `impl_posix.odin`, `add_pending` and `timeout_and_delete`: looked up, then assigned, rather than `map_entry`.
-- `impl_posix.odin`, `__tick`: changes held back for want of room in a kqueue call are moved over only while there is
-  room. The release took one before finding there was none and dropped it: kqueue never heard of it, and the operation
-  never completed. `loop_gives_every_change_it_held_back` fails with the release (773 of 775 timeouts come) and passes.
-- `impl_windows.odin`, `accept_exec`, `dial_exec`, `recv_exec`, `send_exec`: an overlapped call that fails is left to
-  complete later only if Winsock says `ERROR_IO_PENDING`. The release also did so when the failure left `over.Internal`
-  set, or was `WSAEWOULDBLOCK`, and no completion comes for either: the operation waited for ever. A read and a write of
-  a connection its peer has reset are such: with the release they never end, which the test of them in
-  `host/nbio_test.odin` fails on; with this copy each ends at once, with an error.
-- `impl_windows.odin`, `dial_exec`: a socket whose bind failed is closed once, by `dial_callback`. The release closed it
-  in both, the second time whatever socket had since been given the same handle.
-- `impl_windows.odin`, `accept_callback` and `dial_callback`: `SO_UPDATE_ACCEPT_CONTEXT` and `SO_UPDATE_CONNECT_CONTEXT`
-  are checked, and their failure is the operation's.
-- `impl_windows.odin`, `link_timeout`: an operation keeps the timeout it has. A send or receive of `all` that went only
-  part of the way is executed again, and the release linked it a second timeout, which took the first's place and left
-  it to fire at an operation done with by then.
+Each has a test in `host/nbio_test.odin` that fails without it, where the platform it is on runs it.
 
-Left as the release has them, as nothing here uses them: `sendfile_exec` and `read_exec`/`write_exec` on Windows wait on
-a failed call as the four above did.
+All platforms:
+- `nbio.odin`, `Operation.system_error`: the system's own code for the failure an operation ended with, taken where it
+  failed. The error an operation gives keeps only a category, and the system's last error, read in the callback, may be
+  another's by then: on Windows, what the loop's wait said (often 258, a timeout). In the padding after `detached`, so
+  an operation is no larger.
+- `impl_posix.odin`, `impl_linux.odin`: what a removed operation took hold of, all the same, is let go of: a socket
+  accepted or connected, or a file opened, which nobody would otherwise ever close.
+
+kqueue (macOS, the BSDs), `impl_posix.odin`:
+- `add_pending` and `timeout_and_delete`: looked up, then assigned, rather than `map_entry` (#8642).
+- `__tick`: changes held back for want of room in a kqueue call are moved over only while there is room. The release
+  took one before finding there was none and dropped it: kqueue never heard of it, and the operation never completed.
+- `handle_completed`: a removed operation does nothing more. The release went on with it in the tick it was ready:
+  reading into a buffer its owner may have let go of, accepting or connecting what nobody would be handed.
+- `cleanup`: an operation with a timer kqueue may still fire goes back to the pool only once the timer's deletion has
+  been given to kqueue (`_Event_Loop.retired`), and what kqueue says of it meanwhile is ignored. The release put it back
+  at once, and a timer firing before a deletion held back in the overflow handed the loop an operation freed or reused.
+
+Windows, `impl_windows.odin`:
+- `accept_exec`, `dial_exec`, `recv_exec`, `send_exec`, `sendfile_exec`, `read_exec`, `write_exec`: an overlapped call
+  that fails is left to complete later only if the system says `ERROR_IO_PENDING` (#8644). A call that fails as it is
+  made leaves `over.Internal` at `STATUS_PENDING` all the same, and no completion ever comes for it (measured, with the
+  port tied as nbio ties it: `WSARecv` and `WSASend` on a reset connection, `ReadFile` of a file opened only to write,
+  `WriteFile` of one opened only to read). The release took it for one under way, and waited for ever.
+- `dial_exec`: a socket whose bind failed is closed once, by `dial_callback` (#8645).
+- `accept_callback`, `dial_callback`: `SO_UPDATE_ACCEPT_CONTEXT` and `SO_UPDATE_CONNECT_CONTEXT` are checked, and their
+  failure is the operation's; and no socket is closed that was never made (the release closed handle 0, which said
+  nothing but left the last error at 10038).
+- `link_timeout`: an operation keeps the timeout it has. A send or receive of `all` that went only part of the way is
+  executed again, and the release linked it a second timeout, which took the first's place and left it to fire at an
+  operation done with by then.
+- `check_timeouts`: the first timeout due is taken out of the tree before it is completed. The release walked the tree
+  with an iterator holding the next node, which a callback removing that timeout freed under it.
 
 ## Not here, but of the same release
 
 - `core:net`'s `enumerate_interfaces` on macOS, OpenBSD and NetBSD gathers interfaces with `map_entry`, writing through
   it: `host/interfaces_bsd.odin` walks `getifaddrs` itself there, as `host/interfaces_linux.odin` does.
-- `core:net`'s `set_option(.Linger)` on macOS and the BSDs gives the system a `timeval` rather than a `linger`.
+- `core:net`'s `set_option(.Linger)` on macOS and the BSDs gives the system a `timeval` rather than a `linger`. Nothing
+  here sets `.Linger`.
 
 ## To check the copy
 
@@ -55,5 +80,5 @@ a failed call as the four above did.
 diff -r "$(odin root)/core/nbio" third_party/nbio
 ```
 
-shows only the changes above, the two lines atop `doc.odin` that say this is a copy, `README.md` and `LICENSE`, with
-the release installed.
+shows only the changes above, the lines atop `doc.odin` that say this is a copy, `README.md` and `LICENSE`, with the
+release installed.

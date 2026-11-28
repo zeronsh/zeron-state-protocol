@@ -1,7 +1,10 @@
 package host
 
+import "core:fmt"
 import "core:math/rand"
 import "core:net"
+import "core:os"
+import "core:slice"
 import "core:testing"
 import "core:time"
 import "../third_party/nbio"
@@ -145,6 +148,7 @@ loop_ends_reads_and_writes_of_a_reset_connection :: proc(t: ^testing.T) {
 		done:  bool,
 		n:     int,
 		error: bool,
+		code:  u16, // what the system said of it, as the operation keeps it
 	}
 	wait :: proc(t: ^testing.T, r: ^Result, what: string) {
 		start := time.tick_now()
@@ -174,14 +178,310 @@ loop_ends_reads_and_writes_of_a_reset_connection :: proc(t: ^testing.T) {
 	time.sleep(50 * time.Millisecond)
 	r = {}
 	nbio.recv_poly(socket, {buf[:]}, &r, proc(op: ^nbio.Operation, r: ^Result) {
-		r.done, r.n, r.error = true, op.recv.received, op.recv.err != nil
+		r.done, r.n, r.error, r.code = true, op.recv.received, op.recv.err != nil, op.system_error
 	})
 	wait(t, &r, "a read of a reset connection")
 	testing.expectf(t, r.error || r.n == 0, "a read of a reset connection read %d bytes", r.n)
+	// What the system said of it, kept with the operation where it failed: not whatever the system said last, which by
+	// its callback, on Windows, is what the loop's wait said (often 258, a timeout).
+	reset_codes := RESET_CODES
+	testing.expectf(t, !r.error || slice.contains(reset_codes[:], r.code), "a read of a reset connection says the system said %d", r.code)
 	w: Result
 	nbio.send_poly(socket, {buf[:]}, &w, proc(op: ^nbio.Operation, r: ^Result) {
-		r.done, r.n, r.error = true, op.send.sent, op.send.err != nil
+		r.done, r.n, r.error, r.code = true, op.send.sent, op.send.err != nil, op.system_error
 	})
 	wait(t, &w, "a write to a reset connection")
 	testing.expectf(t, w.error, "a write to a reset connection wrote %d bytes and said nothing wrong", w.n)
+	testing.expectf(t, slice.contains(reset_codes[:], w.code), "a write to a reset connection says the system said %d", w.code)
+}
+
+// A dial refused: the system's own word for it is kept with the operation, as it is for every failure, so that whoever
+// says why a connection failed (the forwarder does) says what the system said, not what it said last.
+@(test)
+loop_keeps_what_the_system_said_of_a_refusal :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	// A port nothing listens at: one listened at, and let go of.
+	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, err == nil)
+	at, _ := net.bound_endpoint(listener)
+	net.close(listener)
+	Dial :: struct {
+		done:  bool,
+		error: bool,
+		code:  u16,
+	}
+	d: Dial
+	nbio.dial_poly(at, &d, proc(op: ^nbio.Operation, d: ^Dial) {
+		d^ = {true, op.dial.err != nil, op.system_error}
+		if op.dial.err == nil {
+			net.close(op.dial.socket)
+		}
+	})
+	start := time.tick_now()
+	for !d.done && time.tick_since(start) < 10 * time.Second {
+		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
+	}
+	testing.expectf(t, d.done && d.error, "the dial ended %v, with an error %v", d.done, d.error)
+	testing.expectf(t, d.code == REFUSED_CODE, "the dial says the system said %d, not %d", d.code, REFUSED_CODE)
+}
+
+// A timeout whose callback removes the timeout due after it. On Windows core:nbio (dev-2026-11) went through the
+// timeouts due with an iterator that held the next one meanwhile: the callback freed it under the iterator, which then
+// went on from freed memory. Meaningful on Windows; elsewhere timeouts are kept otherwise, and this is only a removal.
+@(test)
+loop_lets_a_timeout_remove_the_one_after_it :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	Timeouts :: struct {
+		later:             ^nbio.Operation,
+		first, last, gone: bool,
+	}
+	o: Timeouts
+	o.later = nbio.timeout_poly(30 * time.Millisecond, &o, proc(_: ^nbio.Operation, o: ^Timeouts) {
+		o.gone = true // removed: never to come
+	})
+	nbio.timeout_poly(60 * time.Millisecond, &o, proc(_: ^nbio.Operation, o: ^Timeouts) {
+		o.last = true
+	})
+	nbio.timeout_poly(time.Millisecond, &o, proc(_: ^nbio.Operation, o: ^Timeouts) {
+		o.first = true
+		nbio.remove(o.later)
+	})
+	// Not ticked until all three are due, so that the loop finds them due together, in order.
+	time.sleep(100 * time.Millisecond)
+	start := time.tick_now()
+	for !o.last && time.tick_since(start) < 5 * time.Second {
+		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
+	}
+	testing.expectf(t, o.first && o.last && !o.gone, "the first came %v, the last %v, the one removed %v", o.first, o.last, o.gone)
+}
+
+// An operation with a timeout, done while the changes kqueue is to be given have overflowed what one call gives it, and
+// its timer due before the call that would delete it: kqueue still has the timer, with the operation in it.
+// core:nbio (dev-2026-11) put the operation back in its pool at once, and the timer, firing, handed the loop an
+// operation freed (or another's by then). Meaningful where the loop is kqueue's; elsewhere it must merely work.
+@(test)
+loop_keeps_an_operation_kqueue_may_still_name :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	context.logger.lowest_level = .Error // the loop warns of each change it holds back
+	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, err == nil)
+	defer net.close(listener)
+	at, _ := net.bound_endpoint(listener)
+	peer, derr := net.dial_tcp(at)
+	testing.expect(t, derr == nil)
+	defer net.close(peer)
+	socket, _, aerr := net.accept_tcp(listener)
+	testing.expect(t, aerr == nil)
+	defer net.close(socket)
+	testing.expect(t, nbio.associate_socket(socket) == nil)
+
+	State :: struct {
+		read, later: int,
+	}
+	s: State
+	N :: 3 * #config(ODIN_NBIO_QUEUE_SIZE, 2048) + 7
+	buf: [64]byte
+	// A read that waits, with a timeout of its own, given to the system before anything comes.
+	nbio.recv_poly(socket, {buf[:]}, &s, proc(op: ^nbio.Operation, s: ^State) {
+		s.read = op.recv.received
+		// More changes than fit what the next call gives kqueue, made before this read is let go of...
+		for _ in 0 ..< N {
+			nbio.timeout_poly(50 * time.Millisecond, s, proc(_: ^nbio.Operation, s: ^State) {
+				s.later += 1
+			})
+		}
+		// ...and the read's timer due before that call.
+		time.sleep(30 * time.Millisecond)
+	}, timeout = 10 * time.Millisecond)
+	testing.expect(t, nbio.tick(0) == nil)
+	net.send_tcp(peer, {1, 2, 3})
+	start := time.tick_now()
+	for s.later < N && time.tick_since(start) < 5 * time.Second {
+		wait := 10 * time.Millisecond
+		if loop_held_back() {
+			wait = 0
+		}
+		testing.expect(t, nbio.tick(wait) == nil)
+	}
+	testing.expectf(t, s.read == 3 && s.later == N, "read %d bytes; %d of %d timeouts came", s.read, s.later, N)
+}
+
+// An accept removed after the system has accepted for it all the same: nobody is handed what it accepted, so it is let
+// go of. core:nbio (dev-2026-11) accepted on kqueue for an accept removed in the tick it was ready, and on io_uring
+// left open what was accepted before the removal took: the peer was never told the connection had gone.
+@(test)
+loop_lets_go_of_what_a_removed_accept_took :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	listener, err := nbio.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, err == nil)
+	at, _ := net.bound_endpoint(listener)
+	called := false
+	accepting := nbio.accept_poly(listener, &called, proc(op: ^nbio.Operation, called: ^bool) {
+		called^ = true
+		if op.accept.err == nil {
+			net.close(op.accept.client)
+		}
+	})
+	testing.expect(t, nbio.tick(0) == nil) // given to the system
+	peer, derr := net.dial_tcp(at)
+	testing.expect(t, derr == nil)
+	defer net.close(peer)
+	time.sleep(20 * time.Millisecond) // and accepted there, where the system accepts on its own
+	nbio.remove(accepting)
+	for _ in 0 ..< 10 {
+		testing.expect(t, nbio.tick(5 * time.Millisecond) == nil)
+	}
+	net.close(listener)
+	for _ in 0 ..< 3 {
+		testing.expect(t, nbio.tick(0) == nil)
+	}
+	testing.expect(t, !called, "a removed accept called back")
+	// The peer is told its connection has gone, one way or another: an end, or a reset. Left open, it would wait.
+	net.set_option(peer, .Receive_Timeout, 2 * time.Second)
+	b: [8]byte
+	n, rerr := net.recv_tcp(peer, b[:])
+	testing.expectf(t, (rerr == nil && n == 0) || (rerr != nil && rerr != .Timeout && rerr != .Would_Block), "the peer's connection was left open: read %d bytes, %v", n, rerr)
+}
+
+// Reads removed in the same tick as they would have read: what is there for them stays there. core:nbio (dev-2026-11)
+// read on kqueue for a read removed in the tick it was ready, into a buffer its owner may have let go of. On io_uring
+// and Windows the system reads for the operation itself, before any removal can take: only kqueue's loop reads.
+@(test)
+loop_reads_nothing_for_a_removed_read :: proc(t: ^testing.T) {
+	when ODIN_OS != .Darwin && ODIN_OS != .FreeBSD && ODIN_OS != .OpenBSD && ODIN_OS != .NetBSD {
+		return
+	}
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, err == nil)
+	defer net.close(listener)
+	at, _ := net.bound_endpoint(listener)
+	Pair :: struct {
+		peer, socket: net.TCP_Socket,
+		read:         ^nbio.Operation,
+		buf:          [16]byte,
+		other:        ^Pair,
+		called:       bool,
+	}
+	pairs: [2]Pair
+	for &p, i in pairs {
+		derr: net.Network_Error
+		p.peer, derr = net.dial_tcp(at)
+		testing.expect(t, derr == nil)
+		aerr: net.Network_Error
+		p.socket, _, aerr = net.accept_tcp(listener)
+		testing.expect(t, aerr == nil)
+		testing.expect(t, nbio.associate_socket(p.socket) == nil)
+		p.other = &pairs[1 - i]
+	}
+	defer for p in pairs {
+		net.close(p.peer)
+		net.close(p.socket)
+	}
+	// Each read, if it comes first, removes the other.
+	for &p in pairs {
+		p.read = nbio.recv_poly(p.socket, {p.buf[:]}, &p, proc(op: ^nbio.Operation, p: ^Pair) {
+			p.called = true
+			p.read = nil
+			if p.other.read != nil {
+				nbio.remove(p.other.read)
+				p.other.read = nil
+			}
+		})
+	}
+	testing.expect(t, nbio.tick(0) == nil) // both given to kqueue, waiting
+	for p in pairs {
+		net.send_tcp(p.peer, transmute([]byte)string("there"))
+	}
+	time.sleep(20 * time.Millisecond) // both ready, for the same tick
+	for _ in 0 ..< 5 {
+		testing.expect(t, nbio.tick(5 * time.Millisecond) == nil)
+	}
+	testing.expect(t, pairs[0].called != pairs[1].called, "one read called back, and only one")
+	for p in pairs {
+		if p.called {
+			continue
+		}
+		// The removed read's socket has what was sent it still.
+		b: [16]byte
+		n, rerr := net.recv_tcp(p.socket, b[:])
+		testing.expectf(t, rerr == nil && string(b[:n]) == "there", "what was sent for a removed read is gone: read %d bytes, %v", n, rerr)
+	}
+}
+
+// A file read that fails as it is made (here, of a file opened only to write) ends, with the error. On Windows
+// core:nbio (dev-2026-11) took it for one under way, as Windows leaves its OVERLAPPED pending, and waited for ever.
+@(test)
+loop_ends_a_read_that_fails_as_it_is_made :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	dir, derr := os.make_directory_temp("", "zsp-nbio-*", context.temp_allocator)
+	testing.expect(t, derr == nil)
+	defer os.remove_all(dir)
+	path := fmt.tprintf("%s/written-only", dir)
+	handle, oerr := nbio.open_sync(path, mode = {.Write, .Create})
+	testing.expectf(t, oerr == nil, "could not open %s: %v", path, oerr)
+	defer nbio.close(handle)
+	Read :: struct {
+		done, error: bool,
+	}
+	r: Read
+	buf: [16]byte
+	nbio.read_poly(handle, 0, buf[:], &r, proc(op: ^nbio.Operation, r: ^Read) {
+		r.done, r.error = true, op.read.err != nil
+	})
+	start := time.tick_now()
+	for !r.done && time.tick_since(start) < 5 * time.Second {
+		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
+	}
+	testing.expectf(t, r.done && r.error, "a read of a file opened only to write: ended %v, with an error %v", r.done, r.error)
+}
+
+// A read of all, with a timeout, that comes in two pieces: read again for the rest, it keeps the timeout it has. On
+// Windows core:nbio (dev-2026-11) linked it a second, in the first's place, and the first, left behind, fired at the
+// read once it was done with, failing an assertion. Meaningful on Windows.
+@(test)
+loop_keeps_one_timeout_for_a_read_of_all :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, err == nil)
+	defer net.close(listener)
+	at, _ := net.bound_endpoint(listener)
+	peer, derr := net.dial_tcp(at)
+	testing.expect(t, derr == nil)
+	defer net.close(peer)
+	socket, _, aerr := net.accept_tcp(listener)
+	testing.expect(t, aerr == nil)
+	defer net.close(socket)
+	testing.expect(t, nbio.associate_socket(socket) == nil)
+	Read :: struct {
+		done, error: bool,
+		n:           int,
+	}
+	r: Read
+	buf: [10]byte
+	nbio.recv_poly(socket, {buf[:]}, &r, proc(op: ^nbio.Operation, r: ^Read) {
+		r^ = {true, op.recv.err != nil, op.recv.received}
+	}, all = true, timeout = 300 * time.Millisecond)
+	testing.expect(t, nbio.tick(0) == nil)
+	net.send_tcp(peer, {1, 2, 3, 4, 5})
+	for _ in 0 ..< 5 {
+		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
+	}
+	net.send_tcp(peer, {6, 7, 8, 9, 10})
+	start := time.tick_now()
+	for !r.done && time.tick_since(start) < 2 * time.Second {
+		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
+	}
+	testing.expectf(t, r.done && !r.error && r.n == 10, "the read ended %v, with an error %v, %d bytes", r.done, r.error, r.n)
+	// Past when the timeout would have come: nothing is left to fire.
+	for time.tick_since(start) < 600 * time.Millisecond {
+		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
+	}
 }

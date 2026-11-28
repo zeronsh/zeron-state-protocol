@@ -550,10 +550,32 @@ handle_completed :: proc(op: ^Operation, res: i32) {
 			op.cb(op)
 		} else if op._impl.removal == (^Operation)(REMOVED) {
 			debug("done but was cancelled by remove", op.type)
+			let_go(op)
 		} else {
 			debug("done but has removal pending", op.type)
 			// If the remove callback sees their target is nil, they know it is done already.
 			op._impl.removal._remove.target = nil
+			let_go(op)
+		}
+	}
+
+	// ZSP: what a removed operation got all the same, before its removal took, let go of: its callback is not called,
+	// so nobody else will. Upstream left an accepted or connected socket open for good.
+	let_go :: proc(op: ^Operation) {
+		#partial switch op.type {
+		case .Accept:
+			if op.accept.err == nil && op.accept.client > 0 {
+				close(op.accept.client)
+			}
+		case .Dial:
+			// One that failed closed its socket already, in dial_callback.
+			if op.dial.err == nil && op.dial.socket > 0 {
+				close(op.dial.socket)
+			}
+		case .Open:
+			if op.open.err == nil && op.open.handle > 0 {
+				close(op.open.handle)
+			}
 		}
 	}
 
@@ -674,6 +696,7 @@ accept_callback :: proc(op: ^Operation, res: i32) {
 	assert(op.type == .Accept)
 	if res < 0 {
 		errno := linux.Errno(-res)
+		if errno != nil { op.system_error = u16(errno) } // ZSP: see Operation.system_error
 		#partial switch errno {
 		case .ECANCELED:
 			op.accept.err = .Timeout
@@ -721,6 +744,7 @@ dial_exec :: proc(op: ^Operation) {
 dial_callback :: proc(op: ^Operation, res: i32) {
 	assert(op.type == .Dial)
 	errno := linux.Errno(-res)
+	if errno != nil { op.system_error = u16(errno) } // ZSP: see Operation.system_error
 	if errno != nil {
 		#partial switch errno {
 		case .ECANCELED:
@@ -823,6 +847,7 @@ recv_callback :: proc(op: ^Operation, res: i32) -> bool {
 
 	if res < 0 {
 		errno := linux.Errno(-res)
+		if errno != nil { op.system_error = u16(errno) } // ZSP: see Operation.system_error
 		switch sock in op.recv.socket {
 		case TCP_Socket:
 			#partial switch errno {
@@ -908,6 +933,7 @@ send_callback :: proc(op: ^Operation, res: i32) -> bool {
 	assert(op.type == .Send)
 	if res < 0 {
 		errno := linux.Errno(-res)
+		if errno != nil { op.system_error = u16(errno) } // ZSP: see Operation.system_error
 		switch sock in op.send.socket {
 		case TCP_Socket:
 			#partial switch errno {
