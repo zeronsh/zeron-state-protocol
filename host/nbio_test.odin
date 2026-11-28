@@ -443,9 +443,8 @@ loop_lets_go_of_what_a_removed_accept_took :: proc(t: ^testing.T) {
 // A read and a write waiting on one socket, the read removed: the write goes on, and ends with all it was given, as a
 // forwarder's does when it stops reading one way. The loop cancels only the read's own I/O, on every platform. On
 // Windows, cancelling one read cancels the socket's other reads waiting too, as Winsock does it, but not its writes
-// (seen with WSARecv and WSASend alone). There a write of a socket nbio has made non-blocking is taken by the system as
-// it is made, however much, and does not wait on the peer: the write here is done before the read is removed, and the
-// case is held where writes wait (Linux, macOS).
+// (seen with WSARecv and WSASend alone). Were the loop to cancel all of a socket's I/O rather than the read's own
+// (CancelIoEx with no OVERLAPPED), the write would end with an error there.
 @(test)
 loop_keeps_a_write_when_a_read_of_its_socket_is_removed :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
@@ -462,7 +461,7 @@ loop_keeps_a_write_when_a_read_of_its_socket_is_removed :: proc(t: ^testing.T) {
 	testing.expect(t, aerr == nil)
 	defer net.close(socket)
 	// Little room of its own to send from, so that a write waits on the peer reading.
-	testing.expect(t, net.set_option(socket, .Send_Buffer_Size, 0) == nil)
+	testing.expect(t, set_send_buffer(socket, 0))
 	testing.expect(t, nbio.associate_socket(socket) == nil)
 
 	read_called := false
@@ -476,7 +475,7 @@ loop_keeps_a_write_when_a_read_of_its_socket_is_removed :: proc(t: ^testing.T) {
 		sent:  int,
 	}
 	w: Write
-	SIZE :: 16 << 20
+	SIZE :: 2 << 20
 	data := make([]byte, SIZE)
 	defer delete(data)
 	for &b, i in data {
@@ -489,9 +488,7 @@ loop_keeps_a_write_when_a_read_of_its_socket_is_removed :: proc(t: ^testing.T) {
 	for _ in 0 ..< 5 {
 		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
 	}
-	when ODIN_OS != .Windows {
-		testing.expect(t, !w.done, "the write ended before the peer read anything")
-	}
+	testing.expectf(t, !w.done, "the write ended before the peer read anything: error %v, %d bytes", w.err, w.sent)
 	nbio.remove(reading)
 	testing.expect(t, nbio.tick(0) == nil)
 

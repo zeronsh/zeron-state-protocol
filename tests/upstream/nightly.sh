@@ -11,7 +11,7 @@ MINGW* | MSYS* | CYGWIN*) want=windows-amd64 ;;
 *) echo "no nightly for $(uname -s)" >&2; exit 1 ;;
 esac
 python=python3
-command -v python3 >/dev/null || python=python
+python3 -c "" 2>/dev/null || python=python # Windows may have a python3 that only offers to install one
 mkdir -p "$dest"
 curl -fsSLo "$dest/nightly.json" https://f001.backblazeb2.com/file/odin-binaries/nightly.json
 url=$($python -c 'import json, sys

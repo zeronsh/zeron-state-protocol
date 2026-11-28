@@ -163,7 +163,7 @@ Tests are in `host/nbio_test.odin` unless said otherwise.
 - **Upstream:** `_remove` (impl_windows.odin:775, :787) and a timeout's removal (:1827) cancel with the operation's own `OVERLAPPED`. Seen with raw `WSARecv`s tied to a completion port as nbio ties them: both complete with `STATUS_CANCELLED` (0xC0000120). Writes are not cancelled with them: a pending `WSASend` of 64 MiB went on and completed whole.
 - **Status:** no issue (the platform's).
 - **Ours:** unchanged.
-- **Test:** `loop_keeps_a_write_when_a_read_of_its_socket_is_removed` (a forwarder's case: a write goes on when a read of its socket is removed). On Windows, a write of a socket nbio has made non-blocking is taken by the system as it is made, so the case is held where writes wait (Linux, macOS). `loop_counts_every_change_it_gives_kqueue`, which removes one of two reads, runs only on kqueue for this reason.
+- **Test:** `loop_keeps_a_write_when_a_read_of_its_socket_is_removed` (a forwarder's case: a write waiting on a socket goes on when a read of that socket is removed; on Windows it fails if the loop cancels all of a socket's I/O, with `CancelIoEx(handle, nil)`). `loop_counts_every_change_it_gives_kqueue`, which removes one of two reads, runs only on kqueue for this reason.
 
 ### One completion port for every loop of a process
 - **Platform:** Windows.
