@@ -1135,6 +1135,9 @@ def test_node_waits_for_a_command():
         assert time.monotonic() < deadline, "a node starting while a command kept what is here never said it waits"
         assert n.p is None or n.p.poll() is None, "a node starting while a command kept what is here was refused"
         time.sleep(0.02)
+    while n.p is None:  # the process may say it waits before Popen has even returned to the thread starting it
+        assert time.monotonic() < deadline, "a node starting while a command kept what is here was never started"
+        time.sleep(0.01)
     assert n.p.poll() is None, "a node starting while a command kept what is here was refused"
     lock.close()
     s.close()
