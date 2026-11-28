@@ -627,6 +627,7 @@ function connect(port: MessagePort): void {
   let heardBack = false;
   const early: Say[] = [];
   let open = true;
+  let ending = false; // its client has let go of it: that is on its way to the leader, behind all it said
   // Should the leader not hear of it, or not answer, as one opening the store, closing it or frozen does not, the client
   // is told it is broken: it dials again, and this worker, in line for the store, may by then have it.
   let unanswered: ReturnType<typeof setTimeout> | undefined;
@@ -647,9 +648,21 @@ function connect(port: MessagePort): void {
     letGo();
   };
   carried.add(breakOff);
+  // Its client lets go of it: the close goes to the leader behind everything it said, as all it says does, those waiting
+  // for the leader to hear of the pipe included; and the pipe's lock, by which the leader learns that this end has gone,
+  // is let go of only once the leader has heard the close and closed its end, saying so. Let go of sooner, the leader
+  // could close its end before it had read what was sent ahead of the close.
+  const hangUp = () => {
+    if (!open || ending) return;
+    ending = true;
+    port.close(); // nothing more is to come from the client, nor go to it
+    if (heardBack) far.postMessage({ close: true } satisfies Say);
+    else early.push({ close: true });
+  };
   port.onmessage = (e: MessageEvent<Say>) => {
     const say = e.data;
-    if ("close" in say) breakOff();
+    if (ending) return;
+    if ("close" in say) return hangUp();
     else if (heardBack) far.postMessage(say);
     else early.push(say);
     if ("data" in say && open) awaited(name);
@@ -668,7 +681,7 @@ function connect(port: MessagePort): void {
       }
     }
     if ("close" in say) breakOff();
-    else if ("data" in say) toTab(say);
+    else if ("data" in say && !ending) toTab(say);
   };
   void navigator.locks.request(name, () => {
     if (open) {

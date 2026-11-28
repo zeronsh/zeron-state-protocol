@@ -973,6 +973,47 @@ for (const [i, { before, next }] of [
   }
 }
 
+// A pipe carried to the leader that its client closes as soon as it has sent something: what it sent reaches the node
+// before the close does, the close going behind it, and the pipe's lock let go of only once the leader has heard it; and
+// so when it was closed before the leader had even said it heard of the pipe, what was waiting for it to is handed on.
+for (const when of ["heard of", "not yet heard of"] as const) {
+  const store = when === "heard of" ? "fifo" : "fifo-early";
+  const got: { bytes: number; closed: boolean }[] = [];
+  const attach = Node.prototype.attach;
+  Node.prototype.attach = function (receive, closed) {
+    const wire = attach.call(this, receive, closed);
+    if (!wire) return wire;
+    const seen = { bytes: 0, closed: false };
+    got.push(seen);
+    return {
+      send: (data) => (seen.closed || (seen.bytes += data.length), wire.send(data)),
+      close: () => ((seen.closed = true), wire.close()),
+      credit: (n) => wire.credit(n),
+    };
+  };
+  try {
+    const a = await worker();
+    await a.tell({ open: { name: store } });
+    await a.tell({ ask: 1, op: "create", args: [] });
+    const b = await worker();
+    await b.tell({ open: { name: store } });
+    const { port1, port2 } = new MessageChannel();
+    await b.tell({ connect: port2 });
+    if (when === "heard of") {
+      await until("the pipe is carried", () => got.length === 1);
+      await sleep(50); // and the leader heard to have heard of it
+    }
+    port1.postMessage({ data: new Uint8Array(7) });
+    port1.postMessage({ close: true });
+    await until("the leader's end is closed", () => got.length === 1 && got[0].closed);
+    assert.equal(got[0].bytes, 7, `${when}: what was sent before the pipe was closed never reached the node`);
+    await a.tell({ ask: 2, op: "close", args: [] });
+    await b.tell({ ask: 2, op: "close", args: [] });
+  } finally {
+    Node.prototype.attach = attach;
+  }
+}
+
 // A worker holding the store that is stuck opening it, waiting on a file that never opens, does not say it is there, but
 // for once, as it is first asked: what waits on it is given up on. Many waiting on it ask whether it is there, as one does
 // at a time, for a worker that hears another ask need not ask too: what the holder says, every worker hears.
