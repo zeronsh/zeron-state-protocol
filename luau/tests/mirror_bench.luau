@@ -409,6 +409,9 @@ end
 -- case that makes less than that (ZSP_QUIET makes it more) is not collected while it is done.
 -- (The churning is of tables of 16 KiB arrays, which the system gives and takes back: churned as many small tables, the
 -- heap would be left with as many small holes, which what is measured then would be slower to allocate in.)
+-- What each table churned in waiting for the collector holds, in KB: 1024 values of 16 bytes, and what a table is.
+local EACH_KB = 16.1
+
 local function paused()
 	-- A round gone through: a key held by nothing else is gone from a weak table only then.
 	local probe = setmetatable({}, { __mode = "k" }) :: any
@@ -420,8 +423,19 @@ local function paused()
 		made += 1
 		assert(made < 10000000, "the collector never went round")
 	end
-	-- And swept: then the heap only grows, for as long as it takes to be twice what it was. A quarter of what it is, at
-	-- most 16 MB, rising and never falling, is taken for that: where the heap is small, a round can come sooner than 16 MB.
+	-- And swept, all of it. What was made to wait for the round is all but all of what the round found was garbage, as this
+	-- is done twice (see below), and it is most of the heap: it is gone once the sweep is done, or nearly. (Waiting only
+	-- for the heap to grow is not enough: a sweep goes over pages of what is held first, freeing nothing for a while.)
+	local due = gcinfo() - made * EACH_KB * 0.9
+	while gcinfo() > due do
+		made += 1
+		assert(made < 20000000, "what was made was never swept")
+		for _ = 1, 16 do
+			junk = table.create(1024, true)
+		end
+	end
+	-- Then the heap only grows, for as long as it takes to be twice what it was. A quarter of what it is, at most 16 MB,
+	-- rising and never falling, is taken for that: where the heap is small, a round can come sooner than 16 MB.
 	local last, rising = gcinfo(), 0
 	local enough = math.clamp(last // 1024, 4, 64) -- in steps of 256 KB
 	while rising < enough do
@@ -735,6 +749,9 @@ elseif args[2] then
 	-- Only before changes: an opening is led to by almost nothing, and the churning would set the most the process has
 	-- held, which is what opening is measured by too.
 	if warm > 0 then
+		-- Twice: the first round may have begun with much else to collect, made before; the second only with what was
+		-- churned to wait for it, which tells when it has been swept.
+		paused()
 		paused()
 	end
 	local before = if args[5] == "memory" then settled() else 0
