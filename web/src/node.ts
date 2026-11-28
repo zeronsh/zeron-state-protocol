@@ -3,7 +3,7 @@
 // Nothing runs unless something happened: an idle device sets no timer but the one that pings its relays.
 
 import { Store } from "./store.ts";
-import type { Volume } from "./volume.ts";
+import { StoreLocked, type Volume } from "./volume.ts";
 
 /** A pipe to a node: what a client sends and is sent. */
 export interface Wire {
@@ -600,30 +600,50 @@ export class Node {
    * for it cannot wait: what is being opened is closed as it comes. Resolves as `close` does.
    */
   closeNow(): Promise<void> {
-    if (!this.#closing) this.#stop();
-    const shut = this.#store.closeNow();
+    let thrown: { error: unknown } | undefined;
+    try {
+      if (!this.#closing) this.#stop(true);
+    } catch (error) {
+      thrown = { error };
+    }
+    const shut = this.#store.closeNow(); // whatever stopping it threw: else every file would be left open, and held
     this.#closing ??= shut;
+    if (thrown) throw thrown.error;
     return shut;
   }
 
   async #close(): Promise<void> {
-    this.#stop();
-    await this.store.close();
+    try {
+      this.#stop(true);
+    } finally {
+      await this.store.close();
+    }
   }
 
-  #stop(): void {
+  // Everything is stopped, whatever any of it throws, which is thrown once all is: a client told its pipe is closed, the
+  // node, UDP. The node makes durable what it holds as it stops, unless storage has failed, when nothing more is to be.
+  #stop(durable: boolean): void {
     this.#stopped = true;
     clearTimeout(this.#timer);
     clearTimeout(this.#draining);
+    let thrown: { error: unknown } | undefined;
+    const step = (f: () => void) => {
+      try {
+        f();
+      } catch (error) {
+        thrown ??= { error };
+      }
+    };
     for (const [, c] of this.#conns) {
-      if (c.kind === "socket") c.ws.close();
-      else if (c.open) (c.open = false), c.closed();
+      if (c.kind === "socket") step(() => c.ws.close());
+      else if (c.open) (c.open = false), step(c.closed);
     }
     this.#conns.clear();
-    this.#wasm?.stop();
-    this.#options.datagrams?.close();
-    this.#channel?.port1.close();
+    if (durable) step(() => this.#wasm?.stop());
+    step(() => this.#options.datagrams?.close());
+    step(() => this.#channel?.port1.close());
     for (const done of this.#waiting.splice(0)) done(); // idle for good
+    if (thrown) throw thrown.error;
   }
 
   // ---------------------------------------------------------------- the module
@@ -872,7 +892,9 @@ export class Node {
     }
     this.#ticking = false;
     if (wait === -2) {
-      this.#fail(new Error("storage failed: the node has stopped rather than lose what it said was durable"));
+      // Said as what it was, should the store have found a file of its held by another as it opened one in its own time.
+      const cause = this.#store.failure;
+      this.#fail(cause instanceof StoreLocked ? cause : new Error("storage failed: the node has stopped rather than lose what it said was durable", { cause }));
       return;
     }
     // More to do at once, but others first: the same turn as a pipe waiting for room, never a timer of no time, which a
@@ -911,8 +933,13 @@ export class Node {
     if (this.#failure) return;
     this.#failure = error;
     if (!this.#closing) {
-      this.#stop();
-      this.#closing = this.store.letGo();
+      try {
+        this.#stop(false);
+      } catch {
+        // it has failed: that is what is told, whatever stopping it threw
+      } finally {
+        this.#closing = this.store.letGo();
+      }
     }
     if (this.#onFailure) (this.#toldFailure = true), this.#onFailure(error);
   }

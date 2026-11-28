@@ -22,6 +22,8 @@ const open = new Set<Handle>(); // every handle not closed
 let refused = 0; // how often a handle was asked for and the file was held
 let failFlush: string | undefined; // the name of a file whose flush throws, as a full disk's may, or "*" for every one
 let failClose: string | undefined; // and whose close throws
+const heldForEver = new Set<string>(); // paths of files something else holds, and never lets go of
+let writes = 0; // to any file
 const pauses = new Map<string, { reached: () => void; release: Promise<void> }>(); // by path: a file's next handle, held as it is had
 
 class Handle {
@@ -40,6 +42,7 @@ class Handle {
     return n;
   }
   write(bytes: Uint8Array, { at }: { at: number }): number {
+    writes++;
     this.#check();
     if (at + bytes.length > this.file.data.length) {
       const grown = new Uint8Array(at + bytes.length);
@@ -81,7 +84,7 @@ class Entry {
   }
   async createSyncAccessHandle(): Promise<Handle> {
     await Promise.resolve();
-    if (this.handle) {
+    if (this.handle || heldForEver.has(this.path)) {
       refused++;
       throw new DOMException(HELD, "NoModificationAllowedError");
     }
@@ -434,6 +437,64 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   await until("the lock is let go of", () => !locks.has("zsp:first"), 2000);
   assert.equal(held("first"), 0);
   failFlush = undefined;
+}
+
+// ---------------------------------------------------------------- what goes wrong as the store is let go of
+
+// Whatever stopping a node throws, as a client told its pipe is closed, or UDP, may: every file is closed all the same, by
+// close, closeNow, or as storage fails, when whoever listens is told too; and a node whose storage failed makes nothing more
+// durable as it stops, writing nothing.
+{
+  const datagrams = { port: 1, listen() {}, send() {}, interfaces: () => [], close: () => { throw new Error("UDP would not close"); } };
+  for (const how of ["close", "closeNow"] as const) {
+    const node = await Node.open({ volume: await OpfsVolume.at(`zsp/stop-${how}`), module, datagrams, log: () => {} });
+    node.create();
+    await sleep(10);
+    let threw: unknown;
+    try {
+      await node[how]();
+    } catch (e) {
+      threw = e;
+    }
+    await node.close().catch(() => {});
+    assert.match(String(threw), /UDP would not close/, `${how}: what stopping it threw was not said`);
+    assert.equal(held(`stop-${how}`), 0, `${how}: files left open, stopping it having thrown`);
+  }
+  const node = await Node.open({ volume: await OpfsVolume.at("zsp/stop-fail"), module, datagrams, log: () => {} });
+  node.create();
+  await sleep(10);
+  let told: Error | undefined;
+  let written = -1;
+  node.onFailure = (e) => ((told = e), (written = writes));
+  const client = new Client({ connect: node.connect });
+  while (!client.may(1, "write")) await sleep(1);
+  failFlush = "*";
+  void client.write(1, (c) => c.insert({}, "x", 1, {})).catch(() => {}); // never durable
+  await until("it is told", () => told !== undefined);
+  await node.close();
+  failFlush = undefined;
+  assert.equal(held("stop-fail"), 0, "files left open as it failed, stopping it having thrown");
+  assert.equal(writes, written, "something was written as a node whose storage failed was stopped");
+  client.close();
+}
+
+// A segment of the log found held by another as it is opened, in the store's own time, fails the node as the store being
+// locked, not as storage failing: whoever is told can tell.
+{
+  heldForEver.add("/zsp/segment-held/00000001.log");
+  const node = await Node.open({ volume: await OpfsVolume.at("zsp/segment-held"), module, log: () => {} });
+  let told: Error | undefined;
+  node.onFailure = (e) => (told = e);
+  node.create();
+  const client = new Client({ connect: node.connect });
+  while (!client.may(1, "write")) await sleep(1);
+  await sleep(HELD_WITHIN + 200); // given up on by now
+  void client.write(1, (c) => c.insert({}, "x", 1, {})).catch(() => {}); // never durable
+  await until("it is told", () => told !== undefined);
+  assert(told instanceof StoreLocked, `told ${told}`);
+  client.close();
+  await node.close();
+  heldForEver.clear();
 }
 
 console.log("ok");
