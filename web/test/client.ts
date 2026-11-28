@@ -363,7 +363,7 @@ for (const what of ["move", "delete"]) {
   say([1, 2, 3, 4, 5, 6]);
   synced(h, last, 0, lo, hi); // what is held: all six
   assert.equal(st.rows.length, 6);
-  const keys = (Client.internals(h.client) as any).windows.values().next().value.entries.map((e: { key: string }) => e.key);
+  const keys: string[] = [...(Client.internals(h.client) as any).windows.values().next().value.keys];
   synced(h, last, 1, keys[4], hi, 4, 0); // as a full replica says: the last two, and four before
   const [before, , from, to] = watchOf(h.last(WATCH)!);
   assert(before !== last && to === keys[4], "what was shown before them is asked for, as the page before");
@@ -392,21 +392,27 @@ for (const what of ["move", "delete"]) {
     codec.putBytes(w, b(body));
     return s(codec.written(w));
   };
-  const frame = (row: string, order: number, title: string) => {
+  const frameOf = (cells: string) => {
     const w = codec.writer();
-    codec.putBytes(w, b(ch(CELLS) + "\0" + cell(row, 2, 1, 1, h.client.tag(1, "a") + codec.u64(order)) + cell(row, 3, 18, 2, title)));
+    codec.putBytes(w, b(ch(CELLS) + "\0" + cells));
     return codec.written(w).slice();
   };
+  const frame = (row: string, order: number, title: string) =>
+    frameOf(cell(row, 2, 1, 1, h.client.tag(1, "a") + codec.u64(order)) + cell(row, 3, 18, 2, title));
   const one = "\0\0\0\x01" + rep("1", 12), two = "\0\0\0\x01" + rep("2", 12);
   const small = new Uint8Array([...frame(one, 1, "small"), ...frame(two, 2, "also")]);
   for (let i = 0; i < small.length; i++) h.self.receive(small.subarray(i, i + 1));
   h.run();
   assert.deepEqual(st.rows.map((r) => r.title), ["small", "also"]);
-  const big = frame(one, 1, "x".repeat(8 << 20));
+  // Of eight rows, each with a title of all but as much as a node keeps in a cell, 1 MiB (one longer it would pass over).
+  const many = [3, 4, 5, 6, 7, 8, 9, 10].map((i) => "\0\0\0\x01" + rep(String.fromCharCode(64 + i), 12));
+  const title = "x".repeat((1 << 20) - 64);
+  const big = frameOf(many.map((row, i) => cell(row, 2, 1, 1, h.client.tag(1, "a") + codec.u64(10 + i)) + cell(row, 3, 18, 2, title)).join(""));
+  assert(big.length > 8 << 20);
   const began = performance.now();
   for (let i = 0; i < big.length; i += 1024) h.self.receive(big.subarray(i, i + 1024));
   h.run();
-  assert.equal(st.rows[0]?.title?.length, 8 << 20);
+  assert.equal(st.rows.filter((r) => r.title?.length === title.length).length, 8);
   assert(performance.now() - began < 2000, `taken in ${(performance.now() - began).toFixed(0)} ms`);
 }
 
