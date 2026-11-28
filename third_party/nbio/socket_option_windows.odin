@@ -10,6 +10,7 @@ name :: proc(option: Socket_Option) -> (level, opt: i32, ok: bool) {
 	switch option {
 	case .Reuse_Address:       return win.SOL_SOCKET, win.SO_REUSEADDR, true
 	case .Reuse_Port:          return 0, 0, false // Windows shares a port by SO_REUSEADDR
+	case .Exclusive_Address:   return win.SOL_SOCKET, win.SO_EXCLUSIVEADDRUSE, true
 	case .Broadcast:           return win.SOL_SOCKET, win.SO_BROADCAST, true
 	case .TCP_Nodelay:         return win.IPPROTO_TCP, win.TCP_NODELAY, true
 	case .Receive_Buffer_Size: return win.SOL_SOCKET, win.SO_RCVBUF, true
@@ -66,7 +67,7 @@ _socket_option :: proc(s: net.Socket, option: Socket_Option) -> (value: Socket_O
 		return nil, .System, int(win.WSAGetLastError())
 	}
 	switch option {
-	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay: value = x != 0
+	case .Reuse_Address, .Reuse_Port, .Exclusive_Address, .Broadcast, .TCP_Nodelay: value = x != 0
 	case .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size: value = int(x)
 	case .Receive_Timeout:                                      value = time.Duration(u32(x)) * time.Millisecond
 	}

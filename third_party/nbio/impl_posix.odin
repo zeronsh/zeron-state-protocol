@@ -368,7 +368,7 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> General_Error {
 
 @(private="package")
 _create_socket :: proc(l: ^Event_Loop, family: Address_Family, protocol: Socket_Protocol) -> (socket: Any_Socket, err: Create_Socket_Error) {
-	socket = net.create_socket(family, protocol) or_return
+	socket = posix_socket(family, protocol) or_return
 
 	berr := net.set_blocking(socket, false)
 	// This shouldn't be able to fail.
@@ -714,6 +714,45 @@ release_retired :: proc(l: ^Event_Loop) {
 	resize(&l.retired, kept)
 }
 
+// ZSP: every socket here is had close-on-exec, as every other descriptor is, so that no process this one starts is
+// handed it, nor holds its port, or its connection, for as long as it lives. As it is made, where the system can say so
+// then (SOCK_CLOEXEC, accept4); at once after, where it cannot (macOS). core:net's create_socket and accept_tcp do
+// neither.
+posix_socket :: proc(family: Address_Family, protocol: Socket_Protocol) -> (socket: Any_Socket, err: Create_Socket_Error) {
+	c_family: posix.AF = .INET if family == .IP4 else .INET6
+	c_type: posix.Sock = .STREAM if protocol == .TCP else .DGRAM
+	c_protocol: posix.Protocol = .TCP if protocol == .TCP else .UDP
+	fd := posix.socket(c_family, posix.Sock(i32(c_type) | POSIX_SOCK_CLOEXEC), c_protocol)
+	if fd < 0 {
+		return nil, posix_create_socket_error()
+	}
+	when POSIX_SOCK_CLOEXEC == 0 {
+		if posix.fcntl(fd, .SETFD, i32(posix.FD_CLOEXEC)) == -1 {
+			err = posix_create_socket_error()
+			posix.close(fd)
+			return
+		}
+	}
+	return TCP_Socket(fd) if protocol == .TCP else UDP_Socket(fd), nil
+}
+
+posix_accept :: proc(socket: TCP_Socket) -> (client: TCP_Socket, source: Endpoint, err: Accept_Error) {
+	fd := posix_accept4(posix.FD(socket))
+	if fd < 0 {
+		return 0, {}, posix_accept_error()
+	}
+	when POSIX_SOCK_CLOEXEC == 0 {
+		if posix.fcntl(fd, .SETFD, i32(posix.FD_CLOEXEC)) == -1 {
+			err = posix_accept_error()
+			posix.close(fd)
+			return
+		}
+	}
+	client = TCP_Socket(fd)
+	source, _ = net.peer_endpoint(client)
+	return
+}
+
 @(require_results)
 accept_exec :: proc(op: ^Operation) -> Op_Result {
 	assert(op.type == .Accept)
@@ -726,7 +765,7 @@ accept_exec :: proc(op: ^Operation) -> Op_Result {
 		return .Done
 	}
 
-	op.accept.client, op.accept.client_endpoint, op.accept.err = net.accept_tcp(op.accept.socket)
+	op.accept.client, op.accept.client_endpoint, op.accept.err = posix_accept(op.accept.socket)
 	if op.accept.err != nil {
 		if op.accept.err == .Would_Block {
 			op.accept.err = nil

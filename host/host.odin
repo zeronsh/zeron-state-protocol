@@ -317,18 +317,15 @@ host_init :: proc(h: ^Host, config: Config) -> (started: bool) {
 		return false
 	}
 	if at, ok := h.listen.?; ok {
-		// core:net's listener may reuse a port its last owner died holding; core:nbio's may not.
-		listener, err := net.listen_tcp(at)
+		// nbio's listener, which, unlike core:net's, no process this one starts is handed (see host_hands_a_child_nothing),
+		// may reuse a port its last owner died holding, as core:net's may.
+		listener, err := nbio.listen_tcp(at)
 		for tries := 0; err == net.Bind_Error.Address_In_Use && tries < 20; tries += 1 {
 			// A process that died is still letting go of its ring.
 			time.sleep(50 * time.Millisecond)
-			listener, err = net.listen_tcp(at)
+			listener, err = nbio.listen_tcp(at)
 		}
 		if err != nil {
-			report(.Error, "could not listen there")
-			return false
-		}
-		if aerr := nbio.associate_socket(listener); aerr != nil {
 			report(.Error, "could not listen there")
 			return false
 		}

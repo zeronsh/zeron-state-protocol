@@ -729,7 +729,18 @@ _create_socket :: proc(
 	socket: Any_Socket,
 	err: Create_Socket_Error,
 ) {
-	socket = net.create_socket(family, protocol) or_return
+	// ZSP: not inheritable, as it is made, so that no process this one starts is handed it, nor holds its port, or its
+	// connection, for as long as it lives (an accepted one is made here too, for AcceptEx). core:net's create_socket
+	// makes one by socket(), which is inheritable; and SetHandleInformation after would race a CreateProcess in another
+	// thread. Overlapped, as socket() makes one, for the completion port.
+	c_family: i32 = win.AF_INET if family == .IP4 else win.AF_INET6
+	c_type: i32 = win.SOCK_STREAM if protocol == .TCP else win.SOCK_DGRAM
+	c_protocol: i32 = win.IPPROTO_TCP if protocol == .TCP else win.IPPROTO_UDP
+	sock := win.WSASocketW(c_family, c_type, c_protocol, nil, 0, win.WSA_FLAG_OVERLAPPED | win.WSA_FLAG_NO_HANDLE_INHERIT)
+	if sock == win.INVALID_SOCKET {
+		return nil, net._create_socket_error()
+	}
+	socket = TCP_Socket(sock) if protocol == .TCP else UDP_Socket(sock)
 
 	association_err := _associate_socket(socket, l)
 	// Network unreachable would've happened on creation too.

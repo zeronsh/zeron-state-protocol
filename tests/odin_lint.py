@@ -24,6 +24,23 @@ core:net's set_option sets every integer option, and `bool` and `b8` ones, to th
 switch lists several types in one case, where the value stays an `any`). So `net.set_option` fails outright, wherever
 it is called: third_party/nbio's set_socket_option sets each option with the C type the system wants.
 
+A descriptor or handle a process opens is handed to every process it starts, unless it is close-on-exec (on Windows, not
+inheritable): a store's lock file so handed is held until that process ends, and a listening socket keeps its port
+(see host/inherit_test.odin). So outside tests, each is to be made so as it is made, never after, which a fork or a
+CreateProcess in another thread may come between. So this fails on:
+
+- core:os's `.Inheritable` (or `O_INHERITABLE`), wherever it is named;
+- an open, openat, socket, eventfd or pipe2 of core:sys/posix or core:sys/linux, or an accept, openat or socket of
+  core:sys/linux/uring, whose flags do not add CLOEXEC (or POSIX_SOCK_CLOEXEC), in the call or in what the name given is assigned in the file; and posix.accept, linux.accept,
+  posix.pipe, linux.pipe, posix.dup, linux.dup and dup2, which cannot, but in a file built for macOS alone, which has no
+  other way;
+- in host/ and third_party/nbio/, what an embedder links: core:net's create_socket, listen_tcp, dial_tcp,
+  make_bound_udp_socket, make_unbound_udp_socket and accept_tcp in a file built for anything but Linux (core:net makes
+  its sockets close-on-exec only there), and accept_tcp anywhere (not even there): third_party/nbio's are;
+- on Windows: ws2's `socket`, inheritable as it is made; WSASocketW without WSA_FLAG_NO_HANDLE_INHERIT; a
+  SECURITY_ATTRIBUTES with `bInheritHandle = true`; HANDLE_FLAG_INHERIT; and DuplicateHandle asked to make an
+  inheritable one (its sixth argument not `false`).
+
 Formatting is no way round it: comments and strings are taken out, and what is left is read as tokens, in statements
 split as Odin splits them. Each import is followed by the name it is given. A file is taken as built for an OS as Odin
 builds it, by its name and its `#+build` lines (./x selftest holds that to Odin itself, target by target);
@@ -40,6 +57,7 @@ import os, re, sys, tempfile
 ISSUE = "odin-lang/Odin#8642"
 TRUNC_ISSUE = "odin-lang/Odin#8646"
 OPTION_ISSUE = "core:net set_option (no issue)"
+INHERIT_ISSUE = "a descriptor handed to every process started (no issue)"
 # Odin's target_os_names and target_arch_names (src/build_settings.cpp, as of the release CI builds with): there is no
 # `unix`, neither as a build tag nor as the end of a file's name.
 OSES = {"windows", "darwin", "linux", "freebsd", "openbsd", "netbsd", "wasi", "js", "orca", "freestanding"}
@@ -507,6 +525,88 @@ def trunc_uses(toks, os_names):
     return sorted(set(found))
 
 
+
+# Calls of core:sys/posix and core:sys/linux that make a descriptor: each to say CLOEXEC in its flags.
+CLOEXEC_CALLS = {"open", "openat", "socket", "eventfd", "pipe2"}
+# Those that cannot: not to be called, but where nothing else will do (macOS, which has no accept4, pipe2 or SOCK_CLOEXEC).
+NO_CLOEXEC_CALLS = {"accept", "pipe", "dup", "dup2"}
+NET_MAKERS = {"create_socket", "listen_tcp", "dial_tcp", "make_bound_udp_socket", "make_unbound_udp_socket", "accept_tcp"}
+
+
+def says_cloexec(toks, stmts, s, e):
+    """Whether toks[s:e], the arguments of a call, add CLOEXEC: there, or, of a name given there, in what it is assigned
+    in the file, and never taken away."""
+    names = set()
+    for k in range(s, e):
+        t = toks[k][1]
+        if toks[k][0] == "ident" and t in ("CLOEXEC", "POSIX_SOCK_CLOEXEC", "SOCK_CLOEXEC", "O_CLOEXEC"):
+            return True
+        if toks[k][0] == "ident" and not (k >= 1 and toks[k - 1][1] == "."):
+            names.add(t)
+    added = taken = False
+    for a, b in stmts:
+        if b - a < 3 or toks[a][1] not in names:
+            continue
+        op = next((k for k in range(a, b) if toks[k][0] == "punct" and toks[k][1] in ASSIGN), None)
+        if op is None or op != a + 1 and not (toks[a + 1][1] == ":" and op == a + 3):
+            continue
+        has = any(toks[k][0] == "ident" and "CLOEXEC" in toks[k][1] for k in range(op + 1, b))
+        if toks[op][1] in ("-=", "&~="):
+            taken = taken or has
+        else:
+            added = added or has
+    return added and not taken
+
+
+def inherit_uses(path, toks, stmts, named, oses):
+    """The lines on which a descriptor or handle is made that a process started is handed (see above)."""
+    found = []
+    rel = path.replace(os.sep, "/")
+    test = rel.endswith("_test.odin") or "/tests/" in "/" + rel
+    linker = any(("/" + rel).find("/" + d + "/") >= 0 for d in ("host", "third_party/nbio"))
+    os_names = set(n for n, p in named.items() if p == "core:os")
+    sys_names = set(n for n, p in named.items() if p in ("core:sys/posix", "core:sys/linux"))
+    net_names = set(n for n, p in named.items() if p == "core:net")
+    win_names = set(n for n, p in named.items() if p == "core:sys/windows")
+    uring_names = set(n for n, p in named.items() if p == "core:sys/linux/uring")
+    for i, (kind, text, line) in enumerate(toks):
+        if kind != "ident":
+            continue
+        owner = toks[i - 2][1] if i >= 2 and toks[i - 1][1] == "." and toks[i - 2][0] == "ident" else None
+        selector = i >= 1 and toks[i - 1][1] == "."
+        call = i + 1 < len(toks) and toks[i + 1][1] == "("
+        if (text == "Inheritable" and selector) or (text == "O_INHERITABLE" and owner in os_names):
+            found.append((line, "core:os's .Inheritable: a file so opened is handed to every process started"))
+        if test:
+            continue
+        if owner in sys_names and text in CLOEXEC_CALLS and call:
+            close = matching(toks, i + 1)
+            if not says_cloexec(toks, stmts, i + 2, close):
+                found.append((line, f"{owner}.{text} without CLOEXEC: what it makes is handed to every process started"))
+        elif owner in uring_names and text in ("accept", "openat", "socket") and call:
+            if not says_cloexec(toks, stmts, i + 2, matching(toks, i + 1)):
+                found.append((line, f"{owner}.{text} without CLOEXEC: what it makes is handed to every process started"))
+        elif owner in sys_names and text in NO_CLOEXEC_CALLS and call and oses != {"darwin"}:
+            found.append((line, f"{owner}.{text}, which cannot make what it makes close-on-exec: use its CLOEXEC form"))
+        elif owner in net_names and text in NET_MAKERS and linker and (text == "accept_tcp" or oses - {"linux"}):
+            found.append((line, f"net.{text}, whose socket is handed to every process started (but on Linux): use third_party/nbio's"))
+        elif owner in win_names and text == "socket" and call:
+            found.append((line, "ws2's socket, which makes an inheritable socket: use WSASocketW with WSA_FLAG_NO_HANDLE_INHERIT"))
+        elif owner in win_names and text == "WSASocketW" and call:
+            close = matching(toks, i + 1)
+            if not any(toks[k][1] == "WSA_FLAG_NO_HANDLE_INHERIT" for k in range(i + 2, close)):
+                found.append((line, "WSASocketW without WSA_FLAG_NO_HANDLE_INHERIT: the socket is inheritable"))
+        elif owner in win_names and text == "HANDLE_FLAG_INHERIT":
+            found.append((line, "HANDLE_FLAG_INHERIT: a handle made inheritable"))
+        elif owner in win_names and text == "DuplicateHandle" and call:
+            args = split_depth0(toks, i + 2, matching(toks, i + 1), {","})
+            if len(args) < 6 or [toks[k][1] for k in range(*args[5])] not in (["false"], ["FALSE"]):
+                found.append((line, "DuplicateHandle whose sixth argument is not false: the handle may be inheritable"))
+        elif text == "bInheritHandle" and i + 2 < len(toks) and toks[i + 1][1] in ("=", ":") and toks[i + 2][1] not in ("false", "FALSE"):
+            found.append((line, "a SECURITY_ATTRIBUTES whose handle is inheritable"))
+    return found
+
+
 def lint_file(path, src, wasi_built):
     """Each use in a file, as (line, what, issue)."""
     toks = tokens(src)
@@ -545,6 +645,8 @@ def lint_file(path, src, wasi_built):
                 found.append((line, "net.enumerate_interfaces in a file built for macOS, OpenBSD or NetBSD: it gathers with map_entry there", ISSUE))
             if owner in all_net_names and text == "set_option":
                 found.append((line, "net.set_option sets integer and bool options to the bytes of a pointer: use nbio.set_socket_option", OPTION_ISSUE))
+    for line, what in inherit_uses(path, toks, stmts, named, oses):
+        found.append((line, what, INHERIT_ISSUE))
     if "windows" in oses:
         if "core:os" in by_path:
             for line in trunc_uses(toks, by_path["core:os"]):
@@ -852,6 +954,94 @@ o :: proc(s: net.TCP_Socket) {
 }
 set_option :: proc(_: net.TCP_Socket, _: int, _: bool) {}
 """,
+    "d/inherit.odin": """package d
+import "core:os"
+import o2 "core:os"
+import "core:sys/posix"
+import "core:sys/linux"
+import "core:sys/linux/uring"
+import win "core:sys/windows"
+f :: proc(name: cstring, ring: ^uring.Ring) {
+	_, _ = os.open("x", {.Read, .Inheritable}) // use inherit
+	_, _ = os.open("x", o2.O_RDONLY | o2.O_INHERITABLE) // use inherit
+	_ = posix.open(name, {.RDWR}) // use inherit
+	_ = posix.open(name, {.RDWR, .CLOEXEC})
+	_ = posix.open( // use inherit
+		name,
+		{.RDWR},
+	)
+	flags := posix.O_Flags{.RDWR, .CLOEXEC}
+	_ = posix.open(name, flags)
+	bare := posix.O_Flags{.RDWR}
+	_ = posix.open(name, bare) // use inherit
+	_ = posix.open(name, bare + {.CLOEXEC})
+	taken := posix.O_Flags{.RDWR, .CLOEXEC}
+	taken -= {.CLOEXEC}
+	_ = posix.open(name, taken) // use inherit
+	_, _ = linux.openat(linux.AT_FDCWD, name, {.RDWR}, {}) // use inherit
+	_ = posix.socket(.INET, .STREAM, .TCP) // use inherit
+	_ = posix.socket(.INET, posix.Sock(i32(posix.Sock.STREAM) | POSIX_SOCK_CLOEXEC), .TCP)
+	_ = posix.accept(0, nil, nil) // use inherit
+	fds: [2]posix.FD
+	_ = posix.pipe(&fds) // use inherit
+	_ = posix.dup(0) // use inherit
+	_, _ = linux.eventfd(0, {.CLOEXEC})
+	_, _ = linux.eventfd(0, {}) // use inherit
+	_ = linux.pipe2(&fds, {.CLOEXEC})
+	uring.accept(ring, 0, 0, (^linux.Sock_Addr_Any)(nil), nil, {}) // use inherit
+	uring.accept(ring, 0, 0, (^linux.Sock_Addr_Any)(nil), nil, {.CLOEXEC})
+	_ = win.socket(2, 1, 6) // use inherit
+	_ = win.WSASocketW(2, 1, 6, nil, 0, win.WSA_FLAG_OVERLAPPED) // use inherit
+	_ = win.WSASocketW(2, 1, 6, nil, 0, win.WSA_FLAG_OVERLAPPED | win.WSA_FLAG_NO_HANDLE_INHERIT)
+	sa := win.SECURITY_ATTRIBUTES{nLength = 12, bInheritHandle = true} // use inherit
+	_ = win.SECURITY_ATTRIBUTES{bInheritHandle = false}
+	_ = win.SetHandleInformation(nil, win.HANDLE_FLAG_INHERIT, 0) // use inherit
+	h: win.HANDLE
+	_ = win.DuplicateHandle(nil, nil, nil, &h, 0, true, 0) // use inherit
+	_ = win.DuplicateHandle(nil, nil, nil, &h, 0, false, 0)
+	_ = sa
+	_ = "posix.open(name, {}) .Inheritable"
+	// posix.socket(.INET, .STREAM, .TCP)
+}
+""",
+    "d/accept_darwin.odin": """package d
+import "core:sys/posix"
+a :: proc() { _ = posix.accept(0, nil, nil) } // macOS has no accept4
+""",
+    "d/net.odin": """package d
+import "core:net"
+n :: proc() { _, _ = net.listen_tcp({}) } // not what an embedder links
+""",
+    "d/inherit_test.odin": """package d
+import "core:os"
+import "core:sys/posix"
+t :: proc() {
+	_, _ = os.open("x", {.Read, .Inheritable}) // use inherit
+	_ = posix.open("x", {.RDWR})
+}
+""",
+    "host/net.odin": """package host
+import "core:net"
+import n2 "core:net"
+m :: proc() {
+	_, _ = net.listen_tcp({}) // use inherit
+	_, _ = n2.create_socket(.IP4, .TCP) // use inherit
+	_, _ = net.dial_tcp({}) // use inherit
+	_, _ = net.make_unbound_udp_socket(.IP4) // use inherit
+	_, _ = net.bound_endpoint(0)
+}
+""",
+    "third_party/nbio/net_linux.odin": """package nbio
+import "core:net"
+m :: proc() {
+	_, _ = net.create_socket(.IP4, .TCP)
+	_, _, _ = net.accept_tcp(0) // use inherit
+}
+""",
+    "host/net_test.odin": """package host
+import "core:net"
+t :: proc() { _, _ = net.listen_tcp({}) }
+""",
     "node_modules/x/y.odin": """package y
 e :: proc(m: ^map[int]int) { map_entry(m, 1) }
 """,
@@ -934,9 +1124,9 @@ def selftest():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(src)
             for n, line in enumerate(src.splitlines(), 1):
-                m = re.search(r"// use( 8646| option)?$", line.rstrip())
+                m = re.search(r"// use( 8646| option| inherit)?$", line.rstrip())
                 if m:
-                    issue = {None: ISSUE, " 8646": TRUNC_ISSUE, " option": OPTION_ISSUE}[m.group(1)]
+                    issue = {None: ISSUE, " 8646": TRUNC_ISSUE, " option": OPTION_ISSUE, " inherit": INHERIT_ISSUE}[m.group(1)]
                     want.add((os.path.join(*rel.split("/")), n, issue))
         got = lint(root)
         have = {(p, line, issue) for p, line, _, issue in got}
@@ -948,10 +1138,10 @@ def selftest():
             print(f"FAIL the lint took {p}:{line} for a use of what {issue} breaks: {what}")
         if missed or extra:
             return 1
-        each = {i: sum(1 for w in want if w[2] == i) for i in (ISSUE, TRUNC_ISSUE, OPTION_ISSUE)}
+        each = {i: sum(1 for w in want if w[2] == i) for i in (ISSUE, TRUNC_ISSUE, OPTION_ISSUE, INHERIT_ISSUE)}
         print(f"ok   the lint finds each of the {each[ISSUE]} uses of what {ISSUE} breaks, the {each[TRUNC_ISSUE]} of what"
-              f" {TRUNC_ISSUE} does, and the {each[OPTION_ISSUE]} of {OPTION_ISSUE}, put in its fixtures, however written,"
-              " and nothing else")
+              f" {TRUNC_ISSUE} does, the {each[OPTION_ISSUE]} of {OPTION_ISSUE}, and the {each[INHERIT_ISSUE]} of"
+              f" {INHERIT_ISSUE}, put in its fixtures, however written, and nothing else")
         return 0
 
 
@@ -964,7 +1154,8 @@ def main():
         print(f"{p}:{line}: {what} ({issue})")
     for issue in sorted({f[3] for f in found}):
         n = sum(1 for f in found if f[3] == issue)
-        where = f"see https://github.com/{issue.replace('#', '/issues/')}" if "#" in issue else "see third_party/nbio/socket_option.odin"
+        where = (f"see https://github.com/{issue.replace('#', '/issues/')}" if "#" in issue else
+                 "see host/inherit_test.odin" if issue == INHERIT_ISSUE else "see third_party/nbio/socket_option.odin")
         print(f"FAIL {n} uses of what {issue} breaks: {where}")
     return 1 if found else 0
 

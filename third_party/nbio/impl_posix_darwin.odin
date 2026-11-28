@@ -20,6 +20,15 @@ posix_sendfile :: proc(fd: Handle, s: TCP_Socket, offset, nbytes: int) -> (sent:
 	return
 }
 
+// ZSP: macOS has neither SOCK_CLOEXEC nor accept4: a socket is had close-on-exec at once after it is made
+// (posix_socket, posix_accept), a fork in another thread between the two being the one way a process it starts is
+// handed it.
+POSIX_SOCK_CLOEXEC :: 0
+posix_accept4 :: proc(s: posix.FD) -> posix.FD {
+	return posix.accept(s, nil, nil)
+}
+posix_create_socket_error :: net._create_socket_error
+
 posix_listen_error   :: net._listen_error
 posix_accept_error   :: net._accept_error
 posix_dial_error     :: net._dial_error

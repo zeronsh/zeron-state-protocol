@@ -687,7 +687,7 @@ accept_exec :: proc(op: ^Operation) {
 		linux.Fd(op.accept.socket),
 		&op.accept._impl.sockaddr,
 		&op.accept._impl.sockaddr_len,
-		{},
+		{.CLOEXEC}, // ZSP: as every descriptor here is had, so that no process this one starts is handed it
 	))
 	link_timeout(op, op.accept.expires)
 }
