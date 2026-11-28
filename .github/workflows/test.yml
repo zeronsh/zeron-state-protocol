@@ -49,3 +49,10 @@ jobs:
         run: ./x selftest
       - if: runner.os == 'Linux'
         run: ./x nat
+      # Whatever failed, what each test said, kept with the run.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ runner.os }}-${{ github.event_name }}
+          path: build/*.log
+          retention-days: 14

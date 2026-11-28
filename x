@@ -188,7 +188,21 @@ selftest) # that ./x test says every kind of test that fails: with one made to f
 	expected="end_to_end forward luau-client mirror_model mirror_model-plain relay_settle web-client web-tabs web-text zsp"
 	said=$(LC_ALL=C sort -u build/failed | tr '\n' ' ' | sed 's/ $//')
 	if [ "$said" != "$expected" ]; then
-		echo "FAIL ./x test said '$said' failed, not '$expected': see build/selftest.log"
+		echo "FAIL ./x test said '$said' failed, not '$expected'"
+		# What failed that was not made to, as it said it: else a failure here could not be told from anywhere else.
+		for name in $said; do
+			case " $expected " in
+			*" $name "*) ;;
+			*)
+				if [ -f "build/$name.log" ]; then
+					echo "--- build/$name.log"
+					tail -n 120 "build/$name.log"
+				fi
+				;;
+			esac
+		done
+		echo "--- the end of build/selftest.log"
+		tail -n 80 build/selftest.log
 		exit 1
 	fi
 	echo "ok   ./x test says every failure put in it, and nothing else"
