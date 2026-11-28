@@ -620,3 +620,117 @@ live_overtakes_a_full_pipe_to_a_client :: proc(t: ^testing.T) {
 	testing.expectf(t, rows_then >= 0 && rows_then < ROWS, "what was typed came to the client once %d of the %d rows had", rows_then, ROWS)
 	free_all(context.temp_allocator)
 }
+
+// While what has changed waits on live text, a replica becoming partial does not say it has said all it holds: what is
+// held back is not yet said, and may be what fell off the ring, to be compared afresh. (Review 1 of #41, 1.)
+@(test)
+told_waits_for_what_live_text_holds_back :: proc(t: ^testing.T) {
+	state := seeded(73)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 256)
+	defer sim_destroy(&s)
+	desk, laptop := s.nodes[0], s.nodes[1]
+	sim_put(&s, desk, 1)
+	sim_put(&s, laptop, 2)
+	sim_restart(&s, laptop, full = false) // becoming partial
+	sim_link(&s, 0, 1) // the desk dials
+	sim_settle(&s)
+	at := s.links[0].b // the laptop's end
+	testing.expect(t, at.told, "never said it had said all it holds")
+	at.told = false
+	at.typing_due = true // live text owed, and no room for it
+	append(&at.out, ..make([]byte, OUT_LIVE + 1, context.temp_allocator))
+	_ = session_output(at)
+	testing.expect(t, !at.told, "said it had said all it holds while what had changed waited on live text")
+	session_sent(at, len(at.out) - at.sent) // what was in the way goes, unread: the link is not passed again
+	_ = session_output(at)
+	testing.expect(t, at.told, "never said so once there was room")
+	free_all(context.temp_allocator)
+}
+
+// Live text overtakes the rest and never takes its place: however much of it is given at once, and however often, so
+// much of the rest is made each time as would have been without it. (Review 1 of #41, 2.)
+@(test)
+live_text_never_starves_the_rest :: proc(t: ^testing.T) {
+	state := seeded(74)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 4096)
+	defer sim_destroy(&s)
+	seen: Seen
+	defer seen_destroy(&seen)
+	w, r := s.nodes[0], s.nodes[1]
+	sim_link(&s, 0, 1)
+	rows: [5]Id
+	for &x, i in rows {
+		x = put(w, u64(i) + 1)
+	}
+	settle(&s, &seen)
+	writer := sim_client(&s, w)
+	defer session_close(writer)
+	reader := sim_client(&s, r)
+	defer session_close(reader)
+	sim_watch(reader, 1, list_lo(LIST), list_hi(LIST), 50, {data = true, live = true, known = true})
+	settle(&s, &seen, writer, reader)
+	big := make([]byte, 13 << 10, context.temp_allocator)
+	for &b in big {
+		b = 'x'
+	}
+	for x in rows {
+		type(writer, x, 0, string(big)) // five pieces open, 65 KiB of them
+	}
+	take(&seen, writer)
+	for i in 0 ..< 120 {
+		place: [24]byte
+		put_u64(place[:], LIST[0])
+		put_u64(place[8:], LIST[1] + 1)
+		put_u64(place[16:], u64(i))
+		other := node_id(&w.node, 1)
+		node_write(&w.node, {{other, PLACE, .Place, node_stamp(&w.node), place[:]}, {other, DATA + 1, .Value, node_stamp(&w.node), make([]byte, 1024, context.temp_allocator)}})
+	}
+	full := s.links[0].a // the writer's node toward the reader's
+	began := full.cursor
+	for _ in 0 ..< 200 {
+		if !full.typing_due && len(full.out) - full.sent > OUT_LIVE {
+			full.typing_due = true // a key pressed, and dropped for want of room
+		}
+		out := session_output(full)
+		session_sent(full, min(len(out), 4096))
+	}
+	testing.expectf(t, full.cursor > began, "nothing more was made of the rest: %d of %d changes said", full.cursor - began, w.node.store.events.next - began)
+	free_all(context.temp_allocator)
+}
+
+// What a relay keeps of live text is never more than LIVE_OWED, however large what comes, and what it gives up it lets
+// go of. (Review 1 of #41, 3.)
+@(test)
+a_relay_keeps_so_much_live_text_at_most :: proc(t: ^testing.T) {
+	state := seeded(75)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 1, 0, 1, 256)
+	defer sim_destroy(&s)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	at := s.links[0].b // the relay's end
+	testing.expect(t, at.node.keys == nil, "not a relay")
+	append(&at.out, ..make([]byte, OUT_LIVE + 1, context.temp_allocator)) // no room
+	body := make([]byte, 20 << 10, context.temp_allocator)
+	most, gave_up := 0, false
+	for i in 0 ..< 6 {
+		l := Live{row = {1, u64(i)}, slot = DATA, piece = 7, body = body}
+		was := len(at.live_owed)
+		testing.expect(t, send_live(at, &l))
+		most = max(most, len(at.live_owed), cap(at.live_owed))
+		if len(at.live_owed) == 0 && was > 0 {
+			gave_up = true
+			testing.expectf(t, cap(at.live_owed) <= 4096, "what was given up is held still: %d", cap(at.live_owed))
+		}
+	}
+	testing.expectf(t, most <= LIVE_OWED + 4096, "kept %d of live text", most)
+	testing.expect(t, gave_up, "never gave up")
+	clear(&at.out)
+	at.sent = 0
+	free_all(context.temp_allocator)
+}
