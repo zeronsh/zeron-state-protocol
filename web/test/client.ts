@@ -226,7 +226,7 @@ function cellOf(row: string, kind: number, slot: number, n: number, body: string
     })
     .join("");
   assert(cells.length > 3000, "the text was written in a long cell");
-  for (const shown of [true, false]) {
+  for (const [shown, reused] of [[true, false], [false, false], [true, true]] as const) {
     const r = harness();
     r.run();
     r.greet();
@@ -236,13 +236,22 @@ function cellOf(row: string, kind: number, slot: number, n: number, body: string
     else r.client.window({ scope: 1, list: "a", table: { title: Note.title } }, () => {});
     r.run();
     const watch = r.self.said.find((x) => x.kind === WATCH);
-    r.tell(CELLS, "\x00" + cells);
+    if (reused) {
+      // Given in a Node Buffer that the host then writes over, as one reading a socket may: what was heard is the
+      // client's own, and not a view of what the host is done with. (A Buffer's slice is such a view.)
+      const w = codec.writer();
+      codec.putBytes(w, b(ch(CELLS) + "\x00" + cells));
+      const given = Buffer.from(codec.written(w));
+      r.self.receive(given);
+      given.fill(0);
+      r.run();
+    } else r.tell(CELLS, "\x00" + cells);
     if (watch) {
       const [page, , lo, hi] = watchOf(watch);
       synced(r, page, 1, lo, hi);
     }
     const read = shown ? st?.rows[0]?.body : r.client.text(id, Note.body).read();
-    assert.equal(read, long, shown ? "made of the bytes it came in" : "made of its cell");
+    assert.equal(read, long, reused ? "made of bytes the host wrote over" : shown ? "made of the bytes it came in" : "made of its cell");
   }
 }
 

@@ -1197,7 +1197,9 @@ export class Client {
   }
 
   #receive(data: Uint8Array): void {
-    let s = data;
+    // As a plain Uint8Array, whatever the host gave: of a Node Buffer, slice is a view of what the host may write over or
+    // keep as long as anything is cut from it, where of a Uint8Array it is a copy, which is what what is kept is made of.
+    let s = data.constructor === Uint8Array ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     if (this.#input.length > 0) {
       this.#input.push(data.slice());
       this.#inputBytes += data.length;
