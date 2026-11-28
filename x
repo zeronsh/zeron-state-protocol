@@ -189,7 +189,9 @@ selftest) # that ./x test says every kind of test that fails: with one made to f
 	said=$(LC_ALL=C sort -u build/failed | tr '\n' ' ' | sed 's/ $//')
 	if [ "$said" != "$expected" ]; then
 		echo "FAIL ./x test said '$said' failed, not '$expected'"
-		# What failed that was not made to, as it said it: else a failure here could not be told from anywhere else.
+		# What failed that was not made to, as it said it: else a failure here could not be told from anywhere else. A
+		# test with no log of its own said it in build/selftest.log, which is then shown whole.
+		whole=
 		for name in $said; do
 			case " $expected " in
 			*" $name "*) ;;
@@ -197,12 +199,19 @@ selftest) # that ./x test says every kind of test that fails: with one made to f
 				if [ -f "build/$name.log" ]; then
 					echo "--- build/$name.log"
 					tail -n 120 "build/$name.log"
+				else
+					whole=1
 				fi
 				;;
 			esac
 		done
-		echo "--- the end of build/selftest.log"
-		tail -n 80 build/selftest.log
+		if [ -n "$whole" ]; then
+			echo "--- build/selftest.log"
+			cat build/selftest.log
+		else
+			echo "--- the end of build/selftest.log"
+			tail -n 80 build/selftest.log
+		fi
 		exit 1
 	fi
 	echo "ok   ./x test says every failure put in it, and nothing else"
