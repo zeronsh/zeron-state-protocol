@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Node, spaceUrl } from "../src/node.ts";
 import { Client, columns } from "../src/client.ts";
-import { MemoryVolume, type File } from "../src/volume.ts";
+import { MemoryVolume, Uncertain, type File } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
 import { BIN } from "./procs.ts";
 
@@ -180,6 +180,99 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await again.close();
 }
 
+// A change to the space during which storage fails, its roster written but its flush failing, may be found done at the next
+// start, for what was written of it is read back: so it is said to be Uncertain, never that it failed, for an application
+// told it failed may make it again.
+{
+  let failing = false;
+  class Failing extends MemoryVolume {
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f || name !== "roster.0") return f;
+      const flush = f.flush.bind(f);
+      f.flush = () => {
+        if (failing) throw new Error("the disk is full");
+        flush();
+      };
+      return f;
+    }
+  }
+  const volume = new Failing();
+  volume.openNow = undefined;
+  const node = await Node.open({ volume, module, log: () => {} });
+  node.create();
+  failing = true;
+  assert.throws(() => node.scope(), (e) => e instanceof Uncertain, "a change storage failed as it made, which may be found done, said plainly to have failed");
+  failing = false;
+  const again = await Node.open({ volume, module, log: () => {} });
+  const next = again.scope();
+  console.log(`     a change storage failed as it made: said to be Uncertain, and found ${next === 3 ? "done" : "not done"} at the next start`);
+  await again.close();
+}
+
+// A volume whose files of the given name have their flush fail, what was written to them standing, while `failing.on`.
+function flushFailing(names: RegExp) {
+  const failing = { on: false };
+  class Failing extends MemoryVolume {
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f || !names.test(name)) return f;
+      const flush = f.flush.bind(f);
+      f.flush = () => {
+        if (failing.on) throw new Error("the disk is full");
+        flush();
+      };
+      return f;
+    }
+  }
+  const volume = new Failing();
+  volume.openNow = undefined;
+  return { volume, failing };
+}
+const uncertain = (e: unknown) => e instanceof Uncertain;
+
+// What makes a device of a space, made, joined or adopted, its roster or its space written and its flush failing, may be
+// found done at the next start: it is said to be Uncertain, never that it failed, nor that the roster was not taken. And a
+// roster adopted in a space so, the same.
+{
+  for (const how of ["create", "join", "adopt"] as const) {
+    const { volume, failing } = flushFailing(how === "join" ? /^space\./ : /^(space|roster)\./);
+    const node = await Node.open({ volume, module, log: () => {} });
+    failing.on = true;
+    if (how === "create") assert.throws(() => node.create(), uncertain, `${how}: said plainly to have failed`);
+    else if (how === "join") assert.throws(() => node.join("ab".repeat(32), { key: "cd".repeat(32), url: "wss://relay.example" }), uncertain, `${how}: said plainly to have failed`);
+    else {
+      const owner = join(TMP, "adopt-unkept");
+      const space = execFileSync(BIN, ["create", owner], { encoding: "utf8" }).trim();
+      execFileSync(BIN, ["admit", owner, node.key, "1"]);
+      assert.throws(() => node.adopt(readFileSync(join(owner, space, "roster"))), uncertain, `${how}: said plainly not to have been taken, or to have failed`);
+    }
+    await node.close().catch(() => {});
+  }
+  const a = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  a.create();
+  const { volume, failing } = flushFailing(/^roster\./);
+  const b = await Node.open({ volume, module, log: () => {} });
+  a.admit(b.key, 1);
+  assert(b.adopt(a.store.kept("roster").latest!));
+  const c = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
+  a.admit(c.key, 1); // a roster newer than b has
+  failing.on = true;
+  assert.throws(() => b.adopt(a.store.kept("roster").latest!), uncertain, "a roster adopted as its flush failed said plainly not to have been taken");
+  for (const n of [a, b, c]) await n.close().catch(() => {});
+}
+
+// But a change asked of a node whose storage had failed before is refused before anything of it is written: plainly failed.
+{
+  const { volume, failing } = flushFailing(/^roster\./);
+  const node = await Node.open({ volume, module, log: () => {} });
+  node.create();
+  failing.on = true;
+  assert.throws(() => node.scope(), uncertain); // failing as it is made
+  assert.throws(() => node.scope(), (e) => e instanceof Error && !(e instanceof Uncertain), "refused, storage having failed before, and said to be Uncertain");
+  await node.close().catch(() => {});
+}
+
 // A change to the space whose roster was kept is done, though storage failed after: what is said of it is what the next
 // start finds.
 {
@@ -246,7 +339,8 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   const adopting = await Node.open({ volume: fresh, module, log: () => {} });
   execFileSync(BIN, ["admit", owner, adopting.key, "1"]);
   failing = true;
-  assert.equal(adopting.adopt(readFileSync(join(owner, sid, "roster"))), false);
+  // Uncertain, for what of it was written may yet be read back: here, nothing was.
+  assert.throws(() => adopting.adopt(readFileSync(join(owner, sid, "roster"))), uncertain);
   assert.equal(adopting.space, undefined, "it says it is of a space whose roster it never kept");
   failing = false;
   const later = await Node.open({ volume: fresh, module, log: () => {} });
@@ -718,8 +812,10 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
   class Failing {
     onmessage: ((e: { data: unknown }) => void) | null = null;
     onerror: unknown = null;
+    // As a worker does: what it was asked answered, and then that it failed.
     postMessage(msg: { ask?: number }) {
-      if (msg.ask !== undefined) queueMicrotask(() => this.onmessage?.({ data: { failed: "the origin's file system is not there" } }));
+      const failed = "the origin's file system is not there";
+      if (msg.ask !== undefined) queueMicrotask(() => (this.onmessage?.({ data: { answer: msg.ask, error: failed } }), this.onmessage?.({ data: { failed } })));
     }
     terminate() {
       terminated = true;

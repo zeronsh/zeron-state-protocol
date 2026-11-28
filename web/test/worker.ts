@@ -139,7 +139,8 @@ function pause(store: string, name: string): { reached: Promise<void>; release: 
 /** The handles open in a store's directory. */
 const held = (store: string) => [...open].filter((h) => h.file.path.startsWith(`/zsp/${store}/`)).length;
 
-// Web Locks: one holder of a name at a time, the rest in line, in order, any of which may give up its place.
+// Web Locks: one holder of a name at a time, the rest in line, in order, any of which may give up its place. Had in a turn
+// of its own, as a browser grants one, though it is the holder's at once.
 const locks = new Set<string>();
 const lines = new Map<string, (() => void)[]>();
 function request<T>(name: string, a: { signal?: AbortSignal } | (() => T | Promise<T>), b?: () => T | Promise<T>): Promise<T> {
@@ -148,7 +149,7 @@ function request<T>(name: string, a: { signal?: AbortSignal } | (() => T | Promi
   return new Promise<T>((resolve, reject) => {
     const grant = () => {
       locks.add(name);
-      void (async () => {
+      setTimeout(async () => {
         try {
           resolve(await f());
         } catch (e) {
@@ -157,7 +158,7 @@ function request<T>(name: string, a: { signal?: AbortSignal } | (() => T | Promi
           locks.delete(name);
           lines.get(name)?.shift()?.();
         }
-      })();
+      });
     };
     if (!locks.has(name)) return grant();
     const line = lines.get(name) ?? (lines.set(name, []), lines.get(name)!);
@@ -206,13 +207,27 @@ function worker(): Promise<{ said: Report[]; tell: (data: unknown) => Promise<vo
 async function workerNow() {
   const said: Report[] = [];
   let onSaid: ((r: Report) => void) | undefined;
-  const scope = { location: { href: "file:///" }, onmessage: null as ((e: { data: unknown }) => Promise<void>) | null, postMessage: (r: Report) => (said.push(r), onSaid?.(r)) };
+  const awaited = new Map<number, () => void>();
+  const scope = {
+    location: { href: "file:///" },
+    onmessage: null as ((e: { data: unknown }) => Promise<void>) | null,
+    postMessage: (r: Report) => {
+      said.push(r), onSaid?.(r);
+      if ("answer" in r) awaited.get(r.answer)?.(), awaited.delete(r.answer);
+    },
+  };
   Object.defineProperty(globalThis, "self", { value: scope, configurable: true });
   await import(`../src/worker.ts?${++workers}`); // a module of its own, as a worker's is
   const on = scope.onmessage!;
   return {
     said,
-    tell: (data: unknown) => on({ data }),
+    /** Tells it something, and for an ask, waits for its answer. */
+    tell: async (data: unknown) => {
+      const id = (data as { ask?: number }).ask;
+      const answer = id === undefined ? undefined : new Promise<void>((r) => awaited.set(id, r));
+      await on({ data });
+      await answer;
+    },
     /** Says, as it is said, what was so then. */
     watch: (f: (r: Report) => void) => void (onSaid = f),
   };
@@ -325,7 +340,7 @@ async function until(what: string, f: () => boolean, ms = 5000): Promise<void> {
   await w.tell({ ask: 1, op: "identity", args: [] });
   assert.equal(answered(w.said, 1)?.name, "StoreLocked", JSON.stringify(answered(w.said, 1)));
   assert(w.said.some((r) => "failed" in r && r.name === "StoreLocked"), "its tab was not told the store is locked");
-  assert(!locks.has("zsp:locked"));
+  await until("the lock is let go of", () => !locks.has("zsp:locked"));
   other.close();
 }
 
@@ -977,10 +992,8 @@ for (const [i, { before, next }] of [
   spy.close();
 }
 
-// A new leader that says so and then answers nothing is given up on as any holder is, asked after a silence and given up on
-// after as long again: though what was asked of the one before, which may have done it as it went, is said to have failed
-// as it is heard of, which is no word from the new one. On a clock the test moves, timers of a second and more.
-{
+// Runs f on a clock the test moves, for timers of a second and more, which are then due only as the test says.
+async function clocked(f: (advance: (ms: number) => Promise<void>, turns: () => Promise<void>) => Promise<void>): Promise<void> {
   const timers = new Map<object, { at: number; f: () => void }>();
   let now = 0;
   const realSet = globalThis.setTimeout;
@@ -1008,29 +1021,7 @@ for (const [i, { before, next }] of [
   }) as typeof setTimeout;
   globalThis.clearTimeout = ((h: unknown) => (timers.has(h as object) ? timers.delete(h as object) : realClear(h as ReturnType<typeof setTimeout>))) as typeof clearTimeout;
   try {
-    void request("zsp:leader-lost", () => new Promise<void>(() => {})); // in line behind it, for good
-    let anyone = 0;
-    const leaders = new Channel("zsp:leader-lost"); // the one that went, and then the new one
-    leaders.onmessage = (e) => {
-      const d = e.data as { ask?: string; op?: string; anyone?: true };
-      if (d.anyone) anyone++;
-      if (d.ask && d.op === "create") leaders.postMessage({ taking: d.ask }); // and goes before it answers
-    };
-    const w = await worker();
-    await w.tell({ open: { name: "leader-lost" } });
-    void w.tell({ ask: 1, op: "create", args: [] });
-    void w.tell({ ask: 2, op: "member", args: [] });
-    await turns();
-    leaders.postMessage({ leader: true }); // the new one, which then answers nothing
-    await turns();
-    assert.match(answered(w.said, 1)?.error ?? "", /may or may not have been done/, JSON.stringify(w.said));
-    const locked = () => w.said.some((r) => "failed" in r && r.name === "StoreLocked");
-    await advance(3000);
-    assert.equal(anyone, 1, "the new leader was not asked whether it is there after a silence");
-    assert(!locked(), "given up on before it was asked whether it is there");
-    await advance(3000);
-    assert(locked(), "the new leader, asked and silent, was not given up on after as long again");
-    leaders.close();
+    await f(advance, turns);
   } finally {
     globalThis.setTimeout = realSet;
     globalThis.clearTimeout = realClear;
@@ -1076,6 +1067,240 @@ for (const when of ["heard of", "not yet heard of"] as const) {
   } finally {
     Node.prototype.attach = attach;
   }
+}
+
+// A new leader that says so and then answers nothing is given up on as any holder is, asked after a silence and given up on
+// after as long again: though what was asked of the one before, which may have done it as it went, is said to be Uncertain
+// as it is heard of, which is no word from the new one. On a clock the test moves.
+await clocked(async (advance, turns) => {
+  void request("zsp:leader-lost", () => new Promise<void>(() => {})); // in line behind it, for good
+  let anyone = 0;
+  const leaders = new Channel("zsp:leader-lost"); // the one that went, and then the new one
+  leaders.onmessage = (e) => {
+    const d = e.data as { ask?: string; op?: string; anyone?: true; credentials?: true };
+    if (d.anyone) anyone++;
+    if (d.credentials) leaders.postMessage({ leader: true, from: "gone" }); // running the node, as one that has begun hears
+    if (d.ask && d.op === "create") leaders.postMessage({ taking: d.ask, from: "gone" }); // and goes before it answers
+  };
+  const w = await worker();
+  await w.tell({ open: { name: "leader-lost" } });
+  void w.tell({ ask: 1, op: "create", args: [] });
+  void w.tell({ ask: 2, op: "member", args: [] });
+  await turns();
+  leaders.postMessage({ holding: true, from: "next" }); // the new one, which then answers nothing
+  leaders.postMessage({ leader: true, from: "next" });
+  await turns();
+  assert.match(answered(w.said, 1)?.error ?? "", /may or may not have been done/, JSON.stringify(w.said));
+  assert.equal(answered(w.said, 1)?.name, "Uncertain", "what the leader that went may have done was said plainly to have failed");
+  const locked = () => w.said.some((r) => "failed" in r && r.name === "StoreLocked");
+  await advance(3000);
+  assert.equal(anyone, 1, "the new leader was not asked whether it is there after a silence");
+  assert(!locked(), "given up on before it was asked whether it is there");
+  await advance(3000);
+  assert(locked(), "the new leader, asked and silent, was not given up on after as long again");
+  leaders.close();
+});
+
+// What a leader said it was doing, and then answered nothing of, as it failed or went quiet, may have been done: told as
+// Uncertain, not as failed, whether the leader said it failed or was given up on as the store being locked. What it did
+// not say it was doing, it did not do: plainly failed.
+await clocked(async (advance, turns) => {
+  for (const how of ["fails", "goes quiet"] as const) {
+    const store = how === "fails" ? "taken-fails" : "taken-quiet";
+    void request(`zsp:${store}`, () => new Promise<void>(() => {}));
+    const leader = new Channel(`zsp:${store}`);
+    leader.onmessage = (e) => {
+      const d = e.data as { ask?: string; op?: string; credentials?: true };
+      if (d.credentials) leader.postMessage({ leader: true, from: "it" });
+      if (d.ask && (d.op === "scope" || d.op === "members")) leader.postMessage({ taking: d.ask, from: "it" }); // as it begins, and then nothing more
+    };
+    const w = await worker();
+    await w.tell({ open: { name: store } });
+    void w.tell({ ask: 1, op: "scope", args: [] }); // taken
+    void w.tell({ ask: 2, op: "create", args: [] }); // not
+    void w.tell({ ask: 3, op: "members", args: [] }); // taken, as said, and the same done or not
+    await turns();
+    if (how === "fails") leader.postMessage({ failed: "the disk is full", from: "it" });
+    else await advance(3 * 3000); // heard from as it said it was taking it, then asked, and silent: three silences
+    await turns();
+    assert.equal(answered(w.said, 1)?.name, "Uncertain", `${how}: what the leader said it was doing was said plainly to have failed: ${JSON.stringify(answered(w.said, 1))}`);
+    assert.notEqual(answered(w.said, 2)?.name, "Uncertain", `${how}: what it never began was said to be Uncertain`);
+    assert(answered(w.said, 2)?.error, `${how}: what it never began was not said to have failed`);
+    assert(answered(w.said, 3)?.error, `${how}: what it may have done was said to be done`);
+    assert.notEqual(answered(w.said, 3)?.name, "Uncertain", `${how}: what may be asked again was said to be Uncertain`);
+    leader.close();
+  }
+});
+
+// What a leader did as it let go of the store, its word of it still on its way, is not done again by the next: whatever
+// comes on the channel and the store's lock keep no order between them, so that the next may have the store, and run the
+// node, before it hears that the one before was doing it, and what it said of it. It is Uncertain, never done twice.
+{
+  const a = await worker();
+  await a.tell({ open: { name: "late-word" } });
+  await a.tell({ ask: 1, op: "create", args: [] });
+  const b = await worker();
+  await b.tell({ open: { name: "late-word" } });
+  await b.tell({ ask: 1, op: "scope", args: [] });
+  const before = answered(b.said, 1)?.value as number;
+  // All the leader says on the store's channel from now on is held back, on its way.
+  const leaderChannel = [...channels.get("zsp:late-word")!][0];
+  const post = leaderChannel.postMessage.bind(leaderChannel);
+  const onItsWay: unknown[] = [];
+  leaderChannel.postMessage = (data: unknown) => void onItsWay.push(data);
+  void b.tell({ ask: 2, op: "scope", args: [] });
+  await until("the leader has done it", () => onItsWay.some((d) => (d as { answer?: unknown }).answer !== undefined));
+  void a.tell({ away: true }); // and lets go of the store, the next having it before it hears
+  await until("the asker is told", () => answered(b.said, 2) !== undefined);
+  for (const d of onItsWay) post(d);
+  await b.tell({ ask: 3, op: "scope", args: [] });
+  const told = answered(b.said, 2)!;
+  const next = answered(b.said, 3)?.value;
+  assert.equal(next, before + 2, `done ${(next as number) - before - 1} times, told ${JSON.stringify(told)}`);
+  assert.equal(told.name, "Uncertain", `what the leader that went may have done was said to be ${JSON.stringify(told)}`);
+  await b.tell({ ask: 9, op: "close", args: [] });
+}
+
+// Done once, by the leadership it was said to: said again as messages cross, it is answered as it was first answered, not
+// done again; and heard late by the leadership after, it is done by none, for it was not said to that one.
+{
+  const a = await worker();
+  await a.tell({ open: { name: "once" } });
+  await a.tell({ ask: 1, op: "create", args: [] });
+  const b = await worker();
+  await b.tell({ open: { name: "once" } });
+  await b.tell({ ask: 1, op: "scope", args: [] }); // and so in line, and knowing who leads
+  const before = answered(b.said, 1)?.value as number;
+  const said: unknown[] = [];
+  const spy = new Channel("zsp:once");
+  spy.onmessage = (e) => void ((e.data as { op?: string }).op === "scope" && said.push(e.data));
+  await b.tell({ ask: 2, op: "scope", args: [] });
+  assert.equal(answered(b.said, 2)?.value, before + 1);
+  for (const d of [...said, ...said]) spy.postMessage(d); // said again, twice
+  await b.tell({ ask: 3, op: "scope", args: [] });
+  assert.equal(answered(b.said, 3)?.value, before + 2, "what was said again was done again");
+  const spaces = () => b.said.filter((r) => "space" in r).length;
+  const told = spaces();
+  await a.tell({ ask: 9, op: "close", args: [] });
+  await until("the next leads", () => spaces() > told); // as it opens its node
+  for (const d of said) spy.postMessage(d); // heard by the leadership after
+  await new Promise<void>((done) => setTimeout(done)); // a turn: what was said is heard first
+  await b.tell({ ask: 4, op: "scope", args: [] });
+  assert.equal(answered(b.said, 4)?.value, before + 3, "what was said to the leadership before was done by the next");
+  await b.tell({ ask: 9, op: "close", args: [] });
+  spy.close();
+}
+
+// A leader closed, or put away, says it does nothing more asked: what was said to it, and not begun, was done by nobody, and
+// is done by the next, once, never said to be Uncertain as it would be were the leader gone without a word.
+{
+  const a = await worker();
+  await a.tell({ open: { name: "left" } });
+  await a.tell({ ask: 1, op: "create", args: [] });
+  const b = await worker();
+  await b.tell({ open: { name: "left" } });
+  await b.tell({ ask: 1, op: "scope", args: [] });
+  const before = answered(b.said, 1)?.value as number;
+  const closing = a.tell({ ask: 9, op: "close", args: [] });
+  await b.tell({ ask: 2, op: "scope", args: [] }); // said to it as it closed
+  await closing;
+  assert.equal(answered(b.said, 2)?.value, before + 1, JSON.stringify(answered(b.said, 2)));
+  await b.tell({ ask: 3, op: "scope", args: [] });
+  assert.equal(answered(b.said, 3)?.value, before + 2, "done more than once");
+  await b.tell({ ask: 9, op: "close", args: [] });
+}
+
+// What a leader's node failing as it does something is said to the tab that asked before that the node has failed: on
+// another's tab, and on the leader's own. And then, its storage come back, what one tab alone asks next is done by its
+// worker, coming to hold the store again in a turn of its own, as a browser grants it, and is not said to be Uncertain: for
+// it was said to no other.
+for (const whose of ["another's", "its own"] as const) {
+  const store = whose === "its own" ? "failing-own" : "failing-other";
+  const a = await worker();
+  await a.tell({ open: { name: store } });
+  await a.tell({ ask: 1, op: "create", args: [] });
+  const b = whose === "its own" ? a : await worker();
+  if (b !== a) await b.tell({ open: { name: store } }), await b.tell({ ask: 1, op: "scope", args: [] });
+  failFlush = "*";
+  await b.tell({ ask: 2, op: "scope", args: [] });
+  const told = answered(b.said, 2)!;
+  assert.equal(told.name, "Uncertain", `${whose}: ${JSON.stringify(told)}`);
+  await until("the tab is told the node failed", () => b.said.some((r) => "failed" in r));
+  assert(b.said.indexOf(told) < b.said.findIndex((r) => "failed" in r), `${whose}: told the node failed before what it asked: ${JSON.stringify(b.said)}`);
+  failFlush = undefined;
+  if (b !== a) await b.tell({ ask: 9, op: "close", args: [] });
+  await until("the store is let go of", () => !locks.has(`zsp:${store}`)); // as a node that failed lets go of it
+  await a.tell({ ask: 3, op: "scope", args: [] });
+  const after = answered(a.said, 3)!;
+  assert.equal(after.error, undefined, `${whose}: what one tab alone asked after its storage came back: ${JSON.stringify(after)}`);
+  await a.tell({ ask: 9, op: "close", args: [] });
+}
+
+// What a leadership that has gone says, late, is no word of the one holding the store now: an ask is said to that one only
+// once it says it runs the node, and so is never said to be Uncertain as one may have been that was said as it opened.
+{
+  void request("zsp:late-leader", () => new Promise<void>(() => {}));
+  const asked: { ask: string; to?: string }[] = [];
+  const holders = new Channel("zsp:late-leader");
+  holders.onmessage = (e) => {
+    const d = e.data as { ask?: string; to?: string; credentials?: true };
+    if (d.credentials) holders.postMessage({ leader: true, from: "before" });
+    if (d.ask) asked.push(d as { ask: string; to?: string });
+  };
+  const w = await worker();
+  await w.tell({ open: { name: "late-leader" } });
+  void w.tell({ ask: 1, op: "member", args: [] });
+  await until("it is asked of the one leading", () => asked.length === 1);
+  holders.postMessage({ answer: asked[0].ask, value: false, from: "before" });
+  await until("it is answered", () => answered(w.said, 1) !== undefined);
+  holders.postMessage({ holding: true, from: "next" }); // opening the store
+  holders.postMessage({ taking: "nothing of this one's", from: "before" }); // late
+  holders.postMessage({ answer: "nor this", from: "before" });
+  holders.postMessage({ leader: true, from: "before" });
+  await new Promise<void>((done) => setTimeout(done)); // a turn: what was said is heard first
+  void w.tell({ ask: 2, op: "scope", args: [] }); // kept, until the next runs the node
+  holders.postMessage({ leader: true, from: "next" });
+  await until("it is asked", () => asked.length === 2);
+  assert.equal(asked[1].to, "next", `asked of a holder still opening the store, as a leadership gone said it led: ${JSON.stringify(asked)}`);
+  holders.postMessage({ answer: asked[1].ask, value: 7, from: "next" });
+  await until("it is answered", () => answered(w.said, 2) !== undefined);
+  assert.equal(answered(w.said, 2)?.value, 7, JSON.stringify(answered(w.said, 2)));
+  await w.tell({ ask: 9, op: "close", args: [] });
+  holders.close();
+}
+
+// A node whose storage fails as it changes its space, as a scope is asked for, may have kept the change, for what was
+// written of it is read back once the store is opened again, though its flush failed: the asker is told Uncertain then.
+// Told that it failed, it was not done; told it was done, it was, once; and whatever it is told, it is never done twice.
+// Whichever file fails, one of them as the change is written.
+{
+  let uncertain = 0;
+  for (const file of ["*", "roster.0", "roster.1", "keys.0", "keys.1"]) {
+    const store = "governing-" + (file === "*" ? "all" : file.replace(/[^a-z0-9]/g, ""));
+    const a = await worker();
+    await a.tell({ open: { name: store } });
+    await a.tell({ ask: 1, op: "create", args: [] });
+    const b = await worker();
+    await b.tell({ open: { name: store } });
+    await b.tell({ ask: 1, op: "scope", args: [] }); // the last made before, whatever made it
+    const before = answered(b.said, 1)?.value as number;
+    failFlush = file;
+    await b.tell({ ask: 2, op: "scope", args: [] });
+    const told = answered(b.said, 2)!;
+    failFlush = undefined;
+    await until("both hear", () => a.said.some((r) => "failed" in r) && b.said.some((r) => "failed" in r), 3000).catch(() => {});
+    await a.tell({ ask: 9, op: "close", args: [] });
+    await b.tell({ ask: 3, op: "scope", args: [] });
+    const next = answered(b.said, 3)?.value;
+    const all = `told ${JSON.stringify(told)}, the scope before ${before}, the next ${next}; the leader said ${JSON.stringify(a.said)}, the asker ${JSON.stringify(b.said)}`;
+    assert(next === before + 1 || next === before + 2, `${file}: done more than once, or the store lost what was made before: ${all}`);
+    const done = next === before + 2;
+    if (told.error !== undefined && told.name !== "Uncertain") assert(!done, `${file}: said to have failed, and done: ${all}`);
+    if (told.error === undefined) assert(done && told.value === before + 1, `${file}: said to be done, and not: ${all}`);
+    if (told.name === "Uncertain") uncertain++;
+    await b.tell({ ask: 9, op: "close", args: [] });
+  }
+  assert(uncertain > 0, "no file failing as the change was made was said to make it Uncertain");
 }
 
 // A worker holding the store that is stuck opening it, waiting on a file that never opens, does not say it is there, but
@@ -1191,6 +1416,7 @@ let dials = 0;
 let keepTimes = false; // every time asked for kept here, to be said to be up when the test says
 const afters: number[] = [];
 let tabSide: { onmessage: ((e: { data: Report }) => void) | null } | undefined;
+const lost = new Set<string>(); // ops asked of the worker that never reach it
 const tabWorkers: TabWorker[] = [];
 // Stopped, as a browser stops a worker: nothing more reaches it, and what was still on its way to it down its pipes is
 // dropped with them, as it may be.
@@ -1205,9 +1431,9 @@ class TabWorker {
     tabWorkers.push(this);
     void this.#w.then((w) => w.watch((r) => setTimeout(() => this.#stopped || this.onmessage?.({ data: r }))));
   }
-  postMessage(c: { connect?: MessagePort; after?: number }): void {
+  postMessage(c: { connect?: MessagePort; after?: number; op?: string }): void {
     posted.push({ to: "worker", what: c });
-    if (this.#stopped) return;
+    if (this.#stopped || (c.op && lost.has(c.op))) return;
     if (c.connect) {
       dials++;
       if (refusePipes) return void c.connect.postMessage({ close: true });
@@ -1486,6 +1712,31 @@ for (const how of ["answered since", "back since"] as const) {
   const from = posted.length;
   await device.close().catch(() => {});
   assert(posted.slice(from).some((x) => x.to === "worker" && x.what.op === "close"), "the worker started anew was not asked to close");
+}
+
+// What a device was asked, and not answered, as its tab was put away, or as it was closed, may have been done: Uncertain,
+// unless it may be asked again, done or not. And adopting a roster says what space the device is of with it, and asks
+// nothing more, which might fail though the adopting was done.
+{
+  const device = await openDevice({ name: "asked-as-it-went" });
+  await device.create();
+  const away = device.scope().then(() => undefined, (e: Error) => e);
+  tabDocument.dispatchEvent(new Event("freeze"));
+  assert.equal((await away)?.name, "Uncertain", `put away: ${await away}`);
+  tabDocument.dispatchEvent(new Event("resume"));
+  lost.add("scope").add("members");
+  const closing = device.scope().then(() => undefined, (e: Error) => e);
+  const again = device.members().then(() => undefined, (e: Error) => e);
+  await device.close();
+  assert.equal((await closing)?.name, "Uncertain", `closed: ${await closing}`);
+  assert((await again) instanceof Error && (await again)!.name !== "Uncertain", `what may be asked again: ${await again}`);
+  lost.clear();
+  const adopting = await openDevice({ name: "adopting" });
+  const from = posted.length;
+  assert.equal(await adopting.adopt(new Uint8Array(200)), false); // no roster
+  assert.equal(adopting.space, undefined);
+  assert.deepEqual(posted.slice(from).flatMap((x) => (x.to === "worker" && x.what.op ? [x.what.op] : [])), ["adopt"], "it asked more after adopting");
+  await adopting.close();
 }
 
 console.log("ok");

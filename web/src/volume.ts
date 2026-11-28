@@ -10,6 +10,14 @@ export class StoreLocked extends Error {
   override name = "StoreLocked";
 }
 
+/**
+ * What a device was asked may or may not have been done: whoever was doing it went, or its storage failed, as it did it, so
+ * that whether it is durable cannot be known. Look before doing it again. Plainly failed, it was not done.
+ */
+export class Uncertain extends Error {
+  override name = "Uncertain";
+}
+
 /** A file open for reading and writing. Every call is synchronous; failures throw. */
 export interface File {
   /** Reads into `into` from `at`; returns how many bytes there were. */

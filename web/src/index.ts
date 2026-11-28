@@ -11,7 +11,7 @@ export * as mirror from "./mirror.ts";
 export type { Doc, Draft, Fields, Input, ListSchema, MapSchema, Mirror, Of, RecordSchema, Schema, TreeSchema } from "./mirror.ts";
 export type { Match, Question, Total, Where } from "./ask.ts";
 export { spaceUrl } from "./node.ts";
-export { StoreLocked } from "./volume.ts";
+export { StoreLocked, Uncertain } from "./volume.ts";
 export type { Connect, Member, Rights, Wire } from "./node.ts";
 
 /** A relay: the key devices pin, and where it is. */

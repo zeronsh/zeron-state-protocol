@@ -71,17 +71,18 @@ export type Report =
 
 // Between workers, on the store's channel.
 type Shout =
-  | { leader: true } // a worker has opened the store: whatever was carried to another is broken
-  | { failed: string; name?: string } // its storage has failed, or could not be opened: it has stopped, and lets another try
+  | { leader: true; from?: string } // a worker has opened the store: whatever was carried to another is broken; or, said again, that it runs it
+  | { failed: string; name?: string; from?: string } // its storage has failed, or could not be opened: it has stopped, and lets another try
   | { space: string | undefined } // the space the device is of, now
   | { open: string } // a pipe, on the channel of that name
-  | { ask: string; op: Op; args: unknown[] }
-  | { taking: string } // an ask the leader is doing now, which it may have done should it go before it answers
-  | { answer: string; value?: unknown; error?: string; name?: string }
+  | { ask: string; op: Op; args: unknown[]; to?: string } // of the leader of that leadership, and of none other
+  | { taking: string; from?: string } // an ask the leader is doing now, which it may have done should it go before it answers
+  | { answer: string; value?: unknown; error?: string; name?: string; from?: string }
   | Given // a credential a tab has given, for whichever worker runs the node now and later
   | { credentials: true } // a worker that has just begun, asking to be told the newest given before it
   | { anyone: true } // a worker whose asks nobody has answered: whoever holds the store says it is there
-  | { holding: true } // a worker has the store's lock, and is opening the store: whoever had it before has let go of it
+  | { holding: true; from?: string } // a worker has the store's lock, and is opening the store: whoever had it before has let go of it
+  | { left: true; from?: string } // the holder is letting go of the store, as closed or put away: it does nothing more asked
   | { here: true }; // the worker that holds the store, opening it or running it
 
 // What may be asked again of the next leader, as having been done or not it is the same: anything else, asked of one that
@@ -113,6 +114,25 @@ const waiting = new Map<string, (answer: { value?: unknown; error?: string; name
 const unheard = new Map<string, Shout>(); // said to the leader, and not yet answered
 
 const taken = new Set<string>(); // asks of this worker's that the leader said it was doing
+// Asks of this worker's sent while another may have been running the node, as far as it has heard: done, it may be, by one
+// that then went, its word of it still on its way, whatever comes on the channel and the store's lock not keeping order
+// between them. Asked of one opening the store, which says it holds it, and answers nothing until it has opened it, they
+// were done by nobody.
+//
+// So each time a worker comes to hold the store it is a leadership of its own, named afresh (`epoch`), which says so with
+// all it says as it holds it; and an ask is said only to the leadership running the node, as far as this worker has heard
+// (`leading`), and done only by that one, never by one after: kept until a node runs, or this worker runs it, what was
+// never said was done by nobody, and is done once, by whoever runs it first. One said, and unanswered as whoever held the
+// store lets go of it, may have been done by that leadership, as it went (`maybeDone`), and by no other: unless it says
+// it has let go, not having said it was doing it, when it was done by nobody, and is said again. A leadership does what
+// it is asked once, answering what is asked again as it answered it first (`executed`), and does what it is asked as it
+// hears it, there and then, saying it is doing it first, and so before it says it has let go.
+const posted = new Map<string, string>(); // asks said, and unanswered, to the leadership running the node now: to which
+const maybeDone = new Map<string, string>(); // of those, the ones unanswered as whoever held the store let go of it
+let epoch: string | undefined; // this worker's leadership, while it holds the store, and after, of what it says late
+let holder: string | undefined; // the leadership holding the store, by what was heard last: what one that has gone says is late
+let leading: string | undefined; // of that, the leadership known to be running the node, which asks are said to
+const executed = new Map<string, { value?: unknown; error?: string; name?: string }>(); // done here, as leader, by id
 const timers = new Map<number, ReturnType<typeof setTimeout>>(); // the tab's
 
 // What this worker says of itself, rather than as it is asked: to its tab, and with tellAll to every other worker too. Once
@@ -125,7 +145,7 @@ function tell(r: Report): void {
 function tellAll(r: Report & Shout): void {
   if (leaving) return;
   tab.postMessage(r);
-  channel.postMessage(r);
+  channel.postMessage({ ...r, from: epoch } as Shout);
 }
 
 tab.onmessage = async (e: MessageEvent<Command>) => {
@@ -138,7 +158,7 @@ tab.onmessage = async (e: MessageEvent<Command>) => {
     const id = c.after;
     timers.set(id, setTimeout(() => (timers.delete(id), tell({ due: id })), c.ms));
   } else if ("cancel" in c) clearTimeout(timers.get(c.cancel)), timers.delete(c.cancel);
-  else if ("ask" in c) tab.postMessage({ answer: c.ask, ...(await ask(c.op, c.args)) } satisfies Report);
+  else if ("ask" in c) ask(c.op, c.args, (a) => tab.postMessage({ answer: c.ask, ...a } satisfies Report));
 };
 
 let options: Options;
@@ -161,7 +181,9 @@ let quiets = 0; // times this worker has begun to look whether whoever holds the
 /** What went wrong, as a tab is told it: the error's name too, where it is one an application may tell apart. */
 export type Failure = { message: string; name?: string };
 const failure = (e: unknown): Failure =>
-  e instanceof Error ? { message: e.message, ...(e.name === "StoreLocked" ? { name: e.name } : {}) } : { message: String(e) };
+  e instanceof Error ? { message: e.message, ...(told(e.name) ? { name: e.name } : {}) } : { message: String(e) };
+// The names of errors an application may tell apart, as a tab is told them: any other is an Error.
+const told = (name: unknown): name is "StoreLocked" | "Uncertain" => name === "StoreLocked" || name === "Uncertain";
 
 function open(o: Options): void {
   let name: string;
@@ -242,7 +264,10 @@ function contend(): void {
     if (leaving) return;
     holding = true;
     holderChanged(); // what waited on whoever held the store waits on this worker now, which answers it or says it failed
-    channel.postMessage({ holding: true } satisfies Shout); // and on every other, which waits on this one now
+    holder = epoch = crypto.randomUUID(); // a leadership of its own: what it did before, it did with a node gone
+    leading = undefined;
+    executed.clear();
+    channel.postMessage({ holding: true, from: epoch } satisfies Shout); // and on every other, which waits on this one now
     saidStage = -1; // and, holding it anew, it has said nothing of how far it has got
     try {
       await hold(o);
@@ -288,7 +313,8 @@ async function hold(o: Options): Promise<void> {
   else if (!stopped) {
     device = node;
     holderChanged(); // what waited on this worker has it here now
-    channel.postMessage({ leader: true } satisfies Shout);
+    leading = epoch;
+    channel.postMessage({ leader: true, from: epoch } satisfies Shout);
     tellSpace();
     // What this worker itself was waiting to hear, it now answers: but what the one before may have done already, it says
     // may have been.
@@ -319,12 +345,16 @@ function leave(): Promise<void> {
   waiting.clear();
   unheard.clear();
   taken.clear();
+  posted.clear();
+  maybeDone.clear();
   breakCarried();
   for (const t of timers.values()) clearTimeout(t);
   timers.clear();
   line?.abort();
   const d = device;
   device = undefined;
+  // Doing nothing more asked, it says so, behind all it did: whatever it had not said it was doing, it did not do.
+  if (holding && channel) channel.postMessage({ left: true, from: epoch } satisfies Shout);
   stopNow(d);
   try {
     opening?.close();
@@ -366,6 +396,7 @@ function drainAway(): void {
 
 // Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
 function fail(f: Failure): void {
+  leading = undefined; // nobody runs the node now, until another says it has opened it
   failedAsks(f);
   // What waited on this worker is answered, it having failed: every client dials again, and so it is wanted, and tries again.
   holderChanged();
@@ -383,33 +414,38 @@ function breakCarried(): void {
 
 // ---------------------------------------------------------------- the device, for any tab
 
-async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: string; name?: string }> {
-  if (!channel && op !== "close") return { error: "the device was never opened: its name names no store" };
+// Answered by `reply`, there and then as it is settled, so that its tab hears the answer before anything said after it, as
+// that the store has failed: every answer settled is said before the failure that settled it.
+function ask(op: Op, args: unknown[], reply: (answer: { value?: unknown; error?: string; name?: string }) => void): void {
+  if (!channel && op !== "close") return reply({ error: "the device was never opened: its name names no store" });
   if (op === "credential") {
     const c = args[0];
     const at = args[1];
-    if (!(typeof c === "string" || c instanceof Uint8Array) || typeof at !== "number") return { error: "a credential is a string or bytes" };
-    return { value: give(c, at, true) }; // given now, and so after any this worker knows of
+    if (!(typeof c === "string" || c instanceof Uint8Array) || typeof at !== "number") return reply({ error: "a credential is a string or bytes" });
+    return reply({ value: give(c, at, true) }); // given now, and so after any this worker knows of
   }
   if (op === "close") {
     // This tab's device goes: if this worker runs the node, or is opening it, it is stopped as it should be, what it holds
     // written down, and the store let go of, before the worker goes and another takes it. Another's node is not this
     // tab's to stop: this worker's place in line for it is given up.
-    await leave();
-    return {};
+    return void leave().then(() => reply({}));
   }
-  if (device) return answer(op, args);
-  if (leaving) return { error: "the device is closed" }; // and nothing waits on whoever holds the store
+  if (device) return reply(answer(op, args));
+  if (leaving) return reply({ error: "the device is closed" }); // and nothing waits on whoever holds the store
   contend();
   const id = crypto.randomUUID();
-  return new Promise((done) => {
-    waiting.set(id, done);
-    shout(id, { ask: id, op, args });
-  });
+  waiting.set(id, reply);
+  shout(id, { ask: id, op, args });
 }
 
-function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
+// A node's storage failing as something is done means that what was done may or may not be durable: what was written of it
+// may be read back once the store is opened again, though its flush failed. So what fails as storage does is Uncertain,
+// unless it may be done again; what was refused because storage had failed before is plainly failed, never begun. The store's
+// directory counts what of its files failed, as it does, whatever the node makes of it then.
+function answer(op: Op, args: unknown[]): { value?: unknown; error?: string; name?: string } {
   const d = device!;
+  const volume = opening;
+  const before = volume?.failures ?? 0;
   try {
     switch (op) {
       case "identity":
@@ -421,7 +457,7 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
       case "adopt": {
         const taken = d.adopt(args[0] as Uint8Array);
         tellSpace();
-        return { value: taken };
+        return { value: { taken, space: d.space } }; // the space it is of with it, as one answer: nothing more to ask
       }
       case "member":
         return { value: d.member };
@@ -453,27 +489,47 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
         return {}; // see ask
     }
   } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e) };
+    const error = e instanceof Error ? e.message : String(e);
+    if (e instanceof Error && e.name === "Uncertain") return { error, name: "Uncertain" }; // as the node says
+    if ((volume?.failures ?? 0) !== before && !AGAIN.has(op)) return { error: `${error}, as this was done: it may or may not have been`, name: "Uncertain" };
+    return { error };
   }
 }
 
 // Whatever was asked of a node that stopped, or of one that never came to be, and not answered, was not done, and the tab
 // is told it failed: it is not to be done by the next, either.
+// What the leader said it was doing, before it failed or went quiet, may have been done: Uncertain, never plainly failed.
 function failedAsks(f: Failure): void {
-  for (const [id, done] of waiting) unheard.delete(id), taken.delete(id), done({ error: f.message, name: f.name });
+  for (const [id, done] of waiting) {
+    const u = unheard.get(id);
+    unheard.delete(id);
+    const begun = taken.delete(id) || maybeDone.has(id);
+    maybeDone.delete(id);
+    posted.delete(id);
+    const again = u !== undefined && "ask" in u && AGAIN.has(u.op); // done or not, it is the same: never Uncertain
+    done(begun && !again ? { error: `${f.message}, as the device's leader did this: it may or may not have been done`, name: "Uncertain" } : { error: f.message, name: f.name });
+  }
   waiting.clear();
 }
 
-// What a leader that has gone was doing as it went, and may have done: unless it may be done again, it is said to have
-// failed, rather than be done twice.
-function gone(id: string, op: Op): { error: string } | undefined {
-  if (!taken.delete(id) || AGAIN.has(op)) return undefined;
-  return { error: "the tab running the device went as it did this, which may or may not have been done" };
+// What a leader that has gone was doing as it went, or may have been, and so may have done: unless it may be done again, it
+// is Uncertain, rather than done twice.
+function gone(id: string, op: Op): { error: string; name: string } | undefined {
+  const begun = taken.delete(id);
+  const maybe = maybeDone.delete(id);
+  posted.delete(id);
+  if (AGAIN.has(op) || !(begun || maybe)) return undefined;
+  return { error: "the tab running the device went as it did this, which may or may not have been done", name: "Uncertain" };
 }
 
 // Says something to the leader, and again to every new one until it is answered: one opening its store hears nothing.
 function shout(id: string, s: Shout): void {
   unheard.set(id, s);
+  if ("ask" in s) {
+    if (holding || leading === undefined) return void listen(); // kept, until a node runs: said then, or done here
+    posted.set(id, leading);
+    s = { ...s, to: leading };
+  }
   channel.postMessage(s);
   listen();
 }
@@ -554,6 +610,9 @@ function holderChanged(): void {
   breakCarried();
   unlisten();
   listen();
+  // What was asked while the one before may have run the node, and is unanswered, it may have done as it went.
+  for (const [id, to] of posted) if (unheard.has(id)) maybeDone.set(id, to);
+  posted.clear();
 }
 
 // Asked whether it is there, the worker that holds the store says so if it is running the node, or if it has got on with
@@ -579,37 +638,64 @@ function settle(id: string, a: { value?: unknown; error?: string; name?: string 
   unheard.delete(id);
   waiting.delete(id);
   taken.delete(id);
+  posted.delete(id);
+  maybeDone.delete(id);
   if (!waitingOnHolder()) clearTimeout(silence), (silence = undefined); // nothing more to wait on it for
-  done?.({ value: a.value, error: a.error, name: a.name === "StoreLocked" ? a.name : undefined });
+  done?.({ value: a.value, error: a.error, name: told(a.name) ? a.name : undefined });
 }
 
 // Anything on the channel is of this origin; but what is not as a worker says it is ignored, rather than thrown at.
 function heard(s: Shout): void {
   if (typeof s !== "object" || s === null) return;
   if ("here" in s || "leader" in s || "taking" in s || "answer" in s) holderHeard = true; // whoever holds the store is there
+  const said = (s as { from?: unknown }).from;
+  // What a leadership that has gone says, late, is of no holder now: it settles what it answers, which it did, and no more.
+  const fromHolder = typeof said !== "string" || holder === undefined || said === holder;
   if ("failed" in s) {
-    if (typeof s.failed !== "string") return;
-    const f: Failure = { message: s.failed, ...(s.name === "StoreLocked" ? { name: s.name } : {}) };
+    if (typeof s.failed !== "string" || !fromHolder) return;
+    leading = undefined; // nobody runs the node now, until another says it has opened it
+    const f: Failure = { message: s.failed, ...(s.name === "StoreLocked" ? { name: s.name } : {}) }; // a holder's failure, which is never Uncertain
     failedAsks(f);
     holderChanged();
     tell({ failed: f.message, name: f.name });
   } else if ("space" in s) {
     if (s.space !== undefined && typeof s.space !== "string") return;
     tell({ space: s.space });
+  } else if ("left" in s) {
+    if (typeof said !== "string") return;
+    // Whatever it was asked and had not said it was doing, it did not do, whenever this is heard: said again, to the next.
+    for (const [id, to] of [...posted, ...maybeDone]) if (to === said && !taken.has(id)) posted.delete(id), maybeDone.delete(id);
+    if (said !== holder) return; // late: another holds the store already
+    leading = undefined;
+    holderChanged();
   } else if ("holding" in s) {
+    leading = undefined; // a new holder, opening the store: the one before has let go of it, and this one does nothing asked yet
+    if (typeof said === "string") holder = said;
     holderChanged();
   } else if ("leader" in s) {
-    holderChanged(); // what was carried to one that is gone, or to this one as it opened, which served none of it
+    if (typeof said !== "string" || !fromHolder) return;
+    if (said !== leading) {
+      // What was carried to one that is gone, or to this one as it opened, which served none of it; but first heard of, as
+      // this worker has just begun, it is the holder all that was carried went to.
+      if (holder !== undefined) holderChanged();
+      holder = leading = said;
+    }
+    // What was said to a leadership before is done by none after: unless it may be done again, it may have been, and is
+    // said to be. What was never said is said now, to this one.
     for (const [id, u] of [...unheard]) {
-      if ("open" in u) continue;
+      if ("open" in u || posted.has(id)) continue;
       const lost = "ask" in u ? gone(id, u.op) : undefined;
       if (lost) settle(id, lost); // no word from the new one, which is waited on as it was
-      else channel.postMessage(u);
+      else {
+        if ("ask" in u) posted.set(id, said);
+        channel.postMessage("ask" in u ? { ...u, to: said } : u);
+      }
     }
   } else if ("by" in s) {
     heardGiven(s);
   } else if ("credentials" in s) {
     if (newest) channel.postMessage({ ...newest, old: true } satisfies Shout); // to one that has just begun, and so to all
+    if (device) channel.postMessage({ leader: true, from: epoch } satisfies Shout); // and which leadership it may ask
   } else if ("anyone" in s) {
     probeHeard = true;
     if (holding) here();
@@ -619,10 +705,16 @@ function heard(s: Shout): void {
     if (typeof s.answer !== "string") return;
     settle(s.answer, s);
   } else if (device && "ask" in s) {
-    if (typeof s.ask !== "string" || typeof s.op !== "string" || !Array.isArray(s.args)) return;
+    if (typeof s.ask !== "string" || typeof s.op !== "string" || !Array.isArray(s.args) || s.to !== epoch) return; // another's
+    // Done once, whatever is said again as messages cross: asked again, it is answered as it was first.
+    const first = executed.get(s.ask);
+    if (first) return void channel.postMessage({ answer: s.ask, ...first, from: epoch } satisfies Shout);
     // Said before it is done, so that should this worker go as it does it, the asker knows it may have been.
-    if (!AGAIN.has(s.op)) channel.postMessage({ taking: s.ask } satisfies Shout);
-    channel.postMessage({ answer: s.ask, ...answer(s.op, s.args) } satisfies Shout);
+    if (!AGAIN.has(s.op)) channel.postMessage({ taking: s.ask, from: epoch } satisfies Shout);
+    const done = answer(s.op, s.args);
+    executed.set(s.ask, done);
+    if (executed.size > 4096) executed.delete(executed.keys().next().value!); // the oldest, long answered
+    channel.postMessage({ answer: s.ask, ...done, from: epoch } satisfies Shout);
   } else if (device && "open" in s) {
     if (typeof s.open !== "string" || !s.open.startsWith(channel.name + ":")) return;
     serve(new BroadcastChannel(s.open));
