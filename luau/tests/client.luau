@@ -3317,4 +3317,63 @@ do
 	assert(h.self.timers == 0, "a client given up on keeps something awake")
 end
 
+-- A text sealed in a scope this client may no longer write in, its right to taken away as it typed: it is not delivered,
+-- and sealed() and flushed() say so, never that it is durable; and nothing is sent of it.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	ack(h, 1)
+	local editor = h.client:text(id, Note.body)
+	h.run()
+	local fetched = h.last(FETCH) :: any
+	local w = codec.writer()
+	codec.put_varint(w, codec.varint(codec.reader(fetched.body)))
+	codec.put_u8(w, 32)
+	for _ = 1, 4 do
+		codec.put_varint(w, 0)
+	end
+	h.tell(ANSWER, codec.string(w))
+	editor.append("typed as the right went")
+	h.run()
+	local from = #h.self.said
+	h.tell(ROSTER, string.rep("\0", 8) .. "\1\1" .. string.rep("k", 32)) -- read only, now
+	local sealed = waited(function()
+		return editor.sealed()
+	end)
+	h.client:close()
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	h.run()
+	assert(#cells_said(h, from) == 0, "what may not be written was sent")
+	assert(sealed.done and sealed.ok == false, "sealed() said what was never delivered was durable")
+	assert(flushed.done and flushed.ok == false, "flushed() said all the client wrote was delivered")
+end
+
+-- A client a node refuses for good, with what an editor typed before its row was here still to be sealed: it never dials
+-- again, and flushed() says it never delivered it.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local editor = h.client:text("\0\0\0\1" .. "\106\11\28\45" .. "\1\2\3\4\5\6\7\8", Note.body)
+	editor.append("typed before the row was here")
+	h.run()
+	h.tell(ERROR, "\2")
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	h.run()
+	h.laters()
+	h.run()
+	assert(h.self.connects == 1, "a client refused for good dialled again")
+	assert(flushed.done and flushed.ok == false, "flushed() said all it wrote was delivered")
+end
+
 print("ok")

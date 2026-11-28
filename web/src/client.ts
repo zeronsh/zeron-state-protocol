@@ -559,7 +559,12 @@ export class Client {
   #barriers: Barrier[] = []; // by sequence number
   #closing: Promise<void> | undefined; // once closed: until all it wrote is acknowledged
   #early = new Set<Promise<void>>(); // editors' typing before their rows were here: until it is typed in them
-  #abandoned: Undelivered | undefined; // closed and given up on: what it would still have delivered is not
+  // Given up on, or refused for good: nothing more is delivered, nor dialled for, and why.
+  #abandoned: Error | undefined;
+  #givenUp: Pending[] = []; // what it was given up on with, to be counted with anything sealed after
+  #owed: Error | undefined; // what was never to be delivered, with nobody waiting to be told: the next to wait is told
+  #neverDelivered: Error | undefined; // anything it wrote that never will be delivered, as its close says
+  #refusedTexts = new Map<string, Error>(); // editors' texts, by row and slot, sealed where it may no longer write
   #unacked = new Map<string, number>(); // rows in pending, and how often
   #out = codec.writer();
   #flushing = false;
@@ -598,7 +603,7 @@ export class Client {
   // ---------------------------------------------------------------- the pipe
 
   #dial(): void {
-    if (this.#wire || (this.#closed && this.#pending.length === 0)) return; // a client closed dials only to deliver what it wrote
+    if (this.#wire || this.#abandoned || (this.#closed && this.#pending.length === 0)) return; // a client closed dials only to deliver what it wrote
     let over = false;
     const closed = () => {
       if (over) return;
@@ -677,13 +682,14 @@ export class Client {
    */
   close(options: { signal?: AbortSignal } = {}): Promise<void> {
     const signal = options.signal;
+    let forget = () => {};
     if (signal) {
       // Given up on, now or later: what it holds is told it never will be delivered, and it dials no more.
-      const giveUp = () => this.#giveUp((this.#abandoned = this.#undelivered(true)));
+      const giveUp = () => this.#abandon(new Undelivered(0, 0, 0, true));
       if (signal.aborted) queueMicrotask(giveUp);
-      else signal.addEventListener("abort", giveUp, { once: true });
+      else signal.addEventListener("abort", giveUp, { once: true }), (forget = () => signal.removeEventListener("abort", giveUp));
     }
-    if (this.#closing) return this.#closing;
+    if (this.#closing) return void this.#closing.then(forget, forget), this.#closing;
     this.#closed = true;
     const after = () => {
       // Nothing else is left to be done later: a closed client keeps nothing awake but the delivery of what it wrote.
@@ -693,15 +699,28 @@ export class Client {
     };
     const deliver = (): Promise<void> => {
       this.#sealAll();
-      if (this.#abandoned) this.#giveUp(this.#undelivered(true)); // what was sealed since it was given up on, too
+      if (this.#abandoned) {
+        // Given up on, or refused, before it got here: what was sealed since is given up too, and said to be, with the rest,
+        // never sent, though it was framed.
+        this.#out = codec.writer();
+        const why = this.#abandon(this.#abandoned);
+        this.#hangUp();
+        after();
+        return Promise.reject(why);
+      }
       this.#flush();
       if (this.#pending.length === 0) {
         this.#hangUp();
         after();
-        return Promise.resolve(); // at once: nothing to deliver
+        // At once: nothing to deliver; unless something it wrote never will be.
+        if (this.#owed) this.#take();
+        return this.#neverDelivered ? Promise.reject(this.#neverDelivered) : Promise.resolve();
       }
       after();
-      const delivered = this.#barrier();
+      const lost = () => {
+        if (this.#neverDelivered) throw this.#neverDelivered; // the rest delivered, but not all
+      };
+      const delivered = this.#barrier().then(lost);
       const end = () => {
         for (const cancel of [...this.#timers]) cancel();
         if (this.#wire) this.#hangUp();
@@ -710,19 +729,36 @@ export class Client {
       if (!this.#wire) this.#dial(); // now, rather than as an open client would have later
       return handled(delivered);
     };
-    if (this.#early.size === 0) return (this.#closing = deliver());
     // Questions are answered as far as they got: so are those for rows editors typed in before they were here, and what
     // they typed is typed in them, to be sealed with the rest.
     const early = [...this.#early];
-    after();
-    return (this.#closing = handled(Promise.all(early).then(deliver)));
+    if (early.length > 0) after();
+    this.#closing = handled(early.length === 0 ? deliver() : Promise.all(early).then(deliver));
+    this.#closing.then(forget, forget);
+    return this.#closing;
   }
 
-  // How much is written and not yet acknowledged, as an error to give up on it with.
+  // Gives up on all it holds, and anything sealed after: why it never will be delivered, Undelivered counting all of it.
+  #abandon(why: Error): Error {
+    this.#abandoned = why;
+    const told = why instanceof Undelivered ? this.#undelivered(true) : why;
+    this.#giveUp(told);
+    if (why instanceof Undelivered) this.#abandoned = told;
+    return told;
+  }
+
+  // What was never to be delivered, and nobody was told: told now, once.
+  #take(): Error {
+    const e = this.#owed!;
+    this.#owed = undefined;
+    return e;
+  }
+
+  // How much is written and not yet acknowledged, as an error to give up on it with: and, closed, what was given up already.
   #undelivered(closed: boolean, upTo = Infinity): Undelivered {
     const rows = new Set<string>();
     let cells = 0, bytes = 0;
-    for (const p of this.#pending) {
+    for (const p of closed ? [...this.#givenUp, ...this.#pending] : this.#pending) {
       if (p.seq > upTo) break;
       for (const id of p.rows) rows.add(id);
       cells += p.cells;
@@ -732,10 +768,18 @@ export class Client {
   }
 
   [unacknowledged](): boolean {
-    return this.#pending.length > 0;
+    return this.#pending.length > 0 || this.#early.size > 0;
   }
 
   [sealNow](): void {
+    // What editors typed before their rows were here is typed in them now, as held, as it would be were they looked for and
+    // not found: there is no time to wait for them, the tab going.
+    for (const row of this.#rows.values()) {
+      if (row.awaited.length === 0) continue;
+      const awaited = row.awaited;
+      row.awaited = [];
+      for (const f of awaited) f();
+    }
     this.#sealAll();
     this.#flush();
   }
@@ -747,6 +791,7 @@ export class Client {
 
   // Resolves once everything written so far is acknowledged; rejects should any of it never be.
   #barrier(): Promise<void> {
+    if (this.#owed) return Promise.reject(this.#take()); // something written before it never will be
     const last = this.#pending[this.#pending.length - 1];
     if (!last) return Promise.resolve();
     return new Promise((resolve, reject) => this.#barriers.push({ seq: last.seq, resolve, reject }));
@@ -766,13 +811,16 @@ export class Client {
   #fail(p: Pending, e: Error): void {
     this.#pending.splice(this.#pending.indexOf(p), 1);
     this.#settle(p);
-    for (const b of this.#barriers) if (b.seq >= p.seq) b.failed ??= e;
+    let told = false;
+    for (const b of this.#barriers) if (b.seq >= p.seq) (b.failed ??= e), (told = true);
+    if (!told) this.#owed ??= e; // nobody waits for it yet: whoever next does is told
+    this.#neverDelivered ??= e;
     p.fail(e);
     this.#unbar();
   }
 
   #giveUp(e: Error): void {
-    for (const p of [...this.#pending]) this.#fail(p, e);
+    for (const p of [...this.#pending]) this.#givenUp.push(p), this.#fail(p, e);
   }
 
   // Runs f later, unless the client is closed first, with nothing it wrote still to deliver; returns a way to cancel it.
@@ -945,8 +993,9 @@ export class Client {
         this.#faulted = true;
         this.#tell("error", code);
         if (code === 2 || code === 3) {
-          // Refused, or speaking another language: trying again is no use, and what is pending never will be durable.
-          this.#giveUp(new Error(code === 2 ? "the node refused this client" : "the node speaks another version"));
+          // Refused, or speaking another language: trying again is no use, and what is pending never will be durable, nor
+          // anything it seals as it closes: it dials no more.
+          this.#abandon(new Error(code === 2 ? "the node refused this client" : "the node speaks another version"));
           void this.close();
         }
         return;
@@ -2007,6 +2056,11 @@ export class Client {
     row.held.set(slot, (row.held.get(slot) ?? 0) + 1);
     let closed = false, ended = false;
     let sealed: Promise<void> | undefined; // as it was closed
+    // Should what it typed have been sealed where the client may no longer write, that is what any commit and close say.
+    const refused = (): Promise<void> | undefined => {
+      const e = this.#refusedTexts.get(bin + "/" + slot);
+      return e && Promise.reject(e);
+    };
     // What is typed before the row is here is typed in it once it is: until then, commit and close wait for it.
     let applied: Promise<void> | undefined, apply = () => {};
     if (early) this.#early.add((applied = new Promise<void>((done) => (apply = done))));
@@ -2120,9 +2174,9 @@ export class Client {
         });
       },
       commit: () => {
-        if (early) return handled(applied!.then(() => (this.#seal(row, slot), this.#barrier())));
+        if (early) return handled(applied!.then(() => (this.#seal(row, slot), refused() ?? this.#barrier())));
         this.#seal(row, slot);
-        return handled(this.#barrier());
+        return handled(refused() ?? this.#barrier());
       },
       close: () => {
         if (!closed) {
@@ -2130,7 +2184,7 @@ export class Client {
           finish();
         }
         // What it typed before its row was here is sealed once the row comes, and waited for from then.
-        return (sealed ??= handled(early ? applied!.then(() => this.#barrier()) : this.#barrier()));
+        return (sealed ??= handled(early ? applied!.then(() => refused() ?? this.#barrier()) : (refused() ?? this.#barrier())));
       },
     });
   }
@@ -2204,8 +2258,16 @@ export class Client {
 
   #sendCells(cells: Written[], done?: () => void, fail?: (e: Error) => void): void {
     const scope = codec.u32Of(cells[0].row);
-    // What this client may no longer write in, since it began, is never said: a node refuses it, and this client with it.
-    if (this.#ready && !this.may(scope, "write")) return;
+    // What this client may no longer write in, since it began, is never said: a node refuses it, and this client with it. It
+    // is not delivered, and whoever waits for it is told so, or, should nobody yet, whoever next waits for what was written.
+    if (this.#ready && !this.may(scope, "write")) {
+      const e = new Error("this client may no longer write there: what it wrote there is not delivered");
+      this.#owed ??= e;
+      this.#neverDelivered ??= e;
+      for (const c of cells) if (c.kind === PIECE) this.#refusedTexts.set(c.row + "/" + c.slot, e);
+      fail?.(e);
+      return;
+    }
     const w = codec.writer();
     let last = "";
     const rows: string[] = [];
@@ -2372,7 +2434,7 @@ export class Client {
       throw e;
     }
     if (cells.length > 0) this.#sendCells(cells, resolve);
-    else this.#barrier().then(resolve, () => {});
+    else this.#barrier().then(resolve, reject); // something written before it never will be
     const signal = options.signal;
     if (signal) {
       const upTo = this.#seq;

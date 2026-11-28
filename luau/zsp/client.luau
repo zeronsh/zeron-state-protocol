@@ -289,6 +289,13 @@ local function new_client(host: Host)
 		closing = nil :: { result: { any }?, waiters: { (boolean, string?) -> () } }?,
 		early = {} :: { [{}]: boolean }, -- editors' typing before their rows were here: until it is typed in them
 		early_done = nil :: (() -> ())?, -- what a client closed does once it is
+		-- Given up on, or refused for good: nothing more is delivered, nor dialled for, and why; counted, as given up on.
+		abandoned = nil :: string?,
+		abandon_counted = false,
+		given_up = {} :: { Pending }, -- what it was given up on with, to be counted with anything sealed after
+		owed = nil :: string?, -- what was never to be delivered, with nobody waiting to be told: the next to wait is told
+		never_delivered = nil :: string?, -- anything it wrote that never will be delivered, as flushed() says once it is closed
+		refused_texts = {} :: { [string]: string }, -- editors' texts, by row and slot, sealed where it may no longer write
 		unacked = {} :: { [string]: number }, -- rows in pending, and how often
 		out = codec.writer(),
 		flushing = false,
@@ -313,7 +320,7 @@ export type Client = typeof(new_client(nil :: any))
 -- ---------------------------------------------------------------- the pipe
 
 function Client._dial(self: Client)
-	if self.wire or (self.closed and #self.pending == 0) then
+	if self.wire or self.abandoned or (self.closed and #self.pending == 0) then
 		return -- a client closed dials only to deliver what it wrote
 	end
 	local wire: Wire? = nil
@@ -440,17 +447,35 @@ function Client.close(self: Client)
 	end
 	local function deliver()
 		self:_seal_all()
+		if self.abandoned then
+			-- Given up on, or refused, before it got here: what was sealed since is given up too, and said to be, with the
+			-- rest, never sent, though it was framed.
+			self.out = codec.writer()
+			local why = self:_abandon(self.abandoned, self.abandon_counted)
+			self.hang_up()
+			after()
+			closing.result = { false, why }
+			return
+		end
 		self:_flush()
 		if #self.pending == 0 then
 			self.hang_up()
 			after()
-			closing.result = { true }
-			return -- at once: nothing to deliver
+			-- At once: nothing to deliver; unless something it wrote never will be.
+			self.owed = nil
+			local lost = self.never_delivered
+			closing.result = if lost then { false, lost } else { true }
+			return
 		end
 		after()
 		self:_barrier(function(ok, why)
 			self.host.defer(function()
-				finished(ok, why)
+				local lost = self.never_delivered -- the rest delivered, but not all
+				if ok and lost then
+					finished(false, lost)
+				else
+					finished(ok, why)
+				end
 			end)
 		end)
 		if not self.wire then
@@ -485,19 +510,28 @@ function Client.flushed(self: Client, timeout: number?): (boolean, string?)
 			self:_barrier(notify)
 		end
 	end, timeout, function(): string
-		local why = self:_undelivered(self.closed, if self.closed then math.huge else up_to)
 		if self.closed then
-			self:_give_up(why) -- given up on: it dials no more
+			return self:_abandon(nil, true) -- given up on: it dials no more
 		end
-		return why
+		return self:_undelivered(false, up_to)
 	end)
 end
 
--- How much is written and not yet acknowledged, as what is said of giving up on it.
+-- Gives up on all it holds, and anything sealed after: why it never will be delivered, counted, as given up on, or as said.
+function Client._abandon(self: Client, why: string?, counted: boolean): string
+	self.abandoned = why or "given up on"
+	self.abandon_counted = counted
+	local told = if counted then self:_undelivered(true, math.huge) else why :: string
+	self:_give_up(told)
+	return told
+end
+
+-- How much is written and not yet acknowledged, as what is said of giving up on it: and, closed, what was given up already.
 function Client._undelivered(self: Client, closed: boolean, up_to: number): string
 	local rows: { [string]: boolean } = {}
 	local nrows, cells, bytes = 0, 0, 0
-	for _, p in self.pending do
+	local all = if closed then table.move(self.pending, 1, #self.pending, #self.given_up + 1, table.clone(self.given_up)) else self.pending
+	for _, p in all do
 		if p.seq > up_to then
 			break
 		end
@@ -562,6 +596,12 @@ end
 
 -- Tells `notify` once everything written so far is acknowledged, or that some of it never will be: at once, if nothing is.
 function Client._barrier(self: Client, notify: (boolean, string?) -> ())
+	local owed = self.owed
+	if owed then
+		self.owed = nil
+		notify(false, owed) -- something written before it never will be
+		return
+	end
 	local last = self.pending[#self.pending]
 	if not last then
 		notify(true)
@@ -583,16 +623,25 @@ end
 function Client._fail(self: Client, p: Pending, why: string)
 	table.remove(self.pending, table.find(self.pending, p) :: number)
 	self:_settle(p)
+	local told = false
 	for _, b in self.barriers do
-		if b.seq >= p.seq and not b.failed then
-			b.failed = why
+		if b.seq >= p.seq then
+			told = true
+			if not b.failed then
+				b.failed = why
+			end
 		end
 	end
+	if not told and not self.owed then
+		self.owed = why -- nobody waits for it yet: whoever next does is told
+	end
+	self.never_delivered = self.never_delivered or why
 	self:_unbar()
 end
 
 function Client._give_up(self: Client, why: string)
 	for _, p in table.clone(self.pending) do
+		table.insert(self.given_up, p)
 		self:_fail(p, why)
 	end
 end
@@ -791,8 +840,9 @@ function Client._handle(self: Client, kind: number, r: codec.Reader)
 		self.faulted = true
 		self:_tell("error", code)
 		if code == 2 or code == 3 then
-			-- Refused, or speaking another language: trying again is no use, and what is pending never will be durable.
-			self:_give_up(if code == 2 then "the node refused this client" else "the node speaks another version")
+			-- Refused, or speaking another language: trying again is no use, and what is pending never will be durable, nor
+			-- anything it seals as it closes: it dials no more.
+			self:_abandon(if code == 2 then "the node refused this client" else "the node speaks another version", false)
 			self:close()
 		end
 	end
@@ -2493,7 +2543,12 @@ function Client.text(self: Client, id: string, col: Column)
 				local function now()
 					self:_seal(row, slot)
 					up_to = self.seq
-					self:_barrier(notify)
+					local refused = self.refused_texts[row.id .. string.char(slot)]
+					if refused then
+						notify(false, refused) -- sealed where the client may no longer write
+					else
+						self:_barrier(notify)
+					end
 				end
 				local waiting = applied
 				if waiting then
@@ -2605,8 +2660,17 @@ end
 
 function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
 	local scope: number = string.unpack(">I4", cells[1].row) :: any
-	-- What this client may no longer write in, since it began, is never said: a node refuses it, and this client with it.
+	-- What this client may no longer write in, since it began, is never said: a node refuses it, and this client with it. It
+	-- is not delivered, and whoever next waits for what was written is told so.
 	if self.ready and not self:may(scope, "write") then
+		local why = "this client may no longer write there: what it wrote there is not delivered"
+		self.owed = self.owed or why
+		self.never_delivered = self.never_delivered or why
+		for _, c in cells do
+			if c.kind == PIECE then
+				self.refused_texts[c.row .. string.char(c.slot)] = why
+			end
+		end
 		return
 	end
 	local w = codec.writer()

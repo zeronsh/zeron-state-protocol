@@ -2192,4 +2192,69 @@ for (const why of ["no node", "no right"] as const) {
   assert.equal(h.self.timers, 0, "a client given up on keeps something awake");
 }
 
+// A text sealed in a scope this client may no longer write in, its right to taken away as it typed: it is not delivered,
+// and is not said to be. What waits for it, a commit, the editor closed, the client closed, is told so, never that it is
+// durable; and nothing is sent of it.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  ack(h, 1);
+  const editor = h.client.text(id, Note.body);
+  h.run();
+  await answerFetch(h);
+  editor.append("typed as the right went");
+  h.run();
+  const from = h.self.said.length;
+  h.tell(ROSTER, rep("\0", 8) + "\x01\x01" + rep("k", 32)); // read only, now
+  const committed = state(editor.commit());
+  const closed = state(editor.close());
+  const closing = state(h.client.close());
+  h.run();
+  await tick();
+  assert.equal(cellsSaid(h, from).length, 0, "what may not be written was sent");
+  assert(committed.settled && committed.failed instanceof Error, "a commit of what was never delivered said it was durable");
+  assert(closed.settled && closed.failed instanceof Error, "the editor closed said what it typed was delivered");
+  assert(closing.settled && closing.failed instanceof Error, "the client closed said all it wrote was delivered");
+}
+
+// A client closed and given up on before what its editors typed was even sealed, as their rows were still looked for: what
+// it typed is never sent, and the close says how much was not delivered, all of it, rather than that it was.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const editor = h.client.text("00000001" + "6a0b1c2d" + "0102030405060708", Note.body);
+  editor.append("typed before the row was here");
+  h.run();
+  const from = h.self.said.length;
+  const quit = new AbortController();
+  quit.abort();
+  const closing = state(h.client.close({ signal: quit.signal }));
+  await tick();
+  h.run();
+  await tick();
+  assert(closing.settled && closing.failed instanceof Undelivered && closing.failed.cells === 1, `given up on, it said: ${closing.failed}`);
+  assert.equal(cellsSaid(h, from).length, 0, "what it was given up on was sent all the same");
+}
+
+// A client a node refuses for good, with what an editor typed before its row was here still to be sealed: it never dials
+// again, and its close says it never delivered it.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const editor = h.client.text("00000001" + "6a0b1c2d" + "0102030405060708", Note.body);
+  editor.append("typed before the row was here");
+  h.run();
+  h.tell(ERROR, "\x02");
+  const closing = state(h.client.close());
+  for (let i = 0; i < 5; i++) await tick(), h.run(), h.laters(), h.run(); // as long as it would take to dial again
+  assert.equal(h.self.connects, 1, "a client refused for good dialled again");
+  assert(closing.settled && closing.failed instanceof Error, "its close said all it wrote was delivered");
+}
+
 console.log("ok");
