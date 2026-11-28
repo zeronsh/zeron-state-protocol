@@ -129,6 +129,19 @@ async function reload(p: Page): Promise<void> {
   await eventually(async () => (await p.evaluate("typeof window.zsp === 'object' && window.__old === undefined").catch(() => false)) === true, "loaded again");
 }
 
+// Leaves a page for another of the site's, as a link does, and goes back, as the back button does: by CDP, rather than by a
+// script evaluated in the page, whose answer the navigation it starts cuts off should it land first ("Inspected target
+// navigated or closed"). Each returns once the browser has the navigation in hand, whatever the page is doing.
+async function navigate(p: Page, path: string): Promise<void> {
+  const r = await p.cdp<{ errorText?: string }>("Page.navigate", { url: new URL(path, origin).href });
+  if (r.errorText) throw new Error(`navigating to ${path}: ${r.errorText}`);
+}
+async function back(p: Page): Promise<void> {
+  const { currentIndex, entries } = await p.cdp<{ currentIndex: number; entries: { id: number }[] }>("Page.getNavigationHistory");
+  if (currentIndex < 1) throw new Error("nothing to go back to");
+  await p.cdp("Page.navigateToHistoryEntry", { entryId: entries[currentIndex - 1].id });
+}
+
 // A relay of the Durable Object's, under workerd, that lets in only what presents `token`: started again on the same port,
 // with the same key, as a relay whose host has rotated what it accepts.
 const RELAY_SECRET = randomBytes(32).toString("hex");
@@ -182,13 +195,14 @@ const tests: Record<string, () => Promise<void>> = {
     await call(follower, "put", "bf", "notes", ["one"]);
     await leader.evaluate(`addEventListener('pagehide', (e) => localStorage.setItem('cached', String(e.persisted)));
       window.__cached = 1; // on this very page, which a page loaded again has not
-      location.href = '/elsewhere', 1`);
+      1`);
+    await navigate(leader, "/elsewhere");
     await eventually(async () => (await follower.evaluate("localStorage.getItem('cached')")) !== null);
     expectEqual(await follower.evaluate("localStorage.getItem('cached')"), "true", "the leader was put in the back/forward cache");
     expectEqual(await within(10000, call(follower, "put", "bf", "notes", ["two"]).then(() => "written")), "written", "written while it is cached");
     await eventually(async () => (await leader.evaluate("location.pathname").catch(() => "")) === "/elsewhere", "it is elsewhere");
     await leader.evaluate("window.__left = 1, 1"); // on the page it went to
-    await leader.evaluate("history.back(), 1");
+    await back(leader);
     // Taken from the cache, as most often; or, as a browser may let go of what it cached whenever it likes, loaded again.
     await eventually(async () => (await leader.evaluate("typeof window.zsp === 'object' && window.__left === undefined").catch(() => false)) === true, "it is back");
     const restored = (await leader.evaluate("window.__cached === 1")) === true;
@@ -260,7 +274,8 @@ const tests: Record<string, () => Promise<void>> = {
     await call(follower, "device", "ab");
     await leader.evaluate(`addEventListener('pagehide', (e) => localStorage.setItem('left', String(e.persisted)));
       window.__here = 1;
-      location.href = '/elsewhere', 1`);
+      1`);
+    await navigate(leader, "/elsewhere");
     await eventually(async () => (await follower.evaluate("localStorage.getItem('left')")) !== null, "it left");
     expectEqual(await within(10000, call(follower, "put", "ab", "notes", ["two"]).then(() => "written")), "written", "written while it is away");
     const closedAll = (f?: { opened: number; closed: number }) => f !== undefined && f.opened > 0 && f.closed === f.opened;
@@ -269,7 +284,7 @@ const tests: Record<string, () => Promise<void>> = {
     if (!had || had.opened === 0 || had.closed !== had.opened) throw new Error(`the leader's worker, stopped as its tab left, closed ${had?.closed} of the ${had?.opened} files it opened itself`);
     await eventually(async () => (await leader.evaluate("location.pathname").catch(() => "")) === "/elsewhere", "it is elsewhere");
     await leader.preamble(files({ who: "leader again", lag: 150 }));
-    await leader.evaluate("history.back(), 1");
+    await back(leader);
     await eventually(async () => (await leader.evaluate("typeof window.zsp === 'object' && location.pathname === '/'").catch(() => false)) === true, "it is back");
     const restored = (await leader.evaluate("window.__here === 1")) === true;
     // Most often loaded again, its back/forward cache let go of as its channels were spoken on while it was in it.
