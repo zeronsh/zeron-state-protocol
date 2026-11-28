@@ -555,21 +555,22 @@ const tests: Record<string, () => Promise<void>> = {
     if (s.dropped && reached < 9000) throw new Error(`the reader dropped what was sealed ${sealedIn.toFixed(0)} ms after it was typed, and reached it ${reached.toFixed(0)} ms after`);
   },
   // Clients of their own let go of the page's timer worker as they close, the last of them of all of it: nothing of theirs
-  // is left to go off, and no worker is left awake.
+  // is left to go off, and no worker is left awake. Each keeps a window warm for ten minutes once nobody looks at it, so
+  // each has a timer pending however slow the machine.
   async tab_own_client_closed() {
     type Timers = { worker: boolean; broken: boolean; users: number; pending: number };
     const p = await page();
     await call(p, "device", "ot");
     await call(p, "create", "ot");
-    await call(p, "ownClient", "ot", "a");
-    await call(p, "ownClient", "ot", "b");
-    await call(p, "put", "a", "warm", ["a ready"]);
-    await call(p, "put", "b", "warm", ["b ready"]);
-    await call(p, "type", "a", "docs", ["typed by a"]);
-    await call(p, "type", "b", "docs", ["typed by b"]);
+    for (const as of ["a", "b"]) {
+      await call(p, "ownClient", "ot", as, false, 600000);
+      await call(p, "put", as, "warm", [`${as} ready`]);
+      await call(p, "watch", as, "warm", 10);
+      await call(p, "unwatch", as, "warm");
+    }
     const both = await call<Timers>(p, "timers");
     expectEqual({ worker: both.worker, broken: both.broken, users: both.users }, { worker: true, broken: false, users: 2 }, "two clients keeping time by the worker");
-    if (both.pending < 2) throw new Error(`${both.pending} timers pending for two pieces being typed`);
+    if (both.pending < 2) throw new Error(`${both.pending} timers pending for two windows kept warm`);
     await call(p, "closeClient", "a");
     const one = await call<Timers>(p, "timers");
     expectEqual({ worker: one.worker, users: one.users }, { worker: true, users: 1 }, "one closed, of two");
@@ -577,7 +578,7 @@ const tests: Record<string, () => Promise<void>> = {
     await call(p, "closeClient", "b");
     const none: Timers = { worker: false, broken: false, users: 0, pending: 0 };
     expectEqual(await call<Timers>(p, "timers"), none, "both closed");
-    await sleep(1500); // longer than a piece is left unsealed: nothing of theirs goes off
+    await sleep(1500);
     expectEqual(await call<Timers>(p, "timers"), none, "both closed, a while on");
   },
   // In a page that may start no worker of its own, as one whose policy forbids it, a client of its own keeps time by the
