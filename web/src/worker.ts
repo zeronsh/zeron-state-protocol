@@ -364,6 +364,7 @@ function breakCarried(): void {
 // ---------------------------------------------------------------- the device, for any tab
 
 async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: string; name?: string }> {
+  if (!channel && op !== "close") return { error: "the device was never opened: its name names no store" };
   if (op === "credential") {
     const c = args[0];
     const at = args[1];
@@ -378,7 +379,6 @@ async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: 
     return {};
   }
   if (device) return answer(op, args);
-  if (!channel) return { error: "the device was never opened: its name names no store" };
   if (leaving) return { error: "the device is closed" }; // and nothing waits on whoever holds the store
   contend();
   const id = crypto.randomUUID();

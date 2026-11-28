@@ -377,6 +377,14 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   assert.equal(held("app"), 0);
 }
 
+// A credential given to a worker whose store's name names none is refused, as anything else asked of it is.
+{
+  const w = await worker();
+  await w.tell({ open: { name: "a/../b" } });
+  await w.tell({ ask: 1, op: "credential", args: ["c", Date.now()] });
+  assert.match(answered(w.said, 1)?.error ?? "", /never opened/, JSON.stringify(w.said));
+}
+
 // Closed as it opens the store, the device is closed once it has, every file closed and the lock let go of, before it says
 // it is: its tab stops the worker as soon as it hears.
 {
