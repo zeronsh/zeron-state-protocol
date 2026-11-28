@@ -245,7 +245,10 @@ const tests: Record<string, () => Promise<void>> = {
   },
   // The tab running the device is left for another page, and gone back to: its worker closes every file of the store itself,
   // having made durable what it held, before it is stopped; another tab has the store meanwhile; and the first has it again
-  // once the other has gone, the files held a while after, as Chromium has been seen to hold them.
+  // once the other has gone, the files held a while after, as Chromium has been seen to hold them. The other is busy as it is
+  // closed, as a tab may be: Chrome says it has closed it before the tab has heard so, and until it has, its worker runs the
+  // store, and answers what the first asks. What each worker says of its files is heard on a channel of its own, after
+  // whatever it was asked may have been answered: and so it is waited for.
   async tab_away_back() {
     const leader = await page();
     const follower = await page(); // which hears all the leader's worker says of its files
@@ -260,19 +263,28 @@ const tests: Record<string, () => Promise<void>> = {
       location.href = '/elsewhere', 1`);
     await eventually(async () => (await follower.evaluate("localStorage.getItem('left')")) !== null, "it left");
     expectEqual(await within(10000, call(follower, "put", "ab", "notes", ["two"]).then(() => "written")), "written", "written while it is away");
+    const closedAll = (f?: { opened: number; closed: number }) => f !== undefined && f.opened > 0 && f.closed === f.opened;
+    await eventually(async () => closedAll((await filesSaid(follower, "leader"))[0])).catch(() => {}); // and else said so here
     const [had] = await filesSaid(follower, "leader");
     if (!had || had.opened === 0 || had.closed !== had.opened) throw new Error(`the leader's worker, stopped as its tab left, closed ${had?.closed} of the ${had?.opened} files it opened itself`);
     await eventually(async () => (await leader.evaluate("location.pathname").catch(() => "")) === "/elsewhere", "it is elsewhere");
     await leader.preamble(files({ who: "leader again", lag: 150 }));
     await leader.evaluate("history.back(), 1");
     await eventually(async () => (await leader.evaluate("typeof window.zsp === 'object' && location.pathname === '/'").catch(() => false)) === true, "it is back");
-    if ((await leader.evaluate("window.__here === 1")) !== true) await call(leader, "device", "ab"); // loaded again, not cached
+    const restored = (await leader.evaluate("window.__here === 1")) === true;
+    // Most often loaded again, its back/forward cache let go of as its channels were spoken on while it was in it.
+    console.log(`     back ${restored ? "from the back/forward cache" : "loaded again"}`);
+    if (!restored) await call(leader, "device", "ab");
     await call(leader, "put", "ab", "notes", ["three"]);
+    await follower.evaluate("setTimeout(() => { for (const t = performance.now(); performance.now() - t < 500; ); }), 1");
     await gone(follower);
+    // Its worker has the store once it has opened a file of it, having found them held first: the first it opens, it finds
+    // held, as its preamble has it.
+    let again: { opened: number; held: number }[] = [];
+    await eventually(async () => (again = await filesSaid(leader, "leader again")).some((f) => f.opened > 0), "the leader has the store again");
+    if (!again.some((f) => f.held > 0)) throw new Error("the files were not held after the follower went, as the test meant them to be");
     await call(leader, "put", "ab", "notes", ["four"]);
     expectEqual((await call<string[]>(leader, "titles", "ab", "notes", 4)).join(), "one,two,three,four");
-    const again = await filesSaid(leader, "leader again");
-    if (!again.some((f) => f.held > 0)) throw new Error("the files were not held after the follower went, as the test meant them to be");
   },
   // A tab's worker is stopped without a word, as a crash stops it, and the device opened again at once: the files are let go
   // of as the browser stops it, and its next worker opens them, though they are held a while after it has the lock. Held
