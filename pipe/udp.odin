@@ -984,9 +984,17 @@ link_stream :: proc(l: ^Link, id: u64, offset: u64, bytes: []byte, fin: bool) ->
 		stream_check_end(l, s)
 		return true
 	}
-	if offset <= s.in_next && len(s.pieces) == 0 {
-		skip := min(s.in_next - offset, u64(len(bytes)))
-		if !stream_deliver(l, s, bytes[skip:]) {
+	if offset <= s.in_next && (len(s.pieces) == 0 || s.pieces[0].offset > s.in_next) {
+		// In order: it goes now, up to what came early beyond it, which needs no room among what came early, however
+		// full that is. Else what would fill the first hole were refused as the table filled, and nothing more came.
+		now := bytes[min(s.in_next - offset, u64(len(bytes))):]
+		rest: []byte
+		rest_at := s.in_next
+		if len(s.pieces) > 0 && u64(len(now)) > s.pieces[0].offset - s.in_next {
+			upto := s.pieces[0].offset - s.in_next
+			now, rest, rest_at = now[:upto], now[upto:], s.pieces[0].offset
+		}
+		if !stream_deliver(l, s, now) || (len(rest) > 0 && !stream_hold(l, s, rest_at, rest)) {
 			return false
 		}
 	} else if !stream_hold(l, s, offset, bytes) {
@@ -1540,7 +1548,6 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 	limit := min(l.mtu, len(into)) - zsp.TAG
 	w := zsp_writer(into[:limit])
 	w.pos = HEAD
-	eliciting := false
 	p: Sent
 	p.chunk = l.chunk_base + u64(len(l.chunks) - l.chunk_head)
 	// One packet at least, with nothing in flight, whatever the window: else a window smaller than a packet sends nothing,
@@ -1550,19 +1557,24 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 	if acking {
 		link_put_ack(l, &w, now)
 	}
-	// What streams have to say of themselves is small, and rides along with acknowledgements.
-	if room || acking {
-		eliciting ||= link_put_control(l, &w, &p)
-	}
-	// What a probe sends again goes first, whatever is more urgent: what else there is may be what the peer cannot take
-	// until it has this, as the probe before it, unanswered, was.
+	// What a probe sends again goes first, whatever is more urgent, and alone: what else there is may be what the peer
+	// cannot take until it has this, as the probe before it, unanswered, was, and a packet it refuses any of it refuses
+	// whole.
+	resent := false
 	if id, resend := l.resend.?; resend && room {
 		l.resend = nil
 		if s := stream_find(l, id); s != nil {
-			eliciting ||= link_put_lost(l, &w, &p, s)
+			resent = link_put_lost(l, &w, &p, s)
 		}
 	}
-	if room && len(l.datagrams) > 0 {
+	eliciting := resent
+	// What streams have to say of themselves is small, and rides along with acknowledgements. A packet that says any of
+	// it carries no stream's data besides, nor does one with a datagram: so that what the peer always takes is never
+	// refused with what it may not.
+	if !resent && (room || acking) {
+		eliciting = link_put_control(l, &w, &p)
+	}
+	if !resent && room && len(l.datagrams) > 0 {
 		d := l.datagrams[0]
 		if w.pos + 4 + len(d) <= limit {
 			put(&w, byte(Frame.Datagram))
@@ -1573,8 +1585,8 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 			eliciting = true
 		}
 	}
-	if room {
-		eliciting ||= link_put_streams(l, &w, &p)
+	if !eliciting && room {
+		eliciting = link_put_streams(l, &w, &p)
 	}
 	if !eliciting && l.want_probe {
 		put(&w, byte(Frame.Ping))
@@ -1791,14 +1803,22 @@ link_expire :: proc(l: ^Link, now: Time) {
 	}
 	for &p in link_sent(l) {
 		if p.time != 0 {
-			for c in link_chunks(l, &p) {
-				if c.kind == .Data || c.kind == .Fin {
-					l.resend = c.id
-					break
-				}
-			}
+			chunks := link_chunks(l, &p) // kept until link_settle, below
 			size, probe := p.size, p.probe
 			link_lose(l, &p)
+			// The probe carries the first of what it carried that is still to be sent again: not what a stream since
+			// reset or let go of had, nor what a later copy delivered.
+			for c in chunks {
+				if c.kind == .Data || c.kind == .Fin {
+					if s := stream_find(l, c.id); s != nil && s.reset == .None {
+						stream_prune_lost(s)
+						if len(s.lost) > 0 || s.fin_lost {
+							l.resend = c.id
+							break
+						}
+					}
+				}
+			}
 			if !probe {
 				l.round_lost -= int(size) // a timeout is no measure of congestion
 			}

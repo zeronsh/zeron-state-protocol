@@ -576,8 +576,12 @@ link_probe_carries_the_oldest :: proc(t: ^testing.T) {
 	}
 	a.window = f64(a.in_flight)
 	buf: [PACKET_MAX]byte
-	// The first probe carries what is new; the second, the first one being unanswered, the oldest again.
+	// The first probe carries what is new; the second, the first one being unanswered, the oldest again, though what a
+	// stream has to say of itself is due too.
 	for probe in 1 ..= 2 {
+		if probe == 2 {
+			a.limit_due = true
+		}
 		n.now = link_timeout(a)
 		first := link_next(a)
 		for link_output(a, buf[:], n.now) != nil {
@@ -593,6 +597,133 @@ link_probe_carries_the_oldest :: proc(t: ^testing.T) {
 		}
 		testing.expectf(t, carried == (probe == 2), "probe %d carried the oldest: %v", probe, carried)
 	}
+}
+
+// And what it carries again is what still has to be: not the data of a stream reset since, which the oldest packet
+// carried first, with another's after it.
+@(test)
+link_probe_carries_what_is_still_lost :: proc(t: ^testing.T) {
+	state := rand.create(13)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	n.delay = 500
+	for i in 0 ..< 50 {
+		link_write(&n.links[i % 2], 0, {1, 2, 3})
+		for net_step(&n) {
+		}
+	}
+	a := &n.links[0]
+	gone, opened := link_open(a, 4)
+	testing.expect(t, opened)
+	less, opened_too := link_open(a, 5)
+	testing.expect(t, opened_too)
+	more, opened_three := link_open(a, 4)
+	testing.expect(t, opened_three)
+	// One packet, with a little of the one and then of the other, lost.
+	testing.expect(t, link_write(a, gone, []byte{1, 2, 3}))
+	some: [500]byte
+	testing.expect(t, link_write(a, less, some[:]))
+	n.loss = 1
+	first := link_next(a)
+	net_push(&n, 0)
+	n.loss = 0
+	testing.expect_value(t, link_next(a) - first, 1)
+	streams: [dynamic]u64
+	defer delete(streams)
+	for c in link_chunks(a, &link_sent(a)[first - a.sent_base]) {
+		append(&streams, c.id)
+	}
+	testing.expectf(t, len(streams) >= 2 && streams[0] == gone && streams[len(streams) - 1] == less, "the packet carried %v", streams[:])
+	link_reset(a, gone)
+	chunk: [8 << 10]byte
+	for link_room(a, more) >= len(chunk) && f64(a.held) < 4 * a.window {
+		testing.expect(t, link_write(a, more, chunk[:]))
+	}
+	a.window = f64(a.in_flight)
+	buf: [PACKET_MAX]byte
+	for probe in 1 ..= 2 {
+		n.now = link_timeout(a)
+		sent := link_next(a)
+		for link_output(a, buf[:], n.now) != nil {
+		}
+		testing.expectf(t, a.probes == probe && link_next(a) > sent, "probe %d not sent", probe)
+		carried := false
+		for &p, k in link_sent(a) {
+			if a.sent_base + u64(k) >= sent {
+				for c in link_chunks(a, &p) {
+					carried ||= c.id == less && c.kind == .Data
+				}
+			}
+		}
+		testing.expectf(t, carried == (probe == 2), "probe %d carried what the other stream lost: %v", probe, carried)
+	}
+}
+
+// What comes in order is taken, however full the table of what came early: else, when that filled behind a hole of more
+// than one packet, the packet that would begin to fill it was refused like any other, and nothing more came.
+@(test)
+link_takes_what_comes_in_order :: proc(t: ^testing.T) {
+	state := rand.create(14)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	n.delay = 500
+	for i in 0 ..< 50 {
+		link_write(&n.links[i % 2], 0, {1, 2, 3})
+		for net_step(&n) {
+		}
+	}
+	a, b := &n.links[0], &n.links[1]
+	s, opened := link_open(a, 5)
+	testing.expect(t, opened)
+	chunk: [8 << 10]byte
+	for &x, i in chunk {
+		x = byte(i)
+	}
+	// Its windows grown by a while of sending, so that it may send as many packets as the table takes, and more.
+	for sent := 0; sent < 64 << 20; {
+		for link_room(a, s) >= len(chunk) && a.held < 8 << 20 {
+			testing.expect(t, link_write(a, s, chunk[:]))
+			sent += len(chunk)
+		}
+		net_step(&n)
+	}
+	for net_step(&n) {
+	}
+	for link_room(a, s) >= len(chunk) && a.held < 6 << 20 {
+		testing.expect(t, link_write(a, s, chunk[:]))
+	}
+	// Packets as they were sent, of which the first two are lost and every other one after: the table fills.
+	packets: [dynamic][]byte
+	defer {
+		for p in packets {
+			delete(p)
+		}
+		delete(packets)
+	}
+	buf: [PACKET_MAX]byte
+	a.window = 1e12 // as many as it may send
+	for p := link_output(a, buf[:], n.now); p != nil && len(packets) < 4 * MAX_EARLY; p = link_output(a, buf[:], n.now) {
+		append(&packets, slice.clone(p))
+	}
+	cap := MAX_EARLY * 3 / 4
+	for i := 3; i < len(packets) && b.early < cap; i += 2 {
+		link_input(b, packets[i], n.now)
+	}
+	testing.expectf(t, b.early == cap, "%d held early of %d packets, not as many as are taken", b.early, len(packets))
+	// Then what the first carried, sent again as a probe sends it, with nothing new to send: in order, it is taken, and
+	// delivered, though the table is full.
+	testing.expect(t, !link_sendable(a), "more to send")
+	a.window = f64(a.in_flight)
+	before := stream_find(b, s).in_next
+	n.now = link_timeout(a)
+	for p := link_output(a, buf[:], n.now); p != nil; p = link_output(a, buf[:], n.now) {
+		testing.expect(t, link_input(b, p, n.now), "what came in order was refused")
+	}
+	testing.expectf(t, stream_find(b, s).in_next > before, "nothing more delivered: still at %v", before)
 }
 
 // A link a relay carries, whose packets are larger than a datagram's, outlasts a pause with much in flight and then
