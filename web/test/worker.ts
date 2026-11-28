@@ -383,6 +383,12 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   await w.tell({ open: { name: "a/../b" } });
   await w.tell({ ask: 1, op: "credential", args: ["c", Date.now()] });
   assert.match(answered(w.said, 1)?.error ?? "", /never opened/, JSON.stringify(w.said));
+  // And a pipe asked of it is broken at once.
+  const { port1, port2 } = new MessageChannel();
+  let broken = false;
+  port1.onmessage = (e) => void ((e.data as { close?: true }).close && (broken = true));
+  await w.tell({ connect: port2 });
+  await until("the pipe is broken", () => broken);
 }
 
 // Closed as it opens the store, the device is closed once it has, every file closed and the lock let go of, before it says

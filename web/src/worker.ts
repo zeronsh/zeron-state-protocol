@@ -613,7 +613,7 @@ function connect(port: MessagePort): void {
     port.onmessage = (e: MessageEvent<Say>) => (wire ? onSay(wire, e.data) : undefined);
     return;
   }
-  if (leaving) return toTab({ close: true }), port.close(); // carried nowhere: the device is closed
+  if (leaving || !channel) return toTab({ close: true }), port.close(); // carried nowhere: the device is closed, or never was
   contend();
   // The leader may not be listening on the pipe's own channel until it says so: until then what the tab says waits here.
   const name = channel.name + ":" + crypto.randomUUID();
