@@ -542,7 +542,14 @@ export class Client {
           return () => clearTimeout(t);
         }),
     };
-    this.#dial();
+    try {
+      this.#dial();
+    } catch (e) {
+      // No client comes of it: nor does it keep anything awake, or its share of the page's timer worker.
+      this.#closed = true;
+      this.#letGo();
+      throw e;
+    }
   }
 
   // ---------------------------------------------------------------- the pipe
@@ -619,14 +626,27 @@ export class Client {
     if (this.#closed) return;
     this.#closed = true;
     // What editors have typed and not yet sealed is still to be said.
-    if (this.#ready) for (const row of this.#rows.values()) for (const [slot, t] of row.texts) if (t.open !== "") this.#seal(row, slot);
-    this.#flush();
-    this.#hangUp();
-    // Nothing is left to be done later: a closed client keeps nothing awake, nor its share of the page's timer worker.
-    for (const cancel of [...this.#timers]) cancel();
-    this.#letTimersGo?.();
+    try {
+      if (this.#ready) for (const row of this.#rows.values()) for (const [slot, t] of row.texts) if (t.open !== "") this.#seal(row, slot);
+      this.#flush();
+      this.#hangUp();
+    } finally {
+      this.#letGo(); // whatever its pipe threw
+    }
     for (const a of [...this.#asked.values()]) this.#fetched(a);
     for (const live of [...this.#faults.keys()]) this.#fault(live); // calls never made end here, as those made do
+  }
+
+  // Nothing is left to be done later: a closed client keeps nothing awake, nor its share of the page's timer worker, which
+  // it lets go of whatever a cancelling throws.
+  #letGo(): void {
+    try {
+      for (const cancel of [...this.#timers]) cancel();
+    } finally {
+      const release = this.#letTimersGo;
+      this.#letTimersGo = undefined;
+      release?.();
+    }
   }
 
   // Runs f later, unless the client is closed first; returns a way to cancel it.

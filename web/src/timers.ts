@@ -7,8 +7,15 @@
 /** Runs f later, and returns a way to cancel it. */
 export type After = (ms: number, f: () => void) => () => void;
 
-// The worker's whole script: a timer for each id said, said back when it is up, or forgotten when the id is said with -1.
-const SCRIPT = "const t=new Map();onmessage=(e)=>{const[i,m]=e.data;if(m<0){clearTimeout(t.get(i));t.delete(i)}else t.set(i,setTimeout(()=>{t.delete(i);postMessage(i)},m))}";
+// The worker's whole script: [id, ms] sets a timer, said back by its id when it is up; [id] alone forgets it. No delay,
+// whatever it is, means forgetting.
+const SCRIPT = "const t=new Map();onmessage=(e)=>{const[i,m]=e.data;if(e.data.length<2){clearTimeout(t.get(i));t.delete(i)}else t.set(i,setTimeout(()=>{t.delete(i);postMessage(i)},m))}";
+
+// A delay as setTimeout takes one, a WebIDL long: NaN and the infinities none, the rest wrapped to 32 bits, and what is
+// less than none none.
+function delay(ms: number): number {
+  return Math.max(0, Number(ms) | 0);
+}
 
 interface Pending {
   f: () => void;
@@ -54,7 +61,8 @@ export function pageTimers(): { after: After; release: () => void } | undefined 
   };
 }
 
-function after(ms: number, f: () => void): () => void {
+function after(given: number, f: () => void): () => void {
+  const ms = delay(given);
   const id = ++next;
   const p: Pending = { f, due: performance.now() + ms };
   pending.set(id, p);
@@ -66,7 +74,7 @@ function after(ms: number, f: () => void): () => void {
     if (!was) return;
     pending.delete(id);
     if (was.page !== undefined) clearTimeout(was.page);
-    else worker?.postMessage([id, -1]);
+    else worker?.postMessage([id]);
     stopIfIdle();
   };
 }
@@ -75,6 +83,7 @@ function fire(id: number): void {
   const p = pending.get(id);
   if (!p) return; // cancelled since, or let go of with its client
   pending.delete(id);
+  stopIfIdle(); // the last, its client gone: and should it ask for another, the worker is made again
   p.f();
 }
 

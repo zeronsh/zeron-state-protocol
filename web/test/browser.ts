@@ -7,7 +7,7 @@ import { loadModule } from "../src/wasm.ts";
 import { live } from "./live.ts";
 import { where } from "../src/ask.ts";
 import { binaryFromHex } from "../src/codec.ts";
-import { timerInternals } from "../src/timers.ts";
+import { pageTimers, timerInternals } from "../src/timers.ts";
 
 const devices = new Map<string, Device>();
 
@@ -383,9 +383,73 @@ const zsp = {
   async typeMore(words: string[]): Promise<void> {
     for (const w of words) editors[editors.length - 1].append(w);
   },
-  async closeClient(as: string): Promise<void> {
-    clients.get(as)?.close();
+  /** Closes such a client: what closing it threw, if it threw. */
+  async closeClient(as: string): Promise<string | undefined> {
+    const c = clients.get(as);
     clients.delete(as);
+    try {
+      c?.close();
+    } catch (e) {
+      return (e as Error).message;
+    }
+  },
+  /** A client of its own whose pipe throws as it is closed. */
+  async ownClientBrittle(name: string, as: string, linger = 200): Promise<void> {
+    const connect: Connect = (receive, closed) => {
+      const wire = devices.get(name)!.connect(receive, closed);
+      if (!wire) return undefined;
+      return {
+        send: (data) => wire.send(data),
+        close: () => {
+          wire.close();
+          throw new Error("the pipe threw as it closed");
+        },
+      };
+    };
+    clients.set(as, new Client({ connect, linger }));
+  },
+  /** A client of its own whose pipe cannot even be asked for: what making it threw. */
+  async ownClientUnmade(): Promise<string> {
+    try {
+      new Client({
+        connect: () => {
+          throw new Error("no pipe here");
+        },
+      });
+      return "made";
+    } catch (e) {
+      return (e as Error).message;
+    }
+  },
+  /**
+   * For each delay, given as a number or as JSON cannot say it ("NaN", "Infinity", "-Infinity"), whether the page's timer
+   * worker and setTimeout each go off within half a second; and how the worker stands once each is let go of.
+   */
+  async timerDelays(given: (number | string)[]): Promise<{ given: number | string; ours: boolean; page: boolean }[]> {
+    const out = [];
+    for (const g of given) {
+      const ms = typeof g === "string" ? Number(g) : g;
+      const share = pageTimers()!;
+      let ours = false, page = false;
+      const cancel = share.after(ms, () => (ours = true));
+      const t = setTimeout(() => (page = true), ms);
+      await sleep(500);
+      cancel();
+      clearTimeout(t);
+      share.release();
+      out.push({ given: g, ours, page });
+    }
+    return out;
+  },
+  /** A timer let go of by its only client before it goes off: how the worker stands then, and once it has gone off. */
+  async timerOutlivesRelease(): Promise<{ released: ReturnType<typeof timerInternals>; fired: ReturnType<typeof timerInternals>; went: boolean }> {
+    const share = pageTimers()!;
+    let went = false;
+    share.after(100, () => (went = true));
+    share.release();
+    const released = timerInternals();
+    await sleep(600);
+    return { released, fired: timerInternals(), went };
   },
   /** From now on no worker can be started here: trying throws, as some browsers' policies make it. */
   async workersThrow(): Promise<void> {

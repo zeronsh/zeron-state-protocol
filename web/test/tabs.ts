@@ -592,6 +592,48 @@ const tests: Record<string, () => Promise<void>> = {
     await sleep(1500);
     expectEqual(await call<Timers>(p, "timers"), none, "both closed, a while on");
   },
+  // The page's timer worker takes a delay as setTimeout does: one less than none, or none at all (NaN), or past what a
+  // timer holds, goes off at once, as it does there; no delay is taken for forgetting a timer. A client of its own keeping
+  // a window warm for less than no time lets it go at once. And a timer that outlasts its only client goes off, and then
+  // the worker goes too.
+  async tab_own_client_timer_edges() {
+    type Timers = { worker: boolean; broken: boolean; users: number; pending: number };
+    const p = await page();
+    const given = [0, -1, -1000, "NaN", "-Infinity", "Infinity", 2 ** 31, 2 ** 32 + 5, 0.5];
+    const went = await call<{ given: number | string; ours: boolean; page: boolean }[]>(p, "timerDelays", given);
+    for (const w of went) if (w.ours !== w.page) throw new Error(`a delay of ${w.given}: the worker's ${w.ours ? "went off" : "did not"}, setTimeout's ${w.page ? "did" : "did not"}`);
+    expectEqual(await call<Timers>(p, "timers"), { worker: false, broken: false, users: 0, pending: 0 }, "each let go of");
+    const outlived = await call<{ released: Timers; fired: Timers; went: boolean }>(p, "timerOutlivesRelease");
+    expectEqual(outlived.released, { worker: true, broken: false, users: 0, pending: 1 }, "a timer pending, its client gone");
+    expectEqual({ fired: outlived.fired, went: outlived.went }, { fired: { worker: false, broken: false, users: 0, pending: 0 }, went: true }, "and once it has gone off");
+    await call(p, "device", "te");
+    await call(p, "create", "te");
+    await call(p, "ownClient", "te", "own", false, -1);
+    await call(p, "put", "own", "warm", ["its client ready"]);
+    await call(p, "watch", "own", "warm", 10);
+    await call(p, "unwatch", "own", "warm");
+    await eventually(async () => (await call<Timers>(p, "timers")).pending === 0, "a window kept warm for less than no time is let go at once", 5000);
+    await call(p, "closeClient", "own");
+    expectEqual(await call<Timers>(p, "timers"), { worker: false, broken: false, users: 0, pending: 0 }, "and its client closed");
+  },
+  // Nothing a pipe throws keeps a client of its own from letting go of the page's timer worker: not one that cannot be
+  // asked for as the client is made, nor one that throws as it is closed, with a timer of the client's pending.
+  async tab_own_client_throws() {
+    type Timers = { worker: boolean; broken: boolean; users: number; pending: number };
+    const p = await page();
+    await call(p, "device", "tt");
+    await call(p, "create", "tt");
+    expectEqual(await call<string>(p, "ownClientUnmade"), "no pipe here", "a client whose pipe cannot be asked for is not made");
+    expectEqual((await call<Timers>(p, "timers")).users, 0, "and takes no share of the worker");
+    await call(p, "ownClientBrittle", "tt", "brittle", 600000);
+    await call(p, "put", "brittle", "warm", ["its client ready"]);
+    await call(p, "watch", "brittle", "warm", 10);
+    await call(p, "unwatch", "brittle", "warm");
+    const kept = await call<Timers>(p, "timers");
+    expectEqual({ worker: kept.worker, users: kept.users, pending: kept.pending }, { worker: true, users: 1, pending: 1 }, "a window kept warm");
+    expectEqual(await call<string | undefined>(p, "closeClient", "brittle"), "the pipe threw as it closed", "closing it");
+    expectEqual(await call<Timers>(p, "timers"), { worker: false, broken: false, users: 0, pending: 0 }, "closed, though its pipe threw");
+  },
   // In a page that may start no worker of its own, as one whose policy forbids it, a client of its own keeps time by the
   // page's timers, as it would anywhere, and seals what it types: whether starting one fails at once or only later.
   async tab_own_client_no_worker() {
