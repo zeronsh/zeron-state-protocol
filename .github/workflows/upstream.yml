@@ -1,0 +1,69 @@
+name: upstream
+# The Odin bugs third_party/nbio works round, each reproduced (tests/upstream) against the release CI builds with and
+# against the newest nightly, each night. Still broken is no failure, and fixed upstream is said plainly in the run's
+# summary; a repro that no longer shows its bug on the release, or that fails any other way, fails the run.
+# tests/upstream/run.sh says what each is expected to say.
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  pull_request:
+    paths:
+      - ".github/workflows/upstream.yml"
+      - "tests/upstream/**"
+jobs:
+  repro:
+    name: "odin-lang/Odin#${{ matrix.issue }} ${{ matrix.os }} ${{ matrix.odin }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { issue: "8642", os: ubuntu-latest, odin: pinned }
+          - { issue: "8642", os: ubuntu-latest, odin: latest }
+          - { issue: "8642", os: macos-latest, odin: pinned }
+          - { issue: "8642", os: macos-latest, odin: latest }
+          - { issue: "8644", os: windows-latest, odin: pinned }
+          - { issue: "8644", os: windows-latest, odin: latest }
+          # It takes every ephemeral port of the machine it is on: a runner of its own.
+          - { issue: "8645", os: windows-latest, odin: pinned }
+          - { issue: "8645", os: windows-latest, odin: latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - if: matrix.odin == 'pinned'
+        uses: laytan/setup-odin@v2
+        with:
+          release: dev-2026-11 # as test.yml
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+      - if: matrix.odin == 'latest'
+        name: newest nightly
+        run: |
+          case "$RUNNER_OS" in
+            Linux) want=linux-amd64 ;;
+            macOS) want=macos-arm64 ;;
+            Windows) want=windows-amd64 ;;
+          esac
+          python=python3
+          command -v python3 >/dev/null || python=python
+          curl -fsSLo nightly.json https://f001.backblazeb2.com/file/odin-binaries/nightly.json
+          url=$($python -c 'import json, sys
+          files = json.load(open("nightly.json"))["files"]
+          day = max(files)
+          print(next(f["url"] for f in files[day] if "-" + sys.argv[1] + "-" in f["name"]))' "$want")
+          echo "$url"
+          mkdir -p ~/odin-nightly && cd ~/odin-nightly
+          case "$url" in
+            *.zip) curl -fsSLo odin.zip "$url" && unzip -qo odin.zip ;;
+            *) curl -fsSLo odin.tar.gz "$url" && tar xzf odin.tar.gz ;;
+          esac
+          odin=$(find "$PWD" -type f \( -name odin -o -name odin.exe \) | head -n 1)
+          [ -n "$odin" ] || { echo "no odin in $url"; exit 1; }
+          chmod +x "$odin"
+          bin=$(dirname "$odin")
+          [ "$RUNNER_OS" = Windows ] && bin=$(cygpath -w "$bin")
+          echo "$bin" >>"$GITHUB_PATH"
+      - run: tests/upstream/run.sh ${{ matrix.issue }} ${{ matrix.odin }}

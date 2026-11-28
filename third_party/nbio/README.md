@@ -85,3 +85,12 @@ diff -r "$(odin root)/core/nbio" third_party/nbio
 
 shows only the changes above, the lines atop `doc.odin` that say this is a copy, `README.md` and `LICENSE`, with the
 release installed.
+
+`./x check` fails on any use, anywhere here, of what #8642 breaks, or of what of core uses it (`tests/odin_lint.py`
+says what), `core:nbio` among them; `./x selftest` shows that it finds each, however written.
+
+## Whether upstream has fixed them
+
+`.github/workflows/upstream.yml` runs a repro of each issue (`tests/upstream`) each night, with the release and with the
+newest nightly: #8642 on Linux and macOS, #8644 and #8645 on Windows. That they are still broken is no failure; one
+fixed upstream is said in the run's summary, as **FIXED UPSTREAM**. Once a release has all three, the copy can go.
