@@ -376,7 +376,7 @@ dialled; and it is partial from its next start. So a device may be either, from 
 Synced for an interest is believed only from a full replica asked for it, settled or denied, of a range within its scope that meets what was asked; a
 whole-scope watch counts as level only when settled; an Ack of more than was sent ends the session
 as *malformed*. When all a dialler's whole-scope watches are level, and it has sent all the other
-lacked, it says so: Synced with id 0, settled, empty keys and zero counts (and so does one becoming partial that watches whole, though dialled). The other heeds it from a full replica that has such a watch here. When the
+lacked and every change it has taken in since they were asked for (not merely as much as its pipe or window let it), it says so: Synced with id 0, settled, empty keys and zero counts (and so does one becoming partial that watches whole, though dialled). The other heeds it from a full replica that has such a watch here. When the
 roster changes, all of these are asked for afresh: either end may have dropped one under a roster the other never heard.
 
 With *counts* the owner says Synced again whenever, after a burst of changes, how much lies before or after differs from what it last said. A

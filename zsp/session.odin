@@ -2858,7 +2858,10 @@ pump :: proc(s: ^Session) {
 		s.typing_due = false
 		typing_give(s)
 	}
-	if go && (s.initiator || n.becoming) && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && tasks_idle(s) {
+	// All is said only once what has changed is, too: not when flush_changes stopped for a full pipe or a shut window,
+	// with more to say. Said before, the peer would take it as level, and so would this end once that was acknowledged,
+	// what came to it from others since still unsaid.
+	if go && s.cursor == n.events.next && (s.initiator || n.becoming) && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && tasks_idle(s) {
 		s.told = true
 		cells_close(s)
 		at := frame_begin(&s.out, .Synced)

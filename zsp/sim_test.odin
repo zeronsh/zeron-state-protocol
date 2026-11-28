@@ -1252,6 +1252,150 @@ partial_after_full :: proc(t: ^testing.T) {
 	testing.expect_value(t, count(big), 36)
 }
 
+// One becoming partial is level with a full replica, and partial from its next start, only once it has said all that
+// came to it since it reached it: not once its pipe is full with more still to say, nor its window shut. What another
+// full one gave it meanwhile, and which its outbox does not name, it would otherwise let go of once it starts again,
+// while the one it said it was level with never had it.
+@(test)
+becoming_is_level_once_all_is_said :: proc(t: ^testing.T) {
+	becoming_level(t, window = false)
+}
+
+@(test)
+becoming_is_level_once_all_is_said_through_a_shut_window :: proc(t: ^testing.T) {
+	becoming_level(t, window = true)
+}
+
+// Of the window: what the laptop is given goes on to the big one as it comes, while what the big one says, and what it
+// took with it, is still on its way. So the laptop's window is shut, and its pipe empty, when it hears it is level.
+@(private)
+becoming_level :: proc(t: ^testing.T, window: bool) {
+	state := seeded(41)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 3, partial = 0, relays = 0, ring = 256)
+	defer sim_destroy(&s)
+	big, laptop, other := s.nodes[0], s.nodes[1], s.nodes[2]
+	count :: proc(x: ^Sim_Node) -> int {
+		return store_range(&x.node.store, KEY_MIN, KEY_MAX).count
+	}
+	sync :: proc(s: ^Sim) {
+		for x in s.nodes {
+			if store_unsynced(&x.node.store) {
+				node_sync(&x.node)
+			}
+		}
+	}
+	// Whether a frame says this end is level with a full replica.
+	settling :: proc(frame: []byte) -> bool {
+		if Message(frame[0]) != .Synced {
+			return false
+		}
+		f := Reader{buf = frame[1:]}
+		return read_varint(&f) < INTEREST && Synced_Flags(read_u8(&f)).settled
+	}
+	// All one end has to say, to the other, whole, a frame at a time: but for, if `held`, what says it is level, and
+	// all after it, which is still on its way (and is the caller's). Whether there was anything.
+	pass :: proc(t: ^testing.T, from, to: ^Session, held := false) -> (busy: bool, rest: []byte) {
+		out := slice.clone(session_output(from))
+		defer delete(out)
+		session_sent(from, len(out))
+		r := Reader{buf = out}
+		for r.pos < len(out) {
+			at := r.pos
+			if held && settling(read_bytes(&r)) {
+				return true, slice.clone(out[at:])
+			}
+			r.pos = at
+			_ = read_bytes(&r)
+			testing.expect(t, session_input(to, out[at:r.pos]))
+		}
+		return len(out) > 0, nil
+	}
+	ROWS := 40 if window else 12 // of 10 KiB: more than a window, or than a pipe holds
+
+	sim_restart(&s, laptop, full = false)
+	testing.expect(t, laptop.node.full && laptop.node.becoming && !laptop.node.whole)
+	sim_link(&s, 1, 0)
+	la, lb := s.links[0].a, s.links[0].b
+
+	// The laptop and the big one go back and forth until the big one says the laptop is level with it. Then, before it
+	// hears so, another full one gives the laptop what it wrote, more than a pipe holds, and is gone before it says the
+	// laptop is level with it too.
+	late: []byte
+	defer delete(late)
+	for round := 0; ; round += 1 {
+		a, _ := pass(t, la, lb)
+		sync(&s)
+		b: bool
+		b, late = pass(t, lb, la, held = true)
+		if late != nil {
+			break
+		}
+		if !a && !b || round > 1000 {
+			testing.fail_now(t, "the big one never says the laptop is level")
+		}
+	}
+	for i in 0 ..< ROWS {
+		sim_put_big(&s, other, 7, u64(i), 10 << 10)
+	}
+	sim_link(&s, 2, 1)
+	oa, ob := s.links[1].a, s.links[1].b
+	for round := 0; ; round += 1 {
+		a, _ := pass(t, ob, oa)
+		sync(&s)
+		if window {
+			sent, _ := pass(t, la, lb) // and nothing comes back
+			a |= sent
+		}
+		b, gone := pass(t, oa, ob, held = true)
+		if gone != nil {
+			delete(gone) // never comes: the other is gone
+			break
+		}
+		if !a && !b || round > 1000 {
+			testing.fail_now(t, "the other never says the laptop is level")
+		}
+	}
+	sim_cut(&s, 1)
+	testing.expect(t, !laptop.node.whole)
+	testing.expect_value(t, count(laptop), ROWS)
+	testing.expect_value(t, laptop.node.outbox.root, 0) // what it was given, it names nowhere
+	if window {
+		testing.expect(t, window_held(la) && !window_open(la) && la.cursor < laptop.node.events.next)
+	} else {
+		testing.expect(t, laptop.node.events.next - la.cursor >= 2 * u64(ROWS))
+	}
+
+	// What the big one said comes at last, and they go on. All is said only once all is, and the laptop is level only
+	// once the big one holds all it does.
+	testing.expect(t, session_input(la, late))
+	if window {
+		testing.expect(t, len(session_output(la)) < OUT_HIGH) // not a full pipe that holds it back
+	}
+	told := false
+	for round := 0; round < 1000; round += 1 {
+		a, _ := pass(t, la, lb)
+		if la.told && !told {
+			told = true
+			testing.expectf(t, la.cursor == laptop.node.events.next, "all said at %d of %d", la.cursor, laptop.node.events.next)
+		}
+		if laptop.node.whole {
+			testing.expectf(t, count(big) == count(laptop), "level with %d of %d rows", count(big), count(laptop))
+		}
+		sync(&s)
+		b, _ := pass(t, lb, la)
+		if laptop.node.whole {
+			testing.expectf(t, count(big) == count(laptop), "level with %d of %d rows", count(big), count(laptop))
+		}
+		if !a && !b {
+			break
+		}
+	}
+	testing.expect(t, told && laptop.node.whole)
+	testing.expect_value(t, count(big), ROWS)
+}
+
 // A partial replica lets go of what it no longer watches: of a list nobody has watched for long enough, and, when it
 // holds more than it may, of the lists watched least lately first. Never of what it wrote and nobody else is known to
 // hold, nor of what is watched; and whatever it let go of comes again once it is watched again.
