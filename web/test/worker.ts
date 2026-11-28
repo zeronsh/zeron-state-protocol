@@ -3,7 +3,8 @@
 // fails, is closed and is put away; what it says; and when it lets go of the lock. `node test/worker.ts`
 
 import assert from "node:assert/strict";
-import { Client } from "../src/client.ts";
+import { Client, columns } from "../src/client.ts";
+import { where } from "../src/ask.ts";
 import { Node } from "../src/node.ts";
 import { Store } from "../src/store.ts";
 import { HELD_WITHIN, OpfsVolume, storePath, take } from "../src/volume-opfs.ts";
@@ -1108,29 +1109,97 @@ for (const when of ["heard of", "not yet heard of"] as const) {
 
 // ---------------------------------------------------------------- the tab
 
-// A tab's device, ./src/browser.ts, and its worker: every pipe a client dials refused, and every time it asks for kept here,
-// to be said to be up when the test says.
-{
-  let dials = 0;
-  const afters: number[] = [];
-  let tabSide: { onmessage: ((e: { data: Report }) => void) | null } | undefined;
-  class TabWorker {
-    onmessage: ((e: { data: Report }) => void) | null = null;
-    onerror: unknown = null;
-    #w = worker();
-    constructor() {
-      tabSide = this;
-      void this.#w.then((w) => w.watch((r) => setTimeout(() => this.onmessage?.({ data: r }))));
-    }
-    postMessage(c: { connect?: MessagePort; after?: number }): void {
-      if (c.connect) return void (dials++, c.connect.postMessage({ close: true }));
-      if (c.after !== undefined) return void afters.push(c.after);
-      void this.#w.then((w) => setTimeout(() => w.tell(c)));
-    }
-    terminate(): void {}
+// A tab's device, ./src/browser.ts, and its worker: what the tab posts, to its worker and down its pipes, in the order it
+// posts it; and its page and document, which the tab hears freeze, hide and show.
+const page = new EventTarget();
+const tabDocument = new EventTarget();
+Object.assign(globalThis, { document: tabDocument, addEventListener: page.addEventListener.bind(page), removeEventListener: page.removeEventListener.bind(page) });
+const posted: { to: "worker" | "pipe"; what: any; cells?: number[] }[] = [];
+const workerEnds = new WeakSet<MessagePort>(); // of pipes: what the worker posts down them is not the tab's
+const portPost = MessagePort.prototype.postMessage;
+MessagePort.prototype.postMessage = function (this: MessagePort, message: unknown, ...rest: unknown[]) {
+  // What it carries is read as it is posted, for it is handed over with it.
+  if (!workerEnds.has(this)) posted.push({ to: "pipe", what: message, cells: cellKinds((message as { data?: unknown } | null)?.data) });
+  return (portPost as (...a: unknown[]) => void).call(this, message, ...rest);
+} as typeof portPost;
+let refusePipes = false; // every pipe a client dials refused, as by a worker that will not have it
+let dials = 0;
+let keepTimes = false; // every time asked for kept here, to be said to be up when the test says
+const afters: number[] = [];
+let tabSide: { onmessage: ((e: { data: Report }) => void) | null } | undefined;
+class TabWorker {
+  onmessage: ((e: { data: Report }) => void) | null = null;
+  onerror: unknown = null;
+  #w = worker();
+  constructor() {
+    tabSide = this;
+    void this.#w.then((w) => w.watch((r) => setTimeout(() => this.onmessage?.({ data: r }))));
   }
-  Object.defineProperty(globalThis, "Worker", { value: TabWorker, configurable: true });
-  const { open: openDevice } = await import("../src/browser.ts");
+  postMessage(c: { connect?: MessagePort; after?: number }): void {
+    posted.push({ to: "worker", what: c });
+    if (c.connect) {
+      dials++;
+      if (refusePipes) return void c.connect.postMessage({ close: true });
+      workerEnds.add(c.connect);
+    }
+    if (c.after !== undefined && keepTimes) return void afters.push(c.after);
+    void this.#w.then((w) => setTimeout(() => w.tell(c)));
+  }
+  terminate(): void {}
+}
+Object.defineProperty(globalThis, "Worker", { value: TabWorker, configurable: true });
+const { open: openDevice } = await import("../src/browser.ts");
+const Notes = { title: columns.string(16), body: columns.text(17) };
+// The kinds of the cells in the frames of Cells in what a pipe carries.
+const cellKinds = (data: unknown): number[] => {
+  const kinds: number[] = [];
+  if (!(data instanceof Uint8Array)) return kinds;
+  for (let at = 0; at < data.length; ) {
+    let n = 0, shift = 0;
+    while (data[at] & 128) (n += (data[at++] & 127) * 2 ** shift), (shift += 7);
+    n += data[at++] * 2 ** shift;
+    const frame = data.subarray(at, at + n);
+    at += n;
+    if (frame[0] !== 7) continue;
+    let p = 1;
+    while (frame[p] & 128) p++;
+    p++;
+    while (p < frame.length) {
+      const kind = frame[p++];
+      kinds.push(kind & 127);
+      if (!(kind & 128)) p += 16;
+      p += 1 + 16;
+      let len = 0, sh = 0;
+      while (frame[p] & 128) (len += (frame[p++] & 127) * 2 ** sh), (sh += 7);
+      len += frame[p++] * 2 ** sh;
+      p += len;
+    }
+  }
+  return kinds;
+};
+// A device of a space of its own, a client of it, and an editor of a row with something typed in it, not yet sealed.
+async function typing(name: string, typed: string) {
+  const device = await openDevice({ name });
+  await device.create();
+  const client = device.client();
+  await until("the client may write", () => client.may(1, "write"));
+  let id = "";
+  await client.write(1, (change) => (id = change.insert(Notes, "notes", 1, { title: "t" })));
+  const editor = client.text(id, Notes.body);
+  editor.append(typed);
+  await until("it is typed", () => editor.read() === typed);
+  return { device, client, editor, id };
+}
+// What a row's text is, on a device, as a client of it reads it.
+async function bodyOf(device: Awaited<ReturnType<typeof openDevice>>, id: string): Promise<string | undefined> {
+  const reader = device.client();
+  await until("the reader is up", () => reader.ready);
+  const answer = await reader.fetch({ scope: 1, table: Notes, where: where.ids([id]) });
+  await reader.close();
+  return answer.rows[0]?.body;
+}
+{
+  refusePipes = keepTimes = true;
 
   // Closing, it tells no client a time it asked for is up, though its worker said so before it heard: what is due then would
   // have a client dial again, or the like, on a device going.
@@ -1142,7 +1211,43 @@ for (const when of ["heard of", "not yet heard of"] as const) {
   tabSide!.onmessage!({ data: { due: afters[0] } }); // said before the worker heard the device was closed
   await closing;
   assert.equal(dials, dialled, "a client dialled again as its device closed");
-  client.close();
+  void client.close();
+  refusePipes = keepTimes = false;
+}
+
+// A tab frozen, its device's editors open, what they typed not yet sealed: it is sealed, and sent down the pipes, before
+// the worker is told to stop, there and then, for nothing after that is sure to be run.
+{
+  const { device, editor } = await typing("tab-frozen", "typed as the tab froze");
+  const from = posted.length;
+  tabDocument.dispatchEvent(new Event("freeze"));
+  const stopped = posted.findIndex((x, i) => i >= from && x.to === "worker" && "away" in x.what);
+  assert(stopped >= 0, "the worker was not told to stop");
+  assert(posted.slice(from, stopped).some((x) => x.to === "pipe" && x.cells?.includes(4)), "what was typed was not sealed and sent before the worker was stopped");
+  tabDocument.dispatchEvent(new Event("resume"));
+  await editor.close();
+  await device.close();
+}
+
+// A tab hidden, an application closing its client as it hears so, though it began to listen after the device did, which
+// put the tab away first: what its editor typed is sealed and kept all the same, and durable once the tab is back.
+{
+  const { device, client, id } = await typing("tab-hidden", "typed as the tab was hidden");
+  page.addEventListener("pagehide", () => void client.close(), { once: true }); // the application's
+  page.dispatchEvent(new Event("pagehide"));
+  page.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true })); // back, from the back/forward cache
+  assert.equal(await bodyOf(device, id), "typed as the tab was hidden", "what was typed as the tab was hidden was lost");
+  await device.close();
+}
+
+// A device closed, its clients and their editors left open: what they typed is sealed and durable before the node stops,
+// and there when the device is opened again.
+{
+  const { device, id } = await typing("tab-closed", "typed as the device closed");
+  await device.close();
+  const again = await openDevice({ name: "tab-closed" });
+  assert.equal(await bodyOf(again, id), "typed as the device closed", "what was typed was lost as the device closed");
+  await again.close();
 }
 
 console.log("ok");

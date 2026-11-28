@@ -413,6 +413,12 @@ interface Barrier {
 
 const handled = <T>(p: Promise<T>): Promise<T> => (p.catch(() => {}), p); // whoever does not wait for it is not thrown at
 
+/**
+ * Seals what every editor of a client has typed and sends it, there and then: for a browser's device, as its tab is put
+ * away, which leaves no time for anything to wait. Not for applications, which close or commit.
+ */
+export const sealNow = Symbol("seal now");
+
 // ---------------------------------------------------------------- merging
 
 function bundleHas(body: Uint8Array, stamp: string): boolean {
@@ -671,6 +677,11 @@ export class Client {
     const early = [...this.#early];
     after();
     return (this.#closing = handled(Promise.all(early).then(deliver)));
+  }
+
+  [sealNow](): void {
+    this.#sealAll();
+    this.#flush();
   }
 
   // What editors have typed and not yet sealed, sealed, as the client ends or its tab is put away.

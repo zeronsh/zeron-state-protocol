@@ -1,7 +1,7 @@
 // A device in a browser. Its node runs in a worker, where its store, a directory of the origin's private file system,
 // may be read and written synchronously; tabs of one origin share it, whichever of them happens to run it (./worker.ts).
 
-import { Client } from "./client.ts";
+import { Client, sealNow } from "./client.ts";
 import type { Device, Relay } from "./index.ts";
 import type { Connect, Member, Rights } from "./node.ts";
 import { storePath } from "./volume-opfs.ts";
@@ -65,6 +65,17 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   const timers = new Map<number, { f: () => void; due: number }>(); // the tab's clients', kept by the worker
   let space: string | undefined;
   let closing: Promise<void> | undefined;
+  let stopping = false; // nothing is due any more: the device's clients have delivered what they wrote, and it is closing
+  // Its clients, as device.client() made them: sealed as the tab is put away, and closed, what they wrote delivered, as
+  // the device is. Held no longer than whoever made them holds them.
+  const clients = new Set<WeakRef<Client>>();
+  const each = (f: (c: Client) => void) => {
+    for (const ref of [...clients]) {
+      const c = ref.deref();
+      if (c) f(c);
+      else clients.delete(ref);
+    }
+  };
 
   const fail = (error: Error) => {
     for (const a of answers.values()) a.reject(error);
@@ -116,6 +127,9 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   const away = () => {
     if (state !== "running") return;
     state = "away";
+    // What editors have typed is sealed and sent now, whatever else is listening, for nothing after this is sure to be
+    // run: each client keeps it till it is acknowledged, and says it again to the worker started when the tab is back.
+    each((c) => c[sealNow]());
     stop();
     for (const [id, a] of answers) {
       if (a.op === "close") answers.delete(id), a.resolve(undefined); // stopped, as a closed tab's is
@@ -162,7 +176,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   // Timers kept by the worker, which a browser does not hold back while the tab is hidden as it holds back the tab's own:
   // a client here that seals what it types, or dials again, does so when it should though nobody is looking.
   const after = (ms: number, f: () => void): (() => void) => {
-    if (closing) return () => {}; // nothing is due on a device closing
+    if (stopping) return () => {}; // nothing is due on a device closing
     const id = ++ticks;
     timers.set(id, { f, due: Date.now() + ms });
     worker?.postMessage({ after: id, ms } satisfies Command);
@@ -248,12 +262,23 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       if (at !== undefined && credential === c) (credentialAt = at), (taken = true); // as given: no earlier than any it knew of
     },
     connect,
-    client: (host = {}) => new Client({ after, ...host, connect }),
+    client: (host = {}) => {
+      const c = new Client({ after, ...host, connect });
+      clients.add(new WeakRef(c));
+      return c;
+    },
     // Once, however often asked: its node stopped as it should be, and then its worker let go of.
     close: () =>
       (closing ??= (async () => {
+        // Its clients first, what they wrote and their editors typed delivered, and durable, before the node is stopped:
+        // while the worker runs, which it does not while the tab is away, when what a client holds is told it failed
+        // once there is no device to deliver it to.
+        const delivered: Promise<void>[] = [];
+        each((c) => delivered.push(c.close()));
+        if (worker && state === "running") await Promise.allSettled(delivered);
         // Nothing is due any more, though its worker said so before it heard: a client told so would dial again, or the
         // like, on a device going.
+        stopping = true;
         timers.clear();
         // Listened for until it is closed: a tab frozen or left as its worker closes the store stops the worker then, as
         // ever, which would else be frozen holding it.
