@@ -44,14 +44,29 @@ _set_socket_option :: proc(s: net.Socket, option: Socket_Option, value: Socket_O
 		x := i32(v)
 		res = posix.setsockopt(posix.FD(s), level, opt, &x, size_of(x))
 	case time.Duration:
-		x := posix.timeval{
-			tv_sec  = posix.time_t(v / time.Second),
-			tv_usec = posix.suseconds_t((v % time.Second) / time.Microsecond),
-		}
+		x := timeout_timeval(v)
 		res = posix.setsockopt(posix.FD(s), level, opt, &x, size_of(x))
 	}
 	if res != .OK { return .System, int(posix.errno()) }
 	return .None, 0
+}
+
+// A timeout as POSIX takes it, a timeval, where {0, 0} is none (a read waits for ever): a positive one is rounded up to
+// the microsecond, so that none less than one becomes {0, 0}, and its seconds are held to what a time_t holds rather
+// than wrapping.
+@(private="file")
+timeout_timeval :: proc "contextless" (v: time.Duration) -> posix.timeval {
+	if v <= 0 {
+		return {}
+	}
+	us := v / time.Microsecond
+	if v % time.Microsecond != 0 {
+		us += 1
+	}
+	return {
+		tv_sec  = posix.time_t(min(us / 1_000_000, time.Duration(max(posix.time_t)))),
+		tv_usec = posix.suseconds_t(us % 1_000_000),
+	}
 }
 
 @(private="package")
@@ -63,7 +78,12 @@ _socket_option :: proc(s: net.Socket, option: Socket_Option) -> (value: Socket_O
 		x: posix.timeval
 		n := posix.socklen_t(size_of(x))
 		if posix.getsockopt(posix.FD(s), level, opt, &x, &n) != .OK { return nil, .System, int(posix.errno()) }
-		value = time.Duration(x.tv_sec) * time.Second + time.Duration(x.tv_usec) * time.Microsecond
+		// Held to the longest a Duration holds, as a timeout set to it reads back from Linux: not wrapped round.
+		if time.Duration(x.tv_sec) > (max(time.Duration) - time.Second) / time.Second {
+			value = max(time.Duration)
+		} else {
+			value = time.Duration(x.tv_sec) * time.Second + time.Duration(x.tv_usec) * time.Microsecond
+		}
 	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay, .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size:
 		if option == .Receive_Buffer_Size_Forced {
 			opt = .RCVBUF

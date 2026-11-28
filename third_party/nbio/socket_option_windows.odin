@@ -34,11 +34,26 @@ _set_socket_option :: proc(s: net.Socket, option: Socket_Option, value: Socket_O
 		x := i32(v)
 		res = win.setsockopt(win.SOCKET(s), level, opt, &x, size_of(x))
 	case time.Duration:
-		x := win.DWORD(min(v / time.Millisecond, time.Duration(max(u32))))
+		x := win.DWORD(timeout_ms(v))
 		res = win.setsockopt(win.SOCKET(s), level, opt, &x, size_of(x))
 	}
 	if res != 0 { return .System, int(win.WSAGetLastError()) }
 	return .None, 0
+}
+
+// A timeout as Windows takes it, milliseconds in a DWORD, where 0 is none (a read waits for ever): a positive one is
+// rounded up, so that none less than a millisecond becomes 0, and one longer than a DWORD holds is held to its most
+// rather than wrapping.
+@(private="file")
+timeout_ms :: proc "contextless" (v: time.Duration) -> u32 {
+	if v <= 0 {
+		return 0
+	}
+	ms := v / time.Millisecond
+	if v % time.Millisecond != 0 {
+		ms += 1
+	}
+	return u32(min(ms, time.Duration(max(u32))))
 }
 
 @(private="package")

@@ -59,10 +59,18 @@ socket_options_hold_what_was_asked :: proc(t: ^testing.T) {
 			testing.expectf(t, fgot == 2 * (3 << 20), "Receive_Buffer_Size_Forced 3 MiB reads back %v", fgot)
 		} else {
 			testing.expectf(t, ferr == .System && fcode == 1, "Receive_Buffer_Size_Forced refused otherwise than EPERM: %v, %d", ferr, fcode)
+			// The last size asked of the plain option, above.
+			stands := granted(.Receive_Buffer_Size, UDP_RECEIVE_BUFFER)
+			testing.expectf(t, fgot == stands, "Receive_Buffer_Size_Forced refused, and the size asked before it reads back %v, not %d", fgot, stands)
 		}
+		// Read back as itself, it is the receive buffer, as the system keeps it.
+		forced, frerr, _ := nbio.socket_option(udp, .Receive_Buffer_Size_Forced)
+		testing.expectf(t, frerr == nil && forced == fgot, "Receive_Buffer_Size_Forced reads back %v (%v), not the receive buffer's %v", forced, frerr, fgot)
 	} else {
 		ferr, _ := nbio.set_socket_option(udp, .Receive_Buffer_Size_Forced, 3 << 20)
 		testing.expect_value(t, ferr, nbio.Socket_Option_Error.Unsupported)
+		_, frerr, _ := nbio.socket_option(udp, .Receive_Buffer_Size_Forced)
+		testing.expect_value(t, frerr, nbio.Socket_Option_Error.Unsupported)
 	}
 
 	// A timeout, of blocking reads.
@@ -73,6 +81,32 @@ socket_options_hold_what_was_asked :: proc(t: ^testing.T) {
 	d, _ := got.(time.Duration)
 	// Linux keeps it in jiffies: within one of them (at least 100 a second).
 	testing.expectf(t, gerr == nil && abs(d - want) <= 10 * time.Millisecond, "Receive_Timeout set %v reads back %v (%v)", want, got, gerr)
+	// None is none; and none positive is none, however short (0 being a read that waits for ever): Windows counts
+	// milliseconds and POSIX microseconds, so each is rounded up to one, within a jiffy on Linux.
+	for short in ([]time.Duration{0, 500 * time.Microsecond, 500 * time.Nanosecond, 1}) {
+		serr, scode := nbio.set_socket_option(tcp, .Receive_Timeout, short)
+		testing.expectf(t, serr == nil, "Receive_Timeout set %v: %v, %d", short, serr, scode)
+		sgot, sgerr, _ := nbio.socket_option(tcp, .Receive_Timeout)
+		sd, _ := sgot.(time.Duration)
+		if short == 0 {
+			testing.expectf(t, sgerr == nil && sd == 0, "Receive_Timeout set 0 reads back %v (%v)", sgot, sgerr)
+		} else {
+			testing.expectf(t, sgerr == nil && sd > 0 && sd <= 10 * time.Millisecond, "Receive_Timeout set %v reads back %v (%v): a read would wait for ever", short, sgot, sgerr)
+		}
+	}
+	// And the longest there is held to the most the system takes, not wrapped round to something short.
+	lerr2, lcode := nbio.set_socket_option(tcp, .Receive_Timeout, max(time.Duration))
+	testing.expectf(t, lerr2 == nil, "Receive_Timeout set %v: %v, %d", max(time.Duration), lerr2, lcode)
+	lgot, lgerr, _ := nbio.socket_option(tcp, .Receive_Timeout)
+	ld, _ := lgot.(time.Duration)
+	when ODIN_OS == .Windows {
+		testing.expectf(t, lgerr == nil && ld == time.Duration(max(u32)) * time.Millisecond, "Receive_Timeout set %v reads back %v (%v), not a DWORD's most", max(time.Duration), lgot, lgerr)
+	} else when ODIN_OS == .Linux {
+		// Linux holds one beyond what its timer counts as for ever, and says so as none.
+		testing.expectf(t, lgerr == nil && (ld == 0 || ld >= 24 * time.Hour), "Receive_Timeout set %v reads back %v (%v)", max(time.Duration), lgot, lgerr)
+	} else {
+		testing.expectf(t, lgerr == nil && ld >= 24 * time.Hour, "Receive_Timeout set %v reads back %v (%v)", max(time.Duration), lgot, lgerr)
+	}
 
 	// Values of the wrong kind are refused, not set.
 	werr, _ := nbio.set_socket_option(tcp, .TCP_Nodelay, 1)
