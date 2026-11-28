@@ -11,6 +11,7 @@
 //
 // bench/mirror.py runs each case as a process of its own; see there.
 
+import * as v8 from "node:v8";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, openSync, readFileSync, readSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -160,14 +161,17 @@ function readData(path: string): Data {
 const rowsOf = (data: Data) => Number(new TextDecoder().decode(data.get("rows")![0]));
 
 // What the heap holds once collected, and the bytes of array buffers with it: what a buffer holds is not in the heap,
-// and is held all the same.
+// and is held all the same. Not code, nor what V8 keeps beside it (its trusted spaces, as bytecode): what V8 compiles
+// while a case is done is how V8 goes about it, not anything the client holds.
 function settled(): number {
   const gc = (globalThis as { gc?: () => void }).gc;
   if (!gc) throw new Error("run with --expose-gc");
   gc();
   gc();
   const m = process.memoryUsage();
-  return m.heapUsed + m.arrayBuffers;
+  let code = 0;
+  for (const x of v8.getHeapSpaceStatistics()) if (/code|trusted/.test(x.space_name)) code += x.space_used_size;
+  return m.heapUsed - code + m.arrayBuffers;
 }
 
 // Counting by perf, when bench/mirror.py runs it so (perf stat -D -1 --control): only what is between counting(true) and

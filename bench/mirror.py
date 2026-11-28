@@ -20,9 +20,15 @@ itself does; what collecting them will cost goes as what they made, which is mea
 says whether anything was collected after all.
 
 What the heap holds once the collector has been round after a case, as it is run anywhere, is measured in a process of its
-own. Rows are 2,000, 20,000 and 100,000 unless said.
+own (in TypeScript with what array buffers hold, which is not in V8's heap, and without code and bytecode, which is
+what V8 happens to have compiled by then). Rows are 2,000, 20,000 and 100,000 unless said.
+
+In Luau, where the luau CLI is there too, what a change makes and what the heap holds after a case are measured by it, as
+the same bench: it can collect at once, which Lune cannot, so what is made is not less what was collected meanwhile, nor
+what is held what churning happened to leave. Its data is put in a module beside it, as the CLI reads no files.
 """
 
+import base64
 import os
 import shutil
 import subprocess
@@ -131,6 +137,86 @@ def said(text, name):
     return None
 
 
+LUAU_CLI = '''local B64 = {}
+do
+	local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	for k = 1, 64 do
+		B64[string.byte(chars, k)] = k - 1
+	end
+end
+local function unb64(s: string): string
+	local n = #s
+	local pad = (if string.byte(s, n) == 61 then 1 else 0) + (if string.byte(s, n - 1) == 61 then 1 else 0)
+	local out = buffer.create(n // 4 * 3 - pad)
+	local o = 0
+	for i = 1, n, 4 do
+		local a, b, c, d = string.byte(s, i, i + 3)
+		local v = B64[a] * 262144 + B64[b] * 4096 + (B64[c] or 0) * 64 + (B64[d] or 0)
+		buffer.writeu8(out, o, v // 65536)
+		o += 1
+		if c ~= 61 then
+			buffer.writeu8(out, o, (v // 256) % 256)
+			o += 1
+		end
+		if d ~= 61 then
+			buffer.writeu8(out, o, v % 256)
+			o += 1
+		end
+	end
+	return buffer.tostring(out)
+end
+local ARGS = { ... }
+local fs = { readFile = function(_: string): string return unb64(require("./mirror-cli-data") :: any) end, writeFile = function(...) end }
+local process = { args = ARGS, env = { ZSP_WARM = ARGS[6], ZSP_QUIET = ARGS[7] } }
+local task = { wait = function(...) end }
+'''
+
+
+def luau_cli(rows, case, data, count, mode, quiet_mb):
+    """What the bench prints of a case run by the luau CLI (see above), or None where there is none."""
+    luau = shutil.which("luau")
+    if not luau:
+        return None
+    build = os.path.join(ROOT, "build")
+    script, module = os.path.join(build, "mirror-cli.luau"), os.path.join(build, "mirror-cli-data.luau")
+    s = open(os.path.join(ROOT, "luau/tests/mirror_bench.luau")).read()
+    for a, b in [('require("../zsp/codec")', 'require("../luau/zsp/codec")'), ('require("../zsp")', 'require("../luau/zsp")'),
+                 ('local fs = require("@lune/fs")\n', ''), ('local process = require("@lune/process")\n', ''),
+                 ('local task = require("@lune/task")\n', LUAU_CLI),
+                 ("\t\tpaused()\n\t\tpaused()\n", '\t\tcollectgarbage("collect") -- at once, as the luau CLI can\n\t\tcollectgarbage("collect")\n'),
+                 ("local function settled(): number\n",
+                  'local function settled(): number\n\tdo\n\t\tcollectgarbage("collect") -- exactly, as the luau CLI can\n'
+                  '\t\tcollectgarbage("collect")\n\t\treturn collectgarbage("count")\n\tend\n')]:
+        assert s.count(a) == 1, a
+        s = s.replace(a, b)
+    open(script, "w").write(s)
+    stamp = f"-- {data} {os.path.getmtime(data)}\n"
+    if not os.path.exists(module) or open(module).readline() != stamp:
+        with open(data, "rb") as f:
+            open(module, "w").write(stamp + 'return "' + base64.b64encode(f.read()).decode() + '"\n')
+    out = subprocess.run([luau, script, "-a", str(rows), case, "x", str(count), mode, str(warm(case, rows) if count > 0 else 0),
+                          str(quiet_mb)], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SystemExit(f"luau {script} {rows} {case} failed:\n{out.stdout}{out.stderr}")
+    return out.stdout
+
+
+def luau_exact(rows, case, data, n):
+    """What a change makes, and whether anything was collected meanwhile, with a heap made bigger by a GB, or by 2.5 GB
+    where that was not enough; and what the heap holds after the case. None where there is no luau CLI."""
+    if not shutil.which("luau"):
+        return None
+    made = collected = None
+    if case not in ONCE:
+        for quiet_mb in (QUIET_MB, 2560):
+            alloc = luau_cli(rows, case, data, n, "alloc", quiet_mb)
+            made, collected = said(alloc, "alloc_kb"), said(alloc, "collected")
+            if not collected:
+                break
+    held = said(luau_cli(rows, case, data, n, "memory", QUIET_MB), "heap_kb")
+    return made, collected, held
+
+
 def main():
     args = sys.argv[1:]
     lang = "luau"
@@ -155,6 +241,9 @@ def main():
             _, _, _, mem = measure(*command(lang, rows, case, data, n, "memory"), counted=False)
             seconds = middle([said(r[3], "seconds") for r in done])
             heap = said(mem, "heap_kb")
+            exact = luau_exact(rows, case, data, n) if lang == "luau" else None
+            if exact:
+                heap = exact[2]
 
             def each(k):
                 a, b = middle([r[k] for r in base]), middle([r[k] for r in done])
@@ -162,9 +251,13 @@ def main():
 
             peak, made = "", ""
             if quiet:
-                _, _, _, alloc = measure(*command(lang, rows, case, data, n, "alloc", quiet=True), counted=False)
-                made = f"{said(alloc, 'alloc_kb') / n:,.1f}"
-                if said(alloc, "collected"):
+                if exact:
+                    alloc_kb, collected = exact[0], exact[1]
+                else:
+                    _, _, _, alloc = measure(*command(lang, rows, case, data, n, "alloc", quiet=True), counted=False)
+                    alloc_kb, collected = said(alloc, "alloc_kb"), said(alloc, "collected")
+                made = f"{alloc_kb / n:,.1f}"
+                if collected:
                     made += " (collected)"  # the young space or the heap was not big enough: what is counted is not alone
             else:
                 peak = f"{max(middle([r[2] for r in done]) - middle([r[2] for r in base]), 0):,}"
