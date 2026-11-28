@@ -46,6 +46,7 @@ Hold :: enum {
 	Held,
 	In_Use, // by another process, or by another part of this one
 	Remote, // on a file system shared with other machines
+	Unwritable, // its lock file, by this process, which cannot then hold it
 	Failed,
 }
 
@@ -117,6 +118,8 @@ hold_report :: proc(dir: string, held: Hold, kind: string) {
 		report(.Error, "this store is in use by another process: ", dir)
 	case .Remote:
 		report(.Error, dir, " is on a file system shared with other machines (", kind, "), where its lock may not hold: keep the store on a disk of this machine's own")
+	case .Unwritable:
+		report(.Error, "the lock file of ", dir, " cannot be written by this process, and so not held: it is to be its owner's to read and write, and nobody else's")
 	case .Failed:
 		report(.Error, "could not lock ", dir)
 	}

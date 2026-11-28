@@ -190,11 +190,27 @@ Dir_Lock :: distinct posix.FD
 // Holds the lock file of a store's directory, made if there is none, without waiting; or says why not.
 @(private)
 dir_lock :: proc(path: string) -> (lock: Dir_Lock, held: Hold) {
-	// Readable by nobody else, who could otherwise hold it too and so keep every node from the store. Never a link,
-	// followed to wherever it leads.
-	fd := open_file(strings.clone_to_cstring(path, context.temp_allocator), {.RDWR, .CREAT, .CLOEXEC, .NOFOLLOW})
+	// Readable and writable by its owner alone: by nobody else, who could otherwise hold it too and so keep every node
+	// from the store; and by its owner, as a lock is held only of a file open to be written. Never a link, followed to
+	// wherever it leads.
+	name := strings.clone_to_cstring(path, context.temp_allocator)
+	fd := open_file(name, {.RDWR, .CREAT, .CLOEXEC, .NOFOLLOW})
 	if fd < 0 {
-		return Dir_Lock(-1), .Failed
+		#partial switch posix.errno() {
+		case .EACCES, .EPERM:
+			// One this process may not write: made its owner's to, if this process is its owner, and opened again.
+			st: posix.stat_t
+			if posix.lstat(name, &st) == .OK && posix.S_ISREG(st.st_mode) && posix.chmod(name, {.IRUSR, .IWUSR}) == .OK {
+				fd = open_file(name, {.RDWR, .CLOEXEC, .NOFOLLOW})
+			}
+			if fd < 0 {
+				return Dir_Lock(-1), .Unwritable
+			}
+		case .EROFS:
+			return Dir_Lock(-1), .Unwritable
+		case:
+			return Dir_Lock(-1), .Failed
+		}
 	}
 	st: posix.stat_t
 	if posix.fstat(fd, &st) != .OK || !posix.S_ISREG(st.st_mode) {

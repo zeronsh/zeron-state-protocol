@@ -1,6 +1,6 @@
 // A directory on a disk, for Node.
 
-import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, rmSync, statfsSync, statSync, writeSync } from "node:fs";
+import { accessSync, chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, rmSync, statfsSync, statSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { File, Volume } from "./volume.ts";
@@ -139,15 +139,24 @@ function holdDirectory(dir: string): [string, () => void] {
   const path = join(at, LOCK);
   const inUse = () => new Error(`this store is in use by another process: ${dir}`);
   const notFile = () => new Error(`${path} is not a file: a store's lock file is never a link, nor anything but a file`);
-  // Nothing but a file, never a link followed to wherever it leads, readable by its owner alone, as zspd holds it to: one
-  // anyone could read anyone could hold too, and so keep every node from the store. Only asked of by its name, never
-  // opened, which on Linux would let go of what this process holds there.
+  const unwritable = () => new Error(`${path} cannot be written by this process, and so not held: it is to be its owner's to read and write, and nobody else's`);
+  // Nothing but a file, never a link followed to wherever it leads; readable and writable by its owner alone, as zspd
+  // holds it to: one anyone could read anyone could hold too, and so keep every node from the store, and one this
+  // process cannot write, it cannot hold (SQLite opens it only to read, and its write takes no lock; flock's needs it
+  // open to write). Only asked of by its name, never opened, which on Linux would let go of what this process holds there.
   const st = lstatSync(path, { throwIfNoEntry: false });
   if (st && !st.isFile()) throw notFile();
-  if (st && process.platform !== "win32" && st.mode & 0o077) {
+  if (st && (process.platform === "win32" ? !(st.mode & 0o200) : (st.mode & 0o777) !== 0o600)) {
     try {
-      chmodSync(path, st.mode & 0o600);
-    } catch {}
+      chmodSync(path, process.platform === "win32" ? 0o666 : 0o600); // on Windows, no longer read-only
+    } catch {
+      // Another's: held if this process may write it still, as the write SQLite begins says.
+      try {
+        accessSync(path, constants.W_OK);
+      } catch {
+        throw unwritable();
+      }
+    }
   }
   if (FLOCK.has(process.platform)) {
     const O_EXLOCK = 0x20; // as Darwin and the BSDs have it, and Node does not name it
@@ -158,6 +167,7 @@ function holdDirectory(dir: string): [string, () => void] {
       const code = (e as NodeJS.ErrnoException).code;
       if (code === "EAGAIN" || code === "EWOULDBLOCK") throw inUse();
       if (code === "ELOOP") throw notFile();
+      if (code === "EACCES" || code === "EPERM" || code === "EROFS") throw unwritable();
       throw e;
     }
     if (!fstatSync(fd).isFile()) {
@@ -181,8 +191,11 @@ function holdDirectory(dir: string): [string, () => void] {
     try {
       db = new DatabaseSync(name, { timeout: 0 });
       // Its shared lock and its reserved one, which only one holds at a time, by a write begun and never ended: which
-      // writes nothing, nor any journal, kept in memory.
-      db.exec("PRAGMA journal_mode = MEMORY; BEGIN IMMEDIATE");
+      // writes nothing, nor any journal, kept in memory. That it is a write, with the reserved lock held, is proved by a
+      // write made in it and undone at once, in memory, as SQLite accepts none from a connection that cannot write
+      // (SQLITE_READONLY), and begins what it says is a write, holding only its shared lock and soon not even that, on a
+      // file it could open only to read, as one of a later version of SQLite's.
+      db.exec("PRAGMA journal_mode = MEMORY; BEGIN IMMEDIATE; SAVEPOINT held; PRAGMA user_version = 0; ROLLBACK TO held; RELEASE held");
       const held = db;
       return () => held.close();
     } catch (e) {
@@ -213,6 +226,7 @@ function holdDirectory(dir: string): [string, () => void] {
       release = take();
     } catch (e) {
       if (code(e) === 5 || code(e) === 6) throw inUse(); // SQLITE_BUSY, by another; SQLITE_LOCKED, by this one
+      if (code(e) === 8 && !filled()) throw unwritable(); // SQLITE_READONLY, of a file with nothing in it
       // Anything else, with something in it still, is what is in it, whatever SQLite made of it, and is emptied once
       // nobody holds it; with nothing in it, it is no such thing.
       if (tries === 4 || !filled()) throw e;

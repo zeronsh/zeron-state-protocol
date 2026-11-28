@@ -318,3 +318,28 @@ hold_start_never_a_link :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, !starting, "a link was followed to wherever it leads")
 }
+
+// A lock file made read-only is made its owner's to read and write again, and held, as a lock is held only of a file open
+// to be written: not opened only to read, holding nothing, as SQLite would open it.
+@(test)
+hold_read_only_lock_file :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-hold-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer delete(dir)
+	defer os.remove_all(dir)
+	path := file_in(dir, LOCK_FILE)
+	testing.expect(t, os.write_entire_file(path, nil) == nil)
+	if !testing.expect(t, read_only_for_test(path), "the lock file could not be made read-only") {
+		return
+	}
+	lock, held, _ := dir_try(dir)
+	testing.expectf(t, held == .Held, "a read-only lock file is not held: %v", held)
+	if held != .Held {
+		return
+	}
+	testing.expect(t, writable_for_test(path), "the lock file is not its owner's to write")
+	_, again, _ := dir_try(dir)
+	testing.expectf(t, again == .In_Use, "a lock file made read-only is held twice: %v", again)
+	dir_unlock(lock)
+}

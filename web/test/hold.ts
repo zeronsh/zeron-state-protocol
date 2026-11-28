@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -207,6 +207,54 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
     const held = said.filter(({ said }) => said === "held").length;
     const refused = said.filter(({ said }) => IN_USE.test(said)).length;
     assert(held === 1 && refused === 5, `of six at once: ${said.map(({ said }) => said).join("; ")}`);
+  }
+}
+
+// A lock file made read-only, as Unix does with a mode and Windows with an attribute, is made its owner's to read and write
+// again, and held: SQLite would open it only to read, and begin a write that holds nothing, so that every device on it
+// opened the store. One that cannot be made so is refused, saying so, rather than held as nothing.
+{
+  const fs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
+  for (const mode of process.platform === "win32" ? [0o444] : [0o400, 0o444]) {
+    for (const size of [0, 1]) {
+      const dir = join(TMP, `read-only-${mode.toString(8)}-${size}`);
+      zspd("create", dir);
+      writeFileSync(join(dir, LOCK), Buffer.alloc(size, 0x78));
+      chmodSync(join(dir, LOCK), mode);
+      const d = await open({ dir, ...quiet });
+      const mine = statSync(join(dir, LOCK)).mode;
+      assert(process.platform === "win32" ? mine & 0o200 : (mine & 0o777) === 0o600, `the lock file is not its owner's to write: ${(mine & 0o777).toString(8)}`);
+      await assert.rejects(open({ dir, ...quiet }), IN_USE, "a second device in this process held it too");
+      const other = await holder(dir);
+      await killed(other.p);
+      assert.match(other.said, IN_USE, "a device in another process held it too");
+      const p = spawnSync(BIN, ["run", dir, "--listen=127.0.0.1:0", "--no-udp"], { encoding: "utf8", timeout: 30000 });
+      assert.match(p.stderr, IN_USE, "zspd held it too");
+      await d.close();
+    }
+  }
+  // As one of another's would be, which this process may not make its own: here, as its mode cannot be changed.
+  if (process.getuid?.() !== 0) {
+    const dir = join(TMP, "not-mine");
+    zspd("create", dir);
+    chmodSync(join(dir, LOCK), 0o444);
+    const unchanged = fs.chmodSync;
+    for (const chmod of [
+      () => {
+        throw Object.assign(new Error("not permitted"), { code: "EPERM" });
+      },
+      () => {}, // and as though it had been changed, which is not believed: the write SQLite begins says
+    ]) {
+      fs.chmodSync = chmod as typeof fs.chmodSync;
+      syncBuiltinESMExports();
+      try {
+        await assert.rejects(open({ dir, ...quiet }), /cannot be written by this process/);
+      } finally {
+        fs.chmodSync = unchanged;
+        syncBuiltinESMExports();
+      }
+    }
+    chmodSync(join(dir, LOCK), 0o600);
   }
 }
 
