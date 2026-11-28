@@ -15,6 +15,7 @@ Socket_Option :: enum {
 	Broadcast,           // bool
 	TCP_Nodelay,         // bool
 	Receive_Buffer_Size, // int, bytes: what the system grants may differ (see socket_option)
+	Receive_Buffer_Size_Forced, // int, bytes: Linux only, SO_RCVBUFFORCE, beyond net.core.rmem_max; needs CAP_NET_ADMIN
 	Send_Buffer_Size,    // int, bytes
 	Receive_Timeout,     // time.Duration, of blocking reads
 }
@@ -36,7 +37,7 @@ Socket_Option_Error :: enum {
 kind :: proc(option: Socket_Option) -> typeid {
 	switch option {
 	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay: return bool
-	case .Receive_Buffer_Size, .Send_Buffer_Size:               return int
+	case .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size: return int
 	case .Receive_Timeout:                                      return time.Duration
 	}
 	return nil

@@ -13,6 +13,7 @@ name :: proc(option: Socket_Option) -> (level, opt: i32, ok: bool) {
 	case .Broadcast:           return win.SOL_SOCKET, win.SO_BROADCAST, true
 	case .TCP_Nodelay:         return win.IPPROTO_TCP, win.TCP_NODELAY, true
 	case .Receive_Buffer_Size: return win.SOL_SOCKET, win.SO_RCVBUF, true
+	case .Receive_Buffer_Size_Forced: return 0, 0, false // Linux's
 	case .Send_Buffer_Size:    return win.SOL_SOCKET, win.SO_SNDBUF, true
 	case .Receive_Timeout:     return win.SOL_SOCKET, win.SO_RCVTIMEO, true
 	}
@@ -51,7 +52,7 @@ _socket_option :: proc(s: net.Socket, option: Socket_Option) -> (value: Socket_O
 	}
 	switch option {
 	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay: value = x != 0
-	case .Receive_Buffer_Size, .Send_Buffer_Size:               value = int(x)
+	case .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size: value = int(x)
 	case .Receive_Timeout:                                      value = time.Duration(u32(x)) * time.Millisecond
 	}
 	return

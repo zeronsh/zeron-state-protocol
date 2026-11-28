@@ -51,6 +51,20 @@ socket_options_hold_what_was_asked :: proc(t: ^testing.T) {
 		}
 	}
 
+	// Forced (Linux): granted twice what is asked, where privileged; refused otherwise, and the size asked stands.
+	when ODIN_OS == .Linux {
+		ferr, fcode := nbio.set_socket_option(udp, .Receive_Buffer_Size_Forced, 3 << 20)
+		fgot, _, _ := nbio.socket_option(udp, .Receive_Buffer_Size)
+		if ferr == nil {
+			testing.expectf(t, fgot == 2 * (3 << 20), "Receive_Buffer_Size_Forced 3 MiB reads back %v", fgot)
+		} else {
+			testing.expectf(t, ferr == .System && fcode == 1, "Receive_Buffer_Size_Forced refused otherwise than EPERM: %v, %d", ferr, fcode)
+		}
+	} else {
+		ferr, _ := nbio.set_socket_option(udp, .Receive_Buffer_Size_Forced, 3 << 20)
+		testing.expect_value(t, ferr, nbio.Socket_Option_Error.Unsupported)
+	}
+
 	// A timeout, of blocking reads.
 	want := 200 * time.Millisecond
 	terr, tcode := nbio.set_socket_option(tcp, .Receive_Timeout, want)

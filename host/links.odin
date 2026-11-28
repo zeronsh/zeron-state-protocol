@@ -917,15 +917,21 @@ Batch :: struct {
 // hearing from it, LINK_WINDOW (1 MiB) of stream data, which is some 750 datagrams of PACKET_MAX, with room over:
 // measured, Windows and macOS hold what they are granted in datagrams' bytes (1 MiB held 706 to 723 of them, 2 MiB
 // 1413 to 1444), where their defaults (64 KiB, 768 KiB) held 46 and 530. Linux grants twice what it is asked within
-// twice net.core.rmem_max (212992 by default, so 425984, some 185 datagrams), and no more without that raised: what was
-// granted is said once, at debug. core:net's set_option gave it whatever the low bytes of a pointer said (see
+// twice net.core.rmem_max (212992 by default, so 425984, some 185 datagrams), which a stalled loop overflows: a reader
+// stalled 5 ms of every 50 lost 5.3% of a paced 1 Gbit/s, 10 ms 13.1% (0.0% up to 2 ms; at 300 Mbit/s 0.0% up to 5 ms,
+// 10 ms 4.8%), where 2 MiB forced (SO_RCVBUFFORCE, granted 4 MiB) lost none at 10 ms. So it is forced where the host
+// may (CAP_NET_ADMIN), and asked within rmem_max where not. What was granted is said once, at debug. core:net's set_option gave it whatever the low bytes of a pointer said (see
 // third_party/nbio/socket_option.odin).
 UDP_RECEIVE_BUFFER :: 2 << 20
 
 @(private)
 udp_receive_buffer :: proc(socket: net.UDP_Socket) {
-	if err, code := nbio.set_socket_option(socket, .Receive_Buffer_Size, UDP_RECEIVE_BUFFER); err != nil {
-		report(.Debug, "the UDP receive buffer could not be set: ", fmt.tprint(err, code))
+	// On Linux, beyond net.core.rmem_max where the host may (CAP_NET_ADMIN), else within it.
+	forced, _ := nbio.set_socket_option(socket, .Receive_Buffer_Size_Forced, UDP_RECEIVE_BUFFER)
+	if forced != nil {
+		if err, code := nbio.set_socket_option(socket, .Receive_Buffer_Size, UDP_RECEIVE_BUFFER); err != nil {
+			report(.Debug, "the UDP receive buffer could not be set: ", fmt.tprint(err, code))
+		}
 	}
 	if got, err, _ := nbio.socket_option(socket, .Receive_Buffer_Size); err == nil {
 		report(.Debug, "the UDP receive buffer, asked for ", fmt.tprint(UDP_RECEIVE_BUFFER), ", is ", fmt.tprint(got))

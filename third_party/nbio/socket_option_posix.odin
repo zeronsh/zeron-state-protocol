@@ -18,6 +18,12 @@ name :: proc(option: Socket_Option) -> (level: i32, opt: posix.Sock_Option, ok: 
 	case .Broadcast:           return posix.SOL_SOCKET, .BROADCAST, true
 	case .TCP_Nodelay:         return posix.IPPROTO_TCP, posix.Sock_Option(posix.TCP_NODELAY), true
 	case .Receive_Buffer_Size: return posix.SOL_SOCKET, .RCVBUF, true
+	case .Receive_Buffer_Size_Forced:
+		when ODIN_OS == .Linux {
+			return posix.SOL_SOCKET, posix.Sock_Option(33), true // SO_RCVBUFFORCE; read back, it is SO_RCVBUF
+		} else {
+			return 0, nil, false
+		}
 	case .Send_Buffer_Size:    return posix.SOL_SOCKET, .SNDBUF, true
 	case .Receive_Timeout:     return posix.SOL_SOCKET, .RCVTIMEO, true
 	}
@@ -58,11 +64,14 @@ _socket_option :: proc(s: net.Socket, option: Socket_Option) -> (value: Socket_O
 		n := posix.socklen_t(size_of(x))
 		if posix.getsockopt(posix.FD(s), level, opt, &x, &n) != .OK { return nil, .System, int(posix.errno()) }
 		value = time.Duration(x.tv_sec) * time.Second + time.Duration(x.tv_usec) * time.Microsecond
-	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay, .Receive_Buffer_Size, .Send_Buffer_Size:
+	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay, .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size:
+		if option == .Receive_Buffer_Size_Forced {
+			opt = .RCVBUF
+		}
 		x: i32
 		n := posix.socklen_t(size_of(x))
 		if posix.getsockopt(posix.FD(s), level, opt, &x, &n) != .OK { return nil, .System, int(posix.errno()) }
-		if option == .Receive_Buffer_Size || option == .Send_Buffer_Size {
+		if option == .Receive_Buffer_Size || option == .Receive_Buffer_Size_Forced || option == .Send_Buffer_Size {
 			value = int(x)
 		} else {
 			value = x != 0
