@@ -9,7 +9,7 @@ import "core:testing"
 
 @(private = "file")
 unhex :: proc(s: string) -> []byte {
-	b, ok := hex.decode(transmute([]byte)s, context.temp_allocator)
+	b, ok := hex_decode(transmute([]byte)s, context.temp_allocator)
 	assert(ok)
 	return b
 }

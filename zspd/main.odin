@@ -258,7 +258,7 @@ say :: proc(to: ^os.File, parts: ..string) {
 
 @(require_results)
 parse_hex :: proc(s: string, size: int) -> (b: []byte, ok: bool) {
-	b = hex.decode(transmute([]byte)s, context.temp_allocator) or_return
+	b = zsp.hex_decode(transmute([]byte)s, context.temp_allocator) or_return
 	return b, len(b) == size
 }
 

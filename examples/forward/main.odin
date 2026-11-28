@@ -341,7 +341,7 @@ run :: proc() -> int {
 				return 2
 			}
 			port, parsed := strconv.parse_int(parts[0])
-			key, hexed := hex.decode(transmute([]byte)parts[1], context.temp_allocator)
+			key, hexed := zsp.hex_decode(transmute([]byte)parts[1], context.temp_allocator)
 			if !parsed || port < 0 || port > 65535 || !hexed || len(key) != 32 {
 				os.write_string(os.stderr, USAGE)
 				return 2
@@ -385,7 +385,7 @@ run :: proc() -> int {
 	// The space and its relay, as zspd create, join and relay left them.
 	space: zsp.Key32
 	name, err := os.read_entire_file(in_dir(dir, "space"), context.temp_allocator)
-	if bytes, hexed := hex.decode(transmute([]byte)strings.trim_space(string(name)), context.temp_allocator); err != nil || !hexed || copy(space[:], bytes) != 32 {
+	if bytes, hexed := zsp.hex_decode(transmute([]byte)strings.trim_space(string(name)), context.temp_allocator); err != nil || !hexed || copy(space[:], bytes) != 32 {
 		os.write_string(os.stderr, "no space here: make or join one with zspd first\n")
 		return 1
 	}
@@ -404,7 +404,7 @@ run :: proc() -> int {
 		key: []byte
 		hexed: bool
 		if len(parts) == 2 {
-			key, hexed = hex.decode(transmute([]byte)parts[0], context.temp_allocator)
+			key, hexed = zsp.hex_decode(transmute([]byte)parts[0], context.temp_allocator)
 		}
 		relay: zsp.Key32
 		if !hexed || copy(relay[:], key) != 32 {
