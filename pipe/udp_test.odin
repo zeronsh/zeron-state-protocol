@@ -542,6 +542,59 @@ link_probe_unanswered_sends_the_oldest :: proc(t: ^testing.T) {
 	testing.expectf(t, a.state == .Open && got == written, "%v, %d of %d delivered, %d held early", a.state, got, written, b.early)
 }
 
+// A probe that sends the oldest again carries it, whatever else there is to send. Else a more urgent stream's new data
+// filled it, which the peer may be unable to take, its table of what came early being full, as it was the probe before:
+// each probe was refused alike, and what would have filled the first hole never went.
+@(test)
+link_probe_carries_the_oldest :: proc(t: ^testing.T) {
+	state := rand.create(12)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	n.delay = 500
+	for i in 0 ..< 50 {
+		link_write(&n.links[i % 2], 0, {1, 2, 3})
+		for net_step(&n) {
+		}
+	}
+	a := &n.links[0]
+	less, opened := link_open(a, 5)
+	testing.expect(t, opened)
+	more, opened_too := link_open(a, 4)
+	testing.expect(t, opened_too)
+	// The less urgent in flight, all of it lost: what it sent first is the oldest in flight.
+	chunk: [8 << 10]byte
+	testing.expect(t, link_write(a, less, chunk[:]))
+	n.loss = 1
+	net_push(&n, 0)
+	n.loss = 0
+	testing.expect(t, stream_find(a, less).out_next > 0 && a.in_flight > 0)
+	// Then the more urgent has much to say, which only a probe may carry: the window is full.
+	for link_room(a, more) >= len(chunk) && f64(a.held) < 4 * a.window {
+		testing.expect(t, link_write(a, more, chunk[:]))
+	}
+	a.window = f64(a.in_flight)
+	buf: [PACKET_MAX]byte
+	// The first probe carries what is new; the second, the first one being unanswered, the oldest again.
+	for probe in 1 ..= 2 {
+		n.now = link_timeout(a)
+		first := link_next(a)
+		for link_output(a, buf[:], n.now) != nil {
+		}
+		testing.expectf(t, a.probes == probe && link_next(a) > first, "probe %d not sent", probe)
+		carried := false
+		for &p, k in link_sent(a) {
+			if a.sent_base + u64(k) >= first {
+				for c in link_chunks(a, &p) {
+					carried ||= c.id == less && c.lo == 0
+				}
+			}
+		}
+		testing.expectf(t, carried == (probe == 2), "probe %d carried the oldest: %v", probe, carried)
+	}
+}
+
 // A link a relay carries, whose packets are larger than a datagram's, outlasts a pause with much in flight and then
 // sends all of it: its window, cut down while it waited and after, still holds one of its packets.
 @(test)

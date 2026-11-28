@@ -146,6 +146,7 @@ Link :: struct {
 	probes:      int,
 	quiet_since: Time, // since when nothing was heard of what is in flight, while probing
 	want_probe:  bool,
+	resend:      Maybe(u64), // the stream whose oldest data a probe sends again, which it carries first
 	closing:     bool,
 
 	// The path, as measured. Rates are bytes per microsecond.
@@ -1553,6 +1554,14 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 	if room || acking {
 		eliciting ||= link_put_control(l, &w, &p)
 	}
+	// What a probe sends again goes first, whatever is more urgent: what else there is may be what the peer cannot take
+	// until it has this, as the probe before it, unanswered, was.
+	if id, resend := l.resend.?; resend && room {
+		l.resend = nil
+		if s := stream_find(l, id); s != nil {
+			eliciting ||= link_put_lost(l, &w, &p, s)
+		}
+	}
 	if room && len(l.datagrams) > 0 {
 		d := l.datagrams[0]
 		if w.pos + 4 + len(d) <= limit {
@@ -1691,17 +1700,41 @@ link_put_streams :: proc(l: ^Link, w: ^Writer, p: ^Sent) -> (said: bool) {
 				s.list = .None
 				continue
 			}
-			put(w, byte(Frame.Fin if fin else Frame.Stream))
-			put_varint(w, s.id)
-			put_varint(w, r.lo)
-			put_varint(w, r.hi - r.lo)
-			put_bytes(w, s.out[s.out_head:][r.lo - s.out_base:r.hi - s.out_base])
-			link_chunk(l, p, {id = s.id, lo = r.lo, hi = r.hi, kind = .Fin if fin else .Data})
+			stream_put(l, w, p, s, r, fin)
 			s.deficit -= int(r.hi - r.lo) + 8
 			said = true
 		}
 	}
 	return
+}
+
+// What a stream has lost, as much as there is room for.
+@(private)
+link_put_lost :: proc(l: ^Link, w: ^Writer, p: ^Sent, s: ^Stream) -> (said: bool) {
+	for s.reset == .None {
+		stream_prune_lost(s)
+		space := len(w.buf) - w.pos - 32 // frame type, id, offset, length
+		if (len(s.lost) == 0 && !s.fin_lost) || space <= 0 || p.chunks >= max(u16) {
+			return
+		}
+		r, fin := stream_take(l, s, space)
+		if r.lo == r.hi && !fin {
+			return
+		}
+		stream_put(l, w, p, s, r, fin)
+		said = true
+	}
+	return
+}
+
+@(private)
+stream_put :: proc(l: ^Link, w: ^Writer, p: ^Sent, s: ^Stream, r: Range, fin: bool) {
+	put(w, byte(Frame.Fin if fin else Frame.Stream))
+	put_varint(w, s.id)
+	put_varint(w, r.lo)
+	put_varint(w, r.hi - r.lo)
+	put_bytes(w, s.out[s.out_head:][r.lo - s.out_base:r.hi - s.out_base])
+	link_chunk(l, p, {id = s.id, lo = r.lo, hi = r.hi, kind = .Fin if fin else .Data})
 }
 
 @(private)
@@ -1758,6 +1791,12 @@ link_expire :: proc(l: ^Link, now: Time) {
 	}
 	for &p in link_sent(l) {
 		if p.time != 0 {
+			for c in link_chunks(l, &p) {
+				if c.kind == .Data || c.kind == .Fin {
+					l.resend = c.id
+					break
+				}
+			}
 			size, probe := p.size, p.probe
 			link_lose(l, &p)
 			if !probe {
