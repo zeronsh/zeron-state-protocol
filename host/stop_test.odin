@@ -140,3 +140,42 @@ loop_does_not_wait_for_the_log_fsync :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.node.store.synced, tail)
 	testing.expect(t, !zsp.store_flying(&s.node.store) && !s.node.failed)
 }
+
+// A checkpoint too: its pages are written as it is begun, and the fsyncs it waits for, the log's and the page file's
+// and then its header's, are the disk's to make while the loop goes on. The store counts on it only once all are done.
+@(test)
+loop_does_not_wait_for_a_checkpoint :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-fsync-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer delete(dir)
+	defer os.remove_all(dir)
+	h: Host
+	testing.expect(t, host_init(&h, {dir = dir, full = true}))
+	defer host_destroy(&h)
+	space: zsp.Key32
+	crypto.rand_bytes(space[:])
+	s := space_open(&h, space)
+	body: [1000]byte
+	for i in 0 ..< u64(zsp.CHECKPOINT_TAIL / len(body) + 8) {
+		cell := zsp.Cell{row = zsp.Id{1, 100 + i}, slot = 16, kind = .Value, stamp = zsp.Stamp{1000 + i, 1}, body = body[:]}
+		zsp.store_commit(&s.node.store, []zsp.Cell{cell}, 0, own = false)
+	}
+	testing.expect(t, zsp.store_wants_checkpoint(&s.node.store))
+	generation := s.node.store.generation
+	h.syncing, h.sync_due = true, time.tick_now()
+	host_settle(&h)
+	testing.expect(t, s.node.store.flight.step != .None, "the checkpoint is under way")
+	testing.expect(t, s.node.store.generation == generation, "and not yet counted on")
+	start := time.tick_now()
+	for zsp.store_flying(&s.node.store) && time.tick_since(start) < 10 * time.Second {
+		wait := time.Duration(10 * time.Millisecond)
+		if due, ok := host_deadline(&h); ok {
+			wait = min(wait, max(time.tick_diff(time.tick_now(), due), 0))
+		}
+		testing.expect(t, nbio.tick(wait) == nil)
+		host_settle(&h)
+	}
+	testing.expect_value(t, s.node.store.generation, generation + 1)
+	testing.expect(t, s.node.store.checkpoint == s.node.store.synced && !s.node.failed)
+}

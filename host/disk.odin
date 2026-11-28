@@ -167,6 +167,20 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			d.dirty = false // what is written from now on is for the next
 			return fsync_start(d.host, d.active, token)
 		}
+		disk.page_sync_start = proc(data: rawptr, token: u64) -> bool {
+			d := (^File_Disk)(data)
+			since := ticks_now()
+			defer ticks_disk(.Page_Sync_Start, since)
+			if d.tree == nil {
+				return fsync_start(d.host, nil, token)
+			}
+			// Read from the mapping from now on, durable or not: so it must reach every page written.
+			size, err := os.file_size(d.tree)
+			if err != nil || (int(size) != len(d.mapped) && !file_remap(d)) {
+				return false
+			}
+			return fsync_start(d.host, d.tree, token)
+		}
 	}
 	return disk
 }

@@ -24,6 +24,9 @@ Disk :: struct {
 	// says how it ended, by store_disk_synced with the same token, once it has: never before this returns. Nil where
 	// a sync is had only by waiting for it. See Flight.
 	log_sync_start: proc(data: rawptr, token: u64) -> bool,
+	// The same, for pages written: what `page` returned is no longer valid once this returns, and every page written is
+	// read by it from then on, durable or not. Nil where there is no log_sync_start, or a page sync must be waited for.
+	page_sync_start: proc(data: rawptr, token: u64) -> bool,
 }
 
 // A disk in memory, which can also forget everything that was not synced.

@@ -663,13 +663,13 @@ node_sync :: proc(n: ^Node) -> bool {
 }
 
 // The same, as far as the disk lets it be done without waiting: the log's sync begun, to release what waits for it once
-// the host says it is done (store_disk_synced). A checkpoint that is due is made now. False if storage has failed.
+// the host says it is done (store_disk_synced), and a checkpoint that is due begun likewise. False if storage has failed.
 node_sync_start :: proc(n: ^Node) -> bool {
 	if !store_sync_start(&n.store) || n.failed {
 		return false
 	}
 	if store_wants_checkpoint(&n.store) {
-		store_checkpoint(&n.store) or_return
+		store_checkpoint_start(&n.store) or_return
 	}
 	retain_grown(n)
 	return true

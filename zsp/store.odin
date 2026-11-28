@@ -76,7 +76,21 @@ Flight :: struct {
 	log:        u64, // the token of the log sync under way, or 0
 	log_upto:   u64, // the log's end when it was begun: what it makes durable
 	again:      bool, // more was written since it began, and is to be made durable once it is done
+	// A checkpoint under way: see store_checkpoint_start.
+	step:       enum u8 {
+		None,
+		Durable, // its pages written, and waiting for them and the log as far as point.log to be durable
+		Header, // its header written, and waiting for that to be durable
+	},
+	pages:      u64, // the token of the page sync under way, or 0
+	point:      Header, // what its header says
+	point_tail: Header_Tail,
+	reuse:      [dynamic]Page_No, // given up by the trees it names, but not the last's: reusable once it is durable
+	victims:    [dynamic]u64, // segments it evacuated, to be dropped once it is durable
 }
+
+// What may change in copies while a checkpoint is under way, at most: more, and a commit waits for it to be done.
+FLIGHT_DIRTY :: 2 * CHECKPOINT_DIRTY
 
 // Tokens for what is under way, never the same twice in a process, whichever store asks: so that what comes back for
 // a store that is gone, or for a sync that was overtaken, is known for that and passed over.
@@ -217,6 +231,8 @@ store_close :: proc(s: ^Store) {
 	delete(s.repair_added)
 	delete(s.evacuated)
 	delete(s.dropped)
+	delete(s.flight.reuse)
+	delete(s.flight.victims)
 	delete(s.fresh)
 	delete(s.retired)
 	ring_destroy(&s.events)
@@ -500,6 +516,12 @@ record_size :: proc(cells: []Cell) -> int {
 // Merges cells into the store and returns how many were news. The accepted ones become one atomic
 // log record; stale ones cost nothing.
 store_commit :: proc(s: ^Store, cells: []Cell, origin: u32 = 0, own := false) -> (accepted: int) {
+	if s.flight.step != .None && len(s.dirty) > FLIGHT_DIRTY {
+		// What changed while a checkpoint is under way has come to as much as may be held: this waits for it.
+		if !flight_land(s) {
+			return 0
+		}
+	}
 	size := record_size(cells)
 	assert(size <= MAX_RECORD)
 	tail := store_tail(s)
@@ -861,21 +883,28 @@ store_disk_synced :: proc(s: ^Store, token: u64, ok: bool) -> bool {
 		if f.again {
 			store_sync_start(s) or_return
 		}
+	case token == f.pages:
+		f.pages = 0
+		if !ok {
+			s.failed = true
+			return false
+		}
 	case:
+		return !s.failed
 	}
-	return !s.failed
+	return flight_advance(s)
 }
 
 // Whether the disk is making something durable for a store: what a store_disk_synced with this token would be heard.
 @(require_results)
 store_awaits :: proc(s: ^Store, token: u64) -> bool {
-	return token != 0 && token == s.flight.log
+	return token != 0 && (token == s.flight.log || token == s.flight.pages)
 }
 
 // Whether the store is waiting for the disk.
 @(require_results)
 store_flying :: proc(s: ^Store) -> bool {
-	return s.flight.log != 0
+	return s.flight.log != 0 || s.flight.step != .None
 }
 
 // Makes every commit so far durable.
@@ -896,14 +925,16 @@ store_wants_checkpoint :: proc(s: ^Store) -> bool {
 	return store_tail(s) - s.checkpoint > CHECKPOINT_TAIL || len(s.dirty) > CHECKPOINT_DIRTY || s.serial != s.serial_kept || s.whole != s.whole_kept
 }
 
-// Writes the trees, so that the log before this point need never be replayed.
+// Writes the trees, so that the log before this point need never be replayed. A checkpoint under way without waiting
+// (store_checkpoint_start) is finished first, waiting for it.
 store_checkpoint :: proc(s: ^Store) -> bool {
 	if s.remote != nil {
 		// Made a step at a time, and put in object storage whenever it is: see remote_work.
 		s.remote.want_checkpoint = true
 		return !s.failed
 	}
-	if s.replaying || (s.checkpoint == store_tail(s) && len(s.dirty) == 0 && s.serial == s.serial_kept && s.whole == s.whole_kept) {
+	flight_land(s) or_return
+	if s.replaying || !checkpoint_wanted(s) {
 		return true
 	}
 	// Where storage may answer "not yet", evacuation is a job of its own (evac_steps), done before.
@@ -912,7 +943,64 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 	if s.failed {
 		return false
 	}
+	point_write(s, victims) or_return
+	if !s.disk.page_sync(s.disk.data) || !point_header(s) || !s.disk.page_sync(s.disk.data) {
+		s.failed = true
+		return false
+	}
+	point_done(s)
+	return true
+}
 
+// The same, where the disk can make what is written durable without the store waiting (Disk.log_sync_start and
+// page_sync_start): the pages are written now, and the checkpoint goes on as the disk says each sync is done
+// (store_disk_synced). Until it is done, the last one stands: whatever is changed meanwhile is changed in copies, for
+// the next. One is under way at a time; else it is store_checkpoint. False if the store has failed.
+//
+// What the disk is asked, in order, each step only once the one before is durable:
+//
+//   1. the dirty pages, written to numbers the last durable checkpoint does not use; and the log, made durable as
+//      far as the trees reach (its end now);
+//   2. the header, naming those trees and that end, in the slot the last durable header is not in;
+//   3. only then are the pages that checkpoint no longer uses reused, and segments it evacuated dropped.
+//
+// Power lost anywhere before 2 is durable leaves the last header standing, and everything it names, with the log it
+// replays from: 1 wrote nothing it names, and dropped nothing. A header torn by it does not sum, and the other is read.
+store_checkpoint_start :: proc(s: ^Store) -> bool {
+	if s.disk.log_sync_start == nil || s.disk.page_sync_start == nil || s.remote != nil || store_lazy(s) {
+		return store_checkpoint(s)
+	}
+	if s.flight.step != .None || s.replaying || !checkpoint_wanted(s) {
+		return !s.failed
+	}
+	victims := evacuate(s)
+	store_flush(s) or_return
+	if s.failed {
+		return false
+	}
+	point_write(s, victims) or_return
+	f := &s.flight
+	f.step = .Durable
+	f.pages = flight_token()
+	if !s.disk.page_sync_start(s.disk.data, f.pages) {
+		f.pages = 0
+		s.failed = true
+		return false
+	}
+	store_sync_start(s) or_return // the log as far as the trees reach, or the next sync if one is under way already
+	return flight_advance(s)
+}
+
+@(private)
+checkpoint_wanted :: proc(s: ^Store) -> bool {
+	return s.checkpoint != store_tail(s) || len(s.dirty) != 0 || s.serial != s.serial_kept || s.whole != s.whole_kept
+}
+
+// Writes the dirty pages, and holds what the header that names them will say: from now on the trees are changed in
+// copies. The log must be flushed.
+@(private)
+point_write :: proc(s: ^Store, victims: []u64) -> bool {
+	f := &s.flight
 	nos := slice.map_keys(s.dirty, context.temp_allocator) or_else nil
 	slice.sort(nos)
 	for no in nos {
@@ -922,7 +1010,7 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 			return false
 		}
 	}
-	h := Header {
+	f.point = Header {
 		magic      = MAGIC,
 		generation = s.generation + 1,
 		log        = store_tail(s),
@@ -936,30 +1024,43 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 		repair     = s.repair.root,
 		next       = s.next,
 	}
-	h.sum = header_sum(&h)
-	tail := Header_Tail{flags = {whole = s.whole}, used = s.used.root}
-	tail.sum = tail_sum(&h, &tail)
-	block: [512]byte
-	copy(block[:], ([^]byte)(&h)[:size_of(h)])
-	copy(block[size_of(h):], ([^]byte)(&tail)[:size_of(tail)])
-	ok := s.disk.page_sync(s.disk.data)
-	ok = ok && s.disk.page_write(s.disk.data, Page_No(h.generation % HEADER_PAGES), block[:])
-	ok = ok && s.disk.page_sync(s.disk.data)
-	if !ok {
-		s.failed = true
-		return false
-	}
-
-	s.generation = h.generation
-	s.checkpoint, s.serial_kept = h.log, h.serial
-	s.whole_kept = tail.flags.whole
+	f.point.sum = header_sum(&f.point)
+	f.point_tail = Header_Tail{flags = {whole = s.whole}, used = s.used.root}
+	f.point_tail.sum = tail_sum(&f.point, &f.point_tail)
+	// Written, they are read from the disk from now on, and a change to one is made in a copy under another number: as
+	// to any page the last durable checkpoint names. Those it no longer uses are reused only once this one is durable.
 	for no in nos {
 		free(s.dirty[no])
 	}
 	clear(&s.dirty)
-	append(&s.free, ..s.pending[:])
+	append(&f.reuse, ..s.pending[:])
 	clear(&s.pending)
-	for seg in victims {
+	clear(&f.victims)
+	append(&f.victims, ..victims)
+	return true
+}
+
+// Writes the header of the checkpoint under way, once all it names is durable.
+@(private)
+point_header :: proc(s: ^Store) -> bool {
+	f := &s.flight
+	block: [512]byte
+	copy(block[:], ([^]byte)(&f.point)[:size_of(Header)])
+	copy(block[size_of(Header):], ([^]byte)(&f.point_tail)[:size_of(Header_Tail)])
+	return s.disk.page_write(s.disk.data, Page_No(f.point.generation % HEADER_PAGES), block[:])
+}
+
+// The checkpoint under way is durable, header and all: the store counts on it from now on.
+@(private)
+point_done :: proc(s: ^Store) {
+	f := &s.flight
+	s.generation = f.point.generation
+	s.checkpoint, s.serial_kept = f.point.log, f.point.serial
+	s.whole_kept = f.point_tail.flags.whole
+	s.synced = max(s.synced, f.point.log) // as it was made durable before the header was written
+	append(&s.free, ..f.reuse[:])
+	clear(&f.reuse)
+	for seg in f.victims {
 		// Forgotten only now: after a crash before this point the segment is simply evacuated again.
 		s.disk.log_drop(s.disk.data, seg)
 		if store_lazy(s) {
@@ -968,7 +1069,66 @@ store_checkpoint :: proc(s: ^Store) -> bool {
 			tree_delete(s, &s.waste, {0, 0, 0, 0, seg})
 		}
 	}
+	clear(&f.victims)
 	clear(&s.evacuated)
+	f.step = .None
+}
+
+// Takes the checkpoint under way a step further, as far as what the disk has said lets it.
+@(private)
+flight_advance :: proc(s: ^Store) -> bool {
+	f := &s.flight
+	if s.failed {
+		return false
+	}
+	switch f.step {
+	case .None:
+	case .Durable:
+		if f.pages != 0 || s.synced < f.point.log {
+			break
+		}
+		if !point_header(s) {
+			s.failed = true
+			return false
+		}
+		f.step = .Header
+		f.pages = flight_token()
+		if !s.disk.page_sync_start(s.disk.data, f.pages) {
+			f.pages = 0
+			s.failed = true
+			return false
+		}
+	case .Header:
+		if f.pages == 0 {
+			point_done(s)
+		}
+	}
+	return true
+}
+
+// Finishes the checkpoint under way, if any, waiting for each sync it still wants: as when another is to be made at
+// once, or what has changed since it began has come to more than may be held. What the disk then says of the syncs
+// under way is passed over.
+@(private)
+flight_land :: proc(s: ^Store) -> bool {
+	f := &s.flight
+	switch f.step {
+	case .None:
+		return !s.failed
+	case .Durable:
+		f.pages = 0
+		if !store_sync(s) || !s.disk.page_sync(s.disk.data) || !point_header(s) || !s.disk.page_sync(s.disk.data) {
+			s.failed = true
+			return false
+		}
+	case .Header:
+		f.pages = 0
+		if !s.disk.page_sync(s.disk.data) {
+			s.failed = true
+			return false
+		}
+	}
+	point_done(s)
 	return true
 }
 
