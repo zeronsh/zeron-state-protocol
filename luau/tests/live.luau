@@ -573,8 +573,12 @@ run(function()
 		counted.stop()
 		asked.stop()
 		local best: any
+		local answered: (() -> ())? = nil -- looks at what is answered, as it is
 		local searched = b:ask({ scope = 1, table = Track, where = w.matches("words", "quick foxes", { any = true }), order = { "best" }, limit = 20 }, function(s)
 			best = s
+			if answered then
+				answered()
+			end
 		end)
 		eventually("the best come first", function()
 			return best.status == "ready" and #best.rows == 20 and best.rows[1].words == "The quick brown foxes"
@@ -600,17 +604,26 @@ run(function()
 			return editor.read() == "The quick brown foxes ju"
 		end)
 		task.wait(0.1)
-		local began = os.clock()
-		editor.append("mp")
-		eventually("live text shows in an answer", function()
+		-- By live frames, before the piece is sealed: what an answer first shows of them is live yet, however slow the machine,
+		-- as with the streamed tokens above.
+		local live: boolean? = nil
+		answered = function()
+			if live ~= nil then
+				return
+			end
 			for _, row in best.rows do
-				if row.id == typed then
-					return row.words == "The quick brown foxes jump"
+				if row.id == typed and row.words == "The quick brown foxes jump" then
+					local t = b.rows[typed] and b.rows[typed].texts[Track.words.slot]
+					live = t ~= nil and zsp.Text.provisional(t)
 				end
 			end
-			return false
+		end
+		editor.append("mp")
+		eventually("live text shows in an answer", function()
+			return live ~= nil
 		end)
-		assert(os.clock() - began < 0.5, "as it is typed, not once it is sealed")
+		answered = nil
+		assert(live, "as it is typed, not once it is sealed")
 		local other = b:text(typed, Track.words)
 		other.append("!")
 		eventually("and what others write there is heard", function()
