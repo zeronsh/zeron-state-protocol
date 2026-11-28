@@ -232,7 +232,8 @@ loop_keeps_what_the_system_said_of_a_refusal :: proc(t: ^testing.T) {
 
 // A timeout whose callback removes the timeout due after it. On Windows core:nbio (dev-2026-11) went through the
 // timeouts due with an iterator that held the next one meanwhile: the callback freed it under the iterator, which then
-// went on from freed memory. Meaningful on Windows; elsewhere timeouts are kept otherwise, and this is only a removal.
+// went on from freed memory. Meaningful on Windows, which completes timeouts due together in the order they are due;
+// elsewhere the system hands them over in an order of its own, the later may come first, and is then not removed.
 @(test)
 loop_lets_a_timeout_remove_the_one_after_it :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
@@ -244,14 +245,17 @@ loop_lets_a_timeout_remove_the_one_after_it :: proc(t: ^testing.T) {
 	}
 	o: Timeouts
 	o.later = nbio.timeout_poly(30 * time.Millisecond, &o, proc(_: ^nbio.Operation, o: ^Timeouts) {
-		o.gone = true // removed: never to come
+		o.gone = true // to be removed, and never to come where timeouts come in order
+		o.later = nil // done with: no longer to be removed
 	})
 	nbio.timeout_poly(60 * time.Millisecond, &o, proc(_: ^nbio.Operation, o: ^Timeouts) {
 		o.last = true
 	})
 	nbio.timeout_poly(time.Millisecond, &o, proc(_: ^nbio.Operation, o: ^Timeouts) {
 		o.first = true
-		nbio.remove(o.later)
+		if o.later != nil {
+			nbio.remove(o.later)
+		}
 	})
 	// Not ticked until all three are due, so that the loop finds them due together, in order.
 	time.sleep(100 * time.Millisecond)
@@ -259,7 +263,8 @@ loop_lets_a_timeout_remove_the_one_after_it :: proc(t: ^testing.T) {
 	for !o.last && time.tick_since(start) < 5 * time.Second {
 		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
 	}
-	testing.expectf(t, o.first && o.last && !o.gone, "the first came %v, the last %v, the one removed %v", o.first, o.last, o.gone)
+	in_order := ODIN_OS == .Windows
+	testing.expectf(t, o.first && o.last && !(in_order && o.gone), "the first came %v, the last %v, the one removed %v", o.first, o.last, o.gone)
 }
 
 // An operation with a timeout, done while the changes kqueue is to be given have overflowed what one call gives it, and
