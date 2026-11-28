@@ -130,11 +130,13 @@ Link :: struct {
 	in_max:      u64, // our permission, as last told
 	in_window:   u64,
 	in_moved:    Time, // when it was last moved
-	// The most of stream 0 that any stream's header, as this end wrote it, says it waits for. What stream 0 has yet to
-	// send of that is its own, of out_max: the peer gives back the link's window only as it delivers, and it delivers
-	// nothing that waits for stream 0 until stream 0 has come so far; so were the window all taken by what waits,
-	// nothing would ever move again.
+	// The most of stream 0 that a stream the peer may be holding bytes of says, in its header, that it waits for. What
+	// stream 0 has yet to send of that is its own, of out_max: the peer gives back the link's window only as it delivers,
+	// and it delivers nothing that waits for stream 0 until stream 0 has come so far; so were the window all taken by
+	// what waits, nothing would ever move again. A stream sends nothing until stream 0 has been written so far, so what
+	// is kept is only ever what stream 0 has to send anyway.
 	out_after:   u64,
+	out_after_gone: u64, // the most, of those let go of while the peer may still hold what they sent
 
 	// Sending.
 	datagrams:   [dynamic][]byte, // owned
@@ -432,9 +434,18 @@ link_write :: proc(l: ^Link, id: u64, bytes: []byte) -> bool {
 		return true
 	}
 	stream_head(l, s)
+	end := stream_end(s)
 	append(&s.out, ..bytes)
 	l.held += len(bytes)
 	stream_wake(l, s)
+	if id == 0 {
+		// Those that waited for stream 0 to be written so far may go on.
+		for x in l.streams[1:] {
+			if after := x.head_after.? or_else 0; x.headed && x.out_next == 0 && end < after && after <= stream_end(s) {
+				stream_wake(l, x)
+			}
+		}
+	}
 	return true
 }
 
@@ -599,7 +610,6 @@ stream_head :: proc(l: ^Link, s: ^Stream) {
 	n := 1
 	v := s.head_after.? or_else stream_end(zero)
 	s.head_after = v
-	l.out_after = max(l.out_after, v)
 	for v >= 0x80 {
 		head[n] = byte(v) | 0x80
 		v >>= 7
@@ -669,14 +679,22 @@ stream_unlist :: proc(l: ^Link, s: ^Stream) {
 	s.list = .None
 }
 
-// How far a stream may send new bytes: what was written, what the peer permits of it and of the link. Of the link's,
-// what stream 0 has yet to send of what streams wait for is its alone, at any urgency, and so is RESERVE beyond that
-// from bulk: stream 0 then always reaches what waits for it, which the peer then delivers and gives the window back for.
+// How far a stream may send new bytes: what was written, what the peer permits of it and of the link. A stream sends
+// nothing, its header neither, until as much of stream 0 as it waits for has been written: what is said to come after
+// what never comes is held here, and keeps no window from others. Of the link's window, what stream 0 has yet to send
+// of what streams wait for is then its alone, at any urgency, and so is RESERVE beyond that from bulk: stream 0 always
+// reaches what waits for it, which the peer then delivers and gives the window back for.
 @(private)
 stream_allowed :: proc(l: ^Link, s: ^Stream) -> u64 {
 	link := l.out_max
 	if s.id != 0 {
-		owed := l.out_after - min(l.out_after, l.streams[0].out_next)
+		zero := l.streams[0]
+		after := s.head_after.? or_else 0
+		if after > stream_end(zero) {
+			return s.out_next
+		}
+		most := max(l.out_after, after) // its own, once it sends, is kept for stream 0 too
+		owed := most - min(most, zero.out_next)
 		link = link - owed if link > owed else 0
 		if s.urgency > URGENT {
 			link = link - RESERVE if link > RESERVE else 0
@@ -731,6 +749,9 @@ stream_take :: proc(l: ^Link, s: ^Stream, n: int) -> (r: Range, fin: bool) {
 		}
 	} else if allowed := stream_allowed(l, s); s.out_next < allowed {
 		r = {s.out_next, min(allowed, s.out_next + u64(n))}
+		if s.out_next == 0 && s.id != 0 {
+			l.out_after = max(l.out_after, s.head_after.? or_else 0) // the peer may hold what it sends from now on
+		}
 		l.out_total += r.hi - r.lo
 		s.out_next = r.hi
 	} else {
@@ -780,30 +801,41 @@ peer_done_add :: proc(l: ^Link, n: u64) {
 	}
 }
 
+// Whether the peer may be holding what a stream sent until stream 0 reaches its `after`: from its first byte, until
+// its Reset is acknowledged, for then the peer has let go of all of it. Its Fin acknowledged is not enough: what came
+// before it may still wait.
 @(private)
-link_sweep :: proc(l: ^Link) {
-	owed := false // a stream let go of waited for as much of stream 0 as any, which it has yet to send
-	defer if owed {
-		most: u64
-		for s in l.streams[1:] {
-			if s.headed {
-				most = max(most, s.head_after.? or_else 0)
-			}
-		}
-		if most < l.out_after {
-			// Less of the window is stream 0's: those that waited for some of it may go on.
-			l.out_after = most
-			for s in l.streams {
-				stream_wake(l, s)
-			}
+stream_holds :: proc(s: ^Stream) -> bool {
+	return s.id != 0 && s.out_next > 0 && s.reset != .Acked
+}
+
+// Works out again how much of stream 0 what the peer may be holding waits for, once less of it may be: those that
+// waited for the window it kept may go on.
+@(private)
+link_recount_after :: proc(l: ^Link) {
+	most := l.out_after_gone
+	for s in l.streams[1:] {
+		if stream_holds(s) {
+			most = max(most, s.head_after.? or_else 0)
 		}
 	}
+	if most < l.out_after {
+		l.out_after = most
+		for s in l.streams {
+			stream_wake(l, s)
+		}
+	}
+}
+
+@(private)
+link_sweep :: proc(l: ^Link) {
 	#reverse for s, i in l.streams {
 		if !stream_finished(s) || s.listed_due {
 			continue
 		}
-		if after, said := s.head_after.?; said && after >= l.out_after && after > l.streams[0].out_next {
-			owed = true
+		if stream_holds(s) {
+			// Done with both ways, as far as each end has said, and yet what it sent may still wait for stream 0 there.
+			l.out_after_gone = max(l.out_after_gone, s.head_after.? or_else 0)
 		}
 		if s.list != .None {
 			stream_unlist(l, s)
@@ -1415,6 +1447,9 @@ chunk_acked :: proc(l: ^Link, c: Chunk) {
 	case .Reset:
 		if s.reset == .Sent {
 			s.reset = .Acked
+			if s.out_next > 0 && (s.head_after.? or_else 0) >= l.out_after {
+				link_recount_after(l) // the peer has let go of what it held of it
+			}
 		}
 	case .Stop, .Window, .Limit:
 	}
