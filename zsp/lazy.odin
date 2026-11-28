@@ -149,6 +149,7 @@ Session_Mark :: struct {
 	cells:                                    Cells_Frame,
 	seq_out, cursor, whole_to, seq_in, ack_at: u64,
 	whole:                                    Id,
+	ack_prior:                                type_of(Session{}.ack_prior),
 	fault:                                    Fault,
 	closing, ready, settled, told, missed:    bool,
 }
@@ -171,6 +172,7 @@ session_mark :: proc(s: ^Session) -> (m: Session_Mark) {
 		seq_in    = s.seq_in,
 		ack_at    = s.ack_at,
 		whole     = s.whole,
+		ack_prior = s.ack_prior,
 		fault     = s.fault,
 		closing   = s.closing,
 		ready     = s.ready,
@@ -205,7 +207,7 @@ session_restore :: proc(s: ^Session, m: ^Session_Mark) {
 	resize(&s.unacked, m.unacked)
 	s.cells = m.cells
 	s.seq_out, s.cursor, s.whole_to, s.seq_in, s.ack_at = m.seq_out, m.cursor, m.whole_to, m.seq_in, m.ack_at
-	s.whole = m.whole
+	s.whole, s.ack_prior = m.whole, m.ack_prior
 	s.fault, s.closing, s.ready, s.settled, s.told = m.fault, m.closing, m.ready, m.settled, m.told
 	s.missed ||= m.missed // and whatever fell off the ring meanwhile, which the cursor is behind again
 }

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Everything there is to do here: ./x [check|test|selftest|build|wasm|web|sim|bench [find|edits|mirror|web|partial|streams|aead]|nat|slow]
+# Everything there is to do here: ./x [check|test|selftest|build|wasm|web|sim|bench [find|edits|mirror|web|partial|streams|stalls|aead]|nat|slow]
 set -eu
 cd "$(dirname "$0")"
 mkdir -p build
@@ -124,6 +124,9 @@ test)
 	pids="$pids $!:zsp-sized"
 	(odin build zspd -out:build/zspd$EXE -debug $STRICT $TESTING || echo zspd >>build/failed) &
 	pids="$pids $!:zspd"
+	# And one whose segments are small, so that tests/kill_loop.py meets rolls and checkpoints many times a second.
+	(odin build zspd -out:build/zspd-small$EXE -debug $STRICT $TESTING $SMALL || echo zspd >>build/failed) &
+	pids="$pids $!:zspd"
 	(odin build vectors -out:build/vectors$EXE $STRICT || echo vectors >>build/failed) &
 	pids="$pids $!:vectors"
 	(odin build examples/apps -out:build/apps$EXE -debug $STRICT || echo examples >>build/failed) &
@@ -163,6 +166,7 @@ test)
 	step apps $PYTHON examples/apps/test.py
 	step forward $PYTHON examples/forward/test.py
 	step organization $PYTHON examples/organization.py
+	step kill_loop $PYTHON tests/kill_loop.py
 	step end_to_end end_to_end
 	if [ "$(uname)" = Linux ]; then
 		# Calls and links again, under AddressSanitizer: what glibc forgives, it does not.
@@ -245,6 +249,10 @@ bench)
 		odin build host -build-mode:test -o:speed -out:build/bench-streams$EXE $STRICT -define:ZSP_BENCH=true -define:ZSP_BENCH_BYTES=${3:-268435456} -define:ODIN_TEST_NAMES=host.bench_streams
 		build/bench-streams$EXE >build/bench-streams.log 2>&1 || { sed '/^\[INFO/d' build/bench-streams.log; exit 1; }
 		sed '/^\[INFO/d' build/bench-streams.log
+	elif [ "${2:-}" = stalls ]; then # what holds each process's loop, and what that costs a link: ./x bench stalls [--help]
+		odin build zspd -o:speed -out:build/zspd-bench$EXE $STRICT -define:ZSP_BENCH=true -define:ZSP_TICKS=true
+		shift 2
+		$PYTHON bench/stalls.py "$@"
 	elif [ "${2:-}" = web ]; then # what a web device costs, in Node and in a browser: ./x bench web [rows]
 		[ -f build/zspd$EXE ] || odin build zspd -out:build/zspd$EXE -debug $STRICT
 		! stale web/src/node.wasm || web_wasm

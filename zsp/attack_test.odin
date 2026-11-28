@@ -2338,3 +2338,78 @@ signals_are_from_members_through_relays :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(signalled), 1)
 	testing.expect(t, len(signalled) == 1 && signalled[0] == b.keys.device)
 }
+
+// Each acknowledgement says every row it refused, though an acknowledgement owed for earlier frames, by a sync under
+// way, said the same row: a row refused in two frames, one each side of what that sync reaches, is said in both.
+@(test)
+a_row_refused_twice_is_said_twice :: proc(t: ^testing.T) {
+	state := seeded(75)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 3, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a := s.nodes[0]
+	sim_link(&s, 2, 0)
+	sim_settle(&s)
+	@(static) tokens: [dynamic]u64
+	defer delete(tokens)
+	a.node.store.disk.log_sync_start = proc(_: rawptr, token: u64) -> bool {
+		append(&tokens, token)
+		return true
+	}
+	body: [24]byte
+	put_u64(body[:], 2 << 32 | 5)
+	put_u64(body[8:], 5)
+	row := node_id(&a.node, 2)
+	testing.expect(t, node_write(&a.node, {{row, PLACE, .Place, node_stamp(&a.node), body[:]}, {row, DATA, .Value, node_stamp(&a.node), nil}}))
+	sim_settle(&s)
+	at_a := s.links[0].b
+	zeroes := make([]byte, 80, context.temp_allocator)
+	put_u32(zeroes[1:], key_id(roster_scope(&a.node.roster, 2).commits[0]))
+	frame :: proc(seq: u64, c: Cell) -> []byte {
+		c := c
+		w := make([dynamic]byte, context.temp_allocator)
+		at := frame_begin(&w, .Cells)
+		write_varint(&w, seq)
+		write_cell(&w, &c, false)
+		frame_end(&w, at)
+		return w[:]
+	}
+	acks :: proc(s: ^Session) -> (got: [dynamic]Id, seq: u64) {
+		got = make([dynamic]Id, context.temp_allocator)
+		out := session_output(s)
+		r := Reader{buf = out}
+		for r.pos < len(out) {
+			f := read_bytes(&r)
+			if Message(f[0]) == .Ack {
+				b := Reader{buf = f[1:]}
+				seq = read_varint(&b)
+				for b.pos < len(b.buf) {
+					append(&got, read_pair(&b, Id))
+				}
+			}
+		}
+		session_sent(s, len(out))
+		return
+	}
+	_, _ = acks(at_a)
+	clear(&tokens)
+	testing.expect(t, session_input(at_a, frame(1, {row, DATA, .Value, {row_born(row) + 10, 1}, zeroes})))
+	testing.expect(t, node_write(&a.node, {{row, DATA, .Value, node_stamp(&a.node), nil}})) // so that there is a sync to make
+	testing.expect(t, store_sync_start(&a.node.store) && len(tokens) == 1)
+	// And more, past what it reaches, before the second frame: whose acknowledgement waits for the next sync.
+	testing.expect(t, node_write(&a.node, {{row, DATA, .Value, node_stamp(&a.node), nil}}))
+	testing.expect(t, session_input(at_a, frame(2, {row, DATA, .Value, {row_born(row) + 11, 1}, zeroes})))
+	testing.expect(t, store_disk_synced(&a.node.store, pop(&tokens), true))
+	first, seq1 := acks(at_a)
+	testing.expect(t, seq1 == 1 && len(first) == 1 && first[0] == row)
+	if len(tokens) == 0 {
+		testing.expect(t, store_sync_start(&a.node.store))
+	}
+	for len(tokens) > 0 {
+		testing.expect(t, store_disk_synced(&a.node.store, pop(&tokens), true))
+	}
+	second, seq2 := acks(at_a)
+	testing.expectf(t, seq2 == 2 && len(second) == 1 && second[0] == row, "the second says the row too: %v %v", seq2, second)
+}

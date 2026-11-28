@@ -85,6 +85,9 @@ session_lanes :: proc(s: ^Session) -> []^Lane {
 }
 
 session_lane_output :: proc(s: ^Session, l: ^Lane) -> []byte {
+	if s.node.failed {
+		return nil // storage failed: nothing more is said
+	}
 	return l.out[l.sent:]
 }
 

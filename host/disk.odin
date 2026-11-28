@@ -8,6 +8,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "../find"
 import "../zsp"
 
@@ -25,6 +26,26 @@ File_Disk :: struct {
 	hold:    bool, // the directory, from before anything in it is read or written: see hold.odin
 	lock:    Maybe(Dir_Lock),
 	look:    bool, // only: nothing is made, nor opened to be written
+	host:    ^Host, // whose loop makes its fsyncs without waiting for them; none to make them as they are asked
+	rolled:  [dynamic]Rolled, // segments the log has gone on from, written since last synced: made durable with it
+	released: [dynamic]Released, // segments' files let go of, that the host's thread may still have something to do of
+	unremoved: [dynamic]u64, // segments dropped whose files could not yet be removed, as on Windows one open elsewhere
+	id:      u64, // what the host's thread knows its files' failures by: see disk_owner_failed
+}
+
+@(private)
+file_disks: u64 // atomic: the last File_Disk.id given
+
+@(private)
+Rolled :: struct {
+	number: u64,
+	file:   ^os.File,
+}
+
+@(private)
+Released :: struct {
+	number: u64,
+	id:     u64, // as disk_release said: a closed handle's address may be another's by now
 }
 
 // Nothing is created until there is something to keep: merely asking about a space leaves no trace. With `hold`, the
@@ -35,6 +56,7 @@ file_disk_open :: proc(d: ^File_Disk, dir: string, hold := false) -> bool {
 	d.number = max(u64)
 	d.read_no = max(u64)
 	d.hold = hold
+	d.id = sync.atomic_add(&file_disks, 1) + 1
 	if os.exists(dir) && !file_disk_make(d) {
 		file_disk_close(d)
 		return false
@@ -136,7 +158,7 @@ segment_file :: proc(d: ^File_Disk, number: u64) -> ^os.File {
 @(private)
 segments_close :: proc(d: ^File_Disk, first: u64, last := max(u64)) {
 	if d.active != nil && d.number >= first && d.number <= last {
-		os.close(d.active)
+		segment_let_go(d, d.number, d.active)
 		d.active, d.number, d.dirty = nil, max(u64), false // what it held is not wanted
 	}
 	if d.reading != nil && d.read_no >= first && d.read_no <= last {
@@ -145,13 +167,131 @@ segments_close :: proc(d: ^File_Disk, first: u64, last := max(u64)) {
 	}
 }
 
+// Closes a file of the disk's, once the host's thread has done all asked of it, if it is the host's to do.
 @(private)
-disk_sync :: proc(f: ^os.File) -> bool {
-	return os.sync(f) == nil
+file_let_go :: proc(d: ^File_Disk, f: ^os.File) {
+	if d.host != nil {
+		disk_release(d.host, f)
+	} else {
+		os.close(f)
+	}
+}
+
+// The same, of a segment's file, which is waited for before the segment is removed.
+@(private)
+segment_let_go :: proc(d: ^File_Disk, number: u64, f: ^os.File) {
+	if d.host == nil {
+		os.close(f)
+		return
+	}
+	#reverse for r, i in d.released {
+		if !disk_known(d.host, r.id) {
+			unordered_remove(&d.released, i) // closed since
+		}
+	}
+	if id := disk_release(d.host, f); id != 0 {
+		append(&d.released, Released{number, id})
+	}
+}
+
+// Waits for all asked of a file to be done, before it is synced now: what failed of it fails this.
+@(private)
+file_drained :: proc(d: ^File_Disk, f: ^os.File) -> bool {
+	return d.host == nil || disk_drain(d.host, f)
+}
+
+// Removes the file of a segment dropped, once nothing is asked of it; or later, at a settle, if it cannot be now.
+@(private)
+segment_remove :: proc(d: ^File_Disk, number: u64) {
+	path := segment_path(d, number)
+	#reverse for r, i in d.released {
+		// Its handles' last fsyncs made, and the handles closed, as they are once none is left: so that the file goes.
+		if r.number == number {
+			disk_drain_closing(d.host, r.id)
+		}
+		if r.number == number || !disk_known(d.host, r.id) {
+			unordered_remove(&d.released, i)
+		}
+	}
+	if os.remove(path) != nil && os.exists(path) {
+		append(&d.unremoved, number)
+	}
+}
+
+// As a settle begins: removes what could not be removed before.
+file_disk_settle :: proc(d: ^File_Disk) {
+	#reverse for number, i in d.unremoved {
+		path := segment_path(d, number)
+		if os.remove(path) == nil || !os.exists(path) {
+			unordered_remove(&d.unremoved, i)
+		}
+	}
+}
+
+// An fsync made now, by the loop, as a sync that must be had at once is.
+@(private)
+disk_sync :: proc(d: ^File_Disk, f: ^os.File, kind: Tick_Disk) -> bool {
+	since := ticks_now()
+	defer ticks_disk(kind, since)
+	ok := os.sync(f) == nil
+	if ok && d.host != nil && d.host.disk.synced != nil {
+		d.host.disk.synced(d.host, f) // a test's, as in disk_power_test.odin
+	}
+	return ok
 }
 
 @(require_results)
 file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
+	disk := file_disk_waiting(d)
+	if d.host != nil {
+		disk.log_sync_start = proc(data: rawptr, token: u64) -> bool {
+			d := (^File_Disk)(data)
+			since := ticks_now()
+			defer ticks_disk(.Log_Sync_Start, since)
+			if disk_owner_failed(d.host, d.id) {
+				return false
+			}
+			// Every segment the log went on from since, then the one it goes on in: all, as one sync, for one token.
+			files := make([dynamic]^os.File, context.temp_allocator)
+			for r in d.rolled {
+				append(&files, r.file)
+			}
+			if d.active != nil && d.dirty {
+				append(&files, d.active)
+				d.dirty = false // what is written from now on is for the next
+			}
+			disk_sync_ask(d.host, token, d.id, ..files[:])
+			for r in d.rolled {
+				segment_let_go(d, r.number, r.file) // closed once it is durable
+			}
+			clear(&d.rolled)
+			return true
+		}
+		disk.page_sync_start = proc(data: rawptr, token: u64) -> bool {
+			d := (^File_Disk)(data)
+			since := ticks_now()
+			defer ticks_disk(.Page_Sync_Start, since)
+			if disk_owner_failed(d.host, d.id) {
+				return false
+			}
+			if d.tree == nil {
+				disk_sync_ask(d.host, token, d.id)
+				return true
+			}
+			// Read from the mapping from now on, durable or not: so it must reach every page written.
+			size, err := os.file_size(d.tree)
+			if err != nil || (int(size) != len(d.mapped) && !file_remap(d)) {
+				return false
+			}
+			disk_sync_ask(d.host, token, d.id, d.tree)
+			return true
+		}
+	}
+	return disk
+}
+
+@(private)
+file_disk_waiting :: proc(d: ^File_Disk) -> zsp.Disk {
 	return {
 		data = d,
 		log_write = proc(data: rawptr, off: u64, bytes: []byte) -> bool {
@@ -162,10 +302,18 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			number := off / zsp.SEGMENT
 			if number != d.number {
 				if d.active != nil {
-					if d.dirty && !disk_sync(d.active) {
+					switch {
+					case !d.dirty:
+						segment_let_go(d, d.number, d.active) // an fsync of it may yet be under way
+					case d.host != nil:
+						// Made durable with the next sync of the log, which is begun, not waited for: until then nothing
+						// written to it is counted on, as nothing written since the last sync is.
+						append(&d.rolled, Rolled{d.number, d.active})
+					case !disk_sync(d, d.active, .Roll_Sync):
 						return false
+					case:
+						os.close(d.active)
 					}
-					os.close(d.active)
 				}
 				f, err := os.open(segment_path(d, number), {.Read, .Write, .Create}, os.Permissions{.Read_User, .Write_User})
 				if err != nil {
@@ -174,7 +322,10 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 				}
 				d.active, d.number = f, number
 			}
+			since := ticks_now()
 			n, err := os.write_at(d.active, bytes, i64(off % zsp.SEGMENT))
+			ticks_disk(.Log_Write, since)
+			disk_noted(d.host, d.active, i64(off % zsp.SEGMENT), bytes[:max(n, 0)])
 			d.dirty = true
 			return err == nil && n == len(bytes)
 		},
@@ -185,6 +336,25 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			}
 			n, _ := os.read_at(f, into, i64(off % zsp.SEGMENT))
 			return n == len(into)
+		},
+		log_replayed = proc(data: rawptr, from: u64) -> bool {
+			d := (^File_Disk)(data)
+			// Each segment from there on, made durable by the next sync of the log, as one the log has gone on from is.
+			// One that cannot be had to be made durable fails the store: it would be counted on, and might be lost.
+			files, err := os.read_all_directory_by_path(d.dir, context.temp_allocator)
+			if err != nil {
+				return false
+			}
+			for f in files {
+				if number, ok := segment_number(f.name); ok && number >= from / zsp.SEGMENT {
+					g, gerr := os.open(f.fullpath, {.Read, .Write})
+					if gerr != nil {
+						return false
+					}
+					append(&d.rolled, Rolled{number, g})
+				}
+			}
+			return true
 		},
 		log_end = proc(data: rawptr) -> (end: u64) {
 			d := (^File_Disk)(data)
@@ -199,7 +369,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 		log_drop = proc(data: rawptr, segment: u64) {
 			d := (^File_Disk)(data)
 			segments_close(d, segment, segment)
-			os.remove(segment_path(d, segment))
+			segment_remove(d, segment)
 		},
 		log_truncate = proc(data: rawptr, off: u64) {
 			d := (^File_Disk)(data)
@@ -213,21 +383,42 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			}
 			if last == d.number {
 				os.truncate(d.active, i64(off % zsp.SEGMENT))
+				disk_noted(d.host, d.active, i64(off % zsp.SEGMENT), nil, truncated = true)
 			} else if f, err := os.open(segment_path(d, last), {.Write}); err == nil {
 				os.truncate(f, i64(off % zsp.SEGMENT))
+				disk_noted(d.host, f, i64(off % zsp.SEGMENT), nil, truncated = true)
 				os.close(f)
 			}
 		},
 		log_sync = proc(data: rawptr) -> bool {
 			d := (^File_Disk)(data)
-			if d.active == nil || !d.dirty {
-				return true
+			// What the host's thread is still making durable of segments let go of, first: a sync made now counts on
+			// them as on any, and fails if any of them failed, however long ago.
+			if d.host != nil {
+				for r in d.released {
+					disk_drain_closing(d.host, r.id)
+				}
+				clear(&d.released)
+				if disk_owner_failed(d.host, d.id) {
+					return false
+				}
 			}
-			if !disk_sync(d.active) {
+			for len(d.rolled) > 0 {
+				f := d.rolled[0].file
+				if !file_drained(d, f) || !disk_sync(d, f, .Roll_Sync) {
+					return false
+				}
+				ordered_remove(&d.rolled, 0)
+				file_let_go(d, f)
+			}
+			if d.active == nil || !d.dirty {
+				return (d.active == nil || file_drained(d, d.active)) && !disk_owner_failed(d.host, d.id)
+			}
+			if !file_drained(d, d.active) || !disk_sync(d, d.active, .Log_Sync) {
 				return false
 			}
 			d.dirty = false
-			return true
+			return !disk_owner_failed(d.host, d.id)
 		},
 		page = proc(data: rawptr, no: zsp.Page_No) -> ^zsp.Page {
 			d := (^File_Disk)(data)
@@ -243,15 +434,21 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			}
 			block: [zsp.PAGE_SIZE]byte
 			copy(block[:], bytes)
+			since := ticks_now()
 			n, err := os.write_at(d.tree, block[:], i64(no) * zsp.PAGE_SIZE)
+			ticks_disk(.Page_Write, since)
+			disk_noted(d.host, d.tree, i64(no) * zsp.PAGE_SIZE, block[:max(n, 0)])
 			return err == nil && n == len(block)
 		},
 		page_sync = proc(data: rawptr) -> bool {
 			d := (^File_Disk)(data)
-			if d.tree == nil {
-				return true
+			if disk_owner_failed(d.host, d.id) {
+				return false
 			}
-			if !disk_sync(d.tree) {
+			if d.tree == nil || d.look {
+				return true // nothing to make durable; or, only looked at, nothing it holds is reused
+			}
+			if !file_drained(d, d.tree) || !disk_sync(d, d.tree, .Page_Sync) {
 				return false
 			}
 			size, err := os.file_size(d.tree)
@@ -268,11 +465,27 @@ file_disk_close :: proc(d: ^File_Disk) {
 	if d.mapped != nil {
 		virtual.unmap_file(d.mapped)
 	}
-	for f in ([]^os.File{d.tree, d.active, d.reading}) {
+	for f in ([]^os.File{d.tree, d.active}) {
 		if f != nil {
-			os.close(f)
+			file_let_go(d, f)
 		}
 	}
+	if d.reading != nil {
+		os.close(d.reading)
+	}
+	for r in d.rolled {
+		file_let_go(d, r.file) // what was not synced was not counted on
+	}
+	delete(d.rolled)
+	delete(d.released)
+	if d.host != nil {
+		// No handle outlives the disk, nor its directory's lock: what the host's thread has of them is done, and each
+		// closed, before what could not be removed is removed and the directory let go of.
+		disk_owner_drain(d.host, d.id)
+		delete_key(&d.host.disk.failed, d.id)
+	}
+	file_disk_settle(d)
+	delete(d.unremoved)
 	if lock, held := d.lock.?; held {
 		dir_unlock(lock)
 	}

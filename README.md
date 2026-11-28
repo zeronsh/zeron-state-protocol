@@ -147,6 +147,13 @@ node there keeps, fail while one runs. Keep the directory on a disk of the machi
 zspd and Node refuse one they can tell is (NFS, SMB, AFS, 9p, cluster file systems, shared folders of virtual machines, network
 drives on Windows, and on macOS whatever the system does not call local). See host/hold.odin.
 
+On Linux, a node asks for a 2 MiB receive buffer for its direct links' UDP socket. Unprivileged, the kernel holds it
+to `net.core.rmem_max` (212992 by default, granted as twice that), and everything works as it is. Optionally, so that a
+fast link loses less while the node is busy: run zspd with `CAP_NET_ADMIN` (in a systemd unit,
+`AmbientCapabilities=CAP_NET_ADMIN`), which lets it use `SO_RCVBUFFORCE` and have the whole 2 MiB; or raise the limit
+(`sysctl -w net.core.rmem_max=2097152`), which lets the plain request have it. `./x bench stalls --delay 5 --forced`
+measures the difference (see bench/stalls.py).
+
 ```luau
 local zsp = require("zsp")
 

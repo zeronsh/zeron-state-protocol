@@ -94,6 +94,12 @@ Session :: struct {
 	seq_in:    u64,
 	ack_at:    u64, // log position that makes seq_in durable
 	acked_in:  u64,
+	// What a sync under way, begun before seq_in came, makes durable: acknowledged once it is done, though more has come
+	// since, which the next sync makes durable. Else, while a sync is never done before more comes, nothing would be.
+	ack_prior: struct {
+		seq, at: u64,
+		refused: int, // of `refused`, those it says
+	},
 	refused:   [dynamic]Id, // rows something of which was not taken since
 	unacked:   [dynamic]Unacked,
 	reoffer:   [dynamic]Id, // kept for what was still to be sent of them, which may yet send nothing: offered again after
@@ -439,6 +445,9 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 @(require_results)
 session_output :: proc(s: ^Session) -> []byte {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	if s.node.failed {
+		return nil // storage failed: nothing more is said, whoever asks, of what may be lost
+	}
 	if s.ready && !s.closing {
 		pump(s)
 	}
@@ -447,6 +456,9 @@ session_output :: proc(s: ^Session) -> []byte {
 
 // What is queued for the peer already, without making more: for a host to send in the midst of the session's work.
 session_queued :: proc(s: ^Session) -> []byte {
+	if s.node.failed {
+		return nil
+	}
 	cells_close(s) // whole frames only: cells being gathered are ended here, and go on in another
 	return s.out[s.sent:]
 }
@@ -1992,6 +2004,19 @@ emit_row :: proc(s: ^Session, row: Id) {
 @(private)
 on_cells :: proc(s: ^Session, r: ^Reader) {
 	n := s.node
+	// What came before this frame is owed an acknowledgement as far as it is durable, or as far as a sync under way
+	// reaches, whatever this frame adds after it: so held, before this moves seq_in and ack_at on. One durable already is
+	// never given up for one that is not, which would be said only after the next sync, or never while every sync is
+	// overtaken by more; and is acknowledged at the next output, however much more comes before it.
+	if s.seq_in > s.acked_in {
+		f := &n.flight
+		durable := n.synced >= s.ack_at
+		pending := f.log != 0 && s.ack_at <= f.log_upto
+		held := s.ack_prior.seq > s.acked_in && n.synced >= s.ack_prior.at
+		if durable || (pending && !held) {
+			s.ack_prior = {s.seq_in, s.ack_at, len(s.refused)}
+		}
+	}
 	seq := read_varint(r)
 	cells := make([dynamic]Cell, context.temp_allocator)
 	row: Id
@@ -2020,7 +2045,9 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 		} else if _, held := tree_get(&n.store, n.cells, cell_key(c.row, c.slot, c.kind, c.stamp)); held {
 			continue // whatever it says, it goes no further: most often, it came by two roads
 		} else if !cell_welcome(s, c) {
-			if len(s.refused) == 0 || s.refused[len(s.refused) - 1] != c.row {
+			// Each row once a frame, and once a run of frames, but never across what an acknowledgement owed already says
+			// (ack_prior): that one says it of its own frames, and this of these.
+			if len(s.refused) == s.ack_prior.refused || s.refused[len(s.refused) - 1] != c.row {
 				append(&s.refused, c.row)
 			}
 			if len(s.refused) > MAX_REFUSED {
@@ -2188,7 +2215,7 @@ send_live :: proc(s: ^Session, l: ^Live, whole := false) -> bool {
 	write_stamp(&s.out, l.stamp)
 	append(&s.out, ..l.body)
 	frame_end(&s.out, at)
-	if s.datagram != nil && s.datagram(s.datagram_data, s.out[start:]) {
+	if s.datagram != nil && !s.node.failed && s.datagram(s.datagram_data, s.out[start:]) {
 		resize(&s.out, start)
 	}
 	return true
@@ -2892,7 +2919,9 @@ pump :: proc(s: ^Session) {
 		clear(&s.queued)
 	}
 	cells_close(s)
-	if s.seq_in > s.acked_in && n.synced >= s.ack_at {
+	if n.failed {
+		// Nothing is acknowledged once storage has failed: what was written may be lost.
+	} else if s.seq_in > s.acked_in && n.synced >= s.ack_at {
 		at := frame_begin(&s.out, .Ack)
 		write_varint(&s.out, s.seq_in)
 		for row in s.refused {
@@ -2901,6 +2930,17 @@ pump :: proc(s: ^Session) {
 		frame_end(&s.out, at)
 		s.acked_in = s.seq_in
 		clear(&s.refused)
+		s.ack_prior = {}
+	} else if p := s.ack_prior; p.seq > s.acked_in && n.synced >= p.at {
+		at := frame_begin(&s.out, .Ack)
+		write_varint(&s.out, p.seq)
+		for row in s.refused[:p.refused] {
+			write_pair(&s.out, row)
+		}
+		frame_end(&s.out, at)
+		s.acked_in = p.seq
+		remove_range(&s.refused, 0, p.refused)
+		s.ack_prior = {}
 	}
 	took_send(s)
 }

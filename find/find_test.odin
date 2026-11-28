@@ -1298,3 +1298,92 @@ made_before_what_is_not_a_number :: proc(t: ^testing.T) {
 		set_destroy(&rows)
 	}
 }
+
+// What an index is opened with is what the system shows, which may hold a header written as its process was killed and
+// never made durable; power lost after falls back to the one before. So what is read is made durable before what it no
+// longer names is used again: else what the one fallen back to names is written over, and the index made again, or,
+// should a page written over carry the mark it had, read as it is not.
+@(test)
+an_index_header_read_is_made_durable_before_its_last_pages_are_reused :: proc(t: ^testing.T) {
+	Power :: struct {
+		seen, kept: Memory_Disk,
+		syncs:      int,
+		fail_at:    int, // the sync, counting from one, that fails, not done
+	}
+	copy_disk :: proc(from: ^Memory_Disk) -> (m: Memory_Disk) {
+		for no, pg in from.pages {
+			c := new([PAGE_SIZE]byte)
+			c^ = pg^
+			m.pages[no] = c
+		}
+		return
+	}
+	power_disk :: proc(p: ^Power) -> Disk {
+		d := memory_disk(&p.seen)
+		d.data = p
+		d.view = proc(data: rawptr, no: u32) -> []byte {return memory_disk(&(^Power)(data).seen).view(&(^Power)(data).seen, no)}
+		d.write = proc(data: rawptr, no: u32, bytes: []byte) -> bool {
+			return memory_disk(&(^Power)(data).seen).write(&(^Power)(data).seen, no, bytes)
+		}
+		d.sync = proc(data: rawptr) -> bool {
+			p := (^Power)(data)
+			p.syncs += 1
+			if p.syncs == p.fail_at {
+				return false
+			}
+			memory_disk_destroy(&p.kept)
+			p.kept = copy_disk(&p.seen)
+			return true
+		}
+		return d
+	}
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	p: Power
+	defer {
+		memory_disk_destroy(&p.seen)
+		memory_disk_destroy(&p.kept)
+	}
+	index_close(&w.x)
+	index_open(&w.x, &w.node, power_disk(&p), w.secret)
+	save :: proc(t: ^testing.T, w: ^World, writes: int) -> bool {
+		for _ in 0 ..< writes {
+			world_write(t, w)
+		}
+		testing.expect(t, check_query(t, w, ask(w)))
+		testing.expect(t, zsp.store_sync(&w.node.store))
+		index_finish(&w.x)
+		return index_save(&w.x)
+	}
+	testing.expect(t, save(t, &w, 200)) // durable
+	first := w.x.generation
+	// The next, its header written and killed before it was made durable.
+	p.fail_at = p.syncs + 2
+	testing.expect(t, !save(t, &w, 200))
+	index_close(&w.x)
+	index_open(&w.x, &w.node, power_disk(&p), w.secret)
+	testing.expect(t, w.x.generation == first + 1 && len(w.x.scopes) > 0)
+	// Another, its pages written, perhaps over what it read as free, and power lost before they were made durable.
+	p.fail_at = p.syncs + 1
+	testing.expect(t, !save(t, &w, 200))
+	index_close(&w.x)
+	// Every page lands, but no header that was not made durable.
+	image := copy_disk(&p.seen)
+	for no in u32(0) ..< HEADERS {
+		if pg, ok := image.pages[no]; ok {
+			free(pg)
+			delete_key(&image.pages, no)
+		}
+		if pg, ok := p.kept.pages[no]; ok {
+			c := new([PAGE_SIZE]byte)
+			c^ = pg^
+			image.pages[no] = c
+		}
+	}
+	memory_disk_destroy(&p.seen)
+	p.seen, p.fail_at = image, 0
+	index_open(&w.x, &w.node, power_disk(&p), w.secret)
+	testing.expectf(t, w.x.generation > 0 && len(w.x.scopes) > 0, "the index was made again: generation %d", w.x.generation)
+	testing.expect(t, check_query(t, &w, ask(&w)))
+}

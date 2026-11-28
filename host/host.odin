@@ -55,6 +55,7 @@ Host :: struct {
 	methods:      map[string]Host_Method, // that the host answers itself, in-process: see host_serve
 	accepting:    ^nbio.Operation,
 	lock:         Dir_Lock, // of dir, held from host_init until host_destroy: see hold.odin
+	disk:         Disk_Queue, // what the disk is doing that the loop does not wait for: see disk_queue.odin
 }
 
 Space :: struct {
@@ -123,6 +124,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		free(s)
 		return nil
 	}
+	s.disk.host = h
 	staging_clear(s.dir)
 	keys: ^zsp.Keyring
 	if !h.relay {
@@ -343,6 +345,7 @@ host_init :: proc(h: ^Host, config: Config) -> (started: bool) {
 
 host_run :: proc(h: ^Host) -> bool {
 	dialers_refresh(h)
+	ticks_woke()
 	for !sync.atomic_load(&h.stopping) {
 		h.more = false
 		host_settle(h)
@@ -359,11 +362,14 @@ host_run :: proc(h: ^Host) -> bool {
 		if loop_held_back() {
 			wait = 0 // what it holds back goes to the system only by a tick that does not wait
 		}
+		ticks_end()
 		if err := nbio.tick(wait); err != nil {
 			report(.Error, "the event loop failed")
 			return false
 		}
+		ticks_woke()
 		free_all(context.temp_allocator)
+		ticks_mark(.Free)
 	}
 	return true
 }
@@ -387,6 +393,7 @@ host_destroy :: proc(h: ^Host) {
 	for len(h.spaces) > 0 {
 		space_close(pop(&h.spaces))
 	}
+	disk_end(h) // each closed made all it had durable already: what was under way is only waited for
 	for d in h.dialers {
 		dialer_free(d)
 	}
@@ -425,28 +432,47 @@ host_settle :: proc(h: ^Host) {
 	if host_failed(h) {
 		return
 	}
+	// What the disk has made durable, which releases what waits for it: acknowledgements above all.
+	disk_collect(h)
+	for s in h.spaces {
+		file_disk_settle(&s.disk)
+	}
+	if host_failed(h) {
+		return
+	}
 	if h.syncing && time.tick_diff(h.sync_due, now) >= 0 {
 		h.syncing = false
 		for s in h.spaces {
-			if !zsp.node_sync(&s.node) {
+			if !zsp.node_sync_start(&s.node) {
 				report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
 				sync.atomic_store(&h.stopping, true)
 				return
 			}
 		}
 	}
+	ticks_mark(.Sync)
 	dialers_run(h, now)
+	ticks_mark(.Dialers)
 	links_run(h)
+	ticks_mark(.Links)
 	for s in h.spaces {
 		s.node.now = ms
 		s.retaining = false
 		if due := zsp.node_retain_due(&s.node); due != 0 && due <= ms {
 			s.retaining = zsp.node_retain(&s.node) // a step at a time, others' turns between
 		}
+		ticks_mark(.Retain)
 		found_run(s, now)
+		ticks_mark(.Found)
 		relayed_run(s, now)
+		ticks_mark(.Relayed)
+	}
+	// Retaining or saving an index may have found storage failed: nothing goes out after that.
+	if host_failed(h) {
+		return
 	}
 	links_flush(h)
+	ticks_mark(.Links_Flush)
 	for s in h.spaces {
 		#reverse for r, i in s.relayed {
 			relayed_flush(r)
@@ -456,6 +482,7 @@ host_settle :: proc(h: ^Host) {
 			}
 		}
 	}
+	ticks_mark(.Relayed_Flush)
 	// Last, so that what links had to say through relays goes out at once.
 	#reverse for s in h.streams {
 		if s.due != {} && !stream_due(s, now) {
@@ -464,6 +491,7 @@ host_settle :: proc(h: ^Host) {
 		}
 		stream_flush(s)
 	}
+	ticks_mark(.Streams)
 	// And again, for what failed meanwhile, as keeping a roster a link or a relay brought: the host stops now, not when
 	// something next wakes it, and before a relay closes a space nobody is in, which would leave nothing to say so.
 	if host_failed(h) {
@@ -481,6 +509,7 @@ host_settle :: proc(h: ^Host) {
 				space_close(s)
 			}
 		}
+		ticks_mark(.Spaces)
 	}
 	for s in h.spaces {
 		zsp.store_flush(&s.node.store)
@@ -489,6 +518,7 @@ host_settle :: proc(h: ^Host) {
 			h.sync_due = time.tick_add(now, SYNC_DELAY)
 		}
 	}
+	ticks_mark(.Store_Flush)
 }
 
 // Whether a space's storage has failed, which stops the host.
@@ -514,6 +544,9 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 	}
 	if h.syncing {
 		earliest(&due, &ok, h.sync_due)
+	}
+	if len(h.disk.answers) > 0 {
+		earliest(&due, &ok, time.tick_now())
 	}
 	for d in h.dialers {
 		if t, set := dialer_deadline(d); set {

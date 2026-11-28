@@ -19,7 +19,18 @@ waker_wake :: proc(h: ^Host) {
 	win32.QueueUserAPC(proc "system" (_: win32.ULONG_PTR) {}, h.waker, 0)
 }
 
+// On the loop's thread, as the host is let go of: wakes queued and not yet delivered are delivered now, and so are not
+// left to end a wait of whatever this thread does next, which may not expect it. SHFileOperationW, as os.remove_all
+// calls it, does not, and raises and catches an exception of its own there.
 @(private)
 waker_destroy :: proc(h: ^Host) {
+	SleepEx(0, true)
 	win32.CloseHandle(h.waker)
+}
+
+foreign import kernel32 "system:Kernel32.lib"
+
+@(default_calling_convention = "system", private)
+foreign kernel32 {
+	SleepEx :: proc(milliseconds: win32.DWORD, alertable: win32.BOOL) -> win32.DWORD ---
 }
