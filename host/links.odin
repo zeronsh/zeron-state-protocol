@@ -88,7 +88,7 @@ udp_open :: proc(h: ^Host, port: int) -> bool {
 		return false
 	}
 	net.set_blocking(u.socket, false)
-	net.set_option(u.socket, .Receive_Buffer_Size, i32(1 << 20))
+	udp_receive_buffer(u.socket)
 	if at, e := net.bound_endpoint(u.socket); e == nil {
 		u.port = at.port
 	}
@@ -109,7 +109,7 @@ udp_open :: proc(h: ^Host, port: int) -> bool {
 		// 192.168.1.255, or 127.255.255.255), which only the system knows to refuse. It hears those nearby, at
 		// BEACON_PORT, which others on this machine share; or where it cannot, it has a port of its own, and only says.
 		if u.beacon, err = nbio.create_udp_socket(.IP4); err == nil {
-			net.set_option(u.beacon, .Reuse_Address, true)
+			nbio.set_socket_option(u.beacon, .Reuse_Address, true)
 			port_share(u.beacon)
 			if berr := net.bind(u.beacon, {net.IP4_Any, BEACON_PORT}); berr != nil {
 				report(.Debug, "cannot listen for those nearby: ", fmt.tprint(berr))
@@ -121,7 +121,7 @@ udp_open :: proc(h: ^Host, port: int) -> bool {
 			}
 			if err == nil {
 				net.set_blocking(u.beacon, false)
-				net.set_option(u.beacon, .Broadcast, true)
+				nbio.set_socket_option(u.beacon, .Broadcast, true)
 				u.have_beacon = true
 				udp_listen(h, u.beacon) // and what comes to it is heard as any packet is
 			}
@@ -910,4 +910,19 @@ Batch :: struct {
 	packets: [UDP_BATCH][pipe.PACKET_MAX]byte,
 	sizes:   [UDP_BATCH]int,
 	n:       int,
+}
+
+// What the system may hold for the host's UDP socket of what has come and is not yet read: a burst beyond it is lost
+// before the loop sees it, and sent again. Asked for, and what was granted said once (core:net's set_option gave it
+// whatever the low bytes of a pointer said: see third_party/nbio/socket_option.odin).
+UDP_RECEIVE_BUFFER :: 1 << 20
+
+@(private)
+udp_receive_buffer :: proc(socket: net.UDP_Socket) {
+	if err, code := nbio.set_socket_option(socket, .Receive_Buffer_Size, UDP_RECEIVE_BUFFER); err != nil {
+		report(.Debug, "the UDP receive buffer could not be set: ", fmt.tprint(err, code))
+	}
+	if got, err, _ := nbio.socket_option(socket, .Receive_Buffer_Size); err == nil {
+		report(.Debug, "the UDP receive buffer, asked for ", fmt.tprint(UDP_RECEIVE_BUFFER), ", is ", fmt.tprint(got))
+	}
 }

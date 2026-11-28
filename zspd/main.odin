@@ -18,6 +18,7 @@ import "core:strings"
 import "core:time"
 import "../host"
 import "../pipe"
+import "../third_party/nbio"
 import "../zsp"
 
 USAGE :: `zspd - Zeron State Protocol node
@@ -527,7 +528,7 @@ speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool, reached: bo
 	// Its answer, which begins with its clock, says it has read this far. Until then the line stays open: what was sent
 	// on one closed before a busy node read it may not be read at all.
 	buf: [4096]byte
-	net.set_option(socket, .Receive_Timeout, 10 * time.Second)
+	nbio.set_socket_option(socket, .Receive_Timeout, time.Duration(10 * time.Second))
 	got := make([dynamic]byte, context.temp_allocator)
 	stream := make([dynamic]byte, context.temp_allocator)
 	used := 0

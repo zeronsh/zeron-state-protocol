@@ -4,6 +4,7 @@ import "core:net"
 import "core:testing"
 import "core:time"
 import "../pipe"
+import "../third_party/nbio"
 import "../zsp"
 
 // Anyone may have kept an old knock. It neither disturbs a newer one nor stands in its way.
@@ -111,7 +112,7 @@ a_device_started_again_is_found_again :: proc(t: ^testing.T) {
 			watch, err := net.make_bound_udp_socket(net.IP4_Loopback, 0)
 			testing.expect(t, err == nil)
 			defer net.close(watch)
-			net.set_option(watch, .Receive_Timeout, 200 * time.Millisecond)
+			nbio.set_socket_option(watch, .Receive_Timeout, time.Duration(200 * time.Millisecond))
 			bound, _ := net.bound_endpoint(watch)
 			// As a process gone without a word looks from here: what the link sends goes to a socket nobody reads, and
 			// nothing comes back on it. Both ends are turned away, for the other is still running, and anything it sent

@@ -136,7 +136,7 @@ system_said :: proc(op: ^nbio.Operation, err: any) -> string {
 // The socket is connected: bytes flow both ways from now on.
 join_attach :: proc(j: ^Join, socket: net.TCP_Socket) {
 	j.socket, j.connected = socket, true
-	net.set_option(socket, .TCP_Nodelay, true)
+	nbio.set_socket_option(socket, .TCP_Nodelay, true)
 	join_read(j)
 	join_write(j)
 }

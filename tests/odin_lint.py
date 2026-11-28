@@ -20,12 +20,16 @@ expression is read as a whole, wherever it is given (an argument, a return, an a
 elements and the constants added, not those taken away (`-`, `&~`, `excl`) nor only asked of (`&`, a comparison,
 `in`). What is assigned to a name is taken with all else assigned to it in the file (`incl` too), as flags built up.
 
+core:net's set_option sets every integer option, and `bool` and `b8` ones, to the low bytes of a pointer (its type
+switch lists several types in one case, where the value stays an `any`). So `net.set_option` fails outright, wherever
+it is called: third_party/nbio's set_socket_option sets each option with the C type the system wants.
+
 Formatting is no way round it: comments and strings are taken out, and what is left is read as tokens, in statements
 split as Odin splits them. Each import is followed by the name it is given. A file is taken as built for an OS as Odin
 builds it, by its name and its `#+build` lines (./x selftest holds that to Odin itself, target by target);
 a package as built for WASI if a command here builds it so (`-target:wasi_...` in ./x or a workflow), with what it
 imports from here. The one exception is the repros in tests/upstream, there to use what is broken: each file there that
-says at its head which of the issues it reproduces ("Reproduces odin-lang/Odin#...").
+says at its head what it reproduces ("// Reproduces ...").
 
     python3 tests/odin_lint.py [root]   says each use, and fails if there is any
     python3 tests/odin_lint.py --selftest   that it finds each use put in its fixtures, however written, and no other
@@ -35,6 +39,7 @@ import os, re, sys, tempfile
 
 ISSUE = "odin-lang/Odin#8642"
 TRUNC_ISSUE = "odin-lang/Odin#8646"
+OPTION_ISSUE = "core:net set_option (no issue)"
 # Odin's target_os_names and target_arch_names (src/build_settings.cpp, as of the release CI builds with): there is no
 # `unix`, neither as a build tag nor as the end of a file's name.
 OSES = {"windows", "darwin", "linux", "freebsd", "openbsd", "netbsd", "wasi", "js", "orca", "freestanding"}
@@ -521,6 +526,7 @@ def lint_file(path, src, wasi_built):
         found.append((line, "core:os in a file built for WASI: its environment is kept with map_entry", ISSUE))
     strings_names = set(by_path.get("core:strings", []))
     net_names = set(by_path.get("core:net", [])) if oses & BSDS else set()
+    all_net_names = set(by_path.get("core:net", []))
     for i, (kind, text, line) in enumerate(toks):
         if kind != "ident":
             continue
@@ -537,6 +543,8 @@ def lint_file(path, src, wasi_built):
                 found.append((line, f"strings.{text}: interning uses map_entry", ISSUE))
             elif owner in net_names and text == "enumerate_interfaces":
                 found.append((line, "net.enumerate_interfaces in a file built for macOS, OpenBSD or NetBSD: it gathers with map_entry there", ISSUE))
+            if owner in all_net_names and text == "set_option":
+                found.append((line, "net.set_option sets integer and bool options to the bytes of a pointer: use nbio.set_socket_option", OPTION_ISSUE))
     if "windows" in oses:
         if "core:os" in by_path:
             for line in trunc_uses(toks, by_path["core:os"]):
@@ -580,7 +588,7 @@ def is_repro(rel, src):
     """Whether a file is one of the repros of what is broken, which must use it: in tests/upstream, and saying so in its
     first line."""
     parts = rel.replace(os.sep, "/").split("/")
-    return parts[:2] == ["tests", "upstream"] and re.match(r"// Reproduces odin-lang/Odin#\d+", src) is not None
+    return parts[:2] == ["tests", "upstream"] and re.match(r"// Reproduces \S", src) is not None
 
 
 def lint(root):
@@ -829,6 +837,21 @@ w :: proc(p: string) { _, _ = os.open(p, {.Write, .Trunc}) }
 import nbio "../third_party/nbio"
 x :: proc(p: string) { nbio.open(p, nil, {.Write, .Trunc}) }
 """,
+    "c/options.odin": """package c
+import "core:net"
+import n2 "core:net"
+o :: proc(s: net.TCP_Socket) {
+	net.set_option(s, .TCP_Nodelay, true) // use option
+	net.set_option(s, .Receive_Buffer_Size, i32(1 << 20)) // use option
+	_ = n2 .
+		set_option(s, .Broadcast, b32(true)) // use option
+	f :: net.set_option // use option
+	_ = f
+	set_option(s, .TCP_Nodelay, true)
+	_ = "net.set_option"
+}
+set_option :: proc(_: net.TCP_Socket, _: int, _: bool) {}
+""",
     "node_modules/x/y.odin": """package y
 e :: proc(m: ^map[int]int) { map_entry(m, 1) }
 """,
@@ -911,9 +934,10 @@ def selftest():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(src)
             for n, line in enumerate(src.splitlines(), 1):
-                m = re.search(r"// use( 8646)?$", line.rstrip())
+                m = re.search(r"// use( 8646| option)?$", line.rstrip())
                 if m:
-                    want.add((os.path.join(*rel.split("/")), n, TRUNC_ISSUE if m.group(1) else ISSUE))
+                    issue = {None: ISSUE, " 8646": TRUNC_ISSUE, " option": OPTION_ISSUE}[m.group(1)]
+                    want.add((os.path.join(*rel.split("/")), n, issue))
         got = lint(root)
         have = {(p, line, issue) for p, line, _, issue in got}
         missed = sorted(want - have)
@@ -924,9 +948,10 @@ def selftest():
             print(f"FAIL the lint took {p}:{line} for a use of what {issue} breaks: {what}")
         if missed or extra:
             return 1
-        each = {i: sum(1 for w in want if w[2] == i) for i in (ISSUE, TRUNC_ISSUE)}
-        print(f"ok   the lint finds each of the {each[ISSUE]} uses of what {ISSUE} breaks and the {each[TRUNC_ISSUE]} of what"
-              f" {TRUNC_ISSUE} does, put in its fixtures, however written, and nothing else")
+        each = {i: sum(1 for w in want if w[2] == i) for i in (ISSUE, TRUNC_ISSUE, OPTION_ISSUE)}
+        print(f"ok   the lint finds each of the {each[ISSUE]} uses of what {ISSUE} breaks, the {each[TRUNC_ISSUE]} of what"
+              f" {TRUNC_ISSUE} does, and the {each[OPTION_ISSUE]} of {OPTION_ISSUE}, put in its fixtures, however written,"
+              " and nothing else")
         return 0
 
 
@@ -939,7 +964,8 @@ def main():
         print(f"{p}:{line}: {what} ({issue})")
     for issue in sorted({f[3] for f in found}):
         n = sum(1 for f in found if f[3] == issue)
-        print(f"FAIL {n} uses of what {issue} breaks: see https://github.com/{issue.replace('#', '/issues/')}")
+        where = f"see https://github.com/{issue.replace('#', '/issues/')}" if "#" in issue else "see third_party/nbio/socket_option.odin"
+        print(f"FAIL {n} uses of what {issue} breaks: {where}")
     return 1 if found else 0
 
 

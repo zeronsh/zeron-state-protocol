@@ -434,7 +434,7 @@ loop_lets_go_of_what_a_removed_accept_took :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, !called, "a removed accept called back")
 	// The peer is told its connection has gone, one way or another: an end, or a reset. Left open, it would wait.
-	net.set_option(peer, .Receive_Timeout, 2 * time.Second)
+	nbio.set_socket_option(peer, .Receive_Timeout, time.Duration(2 * time.Second))
 	b: [8]byte
 	n, rerr := net.recv_tcp(peer, b[:])
 	testing.expectf(t, (rerr == nil && n == 0) || (rerr != nil && rerr != .Timeout && rerr != .Would_Block), "the peer's connection was left open: read %d bytes, %v", n, rerr)

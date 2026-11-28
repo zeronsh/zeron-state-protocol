@@ -5,7 +5,6 @@ import "base:runtime"
 import "base:intrinsics"
 
 import "core:container/pool"
-import "core:net"
 import "core:reflect"
 import "core:slice"
 import "core:strings"
@@ -112,7 +111,7 @@ _listen_tcp :: proc(
 	socket = create_tcp_socket(family, l, loc) or_return
 	defer if err != nil { close(socket, l=l) }
 
-	net.set_option(socket, .Reuse_Address, true)
+	set_socket_option(socket, .Reuse_Address, true)
 
 	bind(socket, endpoint) or_return
 

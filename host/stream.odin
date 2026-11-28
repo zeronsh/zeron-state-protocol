@@ -66,7 +66,7 @@ stream_new :: proc(h: ^Host, socket: net.TCP_Socket) -> ^Stream {
 	s.host = h
 	s.socket = socket
 	net.set_blocking(socket, false)
-	net.set_option(socket, .TCP_Nodelay, true)
+	nbio.set_socket_option(socket, .TCP_Nodelay, true)
 	append(&h.streams, s)
 	s.quiet_at = time.tick_now()
 	s.due = time.tick_add(s.quiet_at, HANDSHAKE_WAIT)

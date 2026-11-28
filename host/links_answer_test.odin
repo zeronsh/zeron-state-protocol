@@ -8,6 +8,7 @@ import "core:net"
 import "core:testing"
 import "core:time"
 import "../pipe"
+import "../third_party/nbio"
 import "../zsp"
 
 // What a host sends is only ever where one peer could be, whoever asks it to send there. A beacon is answered where it
@@ -74,7 +75,7 @@ links_answer_only_where_one_could_be :: proc(t: ^testing.T) {
 	at_says, _ := net.bound_endpoint(says)
 	at_from, _ := net.bound_endpoint(from)
 	heard :: proc(socket: net.UDP_Socket) -> (first: int) {
-		net.set_option(socket, .Receive_Timeout, 200 * time.Millisecond)
+		nbio.set_socket_option(socket, .Receive_Timeout, time.Duration(200 * time.Millisecond))
 		buf: [2048]byte
 		n, _, err := net.recv_udp(socket, buf[:])
 		return int(buf[0]) if err == nil && n > 0 else -1

@@ -165,6 +165,7 @@ Link :: struct {
 	best:        f64, // when it did
 	ceiling:     f64, // a bound on the window imposed by heavy loss
 	window:      f64,
+	sent_packets, lost_packets: u64, // all the link's life, as told to who asks (benches)
 
 	// Receiving.
 	seen:        [dynamic]Range, // packet numbers, newest last
@@ -1465,6 +1466,7 @@ link_lose :: proc(l: ^Link, p: ^Sent) {
 	}
 	if !p.probe {
 		l.round_lost += int(p.size)
+		l.lost_packets += 1
 	}
 	p^ = {}
 }
@@ -1627,6 +1629,9 @@ link_output :: proc(l: ^Link, into: []byte, now: Time) -> []byte {
 		}
 		l.in_flight += len(out)
 		l.round_sent += len(out)
+		if !p.probe {
+			l.sent_packets += 1
+		}
 	}
 	return out
 }

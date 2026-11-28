@@ -74,6 +74,14 @@ Windows, `impl_windows.odin`:
 
 ## Not here, but of the same release
 
+- `core:net`'s `set_option` sets every integer option, and `bool` and `b8` ones, to the low bytes of a pointer: its type
+  switch lists several types in one case, where the value stays an `any` (core/net/socket_windows.odin:305–351,
+  socket_posix.odin:294–329, socket_linux.odin:368–402). TCP_NODELAY asked off stayed on, and the host's 1 MiB UDP receive
+  buffer was whatever those bytes said. No upstream issue. `socket_option.odin`, ours, sets each option with the C type
+  the system wants, and reads it back (`set_socket_option`, `socket_option`); every option here is set through it, and
+  `./x check` fails on `net.set_option` (`tests/odin_lint.py`). Test: `host/socket_option_test.odin`. Repro:
+  `tests/upstream/core_net_set_option`.
+
 - `core:net`'s `enumerate_interfaces` on macOS, OpenBSD and NetBSD gathers interfaces with `map_entry`, writing through
   it: `host/interfaces_bsd.odin` walks `getifaddrs` itself there, as `host/interfaces_linux.odin` does.
 - `core:net`'s `set_option(.Linger)` on macOS and the BSDs gives the system a `timeval` rather than a `linger`. Nothing
