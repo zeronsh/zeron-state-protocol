@@ -158,10 +158,13 @@ def space(*names, udp=(), relay=None, options=(), partial={}):
     for d in devices[1:]:
         zspd("admit", devices[0].dir, zspd("key", d.dir), "1")
         zspd("join", d.dir, sid, relay.key, url)
+    t0 = time.monotonic()
     for d in devices:
         d.start()
+        print(f"     started {d.name} in {time.monotonic() - t0:.2f}s", flush=True)
     for d in devices:
         eventually("every device hears who belongs", lambda: os.path.exists(os.path.join(d.dir, sid, "roster")))
+        print(f"     roster in {time.monotonic() - t0:.2f}s at {d.name}", flush=True)
     return relay, devices
 
 
