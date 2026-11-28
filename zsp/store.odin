@@ -393,8 +393,9 @@ replay :: proc(s: ^Store) -> bool {
 	// What was only found there may be in the system's keeping rather than the disk's: whoever wrote it died. It is
 	// counted on only once a sync has made it durable, every segment of it.
 	s.synced = s.checkpoint
-	if tail > s.checkpoint && s.disk.log_replayed != nil {
-		s.disk.log_replayed(s.disk.data, s.checkpoint)
+	if tail > s.checkpoint && s.disk.log_replayed != nil && !s.disk.log_replayed(s.disk.data, s.checkpoint) {
+		s.failed = true
+		return false
 	}
 	return true
 }

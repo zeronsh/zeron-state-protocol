@@ -30,7 +30,7 @@ Disk :: struct {
 	// Told, as a store opens, that the log from here to its end was found there and replayed, and so may be in the
 	// system's keeping rather than the disk's, as when whoever wrote it was killed before its sync: whatever syncs the log
 	// next makes it durable too, all of it, before the store counts on any of it. Nil where log_sync does that anyway.
-	log_replayed: proc(data: rawptr, from: u64),
+	log_replayed: proc(data: rawptr, from: u64) -> bool, // false if it cannot be: the store fails to open
 }
 
 // A disk in memory, which can also forget everything that was not synced.

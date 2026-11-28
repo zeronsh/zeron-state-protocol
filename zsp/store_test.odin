@@ -430,6 +430,37 @@ async_sync_counts_only_what_it_began_with :: proc(t: ^testing.T) {
 }
 
 // A client's writes are acknowledged as far as a sync under way reaches, once it is done, though more came meanwhile:
+@(private = "file")
+ack_write :: proc(x: ^Sim_Node, c: ^Reader_Client, seq: u64) {
+	x.node.now += 1000
+	row := node_id(&x.node, 1)
+	body: [24]byte
+	list := list_tag(keyring_scope(&x.keys, 1), "a")
+	put_u64(body[:], list[0])
+	put_u64(body[8:], list[1])
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Cells)
+	write_varint(&w, seq)
+	place := Cell{row, 1, .Place, node_stamp(&x.node), body[:]}
+	write_cell(&w, &place, false)
+	frame_end(&w, at)
+	session_input(c.s, w[:])
+}
+@(private = "file")
+ack_heard :: proc(c: ^Reader_Client) -> (seq: u64) {
+	out := session_output(c.s)
+	r := Reader{buf = out}
+	for r.pos < len(out) {
+		frame := read_bytes(&r)
+		if Message(frame[0]) == .Ack {
+			f := Reader{buf = frame[1:]}
+			seq = read_varint(&f)
+		}
+	}
+	session_sent(c.s, len(out))
+	return
+}
+
 // else, where something more comes before every sync is done, as from a client writing steadily, nothing would be.
 @(test)
 acknowledged_as_far_as_a_sync_reaches :: proc(t: ^testing.T) {
@@ -447,44 +478,16 @@ acknowledged_as_far_as_a_sync_reaches :: proc(t: ^testing.T) {
 	}
 	c := reader_open(x, "as ann")
 	defer reader_close(&c)
-	write :: proc(x: ^Sim_Node, c: ^Reader_Client, seq: u64) {
-		x.node.now += 1000
-		row := node_id(&x.node, 1)
-		body: [24]byte
-		list := list_tag(keyring_scope(&x.keys, 1), "a")
-		put_u64(body[:], list[0])
-		put_u64(body[8:], list[1])
-		w := make([dynamic]byte, context.temp_allocator)
-		at := frame_begin(&w, .Cells)
-		write_varint(&w, seq)
-		place := Cell{row, 1, .Place, node_stamp(&x.node), body[:]}
-		write_cell(&w, &place, false)
-		frame_end(&w, at)
-		session_input(c.s, w[:])
-	}
-	acked :: proc(c: ^Reader_Client) -> (seq: u64) {
-		out := session_output(c.s)
-		r := Reader{buf = out}
-		for r.pos < len(out) {
-			frame := read_bytes(&r)
-			if Message(frame[0]) == .Ack {
-				f := Reader{buf = frame[1:]}
-				seq = read_varint(&f)
-			}
-		}
-		session_sent(c.s, len(out))
-		return
-	}
-	_ = acked(&c)
-	write(x, &c, 1)
+	_ = ack_heard(&c)
+	ack_write(x, &c, 1)
 	testing.expect(t, store_sync_start(&x.node.store) && len(tokens) == 1)
-	write(x, &c, 2) // while the sync is under way
-	testing.expect_value(t, acked(&c), 0)
+	ack_write(x, &c, 2) // while the sync is under way
+	testing.expect_value(t, ack_heard(&c), 0)
 	testing.expect(t, store_disk_synced(&x.node.store, pop(&tokens), true))
-	testing.expect_value(t, acked(&c), 1) // what the sync reached, and not what came after
+	testing.expect_value(t, ack_heard(&c), 1) // what the sync reached, and not what came after
 	testing.expect(t, store_sync_start(&x.node.store))
 	testing.expect(t, store_disk_synced(&x.node.store, pop(&tokens), true))
-	testing.expect_value(t, acked(&c), 2)
+	testing.expect_value(t, ack_heard(&c), 2)
 }
 
 // Once storage has failed, nothing more is said: no acknowledgement, of what was synced before or not, and nothing else,
@@ -506,4 +509,40 @@ nothing_is_said_once_storage_failed :: proc(t: ^testing.T) {
 	x.node.failed = true // as a checkpoint after it might find
 	testing.expect_value(t, len(session_output(c.s)), 0)
 	testing.expect_value(t, len(session_queued(c.s)), 0)
+}
+
+// What is durable is acknowledged at the next output, though more came in the meanwhile, as the loop has it: a sync
+// done, then what the network brought, then what is said. A writer whose next frame always comes before that is
+// acknowledged as each sync is done, never left waiting on one that is overtaken in turn.
+@(test)
+acknowledged_once_durable_though_more_came :: proc(t: ^testing.T) {
+	state := seeded(43)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 0, ring = 64)
+	defer sim_destroy(&s)
+	x := s.nodes[0]
+	@(static) tokens: [dynamic]u64
+	defer delete(tokens)
+	x.node.store.disk.log_sync_start = proc(_: rawptr, token: u64) -> bool {
+		append(&tokens, token)
+		return true
+	}
+	c := reader_open(x, "as ann")
+	defer reader_close(&c)
+	_ = ack_heard(&c)
+	seq := u64(1)
+	ack_write(x, &c, seq)
+	for round in 0 ..< 10 {
+		testing.expect(t, store_sync_start(&x.node.store) && len(tokens) == 1)
+		testing.expect(t, store_disk_synced(&x.node.store, pop(&tokens), true))
+		seq += 1
+		ack_write(x, &c, seq) // before anything is said
+		testing.expectf(t, ack_heard(&c) == seq - 1, "round %d: what was durable is acknowledged", round)
+	}
+	// And so when the sync was one waited for.
+	testing.expect(t, store_sync(&x.node.store))
+	seq += 1
+	ack_write(x, &c, seq)
+	testing.expect_value(t, ack_heard(&c), seq - 1)
 }

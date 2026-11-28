@@ -2004,8 +2004,18 @@ emit_row :: proc(s: ^Session, row: Id) {
 @(private)
 on_cells :: proc(s: ^Session, r: ^Reader) {
 	n := s.node
-	if f := &n.flight; f.log != 0 && s.seq_in > s.acked_in && s.ack_at <= f.log_upto {
-		s.ack_prior = {s.seq_in, s.ack_at, len(s.refused)}
+	// What came before this frame is owed an acknowledgement as far as it is durable, or as far as a sync under way
+	// reaches, whatever this frame adds after it: so held, before this moves seq_in and ack_at on. One durable already is
+	// never given up for one that is not, which would be said only after the next sync, or never while every sync is
+	// overtaken by more; and is acknowledged at the next output, however much more comes before it.
+	if s.seq_in > s.acked_in {
+		f := &n.flight
+		durable := n.synced >= s.ack_at
+		pending := f.log != 0 && s.ack_at <= f.log_upto
+		held := s.ack_prior.seq > s.acked_in && n.synced >= s.ack_prior.at
+		if durable || (pending && !held) {
+			s.ack_prior = {s.seq_in, s.ack_at, len(s.refused)}
+		}
 	}
 	seq := read_varint(r)
 	cells := make([dynamic]Cell, context.temp_allocator)

@@ -37,6 +37,7 @@ Disk_File :: struct {
 	failed:  bool, // an fsync of it failed: none after is said to have succeeded
 	closing: bool, // let go of: closed once its queue is empty
 	id:      u64, // never another's, as a handle's address may be once the handle is closed
+	owner:   u64, // the disk whose file it is (File_Disk.id), which a failure of it fails for good: see disk_owner_failed
 }
 
 // What the thread is given, and gives back. Guarded by `lock`, but for `files` and `answers`, the loop's alone.
@@ -50,12 +51,13 @@ Disk_Queue :: struct {
 	stopping: bool,
 	files:    [dynamic]^Disk_File,
 	ids:      u64, // the last given a file
+	failed:   map[u64]bool, // disks a write or fsync of a file of failed, whatever has become of the file since
 	groups:   map[u64]Disk_Group, // syncs asked of several files at once, by token
 	answers:  [dynamic]Disk_Answer, // what is to be handed to the stores
 	// Where set, what would be given the thread is given this instead, which does it whenever, and says so by
 	// disk_done: so that a test decides what is done when, and what power lost leaves (see disk_power_test.odin).
 	hook:     proc(h: ^Host, op: ^Disk_Op),
-	waiting:  proc(h: ^Host), // and this does something, when the loop must wait
+	waiting:  proc(h: ^Host, for_: ^Disk_File), // and this does something, when the loop must wait: for that file, if one
 	noted:    proc(h: ^Host, f: ^os.File, at: i64, bytes: []byte, truncated: bool), // told of each write the loop makes
 	synced:   proc(h: ^Host, f: ^os.File), // and of each fsync it makes itself
 }
@@ -81,15 +83,16 @@ Disk_Answer :: struct {
 }
 
 @(private)
-disk_file :: proc(h: ^Host, f: ^os.File) -> ^Disk_File {
+disk_file :: proc(h: ^Host, f: ^os.File, owner: u64 = 0) -> ^Disk_File {
 	for x in h.disk.files {
 		if x.file == f && !x.closing {
+			x.owner = max(x.owner, owner)
 			return x
 		}
 	}
 	x := new(Disk_File)
 	h.disk.ids += 1
-	x.file, x.id = f, h.disk.ids
+	x.file, x.id, x.owner = f, h.disk.ids, owner
 	append(&h.disk.files, x)
 	return x
 }
@@ -109,16 +112,16 @@ disk_find :: proc(h: ^Host, f: ^os.File) -> ^Disk_File {
 // Asks an fsync of each of these files, after all asked of it before, as one sync for the store whose token this is.
 // With none, the sync is done at once, said so at the next settle (host_deadline comes at once).
 @(private)
-disk_sync_ask :: proc(h: ^Host, token: u64, files: ..^os.File) {
+disk_sync_ask :: proc(h: ^Host, token: u64, owner: u64, files: ..^os.File) {
 	if len(files) == 0 {
-		append(&h.disk.answers, Disk_Answer{token, true})
+		append(&h.disk.answers, Disk_Answer{token, !h.disk.failed[owner]})
 		return
 	}
 	if len(files) > 1 {
 		h.disk.groups[token] = {left = len(files), ok = true}
 	}
 	for f in files {
-		x := disk_file(h, f)
+		x := disk_file(h, f, owner)
 		op := new(Disk_Op)
 		op.file, op.sync, op.token = x, true, token
 		disk_ask(h, x, op)
@@ -208,8 +211,11 @@ disk_advance :: proc(h: ^Host) {
 		assert(len(x.queue) > 0 && x.queue[0] == op)
 		ordered_remove(&x.queue, 0)
 		x.failed ||= !op.ok
+		if !op.ok && x.owner != 0 {
+			q.failed[x.owner] = true // and so is every sync of that disk's from now on, of whatever file
+		}
 		if op.sync && op.token != 0 {
-			ok := op.ok && !x.failed
+			ok := op.ok && !x.failed && !q.failed[x.owner]
 			if g, grouped := &q.groups[op.token]; grouped {
 				g.left -= 1
 				g.ok &&= ok
@@ -289,18 +295,18 @@ disk_drain :: proc(h: ^Host, f: ^os.File) -> bool {
 		return true
 	}
 	for len(x.queue) > 0 {
-		disk_wait(h)
+		disk_wait(h, x)
 		disk_advance(h)
 	}
 	return !x.failed
 }
 
-// Until the thread has done something more.
+// Until the thread has done something more: for this file, if one is waited for, whatever it does in fact.
 @(private)
-disk_wait :: proc(h: ^Host) {
+disk_wait :: proc(h: ^Host, for_: ^Disk_File = nil) {
 	q := &h.disk
 	if q.waiting != nil {
-		q.waiting(h)
+		q.waiting(h, for_)
 		return
 	}
 	sync.guard(&q.lock)
@@ -314,7 +320,13 @@ disk_wait :: proc(h: ^Host) {
 @(private)
 disk_drain_closing :: proc(h: ^Host, id: u64) {
 	for disk_known(h, id) {
-		disk_wait(h)
+		x: ^Disk_File
+		for y in h.disk.files {
+			if y.id == id {
+				x = y
+			}
+		}
+		disk_wait(h, x)
 		disk_advance(h)
 	}
 }
@@ -330,6 +342,28 @@ disk_known :: proc(h: ^Host, id: u64) -> bool {
 		}
 	}
 	return false
+}
+
+// Whether a write or fsync of any file of a disk has failed, however long ago, and whatever has become of the file.
+@(private)
+disk_owner_failed :: proc(h: ^Host, owner: u64) -> bool {
+	return h != nil && owner != 0 && h.disk.failed[owner]
+}
+
+// Waits until nothing asked of any file of a disk is left to do, and each it let go of is closed.
+@(private)
+disk_owner_drain :: proc(h: ^Host, owner: u64) {
+	for {
+		busy := false
+		for x in h.disk.files {
+			busy ||= x.owner == owner && (len(x.queue) > 0 || x.closing)
+		}
+		if !busy {
+			return
+		}
+		disk_wait(h)
+		disk_advance(h)
+	}
 }
 
 // Whether anything is still to be done of a file.
@@ -361,6 +395,7 @@ disk_end :: proc(h: ^Host) {
 		disk_file_free(x)
 	}
 	delete(q.files)
+	delete(q.failed)
 	delete(q.groups)
 	delete(q.answers)
 	if q.thread != nil {
