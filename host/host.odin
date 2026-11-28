@@ -343,6 +343,7 @@ host_init :: proc(h: ^Host, config: Config) -> (started: bool) {
 
 host_run :: proc(h: ^Host) -> bool {
 	dialers_refresh(h)
+	ticks_woke()
 	for !sync.atomic_load(&h.stopping) {
 		h.more = false
 		host_settle(h)
@@ -359,11 +360,14 @@ host_run :: proc(h: ^Host) -> bool {
 		if loop_held_back() {
 			wait = 0 // what it holds back goes to the system only by a tick that does not wait
 		}
+		ticks_end()
 		if err := nbio.tick(wait); err != nil {
 			report(.Error, "the event loop failed")
 			return false
 		}
+		ticks_woke()
 		free_all(context.temp_allocator)
+		ticks_mark(.Free)
 	}
 	return true
 }
@@ -435,18 +439,25 @@ host_settle :: proc(h: ^Host) {
 			}
 		}
 	}
+	ticks_mark(.Sync)
 	dialers_run(h, now)
+	ticks_mark(.Dialers)
 	links_run(h)
+	ticks_mark(.Links)
 	for s in h.spaces {
 		s.node.now = ms
 		s.retaining = false
 		if due := zsp.node_retain_due(&s.node); due != 0 && due <= ms {
 			s.retaining = zsp.node_retain(&s.node) // a step at a time, others' turns between
 		}
+		ticks_mark(.Retain)
 		found_run(s, now)
+		ticks_mark(.Found)
 		relayed_run(s, now)
+		ticks_mark(.Relayed)
 	}
 	links_flush(h)
+	ticks_mark(.Links_Flush)
 	for s in h.spaces {
 		#reverse for r, i in s.relayed {
 			relayed_flush(r)
@@ -456,6 +467,7 @@ host_settle :: proc(h: ^Host) {
 			}
 		}
 	}
+	ticks_mark(.Relayed_Flush)
 	// Last, so that what links had to say through relays goes out at once.
 	#reverse for s in h.streams {
 		if s.due != {} && !stream_due(s, now) {
@@ -464,6 +476,7 @@ host_settle :: proc(h: ^Host) {
 		}
 		stream_flush(s)
 	}
+	ticks_mark(.Streams)
 	// And again, for what failed meanwhile, as keeping a roster a link or a relay brought: the host stops now, not when
 	// something next wakes it, and before a relay closes a space nobody is in, which would leave nothing to say so.
 	if host_failed(h) {
@@ -481,6 +494,7 @@ host_settle :: proc(h: ^Host) {
 				space_close(s)
 			}
 		}
+		ticks_mark(.Spaces)
 	}
 	for s in h.spaces {
 		zsp.store_flush(&s.node.store)
@@ -489,6 +503,7 @@ host_settle :: proc(h: ^Host) {
 			h.sync_due = time.tick_add(now, SYNC_DELAY)
 		}
 	}
+	ticks_mark(.Store_Flush)
 }
 
 // Whether a space's storage has failed, which stops the host.

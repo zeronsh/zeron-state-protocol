@@ -146,7 +146,9 @@ segments_close :: proc(d: ^File_Disk, first: u64, last := max(u64)) {
 }
 
 @(private)
-disk_sync :: proc(f: ^os.File) -> bool {
+disk_sync :: proc(f: ^os.File, kind: Tick_Disk) -> bool {
+	since := ticks_now()
+	defer ticks_disk(kind, since)
 	return os.sync(f) == nil
 }
 
@@ -162,7 +164,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			number := off / zsp.SEGMENT
 			if number != d.number {
 				if d.active != nil {
-					if d.dirty && !disk_sync(d.active) {
+					if d.dirty && !disk_sync(d.active, .Roll_Sync) {
 						return false
 					}
 					os.close(d.active)
@@ -174,7 +176,9 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 				}
 				d.active, d.number = f, number
 			}
+			since := ticks_now()
 			n, err := os.write_at(d.active, bytes, i64(off % zsp.SEGMENT))
+			ticks_disk(.Log_Write, since)
 			d.dirty = true
 			return err == nil && n == len(bytes)
 		},
@@ -223,7 +227,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			if d.active == nil || !d.dirty {
 				return true
 			}
-			if !disk_sync(d.active) {
+			if !disk_sync(d.active, .Log_Sync) {
 				return false
 			}
 			d.dirty = false
@@ -243,7 +247,9 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			}
 			block: [zsp.PAGE_SIZE]byte
 			copy(block[:], bytes)
+			since := ticks_now()
 			n, err := os.write_at(d.tree, block[:], i64(no) * zsp.PAGE_SIZE)
+			ticks_disk(.Page_Write, since)
 			return err == nil && n == len(block)
 		},
 		page_sync = proc(data: rawptr) -> bool {
@@ -251,7 +257,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			if d.tree == nil {
 				return true
 			}
-			if !disk_sync(d.tree) {
+			if !disk_sync(d.tree, .Page_Sync) {
 				return false
 			}
 			size, err := os.file_size(d.tree)
