@@ -174,10 +174,13 @@ local now = client:fetch({ scope = 1, table = Message, where = w.is("author", "a
 
 local text = client:text(id, Message.body)
 text.append(token) -- seen everywhere at once; durable a piece at a time
+text.sealed() -- durable now, as far as typed: yields until it is acknowledged
 
 client:serve(1, "run", function(call, data) ... end)
 local answer = client:request(device, 1, "run", data)
 local copy = client:call(device, 1, "copy", first, { urgency = 6 }) -- a stream each way, behind what is urgent
+
+client:close() -- drops nothing, pipe or none; client:flushed() yields until all it wrote is durable
 ```
 
 In a browser or Node, the device is the node, and the client is the Luau one, in TypeScript ([docs/web.md](docs/web.md)):
@@ -191,6 +194,7 @@ const client = device.client();
 const window = client.window({ scope: 1, list: "chat/42", table: Message }, (state) => render(state.rows));
 await client.write(1, (change) => change.insert(Message, "chat/42", Date.now(), { author: "model" })); // durable here
 client.text(id, Message.body).append(token);
+await client.close(); // once all it wrote, and typed, is durable: nothing is dropped, its pipe up or not
 ```
 
 On Cloudflare, authentication is a function:

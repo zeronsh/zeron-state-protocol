@@ -256,9 +256,13 @@ export interface Editor {
   insert(index: number, s: string): void;
   append(s: string): void;
   delete(index: number, count: number): void;
-  /** Makes what has been written durable now rather than shortly. */
-  commit(): void;
-  close(): void;
+  /**
+   * Makes what has been written durable now rather than shortly. Resolves once it is acknowledged, durable on the node this
+   * client speaks to, and all this client wrote before it; rejects only should that never be (Client.close).
+   */
+  commit(): Promise<void>;
+  /** Ends the editor, sealing what was typed: resolves, or rejects, as commit does. */
+  close(): Promise<void>;
 }
 
 export interface Change {
@@ -396,7 +400,18 @@ interface Pending {
   body: Uint8Array;
   rows: string[];
   done: () => void;
+  fail: (e: Error) => void; // should it never be durable
 }
+
+// Whoever waits for everything written up to a sequence number: told once each is acknowledged, or that one never will be.
+interface Barrier {
+  seq: number;
+  failed?: Error;
+  resolve: () => void;
+  reject: (e: Error) => void;
+}
+
+const handled = <T>(p: Promise<T>): Promise<T> => (p.catch(() => {}), p); // whoever does not wait for it is not thrown at
 
 // ---------------------------------------------------------------- merging
 
@@ -508,6 +523,9 @@ export class Client {
   #nextShape = 0;
   #seq = 0;
   #pending: Pending[] = [];
+  #barriers: Barrier[] = []; // by sequence number
+  #closing: Promise<void> | undefined; // once closed: until all it wrote is acknowledged
+  #early = new Set<Promise<void>>(); // editors' typing before their rows were here: until it is typed in them
   #unacked = new Map<string, number>(); // rows in pending, and how often
   #out = codec.writer();
   #flushing = false;
@@ -545,7 +563,7 @@ export class Client {
   // ---------------------------------------------------------------- the pipe
 
   #dial(): void {
-    if (this.#closed || this.#wire) return;
+    if (this.#wire || (this.#closed && this.#pending.length === 0)) return; // a client closed dials only to deliver what it wrote
     let over = false;
     const closed = () => {
       if (over) return;
@@ -559,6 +577,8 @@ export class Client {
       if (!over) this.#receive(data);
     }, closed);
     if (!wire) {
+      // No node to hand it to: what a client closed wrote can never be delivered, and it is told so, not dropped unsaid.
+      if (this.#closed) this.#giveUp(new Error("the client was closed with no node to deliver what it wrote to"));
       closed();
       return;
     }
@@ -599,7 +619,7 @@ export class Client {
       }
     }
     this.#sweep();
-    if (!this.#closed) {
+    if (!this.#closed || this.#pending.length > 0) {
       // Soon after a pipe that was well; later and later after each that never came up, or that the node found fault
       // with, since what this client says it would say again.
       if (well) this.#failures = 0;
@@ -611,23 +631,86 @@ export class Client {
     this.#tell("status", false);
   }
 
-  /** Lets go of the pipe, saying first whatever is still to be said. Questions asked once are answered as far as they got. */
-  close(): void {
-    if (this.#closed) return;
+  /**
+   * Ends the client, saying first whatever is still to be said: what editors have typed is sealed, pipe or none, and nothing
+   * it wrote is dropped. The pipe is let go of once all of that is acknowledged, durable on the node this client speaks to,
+   * at once when nothing waits; until then the client dials again should the pipe be lost, as an open one does, and does
+   * nothing else. Resolves then. Rejects only should what it wrote never be durable: no node to dial, one that refuses this
+   * client for good, or a scope it may no longer write in. Questions asked once are answered as far as they got.
+   */
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
     this.#closed = true;
-    // What editors have typed and not yet sealed is still to be said.
-    if (this.#ready) for (const row of this.#rows.values()) for (const [slot, t] of row.texts) if (t.open !== "") this.#seal(row, slot);
-    this.#flush();
-    this.#hangUp();
-    // Nothing is left to be done later: a closed client keeps nothing awake.
-    for (const cancel of [...this.#timers]) cancel();
-    for (const a of [...this.#asked.values()]) this.#fetched(a);
-    for (const live of [...this.#faults.keys()]) this.#fault(live); // calls never made end here, as those made do
+    const after = () => {
+      // Nothing else is left to be done later: a closed client keeps nothing awake but the delivery of what it wrote.
+      for (const cancel of [...this.#timers]) cancel();
+      for (const a of [...this.#asked.values()]) this.#fetched(a);
+      for (const live of [...this.#faults.keys()]) this.#fault(live); // calls never made end here, as those made do
+    };
+    const deliver = (): Promise<void> => {
+      this.#sealAll();
+      this.#flush();
+      if (this.#pending.length === 0) {
+        this.#hangUp();
+        after();
+        return Promise.resolve(); // at once: nothing to deliver
+      }
+      after();
+      const delivered = this.#barrier();
+      const end = () => {
+        for (const cancel of [...this.#timers]) cancel();
+        if (this.#wire) this.#hangUp();
+      };
+      delivered.then(end, end);
+      if (!this.#wire) this.#dial(); // now, rather than as an open client would have later
+      return handled(delivered);
+    };
+    if (this.#early.size === 0) return (this.#closing = deliver());
+    // Questions are answered as far as they got: so are those for rows editors typed in before they were here, and what
+    // they typed is typed in them, to be sealed with the rest.
+    const early = [...this.#early];
+    after();
+    return (this.#closing = handled(Promise.all(early).then(deliver)));
   }
 
-  // Runs f later, unless the client is closed first; returns a way to cancel it.
+  // What editors have typed and not yet sealed, sealed, as the client ends or its tab is put away.
+  #sealAll(): void {
+    for (const row of this.#rows.values()) for (const [slot, t] of row.texts) if (t.open !== "") this.#seal(row, slot);
+  }
+
+  // Resolves once everything written so far is acknowledged; rejects should any of it never be.
+  #barrier(): Promise<void> {
+    const last = this.#pending[this.#pending.length - 1];
+    if (!last) return Promise.resolve();
+    return new Promise((resolve, reject) => this.#barriers.push({ seq: last.seq, resolve, reject }));
+  }
+
+  // Those waiting for what is no longer pending are told: all written before them is acknowledged, or some never will be.
+  #unbar(): void {
+    const lowest = this.#pending.length > 0 ? this.#pending[0].seq : Infinity;
+    while (this.#barriers.length > 0 && this.#barriers[0].seq < lowest) {
+      const b = this.#barriers.shift()!;
+      if (b.failed) b.reject(b.failed);
+      else b.resolve();
+    }
+  }
+
+  // What was written that can never be durable is pending no more, and whoever waits for it is told so.
+  #fail(p: Pending, e: Error): void {
+    this.#pending.splice(this.#pending.indexOf(p), 1);
+    this.#settle(p);
+    for (const b of this.#barriers) if (b.seq >= p.seq) b.failed ??= e;
+    p.fail(e);
+    this.#unbar();
+  }
+
+  #giveUp(e: Error): void {
+    for (const p of [...this.#pending]) this.#fail(p, e);
+  }
+
+  // Runs f later, unless the client is closed first, with nothing it wrote still to deliver; returns a way to cancel it.
   #after(ms: number, f: () => void): () => void {
-    if (this.#closed) return () => {};
+    if (this.#closed && this.#pending.length === 0) return () => {};
     let stop = (): void => {};
     const cancel = (): void => {
       if (this.#timers.delete(cancel)) stop();
@@ -753,6 +836,7 @@ export class Client {
   }
 
   #handle(kind: number, r: codec.Reader): void {
+    if (this.#closed && kind !== ACK && kind !== ROSTER && kind !== ERROR) return; // closed, it only delivers what it wrote
     switch (kind) {
       case CELLS:
         return this.#onCells(r);
@@ -793,7 +877,11 @@ export class Client {
         const code = codec.u8(r);
         this.#faulted = true;
         this.#tell("error", code);
-        if (code === 2 || code === 3) this.close(); // refused, or speaking another language: trying again is no use
+        if (code === 2 || code === 3) {
+          // Refused, or speaking another language: trying again is no use, and what is pending never will be durable.
+          this.#giveUp(new Error(code === 2 ? "the node refused this client" : "the node speaks another version"));
+          void this.close();
+        }
         return;
       }
     }
@@ -813,6 +901,7 @@ export class Client {
       this.#scopes.set(scope, { rights, key: codec.take(r, 32).slice() });
     }
     if (this.#ready) {
+      if (this.#closed) return;
       // Rights have changed: windows waiting for this one open.
       for (const window of this.#windows.values()) {
         if (window.denied && this.#scopes.has(window.scope)) {
@@ -829,11 +918,10 @@ export class Client {
     this.#ready = true;
     // Say again whatever the last pipe was told: what is served, unacknowledged and watched. What this client may no
     // longer write in is let go of, never to be durable: a node would refuse it, and this client with it, for good.
-    for (const key of this.#handlers.keys()) this.#serve(key, true);
+    if (!this.#closed) for (const key of this.#handlers.keys()) this.#serve(key, true);
     for (const p of [...this.#pending]) {
       if (!this.may(p.scope, "write")) {
-        this.#pending.splice(this.#pending.indexOf(p), 1);
-        this.#settle(p);
+        this.#fail(p, new Error("this client may no longer write there"));
         continue;
       }
       const w = codec.writer();
@@ -841,6 +929,7 @@ export class Client {
       codec.put(w, p.body);
       this.#frame(CELLS, w);
     }
+    if (this.#closed) return; // and nothing more
     for (const window of this.#windows.values()) {
       if (window.pages.length === 0) this.#open(window);
       else for (const page of window.pages) this.#watch(page);
@@ -1850,6 +1939,10 @@ export class Client {
     const row = this.#row(bin);
     row.held.set(slot, (row.held.get(slot) ?? 0) + 1);
     let closed = false, ended = false;
+    let sealed: Promise<void> | undefined; // as it was closed
+    // What is typed before the row is here is typed in it once it is: until then, commit and close wait for it.
+    let applied: Promise<void> | undefined, apply = () => {};
+    if (early) this.#early.add((applied = new Promise<void>((done) => (apply = done))));
     const fresh = () => codec.binary(this.#host.random(8));
     const edited = () => {
       row.dirty.add(slot);
@@ -1914,6 +2007,7 @@ export class Client {
         }
       } finally {
         if (closed) finish();
+        if (applied) this.#early.delete(applied), apply();
       }
     });
     // Where a UTF-16 index of what is shown falls in its bytes, whatever they are.
@@ -1958,11 +2052,18 @@ export class Client {
           while ((left = text.erase(t, from, left, fresh, PIECE_MOST)) > 0) this.#seal(row, slot);
         });
       },
-      commit: () => this.#seal(row, slot),
+      commit: () => {
+        if (early) return handled(applied!.then(() => (this.#seal(row, slot), this.#barrier())));
+        this.#seal(row, slot);
+        return handled(this.#barrier());
+      },
       close: () => {
-        if (closed) return;
-        closed = true;
-        finish();
+        if (!closed) {
+          closed = true;
+          finish();
+        }
+        // What it typed before its row was here is sealed once the row comes, and waited for from then.
+        return (sealed ??= handled(early ? applied!.then(() => this.#barrier()) : this.#barrier()));
       },
     });
   }
@@ -2034,7 +2135,7 @@ export class Client {
     }
   }
 
-  #sendCells(cells: Written[], done?: () => void): void {
+  #sendCells(cells: Written[], done?: () => void, fail?: (e: Error) => void): void {
     const scope = codec.u32Of(cells[0].row);
     // What this client may no longer write in, since it began, is never said: a node refuses it, and this client with it.
     if (this.#ready && !this.may(scope, "write")) return;
@@ -2056,7 +2157,7 @@ export class Client {
     }
     const body = codec.written(w).slice();
     const seq = ++this.#seq;
-    this.#pending.push({ seq, scope, body, rows, done: done ?? (() => {}) });
+    this.#pending.push({ seq, scope, body, rows, done: done ?? (() => {}), fail: fail ?? (() => {}) });
     if (this.#ready) {
       const framed = codec.writer();
       codec.putVarint(framed, seq);
@@ -2071,6 +2172,7 @@ export class Client {
       this.#settle(p);
       p.done();
     }
+    if (this.#barriers.length > 0) this.#unbar();
   }
 
   // What was written is pending no more: its rows are let go of, unless something else holds them.
@@ -2086,7 +2188,9 @@ export class Client {
 
   /**
    * Applies several changes as one: all visible in the same turn, all durable together or not at all. Resolves when they
-   * are durable on this device.
+   * are durable on the node this client speaks to, and all this client wrote before them; rejects should they never be,
+   * the scope being one it may no longer write in, or the client closed with no node to deliver them to (close). A change
+   * of nothing is so a barrier: it resolves once all written before it is durable.
    */
   write(scope: number, f: (change: Change) => void): Promise<void> {
     const s = this.#scopes.get(scope);
@@ -2156,8 +2260,9 @@ export class Client {
     };
     const idOf = rowId;
     // Done here, so that what is refused throws here; and should it throw, as if it had never been.
-    let resolve!: () => void;
-    const result = new Promise<void>((done) => (resolve = done));
+    let resolve!: () => void, reject!: (e: Error) => void;
+    // Rejected only should it never be durable, and then handled, so that whoever did not wait for it is not thrown at.
+    const result: Promise<void> = new Promise<void>((done, failed) => ((resolve = done), (reject = (e) => (handled(result), failed(e)))));
     try {
       f({
         insert: (schema, list, order, values) => {
@@ -2197,8 +2302,8 @@ export class Client {
       undo();
       throw e;
     }
-    if (cells.length > 0) this.#sendCells(cells, resolve);
-    else this.#host.defer(resolve);
+    if (cells.length > 0) this.#sendCells(cells, resolve, reject);
+    else this.#barrier().then(resolve, reject);
     const placing = new Set<Stored>();
     for (const id of rows) {
       const row = this.#rows.get(id);

@@ -320,6 +320,11 @@ A peer that is a full replica is sent everything its dialler commits, and everyt
 partial, commits, whoever dialled: what such a one owes is what it has not yet said. Otherwise a session is sent what it watches. A partial replica keeps owing a row
 named in an Ack.
 
+A local client keeps every Cells it sent until an Ack covers it, and sends it again, in order, on its next session, should one end first. So one that
+ends lets its session go only once all it sent is acknowledged: ended while it has no session, it opens one to finish, and does nothing else on it;
+and it says that what it sent will never be durable, rather than nothing, only once that is so, as with no node to open a session with, a node that
+refuses it with Error 2 or 3, or a scope it may no longer write in. A text it has open is sealed as it ends, whether or not a session is up.
+
 If an offered cell was refused because something had killed it, the receiver sends back the row as it has it: the sender held something
 old and would not otherwise hear.
 

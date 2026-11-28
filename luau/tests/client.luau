@@ -15,7 +15,7 @@ local ANSWER, FETCH = 34, 35
 type Said = { kind: number, body: string }
 
 local function harness()
-	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, waits = {} :: { number }, timers = 0, closes = 0, connects = 0, sizes = {} :: { number }, partial = "", clock = function(): number
+	local self = { said = {} :: { Said }, receive = nil :: any, closed = nil :: any, deferred = {} :: { any }, later = {} :: { any }, waits = {} :: { number }, timers = 0, closes = 0, connects = 0, refuse = false, sizes = {} :: { number }, partial = "", clock = function(): number
 		return 1800000000
 	end }
 	local function run()
@@ -58,6 +58,9 @@ local function harness()
 			end
 		end,
 		connect = function(receive: any, closed: any)
+			if self.refuse then
+				return nil -- no pipe can be had, as with no node to dial
+			end
 			self.connects += 1
 			self.receive, self.closed = receive, closed
 			return {
@@ -3082,6 +3085,205 @@ do
 	table.sort(faults)
 	assert(table.concat(faults, ", ") == "answered lost, made lost", table.concat(faults, ", "))
 	assert(next(h.client.calls) == nil and next(h.client.answers) == nil)
+end
+
+-- ---------------------------------------------------------------- what is written, as a client ends
+
+-- The cells a client said, of every frame of Cells from the given one on: by what kind each is.
+local function cells_said(h: any, from: number?): { { seq: number, kinds: { number } } }
+	local out = {}
+	for i = (from or 0) + 1, #h.self.said do
+		local x = h.self.said[i]
+		if x.kind == CELLS then
+			local r = codec.reader(x.body)
+			local seq = codec.varint(r)
+			local kinds = {}
+			while r.pos < r.len do
+				local kind = codec.u8(r)
+				table.insert(kinds, kind % 128)
+				if kind < 128 then
+					codec.take(r, 16)
+				end
+				codec.u8(r)
+				codec.take(r, 16)
+				codec.bytes(r)
+			end
+			table.insert(out, { seq = seq, kinds = kinds })
+		end
+	end
+	return out
+end
+local function ack(h: any, seq: number)
+	local w = codec.writer()
+	codec.put_varint(w, seq)
+	h.tell(ACK, codec.string(w))
+end
+-- What a yielding call comes to, called in a coroutine of its own: nil while it waits.
+local function waited(f: () -> (boolean, string?)): { any }
+	local out: { any } = {}
+	coroutine.wrap(function()
+		local ok, why = f()
+		out.ok, out.why, out.done = ok, why, true
+	end)()
+	return out
+end
+local PIECE_KIND, VALUE_KIND = 4, 3
+local function kinds_of(sent: { { seq: number, kinds: { number } } }): string
+	local parts = {}
+	for _, x in sent do
+		table.insert(parts, table.concat(x.kinds, "+"))
+	end
+	return table.concat(parts, ",")
+end
+
+-- A client closed while its pipe is down, as while zspd starts again or a relay blinks: what an editor typed is sealed all
+-- the same, and what it wrote, and the piece, are kept, the client dialling again to deliver them; and it lets go of the
+-- pipe once they are acknowledged, flushed() saying so then.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	ack(h, 1)
+	local editor = h.client:text(id, Note.body)
+	editor.append("typed as the pipe went")
+	h.run()
+	h.self.closed()
+	h.run()
+	h.client:write(1, function(change)
+		change.set(id, Note, { title = "u" })
+	end)
+	h.client:close()
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	h.run()
+	assert(not flushed.done, "said to be flushed with what it wrote undelivered")
+	h.laters() -- dialled again
+	h.run()
+	assert(h.self.connects == 2, "a client closed with what it wrote undelivered did not dial again")
+	local from = #h.self.said
+	h.greet()
+	h.run()
+	local sent = cells_said(h, from)
+	assert(kinds_of(sent) == `{VALUE_KIND},{PIECE_KIND}`, "what it wrote and what was typed were not delivered: " .. kinds_of(sent))
+	assert(h.self.closes == 0, "the pipe was let go of before what it carried was acknowledged")
+	ack(h, sent[2].seq)
+	h.run()
+	assert(flushed.done and flushed.ok, tostring(flushed.why))
+	assert(h.self.closes == 1, "the pipe was not let go of once all was acknowledged")
+	assert(h.self.timers == 0, "a client closed keeps something awake")
+end
+
+-- One closed with nothing to deliver lets go of its pipe at once, as before; and flushed() does not wait.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	h.client:close()
+	assert(h.self.closes == 1, "the pipe was not let go of at once")
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	assert(flushed.done and flushed.ok)
+end
+
+-- And one closed with what it wrote never to be delivered says so, rather than nothing: with no node to dial, or a scope
+-- it may no longer write in once the pipe is up again.
+for _, why in { "no node", "no right" } do
+	local h = harness()
+	h.run()
+	h.greet()
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	h.self.closed()
+	h.run()
+	if why == "no node" then
+		h.self.refuse = true
+	end
+	h.client:close()
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	h.run()
+	if why == "no right" then
+		h.laters()
+		h.run()
+		h.tell(ROSTER, string.rep("\0", 8) .. "\1\1" .. string.rep("k", 32)) -- read only
+	end
+	h.run()
+	assert(flushed.done and flushed.ok == false and type(flushed.why) == "string", `{why}: flushed() did not say it failed`)
+	assert(h.self.timers == 0, `{why}: a client closed keeps something awake`)
+end
+
+-- And what an editor typed before its row was here, the client closed at once after: it is typed in the row as it is
+-- looked for, as far as that got, and sealed, and delivered.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local editor = h.client:text("\0\0\0\1" .. "\106\11\28\45" .. "\1\2\3\4\5\6\7\8", Note.body)
+	editor.append("typed before the row was here")
+	h.run()
+	h.client:close()
+	h.run()
+	local sent = cells_said(h)
+	assert(kinds_of(sent) == tostring(PIECE_KIND), "what was typed was not delivered: " .. kinds_of(sent))
+	assert(h.self.closes == 0)
+	ack(h, sent[1].seq)
+	h.run()
+	assert(h.self.closes == 1)
+end
+
+-- A change of nothing is a barrier, done once everything written before it is acknowledged, not before; and an editor's
+-- sealed() yields until what it typed is.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	local id = ""
+	h.client:write(1, function(change)
+		id = change.insert(Note, "a", 1, { title = "t" })
+	end)
+	local barrier = false
+	h.client:write(1, function() end, function()
+		barrier = true
+	end)
+	h.run()
+	assert(not barrier, "a change of nothing was done before what was written before it was acknowledged")
+	ack(h, 1)
+	h.run()
+	assert(barrier)
+	local editor = h.client:text(id, Note.body)
+	h.run()
+	local fetched = h.last(FETCH) :: any
+	local w = codec.writer()
+	codec.put_varint(w, codec.varint(codec.reader(fetched.body)))
+	codec.put_u8(w, 32)
+	for _ = 1, 4 do
+		codec.put_varint(w, 0)
+	end
+	h.tell(ANSWER, codec.string(w))
+	editor.append("x")
+	local sealed = waited(function()
+		return editor.sealed()
+	end)
+	h.run()
+	assert(not sealed.done, "sealed() did not wait for what it sealed to be acknowledged")
+	local sent = cells_said(h)
+	ack(h, sent[#sent].seq)
+	h.run()
+	assert(sealed.done and sealed.ok)
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	assert(flushed.done and flushed.ok, "flushed() with nothing to wait for waited")
 end
 
 print("ok")

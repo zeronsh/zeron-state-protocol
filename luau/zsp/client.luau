@@ -107,6 +107,8 @@ type Stored = {
 }
 type Said = { [string]: { [string]: boolean } }
 type Pending = { seq: number, scope: number, body: string, rows: { string }, done: (() -> ())? }
+-- Whoever waits for everything written up to a sequence number: told once each is acknowledged, or that one never will be.
+type Barrier = { seq: number, failed: string?, notify: (boolean, string?) -> () }
 type Page = {
 	id: number,
 	window: Window,
@@ -282,6 +284,11 @@ local function new_client(host: Host)
 		next_shape = 0,
 		seq = 0,
 		pending = {} :: { Pending },
+		barriers = {} :: { Barrier }, -- by sequence number
+		-- Once closed: until all it wrote is acknowledged, then whether it was, and those who wait to hear.
+		closing = nil :: { result: { any }?, waiters: { (boolean, string?) -> () } }?,
+		early = {} :: { [{}]: boolean }, -- editors' typing before their rows were here: until it is typed in them
+		early_done = nil :: (() -> ())?, -- what a client closed does once it is
 		unacked = {} :: { [string]: number }, -- rows in pending, and how often
 		out = codec.writer(),
 		flushing = false,
@@ -306,8 +313,8 @@ export type Client = typeof(new_client(nil :: any))
 -- ---------------------------------------------------------------- the pipe
 
 function Client._dial(self: Client)
-	if self.closed or self.wire then
-		return
+	if self.wire or (self.closed and #self.pending == 0) then
+		return -- a client closed dials only to deliver what it wrote
 	end
 	local wire: Wire? = nil
 	local over = false
@@ -327,6 +334,10 @@ function Client._dial(self: Client)
 		end
 	end, closed)
 	if not wire then
+		-- No node to hand it to: what a client closed wrote can never be delivered, and it is told so, not dropped unsaid.
+		if self.closed then
+			self:_give_up("the client was closed with no node to deliver what it wrote to")
+		end
 		closed()
 		return
 	end
@@ -372,7 +383,7 @@ function Client._lost(self: Client)
 		end
 	end
 	self:_sweep()
-	if not self.closed then
+	if not self.closed or #self.pending > 0 then
 		-- Soon after a pipe that was well; later and later after each that never came up, or that the node found fault
 		-- with, since what this client says it would say again.
 		if well then
@@ -390,38 +401,159 @@ function Client._lost(self: Client)
 	self:_tell("status", false)
 end
 
+-- Ends the client, saying first whatever is still to be said: what editors have typed is sealed, pipe or none, and
+-- nothing it wrote is dropped. The pipe is let go of once all of that is acknowledged, durable on the node this client
+-- speaks to, at once when nothing waits; until then the client dials again should the pipe be lost, as an open one does,
+-- and does nothing else. It never yields: flushed() waits for that, and says whether it never will be, as with no node to
+-- dial, one that refuses this client for good, or a scope it may no longer write in. Questions asked once are answered as
+-- far as they got.
 function Client.close(self: Client)
 	if self.closed then
 		return
 	end
 	self.closed = true
-	-- What editors have typed and not yet sealed is still to be said.
-	if self.ready then
-		for _, row in self.rows do
-			for slot, t in row.texts do
-				if t.open ~= "" then
-					self:_seal(row, slot)
-				end
+	local closing: { result: { any }?, waiters: { (boolean, string?) -> () } } = { result = nil, waiters = {} }
+	self.closing = closing
+	local function after()
+		-- Nothing else is left to be done later: a closed client keeps nothing awake but the delivery of what it wrote.
+		for cancel in table.clone(self.timers) do
+			cancel()
+		end
+		for _, a in table.clone(self.asked) do
+			self:_fetched(a) -- as far as it got
+		end
+		for live in table.clone(self.faults) do
+			self:_fault(live) -- calls never made end here, as those made do
+		end
+	end
+	local function finished(ok: boolean, why: string?)
+		closing.result = { ok, why }
+		for cancel in table.clone(self.timers) do
+			cancel()
+		end
+		if self.wire then
+			self.hang_up()
+		end
+		for _, notify in closing.waiters do
+			notify(ok, why)
+		end
+	end
+	local function deliver()
+		self:_seal_all()
+		self:_flush()
+		if #self.pending == 0 then
+			self.hang_up()
+			after()
+			closing.result = { true }
+			return -- at once: nothing to deliver
+		end
+		after()
+		self:_barrier(function(ok, why)
+			self.host.defer(function()
+				finished(ok, why)
+			end)
+		end)
+		if not self.wire then
+			self:_dial() -- now, rather than as an open client would have later
+		end
+	end
+	if next(self.early) then
+		-- Questions are answered as far as they got: so are those for rows editors typed in before they were here, and
+		-- what they typed is typed in them, to be sealed with the rest.
+		self.early_done = deliver
+		after()
+	else
+		deliver()
+	end
+end
+
+-- Yields until all this client has written is acknowledged, durable on the node it speaks to, and, once it is closed,
+-- until all close delivers is. Returns true; or false and why, should any of it never be. Called from a coroutine.
+function Client.flushed(self: Client): (boolean, string?)
+	local closing = self.closing
+	return self:_wait(function(notify)
+		if closing then
+			if closing.result then
+				notify(closing.result[1], closing.result[2])
+			else
+				table.insert(closing.waiters, notify)
+			end
+		else
+			self:_barrier(notify)
+		end
+	end)
+end
+
+-- Yields the coroutine it is called from until `start` is told how it went, unless it is told at once.
+function Client._wait(self: Client, start: ((boolean, string?) -> ()) -> ()): (boolean, string?)
+	local thread = coroutine.running()
+	local result: { any }? = nil
+	local waiting = false
+	start(function(ok: boolean, why: string?)
+		result = { ok, why }
+		if waiting then
+			self:_resume(thread)
+		end
+	end)
+	if not result then
+		waiting = true
+		coroutine.yield()
+	end
+	local r = result :: { any }
+	return r[1], r[2]
+end
+
+-- What editors have typed and not yet sealed, sealed, as the client ends.
+function Client._seal_all(self: Client)
+	for _, row in self.rows do
+		for slot, t in row.texts do
+			if t.open ~= "" then
+				self:_seal(row, slot)
 			end
 		end
 	end
-	self:_flush()
-	self.hang_up()
-	-- Nothing is left to be done later: a closed client keeps nothing awake.
-	for cancel in table.clone(self.timers) do
-		cancel()
+end
+
+-- Tells `notify` once everything written so far is acknowledged, or that some of it never will be: at once, if nothing is.
+function Client._barrier(self: Client, notify: (boolean, string?) -> ())
+	local last = self.pending[#self.pending]
+	if not last then
+		notify(true)
+		return
 	end
-	for _, a in table.clone(self.asked) do
-		self:_fetched(a) -- as far as it got
+	table.insert(self.barriers, { seq = last.seq, failed = nil, notify = notify })
+end
+
+-- Those waiting for what is no longer pending are told: all written before them is acknowledged, or some never will be.
+function Client._unbar(self: Client)
+	local lowest = if #self.pending > 0 then self.pending[1].seq else math.huge
+	while #self.barriers > 0 and self.barriers[1].seq < lowest do
+		local b = table.remove(self.barriers, 1) :: Barrier
+		b.notify(b.failed == nil, b.failed)
 	end
-	for live in table.clone(self.faults) do
-		self:_fault(live) -- calls never made end here, as those made do
+end
+
+-- What was written that can never be durable is pending no more, and whoever waits for it is told so.
+function Client._fail(self: Client, p: Pending, why: string)
+	table.remove(self.pending, table.find(self.pending, p) :: number)
+	self:_settle(p)
+	for _, b in self.barriers do
+		if b.seq >= p.seq and not b.failed then
+			b.failed = why
+		end
+	end
+	self:_unbar()
+end
+
+function Client._give_up(self: Client, why: string)
+	for _, p in table.clone(self.pending) do
+		self:_fail(p, why)
 	end
 end
 
 -- Runs f later, unless the client is closed first; returns a way to cancel it.
 function Client._after(self: Client, seconds: number, f: () -> ()): () -> ()
-	if self.closed then
+	if self.closed and #self.pending == 0 then
 		return function() end
 	end
 	local stop: () -> () = function() end
@@ -572,6 +704,9 @@ function Client._receive(self: Client, data: buffer | string)
 end
 
 function Client._handle(self: Client, kind: number, r: codec.Reader)
+	if self.closed and kind ~= ACK and kind ~= ROSTER and kind ~= ERROR then
+		return -- closed, it only delivers what it wrote
+	end
 	if kind == CELLS then
 		self:_on_cells(r)
 	elseif kind == LIVE then
@@ -610,7 +745,9 @@ function Client._handle(self: Client, kind: number, r: codec.Reader)
 		self.faulted = true
 		self:_tell("error", code)
 		if code == 2 or code == 3 then
-			self:close() -- refused, or speaking another language: trying again is no use
+			-- Refused, or speaking another language: trying again is no use, and what is pending never will be durable.
+			self:_give_up(if code == 2 then "the node refused this client" else "the node speaks another version")
+			self:close()
 		end
 	end
 end
@@ -631,6 +768,9 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 		self.scopes[scope] = { rights = rights, key = codec.take(r, 32) }
 	end
 	if self.ready then
+		if self.closed then
+			return
+		end
 		-- Rights have changed: windows waiting for this one open.
 		for _, window in self.windows do
 			if window.denied and self.scopes[window.scope] then
@@ -655,19 +795,23 @@ function Client._on_scopes(self: Client, r: codec.Reader)
 	self.ready = true
 	-- Say again whatever the last pipe was told: what is served, unacknowledged and watched. What this client may no
 	-- longer write in is let go of, never to be durable: a node would refuse it, and this client with it, for good.
-	for key in self.handlers do
-		self:_serve(key, true)
+	if not self.closed then
+		for key in self.handlers do
+			self:_serve(key, true)
+		end
 	end
 	for _, p in table.clone(self.pending) do
 		if not self:may(p.scope, "write") then
-			table.remove(self.pending, table.find(self.pending, p) :: number)
-			self:_settle(p)
+			self:_fail(p, "this client may no longer write there")
 			continue
 		end
 		local w = codec.writer()
 		codec.put_varint(w, p.seq)
 		codec.put(w, p.body)
 		self:_frame(CELLS, w)
+	end
+	if self.closed then
+		return -- and nothing more
 	end
 	for _, window in self.windows do
 		if #window.pages == 0 then
@@ -2112,6 +2256,12 @@ function Client.text(self: Client, id: string, col: Column)
 	local row = self:_row(id)
 	row.held[slot] = (row.held[slot] or 0) + 1
 	local closed, ended = false, false
+	-- What is typed before the row is here is typed in it once it is: until then, what is to be done then waits for it.
+	local applied: { () -> () }? = if early then {} else nil
+	local token = {}
+	if early then
+		self.early[token] = true
+	end
 	local function fresh(): string
 		return self.host.random(8)
 	end
@@ -2188,6 +2338,19 @@ function Client.text(self: Client, id: string, col: Column)
 		if closed then
 			finish()
 		end
+		local waiting = applied
+		if waiting then
+			applied = nil
+			self.early[token] = nil
+			for _, f in waiting do
+				f()
+			end
+			local deliver = self.early_done
+			if deliver and next(self.early) == nil then
+				self.early_done = nil
+				deliver()
+			end
+		end
 		if not fine then
 			error(why, 0)
 		end
@@ -2263,9 +2426,33 @@ function Client.text(self: Client, id: string, col: Column)
 				end
 			end)
 		end,
-		-- Makes what has been written durable now rather than shortly.
+		-- Makes what has been written durable now rather than shortly: never yielding, and never dropping it, for what
+		-- was typed before the row was here is sealed once the row is. sealed() waits for it.
 		commit = function()
+			local waiting = applied
+			if waiting then
+				table.insert(waiting, function()
+					self:_seal(row, slot)
+				end)
+				return
+			end
 			self:_seal(row, slot)
+		end,
+		-- Seals what has been written, and yields until it is acknowledged, durable on the node the client speaks to, and
+		-- all the client wrote before it. Returns true; or false and why, should it never be (Client.flushed).
+		sealed = function(): (boolean, string?)
+			return self:_wait(function(notify)
+				local function now()
+					self:_seal(row, slot)
+					self:_barrier(notify)
+				end
+				local waiting = applied
+				if waiting then
+					table.insert(waiting, now)
+				else
+					now()
+				end
+			end)
 		end,
 		close = function()
 			if closed then
@@ -2408,6 +2595,9 @@ function Client._on_ack(self: Client, seq: number)
 		if p.done then
 			self.host.defer(p.done)
 		end
+	end
+	if #self.barriers > 0 then
+		self:_unbar()
 	end
 end
 
@@ -2579,7 +2769,13 @@ function Client.write(self: Client, scope: number, f: (Change) -> (), done: (() 
 	if #cells > 0 then
 		self:_send_cells(cells, done)
 	elseif done then
-		self.host.defer(done)
+		-- A change of nothing is a barrier: it is done once all written before it is durable.
+		local after: () -> () = done
+		self:_barrier(function(ok)
+			if ok then
+				self.host.defer(after)
+			end
+		end)
 	end
 	local placing: { [Stored]: boolean } = {}
 	for id in rows do

@@ -40,6 +40,7 @@ function harness() {
     sizes: [] as number[],
     partial: new Uint8Array(0),
     clock: () => 1800000000000, // what the host says the time is
+    refuse: false, // no pipe can be had, as with no node to dial
   };
   const run = () => {
     while (self.deferred.length > 0) self.deferred.shift()!();
@@ -61,6 +62,7 @@ function harness() {
       };
     },
     connect: (receive, closed) => {
+      if (self.refuse) return undefined;
       self.connects++;
       self.receive = receive;
       self.closed = closed;
@@ -1984,6 +1986,176 @@ for (const code of [2, 3]) {
   h.tell(CELLS, "\0" + cell(one, 3, 17, 8, "new"));
   answer(one, two);
   assert(found().rows[0].title === "kept" && found().rows[0].body === "new", "it is as it was before from then on");
+}
+
+// ---------------------------------------------------------------- what is written, as a client ends
+
+// The cells a client said, of every frame of Cells from the given one on: by what kind each is, and what it is of.
+function cellsSaid(h: ReturnType<typeof harness>, from = 0): { seq: number; kinds: number[] }[] {
+  return h.self.said.slice(from).filter((x) => x.kind === CELLS).map((x) => {
+    const r = codec.reader(b(x.body));
+    const seq = codec.varint(r);
+    const kinds: number[] = [];
+    while (r.pos < r.len) {
+      const kind = codec.u8(r);
+      kinds.push(kind & 127);
+      if (!(kind & 128)) codec.take(r, 16);
+      codec.u8(r), codec.take(r, 16), codec.bytes(r);
+    }
+    return { seq, kinds };
+  });
+}
+const ack = (h: ReturnType<typeof harness>, seq: number) => {
+  const w = codec.writer();
+  codec.putVarint(w, seq);
+  h.tell(ACK, s(codec.written(w)));
+};
+const state = <T>(p: Promise<T>) => {
+  const was = { settled: false, failed: undefined as unknown };
+  p.then(() => (was.settled = true), (e) => ((was.settled = true), (was.failed = e)));
+  return was;
+};
+const PIECE_KIND = 4;
+// What the node says of a row asked for once, as a partial replica with nobody to ask says it: what is held, nothing.
+const answerFetch = async (h: ReturnType<typeof harness>) => {
+  const fetched = h.last(FETCH)!;
+  const w = codec.writer();
+  codec.putVarint(w, codec.varint(codec.reader(b(fetched.body))));
+  codec.putU8(w, 32);
+  for (let i = 0; i < 4; i++) codec.putVarint(w, 0);
+  h.tell(ANSWER, s(codec.written(w)));
+  await tick();
+  h.run();
+};
+
+// A client closed while its pipe is down, as while its leader is handed on, zspd starts again or a relay blinks: what an
+// editor typed is sealed all the same, and what it wrote, and the piece, are kept, the client dialling again to deliver
+// them; and it lets go of the pipe, and resolves, once they are acknowledged.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  ack(h, 1);
+  const editor = h.client.text(id, Note.body);
+  editor.append("typed as the pipe went");
+  h.run();
+  h.self.closed();
+  h.run();
+  void h.client.write(1, (change) => change.set(id, Note, { title: "u" }));
+  const closing = state(h.client.close());
+  h.run();
+  await tick();
+  assert(!closing.settled, "said to be closed with what it wrote undelivered");
+  h.laters(); // dialled again
+  h.run();
+  assert.equal(h.self.connects, 2, "a client closed with what it wrote undelivered did not dial again");
+  const from = h.self.said.length;
+  h.greet();
+  h.run();
+  const sent = cellsSaid(h, from);
+  assert.deepEqual(sent.map((x) => x.kinds), [[3], [PIECE_KIND]], `what it wrote and what was typed were not delivered: ${JSON.stringify(sent)}`);
+  assert.equal(h.self.closes, 0, "the pipe was let go of before what it carried was acknowledged");
+  ack(h, sent[1].seq);
+  await tick();
+  assert(closing.settled && closing.failed === undefined, String(closing.failed));
+  assert.equal(h.self.closes, 1, "the pipe was not let go of once all was acknowledged");
+  assert.equal(h.self.timers, 0, "a client closed keeps something awake");
+}
+
+// One closed with nothing to deliver lets go of its pipe at once, and is closed: as before.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const closing = state(h.client.close());
+  assert.equal(h.self.closes, 1, "the pipe was not let go of at once");
+  await tick();
+  assert(closing.settled && closing.failed === undefined);
+}
+
+// And one closed with what it wrote never to be delivered is told so, not left waiting: with no node to dial, or a scope
+// it may no longer write in once the pipe is up again.
+for (const why of ["no node", "no right"] as const) {
+  const h = harness();
+  h.run();
+  h.greet();
+  const wrote = state(h.client.write(1, (change) => change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  h.self.closed();
+  h.run();
+  if (why === "no node") h.self.refuse = true;
+  const closing = state(h.client.close());
+  h.run();
+  if (why === "no right") {
+    h.laters();
+    h.run();
+    h.tell(ROSTER, rep("\0", 8) + "\x01\x01" + rep("k", 32)); // read only
+  }
+  await tick();
+  assert(closing.settled && closing.failed instanceof Error, `${why}: closing was not told it failed`);
+  assert(wrote.settled && wrote.failed instanceof Error, `${why}: what was written was not told it failed`);
+  assert.equal(h.self.timers, 0, `${why}: a client closed keeps something awake`);
+}
+
+// And what an editor typed before its row was here, the client closed at once after: it is typed in the row as it is looked
+// for, as far as that got, and sealed, and delivered.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const editor = h.client.text("00000001" + "6a0b1c2d" + "0102030405060708", Note.body);
+  editor.append("typed before the row was here");
+  h.run();
+  const closing = state(h.client.close());
+  await tick();
+  h.run();
+  const sent = cellsSaid(h);
+  assert.deepEqual(sent.map((x) => x.kinds), [[PIECE_KIND]], `what was typed was not delivered: ${JSON.stringify(sent)}`);
+  assert(!closing.settled && h.self.closes === 0);
+  ack(h, sent[0].seq);
+  await tick();
+  assert(closing.settled && closing.failed === undefined);
+  assert.equal(h.self.closes, 1);
+}
+
+// A change of nothing is a barrier: it resolves once everything written before it is acknowledged, not before; and so do
+// an editor's commit and close, once what it typed is.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  let id = "";
+  const first = state(h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" }))));
+  const barrier = state(h.client.write(1, () => {}));
+  h.run();
+  await tick();
+  assert(!barrier.settled, "a change of nothing resolved before what was written before it was acknowledged");
+  ack(h, 1);
+  await tick();
+  assert(first.settled && barrier.settled && barrier.failed === undefined);
+  const editor = h.client.text(id, Note.body);
+  h.run();
+  await answerFetch(h);
+  editor.append("x");
+  const committed = state(editor.commit());
+  h.run();
+  await tick();
+  assert(!committed.settled, "a commit resolved before what it sealed was acknowledged");
+  editor.append("y");
+  const closed = state(editor.close());
+  h.run();
+  await tick();
+  assert(!committed.settled && !closed.settled);
+  const sent = cellsSaid(h);
+  ack(h, sent[sent.length - 1].seq);
+  await tick();
+  assert(committed.settled && closed.settled && committed.failed === undefined && closed.failed === undefined);
+  const nothing = state(h.client.write(1, () => {})); // with nothing to wait for, at once
+  await tick();
+  assert(nothing.settled);
 }
 
 console.log("ok");
