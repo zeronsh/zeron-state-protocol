@@ -40,12 +40,17 @@ jobs:
         if: always()
         run: |
           set +e
-          for i in 1 2 3 4; do (cd web && for t in text mirror_model mirror_interop store end_to_end browsers; do a=; [ $t = store ] && a=../build/node-small.wasm; node test/$t.ts $a > ../web-c-$i-$t.log 2>&1 & done; wait) & sleep 15; python tests/end_to_end.py > e2e-c-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-c-$i.log) ok $(grep -c '^FAIL' e2e-c-$i.log) fail"; grep -h "^FAIL" e2e-c-$i.log | cut -c1-150; wait; echo "  web: $(cat web-c-$i-*.log | grep -c '^FAIL') fail"; done; grep -h "roster in" e2e-c-*.log | python tests/diag_sum.py || true
+          for i in 1 2 3 4 5 6; do (cd web && for t in text mirror_model mirror_interop store end_to_end browsers; do a=; [ $t = store ] && a=../build/node-small.wasm; node test/$t.ts $a > ../web-c-$i-$t.log 2>&1 & done; wait) & (typeperf "\\Processor(_Total)\\% Processor Time" "\\LogicalDisk(C:)\\Avg. Disk sec/Write" "\\LogicalDisk(D:)\\Avg. Disk sec/Write" "\\LogicalDisk(C:)\\Current Disk Queue Length" "\\LogicalDisk(D:)\\Current Disk Queue Length" -si 1 -sc 100 -f CSV -o perf-c-$i.csv -y > /dev/null 2>&1 &) ; sleep 15; python tests/end_to_end.py > e2e-c-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-c-$i.log) ok $(grep -c '^FAIL' e2e-c-$i.log) fail"; grep -h "^FAIL" e2e-c-$i.log | cut -c1-150; wait; echo "  web: $(cat web-c-$i-*.log | grep -c '^FAIL') fail"; done; grep -h "roster in" e2e-c-*.log | python tests/diag_sum.py || true
       - name: e2e, temp on the runner's drive
         if: always()
         run: |
           set +e
-          for i in 1 2 3 4; do (cd web && for t in text mirror_model mirror_interop store end_to_end browsers; do a=; [ $t = store ] && a=../build/node-small.wasm; TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" node test/$t.ts $a > ../web-d-$i-$t.log 2>&1 & done; wait) & sleep 15; TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" python tests/end_to_end.py > e2e-d-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-d-$i.log) ok $(grep -c '^FAIL' e2e-d-$i.log) fail"; grep -h "^FAIL" e2e-d-$i.log | cut -c1-150; wait; echo "  web: $(cat web-d-$i-*.log | grep -c '^FAIL') fail"; done; grep -h "roster in" e2e-d-*.log | python tests/diag_sum.py || true
+          for i in 1 2 3 4 5 6; do (cd web && for t in text mirror_model mirror_interop store end_to_end browsers; do a=; [ $t = store ] && a=../build/node-small.wasm; TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" node test/$t.ts $a > ../web-d-$i-$t.log 2>&1 & done; wait) & (typeperf "\\Processor(_Total)\\% Processor Time" "\\LogicalDisk(C:)\\Avg. Disk sec/Write" "\\LogicalDisk(D:)\\Avg. Disk sec/Write" "\\LogicalDisk(C:)\\Current Disk Queue Length" "\\LogicalDisk(D:)\\Current Disk Queue Length" -si 1 -sc 100 -f CSV -o perf-d-$i.csv -y > /dev/null 2>&1 &) ; sleep 15; TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" python tests/end_to_end.py > e2e-d-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-d-$i.log) ok $(grep -c '^FAIL' e2e-d-$i.log) fail"; grep -h "^FAIL" e2e-d-$i.log | cut -c1-150; wait; echo "  web: $(cat web-d-$i-*.log | grep -c '^FAIL') fail"; done; grep -h "roster in" e2e-d-*.log | python tests/diag_sum.py || true
+      - name: counters
+        if: always()
+        run: |
+          sleep 60
+          for f in perf-*.csv; do python tests/diag_perf.py $f; done || true
       - name: durations
         if: always()
         run: |
@@ -58,5 +63,6 @@ jobs:
           path: |
             e2e-*.log
             web-*.log
+            perf-*.csv
             xtest.log
           retention-days: 7
