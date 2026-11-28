@@ -1,4 +1,5 @@
 // Reproduces odin-lang/Odin#8646: on Windows, core:os's open with .Trunc but not .Create always fails, with
+// Platform: windows
 // INVALID_PARAMETER (error 87).
 //
 // core:os asks CreateFileW for TRUNCATE_EXISTING with FILE_GENERIC_READ and FILE_GENERIC_WRITE, and Windows wants the
@@ -11,8 +12,8 @@
 // "FIXED: ..." if both emptied it. Anything else (a file that could not be written, the ways that work not working)
 // is the repro's own failure. Built for Windows only.
 //
-// Run by .github/workflows/upstream.yml, not by ./x test; tests/upstream/run.sh runs it. ./x check fails on any open so
-// here (tests/odin_lint.py), and host/files_test.odin works round it, until a release has this fixed.
+// Run by .github/workflows/upstream.yml, not by ./x test, through tests/upstream/run.sh, against stock Odin. ./x
+// check fails on any open so here (tests/odin_lint.py).
 #+build windows
 package odin_8646
 
