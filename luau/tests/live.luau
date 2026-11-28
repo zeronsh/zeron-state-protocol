@@ -637,8 +637,9 @@ end
 theirs.stop()
 window.stop()
 assert(next(b.windows) ~= nil)
-task.wait(0.3)
-assert(next(b.windows) == nil and next(b.pages) == nil)
+eventually("and then is let go", function()
+	return next(b.windows) == nil and next(b.pages) == nil
+end)
 local held = 0
 for _ in b.rows do
 	held += 1

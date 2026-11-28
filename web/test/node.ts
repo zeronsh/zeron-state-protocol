@@ -9,6 +9,7 @@ import { Node, spaceUrl } from "../src/node.ts";
 import { Client, columns } from "../src/client.ts";
 import { MemoryVolume, type File } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
+import { timerInternals } from "../src/timers.ts";
 import { BIN } from "./procs.ts";
 
 const module = await loadModule();
@@ -307,6 +308,8 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   node.create();
   const writer = new Client({ connect: node.connect }), reader = new Client({ connect: node.connect });
   while (!writer.may(1, "write") || !reader.may(1, "read")) await new Promise((done) => setTimeout(done, 1));
+  // Clients in Node keep time by setTimeout, which nothing holds back here: they take no share of a page's timer worker.
+  assert.deepEqual(timerInternals(), { worker: false, broken: false, users: 0, pending: 0 });
   const Note = { body: columns.text(17), more: columns.string(18) };
   let id = "";
   // Behind more than a pipe takes at once of live text: the reader is sent all of these first.

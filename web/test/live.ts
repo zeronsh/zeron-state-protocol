@@ -196,8 +196,8 @@ export async function live({ a, b, breakPipes, say = console.log }: Sides): Prom
   theirs.stop();
   window.stop();
   check(held(b).windows.size > 0, "a window lingers");
-  await sleep(300);
-  check(held(b).windows.size === 0 && held(b).pages.size === 0, "and then is let go");
+  // By the client's timers, which in a page are a worker's: after the page's own of as long, as likely as not.
+  await eventually("and then is let go", () => held(b).windows.size === 0 && held(b).pages.size === 0);
   // And so are its rows, but for what is still to be acknowledged, which a busy machine may take its time over.
   await eventually("its rows are let go", () => held(b).rows.size <= 1);
 }

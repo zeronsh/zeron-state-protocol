@@ -7,6 +7,7 @@ import { loadModule } from "../src/wasm.ts";
 import { live } from "./live.ts";
 import { where } from "../src/ask.ts";
 import { binaryFromHex } from "../src/codec.ts";
+import { pageTimers, timerInternals } from "../src/timers.ts";
 
 const devices = new Map<string, Device>();
 
@@ -79,6 +80,7 @@ const Big = { more: columns.string(18) };
 const editors: Editor[] = [];
 let shownText = "", textNow = "", textDropped = false, textRow = "";
 let textOf: Client | undefined;
+let typed: { c: Client; id: string } | undefined; // what was typed last, and by whom
 let pageNodeOf: Node | undefined;
 let pageNodeRows = 0;
 
@@ -357,7 +359,109 @@ const zsp = {
     await c.write(1, (change) => (id = change.insert(Doc, list, 1, {})));
     const editor = c.text(id, Doc.body);
     editors.push(editor);
+    typed = { c, id };
     for (const w of words) editor.append(w);
+  },
+  /** Whether what was typed last is sealed by its writer: a piece of it is a cell of its row there. */
+  async typedSealed(): Promise<boolean> {
+    const row = typed && Client.internals(typed.c).rows.get(binaryFromHex(typed.id));
+    return (row?.slots.get(Doc.body.slot)?.size ?? 0) > 0;
+  },
+  /**
+   * A client of a device made as an application makes one of its own, rather than by device.client(): keeping time by
+   * nothing it was given. Known by `as` to what follows, as a device's own client is by its name.
+   */
+  async ownClient(name: string, as: string, pageTimers = false, linger = 200): Promise<void> {
+    // Or, with `pageTimers`, given the page's own timers, as every such client kept time before.
+    const after = (ms: number, f: () => void) => {
+      const t = setTimeout(f, ms);
+      return () => clearTimeout(t);
+    };
+    clients.set(as, new Client({ connect: devices.get(name)!.connect, linger, ...(pageTimers ? { after } : {}) }));
+  },
+  /** Types more into what was typed last. */
+  async typeMore(words: string[]): Promise<void> {
+    for (const w of words) editors[editors.length - 1].append(w);
+  },
+  /** Closes such a client: what closing it threw, if it threw. */
+  async closeClient(as: string): Promise<string | undefined> {
+    const c = clients.get(as);
+    clients.delete(as);
+    try {
+      c?.close();
+    } catch (e) {
+      return (e as Error).message;
+    }
+  },
+  /** A client of its own whose pipe throws as it is closed. */
+  async ownClientBrittle(name: string, as: string, linger = 200): Promise<void> {
+    const connect: Connect = (receive, closed) => {
+      const wire = devices.get(name)!.connect(receive, closed);
+      if (!wire) return undefined;
+      return {
+        send: (data) => wire.send(data),
+        close: () => {
+          wire.close();
+          throw new Error("the pipe threw as it closed");
+        },
+      };
+    };
+    clients.set(as, new Client({ connect, linger }));
+  },
+  /** A client of its own whose pipe cannot even be asked for: what making it threw. */
+  async ownClientUnmade(): Promise<string> {
+    try {
+      new Client({
+        connect: () => {
+          throw new Error("no pipe here");
+        },
+      });
+      return "made";
+    } catch (e) {
+      return (e as Error).message;
+    }
+  },
+  /**
+   * For each delay, given as a number or as JSON cannot say it ("NaN", "Infinity", "-Infinity"), whether the page's timer
+   * worker and setTimeout each go off within half a second; and how the worker stands once each is let go of.
+   */
+  async timerDelays(given: (number | string)[]): Promise<{ given: number | string; ours: boolean; page: boolean }[]> {
+    const out = [];
+    for (const g of given) {
+      const ms = typeof g === "string" ? Number(g) : g;
+      const share = pageTimers()!;
+      let ours = false, page = false;
+      const cancel = share.after(ms, () => (ours = true));
+      const t = setTimeout(() => (page = true), ms);
+      await sleep(500);
+      cancel();
+      clearTimeout(t);
+      share.release();
+      out.push({ given: g, ours, page });
+    }
+    return out;
+  },
+  /** A timer let go of by its only client before it goes off: how the worker stands then, and once it has gone off. */
+  async timerOutlivesRelease(): Promise<{ released: ReturnType<typeof timerInternals>; fired: ReturnType<typeof timerInternals>; went: boolean }> {
+    const share = pageTimers()!;
+    let went = false;
+    share.after(100, () => (went = true));
+    share.release();
+    const released = timerInternals();
+    await sleep(600);
+    return { released, fired: timerInternals(), went };
+  },
+  /** From now on no worker can be started here: trying throws, as some browsers' policies make it. */
+  async workersThrow(): Promise<void> {
+    globalThis.Worker = class {
+      constructor() {
+        throw new DOMException("no workers here", "SecurityError");
+      }
+    } as unknown as typeof Worker;
+  },
+  /** How the page's timer worker stands. */
+  async timers(): Promise<{ worker: boolean; broken: boolean; users: number; pending: number }> {
+    return timerInternals();
   },
   /** Watches the first text of a list: what it has shown, and whether it ever stopped showing it once it had. */
   async watchText(name: string, list: string): Promise<void> {

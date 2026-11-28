@@ -9,6 +9,7 @@ import * as ask from "./ask.ts";
 import * as codec from "./codec.ts";
 import { sha256 } from "./sha256.ts";
 import * as text from "./text.ts";
+import { pageTimers } from "./timers.ts";
 import type { Connect, Wire } from "./node.ts";
 
 const HELLO = 1, ROSTER = 2, WATCH = 3, UNWATCH = 4, CELLS = 7, ACK = 8;
@@ -65,7 +66,10 @@ export interface Host {
   now?: () => number;
   /** Runs f soon, once the current work is done: queueMicrotask by default. */
   defer?: (f: () => void) => void;
-  /** Runs f later, and returns a way to cancel it: setTimeout by default. */
+  /**
+   * Runs f later, and returns a way to cancel it. By default setTimeout; but in a browser page, a worker's, which is not
+   * held back while the tab is hidden, as the page's own are: so what is typed is sealed when it should be, unseen.
+   */
   after?: (ms: number, f: () => void) => () => void;
 }
 
@@ -479,6 +483,7 @@ function placeKey(c: Cell, id: string): string {
 
 export class Client {
   #host: Lent;
+  #letTimersGo?: () => void; // the page's timer worker, which this client had a share of
   #wire?: Wire;
   #hangUp: () => void = () => {};
   #ready = false;
@@ -520,6 +525,8 @@ export class Client {
 
   constructor(host: Host) {
     const credential = host.credential ?? new Uint8Array();
+    const page = host.after ? undefined : pageTimers();
+    this.#letTimersGo = page?.release;
     this.#host = {
       connect: host.connect,
       credential: typeof credential === "string" ? utf8.encode(credential) : credential,
@@ -529,12 +536,20 @@ export class Client {
       defer: host.defer ?? ((f) => queueMicrotask(f)),
       after:
         host.after ??
+        page?.after ??
         ((ms, f) => {
           const t = setTimeout(f, ms);
           return () => clearTimeout(t);
         }),
     };
-    this.#dial();
+    try {
+      this.#dial();
+    } catch (e) {
+      // No client comes of it: nor does it keep anything awake, or its share of the page's timer worker.
+      this.#closed = true;
+      this.#letGo();
+      throw e;
+    }
   }
 
   // ---------------------------------------------------------------- the pipe
@@ -611,13 +626,27 @@ export class Client {
     if (this.#closed) return;
     this.#closed = true;
     // What editors have typed and not yet sealed is still to be said.
-    if (this.#ready) for (const row of this.#rows.values()) for (const [slot, t] of row.texts) if (t.open !== "") this.#seal(row, slot);
-    this.#flush();
-    this.#hangUp();
-    // Nothing is left to be done later: a closed client keeps nothing awake.
-    for (const cancel of [...this.#timers]) cancel();
+    try {
+      if (this.#ready) for (const row of this.#rows.values()) for (const [slot, t] of row.texts) if (t.open !== "") this.#seal(row, slot);
+      this.#flush();
+      this.#hangUp();
+    } finally {
+      this.#letGo(); // whatever its pipe threw
+    }
     for (const a of [...this.#asked.values()]) this.#fetched(a);
     for (const live of [...this.#faults.keys()]) this.#fault(live); // calls never made end here, as those made do
+  }
+
+  // Nothing is left to be done later: a closed client keeps nothing awake, nor its share of the page's timer worker, which
+  // it lets go of whatever a cancelling throws.
+  #letGo(): void {
+    try {
+      for (const cancel of [...this.#timers]) cancel();
+    } finally {
+      const release = this.#letTimersGo;
+      this.#letTimersGo = undefined;
+      release?.();
+    }
   }
 
   // Runs f later, unless the client is closed first; returns a way to cancel it.
