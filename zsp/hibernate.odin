@@ -8,7 +8,7 @@ package zsp
 session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 	n := s.node
 	// Nor owing word of what it took: the peer, its window shut, might wait for it while this sleeps waiting for the peer.
-	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || !tasks_idle(s) || len(s.refused) > 0 || s.closing || took_owed(s) {
+	if s.role != .Peer || len(s.input) > 0 || len(s.out) > 0 || len(s.live_owed) > 0 || !tasks_idle(s) || len(s.refused) > 0 || s.closing || took_owed(s) {
 		return false
 	}
 	// Nor anything more that is not saved: changes it has yet to be sent (as where storage answered "not yet"), counts
