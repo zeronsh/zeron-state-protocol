@@ -736,12 +736,20 @@ a_relay_keeps_so_much_live_text_at_most :: proc(t: ^testing.T) {
 	testing.expect(t, send_live(at, &l) && len(at.live_owed) > 0)
 	saved := make([dynamic]byte, context.temp_allocator)
 	testing.expect(t, !session_save(at, &saved), "a relay would sleep owing live text")
-	f: [dynamic]byte
-	defer delete(f)
-	frame := frame_begin(&f, .Unwatch)
-	write_varint(&f, 12345)
-	frame_end(&f, frame)
-	testing.expect(t, session_input(at, f[:]))
+	unwatch :: proc(t: ^testing.T, at: ^Session, id: u64) {
+		f: [dynamic]byte
+		defer delete(f)
+		frame := frame_begin(&f, .Unwatch)
+		write_varint(&f, id)
+		frame_end(&f, frame)
+		testing.expect(t, session_input(at, f[:]))
+	}
+	unwatch(t, at, 12345) // of no watch it has: what it owes stays
+	testing.expect(t, len(at.live_owed) > 0, "let go of live text for no watch let go of")
+	testing.expect(t, len(at.watches) > 0, "the peer watches nothing")
+	if len(at.watches) > 0 {
+		unwatch(t, at, at.watches[0].id)
+	}
 	testing.expectf(t, len(at.live_owed) == 0, "kept %d of live text for a watch let go of", len(at.live_owed))
 	testing.expect(t, send_live(at, &l) && len(at.live_owed) > 0)
 	session_authorize(at)

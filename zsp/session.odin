@@ -1096,12 +1096,12 @@ hurried :: proc(s: ^Session, id: u64) -> bool {
 
 @(private)
 on_unwatch :: proc(s: ^Session, id: u64) {
-	// What a relay was keeping of live text for it may have been of this watch, which is no more: it goes. What still
-	// matters of it comes once sealed.
-	live_owed_clear(s)
 	for w, i in s.watches {
 		if w.id == id {
 			unordered_remove(&s.watches, i)
+			// What a relay was keeping of live text for it may have been of this watch, which is no more: it goes.
+			// What still matters of it comes once sealed. Not for a watch only now asked for, which was none.
+			live_owed_clear(s)
 			break
 		}
 	}
