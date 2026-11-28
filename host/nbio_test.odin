@@ -321,6 +321,82 @@ loop_keeps_an_operation_kqueue_may_still_name :: proc(t: ^testing.T) {
 	testing.expectf(t, s.read == 3 && s.later == N, "read %d bytes; %d of %d timeouts came", s.read, s.later, N)
 }
 
+// As loop_keeps_an_operation_kqueue_may_still_name, after many removals of the first of two reads of one socket, each
+// of which gives kqueue the second afresh. The loop counted the changes it queued, and missed that way of queueing one
+// (and the wake-up it begins with), while it counted every one it gave: given ran ahead of queued, one for each such
+// removal, and once it was further ahead than the changes held back, an operation went back to the pool while its
+// timer's deletion was still held, as in the release. Meaningful where the loop is kqueue's.
+@(test)
+loop_counts_every_change_it_gives_kqueue :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	defer settle(t)
+	context.logger.lowest_level = .Error // the loop warns of each change it holds back
+	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, err == nil)
+	defer net.close(listener)
+	at, _ := net.bound_endpoint(listener)
+	Pair :: struct {
+		peer, socket: net.TCP_Socket,
+	}
+	pairs: [2]Pair
+	for &p in pairs {
+		derr, aerr: net.Network_Error
+		p.peer, derr = net.dial_tcp(at)
+		testing.expect(t, derr == nil)
+		p.socket, _, aerr = net.accept_tcp(listener)
+		testing.expect(t, aerr == nil)
+		testing.expect(t, nbio.associate_socket(p.socket) == nil)
+	}
+	defer for p in pairs {
+		net.close(p.peer)
+		net.close(p.socket)
+	}
+	QUEUE :: #config(ODIN_NBIO_QUEUE_SIZE, 2048)
+
+	// More removals of the first of two waiting reads than kqueue is given changes in one call.
+	called := 0
+	buf: [8]byte
+	for _ in 0 ..< QUEUE + 50 {
+		first := nbio.recv_poly(pairs[0].socket, {buf[:]}, &called, proc(_: ^nbio.Operation, called: ^int) { called^ += 1 })
+		second := nbio.recv_poly(pairs[0].socket, {buf[:]}, &called, proc(_: ^nbio.Operation, called: ^int) { called^ += 1 })
+		testing.expect(t, nbio.tick(0) == nil) // both given to kqueue, the second behind the first
+		nbio.remove(first)
+		testing.expect(t, nbio.tick(0) == nil)
+		nbio.remove(second)
+		testing.expect(t, nbio.tick(0) == nil)
+	}
+	testing.expectf(t, called == 0, "%d removed reads called back", called)
+
+	// Then a read with a timeout, done while more changes are held back than one call gives, its timer due before the
+	// call that would delete it.
+	State :: struct {
+		read, later: int,
+	}
+	s: State
+	N :: QUEUE + 7
+	nbio.recv_poly(pairs[1].socket, {buf[:]}, &s, proc(op: ^nbio.Operation, s: ^State) {
+		s.read = op.recv.received
+		for _ in 0 ..< N {
+			nbio.timeout_poly(50 * time.Millisecond, s, proc(_: ^nbio.Operation, s: ^State) {
+				s.later += 1
+			})
+		}
+		time.sleep(350 * time.Millisecond)
+	}, timeout = 300 * time.Millisecond)
+	testing.expect(t, nbio.tick(0) == nil)
+	net.send_tcp(pairs[1].peer, {1, 2, 3})
+	start := time.tick_now()
+	for s.later < N && time.tick_since(start) < 5 * time.Second {
+		wait := 10 * time.Millisecond
+		if loop_held_back() {
+			wait = 0
+		}
+		testing.expect(t, nbio.tick(wait) == nil)
+	}
+	testing.expectf(t, s.read == 3 && s.later == N, "read %d bytes; %d of %d timeouts came", s.read, s.later, N)
+}
+
 // An accept removed after the system has accepted for it all the same: nobody is handed what it accepted, so it is let
 // go of. core:nbio (dev-2026-11) accepted on kqueue for an accept removed in the tick it was ready, and on io_uring
 // left open what was accepted before the removal took: the peer was never told the connection had gone.

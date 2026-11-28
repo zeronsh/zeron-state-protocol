@@ -32,9 +32,9 @@ _Event_Loop :: struct {
 	kqueue:    kq.KQ,
 	// ZSP: operations done with, held from the pool until the changes queued for kqueue by the time they were done with
 	// (the deletion of a timer of theirs among them) have been given to it: until then kqueue may still name them, and
-	// what it says of them is ignored. Counted by changes queued and changes given, in order.
+	// what it says of them is ignored. Counted by the changes given to kqueue, in order: those queued are those given and
+	// those still held (see queued), so that no count of them can run ahead of the other.
 	retired:   [dynamic]^Operation,
-	queued:    u64,
 	given:     u64,
 }
 
@@ -669,7 +669,7 @@ handle_completed :: proc(op: ^Operation) {
 			// Upstream put it back at once, and a timer firing meanwhile handed the loop an operation freed or reused.
 			if !op.detached {
 				op._impl.flags += {.Retired}
-				op._impl.given_at = op.l.queued
+				op._impl.given_at = queued(op.l)
 				append(&op.l.retired, op)
 				return
 			}
@@ -1278,8 +1278,15 @@ add_pending :: proc(op: ^Operation, filter: kq.Filter, ident: uintptr) {
 	}
 }
 
+// ZSP: the changes queued for kqueue so far, in order: those given it, and those still held, in pending and the overflow.
+// Derived, not counted as each is queued: a change appended any way at all is counted (_init and timeout_and_delete
+// append to pending themselves), and the count cannot run ahead of what is given, as a counter missed by one did, which
+// let a retired operation go back to the pool while its timer's deletion was still held (see _Event_Loop.retired).
+queued :: #force_inline proc(l: ^Event_Loop) -> u64 {
+	return l.given + u64(len(l.pending)) + u64(queue.len(l.overflow))
+}
+
 append_pending :: #force_inline proc(l: ^Event_Loop, ev: kq.KEvent) {
-	l.queued += 1 // ZSP: see _Event_Loop.retired
 	if append(&l.pending, ev) == 0 {
 		warn("queue is full, adding to overflow, should QUEUE_SIZE be increased?")
 		_, err := queue.append(&l.overflow, ev)
