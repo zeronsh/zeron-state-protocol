@@ -96,8 +96,9 @@ check) # every platform, no code generated
 	for t in linux_amd64 linux_arm64 darwin_arm64 windows_amd64 freebsd_amd64; do
 		r=0; odin check zspd -target:$t $STRICT && odin check examples/forward -target:$t $STRICT || r=1; said $r $t
 	done
-	# What the runtime's map_entry breaks, used nowhere: tests/odin_lint.py says what it holds each .odin file to.
-	r=0; $PYTHON tests/odin_lint.py || r=1; said $r "none of what odin-lang/Odin#8642 breaks"
+	# What the runtime's map_entry breaks, and core:os's open with .Trunc on Windows, used nowhere: tests/odin_lint.py
+	# says what it holds each .odin file to.
+	r=0; $PYTHON tests/odin_lint.py || r=1; said $r "none of what odin-lang/Odin#8642 and #8646 break"
 	r=0; odin check relay/wasm -target:js_wasm32 -no-entry-point $STRICT || r=1; said $r js_wasm32
 	r=0; odin check web/wasm -target:js_wasm32 -no-entry-point $STRICT || r=1; said $r "js_wasm32 web"
 	r=0; luau-analyze luau/zsp/init.luau examples/luau/workspace.luau || r=1; said $r luau
@@ -181,7 +182,7 @@ test)
 	fi
 	;;
 selftest) # that ./x test says every kind of test that fails: with one made to fail in each, it fails, naming each
-	# And that ./x check's lint finds each use of what odin-lang/Odin#8642 breaks, however written.
+	# And that ./x check's lint finds each use of what odin-lang/Odin#8642 and #8646 break, however written.
 	$PYTHON tests/odin_lint.py --selftest
 	if ZSP_FAIL=1 ./x test >build/selftest.log 2>&1; then
 		echo "FAIL ./x test passed with a failure put in each kind of test: see build/selftest.log"

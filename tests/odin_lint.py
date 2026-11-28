@@ -1,5 +1,7 @@
-"""What `./x check` holds every .odin file here to, outside node_modules: no use of what odin-lang/Odin#8642 breaks.
+"""What `./x check` holds every .odin file here to, outside node_modules: no use of what odin-lang/Odin#8642 or #8646
+breaks.
 
+#8642. 
 The runtime's `__dynamic_map_entry` (`map_entry`) can give back the slot of another key, and the pointer an insertion
 gives back (`map_insert`, `map_upsert`) can be to it too: what is written through it lands on another key. Inserting
 itself is sound (`m[k] = v`, or `map_insert` with its pointer let go of), as is looking up. So this fails on:
@@ -11,6 +13,13 @@ itself is sound (`m[k] = v`, or `map_insert` with its pointer let go of), as is 
   is kept with `map_entry`); `core:net`'s `enumerate_interfaces` in a file built for macOS, OpenBSD or NetBSD;
   `core:nbio` (third_party/nbio is the copy to use, until #8642, #8644 and #8645 are fixed in a release);
   `core:text/i18n` (it interns); `core:container/topological_sort` (it keeps `map_insert`'s pointer).
+
+#8646. On Windows, core:os opens a file with `.Trunc` but not `.Create` asking TRUNCATE_EXISTING with FILE_GENERIC_WRITE,
+which Windows refuses as an invalid parameter (87), wanting GENERIC_WRITE itself. So in a file that imports `core:os`
+and is built for Windows, `.Trunc` or `O_TRUNC` fails unless `.Create` or `O_CREATE` is with it: in the same set
+(`{.Write, .Create, .Trunc}`), or, outside a set, in the same line (`os.O_RDWR + os.O_CREATE + os.O_TRUNC`). A set or
+`.Trunc` only asked of (`.Trunc in flags`, `flags & {.Trunc} == {.Trunc}`) builds nothing, and passes. Flags it cannot
+see the type of are taken for core:os's, so a file that imports it holds every `.Trunc` to this.
 
 Formatting is no way round it: comments and strings are taken out, and what is left is read as tokens. Each import is
 followed by the name it is given. A file is taken as built for an OS unless its name or `#+build` lines say it is not;
@@ -25,6 +34,7 @@ says at its head which of the issues it reproduces ("Reproduces odin-lang/Odin#.
 import os, re, sys, tempfile
 
 ISSUE = "odin-lang/Odin#8642"
+TRUNC_ISSUE = "odin-lang/Odin#8646"
 OSES = {"windows", "darwin", "linux", "essence", "freebsd", "openbsd", "netbsd", "haiku", "wasi", "js", "orca", "freestanding"}
 ARCHES = {"amd64", "i386", "arm32", "arm64", "wasm32", "wasm64p32", "riscv64"}
 BSDS = {"darwin", "openbsd", "netbsd"}  # core:net's enumerate_interfaces gathers with map_entry on these
@@ -239,8 +249,62 @@ def pointer_let_go(toks, i, at):
     return len(lhs) > place and lhs[place] == "_"
 
 
+def trunc_uses(toks):
+    """The lines on which `.Trunc` or `O_TRUNC` is given without `.Create` or `O_CREATE` (see #8646 above)."""
+    # Each `{` with its `}`, and whether what is between is a set: its elements, at its own depth, on a line of their own
+    # only after a comma.
+    close, stack = {}, []
+    for i, (kind, text, _) in enumerate(toks):
+        if kind == "punct" and text == "{":
+            stack.append(i)
+        elif kind == "punct" and text == "}" and stack:
+            close[stack.pop()] = i
+
+    def is_set(o):
+        depth, prev = 0, toks[o]
+        for k in range(o + 1, close[o]):
+            t = toks[k]
+            if depth == 0 and t[2] > prev[2] and prev[1] not in (",", "{"):
+                return False
+            if t[0] == "punct" and t[1] in "([{":
+                depth += 1
+            elif t[0] == "punct" and t[1] in ")]}":
+                depth -= 1
+            if depth == 0:
+                prev = t
+        return True
+
+    def creates(ts):
+        return any(t[0] == "ident" and t[1] in ("Create", "O_CREATE") for t in ts)
+
+    found = []
+    for i, (kind, text, line) in enumerate(toks):
+        if kind != "ident" or text not in ("Trunc", "O_TRUNC"):
+            continue
+        if text == "Trunc" and (i == 0 or toks[i - 1][1] != "."):
+            continue  # a name of another's, not the flag
+        # The innermost set it is in, if any.
+        inner = None
+        for o in close:
+            if o < i < close[o] and is_set(o) and (inner is None or o > inner):
+                inner = o
+        if inner is not None:
+            group = toks[inner + 1 : close[inner]]
+            asked = toks[inner - 1][1] in ("&", "==", "!=", "<=", ">=", "<", ">") or (
+                close[inner] + 1 < len(toks) and toks[close[inner] + 1][1] in ("==", "!=", "&", "<=", ">=", "<", ">", "in", "not_in")
+            )
+            if not asked and not creates(group):
+                found.append(line)
+        else:
+            if i + 1 < len(toks) and toks[i + 1][1] in ("in", "not_in"):
+                continue
+            if not creates(t for t in toks if t[2] == line):
+                found.append(line)
+    return found
+
+
 def lint_file(path, src, wasi_built):
-    """Each use in a file, as (line, what)."""
+    """Each use in a file, as (line, what, issue)."""
     toks = tokens(src)
     found = []
     named = imports(toks)
@@ -251,28 +315,32 @@ def lint_file(path, src, wasi_built):
     for p, why in BANNED_IMPORTS.items():
         if p in by_path:
             line = next(t[2] for t in toks if t[0] == "string" and t[1] == p)
-            found.append((line, why))
+            found.append((line, why, ISSUE))
     if "core:os" in by_path and "wasi" in oses and (wasi_built or explicitly(path, src, "wasi")):
         line = next(t[2] for t in toks if t[0] == "string" and t[1] == "core:os")
-        found.append((line, "core:os in a file built for WASI: its environment is kept with map_entry"))
+        found.append((line, "core:os in a file built for WASI: its environment is kept with map_entry", ISSUE))
     strings_names = set(by_path.get("core:strings", []))
     net_names = set(by_path.get("core:net", [])) if oses & BSDS else set()
     for i, (kind, text, line) in enumerate(toks):
         if kind != "ident":
             continue
         if text in ("map_entry", "__dynamic_map_entry") or text.startswith("__dynamic_map_set"):
-            found.append((line, f"{text}: it can give back another key's slot"))
+            found.append((line, f"{text}: it can give back another key's slot", ISSUE))
         elif text in ("map_insert", "map_upsert"):
             if i + 1 >= len(toks) or toks[i + 1][1] != "(":
-                found.append((line, f"{text} named but to call it: the pointer it gives back is not to be had"))
+                found.append((line, f"{text} named but to call it: the pointer it gives back is not to be had", ISSUE))
             elif not pointer_let_go(toks, i, matching(toks, i + 1)):
-                found.append((line, f"{text}'s pointer kept or used: it may be another key's; call it as a statement, or assign that result to _"))
+                found.append((line, f"{text}'s pointer kept or used: it may be another key's; call it as a statement, or assign that result to _", ISSUE))
         elif i >= 2 and toks[i - 1][1] == "." and toks[i - 2][0] == "ident":
             owner = toks[i - 2][1]
             if owner in strings_names and (text == "Intern" or text.startswith("intern_")):
-                found.append((line, f"strings.{text}: interning uses map_entry"))
+                found.append((line, f"strings.{text}: interning uses map_entry", ISSUE))
             elif owner in net_names and text == "enumerate_interfaces":
-                found.append((line, "net.enumerate_interfaces in a file built for macOS, OpenBSD or NetBSD: it gathers with map_entry there"))
+                found.append((line, "net.enumerate_interfaces in a file built for macOS, OpenBSD or NetBSD: it gathers with map_entry there", ISSUE))
+    if "windows" in oses:
+        if "core:os" in by_path:
+            for line in trunc_uses(toks):
+                found.append((line, ".Trunc without .Create, in a file built for Windows that imports core:os: core:os's open fails so with error 87 there", TRUNC_ISSUE))
     return found
 
 
@@ -316,7 +384,7 @@ def is_repro(rel, src):
 
 
 def lint(root):
-    """Each use under root, as (path, line, what)."""
+    """Each use under root, as (path, line, what, issue)."""
     wasi = wasi_packages(root)
     out = []
     for d, dirs, files in os.walk(root):
@@ -328,8 +396,8 @@ def lint(root):
                     src = f.read()
                 if is_repro(os.path.relpath(path, root), src):
                     continue
-                for line, what in lint_file(path, src, os.path.normpath(d) in wasi):
-                    out.append((os.path.relpath(path, root), line, what))
+                for line, what, issue in lint_file(path, src, os.path.normpath(d) in wasi):
+                    out.append((os.path.relpath(path, root), line, what, issue))
     return out
 
 
@@ -474,6 +542,58 @@ e :: proc(m: ^map[int]int) { _, v, _, _ := map_entry(m, 1); v^ = 1 } // use
 package other
 e :: proc(m: ^map[int]int) { _, v, _, _ := map_entry(m, 1); v^ = 1 } // use
 """,
+    "b/trunc.odin": """package b
+import "core:os"
+t :: proc(p: string) {
+	_, _ = os.open(p, {.Write, .Trunc}) // use 8646
+	_, _ = os.open(p, {.Read, .Write, .Trunc}, os.Permissions_Default_File) // use 8646
+	_, _ = os.open(p, {
+		.Read,
+		.Trunc, // use 8646
+		.Write,
+	})
+	_, _ = os.open(p, {.Write, .Create, .Trunc})
+	_, _ = os.open(p, {
+		.Write,
+		.Trunc,
+		.Create,
+	})
+	f := os.File_Flags{.Trunc, .Write} // use 8646
+	g: os.File_Flags = {.Write}
+	incl(&g, os.File_Flag.Trunc) // use 8646
+	g += {.Trunc} // use 8646
+	if .Trunc in g {
+		_ = f & {.Trunc} == {.Trunc}
+		_ = {.Trunc} <= g
+	}
+	_, _ = os.open(p, os.O_RDWR + os.O_TRUNC) // use 8646
+	_, _ = os.open(p, os.O_RDWR + os.O_CREATE + os.O_TRUNC)
+	if true { _, _ = os.open(p, {.Write, .Trunc}) } // use 8646
+	Trunc :: 1
+	_ = Trunc
+	// {.Write, .Trunc} in a comment
+	_ = "{.Write, .Trunc}"
+}
+""",
+    "b/trunc_alias.odin": """package b
+import o "core:os"
+u :: proc(p: string) {
+	_, _ = o.open(p, o.O_WRONLY | o.O_TRUNC) // use 8646
+}
+""",
+    "b/trunc_linux.odin": """package b
+import "core:os"
+v :: proc(p: string) { _, _ = os.open(p, {.Write, .Trunc}) }
+""",
+    "b/trunc_not_windows.odin": """#+build !windows
+package b
+import "core:os"
+w :: proc(p: string) { _, _ = os.open(p, {.Write, .Trunc}) }
+""",
+    "b/trunc_no_os.odin": """package b
+import nbio "../third_party/nbio"
+x :: proc(p: string) { nbio.open(p, nil, {.Write, .Trunc}) }
+""",
     "node_modules/x/y.odin": """package y
 e :: proc(m: ^map[int]int) { map_entry(m, 1) }
 """,
@@ -489,19 +609,22 @@ def selftest():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(src)
             for n, line in enumerate(src.splitlines(), 1):
-                if line.rstrip().endswith("// use"):
-                    want.add((os.path.join(*rel.split("/")), n))
+                m = re.search(r"// use( 8646)?$", line.rstrip())
+                if m:
+                    want.add((os.path.join(*rel.split("/")), n, TRUNC_ISSUE if m.group(1) else ISSUE))
         got = lint(root)
-        have = {(p, line) for p, line, _ in got}
+        have = {(p, line, issue) for p, line, _, issue in got}
         missed = sorted(want - have)
-        extra = sorted((p, line, what) for p, line, what in got if (p, line) not in want)
-        for p, line in missed:
-            print(f"FAIL the lint ({ISSUE}) missed a use at {p}:{line}")
-        for p, line, what in extra:
-            print(f"FAIL the lint ({ISSUE}) took {p}:{line} for a use: {what}")
+        extra = sorted((p, line, what, issue) for p, line, what, issue in got if (p, line, issue) not in want)
+        for p, line, issue in missed:
+            print(f"FAIL the lint missed a use of what {issue} breaks at {p}:{line}")
+        for p, line, what, issue in extra:
+            print(f"FAIL the lint took {p}:{line} for a use of what {issue} breaks: {what}")
         if missed or extra:
             return 1
-        print(f"ok   the lint ({ISSUE}) finds each of the {len(want)} uses put in its fixtures, however written, and nothing else")
+        each = {i: sum(1 for w in want if w[2] == i) for i in (ISSUE, TRUNC_ISSUE)}
+        print(f"ok   the lint finds each of the {each[ISSUE]} uses of what {ISSUE} breaks and the {each[TRUNC_ISSUE]} of what"
+              f" {TRUNC_ISSUE} does, put in its fixtures, however written, and nothing else")
         return 0
 
 
@@ -510,12 +633,12 @@ def main():
         return selftest()
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     found = lint(root)
-    for p, line, what in found:
-        print(f"{p}:{line}: {what} ({ISSUE})")
-    if found:
-        print(f"FAIL {len(found)} uses of what {ISSUE} breaks: see https://github.com/odin-lang/Odin/issues/8642")
-        return 1
-    return 0
+    for p, line, what, issue in found:
+        print(f"{p}:{line}: {what} ({issue})")
+    for issue in sorted({f[3] for f in found}):
+        n = sum(1 for f in found if f[3] == issue)
+        print(f"FAIL {n} uses of what {issue} breaks: see https://github.com/{issue.replace('#', '/issues/')}")
+    return 1 if found else 0
 
 
 if __name__ == "__main__":
