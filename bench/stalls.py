@@ -231,6 +231,62 @@ def show(r, bulk):
         )
 
 
+def acks(args):
+    """A device alone and a client of it writing steadily: how long each write waits to be acknowledged, timed as the
+    acknowledgement arrives, by a thread that does nothing but read; and how often the node syncs."""
+    root = tempfile.mkdtemp(prefix="zsp-acks-", dir=args.dir)
+    try:
+        a = Node(root, "a", "run", "--no-udp")
+        zspd("create", a.dir)
+        a.start()
+        c = a.client()
+        c.until(lambda: 1 in c.scopes, 60)
+        value = os.urandom(ROW)
+        sent, heard = {}, []  # seq -> when sent; (acked seq, when heard)
+        stop = threading.Event()
+
+        def read():
+            c.sock.settimeout(0.05)
+            while not stop.is_set():
+                try:
+                    before = c.acked
+                    c.step()
+                    if c.acked != before:
+                        heard.append((c.acked, time.perf_counter()))
+                except (TimeoutError, socket.timeout):
+                    pass
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        rate = args.write << 20
+        start, n = time.perf_counter(), 0
+        while time.perf_counter() - start < args.acks:
+            due = start + n * ROW / rate
+            while time.perf_counter() < due:
+                time.sleep(max(due - time.perf_counter(), 0) / 2)
+            seq = c.seq + 1
+            sent[seq] = time.perf_counter()
+            c.put(1, "w", n, [value])  # sends, and bumps c.seq: only this thread does
+            n += 1
+        deadline = time.perf_counter() + 30
+        while (not heard or heard[-1][0] < c.seq) and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        stop.set()
+        reader.join()
+        waits, i = [], 0
+        for seq in sorted(sent):
+            while i < len(heard) and heard[i][0] < seq:
+                i += 1
+            if i < len(heard):
+                waits.append(heard[i][1] - sent[seq])
+        switches = a.switches()
+        a.stop()
+        disk = (a.report.get("loop") or {}).get("asked", {})
+        return dict(writes=n, acked=len(waits), p50=percentile(waits, 50), p90=percentile(waits, 90), p99=percentile(waits, 99), max=max(waits or [0]), syncs=disk.get("Log_Sync_Start", disk.get("Log_Sync", 0)), acks=len(heard))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--stall", action="append", help="B's loop held so many ms, every so many: 5,50; none for none")
@@ -241,6 +297,7 @@ def main():
     ap.add_argument("--idle", type=float, default=5, help="seconds idle wakeups are counted over")
     ap.add_argument("--dir", default=None, help="where stores go: a real disk, as their fsyncs are what is measured")
     ap.add_argument("--delay", type=float, default=0, help="ms each packet waits, each way, as on a longer path: Linux, in a network namespace of its own")
+    ap.add_argument("--acks", type=float, default=0, help="seconds of a device alone and a client writing steadily: only how long writes wait to be acknowledged")
     ap.add_argument("--forced", action="store_true", help="with CAP_NET_ADMIN, so that SO_RCVBUFFORCE is allowed: by sudo, Linux")
     ap.add_argument("--json", default=os.path.join(ROOT, "build", "bench-stalls.json"))
     ap.add_argument("--in-namespace", action="store_true", help=argparse.SUPPRESS)
@@ -262,6 +319,12 @@ def main():
         if args.delay:
             subprocess.run(["tc", "qdisc", "add", "dev", "lo", "root", "netem", "delay", f"{args.delay}ms", "limit", "1000000"], check=True)
         print(f"  on a loopback of its own, each packet delayed {args.delay} ms each way" + (", SO_RCVBUFFORCE allowed" if args.forced else ""))
+    if args.acks:
+        r = acks(args)
+        print(f"  {r['writes']} writes at {args.write} MiB/s, {r['acked']} acknowledged in {r['p50'] * 1e3:.1f} ms median, {r['p90'] * 1e3:.1f} at the 90th, {r['p99'] * 1e3:.1f} at the 99th, {r['max'] * 1e3:.1f} at most; {r['acks']} acknowledgements, {r['syncs']} log syncs")
+        with open(args.json, "w") as f:
+            json.dump(r, f)
+        return
     stalls = [None if s == "none" else s for s in (args.stall or ["none", "2,50", "5,50", "10,50"])]
     results = []
     for stall in stalls:

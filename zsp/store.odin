@@ -880,7 +880,9 @@ store_disk_synced :: proc(s: ^Store, token: u64, ok: bool) -> bool {
 			return false
 		}
 		s.synced = max(s.synced, f.log_upto)
-		if f.again {
+		// What was committed while it was under way is made durable at once, by the next, rather than when the next sync
+		// is due: so that a steady writer waits for one sync, not for one and then the next.
+		if f.again || store_tail(s) != f.log_upto {
 			store_sync_start(s) or_return
 		}
 	case token == f.pages:
