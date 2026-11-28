@@ -127,10 +127,10 @@ join_reset :: proc(j: ^Join, why: string) {
 	join_close(j)
 }
 
-// What the system last said went wrong, as the reason a socket's operation gave: core:nbio maps it to an error of its
-// own, and on Windows that loses all but a few, so the number is said too.
-system_said :: proc(err: any) -> string {
-	return fmt.tprintf("%v (the system's last error then: %d)", err, net.last_platform_error())
+// What an operation failed with: the error it gives, a category, and the system's own code, taken by nbio where it
+// failed (Operation.system_error), which says which of the category it was.
+system_said :: proc(op: ^nbio.Operation, err: any) -> string {
+	return fmt.tprintf("%v (system error %d)", err, op.system_error)
 }
 
 // The socket is connected: bytes flow both ways from now on.
@@ -156,7 +156,7 @@ join_read :: proc(j: ^Join) {
 		case j.over:
 			join_free(j)
 		case op.recv.err != nil:
-			join_reset(j, fmt.tprintf("reading it failed: %s", system_said(op.recv.err)))
+			join_reset(j, fmt.tprintf("reading it failed: %s", system_said(op, op.recv.err)))
 		case op.recv.received == 0:
 			j.eof = true
 			host.call_end(j.sp, j.call)
@@ -194,7 +194,7 @@ join_write :: proc(j: ^Join) {
 			return
 		}
 		if op.send.err != nil {
-			join_reset(j, fmt.tprintf("writing to it failed, %d of %d bytes taken: %s", op.send.sent, len(j.sending), system_said(op.send.err)))
+			join_reset(j, fmt.tprintf("writing to it failed, %d of %d bytes taken: %s", op.send.sent, len(j.sending), system_said(op, op.send.err)))
 			return
 		}
 		j.written += op.send.sent
@@ -270,7 +270,7 @@ serve_forward :: proc(sp: ^host.Space, call: u64, from: host.Caller, scope: zsp.
 			return
 		}
 		if op.dial.err != nil {
-			join_reset(j, fmt.tprintf("connecting failed: %s", system_said(op.dial.err))) // a reset, as a refusal is
+			join_reset(j, fmt.tprintf("connecting failed: %s", system_said(op, op.dial.err))) // a reset, as a refusal is
 			return
 		}
 		join_attach(j, op.dial.socket)
@@ -282,7 +282,7 @@ serve_forward :: proc(sp: ^host.Space, call: u64, from: host.Caller, scope: zsp.
 accepted :: proc(op: ^nbio.Operation, c: ^Connect) {
 	c.accepting = nil
 	if op.accept.err != nil {
-		log.warnf("forward: could not accept a connection at %s: %s", net.endpoint_to_string(c.at, context.temp_allocator), system_said(op.accept.err))
+		log.warnf("forward: could not accept a connection at %s: %s", net.endpoint_to_string(c.at, context.temp_allocator), system_said(op, op.accept.err))
 		// Tried again in a while, not at once: an error that lasts would have this spin.
 		c.accepting = nbio.timeout_poly(ACCEPT_AGAIN, c, proc(_: ^nbio.Operation, c: ^Connect) {
 			c.accepting = nbio.accept_poly(c.listener, c, accepted)

@@ -173,12 +173,23 @@ def bulk(port, size):
 
         sender = Thread(target=send)
         sender.start()
+        failed = []
         try:
             while chunk := s.recv(1 << 18):
                 got += chunk
         except OSError as e:
-            raise AssertionError(f"bulk from {here}: reading back failed with {e!r}, {len(got)} of {size} bytes read back and {sent} sent") from e
-        sender.join()
+            failed.append(f"reading back failed with {e!r}, {len(got)} of {size} bytes read back and {sent} sent")
+            try:
+                s.shutdown(socket.SHUT_RDWR)  # what the sender waits on ends, so that it is joined
+            except OSError:
+                pass
+        # Joined whichever way reading went: what the sender met is said too, and is often what came first.
+        try:
+            sender.join()
+        except AssertionError as e:
+            failed.insert(0, str(e).removeprefix(f"bulk from {here}: "))
+        if failed:
+            raise AssertionError(f"bulk from {here}: " + "; and ".join(failed))
     assert hashlib.sha256(got).digest() == hashlib.sha256(data).digest(), f"{len(got)} of {size} bytes came back as sent"
 
 
