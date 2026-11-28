@@ -1,8 +1,7 @@
 """What `./x check` holds every .odin file here to, outside node_modules: no use of what odin-lang/Odin#8642 or #8646
 breaks.
 
-#8642. 
-The runtime's `__dynamic_map_entry` (`map_entry`) can give back the slot of another key, and the pointer an insertion
+#8642. The runtime's `__dynamic_map_entry` (`map_entry`) can give back the slot of another key, and the pointer an insertion
 gives back (`map_insert`, `map_upsert`) can be to it too: what is written through it lands on another key. Inserting
 itself is sound (`m[k] = v`, or `map_insert` with its pointer let go of), as is looking up. So this fails on:
 
@@ -11,19 +10,19 @@ itself is sound (`m[k] = v`, or `map_insert` with its pointer let go of), as is 
   result assigned to `_`; and neither may be named but to call it, as `alias :: map_insert` would hide it;
 - what of core uses them: `core:strings`'s `Intern` and `intern_*`; `core:os` in a file built for WASI (its environment
   is kept with `map_entry`); `core:net`'s `enumerate_interfaces` in a file built for macOS, OpenBSD or NetBSD;
-  `core:nbio` (third_party/nbio is the copy to use, until #8642, #8644, #8645 and #8647 are fixed in a
-  release);
+  `core:nbio` (third_party/nbio is the copy to use, until #8642, #8644, #8645 and #8647 are fixed in a release);
   `core:text/i18n` (it interns); `core:container/topological_sort` (it keeps `map_insert`'s pointer).
 
 #8646. On Windows, core:os opens a file with `.Trunc` but not `.Create` asking TRUNCATE_EXISTING with FILE_GENERIC_WRITE,
 which Windows refuses as an invalid parameter (87), wanting GENERIC_WRITE itself. So in a file that imports `core:os`
-and is built for Windows, `.Trunc` or `O_TRUNC` fails unless `.Create` or `O_CREATE` is with it: in the same set
-(`{.Write, .Create, .Trunc}`), or, outside a set, in the same line (`os.O_RDWR + os.O_CREATE + os.O_TRUNC`). A set or
-`.Trunc` only asked of (`.Trunc in flags`, `flags & {.Trunc} == {.Trunc}`) builds nothing, and passes. Flags it cannot
-see the type of are taken for core:os's, so a file that imports it holds every `.Trunc` to this.
+and is built for Windows, flags made with `.Trunc` (or `O_TRUNC`) and not `.Create` (or `O_CREATE`) fail. Each flags
+expression is read as a whole, wherever it is given (an argument, a return, an assignment), across lines: a set's
+elements and the constants added, not those taken away (`-`, `&~`, `excl`) nor only asked of (`&`, a comparison,
+`in`). What is assigned to a name is taken with all else assigned to it in the file (`incl` too), as flags built up.
 
-Formatting is no way round it: comments and strings are taken out, and what is left is read as tokens. Each import is
-followed by the name it is given. A file is taken as built for an OS unless its name or `#+build` lines say it is not;
+Formatting is no way round it: comments and strings are taken out, and what is left is read as tokens, in statements
+split as Odin splits them. Each import is followed by the name it is given. A file is taken as built for an OS as Odin
+builds it, by its name and its `#+build` lines (./x selftest holds that to Odin itself, target by target);
 a package as built for WASI if a command here builds it so (`-target:wasi_...` in ./x or a workflow), with what it
 imports from here. The one exception is the repros in tests/upstream, there to use what is broken: each file there that
 says at its head which of the issues it reproduces ("Reproduces odin-lang/Odin#...").
@@ -36,8 +35,20 @@ import os, re, sys, tempfile
 
 ISSUE = "odin-lang/Odin#8642"
 TRUNC_ISSUE = "odin-lang/Odin#8646"
-OSES = {"windows", "darwin", "linux", "essence", "freebsd", "openbsd", "netbsd", "haiku", "wasi", "js", "orca", "freestanding"}
+# Odin's target_os_names and target_arch_names (src/build_settings.cpp, as of the release CI builds with): there is no
+# `unix`, neither as a build tag nor as the end of a file's name.
+OSES = {"windows", "darwin", "linux", "freebsd", "openbsd", "netbsd", "wasi", "js", "orca", "freestanding"}
 ARCHES = {"amd64", "i386", "arm32", "arm64", "wasm32", "wasm64p32", "riscv64"}
+# The targets Odin builds for (`odin check -target:?`), as an OS and an arch: a file is built for an OS if it is for
+# any target of it.
+TARGETS = [
+    "darwin_amd64", "darwin_arm64", "linux_i386", "linux_amd64", "linux_arm64", "linux_arm32", "linux_riscv64",
+    "windows_i386", "windows_amd64", "freebsd_i386", "freebsd_amd64", "freebsd_arm64", "netbsd_amd64", "netbsd_arm64",
+    "openbsd_amd64", "freestanding_wasm32", "wasi_wasm32", "js_wasm32", "orca_wasm32", "freestanding_wasm64p32",
+    "js_wasm64p32", "wasi_wasm64p32", "freestanding_amd64_sysv", "freestanding_amd64_win64", "freestanding_amd64_mingw",
+    "freestanding_arm64", "freestanding_arm32", "freestanding_riscv64",
+]
+OS_ARCHES = sorted({tuple(t.split("_")[:2]) for t in TARGETS})
 BSDS = {"darwin", "openbsd", "netbsd"}  # core:net's enumerate_interfaces gathers with map_entry on these
 BANNED_IMPORTS = {
     "core:nbio": "core:nbio: import third_party/nbio, the copy fixed of it, until #8642, #8644, #8645 and #8647 are fixed in a release",
@@ -95,7 +106,7 @@ def tokens(src):
             out.append(("number", src[i:j], line))
             i = j
         else:
-            for p in ("::", ":=", "..=", "..<", "->", "+=", "-=", "==", "!=", "<=", ">="):
+            for p in ("&~=", "::", ":=", "..=", "..<", "->", "+=", "-=", "|=", "&=", "~=", "&~", "==", "!=", "<=", ">=", "&&", "||"):
                 if src.startswith(p, i):
                     out.append(("punct", p, line))
                     i += len(p)
@@ -106,51 +117,115 @@ def tokens(src):
     return out
 
 
+def build_lines(src):
+    """The `#+build` tags of a file, each the text of its line after `#+build`, as Odin reads them: lines starting `#+`
+    before `package`, among comments, each ending where a `/` begins (a comment after it)."""
+    out = []
+    for t in tokens_before_package(src):
+        m = re.match(r"#\+build(?:\s+|$)(.*)", t)
+        if m and not t.startswith("#+build-"):
+            out.append(m.group(1))
+    return out
+
+
+def tokens_before_package(src):
+    """Each `#+` tag before `package`, its text up to the end of its line or a `/`, as Odin's tokenizer takes it."""
+    tags, i, n = [], 0, len(src)
+    while i < n:
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+        elif src.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if src.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif src.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif src.startswith("#+", i):
+            j = i
+            while j < n and src[j] not in "\n/":
+                j += 1
+            tags.append(src[i:j].strip())
+            i = j
+        elif src[i].isspace():
+            i += 1
+        else:
+            break  # `package`, or whatever comes first that is not a comment or a tag
+    return tags
+
+
+def tag_groups(text):
+    """A `#+build` line as Odin's parse_build_tag reads it: groups, separated by commas, any of which may hold; in each,
+    words, all of which must; a word `!` before a name to be not that; `ignore` a group that never holds."""
+    groups, cur = [], []
+    for w in re.findall(r"!?[A-Za-z0-9_:]+|,", text):
+        if w == ",":
+            groups.append(cur)
+            cur = []
+        else:
+            cur.append(w)
+    groups.append(cur)
+    return [g for g in groups if g]
+
+
+def group_admits(group, os_name, arch):
+    """Whether a group holds for a target: each word for it (an `os:subtarget` word for some subtarget of the OS, so
+    that a negated one does not exclude the OS)."""
+    for w in group:
+        neg = w.startswith("!")
+        name = w.lstrip("!").lower()
+        if name == "ignore":
+            return False
+        os_part, _, subtarget = name.partition(":")
+        if os_part in OSES:
+            if neg and not subtarget and os_part == os_name:
+                return False
+            if not neg and os_part != os_name:
+                return False
+        elif name in ARCHES:
+            if (name == arch) == neg:
+                return False
+    return True
+
+
+def suffix_builds(path, os_name, arch):
+    """Whether a file's name lets it be built for a target, as Odin's is_excluded_target_filename reads it: by the
+    last part after `_` (an OS or an arch), or the last two (`_os_arch` or `_arch_os`); a name starting with `.` is
+    never built."""
+    name = os.path.basename(path)[: -len(".odin")]
+    if name.startswith("."):
+        return False
+    parts = name.split("_")
+    if len(parts) < 2:
+        return True
+    last, before = parts[-1].lower(), (parts[-2].lower() if len(parts) >= 3 else "")
+    if last in OSES and before in ARCHES:
+        return last == os_name and before == arch
+    if last in ARCHES and before in OSES:
+        return last == arch and before == os_name
+    if last in OSES:
+        return last == os_name
+    if last in ARCHES:
+        return last == arch
+    return True
+
+
 def admits(path, src):
-    """The set of OSes a file is built for, of its name and its `#+build` lines (each line one condition, all of which
-    must hold; in a line, terms separated by commas, any of which may; a term an OS, an arch, or both, `!` before it
-    to be not that)."""
-    oses = set(OSES)
-    parts = os.path.basename(path)[: -len(".odin")].split("_")
-    if len(parts) >= 3 and parts[-2] in OSES and parts[-1] in ARCHES:
-        oses &= {parts[-2]}
-    elif len(parts) >= 2 and parts[-1] in OSES:
-        oses &= {parts[-1]}
-    for raw in src.splitlines():
-        s = raw.strip()
-        if s.startswith("package "):
-            break
-        m = re.match(r"#\+build\s+(.*)", s)
-        if not m:
-            continue
-        line_oses = set()
-        for term in m.group(1).split(","):
-            words = term.split()
-            if not words:
-                continue
-            if words[0] == "ignore":
-                return set()
-            neg = words[0].startswith("!")
-            names = [w.lstrip("!") for w in words]
-            term_os = [w for w in names if w in OSES]
-            if neg:  # not this OS (or arch): every OS but it may be
-                line_oses |= OSES - set(term_os) if term_os else set(OSES)
-            else:
-                line_oses |= set(term_os) if term_os else set(OSES)
-        oses &= line_oses
-    return oses
+    """The set of OSes a file is built for, for some target of each, by Odin's rules: its name, and each of its
+    `#+build` lines, all of which must hold (see tag_groups)."""
+    lines = [tag_groups(line) for line in build_lines(src)]
+    return {o for o, a in OS_ARCHES if suffix_builds(path, o, a) and all(any(group_admits(g, o, a) for g in groups) for groups in lines)}
 
 
 def explicitly(path, src, os_name):
-    """Whether a file is meant for that OS by name: its name ends in it, or a `#+build` line names it, not negated."""
-    parts = os.path.basename(path)[: -len(".odin")].split("_")
-    if len(parts) >= 2 and (parts[-1] == os_name or (len(parts) >= 3 and parts[-2] == os_name and parts[-1] in ARCHES)):
+    """Whether a file is meant for that OS by name: its name builds it for that OS only, or one of its `#+build` lines
+    (before `package`) names it, not negated."""
+    if admits(path, "") == {os_name}:
         return True
-    for raw in src.splitlines():
-        m = re.match(r"\s*#\+build\s+(.*)", raw)
-        if m and any(os_name in t.split() for t in m.group(1).split(",")):
-            return True
-    return False
+    return any(os_name in [w.partition(":")[0].lower() for w in g] for line in build_lines(src) for g in tag_groups(line))
 
 
 def imports(toks):
@@ -181,127 +256,250 @@ def imports(toks):
     return out
 
 
+# Odin's keywords. A line ends a statement, as Odin puts a semicolon there, after a name, a literal, `)`, `]`, `}`, `^`
+# or `?`, and after the keywords of ENDING: after any other token, or keyword, the statement goes on.
+KEYWORDS = {"import", "foreign", "package", "typeid", "when", "where", "if", "else", "for", "switch", "in", "not_in", "do",
+            "case", "break", "continue", "fallthrough", "defer", "return", "proc", "struct", "union", "enum", "bit_set",
+            "bit_field", "map", "dynamic", "auto_cast", "cast", "transmute", "distinct", "using", "context", "or_else",
+            "or_return", "or_break", "or_continue", "asm", "matrix"}
+ENDING = {"break", "continue", "fallthrough", "return", "or_return", "or_break", "or_continue", "context"}
+
+
+def ends_line(tok):
+    """Whether a statement ends at the end of a line that ends with this token (see KEYWORDS)."""
+    kind, text, _ = tok
+    if kind in ("number", "string", "rune"):
+        return True
+    if kind == "ident":
+        return text not in KEYWORDS or text in ENDING
+    return text in (")", "]", "}", "^", "?")
+# Words that, at the head of a statement, make the `{` that follows its block.
+BLOCK_HEADS = {"if", "for", "switch", "when", "else", "proc", "struct", "enum", "union", "foreign", "defer"}
+ASSIGN = {"=", ":=", "+=", "-=", "|=", "&=", "&~=", "~="}
+
+
+def statements(toks):
+    """Each statement as (start, end), indices of its tokens, end past its last: split at `;`, at a block's `{` and
+    `}`, and at the end of a line not inside brackets and not going on. A block's contents are statements of their own;
+    a literal's `{...}` is part of the expression it is in. A `{` is a block's if it begins a statement, or if a word of
+    BLOCK_HEADS is in the statement before it, outside brackets."""
+    out, stack, start, n = [], [], 0, len(toks)
+    heads = False  # whether the statement so far has a word of BLOCK_HEADS outside brackets
+
+    def close(end):
+        nonlocal start, heads
+        if end > start:
+            out.append((start, end))
+        start, heads = end + 1, False
+
+    i = 0
+    while i < n:
+        kind, text, line = toks[i]
+        inside = any(k != "block" for k in stack)
+        if kind == "punct" and text in "([":
+            stack.append("paren")
+        elif kind == "punct" and text == "{":
+            if not inside and (i == start or heads):
+                close(i)
+                stack.append("block")
+            else:
+                stack.append("literal")
+        elif kind == "punct" and text in ")]}":
+            k = stack.pop() if stack else "block"
+            if k == "block":
+                close(i)
+        elif kind == "punct" and text == ";" and not inside:
+            close(i)
+        elif kind == "ident" and text in BLOCK_HEADS and not inside:
+            heads = True
+        if i + 1 < n and not any(k != "block" for k in stack) and toks[i + 1][2] > line and ends_line(toks[i]) and start <= i:
+            out.append((start, i + 1))
+            start, heads = i + 1, False
+        i += 1
+    if start < n:
+        out.append((start, n))
+    return out
+
+
+def split_depth0(toks, s, e, seps):
+    """The parts of toks[s:e] between separators at depth 0, as (start, end)."""
+    parts, depth, b = [], 0, s
+    for k in range(s, e):
+        t = toks[k][1]
+        if toks[k][0] == "punct" and t in "([{":
+            depth += 1
+        elif toks[k][0] == "punct" and t in ")]}":
+            depth -= 1
+        elif depth == 0 and t in seps:
+            parts.append((b, k))
+            b = k + 1
+    parts.append((b, e))
+    return parts
+
+
 def matching(toks, i):
-    """The index of the `)` that closes the `(` at i."""
+    """The index of the bracket that closes the one at i."""
     depth = 0
     for j in range(i, len(toks)):
-        if toks[j][1] in "([{" and toks[j][0] == "punct":
+        if toks[j][0] == "punct" and toks[j][1] in "([{":
             depth += 1
-        elif toks[j][1] in ")]}" and toks[j][0] == "punct":
+        elif toks[j][0] == "punct" and toks[j][1] in ")]}":
             depth -= 1
             if depth == 0:
                 return j
     return len(toks) - 1
 
 
-STATEMENT_START = {";", "{", "}", "defer", "if", "for", "switch", "when", "do", "else"}
-CONTINUES = {",", "(", "[", "=", ":=", "+", "-", "*", "/", "%", "&", "|", "~", "<", ">", "!", "^", ".", "->", "?", ":", "::", "==", "!=", "<=", ">=", "&&", "||", "or_else", "or_return", "return", "in", "not_in"}
+def statement_of(stmts, i):
+    for s, e in stmts:
+        if s <= i < e:
+            return s, e
+    return i, i + 1
 
 
-def starts_statement(toks, i):
-    """Whether the token at i begins a statement: after one that cannot go on into it."""
-    if i == 0:
-        return True
-    prev = toks[i - 1]
-    if prev[1] in STATEMENT_START:
-        return True
-    return prev[2] < toks[i][2] and prev[1] not in CONTINUES
-
-
-def ends_statement(toks, j):
-    """Whether the statement ends after the token at j (perhaps with or_return)."""
-    k = j + 1
-    if k < len(toks) and toks[k][1] == "or_return":
-        k += 1
-    if k >= len(toks):
-        return True
-    nxt = toks[k]
-    if nxt[1] in (";", "}"):
-        return True
-    return nxt[2] > toks[k - 1][2] and nxt[1] not in CONTINUES and nxt[1] not in (".", "^", "[", "(")
-
-
-def pointer_let_go(toks, i, at):
-    """Whether the call whose name is the token at i, ending at the token at `at`, gives back its pointer only to be let
-    go of: called as a statement, or assigned with the pointer's place `_`. map_insert gives the pointer first,
-    map_upsert second."""
+def pointer_let_go(toks, stmts, i):
+    """Whether the call whose name is the token at i gives back its pointer only to be let go of: the call the whole of
+    its statement (after `defer`, `if`, `for`, `when` or `switch`, and with `or_return` after it), or the whole of what
+    an assignment assigns, with the pointer's place `_`. map_insert gives the pointer first, map_upsert second."""
     name = toks[i][1]
-    start = i
-    if start >= 2 and toks[start - 1][1] == "." and toks[start - 2][0] == "ident":  # runtime.map_insert
-        start -= 2
-    if not ends_statement(toks, at):
+    s, e = statement_of(stmts, i)
+    start = i - 2 if i >= 2 and toks[i - 1][1] == "." and toks[i - 2][0] == "ident" else i  # runtime.map_insert
+    end = matching(toks, i + 1) + 1
+    if end < e and toks[end][1] == "or_return":
+        end += 1
+    if end != e:
         return False
-    if starts_statement(toks, start):
+    while s < start and toks[s][1] in ("defer", "if", "for", "when", "switch"):
+        s += 1
+    if start == s:
         return True
     if toks[start - 1][1] not in ("=", ":="):
         return False
-    # The names assigned, back to where the statement starts.
-    lhs, k = [], start - 2
-    while k >= 0:
-        if toks[k][0] != "ident":
-            return False
-        lhs.insert(0, toks[k][1])
-        if starts_statement(toks, k):
-            break
-        if toks[k - 1][1] != ",":
-            return False
-        k -= 2
+    lhs_end = start - 1
+    # Typed: `a, b: T = call`. The names are before the `:`.
+    colon = [k for k in range(s, lhs_end) if toks[k][1] == ":" and toks[k][0] == "punct"]
+    if colon and toks[start - 1][1] == "=":
+        lhs_end = colon[0]
+    lhs = split_depth0(toks, s, lhs_end, {","})
     place = 0 if name == "map_insert" else 1
-    return len(lhs) > place and lhs[place] == "_"
+    if place >= len(lhs):
+        return False
+    a, b = lhs[place]
+    return b - a == 1 and toks[a][1] == "_"
 
 
-def trunc_uses(toks):
-    """The lines on which `.Trunc` or `O_TRUNC` is given without `.Create` or `O_CREATE` (see #8646 above)."""
-    # Each `{` with its `}`, and whether what is between is a set: its elements, at its own depth, on a line of their own
-    # only after a comma.
-    close, stack = {}, []
-    for i, (kind, text, _) in enumerate(toks):
-        if kind == "punct" and text == "{":
-            stack.append(i)
-        elif kind == "punct" and text == "}" and stack:
-            close[stack.pop()] = i
+def flags_added(toks, s, e, consts):
+    """Of a flags expression, toks[s:e]: whether it adds .Trunc, and whether it adds .Create, as it reads: set elements
+    and O_* constants added (by `+`, `|` or in a set), not taken away (by `-` or `&~`) nor only asked of (`&`, a
+    comparison, `in`). consts names the core:os O_* constants: O_TRUNC is .Trunc, O_CREATE .Create. None if it is no
+    flags expression at all but a test."""
+    trunc, create = [], False  # the lines .Trunc is added on; whether .Create is
+    sign, depth, k = 1, 0, s
+    while k < e:
+        kind, t, _ = toks[k]
+        if kind == "punct" and t in ("==", "!=", "<=", ">=", "<", ">") and depth == 0:
+            return None
+        if kind == "ident" and t in ("in", "not_in") and depth == 0:
+            return None
+        if kind == "punct" and t in ("+", "|"):
+            sign = 1
+        elif kind == "punct" and t in ("-", "&~"):
+            sign = -1
+        elif kind == "punct" and t == "&":
+            sign = 0
+        elif kind == "punct" and t == "{":
+            close = matching(toks, k)
+            for a, b in split_depth0(toks, k + 1, close, {","}):
+                words = [toks[x][1] for x in range(a, b)]
+                if sign > 0 and words[-1:] == ["Trunc"]:
+                    trunc.append(toks[b - 1][2])
+                if sign > 0 and words[-1:] == ["Create"]:
+                    create = True
+            k = close
+        elif kind == "punct" and t == "(":
+            close = matching(toks, k)
+            inner = flags_added(toks, k + 1, close, consts)
+            if inner and sign > 0:
+                trunc, create = trunc + inner[0], create or inner[1]
+            k = close
+        elif kind == "ident" and sign > 0 and (t in consts or (k >= 1 and toks[k - 1][1] == ".")):
+            if t in ("O_TRUNC", "Trunc"):
+                trunc.append(toks[k][2])
+            create = create or t in ("O_CREATE", "Create")
+        k += 1
+    return trunc, create
 
-    def is_set(o):
-        depth, prev = 0, toks[o]
-        for k in range(o + 1, close[o]):
-            t = toks[k]
-            if depth == 0 and t[2] > prev[2] and prev[1] not in (",", "{"):
-                return False
-            if t[0] == "punct" and t[1] in "([{":
-                depth += 1
-            elif t[0] == "punct" and t[1] in ")]}":
-                depth -= 1
-            if depth == 0:
-                prev = t
-        return True
 
-    def creates(ts):
-        return any(t[0] == "ident" and t[1] in ("Create", "O_CREATE") for t in ts)
+def trunc_uses(toks, os_names):
+    """The lines on which flags with .Trunc and not .Create are made (see #8646 above). Each flags expression is read
+    as a whole (flags_added), wherever it is given: as an argument of a call, in a return, or assigned. What is
+    assigned to a name is taken with all else assigned to that name in the file, as one set of flags built up: it adds
+    .Trunc without .Create if some assignment adds .Trunc and none adds .Create (incl and excl count as assignments)."""
+    consts = {"O_TRUNC", "O_CREATE"}
+    stmts = statements(toks)
+    found, by_name = [], {}
 
-    found = []
-    for i, (kind, text, line) in enumerate(toks):
-        if kind != "ident" or text not in ("Trunc", "O_TRUNC"):
-            continue
-        if text == "Trunc" and (i == 0 or toks[i - 1][1] != "."):
-            continue  # a name of another's, not the flag
-        # The innermost set it is in, if any.
-        inner = None
-        for o in close:
-            if o < i < close[o] and is_set(o) and (inner is None or o > inner):
-                inner = o
-        if inner is not None:
-            group = toks[inner + 1 : close[inner]]
-            asked = toks[inner - 1][1] in ("&", "==", "!=", "<=", ">=", "<", ">") or (
-                close[inner] + 1 < len(toks) and toks[close[inner] + 1][1] in ("==", "!=", "&", "<=", ">=", "<", ">", "in", "not_in")
-            )
-            if not asked and not creates(group):
-                found.append(line)
+    def note(s, e, name=None):
+        r = flags_added(toks, s, e, consts)
+        if r is None or not (r[0] or r[1]):
+            return
+        if name is None:
+            if r[0] and not r[1]:
+                found.extend(r[0])
         else:
-            if i + 1 < len(toks) and toks[i + 1][1] in ("in", "not_in"):
+            entry = by_name.setdefault(name, [[], False])
+            entry[0].extend(r[0])
+            entry[1] = entry[1] or r[1]
+
+    for s, e in stmts:
+        # Calls in it, each argument.
+        k = s
+        while k < e:
+            if toks[k][0] == "ident" and k + 1 < e and toks[k + 1][1] == "(":
+                close = matching(toks, k + 1)
+                args = split_depth0(toks, k + 2, close, {","})
+                callee = toks[k][1]
+                if callee in ("incl", "excl") and len(args) == 2:
+                    # incl(&flags, x) adds x to flags, as flags += x would; excl takes it away.
+                    a0, b0 = args[0]
+                    a1, b1 = args[1]
+                    if toks[a0][1] == "&":
+                        a0 += 1
+                    if callee == "incl":
+                        note(a1, b1, name=" ".join(t[1] for t in toks[a0:b0]))
+                else:
+                    for a, b in args:
+                        if b > a and not (b - a == 1 and toks[a][0] == "ident"):
+                            note(a, b)
+            k += 1
+        # Returns, and assignments.
+        if toks[s][1] == "return":
+            for a, b in split_depth0(toks, s + 1, e, {","}):
+                note(a, b)
+            continue
+        ops = [k for k in range(s, e) if toks[k][0] == "punct" and toks[k][1] in ASSIGN and not any(
+            toks[x][1] in "([{" and matching(toks, x) > k for x in range(s, k) if toks[x][0] == "punct")]
+        if not ops:
+            continue
+        op = ops[0]
+        lhs_end = op
+        colon = [k for k in range(s, op) if toks[k][1] == ":" and toks[k][0] == "punct"]
+        if colon and toks[op][1] == "=":
+            lhs_end = colon[0]
+        names = [" ".join(t[1] for t in toks[a:b]) for a, b in split_depth0(toks, s, lhs_end, {","})]
+        values = split_depth0(toks, op + 1, e, {","})
+        if toks[op][1] in ("-=", "&~=", "&="):
+            continue  # taken away, or asked of
+        for idx, (a, b) in enumerate(values):
+            name = names[idx] if idx < len(names) and len(names) == len(values) else None
+            # A call assigned is read by its arguments above; a name assigned only as it stands is not a set built.
+            if b - a >= 1 and toks[a][0] == "ident" and a + 1 < b and toks[a + 1][1] == "(" and matching(toks, a + 1) == b - 1:
                 continue
-            if not creates(t for t in toks if t[2] == line):
-                found.append(line)
-    return found
+            note(a, b, name=name)
+    for trunc, create in by_name.values():
+        if trunc and not create:
+            found.extend(trunc)
+    return sorted(set(found))
 
 
 def lint_file(path, src, wasi_built):
@@ -313,6 +511,7 @@ def lint_file(path, src, wasi_built):
     for alias, p in named.items():
         by_path.setdefault(p, []).append(alias)
     oses = admits(path, src)
+    stmts = statements(toks)
     for p, why in BANNED_IMPORTS.items():
         if p in by_path:
             line = next(t[2] for t in toks if t[0] == "string" and t[1] == p)
@@ -330,7 +529,7 @@ def lint_file(path, src, wasi_built):
         elif text in ("map_insert", "map_upsert"):
             if i + 1 >= len(toks) or toks[i + 1][1] != "(":
                 found.append((line, f"{text} named but to call it: the pointer it gives back is not to be had", ISSUE))
-            elif not pointer_let_go(toks, i, matching(toks, i + 1)):
+            elif not pointer_let_go(toks, stmts, i):
                 found.append((line, f"{text}'s pointer kept or used: it may be another key's; call it as a statement, or assign that result to _", ISSUE))
         elif i >= 2 and toks[i - 1][1] == "." and toks[i - 2][0] == "ident":
             owner = toks[i - 2][1]
@@ -340,7 +539,7 @@ def lint_file(path, src, wasi_built):
                 found.append((line, "net.enumerate_interfaces in a file built for macOS, OpenBSD or NetBSD: it gathers with map_entry there", ISSUE))
     if "windows" in oses:
         if "core:os" in by_path:
-            for line in trunc_uses(toks):
+            for line in trunc_uses(toks, by_path["core:os"]):
                 found.append((line, ".Trunc without .Create, in a file built for Windows that imports core:os: core:os's open fails so with error 87 there", TRUNC_ISSUE))
     return found
 
@@ -513,6 +712,13 @@ import "core:os" // use
 package a
 import o "core:os" // use
 """,
+    "a/env_after.odin": """package a
+import "core:os"
+// #+build wasi, in a comment
+TAG :: `
+#+build wasi
+`
+""",
     "a/env_native.odin": """package a
 import "core:os"
 """,
@@ -576,6 +782,34 @@ t :: proc(p: string) {
 	_ = "{.Write, .Trunc}"
 }
 """,
+    "b/trunc_more.odin": """package b
+import "core:os"
+import "base:runtime"
+S :: struct { err: runtime.Allocator_Error }
+m :: proc(p: string, mode: os.File_Flag, g: ^os.File_Flags, s: ^S, mp: ^map[int]int) {
+	g^ &~= {.Trunc}
+	g^ = g^ - {.Trunc}
+	excl(g, os.File_Flag.Trunc)
+	h := g^ &~ {.Trunc}
+	_ = h
+	_, _ = os.open(p, os.O_CREATE |
+		os.O_TRUNC)
+	if mode != .Create do _, _ = os.open(p, os.O_WRONLY | os.O_TRUNC) // use 8646
+	fl := os.File_Flags{.Write, .Trunc}
+	fl += {.Create}
+	_, _ = os.open(p, fl)
+	fl2 := os.File_Flags{.Write}
+	fl2 |= {.Trunc} // use 8646
+	_, _ = os.open(p, fl2)
+	_, s.err = map_insert(mp, 1, 1)
+	_, e: runtime.Allocator_Error = map_insert(mp, 2, 2)
+	_ = e
+	q: ^int = map_insert(mp, 3, 3) // use
+	_ = q
+	r := mp^[1] + 1
+	_ = r
+}
+""",
     "b/trunc_alias.odin": """package b
 import o "core:os"
 u :: proc(p: string) {
@@ -599,6 +833,73 @@ x :: proc(p: string) { nbio.open(p, nil, {.Write, .Trunc}) }
 e :: proc(m: ^map[int]int) { map_entry(m, 1) }
 """,
 }
+
+
+# Files and their `#+build` lines, each to be built as Odin builds it (see selftest_tags).
+TAG_FIXTURES = {
+    "tag_neg_first.odin": "#+build !arm64 windows\n",
+    "tag_neg_second.odin": "#+build amd64 !windows\n",
+    "tag_comment.odin": "#+build linux // only Linux\n",
+    "tag_nospace.odin": "#+build linux,darwin\n",
+    "tag_spaces.odin": "#+build  linux ,  darwin amd64\n",
+    "tag_lines.odin": "#+build !windows\n#+build !linux\n",
+    "tag_ignore.odin": "#+build ignore\n",
+    "tag_group_ignore.odin": "#+build ignore, linux\n",
+    "tag_subtarget.odin": "#+build !darwin:iphone\n",
+    "tag_case.odin": "#+build Windows\n",
+    "tag_after_comments.odin": "/* a block */\n// a line\n#+build freebsd\n",
+    "x_unix.odin": "",
+    "x_windows.odin": "",
+    "x_amd64_linux.odin": "",
+    "x_linux_arm64.odin": "",
+    "x_arm64.odin": "",
+    ".hidden.odin": "",
+}
+TAG_TARGETS = TARGETS
+
+
+def selftest_tags():
+    """That admits() takes each of TAG_FIXTURES to be built for the OSes Odin builds it for: each checked with odin, for
+    each of TAG_TARGETS, as the one file beside a main, failing if it is built."""
+    import shutil, subprocess
+    from concurrent.futures import ThreadPoolExecutor
+
+    odin = shutil.which("odin")
+    if odin is None:
+        print("FAIL no odin to hold the lint's reading of build tags to")
+        return 1
+    with tempfile.TemporaryDirectory() as root:
+        dirs = {}
+        for i, (name, tags) in enumerate(TAG_FIXTURES.items()):
+            d = os.path.join(root, f"p{i}")
+            os.makedirs(d)
+            with open(os.path.join(d, "main.odin"), "w") as f:
+                f.write("package p\nmain :: proc() {}\n")
+            with open(os.path.join(d, name), "w") as f:
+                f.write(tags + 'package p\n#assert(false, "BUILT")\n')
+            dirs[name] = d
+
+        def built(job):
+            name, target = job
+            r = subprocess.run([odin, "check", dirs[name], "-target:" + target], capture_output=True, text=True)
+            return name, target, "BUILT" in r.stdout + r.stderr
+
+        jobs = [(n, t) for n in TAG_FIXTURES for t in TAG_TARGETS]
+        odin_says = {n: set() for n in TAG_FIXTURES}
+        with ThreadPoolExecutor(4) as pool:
+            for name, target, yes in pool.map(built, jobs):
+                if yes:
+                    odin_says[name].add(target.split("_")[0])
+        failed = 0
+        for name, tags in TAG_FIXTURES.items():
+            mine = admits(name, tags + "package p\n")
+            if mine != odin_says[name]:
+                failed += 1
+                print(f"FAIL the lint takes {name} ({tags.strip() or 'no tags'!r}) to be built for {sorted(mine)}; Odin builds it for {sorted(odin_says[name])}")
+        if failed:
+            return 1
+        print(f"ok   the lint reads the build tags and names of {len(TAG_FIXTURES)} files as Odin does, for {len(TAG_TARGETS)} targets")
+        return 0
 
 
 def selftest():
@@ -631,7 +932,7 @@ def selftest():
 
 def main():
     if sys.argv[1:] == ["--selftest"]:
-        return selftest()
+        return selftest() or selftest_tags()
     root = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     found = lint(root)
     for p, line, what, issue in found:
