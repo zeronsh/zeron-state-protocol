@@ -5,10 +5,10 @@ import "core:net"
 import "core:slice"
 import "core:testing"
 
-// Where core:net lists interfaces soundly, every address it lists is among the host's, with the same broadcast. On
-// Linux it lists none, and on macOS and the BSDs it gathers them with map_entry (odin-lang/Odin#8642).
+// Where the host takes core:net's list of interfaces, and core:net lists them soundly, every address it lists is among
+// the host's, with the same broadcast. (Elsewhere, see interfaces_walked_test.odin.)
 @(private)
-also_listed_by_core :: proc(t: ^testing.T, mine: []Interface) {
+held_to_the_system :: proc(t: ^testing.T, mine: []Interface) {
 	listed, err := net.enumerate_interfaces(context.temp_allocator)
 	if !testing.expectf(t, err == nil, "core:net listed nothing: %v", err) {
 		return
