@@ -7,6 +7,7 @@ import "core:strings"
 VERSION :: 1
 OUT_HIGH :: 64 << 10 // stop producing bulk when this much is waiting
 OUT_LIVE :: 16 << 10 // drop live frames when this much is waiting
+LIVE_OWED :: 32 << 10 // of live frames a relay could not send at once, so much at most is kept for when it can
 CELLS_FRAME :: 16 << 10 // close a cells frame past this
 RECON_FRAME :: 128 << 10 // say no more than this at once; the rest is said next time
 WANT_FRAME :: 64 << 10
@@ -70,7 +71,9 @@ Session :: struct {
 	busy:      bool, // within session_input
 	stalled:   bool, // a frame in input read what storage did not yet have: see lazy.odin
 	recompare: bool, // session_recompare is owed, where storage may answer "not yet"
-	typing_due: bool, // what is being typed where it watches is to be given it, once its tasks are done and its pipe has room
+	typing_due: bool, // what is being typed where it watches is to be given it, once its pipe has room
+	live_owed:  [dynamic]byte, // of a relay, live frames as they came, whole, that its pipe had no room for when they did
+	bulk_more:  int, // within pump, what live text it just gave: so much more of the rest may be made, as though it were not
 	counts_due: bool, // changes have been sent since what lies beyond its windows was last counted
 	out:       [dynamic]byte,
 	sent:      int,
@@ -320,6 +323,7 @@ session_close :: proc(s: ^Session) {
 	delete(s.roots)
 	delete(s.input)
 	delete(s.out)
+	delete(s.live_owed)
 	delete(s.tasks)
 	delete(s.watches)
 	delete(s.unacked)
@@ -433,6 +437,31 @@ session_input :: proc(s: ^Session, bytes: []byte) -> bool {
 		lanes_take(s) // what waited on lanes for the session to be ready
 	}
 	return !s.closing
+}
+
+@(private)
+live_owed_clear :: proc(s: ^Session) {
+	clear(&s.live_owed)
+	if cap(s.live_owed) > 4096 {
+		shrink(&s.live_owed)
+	}
+}
+
+// What is owed of live text, once the pipe has room for it.
+@(private)
+live_give :: proc(s: ^Session) {
+	if len(s.out) - s.sent > OUT_LIVE {
+		return
+	}
+	if len(s.live_owed) > 0 {
+		cells_close(s)
+		append(&s.out, ..s.live_owed[:])
+		live_owed_clear(s)
+	}
+	if s.typing_due {
+		s.typing_due = false
+		typing_give(s)
+	}
 }
 
 // Bytes ready for the pipe. Producing them is when work happens: an idle or blocked pipe costs nothing.
@@ -695,6 +724,8 @@ on_roster :: proc(s: ^Session, r: ^Reader) -> Fault {
 @(private)
 session_authorize :: proc(s: ^Session) {
 	n := s.node
+	// Whatever it may read now: what a relay was keeping of live text for it was had under what it might read before.
+	live_owed_clear(s)
 	before := slice.clone(s.grants[:], context.temp_allocator)
 	if s.role != .Open {
 		// A device that does not belong has no peers, as on_roster says: neither a relay nor anyone. (One that knows no
@@ -919,7 +950,7 @@ on_watch :: proc(s: ^Session, r: ^Reader) {
 	}
 	w := Watch{id = id, lo = lo, hi = hi, data = flags.data, live = flags.live, counts = flags.counts}
 	append(&s.watches, w)
-	// What is being typed there goes once whatever this watch has the session sent goes: after this watch's tasks.
+	// What is being typed there goes once the pipe has room; of a row it has yet to be sent, again once it is (emit_row).
 	s.typing_due ||= w.live && len(n.typing) > 0
 
 	// Data interests spread outward from clients, and live ones through relays.
@@ -1068,6 +1099,9 @@ on_unwatch :: proc(s: ^Session, id: u64) {
 	for w, i in s.watches {
 		if w.id == id {
 			unordered_remove(&s.watches, i)
+			// What a relay was keeping of live text for it may have been of this watch, which is no more: it goes.
+			// What still matters of it comes once sealed. Not for a watch only now asked for, which was none.
+			live_owed_clear(s)
 			break
 		}
 	}
@@ -2175,8 +2209,26 @@ live_bind :: proc(l: ^Live) -> (b: [33]byte) {
 
 @(private)
 send_live :: proc(s: ^Session, l: ^Live, whole := false) -> bool {
-	if !whole && len(s.out) - s.sent > OUT_LIVE {
-		return false // the piece itself will follow; a slow pipe is not helped by more
+	if !whole && (len(s.out) - s.sent > OUT_LIVE || len(s.live_owed) > 0) {
+		// No room now: what the node keeps of it is given once there is, and before what else is made then. A relay keeps
+		// none of what is typed, which it cannot read: so it keeps the frame, as it came, for this peer alone, as far as
+		// it may; past that, the piece itself will follow, once sealed.
+		if s.node.keys != nil {
+			return false
+		}
+		if len(s.live_owed) + len(l.body) + 64 > LIVE_OWED {
+			live_owed_clear(s) // this, and what was kept before it, of no use without it: given up
+			return true
+		}
+		at := frame_begin(&s.live_owed, .Live)
+		write_pair(&s.live_owed, l.row)
+		write_u8(&s.live_owed, u8(l.slot))
+		write_u64(&s.live_owed, l.piece)
+		write_varint(&s.live_owed, l.offset)
+		write_stamp(&s.live_owed, l.stamp)
+		append(&s.live_owed, ..l.body)
+		frame_end(&s.live_owed, at)
+		return true
 	}
 	cells_close(s)
 	start := len(s.out)
@@ -2569,8 +2621,8 @@ typing_forget :: proc(n: ^Node, row: Id, slot: Slot, piece: u64) {
 
 // Gives a session what is being typed by others where it watches live text, or in a row it is shown, from the start of
 // each piece, whole however full its pipe: to a peer only what this node's own clients type, sealed afresh, as it would
-// have been sent had it watched all along. Only once the session has been sent everything it was owed (see pump), for a
-// reader takes no live text for a row it does not hold.
+// have been sent had it watched all along. Once the pipe has room (see live_give), whatever rows it has yet to be sent: a
+// reader takes no live text for a row it does not hold, and is given it again once it is sent the row (see emit_row).
 @(private)
 typing_give :: proc(to: ^Session) {
 	n := to.node
@@ -2792,7 +2844,7 @@ node_balance :: proc(n: ^Node) {
 // Runs what is queued, `first` first, while the pipe has room. False if a step must wait for storage.
 @(private)
 run_tasks :: proc(s: ^Session) -> bool {
-	for len(s.out) - s.sent < OUT_HIGH {
+	for len(s.out) - s.sent < OUT_HIGH + s.bulk_more {
 		go := true
 		if s.first_head < len(s.first) {
 			if !window_open(s, first = true) {
@@ -2834,14 +2886,26 @@ pump :: proc(s: ^Session) {
 		go = unit_step(s, proc(s: ^Session, _: ^Task) {session_recompare(s)})
 		s.recompare &&= !go
 	}
-	if go && (s.cursor != n.events.next || s.counts_due) {
+	// What is being typed goes first, once the pipe has room: before more is made of what is not, which would fill it
+	// again, so that live text waited for all of that. A client is given it now whatever rows it has yet to be sent: of
+	// one it does not hold yet it takes none, and is given it again once the row is sent (see emit_row).
+	given := len(s.out)
+	live_give(s)
+	// The rest may still be made as far as it would have been without it: live text overtakes it, and never takes its
+	// place, however much is given at once, nor however often.
+	s.bulk_more = max(len(s.out) - given, 0)
+	defer s.bulk_more = 0
+	// And while it waits for room, nothing more is made of the rest: what was made goes, and then it does.
+	waits := s.typing_due || len(s.live_owed) > 0
+	if go && !waits && (s.cursor != n.events.next || s.counts_due) {
 		// Bounded before what has changed is sent, so that what falls outside is not.
 		go = unit_step(s, proc(s: ^Session, _: ^Task) {bound_windows(s)})
-		go = go && flush_changes(s, OUT_HIGH, windowed = true) && unit_step(s, proc(s: ^Session, _: ^Task) {tell_counts(s)})
+		go = go && flush_changes(s, OUT_HIGH + s.bulk_more, windowed = true) && unit_step(s, proc(s: ^Session, _: ^Task) {tell_counts(s)})
 		s.counts_due &&= !go
 	}
-	go = go && run_tasks(s)
-	if go && tasks_idle(s) && len(s.reoffer) > 0 {
+	go = go && (waits || run_tasks(s))
+	live_give(s) // and what came due as it was made: as a row it is typed in went
+	if go && !waits && tasks_idle(s) && len(s.reoffer) > 0 {
 		for row in s.reoffer {
 			pending := false
 			for u in s.unacked {
@@ -2854,12 +2918,8 @@ pump :: proc(s: ^Session) {
 		clear(&s.reoffer)
 		go = run_tasks(s) // now, rather than when something else is next to say
 	}
-	// After all the rows the session was owed, and once its pipe has room for live text: what is being typed.
-	if go && s.typing_due && tasks_idle(s) && len(s.out) - s.sent <= OUT_LIVE {
-		s.typing_due = false
-		typing_give(s)
-	}
-	if go && (s.initiator || n.becoming) && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && tasks_idle(s) {
+	// Not while what has changed waits on live text, nor what is offered again: it is not yet all said.
+	if go && !waits && len(s.reoffer) == 0 && (s.initiator || n.becoming) && n.full && s.peer_full && s.settled && !s.told && len(s.roots) > 0 && tasks_idle(s) {
 		s.told = true
 		cells_close(s)
 		at := frame_begin(&s.out, .Synced)
@@ -3032,7 +3092,7 @@ run_task :: proc(s: ^Session, t: ^Task) {
 				return
 			}
 			emit_row(s, key_row(leaf.key))
-			if len(s.out) - s.sent >= OUT_HIGH {
+			if len(s.out) - s.sent >= OUT_HIGH + s.bulk_more {
 				t.lo = key_next(leaf.key)
 				return
 			}
