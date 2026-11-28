@@ -6,6 +6,7 @@ import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
+import "core:time"
 
 // The byte a test's file has at an offset, wherever it is written from.
 @(private = "file")
@@ -37,8 +38,9 @@ files_read_whole :: proc(t: ^testing.T) {
 	testing.expect(t, !missing, "a file that is not there is read")
 
 	Shared :: struct {
-		path: string,
-		done: bool, // atomic
+		path:   string,
+		done:   bool, // atomic
+		shrunk: int, // atomic: to more than nothing, while it was read
 	}
 	sh := Shared{path = path}
 	writer := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
@@ -51,13 +53,18 @@ files_read_whole :: proc(t: ^testing.T) {
 		chunk: [3001]byte
 		size := 0
 		for round := 0; !sync.atomic_load(&sh.done); round += 1 {
-			if round % 64 == 63 {
-				// And shrinks now and then: to a whole number of pages, of any size a system has (4, 16 or 64 KiB). Shrunk
-				// within a page, the system zeroes the rest of that page, and a read that took the file to be longer
-				// meanwhile may copy those zeros, before the file grows past them again: bytes it never held, which
-				// Linux allows a read beside a truncation to see. No file a host keeps is shrunk where it is read: each is
-				// replaced whole (see save). And one handed to it, as a roster to join by, is held to its signature.
-				size = size / 3 / (64 << 10) * (64 << 10)
+			if round % 128 == 127 {
+				// And shrinks now and then, to none of it, a quarter, a half or three quarters of it in turn (0, 64, 192
+				// and 384 KiB, as it grows here), each to a whole number of pages of any size a system has (4, 16 or
+				// 64 KiB). Shrunk within a page, the system zeroes the rest of that page, and a read that took the file
+				// to be longer meanwhile may copy those zeros before the file grows past them again: bytes it never
+				// held, which Linux allows a read beside a truncation to see. No file a host keeps is shrunk where it is
+				// read: each is replaced whole (see save). And one handed to it, as a roster to join by, is held to its
+				// signature.
+				size = size / 4 * (round / 128 % 4) / (64 << 10) * (64 << 10)
+				if size > 0 {
+					sync.atomic_add(&sh.shrunk, 1)
+				}
 				os.truncate(f, i64(size))
 			}
 			for &x, i in chunk {
@@ -72,7 +79,8 @@ files_read_whole :: proc(t: ^testing.T) {
 		}
 	})
 	reads, failed, wrong := 0, 0, 0
-	for reads < 2000 {
+	// Until it has been read 2000 times and shrunk to each of 64, 192 and 384 KiB meanwhile.
+	for start := time.tick_now(); (reads < 2000 || sync.atomic_load(&sh.shrunk) < 3) && time.tick_since(start) < 20 * time.Second; {
 		data, ok := read_file(path)
 		reads += 1
 		if !ok {
@@ -91,6 +99,7 @@ files_read_whole :: proc(t: ^testing.T) {
 	thread.join(writer)
 	thread.destroy(writer)
 	testing.expectf(t, failed == 0 && wrong == 0, "of %d reads while it changed, %d failed and %d were not what it held", reads, failed, wrong)
+	testing.expectf(t, sh.shrunk >= 3, "the file was shrunk to more than nothing only %d times while it was read", sh.shrunk)
 }
 
 @(private = "file", thread_local)
