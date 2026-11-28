@@ -305,21 +305,27 @@ disk_wait :: proc(h: ^Host) {
 	}
 }
 
-// Waits until nothing asked is left to do of any file at this path, let go of or not: before the file is removed, which
-// on Windows fails while a handle of it is open, and elsewhere would leave a sync of it to make of nothing.
+// Waits until nothing asked is left to do of a file let go of, and so it is closed: before the file is removed, which on
+// Windows fails while a handle of it is open, and elsewhere would leave a sync of it to make of nothing.
 @(private)
-disk_drain_path :: proc(h: ^Host, path: string) {
-	for {
-		busy := false
-		for x in h.disk.files {
-			busy ||= len(x.queue) > 0 && os.name(x.file) == path
-		}
-		if !busy {
-			return
-		}
+disk_drain_closing :: proc(h: ^Host, f: ^os.File) {
+	for disk_known(h, f) {
 		disk_wait(h)
 		disk_advance(h)
 	}
+}
+
+// Whether the host's thread has anything still to do of a file, let go of or not.
+@(private)
+disk_known :: proc(h: ^Host, f: ^os.File) -> bool {
+	if h != nil {
+		for x in h.disk.files {
+			if x.file == f {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Whether anything is still to be done of a file.

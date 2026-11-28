@@ -43,7 +43,7 @@ power: Power // each test's own, as tests run beside each other
 @(private = "file")
 power_note :: proc(h: ^Host, f: ^os.File, at: i64, bytes: []byte, truncated: bool) {
 	if !power.dead {
-		append(&power.noted, Noted{strings.clone(os.name(f)), at, slice.clone(bytes), truncated, truncated})
+		append(&power.noted, Noted{strings.clone(filepath.base(os.name(f))), at, slice.clone(bytes), truncated, truncated})
 	}
 }
 
@@ -60,7 +60,7 @@ power_do :: proc(h: ^Host, i: int) {
 	power.twice += int(op.file.closing && !power.dead) // let go of before its fsync was made
 	disk_do(op)
 	if !power.dead && op.ok {
-		power_durable(os.name(op.file.file))
+		power_durable(filepath.base(os.name(op.file.file)))
 	}
 	disk_done(h, op)
 }
@@ -76,7 +76,7 @@ power_hooks :: proc(h: ^Host) {
 	h.disk.noted = power_note
 	h.disk.synced = proc(h: ^Host, f: ^os.File) {
 		if !power.dead {
-			power_durable(os.name(f))
+			power_durable(filepath.base(os.name(f)))
 		}
 	}
 }
@@ -100,13 +100,13 @@ power_image :: proc(dir, into: string) {
 	}
 	files, _ := os.read_all_directory_by_path(dir, context.temp_allocator)
 	for f in files {
-		if f.type != .Directory && f.fullpath not_in noted {
+		if f.type != .Directory && f.name not_in noted {
 			data, _ := os.read_entire_file(f.fullpath, context.temp_allocator)
 			_ = os.write_entire_file(file_in(into, f.name), data)
 		}
 	}
 	for path in noted {
-		if !os.exists(path) {
+		if !os.exists(file_in(dir, path)) {
 			continue // dropped, which is taken as durable at once
 		}
 		image: [dynamic]byte
@@ -133,12 +133,12 @@ power_image :: proc(dir, into: string) {
 			}
 			copy(image[w.at:], w.bytes[:n])
 		}
-		_ = os.write_entire_file(file_in(into, filepath.base(path)), image[:])
+		_ = os.write_entire_file(file_in(into, path), image[:])
 	}
 }
 
 // The process killed: every file as it is, in the system's keeping, in a directory of its own, and what was noted of
-// them noted of their copies. What was not yet made of the fsyncs given never will be.
+// them noted of their copies, which have their names. What was not yet made of the fsyncs given never will be.
 @(private = "file")
 power_kill :: proc(dir, into: string) {
 	os.make_directory_all(into)
@@ -147,13 +147,6 @@ power_kill :: proc(dir, into: string) {
 		if f.type != .Directory {
 			data, _ := os.read_entire_file(f.fullpath, context.temp_allocator)
 			_ = os.write_entire_file(file_in(into, f.name), data)
-		}
-	}
-	for &w in power.noted {
-		if strings.has_prefix(w.path, dir) {
-			moved := strings.concatenate({into, w.path[len(dir):]})
-			delete(w.path)
-			w.path = moved
 		}
 	}
 }
@@ -390,7 +383,7 @@ a_segment_is_dropped_after_what_is_asked_of_it :: proc(t: ^testing.T) {
 	h.disk.waiting = proc(h: ^Host) {
 		for len(power.given) > 0 {
 			op := power.given[0]
-			gone_first ||= !os.exists(os.name(op.file.file))
+			gone_first ||= !os.exists(os.name(op.file.file)) // the system's own name for it, whatever it was opened by
 			unordered_remove(&power.given, 0)
 			disk_do(op)
 			disk_done(h, op)
