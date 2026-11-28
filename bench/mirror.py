@@ -178,6 +178,7 @@ def luau_cli(rows, case, data, count, mode, quiet_mb):
     if not luau:
         return None
     build = os.path.join(ROOT, "build")
+    os.makedirs(build, exist_ok=True)
     script, module = os.path.join(build, "mirror-cli.luau"), os.path.join(build, "mirror-cli-data.luau")
     s = open(os.path.join(ROOT, "luau/tests/mirror_bench.luau")).read()
     for a, b in [('require("../zsp/codec")', 'require("../luau/zsp/codec")'), ('require("../zsp")', 'require("../luau/zsp")'),
