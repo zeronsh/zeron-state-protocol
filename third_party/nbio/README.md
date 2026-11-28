@@ -87,10 +87,13 @@ shows only the changes above, the lines atop `doc.odin` that say this is a copy,
 release installed.
 
 `./x check` fails on any use, anywhere here, of what #8642 breaks, or of what of core uses it (`tests/odin_lint.py`
-says what), `core:nbio` among them; `./x selftest` shows that it finds each, however written.
+says what), `core:nbio` among them; and on core:os's open with `.Trunc` but not `.Create` in a file built for Windows,
+which always fails there ([odin-lang/Odin#8646](https://github.com/odin-lang/Odin/issues/8646); this copy's own open,
+by `NtCreateFile`, truncates so as asked). `./x selftest` shows that it finds each, however written.
 
 ## Whether upstream has fixed them
 
 `.github/workflows/upstream.yml` runs a repro of each issue (`tests/upstream`) each night, with the release and with the
-newest nightly: #8642 on Linux and macOS, #8644 and #8645 on Windows. That they are still broken is no failure; one
-fixed upstream is said in the run's summary, as **FIXED UPSTREAM**. Once a release has all three, the copy can go.
+newest nightly: #8642 on Linux and macOS, #8644, #8645 and #8646 on Windows. That they are still broken is no failure; one
+fixed upstream is said in the run's summary, as **FIXED UPSTREAM**. Once a release has #8642, #8644 and #8645, the
+copy can go; once one has #8646, host/files_test.odin may open with `.Trunc` again.

@@ -15,7 +15,7 @@ set -u
 issue=$1
 toolchain=$2
 cd "$(dirname "$0")"
-version=$(odin version 2>&1 | head -n 1)
+version=$(odin version 2>&1 | head -n 1 | sed 's/.* version //') # as dev-2026-11:e28f5d1
 EXE=
 [ "${OS:-}" = Windows_NT ] && EXE=.exe
 dir=$(mktemp -d)
