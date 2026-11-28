@@ -1,6 +1,7 @@
 package zsp
 
 import "base:runtime"
+import "core:log"
 import "core:slice"
 import "core:strings"
 
@@ -2047,6 +2048,7 @@ live_bind :: proc(l: ^Live) -> (b: [33]byte) {
 @(private)
 send_live :: proc(s: ^Session, l: ^Live, whole := false) -> bool {
 	if !whole && len(s.out) - s.sent > OUT_LIVE {
+		log.debugf("LIVEDROP session %d role %v out %d tasks %d", s.id, s.role, len(s.out) - s.sent, len(s.tasks) - s.task_head)
 		return false // the piece itself will follow; a slow pipe is not helped by more
 	}
 	cells_close(s)

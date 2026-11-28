@@ -333,12 +333,16 @@ async function questions(a: Client, b: Client): Promise<void> {
   const editor = a.text(typed, Track.words);
   editor.append(" ju"); // before it is here
   await eventually("what is being edited is had", () => editor.read() === "The quick brown foxes ju");
+  const tJu = performance.now();
   await sleep(100);
   let live: boolean | undefined;
-  answered = () => live === undefined && best.rows.some((row) => row.id === typed && row.words === "The quick brown foxes jump") && (live = isLive(b, typed, Track.words.slot));
+  let tSeen = 0;
+  answered = () => live === undefined && best.rows.some((row) => row.id === typed && row.words === "The quick brown foxes jump") && ((tSeen = performance.now()), (live = isLive(b, typed, Track.words.slot)));
+  const tMp = performance.now();
   editor.append("mp");
   await eventually("live text shows in an answer", () => live !== undefined);
   answered = undefined;
+  console.log(`TYPEDIAG live ${live} piece ${(tSeen - tJu).toFixed(0)} ms, after mp ${(tSeen - tMp).toFixed(0)} ms, mp at ${(tMp - tJu).toFixed(0)} ms`);
   check(live, "as it is typed, not once it is sealed");
   const other = b.text(typed, Track.words);
   other.append("!");
