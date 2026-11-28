@@ -1253,7 +1253,7 @@ add_pending :: proc(op: ^Operation, filter: kq.Filter, ident: uintptr) {
 
 	// ZSP: looked up, then assigned, rather than `map_entry`: the runtime's `__dynamic_map_entry` (dev-2026-11) can
 	// give back the slot of another key when its insertion shifts entries round a map with no empty slot, and what is
-	// written through it then lands on that key, leaving this one nil. odin-lang/Odin#8642; third_party/nbio/README.md.
+	// written through it then lands on that key, leaving this one nil. odin-lang/Odin#8642; nbio/PATCHES.md.
 	key := Queue_Identifier{ ident = ident, filter = filter }
 	head, found := op.l.submitted[key]
 	if !found {

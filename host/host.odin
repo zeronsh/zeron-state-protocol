@@ -9,7 +9,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import "../pipe"
-import "../third_party/nbio"
+import "../nbio"
 import "../zsp"
 
 // One thread, one event loop, no polling: between events the process is asleep in the kernel, and the

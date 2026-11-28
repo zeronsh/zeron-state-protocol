@@ -102,7 +102,7 @@ main :: proc() {
 	apps, read := apps_read(strings.concatenate({dir, "/apps"}))
 	name, err := os.read_entire_file(strings.concatenate({dir, "/space"}), context.allocator)
 	space: zsp.Key32
-	if bytes, hexed := hex.decode(transmute([]byte)strings.trim_space(string(name))); !read || err != nil || !hexed || copy(space[:], bytes) != 32 {
+	if bytes, hexed := zsp.hex_decode(transmute([]byte)strings.trim_space(string(name))); !read || err != nil || !hexed || copy(space[:], bytes) != 32 {
 		os.write_string(os.stderr, "there must be a space here, made or joined with zspd, and a file that says what applications there are\n")
 		os.exit(1)
 	}

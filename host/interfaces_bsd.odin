@@ -5,7 +5,7 @@ import "core:net"
 import "core:sys/posix"
 
 // Here core:net (dev-2026-11) gathers interfaces into a map with the runtime's map_entry, which can give back another
-// key's slot (see third_party/nbio/README.md): so they are walked here, as on Linux, and each address taken as it
+// key's slot (see nbio/PATCHES.md): so they are walked here, as on Linux, and each address taken as it
 // comes. What is taken is what core:net gave: every address of every interface, and an IPv4 one's broadcast address.
 
 when ODIN_OS == .Darwin {

@@ -111,7 +111,7 @@ test)
 	rm -f build/failed
 	pids=
 	for p in zsp pipe find host zspd; do
-		# Host tests each run whole hosts, each with an event loop of its own. On Windows nbio (third_party/nbio) has
+		# Host tests each run whole hosts, each with an event loop of its own. On Windows our event loop (nbio/) has
 		# those loops share one completion port, and hands what one finds of another's to it, which may have let that go
 		# meanwhile: so there they run one at a time, as zspd's one loop always does.
 		one=

@@ -8,7 +8,7 @@ import "core:path/filepath"
 import "core:strings"
 import "core:testing"
 import "core:time"
-import "../third_party/nbio"
+import "../nbio"
 import "../zsp"
 
 // A relay and two devices, A and B, in one process and on one event loop, over loopback: the whole of the host,

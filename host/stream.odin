@@ -1,6 +1,5 @@
 package host
 
-import "core:encoding/hex"
 import "core:fmt"
 import "core:net"
 import "core:strings"
@@ -8,7 +7,7 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 import "../pipe"
-import "../third_party/nbio"
+import "../nbio"
 import "../zsp"
 
 // A session over a WebSocket over TCP, with TLS beneath when dialled so and a Noise channel within
@@ -301,7 +300,7 @@ stream_greeted :: proc(s: ^Stream, head: ^pipe.Http) -> bool {
 		return false
 	}
 	if len(path) == 65 {
-		bytes := hex.decode(transmute([]byte)path[1:], context.temp_allocator) or_return
+		bytes := zsp.hex_decode(transmute([]byte)path[1:], context.temp_allocator) or_return
 		copy(s.id[:], bytes)
 		for x in h.spaces {
 			if x.node.space == s.id {

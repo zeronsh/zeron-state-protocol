@@ -1,8 +1,13 @@
 name: upstream
-# The Odin bugs third_party/nbio works round, each reproduced (tests/upstream) against the release CI builds with and
-# against the newest nightly, each night. Still broken is no failure, and fixed upstream is said plainly in the run's
-# summary; a repro that no longer shows its bug on the release, or that fails any other way, fails the run.
-# tests/upstream/run.sh says what each is expected to say.
+# Each night, two things of the Odin we build with, against the release we pin (dev-2026-11, as test.yml) as the
+# control, the newest Odin release and the newest nightly:
+# - suite: ./x check and ./x test, on all three platforms, built with each. A failure with the release or the nightly
+#   is ours to deal with before we move the pin to it (docs/odin.md), and fails the run loudly.
+# - repros: each of tests/upstream, of what upstream gets wrong that we work round (nbio/PATCHES.md), on the platforms
+#   it means something on. Against stock with the pinned release it must still say BROKEN (the control: else the repro
+#   shows nothing any more), and against our nbio FIXED (else our fix is broken): either failing fails the run.
+#   Against stock with the nightly it is information only, never red: "FIXED UPSTREAM" says what we may simplify.
+# What each said is in the run's summary. tests/upstream/run.sh says what each repro is held to.
 on:
   schedule:
     - cron: "41 4 * * *"
@@ -11,68 +16,106 @@ on:
       - ".github/workflows/upstream.yml"
       - "tests/upstream/**"
 jobs:
-  repro:
-    name: "odin-lang/Odin#${{ matrix.issue }} ${{ matrix.os }} ${{ matrix.odin }}"
+  repros:
+    name: "repros, ${{ matrix.os }}"
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { issue: "8642", os: ubuntu-latest, odin: pinned }
-          - { issue: "8642", os: ubuntu-latest, odin: latest }
-          - { issue: "8642", os: macos-latest, odin: pinned }
-          - { issue: "8642", os: macos-latest, odin: latest }
-          - { issue: "8644", os: windows-latest, odin: pinned }
-          - { issue: "8644", os: windows-latest, odin: latest }
-          # It takes every ephemeral port of the machine it is on: a runner of its own.
-          - { issue: "8645", os: windows-latest, odin: pinned }
-          - { issue: "8645", os: windows-latest, odin: latest }
-          - { issue: "8646", os: windows-latest, odin: pinned }
-          - { issue: "8646", os: windows-latest, odin: latest }
-          - { issue: "8647", os: windows-latest, odin: pinned }
-          - { issue: "8647", os: windows-latest, odin: latest }
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-      - if: matrix.odin == 'pinned'
-        uses: laytan/setup-odin@v2
+      - uses: laytan/setup-odin@v2
         with:
           release: dev-2026-11 # as test.yml
         env:
           GIT_LFS_SKIP_SMUDGE: "1"
-      - if: matrix.odin == 'latest'
+      - name: repros
+        run: |
+          latest=$(tests/upstream/nightly.sh ~/odin-nightly)
+          case "$RUNNER_OS" in
+            Linux) here=linux ;;
+            macOS) here=darwin ;;
+            Windows) here=windows ;;
+          esac
+          echo "### Repros on $RUNNER_OS" >>"$GITHUB_STEP_SUMMARY"
+          failed=
+          # odin_8645 last: it takes every ephemeral port of the machine while it runs.
+          for d in $(ls tests/upstream | grep -v '^odin_8645$') odin_8645; do
+            [ -f "tests/upstream/$d/main.odin" ] || continue
+            grep -Eq "^// Platform:(.*[ ,])? *$here *(,|$)" "tests/upstream/$d/main.odin" || continue
+            echo "::group::$d"
+            tests/upstream/run.sh "$d" pinned || failed="$failed $d:pinned"
+            tests/upstream/run.sh "$d" ours || failed="$failed $d:ours"
+            ODIN="$latest" tests/upstream/run.sh "$d" latest
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "failed:$failed"
+            exit 1
+          fi
+  suite:
+    name: "suite, ${{ matrix.os }}, ${{ matrix.odin }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        odin: [pinned, release, nightly]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - if: matrix.odin != 'nightly'
+        uses: laytan/setup-odin@v2
+        with:
+          release: ${{ matrix.odin == 'pinned' && 'dev-2026-11' || 'latest' }}
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+      - if: matrix.odin == 'nightly'
         name: newest nightly
         run: |
-          case "$RUNNER_OS" in
-            Linux) want=linux-amd64 ;;
-            macOS) want=macos-arm64 ;;
-            Windows) want=windows-amd64 ;;
-          esac
-          python=python3
-          command -v python3 >/dev/null || python=python
-          curl -fsSLo nightly.json https://f001.backblazeb2.com/file/odin-binaries/nightly.json
-          # The newest night that has this platform's: a night's may be missing one, as it is built.
-          url=$($python -c 'import json, sys
-          files = json.load(open("nightly.json"))["files"]
-          for day in sorted(files, reverse=True):
-              for f in files[day]:
-                  if "-" + sys.argv[1] + "-" in f["name"]:
-                      print(f["url"])
-                      sys.exit(0)
-          sys.exit("no nightly for " + sys.argv[1])' "$want")
-          echo "$url"
-          mkdir -p ~/odin-nightly && cd ~/odin-nightly
-          case "$url" in
-            *.zip) curl -fsSLo odin.zip "$url" && unzip -qo odin.zip ;;
-            *) curl -fsSLo odin.tar.gz "$url" && tar xzf odin.tar.gz ;;
-          esac
-          odin=$(find "$PWD" -type f \( -name odin -o -name odin.exe \) | head -n 1)
-          [ -n "$odin" ] || { echo "no odin in $url"; exit 1; }
-          chmod +x "$odin"
+          odin=$(tests/upstream/nightly.sh ~/odin-nightly)
           bin=$(dirname "$odin")
           [ "$RUNNER_OS" = Windows ] && bin=$(cygpath -w "$bin")
           echo "$bin" >>"$GITHUB_PATH"
-      - run: tests/upstream/run.sh ${{ matrix.issue }} ${{ matrix.odin }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: tools
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get install -y -q lld; lune=linux-x86_64; luau=ubuntu ;;
+            macOS) brew install -q lld; lune=macos-aarch64; luau=macos ;;
+            Windows) lune=windows-x86_64; luau=windows ;;
+          esac
+          mkdir -p ~/tools && cd ~/tools
+          curl -fsSLo lune.zip https://github.com/lune-org/lune/releases/download/v0.11.1/lune-0.11.1-$lune.zip
+          unzip -qo lune.zip
+          curl -fsSLo luau.zip https://github.com/luau-lang/luau/releases/download/0.748/luau-$luau.zip
+          unzip -qo luau.zip
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+      - name: toolchain
+        run: |
+          version=$(odin version | sed 's/.* version //')
+          echo "toolchain: ${{ matrix.odin }}, $version"
+          echo "- suite on $RUNNER_OS with ${{ matrix.odin }} ($version)" >>"$GITHUB_STEP_SUMMARY"
+      - run: ./x check
+      - run: ./x test
+      - if: runner.os == 'Linux'
+        run: ./x selftest
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ runner.os }}-${{ matrix.odin }}
+          path: build/*.log
+          retention-days: 14

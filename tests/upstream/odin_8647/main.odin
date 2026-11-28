@@ -1,4 +1,6 @@
 // Reproduces odin-lang/Odin#8647: on Windows, core:nbio's wait of under a millisecond is no wait; the loop spins.
+// Platform: windows
+// Ours: FIXED
 //
 // __tick gives GetQueuedCompletionStatusEx the wait as DWORD(d / time.Millisecond), truncated (impl_windows.odin,
 // compute_timeout): a wait of under a millisecond, asked of a tick or to a timeout due that soon, is a poll, and the
@@ -10,8 +12,8 @@
 // Anything else (a timeout that never came, a crash) is the repro's own failure. Meaningful on Windows; elsewhere the
 // loop waits in nanoseconds, and it says FIXED.
 //
-// Run by .github/workflows/upstream.yml, not by ./x test; tests/upstream/run.sh runs it. The copy third_party/nbio is
-// dropped once a release has this fixed, with odin-lang/Odin#8642, #8644 and #8645.
+// Run by .github/workflows/upstream.yml, not by ./x test, through tests/upstream/run.sh, against stock core:nbio
+// and against ours.
 package odin_8647
 
 import "core:fmt"

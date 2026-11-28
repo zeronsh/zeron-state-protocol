@@ -1,4 +1,6 @@
 // Reproduces odin-lang/Odin#8644: on Windows, core:nbio's read or write of a connection its peer reset never ends.
+// Platform: windows
+// Ours: FIXED
 //
 // WSARecv and WSASend fail as they are made on such a connection, and leave the OVERLAPPED's Internal at
 // STATUS_PENDING; no completion is ever queued for them. core:nbio took that for a call under way, and waited for ever.
@@ -11,8 +13,8 @@
 // does for anything else that is the repro's own failure (a connection that could not be made, a crash). Meaningful on
 // Windows, where it is run; elsewhere both end.
 //
-// Run by .github/workflows/upstream.yml, not by ./x test; tests/upstream/run.sh runs it. The copy third_party/nbio is
-// dropped once a release has this fixed, with odin-lang/Odin#8642, #8645 and #8647.
+// Run by .github/workflows/upstream.yml, not by ./x test, through tests/upstream/run.sh, against stock core:nbio
+// and against ours.
 package odin_8644
 
 import "core:fmt"

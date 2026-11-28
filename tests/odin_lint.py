@@ -10,7 +10,7 @@ itself is sound (`m[k] = v`, or `map_insert` with its pointer let go of), as is 
   result assigned to `_`; and neither may be named but to call it, as `alias :: map_insert` would hide it;
 - what of core uses them: `core:strings`'s `Intern` and `intern_*`; `core:os` in a file built for WASI (its environment
   is kept with `map_entry`); `core:net`'s `enumerate_interfaces` in a file built for macOS, OpenBSD or NetBSD;
-  `core:nbio` (third_party/nbio is the copy to use, until #8642, #8644, #8645 and #8647 are fixed in a release);
+  `core:nbio` (nbio/ is ours, with what it fixes of it: see nbio/PATCHES.md);
   `core:text/i18n` (it interns); `core:container/topological_sort` (it keeps `map_insert`'s pointer).
 
 #8646. On Windows, core:os opens a file with `.Trunc` but not `.Create` asking TRUNCATE_EXISTING with FILE_GENERIC_WRITE,
@@ -25,7 +25,7 @@ split as Odin splits them. Each import is followed by the name it is given. A fi
 builds it, by its name and its `#+build` lines (./x selftest holds that to Odin itself, target by target);
 a package as built for WASI if a command here builds it so (`-target:wasi_...` in ./x or a workflow), with what it
 imports from here. The one exception is the repros in tests/upstream, there to use what is broken: each file there that
-says at its head which of the issues it reproduces ("Reproduces odin-lang/Odin#...").
+says at its head what it reproduces ("// Reproduces ...").
 
     python3 tests/odin_lint.py [root]   says each use, and fails if there is any
     python3 tests/odin_lint.py --selftest   that it finds each use put in its fixtures, however written, and no other
@@ -51,7 +51,7 @@ TARGETS = [
 OS_ARCHES = sorted({tuple(t.split("_")[:2]) for t in TARGETS})
 BSDS = {"darwin", "openbsd", "netbsd"}  # core:net's enumerate_interfaces gathers with map_entry on these
 BANNED_IMPORTS = {
-    "core:nbio": "core:nbio: import third_party/nbio, the copy fixed of it, until #8642, #8644, #8645 and #8647 are fixed in a release",
+    "core:nbio": "core:nbio: import nbio/, ours, which fixes what nbio/PATCHES.md lists of it",
     "core:text/i18n": "core:text/i18n interns its strings with strings.Intern, which uses map_entry",
     "core:container/topological_sort": "core:container/topological_sort writes through map_insert's pointer",
 }
@@ -580,7 +580,7 @@ def is_repro(rel, src):
     """Whether a file is one of the repros of what is broken, which must use it: in tests/upstream, and saying so in its
     first line."""
     parts = rel.replace(os.sep, "/").split("/")
-    return parts[:2] == ["tests", "upstream"] and re.match(r"// Reproduces odin-lang/Odin#\d+", src) is not None
+    return parts[:2] == ["tests", "upstream"] and re.match(r"// Reproduces \S", src) is not None
 
 
 def lint(root):
@@ -826,7 +826,7 @@ import "core:os"
 w :: proc(p: string) { _, _ = os.open(p, {.Write, .Trunc}) }
 """,
     "b/trunc_no_os.odin": """package b
-import nbio "../third_party/nbio"
+import nbio "../nbio"
 x :: proc(p: string) { nbio.open(p, nil, {.Write, .Trunc}) }
 """,
     "node_modules/x/y.odin": """package y

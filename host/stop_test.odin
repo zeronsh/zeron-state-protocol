@@ -9,7 +9,7 @@ import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
-import "../third_party/nbio"
+import "../nbio"
 import "../zsp"
 
 @(private = "file")

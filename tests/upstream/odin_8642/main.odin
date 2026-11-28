@@ -1,4 +1,5 @@
 // Reproduces odin-lang/Odin#8642: the runtime's map_entry can give back the slot of another key.
+// Platform: linux, darwin
 //
 // Keys put into and taken out of a small map, at random from a few, with map_entry, and the value written through the
 // pointer it gives back, as core:nbio's kqueue loop does, with keys of the same shape: a map so churned comes to have
@@ -11,8 +12,8 @@
 // wrong within a second in every run (30 of 30, within the first 12 of 23 sizes). Anything else (a crash, another
 // exit) is the repro's own failure.
 //
-// Run by .github/workflows/upstream.yml, not by ./x test; tests/upstream/run.sh runs it. The copy third_party/nbio is
-// dropped once a release has this fixed, with odin-lang/Odin#8644, #8645 and #8647.
+// Run by .github/workflows/upstream.yml, not by ./x test, through tests/upstream/run.sh, against stock Odin: what
+// it says is information (nbio/PATCHES.md says what we may simplify once a release we pin has it fixed).
 package odin_8642
 
 import "core:fmt"

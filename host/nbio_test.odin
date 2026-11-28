@@ -7,7 +7,7 @@ import "core:os"
 import "core:slice"
 import "core:testing"
 import "core:time"
-import "../third_party/nbio"
+import "../nbio"
 
 // Where the loop is kqueue's (macOS, the BSDs) it keeps what it has asked the system for in a map, by what each waits
 // on: a socket and which way. Here a few sockets at a time are waited on, of many, and one of them heard at a time,
@@ -438,6 +438,78 @@ loop_lets_go_of_what_a_removed_accept_took :: proc(t: ^testing.T) {
 	b: [8]byte
 	n, rerr := net.recv_tcp(peer, b[:])
 	testing.expectf(t, (rerr == nil && n == 0) || (rerr != nil && rerr != .Timeout && rerr != .Would_Block), "the peer's connection was left open: read %d bytes, %v", n, rerr)
+}
+
+// A read and a write waiting on one socket, the read removed: the write goes on, and ends with all it was given, as a
+// forwarder's does when it stops reading one way. The loop cancels only the read's own I/O, on every platform. On
+// Windows, cancelling one read cancels the socket's other reads waiting too, as Winsock does it, but not its writes
+// (seen with WSARecv and WSASend alone). Were the loop to cancel all of a socket's I/O rather than the read's own
+// (CancelIoEx with no OVERLAPPED), the write would end with an error there.
+@(test)
+loop_keeps_a_write_when_a_read_of_its_socket_is_removed :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	defer settle(t)
+	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, err == nil)
+	defer net.close(listener)
+	at, _ := net.bound_endpoint(listener)
+	peer, derr := net.dial_tcp(at)
+	testing.expect(t, derr == nil)
+	defer net.close(peer)
+	socket, _, aerr := net.accept_tcp(listener)
+	testing.expect(t, aerr == nil)
+	defer net.close(socket)
+	// Little room of its own to send from, so that a write waits on the peer reading.
+	testing.expectf(t, set_send_buffer(socket, LEAST_SEND_BUFFER), "the system refused a send buffer of %d", LEAST_SEND_BUFFER)
+	testing.expect(t, nbio.associate_socket(socket) == nil)
+
+	read_called := false
+	rbuf: [16]byte
+	reading := nbio.recv_poly(socket, {rbuf[:]}, &read_called, proc(_: ^nbio.Operation, called: ^bool) {
+		called^ = true
+	})
+	Write :: struct {
+		done:  bool,
+		err:   bool,
+		sent:  int,
+	}
+	w: Write
+	SIZE :: 2 << 20
+	data := make([]byte, SIZE)
+	defer delete(data)
+	for &b, i in data {
+		b = byte(i * 7)
+	}
+	nbio.send_poly(socket, {data}, &w, proc(op: ^nbio.Operation, w: ^Write) {
+		w^ = {true, op.send.err != nil, op.send.sent}
+	}, all = true)
+	// Both waiting, the write on the peer, who reads nothing yet: as much as it takes, the rest still being written.
+	for _ in 0 ..< 5 {
+		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
+	}
+	testing.expectf(t, !w.done, "the write ended before the peer read anything: error %v, %d bytes", w.err, w.sent)
+	nbio.remove(reading)
+	testing.expect(t, nbio.tick(0) == nil)
+
+	// The peer reads it all, as the loop goes on.
+	testing.expect(t, net.set_blocking(peer, false) == nil)
+	got := make([]byte, SIZE)
+	defer delete(got)
+	n := 0
+	start := time.tick_now()
+	for (n < SIZE || !w.done) && time.tick_since(start) < 20 * time.Second {
+		if n < SIZE {
+			k, rerr := net.recv_tcp(peer, got[n:])
+			if rerr == nil {
+				n += k
+			}
+		}
+		testing.expect(t, nbio.tick(0) == nil)
+	}
+	testing.expect(t, !read_called, "a removed read called back")
+	testing.expectf(t, w.done && !w.err && w.sent == SIZE, "the write ended %v, with an error %v, %d of %d bytes", w.done, w.err, w.sent, SIZE)
+	testing.expectf(t, n == SIZE && slice.equal(got[:n], data), "the peer read %d of %d bytes, as they were: %v", n, SIZE, slice.equal(got[:n], data[:n]))
 }
 
 // A read of all, removed when it has read part of what it wants but before the loop has heard so: it is done, and reads

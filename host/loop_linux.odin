@@ -2,7 +2,7 @@
 package host
 
 import "core:container/queue"
-import "../third_party/nbio"
+import "../nbio"
 
 // Whether the event loop holds operations back: some it could not give the system yet (io_uring's ring was full),
 // and some done already, whose callbacks wait for the next tick. A tick that waits gives the first only once it has

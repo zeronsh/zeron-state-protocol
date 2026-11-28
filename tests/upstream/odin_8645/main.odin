@@ -1,4 +1,6 @@
 // Reproduces odin-lang/Odin#8645: on Windows, core:nbio's dial whose bind fails closes its socket twice.
+// Platform: windows
+// Ours: FIXED
 //
 // dial_exec closes the socket when bind fails, and dial_callback closes it again: by then the handle may have been
 // given to a socket made meanwhile, which the second close takes from its owner. bind(0.0.0.0:0) fails once the
@@ -9,8 +11,7 @@
 // its owner, or "FIXED: ..." if none of 20 was. Anything else (ports that could not all be taken, a dial that did not
 // fail, a crash) is the repro's own failure. Meaningful on Windows only.
 //
-// Run by .github/workflows/upstream.yml; tests/upstream/run.sh runs it. The copy third_party/nbio is dropped once a
-// release has this fixed, with odin-lang/Odin#8642, #8644 and #8647.
+// Run by .github/workflows/upstream.yml, through tests/upstream/run.sh, against stock core:nbio and against ours.
 package odin_8645
 
 import "core:fmt"
