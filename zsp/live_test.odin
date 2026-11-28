@@ -691,7 +691,15 @@ live_text_never_starves_the_rest :: proc(t: ^testing.T) {
 	}
 	full, peer := s.links[0].a, s.links[0].b // the writer's node toward the reader's, and the reader's
 	began := full.cursor
+	// At 100 KB/s, 40 ms round trips: a window of the least it may be, which live text alone would fill. What the
+	// reader's node says comes back a round trip after what it was said of went.
+	back: [dynamic]byte
+	defer delete(back)
 	for _ in 0 ..< 200 {
+		w.node.now += 40
+		r.node.now += 40
+		testing.expect(t, session_input(full, back[:]))
+		clear(&back)
 		if !full.typing_due && len(full.out) - full.sent > OUT_LIVE {
 			full.typing_due = true // a key pressed, and dropped for want of room
 		}
@@ -699,10 +707,11 @@ live_text_never_starves_the_rest :: proc(t: ^testing.T) {
 		n := min(len(out), 4096)
 		testing.expect(t, session_input(peer, out[:n]))
 		session_sent(full, n)
-		back := session_output(peer) // and what the reader's node says of it, as it would: what it took
-		testing.expect(t, session_input(full, back))
-		session_sent(peer, len(back))
+		said := session_output(peer) // what it took
+		append(&back, ..said)
+		session_sent(peer, len(said))
 	}
+	testing.expectf(t, full.window.size > 0 && full.window.size <= WINDOW_START, "the window was not reckoned for a slow way: %d", full.window.size)
 	testing.expectf(t, full.cursor > began, "nothing more was made of the rest: %d of %d changes said", full.cursor - began, w.node.store.events.next - began)
 	free_all(context.temp_allocator)
 }

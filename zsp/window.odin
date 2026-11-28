@@ -77,7 +77,8 @@ window_open :: proc(s: ^Session, first := false) -> bool {
 		return true
 	}
 	size := s.window.size if s.window.size > 0 else WINDOW_START
-	return window_in_flight(s) < size + (WINDOW_HEADROOM if first else 0)
+	// And as far beyond it as live text given this turn: it overtakes the rest, and never takes its place (see pump).
+	return window_in_flight(s) < size + (WINDOW_HEADROOM if first else 0) + u64(s.bulk_more)
 }
 
 // The host took bytes: a round trip is timed now and then, of the first byte taken now that the peer counts. (Not of

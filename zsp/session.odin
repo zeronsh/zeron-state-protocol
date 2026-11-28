@@ -2893,7 +2893,7 @@ pump :: proc(s: ^Session) {
 	live_give(s)
 	// The rest may still be made as far as it would have been without it: live text overtakes it, and never takes its
 	// place, however much is given at once, nor however often.
-	s.bulk_more = len(s.out) - given
+	s.bulk_more = max(len(s.out) - given, 0)
 	defer s.bulk_more = 0
 	// And while it waits for room, nothing more is made of the rest: what was made goes, and then it does.
 	waits := s.typing_due || len(s.live_owed) > 0
