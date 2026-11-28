@@ -54,10 +54,15 @@ jobs:
           python=python3
           command -v python3 >/dev/null || python=python
           curl -fsSLo nightly.json https://f001.backblazeb2.com/file/odin-binaries/nightly.json
+          # The newest night that has this platform's: a night's may be missing one, as it is built.
           url=$($python -c 'import json, sys
           files = json.load(open("nightly.json"))["files"]
-          day = max(files)
-          print(next(f["url"] for f in files[day] if "-" + sys.argv[1] + "-" in f["name"]))' "$want")
+          for day in sorted(files, reverse=True):
+              for f in files[day]:
+                  if "-" + sys.argv[1] + "-" in f["name"]:
+                      print(f["url"])
+                      sys.exit(0)
+          sys.exit("no nightly for " + sys.argv[1])' "$want")
           echo "$url"
           mkdir -p ~/odin-nightly && cd ~/odin-nightly
           case "$url" in
