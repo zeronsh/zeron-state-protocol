@@ -814,8 +814,9 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
 }
 
 // While the way to the relay is full, what a link it carries would send waits in the link, unsent: not handed on to be
-// dropped, which the link would take for the path's congestion and send again. A burst sent while the WebSocket says it
-// is full costs no more on the wire than one sent while it is not.
+// dropped, which the link would take for the path's congestion and send again. Not one packet of a burst sent while the
+// WebSocket says it is full is dropped by the node. (What either burst costs on the wire is no measure of that: a link
+// whose acknowledgements are late, as a busy machine's are, may send a packet again, with or without anything held.)
 {
   const { spawn } = await import("node:child_process");
   const relay = spawn(BIN, ["serve", join(TMP, "full-relay"), "--listen=127.0.0.1:0", "--no-udp"], { stdio: ["ignore", "pipe", "ignore"] });
@@ -854,7 +855,13 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
         this.#ws.close();
       }
     }
-    const a = await Node.open({ volume: new MemoryVolume(), module, log: () => {}, WebSocket: Counted as unknown as typeof WebSocket });
+    let dropped = 0;
+    const a = await Node.open({
+      volume: new MemoryVolume(),
+      module,
+      log: (_level, text) => void (text.includes("a link's packet was dropped") && dropped++),
+      WebSocket: Counted as unknown as typeof WebSocket,
+    });
     const b = await Node.open({ volume: new MemoryVolume(), module, log: () => {} });
     const space = a.create();
     a.relay(key, `ws://${address}`);
@@ -876,17 +883,18 @@ for (const keep of [{ days: -1 }, { bytes: -5 }, { days: NaN }, { bytes: Infinit
     const chunk = new Uint8Array(4096).fill(0x5a);
     const burst = async (held: boolean) => {
       wire = 0;
+      dropped = 0;
       const want = got + 2 * 50 * chunk.length; // more than a relay queues for a session
       full = held;
       for (let i = 0; i < 50; i++) for (const c of calls) c.send(chunk);
       if (held) await new Promise((done) => setTimeout(done, 200));
       full = false;
       for (const end = Date.now() + 20_000; got < want; await new Promise((done) => setTimeout(done, 5))) assert(Date.now() < end, "the burst never arrived");
-      return wire;
+      assert(wire >= 2 * 50 * chunk.length, `only ${wire} bytes of a burst went by the counted way`);
+      return dropped;
     };
-    const free = await burst(false);
-    const held = await burst(true);
-    assert(held - free < 4096, `a burst sent while the relay's way was full cost ${held - free} bytes more`);
+    assert.equal(await burst(false), 0, "packets of a burst dropped by the node, its way not full");
+    assert.equal(await burst(true), 0, "packets of a burst dropped by the node while its way was full");
     ca.close();
     cb.close();
     await Promise.all([a.close(), b.close()]);

@@ -341,7 +341,10 @@ relayed_flush :: proc(r: ^Relayed) {
 		if packet == nil {
 			return
 		}
-		zsp.node_post_link(&node, r.via, r.device, packet) // or dropped, as a relay may
+		if !zsp.node_post_link(&node, r.via, r.device, packet) {
+			// Dropped, as a relay may drop it: said, as it is never what a way that is full does, waited for above.
+			report(.Debug, "a link's packet was dropped, its way to the relay gone")
+		}
 		r.used = time.tick_now()
 	}
 }

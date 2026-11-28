@@ -456,6 +456,92 @@ link_probe_finds_a_lost_tail :: proc(t: ^testing.T) {
 	testing.expect_value(t, a.state, Link_State.Open)
 }
 
+// A probe of what is new that the peer cannot take, its table of what came early being full, is not answered: the
+// next probe sends the oldest again, which fills the first hole and is answered. Else every probe was the same refused
+// packet, and a link that lost nothing more died for want of an answer.
+@(test)
+link_probe_unanswered_sends_the_oldest :: proc(t: ^testing.T) {
+	secrets: [2]zsp.Key32
+	secrets[0][0], secrets[1][0] = 1, 2
+	space: zsp.Key32
+	a, b: Link
+	defer link_destroy(&a)
+	defer link_destroy(&b)
+	got := 0
+	b.data = &got
+	b.on_stream = proc(l: ^Link, id: u64, bytes: []byte, event: Stream_Event) {
+		if event == .Data {
+			(^int)(l.data)^ += len(bytes)
+		}
+	}
+	now: Time = 1000
+	buf: [PACKET_MAX]byte
+	testing.expect(t, link_dial(&a, secrets[0], zsp.x25519_public(secrets[1]), space))
+	testing.expect(t, link_answer(&b, secrets[1], space, link_hello(&a, buf[:])))
+	testing.expect(t, link_input(&a, link_hello(&b, buf[:]), now))
+	// Each way, all there is, arriving half a round trip of 10 ms later.
+	exchange :: proc(a, b: ^Link, now: ^Time, buf: []byte) -> (moved: bool) {
+		for p := link_output(a, buf, now^); p != nil; p = link_output(a, buf, now^) {
+			link_input(b, p, now^ + 5 * MS)
+			moved = true
+		}
+		now^ += 5 * MS
+		for p := link_output(b, buf, now^); p != nil; p = link_output(b, buf, now^) {
+			link_input(a, p, now^ + 5 * MS)
+			moved = true
+		}
+		now^ += 5 * MS
+		return
+	}
+	// A bulk stream, its windows grown by a while of sending.
+	s, opened := link_open(&a, 5)
+	testing.expect(t, opened)
+	chunk: [4096]byte
+	written := 0
+	for _ in 0 ..< 25 {
+		for link_room(&a, s) >= len(chunk) && a.held <= 6 << 20 {
+			testing.expect(t, link_write(&a, s, chunk[:]))
+			written += len(chunk)
+		}
+		exchange(&a, &b, &now, buf[:])
+	}
+	for i := 0; i < 5000 && (exchange(&a, &b, &now, buf[:]) || a.in_flight > 0); i += 1 {
+	}
+	testing.expect_value(t, got, written)
+	// Then more than the window, of which every other packet is lost and every answer too: the peer holds as many
+	// pieces come early as it takes, and the first hole is the oldest packet in flight.
+	for _ in 0 ..< 2500 {
+		testing.expect(t, link_write(&a, s, chunk[:]))
+		written += len(chunk)
+	}
+	for i := 0; ; i += 1 {
+		p := link_output(&a, buf[:], now)
+		if p == nil {
+			break
+		}
+		if i % 2 == 1 && b.early < MAX_EARLY * 3 / 4 {
+			link_input(&b, p, now + 5 * MS)
+		}
+	}
+	for link_output(&b, buf[:], now + 10 * MS) != nil {
+	}
+	now += 10 * MS
+	testing.expectf(t, b.early == MAX_EARLY * 3 / 4, "%d pieces held early, not as many as are taken", b.early)
+	testing.expect(t, link_sendable(&a), "nothing more to send")
+	// And from then on nothing is lost.
+	for i := 0; i < 50_000 && a.state == .Open && got < written; i += 1 {
+		next := now + 10 * MS
+		for d in ([2]Time{link_deadline(&a), link_deadline(&b)}) {
+			if d > now && d < next {
+				next = d
+			}
+		}
+		now = next
+		exchange(&a, &b, &now, buf[:])
+	}
+	testing.expectf(t, a.state == .Open && got == written, "%v, %d of %d delivered, %d held early", a.state, got, written, b.early)
+}
+
 // A link a relay carries, whose packets are larger than a datagram's, outlasts a pause with much in flight and then
 // sends all of it: its window, cut down while it waited and after, still holds one of its packets.
 @(test)

@@ -1749,9 +1749,11 @@ link_expire :: proc(l: ^Link, now: Time) {
 		l.window = 2 * link_floor(l)
 	}
 	// A probe asks for word of what is in flight, which is as likely only late as lost: on a busy machine the peer's
-	// acknowledgements wait their turn. So, as RFC 9002 has it, it carries what was never sent where there is some, and
-	// what it is answered with says what was lost. Only with nothing new to say is the oldest unacknowledged sent again.
-	if link_sendable(l) {
+	// acknowledgements wait their turn. So, as RFC 9002 has it, the first carries what was never sent where there is
+	// some, and what it is answered with says what was lost. One that goes unanswered too, or with nothing new to say,
+	// sends the oldest unacknowledged again: what is new may be what the peer cannot take, its table of what came early
+	// being full, and then only the oldest fills the hole before it.
+	if l.probes == 1 && link_sendable(l) {
 		return
 	}
 	for &p in link_sent(l) {
