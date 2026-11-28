@@ -7,6 +7,7 @@ import { loadModule } from "../src/wasm.ts";
 import { live } from "./live.ts";
 import { where } from "../src/ask.ts";
 import { binaryFromHex } from "../src/codec.ts";
+import { timerInternals } from "../src/timers.ts";
 
 const devices = new Map<string, Device>();
 
@@ -79,6 +80,7 @@ const Big = { more: columns.string(18) };
 const editors: Editor[] = [];
 let shownText = "", textNow = "", textDropped = false, textRow = "";
 let textOf: Client | undefined;
+let typed: { c: Client; id: string } | undefined; // what was typed last, and by whom
 let pageNodeOf: Node | undefined;
 let pageNodeRows = 0;
 
@@ -357,7 +359,45 @@ const zsp = {
     await c.write(1, (change) => (id = change.insert(Doc, list, 1, {})));
     const editor = c.text(id, Doc.body);
     editors.push(editor);
+    typed = { c, id };
     for (const w of words) editor.append(w);
+  },
+  /** Whether what was typed last is sealed by its writer: a piece of it is a cell of its row there. */
+  async typedSealed(): Promise<boolean> {
+    const row = typed && Client.internals(typed.c).rows.get(binaryFromHex(typed.id));
+    return (row?.slots.get(Doc.body.slot)?.size ?? 0) > 0;
+  },
+  /**
+   * A client of a device made as an application makes one of its own, rather than by device.client(): keeping time by
+   * nothing it was given. Known by `as` to what follows, as a device's own client is by its name.
+   */
+  async ownClient(name: string, as: string, pageTimers = false, linger = 200): Promise<void> {
+    // Or, with `pageTimers`, given the page's own timers, as every such client kept time before.
+    const after = (ms: number, f: () => void) => {
+      const t = setTimeout(f, ms);
+      return () => clearTimeout(t);
+    };
+    clients.set(as, new Client({ connect: devices.get(name)!.connect, linger, ...(pageTimers ? { after } : {}) }));
+  },
+  /** Types more into what was typed last. */
+  async typeMore(words: string[]): Promise<void> {
+    for (const w of words) editors[editors.length - 1].append(w);
+  },
+  async closeClient(as: string): Promise<void> {
+    clients.get(as)?.close();
+    clients.delete(as);
+  },
+  /** From now on no worker can be started here: trying throws, as some browsers' policies make it. */
+  async workersThrow(): Promise<void> {
+    globalThis.Worker = class {
+      constructor() {
+        throw new DOMException("no workers here", "SecurityError");
+      }
+    } as unknown as typeof Worker;
+  },
+  /** How the page's timer worker stands. */
+  async timers(): Promise<{ worker: boolean; broken: boolean; users: number; pending: number }> {
+    return timerInternals();
   },
   /** Watches the first text of a list: what it has shown, and whether it ever stopped showing it once it had. */
   async watchText(name: string, list: string): Promise<void> {

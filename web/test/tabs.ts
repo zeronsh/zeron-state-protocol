@@ -32,6 +32,12 @@ const site = http((req, res) => {
     res.end('<!doctype html><meta charset="utf-8"><script type="module" src="/test.js"></script>');
     return;
   }
+  if (path === "/no-workers") {
+    // A page whose policy lets it start no worker but its own scripts: none of a blob, as the clients' timer worker is.
+    res.writeHead(200, { "content-type": "text/html", "content-security-policy": "worker-src 'self'" });
+    res.end('<!doctype html><meta charset="utf-8"><script type="module" src="/test.js"></script>');
+    return;
+  }
   if (path === "/elsewhere") {
     res.writeHead(200, { "content-type": "text/html" });
     res.end('<!doctype html><meta charset="utf-8"><p>elsewhere</p>');
@@ -51,9 +57,9 @@ const origin = `http://127.0.0.1:${(site.address() as AddressInfo).port}/`;
 let chrome: Chrome | undefined;
 const said: string[] = []; // what pages and their workers said
 const pages: Page[] = [];
-async function page(): Promise<Page> {
+async function page(path = ""): Promise<Page> {
   const t = performance.now();
-  const p = await chrome!.open(origin, (line) => (said.push(line), console.log("     page: " + line)));
+  const p = await chrome!.open(origin + path, (line) => (said.push(line), console.log("     page: " + line)));
   if (process.env.TRACE) console.log("     opened in", performance.now() - t);
   await p.evaluate("new Promise((done) => { const go = () => window.zsp ? done() : setTimeout(go, 10); go(); })");
   pages.push(p);
@@ -520,6 +526,84 @@ const tests: Record<string, () => Promise<void>> = {
     expectEqual(await evaluate("self.letTimers()"), true, "the worker let its timers go");
     await eventually(async () => (await seen()).sealed, "what was typed is sealed once the worker goes on", 60000);
     expectEqual((await seen()).now, "typed and sealed late", "what the reader shows again, sealed");
+  },
+  // A client an application makes of its own, keeping time by nothing it was given, in a tab whose timers are held back:
+  // it keeps time by the page's timer worker, so it seals what it types about a second on, long before a reader would stop
+  // showing it. Held back for good here, so that one keeping time by the page's own timers would never seal it at all.
+  async tab_own_client_seal() {
+    const writer = await page();
+    await call(writer, "device", "oc");
+    await call(writer, "create", "oc");
+    await call(writer, "ownClient", "oc", "own");
+    await call(writer, "put", "own", "warm", ["its client ready"]);
+    const reader = await page();
+    await call(reader, "device", "oc");
+    await call(reader, "watchText", "oc", "docs");
+    await call(writer, "holdTimers");
+    await call(writer, "type", "own", "docs", ["typed ", "by a client ", "of its own"]);
+    const typedAt = performance.now();
+    await eventually(() => call<boolean>(writer, "typedSealed"), "what a client of its own typed with its tab's timers held back is sealed", 60000);
+    const sealedIn = performance.now() - typedAt;
+    console.log(`     sealed ${sealedIn.toFixed(0)} ms after it was typed`);
+    if (sealedIn >= 10000) throw new Error(`sealed ${sealedIn.toFixed(0)} ms after it was typed: later than a reader shows live text unconfirmed`);
+    const seen = () => call<{ shown: string; now: string; dropped: boolean; sealed: boolean }>(reader, "textSeen");
+    await eventually(async () => (await seen()).sealed, "and the reader holds it sealed", 60000);
+    const reached = performance.now() - typedAt;
+    const s = await seen();
+    expectEqual(s.now, "typed by a client of its own", "what the reader shows of it");
+    // Never dropped: unless the machine took longer to bring the reader the piece, sealed in time, than a reader waits.
+    if (s.dropped && reached < 9000) throw new Error(`the reader dropped what was sealed ${sealedIn.toFixed(0)} ms after it was typed, and reached it ${reached.toFixed(0)} ms after`);
+  },
+  // Clients of their own let go of the page's timer worker as they close, the last of them of all of it: nothing of theirs
+  // is left to go off, and no worker is left awake.
+  async tab_own_client_closed() {
+    type Timers = { worker: boolean; broken: boolean; users: number; pending: number };
+    const p = await page();
+    await call(p, "device", "ot");
+    await call(p, "create", "ot");
+    await call(p, "ownClient", "ot", "a");
+    await call(p, "ownClient", "ot", "b");
+    await call(p, "put", "a", "warm", ["a ready"]);
+    await call(p, "put", "b", "warm", ["b ready"]);
+    await call(p, "type", "a", "docs", ["typed by a"]);
+    await call(p, "type", "b", "docs", ["typed by b"]);
+    const both = await call<Timers>(p, "timers");
+    expectEqual({ worker: both.worker, broken: both.broken, users: both.users }, { worker: true, broken: false, users: 2 }, "two clients keeping time by the worker");
+    if (both.pending < 2) throw new Error(`${both.pending} timers pending for two pieces being typed`);
+    await call(p, "closeClient", "a");
+    const one = await call<Timers>(p, "timers");
+    expectEqual({ worker: one.worker, users: one.users }, { worker: true, users: 1 }, "one closed, of two");
+    if (one.pending >= both.pending) throw new Error(`the closed client's timers are pending still: ${one.pending} of ${both.pending}`);
+    await call(p, "closeClient", "b");
+    const none: Timers = { worker: false, broken: false, users: 0, pending: 0 };
+    expectEqual(await call<Timers>(p, "timers"), none, "both closed");
+    await sleep(1500); // longer than a piece is left unsealed: nothing of theirs goes off
+    expectEqual(await call<Timers>(p, "timers"), none, "both closed, a while on");
+  },
+  // In a page that may start no worker of its own, as one whose policy forbids it, a client of its own keeps time by the
+  // page's timers, as it would anywhere, and seals what it types: whether starting one fails at once or only later.
+  async tab_own_client_no_worker() {
+    const p = await page("no-workers");
+    await call(p, "device", "nw"); // the device's worker, of the page's own scripts, it may start
+    await call(p, "create", "nw");
+    await call(p, "ownClient", "nw", "own");
+    await call(p, "put", "own", "warm", ["its client ready"]);
+    await call(p, "type", "own", "docs", ["typed ", "with no timer worker"]);
+    await eventually(() => call<boolean>(p, "typedSealed"), "what a client of its own typed with no timer worker is sealed");
+    const t = await call<{ worker: boolean; broken: boolean; users: number; pending: number }>(p, "timers");
+    expectEqual({ worker: t.worker, broken: t.broken, users: t.users }, { worker: false, broken: true, users: 1 }, "kept by the page's timers");
+    // Chrome refuses such a worker once it has begun, and the timers it was given go to the page; other browsers refuse
+    // one at once, as a page here whose Worker throws does.
+    const q = await page();
+    await call(q, "device", "nt");
+    await call(q, "create", "nt");
+    await call(q, "workersThrow");
+    await call(q, "ownClient", "nt", "own");
+    await call(q, "put", "own", "warm", ["its client ready"]);
+    await call(q, "type", "own", "docs", ["typed ", "where no worker can start"]);
+    await eventually(() => call<boolean>(q, "typedSealed"), "what a client of its own typed where no worker can start is sealed");
+    const u = await call<{ worker: boolean; broken: boolean; users: number; pending: number }>(q, "timers");
+    expectEqual({ worker: u.worker, broken: u.broken, users: u.users }, { worker: false, broken: true, users: 1 }, "kept by the page's timers there too");
   },
   // A tab that opens the device after a credential was given, and gives none, presents the newest given though it heard
   // of none being given; a tab that comes back from being frozen does not present what it gave as newer than what was
