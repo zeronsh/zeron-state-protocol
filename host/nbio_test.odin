@@ -461,7 +461,7 @@ loop_keeps_a_write_when_a_read_of_its_socket_is_removed :: proc(t: ^testing.T) {
 	testing.expect(t, aerr == nil)
 	defer net.close(socket)
 	// Little room of its own to send from, so that a write waits on the peer reading.
-	testing.expect(t, set_send_buffer(socket, 0))
+	testing.expectf(t, set_send_buffer(socket, LEAST_SEND_BUFFER), "the system refused a send buffer of %d", LEAST_SEND_BUFFER)
 	testing.expect(t, nbio.associate_socket(socket) == nil)
 
 	read_called := false
