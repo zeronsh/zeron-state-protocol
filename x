@@ -108,9 +108,9 @@ test)
 	rm -f build/failed
 	pids=
 	for p in zsp pipe find host zspd; do
-		# Host tests each run whole hosts, each with an event loop of its own. On Windows core:nbio has those loops share
-		# one completion port, and hands what one finds of another's to it, which may have let that go meanwhile: so
-		# there they run one at a time, as zspd's one loop always does.
+		# Host tests each run whole hosts, each with an event loop of its own. On Windows nbio (third_party/nbio) has
+		# those loops share one completion port, and hands what one finds of another's to it, which may have let that go
+		# meanwhile: so there they run one at a time, as zspd's one loop always does.
 		one=
 		[ $p = host ] && [ -n "$EXE" ] && one=-define:ODIN_TEST_THREADS=1
 		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL $one -define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 -define:ZSP_FIND_RUN=64 -define:ZSP_FIND_HOT=0 >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &

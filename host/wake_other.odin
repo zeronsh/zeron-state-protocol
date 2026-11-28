@@ -1,7 +1,7 @@
 #+build !windows
 package host
 
-import "core:nbio"
+import "../third_party/nbio"
 
 // What wakes the host's loop, from any thread: here core:nbio's own, an eventfd's count or a kqueue event, which is
 // kept until the loop next waits, and ends that wait. From the loop's own thread it does nothing, and need not: the

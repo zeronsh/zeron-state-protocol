@@ -3,13 +3,13 @@ package host
 import "base:runtime"
 import "core:crypto"
 import "core:log"
-import "core:nbio"
 import "core:net"
 import "core:os"
 import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../third_party/nbio"
 import "../zsp"
 
 @(private = "file")

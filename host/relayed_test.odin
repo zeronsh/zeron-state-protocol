@@ -1,9 +1,9 @@
 package host
 
-import "core:nbio"
 import "core:testing"
 import "core:time"
 import "../pipe"
+import "../third_party/nbio"
 import "../zsp"
 
 // A device whose own way to its relay is backed up holds its link's packets back, rather than handing them on to be

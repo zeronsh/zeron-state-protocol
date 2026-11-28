@@ -2,13 +2,13 @@ package host
 
 import "core:encoding/hex"
 import "core:fmt"
-import "core:nbio"
 import "core:net"
 import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
 import "../pipe"
+import "../third_party/nbio"
 import "../zsp"
 
 // A session over a WebSocket over TCP, with TLS beneath when dialled so and a Noise channel within

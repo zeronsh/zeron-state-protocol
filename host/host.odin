@@ -3,13 +3,13 @@ package host
 import "core:crypto"
 import "core:encoding/hex"
 import "core:fmt"
-import "core:nbio"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
 import "core:sync"
 import "core:time"
 import "../pipe"
+import "../third_party/nbio"
 import "../zsp"
 
 // One thread, one event loop, no polling: between events the process is asleep in the kernel, and the

@@ -3,7 +3,6 @@ package host
 import "base:runtime"
 import "core:encoding/hex"
 import "core:log"
-import "core:nbio"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
@@ -14,6 +13,7 @@ import "core:thread"
 import "core:time"
 import "../find"
 import "../pipe"
+import "../third_party/nbio"
 import "../zsp"
 
 // Each a reproduction from adversarial review, kept so that what it found stays found.

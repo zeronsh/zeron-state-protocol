@@ -178,8 +178,10 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> General_Error {
 		results := kevent(l, results_buf[:], ts_pointer) or_return
 
 		clear(&l.pending)
-		for overflow in queue.pop_front_safe(&l.overflow) {
-			(append(&l.pending, overflow) != 0) or_break
+		// ZSP: moved over only while there is room. Upstream took one from the overflow before finding there was none,
+		// and dropped it: a change kqueue was never given, as an operation added that never completes.
+		for queue.len(l.overflow) > 0 && len(l.pending) < cap(l.pending) {
+			append(&l.pending, queue.pop_front(&l.overflow))
 		}
 
 		l.now = time.now()
@@ -1169,10 +1171,14 @@ add_pending :: proc(op: ^Operation, filter: kq.Filter, ident: uintptr) {
 	assert(op._impl.prev == nil)
 	op._impl.flags += {.For_Kernel}
 
-	_, val, just_inserted, err := map_entry(&op.l.submitted, Queue_Identifier{ ident = ident, filter = filter })
-	ensure(err == nil, "allocation failure")
-	if just_inserted {
-		val^ = op
+	// ZSP: looked up, then assigned, rather than `map_entry`: the runtime's `__dynamic_map_entry` (dev-2026-11) can
+	// give back the slot of another key when its insertion shifts entries round a map with no empty slot, and what is
+	// written through it then lands on that key, leaving this one nil. odin-lang/Odin#8642; third_party/nbio/README.md.
+	key := Queue_Identifier{ ident = ident, filter = filter }
+	head, found := op.l.submitted[key]
+	if !found {
+		_, err := map_insert(&op.l.submitted, key, op)
+		ensure(err == nil, "allocation failure")
 
 		append_pending(op.l, kq.KEvent {
 			filter = filter,
@@ -1183,7 +1189,7 @@ add_pending :: proc(op: ^Operation, filter: kq.Filter, ident: uintptr) {
 	} else {
 		debug("already have this operation on the kqueue, bundling it")
 
-		last := val^
+		last := head
 		for last._impl.next != nil {
 			last = last._impl.next
 		}
@@ -1319,10 +1325,11 @@ timeout_and_delete :: proc(target: ^Operation) {
 		} else {
 			debug("target was the head of the list, updating map to point at new head")
 
-			_, vp, _, err := map_entry(&target.l.submitted, Queue_Identifier{ ident = ident, filter = filter })
+			// ZSP: looked up, then assigned, rather than `map_entry`, as in add_pending.
+			key := Queue_Identifier{ ident = ident, filter = filter }
+			assert(target.l.submitted[key] == target)
+			_, err := map_insert(&target.l.submitted, key, target._impl.next)
 			ensure(err == nil, "allocation failure")
-			assert(vp^ == target)
-			vp^ = target._impl.next
 
 			ev := kq.KEvent{
 				filter = filter,

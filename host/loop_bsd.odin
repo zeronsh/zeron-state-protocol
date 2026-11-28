@@ -2,7 +2,7 @@
 package host
 
 import "core:container/queue"
-import "core:nbio"
+import "../third_party/nbio"
 
 // Whether the event loop holds changes back that did not fit what it gives kqueue at once. It gives them only once
 // kqueue has answered, and kqueue may wait for ever for what it has not been given: so it is not to wait.

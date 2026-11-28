@@ -1,4 +1,7 @@
 #+build !linux
+#+build !darwin
+#+build !openbsd
+#+build !netbsd
 package host
 
 import "core:net"

@@ -1004,15 +1004,14 @@ accept_exec :: proc(op: ^Operation) -> Op_Result {
 		&received,
 		&op._impl.over,
 	) {
-		if is_pending(op._impl.over) || (op._impl.over.Internal == nil && is_incomplete(win.System_Error(win.GetLastError()))) {
-			link_timeout(op, op.accept.expires)
-			return .Pending
-		} else if op._impl.over.Internal == nil {
-			op.accept.err = net._accept_error()
-		} else {
+		// ZSP: only ERROR_IO_PENDING leaves the operation to complete later. Any other failure is its result now, and
+		// no completion will come for it: upstream took one that left `over.Internal` set for pending too, and waited
+		// for ever.
+		if left_pending() {
 			link_timeout(op, op.accept.expires)
 			return .Pending
 		}
+		op.accept.err = net._accept_error()
 	}
 
 	return .Done
@@ -1052,7 +1051,10 @@ accept_callback :: proc(op: ^Operation) {
 
 		// enables getsockopt, setsockopt, getsockname, getpeername, etc.
 		listener := win.SOCKET(op.accept.socket)
-		win.setsockopt(win.SOCKET(op.accept.client), win.SOL_SOCKET, win.SO_UPDATE_ACCEPT_CONTEXT, &listener, size_of(listener))
+		// ZSP: checked; without it, the socket is one that shutdown, getpeername and the rest fail on.
+		if win.setsockopt(win.SOCKET(op.accept.client), win.SOL_SOCKET, win.SO_UPDATE_ACCEPT_CONTEXT, &listener, size_of(listener)) != 0 {
+			op.accept.err = net._accept_error()
+		}
 
 	case .OPERATION_ABORTED:
 		// This error could also happen when the user calls close on the socket.
@@ -1090,7 +1092,8 @@ dial_exec :: proc(op: ^Operation) -> (result: Op_Result) {
 	res      := win.bind(win.SOCKET(op.dial.socket), &sockaddr, size_of(sockaddr))
 	if res < 0 {
 		op.dial.err = net._bind_error()
-		win.closesocket(win.SOCKET(op.dial.socket))
+		// ZSP: closed by dial_callback, as every failed dial's socket is: closing it here too closed it twice, the
+		// second time whatever socket had been given the same handle meanwhile.
 		return .Done
 	}
 
@@ -1109,15 +1112,14 @@ dial_exec :: proc(op: ^Operation) -> (result: Op_Result) {
 		&transferred,
 		&op._impl.over,
 	) {
-		if is_pending(op._impl.over) || (op._impl.over.Internal == nil && is_incomplete(win.System_Error(win.GetLastError()))) {
-			link_timeout(op, op.dial.expires)
-			return .Pending
-		} else if op._impl.over.Internal == nil {
-			op.dial.err = net._dial_error()
-		} else {
+		// ZSP: only ERROR_IO_PENDING leaves the operation to complete later. Any other failure is its result now, and
+		// no completion will come for it: upstream took one that left `over.Internal` set for pending too, and waited
+		// for ever.
+		if left_pending() {
 			link_timeout(op, op.dial.expires)
 			return .Pending
 		}
+		op.dial.err = net._dial_error()
 	}
 
 	return .Done
@@ -1138,7 +1140,10 @@ dial_callback :: proc(op: ^Operation) {
 	#partial switch err {
 	case .SUCCESS:
 		// enables getsockopt, setsockopt, getsockname, getpeername, etc.
-		win.setsockopt(win.SOCKET(op.dial.socket), win.SOL_SOCKET, win.SO_UPDATE_CONNECT_CONTEXT, nil, 0)
+		// ZSP: checked, as for an accepted socket.
+		if win.setsockopt(win.SOCKET(op.dial.socket), win.SOL_SOCKET, win.SO_UPDATE_CONNECT_CONTEXT, nil, 0) != 0 {
+			op.dial.err = net._dial_error()
+		}
 
 	case .OPERATION_ABORTED:
 		op.dial.err = Dial_Error.Timeout
@@ -1345,17 +1350,16 @@ recv_exec :: proc(op: ^Operation) -> Op_Result {
 	}
 
 	if status == win.SOCKET_ERROR {
-		if is_pending(op._impl.over) || (op._impl.over.Internal == nil && is_incomplete(win.System_Error(win.GetLastError()))) {
+		// ZSP: only ERROR_IO_PENDING leaves the operation to complete later. Any other failure is its result now, and
+		// no completion will come for it: upstream took one that left `over.Internal` set for pending too, and waited
+		// for ever.
+		if left_pending() {
 			link_timeout(op, op.recv.expires)
 			return .Pending
-		} else if op._impl.over.Internal == nil {
-			switch _ in op.recv.socket {
-			case TCP_Socket: op.recv.err = net._tcp_recv_error()
-			case UDP_Socket: op.recv.err = net._udp_recv_error()
-			}
-		} else {
-			link_timeout(op, op.recv.expires)
-			return .Pending
+		}
+		switch _ in op.recv.socket {
+		case TCP_Socket: op.recv.err = net._tcp_recv_error()
+		case UDP_Socket: op.recv.err = net._udp_recv_error()
 		}
 	}
 
@@ -1466,17 +1470,16 @@ send_exec :: proc(op: ^Operation) -> Op_Result {
 	}
 
 	if status == win.SOCKET_ERROR {
-		if is_pending(op._impl.over) || (op._impl.over.Internal == nil && is_incomplete(win.System_Error(win.GetLastError()))) {
+		// ZSP: only ERROR_IO_PENDING leaves the operation to complete later. Any other failure is its result now, and
+		// no completion will come for it: upstream took one that left `over.Internal` set for pending too, and waited
+		// for ever.
+		if left_pending() {
 			link_timeout(op, op.send.expires)
 			return .Pending
-		} else if op._impl.over.Internal == nil {
-			switch _ in op.send.socket {
-			case TCP_Socket: op.send.err = net._tcp_send_error()
-			case UDP_Socket: op.send.err = net._udp_send_error()
-			}
-		} else {
-			link_timeout(op, op.send.expires)
-			return .Pending
+		}
+		switch _ in op.send.socket {
+		case TCP_Socket: op.send.err = net._tcp_send_error()
+		case UDP_Socket: op.send.err = net._udp_send_error()
 		}
 	}
 
@@ -1736,6 +1739,12 @@ link_timeout :: proc(op: ^Operation, expires: time.Time) {
 	if expires == {} {
 		return
 	}
+	// ZSP: one already linked stays. A send or receive of `all` that went only part of the way is executed again,
+	// and linked a second, which took the first's place in `op._impl.timeout` and left it to fire at an operation
+	// done with by then.
+	if op._impl.timeout != nil {
+		return
+	}
 
 	timeout_op := _prep(op.l, internal_timeout_callback, .Timeout)
 	timeout_op.timeout._impl.expires = expires
@@ -1871,6 +1880,12 @@ wsa_get_result :: proc(socket: win.SOCKET, over: win.OVERLAPPED) -> (n: int, err
 
 	n = int(uintptr(over.InternalHigh))
 	return
+}
+
+// ZSP: whether an overlapped call that returned failure was only left to complete later, as Winsock says by
+// ERROR_IO_PENDING alone. Its error is left where the `_error` procedures read it.
+left_pending :: proc() -> bool {
+	return win.System_Error(win.WSAGetLastError()) == .IO_PENDING
 }
 
 is_incomplete :: proc(err: win.System_Error) -> bool {
