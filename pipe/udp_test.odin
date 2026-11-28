@@ -1239,6 +1239,294 @@ stream_waits_for_stream_0 :: proc(t: ^testing.T) {
 	testing.expect_value(t, heard[1].first[id], 5)
 }
 
+// Streams begun after much of stream 0, which they are delivered after, pour out more than the link's window, at an
+// urgency above stream 0's, beside it, and below it: the window they take is never what stream 0 needs to reach them,
+// which the peer would give back only as it delivered what it cannot deliver until stream 0 has. All of it arrives.
+@(test)
+streams_leave_stream_0_its_window :: proc(t: ^testing.T) {
+	Case :: struct {
+		urgency: u8,
+		streams: int,
+		zero:    int, // of stream 0, that each stream is to wait for
+		first:   bool, // written whole before they begin, so that each waits for all of it by default; else each is said
+		// to wait for it all, and it is handed over as the link has room, as a session's is
+		late:    Time, // handed over from then on only, as a session's own may lag what it said its calls come after
+	}
+	cases := []Case {
+		// Above stream 0, which has no turn until they have taken the whole window.
+		{urgency = 1, streams = 5, zero = 100 << 10, first = true},
+		{urgency = 1, streams = 5, zero = 100 << 10},
+		// Beside it, as a call's lane is: so many go ahead of it, each having lately had nothing to send, that its share
+		// falls short; or, where it lags, it has none.
+		{urgency = 3, streams = 15, zero = 100 << 10, first = true},
+		{urgency = 3, streams = 60, zero = 100 << 10},
+		{urgency = 3, streams = 15, zero = 100 << 10, late = 200 * MS},
+		// Below it, where RESERVE is all bulk leaves, and it lags by more than that.
+		{urgency = 6, streams = 5, zero = 200 << 10},
+		{urgency = 6, streams = 5, zero = 200 << 10, late = 200 * MS},
+	}
+	for c in cases {
+		state := rand.create(23)
+		context.random_generator = rand.default_random_generator(&state)
+		n: Net
+		net_init(t, &n)
+		defer net_destroy(&n)
+		heard: [2]Heard
+		defer heard_destroy(&heard[0])
+		defer heard_destroy(&heard[1])
+		heard_wire(&n.links[0], &heard[0])
+		heard_wire(&n.links[1], &heard[1])
+		n.rate = 12.5 // 100 Mbit/s
+		n.delay = 5 * MS
+		for net_step(&n) && n.now < 50 * MS {}
+		a := &n.links[0]
+		start := n.now
+		chunk: [16 << 10]byte
+		zero := 0 // of stream 0, handed to the link
+		after: Maybe(u64)
+		if c.first {
+			link_write(a, 0, make([]byte, c.zero, context.temp_allocator))
+			zero = c.zero
+		} else {
+			after = u64(c.zero)
+		}
+		ids := make([]u64, c.streams, context.temp_allocator)
+		written := make([]int, c.streams, context.temp_allocator)
+		for &id in ids {
+			ok: bool
+			id, ok = link_open(a, c.urgency, after)
+			testing.expect(t, ok)
+		}
+		each := int(STREAM_WINDOW) // as much as each may send before the peer has delivered any of it
+		for steps := 0; steps < 200_000; steps += 1 {
+			for n.now - start >= c.late && zero < c.zero {
+				k := min(c.zero - zero, len(chunk), link_room(a, 0))
+				if k <= 0 {
+					break
+				}
+				link_write(a, 0, chunk[:k])
+				zero += k
+			}
+			for id, i in ids {
+				for written[i] < each {
+					k := min(each - written[i], len(chunk), link_room(a, id))
+					if k <= 0 {
+						break
+					}
+					link_write(a, id, chunk[:k])
+					written[i] += k
+				}
+				if written[i] == each {
+					link_finish(a, id)
+					written[i] += 1
+				}
+			}
+			if !net_step(&n) {
+				if n.now - start >= c.late {
+					break
+				}
+				n.now = start + c.late // nothing happens meanwhile
+			}
+		}
+		got := 0
+		for id in ids {
+			if id in heard[1].got {
+				got += len(heard[1].got[id])
+				testing.expectf(t, heard[1].first[id] >= c.zero, "%v: stream %d came before stream 0 had", c, id)
+			}
+		}
+		delivered_zero := len(heard[1].got[0]) if 0 in heard[1].got else 0
+		testing.expectf(t, delivered_zero == c.zero && got == c.streams * each,
+			"%v: stream 0 delivered %d of %d, the rest %d of %d, with %d of the link's %d sent", c, delivered_zero, c.zero,
+			got, c.streams * each, a.out_total, a.out_max)
+		ended := 0
+		for id in ids {
+			ended += 1 if heard[1].ends[id] == .Fin else 0
+		}
+		testing.expectf(t, ended == c.streams, "%v: %d of %d streams ended", c, ended, c.streams)
+		testing.expect_value(t, a.state, Link_State.Open)
+	}
+}
+
+// A stream that waited for more of stream 0 than was ever written, given up, leaves none of the link's window owed to
+// stream 0 once it is done with: what is begun after it has the whole window.
+@(test)
+stream_let_go_owes_stream_0_nothing :: proc(t: ^testing.T) {
+	state := rand.create(29)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	heard: [2]Heard
+	defer heard_destroy(&heard[0])
+	defer heard_destroy(&heard[1])
+	heard_wire(&n.links[0], &heard[0])
+	heard_wire(&n.links[1], &heard[1])
+	for net_step(&n) {}
+	a := &n.links[0]
+	far, ok := link_open(a, 3, u64(LINK_WINDOW_MAX))
+	testing.expect(t, ok)
+	link_write(a, far, {1})
+	link_reset(a, far)
+	for net_step(&n) && !(far in heard[1].ends) {}
+	testing.expect_value(t, heard[1].ends[far], Stream_Event.Reset)
+	link_finish(&n.links[1], far)
+	for net_step(&n) {}
+	testing.expect_value(t, len(a.streams), 1)
+	id: u64
+	id, ok = link_open(a, 3)
+	testing.expect(t, ok)
+	link_write(a, id, make([]byte, LINK_WINDOW, context.temp_allocator))
+	link_finish(a, id)
+	for net_step(&n) {}
+	testing.expect_value(t, len(heard[1].got[id]), LINK_WINDOW)
+	testing.expect_value(t, heard[1].ends[id], Stream_Event.Fin)
+}
+
+// A stream said to wait for more of stream 0 than is ever written, given up, keeps none of the window from what comes
+// after it, though the peer keeps its own half open: as one that has finished its own does, or one that ignores Stop.
+@(test)
+stream_given_up_owes_stream_0_nothing :: proc(t: ^testing.T) {
+	state := rand.create(31)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	heard: [2]Heard
+	defer heard_destroy(&heard[0])
+	defer heard_destroy(&heard[1])
+	heard_wire(&n.links[0], &heard[0])
+	heard_wire(&n.links[1], &heard[1])
+	for net_step(&n) {}
+	a := &n.links[0]
+	far, ok := link_open(a, 3, u64(LINK_WINDOW_MAX))
+	testing.expect(t, ok)
+	link_write(a, far, {1})
+	link_reset(a, far)
+	for net_step(&n) {}
+	id: u64
+	id, ok = link_open(a, 3)
+	testing.expect(t, ok)
+	link_write(a, id, make([]byte, LINK_WINDOW, context.temp_allocator))
+	link_finish(a, id)
+	for net_step(&n) {}
+	testing.expect_value(t, len(heard[1].got[id]), LINK_WINDOW)
+	testing.expect_value(t, heard[1].ends[id], Stream_Event.Fin)
+}
+
+// Nor does one that is never given up: a stream that waits for nothing has the whole window, and more as it is
+// delivered, beside one said to wait for what stream 0 never has, which sends nothing meanwhile.
+@(test)
+stream_waiting_for_what_never_comes_keeps_nothing :: proc(t: ^testing.T) {
+	state := rand.create(37)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	heard: [2]Heard
+	defer heard_destroy(&heard[0])
+	defer heard_destroy(&heard[1])
+	heard_wire(&n.links[0], &heard[0])
+	heard_wire(&n.links[1], &heard[1])
+	n.rate = 12.5
+	n.delay = 5 * MS
+	for net_step(&n) && n.now < 50 * MS {}
+	a := &n.links[0]
+	link_write(a, 0, make([]byte, 10 << 10, context.temp_allocator))
+	Never :: struct {
+		urgency: u8,
+		after:   u64, // more of stream 0 than it is ever given
+	}
+	for x in ([]Never{{1, 20 << 10}, {3, LINK_WINDOW_MAX}, {6, max(u64)}}) {
+		never, ok := link_open(a, x.urgency, x.after)
+		testing.expect(t, ok)
+		link_write(a, never, make([]byte, 64 << 10, context.temp_allocator))
+	}
+	free, ok := link_open(a, 3, 0)
+	testing.expect(t, ok)
+	total := 3 * LINK_WINDOW
+	chunk: [16 << 10]byte
+	written := 0
+	for steps := 0; steps < 200_000; steps += 1 {
+		for written < total {
+			k := min(total - written, len(chunk), link_room(a, free))
+			if k <= 0 {
+				break
+			}
+			link_write(a, free, chunk[:k])
+			written += k
+		}
+		if written == total && a.streams[len(a.streams) - 1].fin == .None {
+			link_finish(a, free)
+		}
+		if !net_step(&n) {
+			break
+		}
+	}
+	testing.expectf(t, len(heard[1].got[free]) == total, "%d of %d delivered, with %d of the link's %d sent", len(heard[1].got[free]), total, a.out_total, a.out_max)
+	testing.expect_value(t, heard[1].ends[free], Stream_Event.Fin)
+	testing.expect_value(t, len(heard[1].got[0]), 10 << 10)
+	testing.expectf(t, a.out_after == 0, "%d of stream 0 kept for streams that sent nothing", a.out_after)
+}
+
+// What the peer holds of a stream, waiting for stream 0, is what the window is kept for: no longer once its Reset is
+// acknowledged, for then the peer has let go of it all, though it keeps its own half open; and still once both halves
+// are over and the stream let go of, if what it sent was not yet given up.
+@(test)
+stream_owes_stream_0_while_the_peer_may_hold_it :: proc(t: ^testing.T) {
+	for reset in ([]bool{true, false}) {
+		state := rand.create(41)
+		context.random_generator = rand.default_random_generator(&state)
+		n: Net
+		net_init(t, &n)
+		defer net_destroy(&n)
+		heard: [2]Heard
+		defer heard_destroy(&heard[0])
+		defer heard_destroy(&heard[1])
+		heard_wire(&n.links[0], &heard[0])
+		heard_wire(&n.links[1], &heard[1])
+		for net_step(&n) {}
+		a, b := &n.links[0], &n.links[1]
+		zero :: 64 << 10
+		link_write(a, 0, make([]byte, zero, context.temp_allocator))
+		id, _ := link_open(a, 1) // ahead of stream 0, and waiting for all of it
+		link_write(a, id, {1, 2, 3})
+		if !reset {
+			link_finish(a, id)
+		}
+		// By hand, a packet at a time, so that stream 0 stays behind.
+		buf: [PACKET_MAX]byte
+		across :: proc(from, to: ^Link, buf: []byte, now: Time) {
+			if out := link_output(from, buf, now); out != nil {
+				link_input(to, out, now)
+			}
+		}
+		across(a, b, buf[:], n.now)
+		testing.expect(t, a.streams[0].out_next < zero && a.out_after == zero)
+		testing.expect(t, link_has(b, id) && id not_in heard[1].got)
+		if reset {
+			link_reset(a, id)
+			across(a, b, buf[:], n.now)
+		} else {
+			link_finish(b, id)
+		}
+		b.ack_due = n.now
+		across(b, a, buf[:], n.now)
+		testing.expect(t, a.streams[0].out_next < zero)
+		if reset {
+			testing.expectf(t, a.out_after == 0, "%d of stream 0 kept for a stream the peer has let go of", a.out_after)
+		} else {
+			testing.expect(t, !link_has(a, id)) // over both ways, and let go of
+			testing.expectf(t, a.out_after == zero, "%d of stream 0 kept for a stream the peer still holds", a.out_after)
+		}
+		for net_step(&n) {}
+		testing.expect_value(t, len(heard[1].got[0]), zero)
+		if !reset {
+			testing.expect(t, string(heard[1].got[id][:]) == "\x01\x02\x03" && heard[1].first[id] == zero)
+		}
+	}
+}
+
 // Both ends pour bytes into one stream at once, as an echo does, as fast as the link lets them: every byte arrives,
 // in order, both ways.
 @(test)
