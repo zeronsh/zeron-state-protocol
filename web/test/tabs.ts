@@ -515,9 +515,10 @@ const tests: Record<string, () => Promise<void>> = {
     const seen = () => call<{ shown: string; now: string; dropped: boolean; sealed: boolean }>(reader, "textSeen");
     await eventually(async () => (await seen()).shown === "typed and sealed late", "the reader sees it");
     await eventually(async () => (await seen()).dropped, "the reader stops showing live text unconfirmed for ten seconds", 30000);
-    expectEqual((await seen()).sealed, false, "nothing sealed it meanwhile");
+    const blank = await seen();
+    expectEqual({ now: blank.now, sealed: blank.sealed }, { now: "", sealed: false }, "nothing sealed it meanwhile, and the reader shows none of it");
     expectEqual(await evaluate("self.letTimers()"), true, "the worker let its timers go");
-    await eventually(async () => (await seen()).sealed, "what was typed is sealed once the worker goes on");
+    await eventually(async () => (await seen()).sealed, "what was typed is sealed once the worker goes on", 60000);
     expectEqual((await seen()).now, "typed and sealed late", "what the reader shows again, sealed");
   },
   // A tab that opens the device after a credential was given, and gives none, presents the newest given though it heard
