@@ -325,9 +325,13 @@ loop_keeps_an_operation_kqueue_may_still_name :: proc(t: ^testing.T) {
 // of which gives kqueue the second afresh. The loop counted the changes it queued, and missed that way of queueing one
 // (and the wake-up it begins with), while it counted every one it gave: given ran ahead of queued, one for each such
 // removal, and once it was further ahead than the changes held back, an operation went back to the pool while its
-// timer's deletion was still held, as in the release. Meaningful where the loop is kqueue's.
+// timer's deletion was still held, as in the release. Only where the loop is kqueue's: elsewhere the removals are not
+// what they are here (on Windows, cancelling one of two reads waiting on a socket ends the other too, with an error).
 @(test)
 loop_counts_every_change_it_gives_kqueue :: proc(t: ^testing.T) {
+	when ODIN_OS != .Darwin && ODIN_OS != .FreeBSD && ODIN_OS != .OpenBSD && ODIN_OS != .NetBSD {
+		return
+	}
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
 	defer settle(t)
