@@ -31,6 +31,10 @@ socket_options_hold_what_was_asked :: proc(t: ^testing.T) {
 		flag(t, tcp, .TCP_Nodelay, want)
 		flag(t, udp, .Reuse_Address, want)
 		flag(t, udp, .Broadcast, want)
+		if udp6, err6 := net.make_unbound_udp_socket(.IP6); err6 == nil { // where the machine has IPv6
+			flag(t, udp6, .IPv6_Only, want)
+			net.close(udp6)
+		}
 		when ODIN_OS == .Darwin || ODIN_OS == .FreeBSD || ODIN_OS == .OpenBSD || ODIN_OS == .NetBSD {
 			flag(t, udp, .Reuse_Port, want)
 		}

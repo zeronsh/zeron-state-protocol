@@ -94,9 +94,13 @@ udp_open :: proc(h: ^Host, port: int) -> bool {
 	}
 	udp_listen(h, u.socket)
 	if u.socket6, err = nbio.create_udp_socket(.IP6); err == nil {
-		// Where one socket covers both families this bind fails, harmlessly.
+		// IPv6 alone: a socket of both families (Linux's and macOS's default) may not share the IPv4 one's port, and
+		// on Linux was refused it (EADDRINUSE), which left a host there with no IPv6 at all. Where IPv6 is not to be
+		// had the bind fails, harmlessly.
+		nbio.set_socket_option(u.socket6, .IPv6_Only, true)
 		if net.bind(u.socket6, {net.IP6_Any, u.port}) == nil {
 			net.set_blocking(u.socket6, false)
+			udp_receive_buffer(u.socket6) // as much room for what arrives by IPv6 as by IPv4
 			u.have6 = true
 			udp_listen(h, u.socket6)
 		} else {

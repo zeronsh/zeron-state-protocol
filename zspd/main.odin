@@ -492,6 +492,24 @@ running_clock :: proc(dir: string) -> u64 {
 	return clock
 }
 
+// All of buf, through any signal: a send interrupted after some of it was taken (as a large roster may be, while the
+// node reads it) says how much, and the rest goes after; one interrupted before any says none. A send that fails
+// otherwise means the line is gone.
+@(private)
+send_all :: proc(socket: net.TCP_Socket, buf: []byte) -> bool {
+	for sent := 0; sent < len(buf); {
+		n, err := net.send_tcp(socket, buf[sent:])
+		sent += max(n, 0)
+		if err == .Interrupted {
+			continue
+		}
+		if err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // Greets the node running here, with a roster if there is one to hand over, and hears what it says back: its clock,
 // whether it said it, and whether anything was there to speak to. It answers once it has read all that was said, and so
 // once it has taken the roster or not: not that it has taken it.
@@ -509,7 +527,9 @@ speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool, reached: bo
 	defer net.close(socket)
 	reached = true
 	request := pipe.ws_request(string(address), "/")
-	net.send_tcp(socket, transmute([]byte)request)
+	if !send_all(socket, transmute([]byte)request) {
+		return
+	}
 	frames := make([dynamic]byte, context.temp_allocator)
 	at := zsp.frame_begin(&frames, .Hello)
 	append(&frames, zsp.VERSION, 0)
@@ -524,7 +544,9 @@ speak :: proc(dir: string, roster: []byte) -> (clock: u64, ok: bool, reached: bo
 	}
 	message := make([dynamic]byte, context.temp_allocator)
 	pipe.ws_put(&message, .Binary, frames[:], true)
-	net.send_tcp(socket, message[:])
+	if !send_all(socket, message[:]) {
+		return // the line is gone: no answer is coming
+	}
 	// Its answer, which begins with its clock, says it has read this far. Until then the line stays open: what was sent
 	// on one closed before a busy node read it may not be read at all.
 	buf: [4096]byte

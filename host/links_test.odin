@@ -7,6 +7,82 @@ import "../pipe"
 import "../third_party/nbio"
 import "../zsp"
 
+// A host hears by IPv6 wherever the machine has it, beside IPv4 on the same port: on Linux an IPv6 socket of both
+// families was refused that port, and a host there had no IPv6. And what arrives by IPv6 has as much room to wait in
+// as what arrives by IPv4, so that a loop slow for a moment drops no more of it.
+@(test)
+both_families_are_heard :: proc(t: ^testing.T) {
+	// Whether this machine has IPv6 at all: its loopback, at a port of its own.
+	probe, perr := nbio.create_udp_socket(.IP6)
+	has6 := perr == nil && net.bind(probe, {net.IP6_Loopback, 0}) == nil
+	if perr == nil {
+		net.close(probe)
+	}
+	w: World
+	testing.expect(t, world_init(t, &w))
+	defer world_destroy(&w)
+	for i in 1 ..= 2 {
+		u := &w.hosts[i].udp
+		testing.expectf(t, u.have6 == has6, "host %d hears by IPv6: %v, where the machine has it: %v", i, u.have6, has6)
+		four, err4, _ := nbio.socket_option(u.socket, .Receive_Buffer_Size)
+		testing.expectf(t, err4 == nil, "the IPv4 receive buffer: %v", err4)
+		if !u.have6 {
+			continue
+		}
+		only, erro, _ := nbio.socket_option(u.socket6, .IPv6_Only)
+		testing.expectf(t, erro == nil && only == true, "the IPv6 socket takes IPv4 too: %v (%v)", only, erro)
+		six, err6, _ := nbio.socket_option(u.socket6, .Receive_Buffer_Size)
+		testing.expectf(t, err6 == nil && six == four, "the IPv6 receive buffer is %v, the IPv4 one %v (%v)", six, four, err6)
+	}
+	if !has6 || !w.hosts[1].udp.have6 || !w.hosts[2].udp.have6 {
+		return
+	}
+
+	// And a peer is reached by it: a link between A and B, turned onto IPv6 loopback at each end, carries a call whole,
+	// and stays there.
+	testing.expect(t, world_ready(&w, direct = true))
+	Turn :: struct {
+		at: [3]pipe.Address, // where each of A and B is, by IPv6
+	}
+	turn: Turn
+	for i in 1 ..= 2 {
+		turn.at[i] = address_from({net.IP6_Loopback, w.hosts[i].udp.port})
+	}
+	turned :: proc(w: ^World, turn: ^Turn) -> bool {
+		all := true
+		for pair in ([2][2]int{{1, 2}, {2, 1}}) {
+			for x in w.hosts[pair[0]].udp.links {
+				if x.device == w.keys[pair[1]].device && x.address != turn.at[pair[1]] {
+					x.address = turn.at[pair[1]]
+					all = false
+				}
+			}
+		}
+		return all
+	}
+	// Until nothing still on its way by IPv4, heard, turns either back (peer_heard).
+	settled := false
+	for _ in 0 ..< 10 {
+		if settled = turned(&w, &turn); settled {
+			break
+		}
+		world_run(&w, proc(_: ^World, _: rawptr) -> bool {return false}, nil, 200 * time.Millisecond)
+	}
+	testing.expect(t, settled, "the link stays turned onto IPv6")
+	echo_serve(&w.hosts[2])
+	p: Pump
+	testing.expect(t, pump_start(&p, &w, 1 << 20))
+	testing.expect(t, world_run(&w, pump_done, &p))
+	testing.expectf(t, pump_whole(&p), "a call by IPv6 loopback: sent %d, back %d, faulted %v", p.sent, p.got, p.faulted)
+	for pair in ([2][2]int{{1, 2}, {2, 1}}) {
+		for x in w.hosts[pair[0]].udp.links {
+			if x.device == w.keys[pair[1]].device {
+				testing.expectf(t, x.address == turn.at[pair[1]] && x.session != nil, "host %d's link to %d went to %v", pair[0], pair[1], net.endpoint_to_string(address_to(x.address), context.temp_allocator))
+			}
+		}
+	}
+}
+
 // Anyone may have kept an old knock. It neither disturbs a newer one nor stands in its way.
 @(test)
 knocks_are_heard_once :: proc(t: ^testing.T) {
