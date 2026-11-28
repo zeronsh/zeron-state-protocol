@@ -144,7 +144,10 @@ dir_starting :: proc(dir: string) -> (lock: File_Lock, ok: bool) {
 			return
 		}
 	}
-	lock, ok = file_lock(file_in(at, START_FILE))
+	// Said when it waits, as it may for long: else a node that does looks as though it hangs.
+	lock, ok = file_lock(file_in(at, START_FILE), proc(_: string) {
+		report(.Info, "waiting while another node starts here, or a command keeps what is here")
+	})
 	if !ok {
 		report(.Error, "could not lock ", dir)
 	}

@@ -165,3 +165,48 @@ files_left_behind :: proc(t: ^testing.T) {
 		staging_drop(writing)
 	}
 }
+
+@(private = "file")
+waited: int // atomic
+
+// A lock held elsewhere is said to be waited for, once, before it is waited for, and had once let go of; one that is free
+// is had at once, with nothing said.
+@(test)
+files_lock_says_it_waits :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-waits-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer delete(dir)
+	defer os.remove_all(dir)
+	path := strings.clone(file_in(dir, "start.lock"))
+	defer delete(path)
+	say :: proc(_: string) {
+		sync.atomic_add(&waited, 1)
+	}
+	sync.atomic_store(&waited, 0)
+	free, had := file_lock(path, say)
+	testing.expect(t, had, "a free lock was not had")
+	testing.expectf(t, sync.atomic_load(&waited) == 0, "a free lock was said to be waited for")
+	Taker :: struct {
+		path: string,
+		had:  bool, // atomic
+	}
+	taker := Taker{path = path}
+	other := thread.create_and_start_with_poly_data(&taker, proc(t: ^Taker) {
+		lock, ok := file_lock(t.path, say)
+		if ok {
+			file_unlock(lock)
+		}
+		sync.atomic_store(&t.had, ok)
+	})
+	for start := time.tick_now(); sync.atomic_load(&waited) == 0 && time.tick_since(start) < 10 * time.Second; {
+		time.sleep(time.Millisecond)
+	}
+	testing.expectf(t, sync.atomic_load(&waited) == 1, "a held lock was said to be waited for %d times", sync.atomic_load(&waited))
+	testing.expect(t, !sync.atomic_load(&taker.had), "a held lock was had")
+	file_unlock(free)
+	thread.join(other)
+	thread.destroy(other)
+	testing.expect(t, sync.atomic_load(&taker.had), "a lock let go of was not had")
+	testing.expectf(t, sync.atomic_load(&waited) == 1, "said to be waited for %d times", sync.atomic_load(&waited))
+}

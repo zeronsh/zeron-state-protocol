@@ -166,11 +166,21 @@ sync_file :: proc(fd: posix.FD) -> bool {
 File_Lock :: distinct posix.FD
 
 @(private)
-file_lock :: proc(path: string) -> (lock: File_Lock, ok: bool) {
+file_lock :: proc(path: string, waiting: proc(path: string) = nil) -> (lock: File_Lock, ok: bool) {
 	name := strings.clone_to_cstring(path, context.temp_allocator)
 	fd := open_file(name, {.RDWR, .CREAT, .CLOEXEC, .NOFOLLOW}) // never a link, followed to wherever it leads
 	if fd < 0 {
 		return
+	}
+	// Had at once if it is free; else, said to be waited for, as it is.
+	if waiting != nil && !lock_file(fd, LOCK_EX | LOCK_NB) {
+		if posix.errno() != .EWOULDBLOCK {
+			posix.close(fd)
+			return
+		}
+		waiting(path)
+	} else if waiting != nil {
+		return File_Lock(fd), true
 	}
 	if !lock_file(fd, LOCK_EX) {
 		posix.close(fd)

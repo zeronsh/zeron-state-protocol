@@ -1128,8 +1128,14 @@ def test_node_waits_for_a_command():
     n = Node("waits-node", "run", "--no-udp")
     started = Thread(target=n.start)
     started.start()
-    time.sleep(0.5)
-    assert n.p is not None and n.p.poll() is None, "a node starting while a command kept what is here was refused"
+    # Until it says it waits: not a while, which a machine slow to start a process may outlast, the node not having
+    # come to the lock yet, and nothing then shown either way.
+    deadline = time.monotonic() + 30
+    while "waiting while another node starts here" not in (n.log() if os.path.exists(os.path.join(TMP, "waits-node.log")) else ""):
+        assert time.monotonic() < deadline, "a node starting while a command kept what is here never said it waits"
+        assert n.p is None or n.p.poll() is None, "a node starting while a command kept what is here was refused"
+        time.sleep(0.02)
+    assert n.p.poll() is None, "a node starting while a command kept what is here was refused"
     lock.close()
     s.close()
     started.join()

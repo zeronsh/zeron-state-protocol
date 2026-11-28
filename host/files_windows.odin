@@ -199,7 +199,7 @@ File_Lock :: distinct win32.HANDLE
 
 // Holds a file's lock against every other process that takes it, until let go of: blocking until it is free.
 @(private)
-file_lock :: proc(path: string) -> (lock: File_Lock, ok: bool) {
+file_lock :: proc(path: string, waiting: proc(path: string) = nil) -> (lock: File_Lock, ok: bool) {
 	name := win32.utf8_to_wstring(path, context.temp_allocator)
 	// The link itself, should it be one, which is then refused: never followed to wherever it leads.
 	handle := win32.CreateFileW(name, win32.GENERIC_READ | win32.GENERIC_WRITE, win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE, nil, win32.OPEN_ALWAYS, win32.FILE_ATTRIBUTE_NORMAL | win32.FILE_FLAG_OPEN_REPARSE_POINT, nil)
@@ -211,6 +211,18 @@ file_lock :: proc(path: string) -> (lock: File_Lock, ok: bool) {
 		return
 	}
 	over: win32.OVERLAPPED
+	// Had at once if it is free; else, said to be waited for, as it is.
+	if waiting != nil {
+		if win32.LockFileEx(handle, win32.LOCKFILE_EXCLUSIVE_LOCK | win32.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &over) {
+			return File_Lock(handle), true
+		}
+		if win32.GetLastError() != win32.ERROR_LOCK_VIOLATION {
+			win32.CloseHandle(handle)
+			return
+		}
+		waiting(path)
+		over = {}
+	}
 	if !win32.LockFileEx(handle, win32.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &over) {
 		win32.CloseHandle(handle)
 		return
