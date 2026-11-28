@@ -250,7 +250,7 @@ def main():
         # AmbientCapabilities=CAP_NET_ADMIN gives it: SO_RCVBUFFORCE is allowed.
         uid, gid = str(os.getuid()), str(os.getgid())
         os.execvp("sudo", ["sudo", "-n", "unshare", "--net", "--", "setpriv", "--reuid=" + uid, "--regid=" + gid, "--init-groups",
-                           "--inh-caps=+net_admin", "--ambient-caps=+net_admin", "env", "PATH=" + os.environ["PATH"], "HOME=" + os.environ.get("HOME", "/"),
+                           "--inh-caps=+net_admin", "--ambient-caps=+net_admin", "env", "PATH=" + os.environ["PATH"], "HOME=" + os.environ.get("HOME", "/"), "ZSPD=" + BIN,
                            sys.executable, *sys.argv, "--in-namespace"])
     if args.delay and not args.in_namespace:
         # A loopback of its own, slowed, that nothing else on the machine shares: a user namespace needs no privilege,
