@@ -832,7 +832,11 @@ for (const how of ["heard of late", "crossed", "there"] as const) {
     holdBack = false;
     for (const e of held.splice(0)) hear(e);
   }
-  await until(`${how}: the pipe's lock is let go of`, () => !locks.has(pipe), 5 * 3000);
+  // Frozen as it says it has closed its end, or, there still, as it is asked whether it is there, which is within two
+  // intervals; and given up on in three intervals at most after its last word: the rest of the one it said it in, a
+  // silence, and as long again asked.
+  await until(`${how}: the leader is frozen`, () => frozen, 2 * 3000 + 1000);
+  await until(`${how}: the pipe's lock is let go of`, () => !locks.has(pipe), 3 * 3000 + 1000);
   assert(heardBack, `${how}: the leader was never heard from on the pipe`);
   assert(b.said.some((r) => "failed" in r && r.name === "StoreLocked"), `${how}: the tab was not told the store is locked`);
   Channel.prototype.postMessage = leaderSays;
