@@ -1,5 +1,5 @@
 """What `./x check` holds every .odin file here to, outside node_modules: no use of what odin-lang/Odin#8642 or #8646
-breaks.
+breaks, and no test's logger set but through tests/testlog.
 
 #8642. The runtime's `__dynamic_map_entry` (`map_entry`) can give back the slot of another key, and the pointer an insertion
 gives back (`map_insert`, `map_upsert`) can be to it too: what is written through it lands on another key. Inserting
@@ -24,6 +24,39 @@ core:net's set_option sets every integer option, and `bool` and `b8` ones, to th
 switch lists several types in one case, where the value stays an `any`). So `net.set_option` fails outright, wherever
 it is called: third_party/nbio's set_socket_option sets each option with the C type the system wants.
 
+A test's logger. core:testing counts a test's failures in the logger it runs the test with: a test that sets
+context.logger to another loses every failure it says, and passes having checked nothing. So a test sets it only to
+what testlog.quiet gives (tests/testlog/testlog.odin, which says why that loses none), as the whole of a statement:
+`context.logger = testlog.quiet(t, &q, .Code_Under_Test)`. In test code (a _test.odin file, or one that imports
+core:testing) this fails on anything else that sets it or a part of it (`context.logger.lowest_level = .Error`,
+`defer context.logger = saved`); on setting the whole context (`context = runtime.default_context()`), or a context's
+logger (`ctx.logger = ...`, `Context{logger = ...}`), or taking context's address. core:testing may be imported only by
+a _test.odin file, and testlog, so that every failure is said from a line of one, which quiet always passes on. In code
+a test runs that is not a test's own (the other files of a package `odin test` builds, and what they import from here),
+which may call back a test's own, as a hook does, this fails on the same, but in a package main's `main` and what only
+it calls, as `odin test` runs a main of its own; and the whole context may be set in a procedure of another calling
+convention, as the system calls, which has none to lose.
+
+Where a failure is said from. A location is had only from #caller_location and #location(): in test code and in code a
+test runs, this fails on any made by hand, which could say a test's failure from a line quiet does not pass on: on
+Source_Code_Location named (in code a test runs, but as the type of a parameter of a procedure with a body: not of a
+procedure type, a result, a field, a variable, a literal, a cast); on `#location(x)`, a declaration's, which may be
+another file's; on a location's type had by type_of; and on a location's file_path set. And in test code, on a location
+given a call, by name (`loc =`, `location =`) or by place to core:testing's procedures that say a failure, that is not
+#caller_location, #location() or a parameter given #caller_location by default.
+
+A thread started to say a test's failures and given no `context`: core:thread gives a thread not given one
+runtime.default_context(), whose logger says nothing. Each call of core:thread in test code given no `context` fails if
+its procedure may say a test's failures, or is one the lint cannot tell. Its procedure is followed wherever it is: a
+literal; a procedure named, of any file of its package or of another package here; a local's every value; a
+package variable's every value given it in any file; a field's every value given it in the file (`x.f = v`,
+`x := T{f = v}`); a parameter's every value given it, at each call of its procedure in its package and, but for a
+`@(private)` one, in each package here that imports it, or its default. A procedure may say a test's failures if it
+names core:testing, or names or calls one that may, or calls one through a value the lint cannot tell (the context's
+logger and allocator it can: they are runtime.default_context()'s, or what the rest of this holds them to). Where it
+cannot tell, a line may say why it is fine, on it or the line before: `// lint-thread: why`, on a thread's call for all
+of it, or on a call through a value within.
+
 Formatting is no way round it: comments and strings are taken out, and what is left is read as tokens, in statements
 split as Odin splits them. Each import is followed by the name it is given. A file is taken as built for an OS as Odin
 builds it, by its name and its `#+build` lines (./x selftest holds that to Odin itself, target by target);
@@ -40,6 +73,7 @@ import os, re, sys, tempfile
 ISSUE = "odin-lang/Odin#8642"
 TRUNC_ISSUE = "odin-lang/Odin#8646"
 OPTION_ISSUE = "core:net set_option (no issue)"
+LOGGER_ISSUE = "a test's logger (no issue)"
 # Odin's target_os_names and target_arch_names (src/build_settings.cpp, as of the release CI builds with): there is no
 # `unix`, neither as a build tag nor as the end of a file's name.
 OSES = {"windows", "darwin", "linux", "freebsd", "openbsd", "netbsd", "wasi", "js", "orca", "freestanding"}
@@ -507,7 +541,652 @@ def trunc_uses(toks, os_names):
     return sorted(set(found))
 
 
-def lint_file(path, src, wasi_built):
+def proc_bodies(toks):
+    """Each procedure's body, as (open, close, name, convention, params, proc): the indices of its `{` and `}`, the name
+    it is declared with (`name :: proc`) or None, the calling convention written after `proc` (`proc "c"`) or None, the
+    index of the `(` of its parameters, and of its `proc`. A body is the `{` after a `proc`'s parameters and what it
+    gives back, on the line its head ends on; a procedure type has none."""
+    out = []
+    for i, (kind, text, _) in enumerate(toks):
+        if kind != "ident" or text != "proc":
+            continue
+        j = i + 1
+        convention = None
+        if j < len(toks) and toks[j][0] == "string":
+            convention, j = toks[j][1], j + 1
+        if j >= len(toks) or toks[j][1] != "(":
+            continue  # proc groups, `proc{a, b}`
+        k = matching(toks, j) + 1
+        body = None
+        while k < len(toks):
+            t = toks[k]
+            if t[0] == "punct" and t[1] in "([":
+                k = matching(toks, k) + 1
+                continue
+            if t[0] == "punct" and t[1] == "{":
+                body = k
+                break
+            if t[0] == "punct" and t[1] in (",", ")", "]", "}", ";", "=", ":="):
+                break
+            if t[2] > toks[k - 1][2] and toks[k - 1][1] not in ("->", ",") and t[1] != "where":
+                break
+            k += 1
+        if body is None:
+            continue
+        name = toks[i - 2][1] if i >= 2 and toks[i - 1][1] == "::" and toks[i - 2][0] == "ident" else None
+        out.append((body, matching(toks, body), name, convention, j, i))
+    return out
+
+
+def innermost(bodies, i):
+    """The body of the procedure the token at i is in, innermost, or None."""
+    best = None
+    for b in bodies:
+        if b[0] < i < b[1] and (best is None or b[0] > best[0]):
+            best = b
+    return best
+
+
+def targets_begin(toks, i):
+    """Whether toks[i] begins one of the names a statement assigns to: before it, back to where the statement begins,
+    only names, fields of them and commas, `a, b.c, `; and not a field given in a literal, `{a = x, b`."""
+    k = i - 1
+    while k >= 0 and toks[k][1] == ",":
+        k -= 1
+        while k >= 1 and toks[k][0] == "ident" and toks[k - 1][1] == ".":
+            k -= 2
+        if k < 0 or toks[k][0] != "ident":
+            return False
+        k -= 1
+    if k < 0:
+        return True
+    return toks[k][1] in ("{", ";", "}", ":", "defer", "do") or (toks[k + 1][2] > toks[k][2] and ends_line(toks[k]))
+
+
+def field_given(toks, i):
+    """Whether `name = value` at toks[i] gives a field of a literal, or an argument by name: what is given ends at a `,`
+    or a `)`, or a `}` on its line; not at the end of its line, as a statement in a block does."""
+    depth = 0
+    for k in range(i + 2, len(toks)):
+        t = toks[k]
+        if depth == 0 and t[0] == "punct" and t[1] in (",", ")", "}"):
+            return t[1] != "}" or t[2] == toks[k - 1][2]
+        if t[0] == "punct" and t[1] in "([{":
+            depth += 1
+        elif t[0] == "punct" and t[1] in ")]}":
+            depth -= 1
+        elif depth == 0 and t[1] == ";":
+            return False
+        if depth == 0 and k + 1 < len(toks) and toks[k + 1][2] > t[2] and ends_line(t):
+            return toks[k + 1][1] in (",", ")")
+    return False
+
+
+def assigned(toks, i, j):
+    """Whether what is at toks[i:j] is assigned to: toks[j] is an assignment, or a `,` of names an assignment further
+    on in the same statement assigns to, which begin a statement."""
+    if j >= len(toks):
+        return False
+    if toks[j][0] == "punct" and toks[j][1] in ASSIGN:
+        return True
+    if toks[j][1] != "," or not targets_begin(toks, i):
+        return False
+    depth = 0
+    for k in range(j, len(toks)):
+        t = toks[k]
+        if k > j and depth == 0 and t[2] > toks[k - 1][2] and ends_line(toks[k - 1]):
+            return False
+        if t[0] == "punct" and t[1] in "([{":
+            depth += 1
+        elif t[0] == "punct" and t[1] in ")]}":
+            depth -= 1
+            if depth < 0:
+                return False
+        elif depth == 0 and t[1] == ";":
+            return False
+        elif depth == 0 and t[0] == "punct" and t[1] in ASSIGN:
+            return True
+    return False
+
+
+def chain_end(toks, j):
+    """Past the fields and indices that follow toks[j - 1]: `.a.b[i]`."""
+    while j < len(toks):
+        if toks[j][1] == "." and j + 1 < len(toks) and toks[j + 1][0] == "ident":
+            j += 2
+        elif toks[j][1] == "[":
+            j = matching(toks, j) + 1
+        else:
+            break
+    return j
+
+
+def logger_uses(toks, named, test_code, under_test, in_helper, main_only=frozenset(), unit=None, resolver=None):
+    """The lines on which a test's logger is set otherwise than through tests/testlog (see LOGGER_ISSUE above), each as
+    (line, what)."""
+    found = []
+    if not (test_code or under_test):
+        return found
+    helper = {alias for alias, p in named.items() if p.replace("\\", "/").rstrip("/").split("/")[-2:] == ["tests", "testlog"]}
+    testing_names = {alias for alias, p in named.items() if p == "core:testing"}
+    thread_names = {alias for alias, p in named.items() if p == "core:thread"}
+    bodies = proc_bodies(toks)
+
+    def excused(i, whole_context):
+        """In code a test runs that is not a test's: in a package main's main, or what only it calls, which `odin test`
+        never runs, as it makes a main of its own; or, for the whole context, in a procedure of another calling
+        convention, as the system calls, given none to lose."""
+        if test_code:
+            return False
+        b = innermost(bodies, i)
+        if b is None:
+            return False
+        if whole_context and b[3] not in (None, "odin"):
+            return True
+        while innermost(bodies, b[0]) is not None:
+            b = innermost(bodies, b[0])
+        return b[2] in main_only
+
+    def quieted(i, j):
+        """Whether `context.logger = ` at toks[i:j+1] assigns exactly what testlog.quiet gives, and nothing else."""
+        k = j + 1
+        if not test_code or toks[j][1] != "=":
+            return False
+        if k + 2 < len(toks) and toks[k][1] in helper and toks[k + 1][1] == "." and toks[k + 2][1] == "quiet":
+            k += 3
+        elif in_helper and k < len(toks) and toks[k][1] == "quiet":
+            k += 1
+        else:
+            return False
+        if k >= len(toks) or toks[k][1] != "(":
+            return False
+        close = matching(toks, k)
+        after = close + 1
+        return after >= len(toks) or toks[after][2] > toks[close][2] or toks[after][1] in (";", "}")
+
+    who = "a test" if test_code else "code a test runs"
+    for i, (kind, text, line) in enumerate(toks):
+        if kind != "ident":
+            continue
+        before = toks[i - 1][1] if i > 0 else ""
+        if text == "context" and before != ".":
+            if before == "&" and not excused(i, False):
+                found.append((line, f"{who} takes context's address: whatever is set through it, its logger among it, is not quiet's"))
+                continue
+            j = chain_end(toks, i + 1)
+            if not assigned(toks, i, j):
+                continue
+            if j == i + 1:
+                if not excused(i, True):
+                    found.append((line, f"{who} sets the whole context, and with it a logger that is not the test runner's"))
+            elif toks[i + 2][1] == "logger" and not (j == i + 3 and quieted(i, j)) and not excused(i, False):
+                found.append((line, f"{who} sets context.logger otherwise than to what testlog.quiet gives: what is said of a failure may never be counted"))
+        elif text == "logger" and before == "." and not (i >= 2 and toks[i - 2][1] == "context" and (i < 3 or toks[i - 3][1] != ".")):
+            owner = i - 2
+            while owner >= 2 and toks[owner - 1][1] == "." and toks[owner - 2][0] == "ident":
+                owner -= 2
+            if assigned(toks, owner, chain_end(toks, i + 1)) and not excused(i, False):
+                found.append((line, f"{who} sets a context's logger, as for a thread: one that is not quiet's"))
+        elif text == "logger" and before in ("{", ",", "(") and i + 1 < len(toks) and toks[i + 1][1] == "=":
+            if field_given(toks, i) and not (before == "," and targets_begin(toks, i)) and not excused(i, False):
+                found.append((line, f"{who} makes a context with a logger of its own: one that is not quiet's"))
+    found += location_uses(toks, bodies, test_code)
+    if test_code:
+        found += location_arguments(toks, bodies, testing_names)
+        if thread_names and unit is not None:
+            found += thread_failures(unit, resolver)
+    return found
+
+
+LOCATION_DIRECTIVES = ("caller_location", "location")
+# The procedures of core:testing that say a failure, and how many arguments each takes before its location, by place.
+FAILING = {"expect": 4, "expect_value": 3, "fail": 1, "fail_now": 2, "expectf": None}
+
+
+def location_uses(toks, bodies, test_code):
+    """The lines on which a location is made by hand (see LOGGER_ISSUE above), each as (line, what): the only locations
+    are what #caller_location and #location() give."""
+    found = []
+    in_params = lambda i: any(b[4] < i < matching(toks, b[4]) for b in bodies)
+    for i, (kind, text, line) in enumerate(toks):
+        nxt = toks[i + 1][1] if i + 1 < len(toks) else ""
+        if kind == "ident" and text == "Source_Code_Location":
+            if test_code:
+                found.append((line, "a test names Source_Code_Location, as to make a location by hand: it may take only what #caller_location gives"))
+            elif not in_params(i):
+                found.append((line, "code a test runs names Source_Code_Location but as a parameter's, as to make a location by hand"))
+        elif kind == "punct" and text == "#" and nxt == "location" and i + 3 < len(toks) and toks[i + 2][1] == "(" and toks[i + 3][1] != ")":
+            found.append((line, "#location of a declaration, which may be another file's: only #location() is of where it is said"))
+        elif kind == "ident" and text == "type_of" and nxt == "(":
+            close = matching(toks, i + 1)
+            if any(toks[k][1] == "#" and toks[k + 1][1] in LOCATION_DIRECTIVES for k in range(i + 2, close)):
+                found.append((line, "a location's type had by type_of, as to make one by hand"))
+        elif kind == "ident" and text == "file_path":
+            before = toks[i - 1][1] if i else ""
+            if (before == "." and assigned(toks, i, chain_end(toks, i + 1))) or (before in ("{", ",", "(") and nxt == "=" and field_given(toks, i)):
+                found.append((line, "a location's file set by hand"))
+    return found
+
+
+def caller_param(toks, bodies, i, name):
+    """Whether name, at i, is a parameter of the procedure i is in, given by default where it is called from."""
+    b = innermost(bodies, i)
+    if b is None:
+        return False
+    close = matching(toks, b[4])
+    for k in range(b[4] + 1, close - 3):
+        if toks[k][1] == name and toks[k - 1][1] in ("(", ",") and toks[k + 1][1] == ":=" and toks[k + 2][1] == "#" and toks[k + 3][1] == "caller_location":
+            return True
+    return False
+
+
+def location_arguments(toks, bodies, testing_names):
+    """In test code, each location given a call by name (`loc =`, `location =`), or by place to one of core:testing's
+    FAILING, that is not what #caller_location or #location() gives here, nor a parameter given by default where it is
+    called from: a failure said there would be said from wherever it was had, which quiet may not pass on."""
+    found = []
+
+    def fine(a, b):
+        words = [t[1] for t in toks[a:b]]
+        if words in (["#", "caller_location"], ["#", "location", "(", ")"]):
+            return True
+        return b - a == 1 and toks[a][0] == "ident" and caller_param(toks, bodies, a, toks[a][1])
+
+    for i, (kind, text, line) in enumerate(toks):
+        if kind != "ident" or i + 1 >= len(toks) or toks[i + 1][1] != "(" or (i and toks[i - 1][1] == "#"):
+            continue
+        close = matching(toks, i + 1)
+        failing = i >= 2 and toks[i - 1][1] == "." and toks[i - 2][1] in testing_names and text in FAILING
+        args = split_depth0(toks, i + 2, close, {","}) if close > i + 2 else []
+        for place, (a, b) in enumerate(args):
+            if b == a:
+                continue  # after a trailing comma
+            if b - a >= 2 and toks[a][0] == "ident" and toks[a + 1][1] == "=":
+                if toks[a][1] in ("loc", "location") and not fine(a + 2, b):
+                    found.append((toks[a][2], "a location given that is not where it is said from: a failure said with it may not be passed on"))
+            elif failing and FAILING[text] is not None and place >= FAILING[text] and not fine(a, b):
+                found.append((toks[a][2], "a location given that is not where it is said from: a failure said with it may not be passed on"))
+    return found
+
+
+# Of core:thread's procedures, which argument, by place, is the procedure the thread runs (core/thread/thread.odin,
+# thread_pool.odin).
+THREAD_PROC = {"create": 0, "create_and_start": 0, "run": 0, "create_and_start_with_data": 1, "run_with_data": 1,
+               "create_and_start_with_poly_data": 1, "run_with_poly_data": 1, "create_and_start_with_poly_data2": 2,
+               "run_with_poly_data2": 2, "create_and_start_with_poly_data3": 3, "run_with_poly_data3": 3,
+               "create_and_start_with_poly_data4": 4, "run_with_poly_data4": 4, "pool_add_task": 2}
+UNRESOLVED = "unresolved"
+
+
+class Unit:
+    """A file, as the thread rule reads it."""
+
+    def __init__(self, path, src):
+        self.path, self.src = path, src
+        self.toks = tokens(src)
+        self.bodies = proc_bodies(self.toks)
+        named = imports(self.toks)
+        self.imports = named
+        self.testing = {a for a, p in named.items() if p == "core:testing"}
+        self.thread = {a for a, p in named.items() if p == "core:thread"}
+        self.procs, self.vars, depth = {}, set(), 0
+        for b in self.bodies:
+            if b[2] and innermost(self.bodies, b[0]) is None:
+                self.procs.setdefault(b[2], []).append(b)
+        for i, t in enumerate(self.toks):
+            if t[0] == "punct" and t[1] in "([{":
+                depth += 1
+            elif t[0] == "punct" and t[1] in ")]}":
+                depth -= 1
+            elif depth == 0 and t[0] == "ident" and i + 1 < len(self.toks) and self.toks[i + 1][1] in (":", ":=") and targets_begin(self.toks, i):
+                self.vars.add(t[1])  # a variable of the package's, whose value may be any procedure
+
+    def annotated(self, line):
+        """Whether the line, or the one before, says why what the thread rule cannot tell is fine: `// lint-thread: why`."""
+        lines = self.src.splitlines()
+        return any(0 < n <= len(lines) and re.search(r"//\s*lint-thread:\s*\S", lines[n - 1]) for n in (line, line - 1))
+
+
+class Resolver:
+    """Every procedure of every package here, by name, across all its files, test or not: what the thread rule follows."""
+
+    def __init__(self, root):
+        self.root = root
+        self.units, self.dirs, self.memo = {}, {}, {}
+
+    def unit(self, path, src=None):
+        path = os.path.normpath(path)
+        if path not in self.units:
+            if src is None:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    src = f.read()
+            self.units[path] = Unit(path, src)
+        return self.units[path]
+
+    def package(self, d):
+        d = os.path.normpath(d)
+        if d not in self.dirs:
+            self.dirs[d] = [self.unit(os.path.join(d, n)) for n in sorted(os.listdir(d)) if n.endswith(".odin")] if os.path.isdir(d) else []
+        return self.dirs[d]
+
+    def procs(self, unit, name):
+        """The procedures of unit's package named so, each as (unit, body); and whether a variable of it is."""
+        refs, var = [], False
+        for u in self.package(os.path.dirname(unit.path)):
+            refs += [(u, b) for b in u.procs.get(name, [])]
+            var = var or name in u.vars
+        return refs, var
+
+    def imported(self, unit, alias):
+        """The directory of a package unit imports from here by alias, or None for core's, or one not imported."""
+        p = unit.imports.get(alias)
+        if p is None or not p.startswith("."):
+            return None
+        return os.path.normpath(os.path.join(os.path.dirname(unit.path), p))
+
+    def value(self, unit, a, depth):
+        """The procedures an expression at unit.toks[a] may be, as (unit, body) each, or UNRESOLVED: a literal, a name,
+        another package's, or a field of a name; anything else may be any."""
+        toks = unit.toks
+        b = a
+        while b < len(toks) and toks[b][1] not in (",", ")", "}", ";") and not (b > a and toks[b][2] > toks[b - 1][2] and ends_line(toks[b - 1])):
+            if toks[b][0] == "punct" and toks[b][1] in ("(", "[", "{"):
+                b = matching(toks, b)
+            b += 1
+        if depth > 12:
+            return UNRESOLVED
+        if toks[a][1] == "proc":
+            lit = [x for x in unit.bodies if x[5] == a]
+            return [(unit, lit[0])] if lit else []  # with no body, foreign (`---`) or a type: none of ours
+        if b - a == 1 and toks[a][1] == "nil":
+            return []
+        if b - a == 1 and toks[a][0] == "ident":
+            return self.name(unit, a, toks[a][1], depth + 1, strict=True)
+        if b - a == 3 and toks[a][0] == "ident" and toks[a + 1][1] == "." and toks[a + 2][0] == "ident":
+            if toks[a][1] in unit.imports:
+                return self.external(unit, toks[a][1], toks[a + 2][1])
+            return self.field(unit, a, toks[a][1], toks[a + 2][1], depth + 1)
+        return UNRESOLVED
+
+    def external(self, unit, alias, name):
+        d = self.imported(unit, alias)
+        if d is None:
+            return []  # core's, which says no test's failures but through what is given it, followed where it is given
+        refs = [(u, b) for u in self.package(d) for b in u.procs.get(name, [])]
+        if any(name in u.vars for u in self.package(d)):
+            return UNRESOLVED
+        return refs
+
+    def name(self, unit, i, name, depth, strict=False):
+        """What a name at i may be, as procedures: a local's every value, a parameter's any, the package's procedures of
+        that name; nothing, if it is none of these (a type, a constant, the language's own), or UNRESOLVED if strict."""
+        toks, refs = unit.toks, []
+        b = innermost(unit.bodies, i)
+        while b is not None:
+            close = matching(toks, b[4])
+            params = split_depth0(toks, b[4] + 1, close, {","}) if close > b[4] + 1 else []
+            for place, (pa, pb) in enumerate(params):
+                if pb > pa and toks[pa][1] == name and (pa + 1 == pb or toks[pa + 1][1] in (":", ":=", ",")):
+                    return self.parameter(unit, b, place, name, params, depth)
+            declared = False
+            for k in range(b[0] + 1, b[1]):
+                if toks[k][1] != name or toks[k][0] != "ident" or (k and toks[k - 1][1] == "."):
+                    continue
+                op = toks[k + 1][1] if k + 1 < len(toks) else ""
+                if op in ("::", ":=", ":", "=") and targets_begin(toks, k):
+                    declared = declared or op != "="
+                    if op == "::":
+                        v = toks[k + 2][1] if k + 2 < len(toks) else ""
+                        r = self.value(unit, k + 2, depth) if v == "proc" else []
+                    elif op == ":":
+                        eq = [x for x in range(k + 2, len(toks)) if toks[x][1] == "=" or toks[x][2] > toks[k][2]]
+                        r = self.value(unit, eq[0] + 1, depth) if eq and toks[eq[0]][1] == "=" else UNRESOLVED
+                    else:
+                        r = self.value(unit, k + 2, depth)
+                    if r == UNRESOLVED:
+                        return UNRESOLVED
+                    refs += r
+            if declared:
+                return refs
+            b = innermost(unit.bodies, b[0])
+        found, var = self.procs(unit, name)
+        if var:
+            return self.assigned_values(unit, name, depth)
+        if not found and strict:
+            return UNRESOLVED
+        return found
+
+    def parameter(self, unit, b, place, name, params, depth):
+        """What a parameter may be, as procedures: what each call of its procedure gives it, by place or by name, or its
+        default where it is given nothing; UNRESOLVED if the procedure is a literal, called where the lint cannot see,
+        or is variadic there. Its calls are looked for in its package, and, but for one of the package's own
+        (`@(private)`), in each package here that imports it."""
+        toks = unit.toks
+        if depth > 12 or b[2] is None or innermost(unit.bodies, b[0]) is not None:
+            return UNRESOLVED
+        pa, pb = params[place]
+        if any(toks[x][1] == ".." for x in range(pa, pb)):
+            return UNRESOLVED
+        default = next((x + 1 for x in range(pa, pb) if toks[x][1] in ("=", ":=")), None)
+        decl = b[5] - 2
+        private = any(toks[x][1] == "private" for x in range(max(0, decl - 8), decl) if toks[x][2] >= toks[decl][2] - 1)
+        here = os.path.dirname(unit.path)
+        places = [(u, None) for u in self.package(here)]
+        if not private:
+            for d in self.all_dirs():
+                for u in self.package(d):
+                    places += [(u, a) for a, p in u.imports.items() if p.startswith(".") and self.imported(u, a) == os.path.normpath(here)]
+        refs, calls = [], 0
+        for u, alias in places:
+            ut = u.toks
+            for k in range(len(ut) - 1):
+                if ut[k][1] != b[2] or ut[k + 1][1] != "(" or (u is unit and k == decl):
+                    continue
+                if alias is None and k and ut[k - 1][1] == ".":
+                    continue
+                if alias is not None and not (k >= 2 and ut[k - 1][1] == "." and ut[k - 2][1] == alias):
+                    continue
+                calls += 1
+                close = matching(ut, k + 1)
+                args = [x for x in (split_depth0(ut, k + 2, close, {","}) if close > k + 2 else []) if x[1] > x[0]]
+                given = next((a + 2 for a, e in args if e - a >= 2 and ut[a][1] == name and ut[a + 1][1] == "="), None)
+                if given is None and place < len(args) and not (ut[args[place][0] + 1][1] == "=" and ut[args[place][0]][0] == "ident"):
+                    given = args[place][0]
+                if given is not None:
+                    r = self.value(u, given, depth + 1)
+                elif default is not None:
+                    r = self.value(unit, default, depth + 1)
+                else:
+                    r = UNRESOLVED
+                if r == UNRESOLVED:
+                    return UNRESOLVED
+                refs += r
+        return refs
+
+    def all_dirs(self):
+        if not hasattr(self, "_dirs"):
+            self._dirs = []
+            for d, dirs, files in os.walk(self.root):
+                dirs[:] = sorted(x for x in dirs if x not in ("node_modules", ".git"))
+                if any(f.endswith(".odin") for f in files):
+                    self._dirs.append(os.path.normpath(d))
+        return self._dirs
+
+    def of_context(self, unit, a):
+        """Whether the owner at a is the context's logger or allocator, or a local copy of either: whose procedure, in a
+        thread given no context, is runtime.default_context()'s, and anywhere is the runner's, quiet's, or one set in a
+        package main's main, the lint holding everything else to that."""
+        toks = unit.toks
+        if a >= 2 and toks[a - 1][1] == "." and toks[a - 2][1] == "context" and toks[a][1] in ("logger", "allocator", "temp_allocator"):
+            return True
+        b = innermost(unit.bodies, a)
+        while b is not None:
+            for k in range(b[0] + 1, b[1] - 3):
+                if toks[k][1] == toks[a][1] and toks[k + 1][1] == ":=" and toks[k + 2][1] == "context" and toks[k + 3][1] == "." and toks[k + 4][1] in ("logger", "allocator", "temp_allocator") and targets_begin(toks, k):
+                    return True
+            b = innermost(unit.bodies, b[0])
+        return False
+
+    def assigned_values(self, unit, name, depth):
+        """What a variable of unit's package may be, as procedures: each value it is given, in any of its files."""
+        refs = []
+        for u in self.package(os.path.dirname(unit.path)):
+            toks = u.toks
+            for k in range(len(toks) - 2):
+                if toks[k][1] != name or toks[k][0] != "ident" or (k and toks[k - 1][1] == ".") or not targets_begin(toks, k):
+                    continue
+                op = toks[k + 1][1]
+                if op in ("=", ":="):
+                    r = self.value(u, k + 2, depth + 1)
+                elif op == ":":
+                    eq = next((x for x in range(k + 2, len(toks)) if toks[x][1] == "=" or toks[x][2] > toks[k][2]), None)
+                    if eq is None or toks[eq][1] != "=":
+                        continue  # declared, given nothing: nil
+                    r = self.value(u, eq + 1, depth + 1)
+                else:
+                    continue
+                if r == UNRESOLVED:
+                    return UNRESOLVED
+                refs += r
+        return refs
+
+    def local(self, unit, i, name):
+        """Whether name, at i, is a parameter or a local of the procedures it is in."""
+        toks = unit.toks
+        b = innermost(unit.bodies, i)
+        while b is not None:
+            close = matching(toks, b[4])
+            if any(toks[k][1] == name and toks[k - 1][1] in ("(", ",") and toks[k + 1][1] in (":", ":=") for k in range(b[4] + 1, close)):
+                return True
+            if any(toks[k][1] == name and toks[k + 1][1] in ("::", ":=", ":") and toks[k - 1][1] != "." and targets_begin(toks, k) for k in range(b[0] + 1, b[1])):
+                return True
+            b = innermost(unit.bodies, b[0])
+        return False
+
+    def field(self, unit, i, owner, field, depth):
+        """What owner.field may be, as procedures: each value it is given in the file, `owner.field = v`, or in a literal
+        owner is made with, `owner := T{field = v}`; UNRESOLVED if it is given none there, or one that cannot be told."""
+        toks, refs, given = unit.toks, [], False
+        for k in range(len(toks) - 3):
+            if toks[k][1] != owner or toks[k][0] != "ident" or (k and toks[k - 1][1] == "."):
+                continue
+            if toks[k + 1][1] == "." and toks[k + 2][1] == field and toks[k + 3][1] == "=":
+                r, given = self.value(unit, k + 4, depth), True
+            elif toks[k + 1][1] in (":=", "=", ":") and targets_begin(toks, k):
+                lit = next((x for x in range(k + 2, min(len(toks), k + 8)) if toks[x][1] == "{"), None)
+                if lit is None:
+                    continue
+                r = []
+                for a, b in split_depth0(toks, lit + 1, matching(toks, lit), {","}):
+                    if b - a >= 3 and toks[a][1] == field and toks[a + 1][1] == "=":
+                        r, given = self.value(unit, a + 2, depth), True
+            else:
+                continue
+            if r == UNRESOLVED:
+                return UNRESOLVED
+            refs += r
+        return refs if given else UNRESOLVED
+
+    def says(self, unit, body, seen=None):
+        """Whether a procedure may say a test's failures: as (where, why) if it may, else None. It may if it names
+        core:testing; or calls, or names, a procedure that may; or calls one through a value the lint cannot tell,
+        unless that line says why it is fine (`// lint-thread: why`)."""
+        key = (unit.path, body[0])
+        top = seen is None
+        if key in self.memo:
+            return self.memo[key]
+        seen = set() if top else seen
+        if key in seen:
+            return None
+        seen.add(key)
+        toks, out = unit.toks, None
+        rel = os.path.relpath(unit.path, self.root)
+        for a in range(body[0] + 1, body[1]):
+            kind, text, line = toks[a]
+            if kind != "ident" or text in KEYWORDS:
+                continue
+            before = toks[a - 1][1]
+            call = a + 1 < len(toks) and toks[a + 1][1] == "("
+            if text in unit.testing and toks[a + 1][1] == ".":
+                out = (f"{rel}:{line}", "names core:testing")
+                break
+            if before == "#":
+                continue
+            if before == "." and call and text == "procedure" and toks[a - 2][0] == "ident" and self.of_context(unit, a - 2):
+                continue  # the context's logger or allocator
+            if before == "." and toks[a - 2][0] == "ident" and (a < 3 or toks[a - 3][1] != "."):
+                owner = toks[a - 2][1]
+                if owner in unit.imports:
+                    refs = self.external(unit, owner, text)
+                elif call:
+                    refs = self.field(unit, a - 2, owner, text, 0)
+                else:
+                    continue
+            elif before == "." and call:
+                refs = UNRESOLVED  # a field of a field, or of what an expression gives
+            elif before == ".":
+                continue
+            elif call:
+                refs = self.name(unit, a, text, 0)
+            elif toks[a + 1][1] in (":", "::", ":=", "=") or self.local(unit, a, text):
+                continue  # what is declared or given, or a local, called where it is called
+            else:
+                refs = self.procs(unit, text)[0]  # a procedure named, given to whatever may call it
+            if refs == UNRESOLVED:
+                if unit.annotated(line):
+                    continue
+                out = (f"{rel}:{line}", f"calls {text} through a value the lint cannot tell")
+                break
+            for u, b in refs:
+                out = self.says(u, b, seen)
+                if out:
+                    break
+            if out:
+                break
+        if top:
+            self.memo[key] = out  # what is found within a cycle may want what it is in, not yet known
+        return out
+
+
+def thread_failures(unit, resolver):
+    """A thread started that may say a test's failures, with no logger of the test's: core:thread starts a thread given
+    no context with runtime.default_context(), whose logger says nothing. Each call of core:thread given no `context`
+    itself, whose procedure may (Resolver.says), or is one the lint cannot tell, unless it says why it is fine
+    (`// lint-thread: why`)."""
+    found, toks = [], unit.toks
+    for i, (kind, text, line) in enumerate(toks):
+        if kind != "ident" or text not in unit.thread or i + 3 >= len(toks) or toks[i + 1][1] != "." or toks[i + 3][1] != "(":
+            continue
+        what = toks[i + 2][1]
+        k = i + 3
+        close = matching(toks, k)
+        args = split_depth0(toks, k + 1, close, {","}) if close > k + 1 else []
+        procs = []
+        for place, (a, b) in enumerate(args):
+            if b - a >= 2 and toks[a][0] == "ident" and toks[a + 1][1] == "=":
+                if toks[a][1] in ("fn", "procedure"):
+                    procs.append(a + 2)
+            elif THREAD_PROC.get(what) == place or (what not in THREAD_PROC and toks[a][1] == "proc"):
+                procs.append(a)
+        inner = [b for b in unit.bodies if k < b[0] < close]
+        if any(toks[a][0] == "ident" and toks[a][1] == "context" and not any(b[0] < a < b[1] for b in inner) for a in range(k + 1, close)):
+            continue
+        if unit.annotated(line):
+            continue
+        for a in procs:
+            refs = resolver.value(unit, a, 0)
+            if refs == UNRESOLVED:
+                found.append((line, f"a thread whose procedure the lint cannot tell is given no context: give it the test's (init_context = context), or say why it is fine (// lint-thread: why)"))
+                continue
+            for u, b in refs:
+                says = resolver.says(u, b)
+                if says:
+                    found.append((line, f"a thread that may say a test's failures ({says[1]}, {says[0]}) is given no context, and so no logger of the test's: give it the test's (init_context = context), or say why it is fine (// lint-thread: why)"))
+                    break
+    return found
+
+
+def lint_file(path, src, wasi_built, under_test=False, in_helper=False, main_only=frozenset(), resolver=None):
     """Each use in a file, as (line, what, issue)."""
     toks = tokens(src)
     found = []
@@ -549,6 +1228,14 @@ def lint_file(path, src, wasi_built):
         if "core:os" in by_path:
             for line in trunc_uses(toks, by_path["core:os"]):
                 found.append((line, ".Trunc without .Create, in a file built for Windows that imports core:os: core:os's open fails so with error 87 there", TRUNC_ISSUE))
+    test_code = os.path.basename(path).endswith("_test.odin") or "core:testing" in by_path
+    if "core:testing" in by_path and not os.path.basename(path).endswith("_test.odin") and not in_helper:
+        line = next(t[2] for t in toks if t[0] == "string" and t[1] == "core:testing")
+        found.append((line, "core:testing imported outside a _test.odin file: a failure said from it is said from a line testlog.quiet does not pass on", LOGGER_ISSUE))
+    resolver = resolver or Resolver(os.path.dirname(os.path.abspath(path)))
+    unit = resolver.unit(path, src)
+    for line, what in logger_uses(toks, named, test_code, under_test and not test_code, in_helper, main_only, unit, resolver):
+        found.append((line, what, LOGGER_ISSUE))
     return found
 
 
@@ -584,6 +1271,75 @@ def wasi_packages(root):
     return seen
 
 
+def tested_packages(root):
+    """The package directories `odin test` builds: those with a _test.odin file, and what they import from here, all the
+    way down."""
+    todo, seen = set(), set()
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in ("node_modules", ".git")]
+        if any(f.endswith("_test.odin") for f in files):
+            todo.add(os.path.normpath(d))
+    while todo:
+        d = todo.pop()
+        if d in seen or not os.path.isdir(d):
+            continue
+        seen.add(d)
+        for name in os.listdir(d):
+            if name.endswith(".odin"):
+                with open(os.path.join(d, name), encoding="utf-8", errors="replace") as f:
+                    for p in imports(tokens(f.read())).values():
+                        if p.startswith("."):
+                            todo.add(os.path.normpath(os.path.join(d, p)))
+    return seen
+
+
+def package_name(toks):
+    for i, t in enumerate(toks[:-1]):
+        if t[0] == "ident" and t[1] == "package":
+            return toks[i + 1][1]
+    return None
+
+
+def main_only(sources):
+    """Of a package main's files ({path: source}), main and the procedures declared in them that only main calls, or
+    another of these: each named somewhere in the package, and nowhere but in the body of one, outside its own. `odin
+    test` runs none of them, as it runs no main but its own; and no package main is imported. Of another package's,
+    none."""
+    found = {}
+    names = {}
+    for path, src in sources.items():
+        toks = tokens(src)
+        if package_name(toks) != "main":
+            return set()
+        bodies = proc_bodies(toks)
+        found[path] = (toks, bodies)
+        for b in bodies:
+            if b[2] and innermost(bodies, b[0]) is None:
+                names[b[2]] = names.get(b[2], 0) + 1
+    only = {"main"}
+    while True:
+        grown = set(only)
+        for name, count in names.items():
+            if name in only or count != 1:
+                continue
+            ok, named = True, False
+            for toks, bodies in found.values():
+                for i, t in enumerate(toks):
+                    if t[0] != "ident" or t[1] != name or (i + 1 < len(toks) and toks[i + 1][1] == "::"):
+                        continue
+                    b = innermost(bodies, i)
+                    while b is not None and innermost(bodies, b[0]) is not None:
+                        b = innermost(bodies, b[0])
+                    named = True
+                    if b is None or b[2] not in only or b[2] == name:
+                        ok = False
+            if ok and named:
+                grown.add(name)
+        if grown == only:
+            return only
+        only = grown
+
+
 def is_repro(rel, src):
     """Whether a file is one of the repros of what is broken, which must use it: in tests/upstream, and saying so in its
     first line."""
@@ -594,6 +1350,10 @@ def is_repro(rel, src):
 def lint(root):
     """Each use under root, as (path, line, what, issue)."""
     wasi = wasi_packages(root)
+    tested = tested_packages(root)
+    helper = os.path.normpath(os.path.join(root, "tests", "testlog"))
+    resolver = Resolver(root)
+    mains = {}
     out = []
     for d, dirs, files in os.walk(root):
         dirs[:] = sorted(x for x in dirs if x not in ("node_modules", ".git"))
@@ -604,7 +1364,15 @@ def lint(root):
                     src = f.read()
                 if is_repro(os.path.relpath(path, root), src):
                     continue
-                for line, what, issue in lint_file(path, src, os.path.normpath(d) in wasi):
+                pkg = os.path.normpath(d)
+                if pkg in tested and pkg not in mains:
+                    sources = {}
+                    for other in sorted(os.listdir(pkg)):
+                        if other.endswith(".odin"):
+                            with open(os.path.join(pkg, other), encoding="utf-8", errors="replace") as f:
+                                sources[other] = f.read()
+                    mains[pkg] = frozenset(main_only(sources))
+                for line, what, issue in lint_file(path, src, pkg in wasi, pkg in tested, pkg == helper, mains.get(pkg, frozenset()), resolver):
                     out.append((os.path.relpath(path, root), line, what, issue))
     return out
 
@@ -852,6 +1620,299 @@ o :: proc(s: net.TCP_Socket) {
 }
 set_option :: proc(_: net.TCP_Socket, _: int, _: bool) {}
 """,
+    "d/quiet_test.odin": """package d
+import "base:runtime"
+import "core:log"
+import "core:testing"
+import "core:thread"
+import "../tests/testlog"
+import tl "../tests/testlog"
+import "../e"
+q :: proc(t: ^testing.T) {
+	quieted: testlog.Quiet
+	context.logger = testlog.quiet(t, &quieted, .Code_Under_Test)
+	context.logger = tl.quiet(t, &quieted, .Below_Errors) // and a comment
+	context.logger = testlog.quiet(
+		t, &quieted, .Below_Errors,
+	)
+	if t != nil { context.logger = testlog.quiet(t, &quieted, .Below_Errors) }
+	saved := context.logger
+	logger := context.logger
+	logger = context.logger
+	a, logger2 := 1, context.logger
+	b, logger = 2, saved
+	{
+		logger = saved
+	}
+	_, _, _ = a, b, logger2
+	context.logger.procedure(context.logger.data, .Info, "x", context.logger.options)
+	l := runtime.Logger{lowest_level = context.logger.lowest_level, procedure = context.logger.procedure}
+	_ = l
+	context.allocator = context.temp_allocator
+	_ = "context.logger = log.nil_logger()"
+	// context.logger = log.nil_logger()
+	/* context = runtime.default_context() */
+	e.run(t)
+	th := thread.create_and_start_with_poly_data(t, proc(t: ^testing.T) {
+		testing.expect(t, true)
+	}, init_context = context)
+	thread.join(th)
+	th2 := thread.create_and_start_with_poly_data(t, proc(t: ^testing.T) {
+		log.info("nothing of the test's")
+	})
+	thread.join(th2)
+	th3 := thread.create_and_start_with_poly_data(t, says, context)
+	thread.join(th3)
+}
+says :: proc(t: ^testing.T) {
+	testing.expect(t, true)
+}
+""",
+    "d/flagged_test.odin": """package d
+import "base:runtime"
+import "core:log"
+import "core:testing"
+import "core:thread"
+import "../tests/testlog"
+import other "../e"
+Holder :: struct { ctx: runtime.Context }
+f :: proc(t: ^testing.T) {
+	q: testlog.Quiet
+	context.logger = log.nil_logger() // use logger
+	context.logger = runtime.Logger{} // use logger
+	context . logger = // use logger
+		log.nil_logger()
+	context. // use logger
+		logger = log.nil_logger()
+	saved := context.logger
+	defer context.logger = saved // use logger
+	context.logger.lowest_level = .Error // use logger
+	context.logger.options = {} // use logger
+	context = runtime.default_context() // use logger
+	ctx := context
+	ctx.logger = log.nil_logger() // use logger
+	ctx.logger.data = nil // use logger
+	holder: Holder
+	holder.ctx.logger = saved // use logger
+	ctx2 := runtime.Context{logger = log.nil_logger()} // use logger
+	ctx3 := runtime.Context{
+		allocator = context.allocator,
+		logger = saved, // use logger
+	}
+	p := &context // use logger
+	pl := &context.logger // use logger
+	_, _, _, _ = ctx2, ctx3, p, pl
+	context.logger, ctx.allocator = saved, ctx.allocator // use logger
+	context.logger = testlog.quiet(t, &q, .Below_Errors) if t != nil else saved // use logger
+	context.logger = other.quiet(t, &q, .Below_Errors) // use logger
+	context.logger = quiet(t, &q, .Below_Errors) // use logger
+	if t != nil do context.logger = saved // use logger
+	th := thread.create_and_start_with_poly_data(t, proc(t: ^testing.T) { // use logger
+		testing.expect(t, false)
+	})
+	th2 := thread.create_and_start_with_poly_data(t, fails) // use logger
+	th3 := thread.create_and_start_with_poly_data(t, proc(t: ^testing.T) { // use logger
+		testing.expect(t, false)
+	}, init_context = runtime.default_context())
+	_, _, _ = th, th2, th3
+}
+fails :: proc(t: ^testing.T) {
+	testing.expect(t, false)
+}
+""",
+    "d/helpers.odin": """package d
+import "core:testing" // use logger
+h :: proc(t: ^testing.T) { testing.expect(t, false) }
+""",
+    "e/e.odin": """package e
+import "base:runtime"
+import "core:log"
+run :: proc(_: rawptr) {
+	context.logger = log.nil_logger() // use logger
+	context = runtime.default_context() // use logger
+	ctx := context
+	ctx.logger = log.nil_logger() // use logger
+	_ = ctx
+	logger := context.logger
+	_ = logger
+}
+main :: proc() {
+	context.logger = log.nil_logger() // use logger
+}
+signalled :: proc "system" () {
+	context = runtime.default_context()
+	context.logger = log.nil_logger() // use logger
+}
+none :: proc "contextless" () {
+	context = runtime.default_context()
+}
+""",
+    "g/g.odin": """package main
+import "base:runtime"
+import "core:log"
+main :: proc() {
+	context.logger = log.nil_logger()
+	start()
+	both()
+	_ = proc() { context.logger = log.nil_logger() }
+}
+start :: proc() {
+	context.logger = log.nil_logger()
+	context = runtime.default_context()
+	deeper()
+}
+deeper :: proc() { context.logger = log.nil_logger() }
+both :: proc() { context.logger = log.nil_logger() } // use logger
+unnamed :: proc() { context.logger = log.nil_logger() } // use logger
+""",
+    "g/g_test.odin": """package main
+import "core:testing"
+t :: proc(t: ^testing.T) { both() }
+""",
+    "d/threads_test.odin": """package d
+import "base:runtime"
+import "core:testing"
+import "core:thread"
+import "../e"
+Work :: struct { t: ^testing.T, fn: proc(t: ^testing.T), go: proc(t: ^testing.T) }
+foreign import libc "system:c"
+foreign libc { getpid :: proc "c" () -> i32 --- }
+hook: proc(t: ^testing.T)
+threads :: proc(t: ^testing.T, given: proc(t: ^testing.T)) {
+	hook = fails_elsewhere
+	a := thread.create_and_start_with_poly_data(t, fails_elsewhere) // use logger
+	b := thread.create_and_start_with_poly_data(t, proc(t: ^testing.T) { // use logger
+		check_elsewhere(t)
+	})
+	p := fails_elsewhere
+	c := thread.create_and_start_with_poly_data(t, p) // use logger
+	w := Work{t = t, fn = fails_elsewhere}
+	d := thread.create_and_start_with_poly_data(t, w.fn) // use logger
+	ee := thread.create_and_start_with_poly_data(t, proc(t: ^testing.T) { // use logger
+		hook(t)
+	})
+	_ = ee
+	f := thread.create_and_start_with_poly_data(t, pick()) // use logger
+	g := thread.create_and_start_with_poly_data(t, pick()) // lint-thread: pick gives one that says nothing
+
+	h := thread.create_and_start_with_poly_data(&w, proc(w: ^Work) { // use logger
+		w.go(w.t)
+	})
+	i := thread.create_and_start_with_poly_data(&w, proc(w: ^Work) {
+		w.go(w.t) // lint-thread: what is given go here says nothing
+	})
+	j := thread.create_and_start_with_poly_data(t, given) // use logger
+	q := quiet_elsewhere
+	k := thread.create_and_start_with_poly_data(t, q)
+	l := thread.create_and_start_with_poly_data(t, proc(t: ^testing.T) {
+		_ = getpid()
+		_ = len("x")
+		_ = runtime.default_logger()
+	})
+	m := thread.create_and_start_with_poly_data(t, fails_elsewhere, context)
+	n := thread.create_and_start_with_poly_data(t, proc(t: ^testing.T) {
+		l := context.logger
+		l.procedure(l.data, .Info, "x", l.options)
+		context.allocator.procedure(nil, .Free_All, 0, 0, nil, 0)
+	})
+	o := thread.create_and_start(proc() { // use logger
+		data := new(int)
+		free(data)
+		hooks.fn(nil)
+	})
+	r := thread.create_and_start(proc() { // use logger
+		e.fire()
+	})
+	s := thread.create_and_start(proc() {
+		e.made()
+	})
+	_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ = a, b, c, d, f, g, h, i, j, k, l, m, n, o, r, s
+}
+hooks: Work
+run_given :: proc(t: ^testing.T) { threads(t, fails_elsewhere) }
+pick :: proc() -> proc(t: ^testing.T) { return quiet_elsewhere }
+""",
+    "d/elsewhere_test.odin": """package d
+import "core:testing"
+fails_elsewhere :: proc(t: ^testing.T) {
+	testing.expect(t, false)
+}
+check_elsewhere :: proc(t: ^testing.T) {
+	fails_elsewhere(t)
+}
+quiet_elsewhere :: proc(t: ^testing.T) {
+	_ = t
+}
+""",
+    "d/locations_test.odin": """package d
+import "base:runtime"
+import "core:testing"
+check :: proc(t: ^testing.T, ok: bool, loc := #caller_location) {
+	testing.expect(t, ok, loc = loc)
+	testing.expect(t, ok, "m", "e", loc)
+}
+locations :: proc(t: ^testing.T) {
+	testing.expect(t, true, loc = #location())
+	testing.expect(t, true, "m", "e")
+	testing.expect_value(t, 1, 1)
+	testing.expect_value(
+		t,
+		1,
+		1,
+	)
+	check(t, true)
+	check(t, true, loc = #location())
+	here := #location()
+	_ = here.line
+	l := runtime.Source_Code_Location{file_path = "host/host.odin"} // use logger
+	testing.expect(t, false, loc = {file_path = "host/host.odin"}) // use logger
+	testing.expect(t, false, "m", "e", here) // use logger
+	testing.expect_value(t, 1, 2, here) // use logger
+	testing.fail(t, here) // use logger
+	testing.expect(t, false, loc = #location(check)) // use logger
+	check(t, false, loc = here) // use logger
+	check(t, false, loc = l) // use logger
+	x: type_of(#location()) // use logger
+	here.file_path = "host/host.odin" // use logger
+	_ = x
+}
+""",
+    "e/locations.odin": """package e
+import "base:runtime"
+Hooks :: struct { on: proc() }
+hooks: Hooks
+fire :: proc() { hooks.on() }
+takes :: proc(l: runtime.Source_Code_Location, loc := #caller_location) { _, _ = l, loc }
+gives :: proc() -> runtime.Source_Code_Location { return #location() } // use logger
+Hook :: proc(l: runtime.Source_Code_Location) // use logger
+Holder :: struct { l: runtime.Source_Code_Location } // use logger
+made :: proc() {
+	l := #location()
+	l.file_path = "x_test.odin" // use logger
+	takes(l)
+}
+""",
+    "f/f.odin": """package f
+import "base:runtime"
+import "core:log"
+g :: proc() {
+	context.logger = log.nil_logger()
+	context = runtime.default_context()
+	_ = runtime.Source_Code_Location{file_path = "x_test.odin"}
+}
+""",
+    "tests/testlog/testlog.odin": """package testlog
+import "core:testing"
+quiet :: proc(t: ^testing.T) -> int { return 0 }
+""",
+    "tests/testlog/testlog_test.odin": """package testlog
+import "core:log"
+import "core:testing"
+q :: proc(t: ^testing.T) {
+	context.logger = quiet(t)
+	context.logger = log.nil_logger() // use logger
+}
+""",
     "node_modules/x/y.odin": """package y
 e :: proc(m: ^map[int]int) { map_entry(m, 1) }
 """,
@@ -934,9 +1995,9 @@ def selftest():
             with open(path, "w", encoding="utf-8") as f:
                 f.write(src)
             for n, line in enumerate(src.splitlines(), 1):
-                m = re.search(r"// use( 8646| option)?$", line.rstrip())
+                m = re.search(r"// use( 8646| option| logger)?$", line.rstrip())
                 if m:
-                    issue = {None: ISSUE, " 8646": TRUNC_ISSUE, " option": OPTION_ISSUE}[m.group(1)]
+                    issue = {None: ISSUE, " 8646": TRUNC_ISSUE, " option": OPTION_ISSUE, " logger": LOGGER_ISSUE}[m.group(1)]
                     want.add((os.path.join(*rel.split("/")), n, issue))
         got = lint(root)
         have = {(p, line, issue) for p, line, _, issue in got}
@@ -948,10 +2009,10 @@ def selftest():
             print(f"FAIL the lint took {p}:{line} for a use of what {issue} breaks: {what}")
         if missed or extra:
             return 1
-        each = {i: sum(1 for w in want if w[2] == i) for i in (ISSUE, TRUNC_ISSUE, OPTION_ISSUE)}
+        each = {i: sum(1 for w in want if w[2] == i) for i in (ISSUE, TRUNC_ISSUE, OPTION_ISSUE, LOGGER_ISSUE)}
         print(f"ok   the lint finds each of the {each[ISSUE]} uses of what {ISSUE} breaks, the {each[TRUNC_ISSUE]} of what"
-              f" {TRUNC_ISSUE} does, and the {each[OPTION_ISSUE]} of {OPTION_ISSUE}, put in its fixtures, however written,"
-              " and nothing else")
+              f" {TRUNC_ISSUE} does, the {each[OPTION_ISSUE]} of {OPTION_ISSUE}, and the {each[LOGGER_ISSUE]} places a"
+              " test's logger is set but through testlog.quiet, put in its fixtures, however written, and nothing else")
         return 0
 
 
@@ -964,6 +2025,9 @@ def main():
         print(f"{p}:{line}: {what} ({issue})")
     for issue in sorted({f[3] for f in found}):
         n = sum(1 for f in found if f[3] == issue)
+        if issue == LOGGER_ISSUE:
+            print(f"FAIL {n} places a test's logger is set but through testlog.quiet, which may lose a failure: see tests/testlog/testlog.odin")
+            continue
         where = f"see https://github.com/{issue.replace('#', '/issues/')}" if "#" in issue else "see third_party/nbio/socket_option.odin"
         print(f"FAIL {n} uses of what {issue} breaks: {where}")
     return 1 if found else 0

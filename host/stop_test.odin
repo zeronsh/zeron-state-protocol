@@ -1,8 +1,6 @@
 package host
 
-import "base:runtime"
 import "core:crypto"
-import "core:log"
 import "core:net"
 import "core:os"
 import "core:sync"
@@ -35,9 +33,10 @@ host_stops_however_told :: proc(t: ^testing.T) {
 		dir, err := os.make_directory_temp(base, "zsp-stop-*", context.allocator)
 		testing.expect(t, err == nil)
 		st := Stopping{dir = dir, how = how}
+		// What the host says of its failing is meant, and not heard: core:thread gives a thread not given a context
+		// runtime.default_context(), whose logger says nothing.
+		// lint-thread: given no T, it says none of the test's failures; what its host's loop calls back is the host's
 		runner := thread.create_and_start_with_poly_data(&st, proc(st: ^Stopping) {
-			context = runtime.default_context()
-			context.logger = log.nil_logger() // what the host says of its failing is meant
 			h: Host
 			// Listening, so that the loop has something to wait for, and would wait for ever.
 			if !host_init(&h, {dir = st.dir, full = true, listen = net.Endpoint{net.IP4_Loopback, 0}}) {

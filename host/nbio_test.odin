@@ -7,6 +7,7 @@ import "core:os"
 import "core:slice"
 import "core:testing"
 import "core:time"
+import "../tests/testlog"
 import "../third_party/nbio"
 
 // Where the loop is kqueue's (macOS, the BSDs) it keeps what it has asked the system for in a map, by what each waits
@@ -108,7 +109,8 @@ loop_gives_every_change_it_held_back :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
 	defer settle(t)
-	context.logger.lowest_level = .Error // the loop warns of each it holds back, thousands; what fails is still said
+	quieted: testlog.Quiet
+	context.logger = testlog.quiet(t, &quieted, .Below_Errors) // the loop warns of each it holds back, thousands; what fails is still said
 	// Past what two calls give, whatever the loop's size: the define the tests build with, or the largest default.
 	N :: 3 * #config(ODIN_NBIO_QUEUE_SIZE, 2048) + 7
 	came := 0
@@ -276,7 +278,8 @@ loop_keeps_an_operation_kqueue_may_still_name :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
 	defer settle(t)
-	context.logger.lowest_level = .Error // the loop warns of each change it holds back
+	quieted: testlog.Quiet
+	context.logger = testlog.quiet(t, &quieted, .Below_Errors) // the loop warns of each change it holds back
 	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
 	testing.expect(t, err == nil)
 	defer net.close(listener)
@@ -335,7 +338,8 @@ loop_counts_every_change_it_gives_kqueue :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
 	defer settle(t)
-	context.logger.lowest_level = .Error // the loop warns of each change it holds back
+	quieted: testlog.Quiet
+	context.logger = testlog.quiet(t, &quieted, .Below_Errors) // the loop warns of each change it holds back
 	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
 	testing.expect(t, err == nil)
 	defer net.close(listener)
