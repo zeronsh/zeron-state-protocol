@@ -41,16 +41,12 @@ end
 -- A node that is slow to say what it holds is durable, as on a slow disk, is had by holding back what it says so with,
 -- its Ack frames, for `ack_delay` seconds: all else it says comes at once, in order, and every Ack as late as any other.
 local function acks_held(self: any, receive: (any) -> ()): (any) -> ()
-	local carry = ""
+	local carry = "" -- of a frame not yet whole: always split, so that what the delay is set to may change at any time
 	return function(message: any)
-		if self.ack_delay <= 0 and carry == "" then
-			receive(message)
-			return
-		end
 		local s = carry .. (if type(message) == "string" then message else buffer.tostring(message))
 		local at = 1
 		while at <= #s do
-			local n, scale, p = 0, 1, at
+			local n, scale, p, whole = 0, 1, at, false
 			while true do
 				local b = string.byte(s, p)
 				if not b then
@@ -59,21 +55,22 @@ local function acks_held(self: any, receive: (any) -> ()): (any) -> ()
 				p += 1
 				n += b % 128 * scale
 				if b < 128 then
+					whole = true
 					break
 				end
 				scale *= 128
 			end
-			if p + n - 1 > #s or n == 0 then
-				break
+			if not whole or p + n - 1 > #s then
+				break -- the rest of it is yet to come
 			end
-			local frame, kind = string.sub(s, at, p + n - 1), string.byte(s, p)
+			local frame, kind = string.sub(s, at, p + n - 1), if n > 0 then string.byte(s, p) else nil
 			at = p + n
 			if kind == 8 and self.ack_delay > 0 then -- Ack
 				task.delay(self.ack_delay, guarded(function()
 					receive(frame)
 				end))
 			else
-				receive(frame)
+				receive(frame) -- what is no frame too, as the client takes it, and fails on it
 			end
 		end
 		carry = string.sub(s, at)
