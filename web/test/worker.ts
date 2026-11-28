@@ -518,6 +518,18 @@ async function firstTurnWrites(store: string): Promise<void> {
   assert(!w.said.some((r) => "failed" in r), JSON.stringify(w.said));
 }
 
+// And put away, it says no time its tab asked for is up, asked for before or after: its tab keeps them, for its next worker.
+{
+  const w = await worker();
+  await w.tell({ open: { name: "away-timers" } });
+  await w.tell({ ask: 1, op: "identity", args: [] });
+  void w.tell({ after: 1, ms: 20 });
+  void w.tell({ away: true });
+  void w.tell({ after: 2, ms: 20 });
+  await sleep(200); // ten times as long
+  assert(!w.said.some((r) => "due" in r), `a worker put away said a time was up: ${JSON.stringify(w.said)}`);
+}
+
 // ---------------------------------------------------------------- what goes wrong as the store is let go of
 
 // Whatever stopping a node throws, as a client told its pipe is closed, or UDP, may: every file is closed all the same, by
@@ -882,6 +894,45 @@ async function firstTurnWrites(store: string): Promise<void> {
   store.logDrop(0);
   failClose = undefined;
   await store.close();
+}
+
+// ---------------------------------------------------------------- the tab
+
+// A tab's device, ./src/browser.ts, and its worker: every pipe a client dials refused, and every time it asks for kept here,
+// to be said to be up when the test says.
+{
+  let dials = 0;
+  const afters: number[] = [];
+  let tabSide: { onmessage: ((e: { data: Report }) => void) | null } | undefined;
+  class TabWorker {
+    onmessage: ((e: { data: Report }) => void) | null = null;
+    onerror: unknown = null;
+    #w = worker();
+    constructor() {
+      tabSide = this;
+      void this.#w.then((w) => w.watch((r) => setTimeout(() => this.onmessage?.({ data: r }))));
+    }
+    postMessage(c: { connect?: MessagePort; after?: number }): void {
+      if (c.connect) return void (dials++, c.connect.postMessage({ close: true }));
+      if (c.after !== undefined) return void afters.push(c.after);
+      void this.#w.then((w) => setTimeout(() => w.tell(c)));
+    }
+    terminate(): void {}
+  }
+  Object.defineProperty(globalThis, "Worker", { value: TabWorker, configurable: true });
+  const { open: openDevice } = await import("../src/browser.ts");
+
+  // Closing, it tells no client a time it asked for is up, though its worker said so before it heard: what is due then would
+  // have a client dial again, or the like, on a device going.
+  const device = await openDevice({ name: "tab-closing" });
+  const client = device.client();
+  await until("its client is to dial again", () => afters.length > 0);
+  const dialled = dials;
+  const closing = device.close();
+  tabSide!.onmessage!({ data: { due: afters[0] } }); // said before the worker heard the device was closed
+  await closing;
+  assert.equal(dials, dialled, "a client dialled again as its device closed");
+  client.close();
 }
 
 console.log("ok");

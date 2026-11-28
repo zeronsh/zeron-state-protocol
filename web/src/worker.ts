@@ -133,8 +133,9 @@ tab.onmessage = async (e: MessageEvent<Command>) => {
   else if ("open" in c) open(c.open);
   else if ("connect" in c) connect(c.connect);
   else if ("after" in c) {
+    if (leaving) return; // the tab keeps it, for whichever worker it starts next
     const id = c.after;
-    timers.set(id, setTimeout(() => (timers.delete(id), tab.postMessage({ due: id } satisfies Report)), c.ms));
+    timers.set(id, setTimeout(() => (timers.delete(id), tell({ due: id })), c.ms));
   } else if ("cancel" in c) clearTimeout(timers.get(c.cancel)), timers.delete(c.cancel);
   else if ("ask" in c) tab.postMessage({ answer: c.ask, ...(await ask(c.op, c.args)) } satisfies Report);
 };
@@ -316,6 +317,8 @@ function leave(): Promise<void> {
   unheard.clear();
   taken.clear();
   breakCarried();
+  for (const t of timers.values()) clearTimeout(t);
+  timers.clear();
   line?.abort();
   const d = device;
   device = undefined;

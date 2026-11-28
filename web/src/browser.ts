@@ -162,6 +162,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   // Timers kept by the worker, which a browser does not hold back while the tab is hidden as it holds back the tab's own:
   // a client here that seals what it types, or dials again, does so when it should though nobody is looking.
   const after = (ms: number, f: () => void): (() => void) => {
+    if (closing) return () => {}; // nothing is due on a device closing
     const id = ++ticks;
     timers.set(id, { f, due: Date.now() + ms });
     worker?.postMessage({ after: id, ms } satisfies Command);
@@ -251,6 +252,9 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     // Once, however often asked: its node stopped as it should be, and then its worker let go of.
     close: () =>
       (closing ??= (async () => {
+        // Nothing is due any more, though its worker said so before it heard: a client told so would dial again, or the
+        // like, on a device going.
+        timers.clear();
         // Listened for until it is closed: a tab frozen or left as its worker closes the store stops the worker then, as
         // ever, which would else be frozen holding it.
         const w = worker;
@@ -262,7 +266,6 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
         for (const breakOff of [...pipes]) breakOff(); // its clients told, as the worker that carried their pipes is gone
         for (const a of answers.values()) a.reject(new Error("the device is closed"));
         answers.clear();
-        timers.clear();
       })()),
   };
 }
