@@ -170,8 +170,10 @@ function request<T>(name: string, a: { signal?: AbortSignal } | (() => T | Promi
   });
 }
 
-// BroadcastChannel: what is said is heard a turn later by every other of the name.
+// BroadcastChannel: what is said is heard a turn later by every other of the name; or as `between` has it, which may hold
+// it back, or drop it, keeping no order between what different senders say, as a browser keeps none.
 const channels = new Map<string, Set<Channel>>();
+let between: ((from: Channel, to: Channel, data: unknown, hear: () => void) => void) | undefined;
 class Channel {
   readonly name: string;
   onmessage: ((e: { data: unknown }) => void) | null = null;
@@ -183,7 +185,9 @@ class Channel {
     for (const c of channels.get(this.name) ?? []) {
       if (c === this) continue;
       const copy = structuredClone(data);
-      setTimeout(() => c.onmessage?.({ data: copy }));
+      const hear = () => c.onmessage?.({ data: copy });
+      if (between) between(this, c, copy, hear);
+      else setTimeout(hear);
     }
   }
   close(): void {
@@ -1103,7 +1107,8 @@ await clocked(async (advance, turns) => {
 
 // What a leader said it was doing, and then answered nothing of, as it failed or went quiet, may have been done: told as
 // Uncertain, not as failed, whether the leader said it failed or was given up on as the store being locked. What it did
-// not say it was doing, it did not do: plainly failed.
+// not say it was doing, it did not do, if it said it failed: plainly failed. Given up on as it said nothing, it may yet do
+// it, as one frozen does once thawed: Uncertain too. What may be asked again is never Uncertain.
 await clocked(async (advance, turns) => {
   for (const how of ["fails", "goes quiet"] as const) {
     const store = how === "fails" ? "taken-fails" : "taken-quiet";
@@ -1124,7 +1129,8 @@ await clocked(async (advance, turns) => {
     else await advance(3 * 3000); // heard from as it said it was taking it, then asked, and silent: three silences
     await turns();
     assert.equal(answered(w.said, 1)?.name, "Uncertain", `${how}: what the leader said it was doing was said plainly to have failed: ${JSON.stringify(answered(w.said, 1))}`);
-    assert.notEqual(answered(w.said, 2)?.name, "Uncertain", `${how}: what it never began was said to be Uncertain`);
+    if (how === "fails") assert.notEqual(answered(w.said, 2)?.name, "Uncertain", `${how}: what it never began was said to be Uncertain`);
+    else assert.equal(answered(w.said, 2)?.name, "Uncertain", `${how}: what a holder given up on may yet do was said plainly to have failed`);
     assert(answered(w.said, 2)?.error, `${how}: what it never began was not said to have failed`);
     assert(answered(w.said, 3)?.error, `${how}: what it may have done was said to be done`);
     assert.notEqual(answered(w.said, 3)?.name, "Uncertain", `${how}: what may be asked again was said to be Uncertain`);
@@ -1267,6 +1273,147 @@ for (const whose of ["another's", "its own"] as const) {
   assert.equal(answered(w.said, 2)?.value, 7, JSON.stringify(answered(w.said, 2)));
   await w.tell({ ask: 9, op: "close", args: [] });
   holders.close();
+}
+
+// A leader frozen, given up on as it says nothing, does what it was asked once it is thawed: what it was asked and never
+// said it was doing is Uncertain as it is given up on, never plainly failed, for it was done after all.
+{
+  const a = await worker();
+  await a.tell({ open: { name: "frozen-leader" } });
+  await a.tell({ ask: 1, op: "create", args: [] });
+  const b = await worker();
+  await b.tell({ open: { name: "frozen-leader" } });
+  await b.tell({ ask: 1, op: "scope", args: [] });
+  const before = answered(b.said, 1)?.value as number;
+  const leader = [...channels.get("zsp:frozen-leader")!][0];
+  const hear = leader.onmessage!, say = leader.postMessage.bind(leader);
+  const toHear: { data: unknown }[] = [], toSay: unknown[] = [];
+  leader.onmessage = (e) => void toHear.push(e); // frozen: what comes waits, and it says nothing
+  leader.postMessage = (data) => void toSay.push(data);
+  await b.tell({ ask: 2, op: "scope", args: [] }); // given up on, after a silence and as long again asked
+  const told = answered(b.said, 2)!;
+  assert(b.said.some((r) => "failed" in r && r.name === "StoreLocked"), JSON.stringify(b.said));
+  assert.equal(told.name, "Uncertain", `what a frozen leader was asked was said to be ${JSON.stringify(told)}`);
+  leader.onmessage = hear; // thawed
+  leader.postMessage = say;
+  for (const e of toHear.splice(0)) hear(e);
+  for (const d of toSay.splice(0)) say(d);
+  await b.tell({ ask: 3, op: "scope", args: [] });
+  assert.equal(answered(b.said, 3)?.value, before + 2, "what the leader was asked as it was frozen was not done once thawed, though said to be Uncertain");
+  await b.tell({ ask: 9, op: "close", args: [] });
+  await a.tell({ ask: 9, op: "close", args: [] });
+}
+
+// A follower that hears what holders said in another order than they said it, as the channel may give it, comes to the
+// holder there is as it asks whether it is there, and has its asks answered, whatever it had of the holder before: one
+// gone, as what it said comes after what the next said; or, as it has just begun, one that answered it as it went, and so
+// not the next. Each worker's own word comes in the order it said it, as a browser's channel has it.
+// Once it has opened its node, as the next in line: what it asks is answered then, by itself.
+const leads = (w: Awaited<ReturnType<typeof worker>>, id: number) => w.tell({ ask: id, op: "identity", args: [] });
+for (const how of ["the one before came late", "one gone answered first"] as const) {
+  const store = how === "the one before came late" ? "late-holding" : "late-answer";
+  const name = "zsp:" + store;
+  const mine = () => new Set(channels.get(name) ?? []);
+  const a = await worker();
+  await a.tell({ open: { name: store } });
+  await a.tell({ ask: 1, op: "create", args: [] });
+  const [aCh] = mine();
+  const b = await worker();
+  await b.tell({ open: { name: store } });
+  await b.tell({ ask: 1, op: "identity", args: [] }); // in line
+  const bCh = [...mine()].find((x) => x !== aCh)!;
+  const c = how === "the one before came late" ? await worker() : undefined;
+  await c?.tell({ open: { name: store } });
+  await c?.tell({ ask: 1, op: "identity", args: [] }); // in line after it
+  const known = mine();
+  const held: (() => void)[] = [], later: (() => void)[] = [];
+  let f!: Awaited<ReturnType<typeof worker>>;
+  let fCh: Channel | undefined;
+  if (how === "the one before came late") {
+    f = await worker();
+    await f.tell({ open: { name: store } });
+    await f.tell({ ask: 1, op: "identity", args: [] });
+    fCh = [...mine()].find((x) => !known.has(x))!;
+    // What b says comes to f only once the test says, and its last word, that it let go, never: as of one gone with its tab.
+    between = (from, to, data, hear) => {
+      if (to !== fCh || from !== bCh) return void setTimeout(hear);
+      if (!("left" in (data as object))) held.push(hear);
+    };
+    await a.tell({ ask: 9, op: "close", args: [] });
+    await leads(b, 2);
+    void b.tell({ away: true });
+    await leads(c!, 2);
+  } else {
+    // f begins as a goes: what a answers it, that it leads, comes to it first, and that it let go never; and of b, that it
+    // leads, and not that it came to hold the store, for f began after that.
+    between = (from, to, data, hear) => {
+      if (known.has(to)) return void setTimeout(hear);
+      if (from === aCh && !("left" in (data as object))) held.push(hear);
+      else if (from === bCh && !("holding" in (data as object))) later.push(hear);
+      else if (from !== aCh && from !== bCh) setTimeout(hear);
+    };
+    f = await worker();
+    await f.tell({ open: { name: store } });
+    await until("a has answered f", () => held.length > 0);
+    await a.tell({ ask: 9, op: "close", args: [] });
+    await leads(b, 2);
+  }
+  for (const h of [...held.splice(0), ...later.splice(0)]) h();
+  between = undefined;
+  // Within a silence, as it asks, and its answer: well within two.
+  await Promise.race([f.tell({ ask: 2, op: "identity", args: [] }), sleep(2 * 3000)]);
+  const told = answered(f.said, 2);
+  assert(told, `${how}: unanswered: ${JSON.stringify(f.said)}`);
+  assert.equal(told.error, undefined, `${how}: ${JSON.stringify(told)}`);
+  for (const w of [f, c, b]) await w?.tell({ ask: 9, op: "close", args: [] });
+}
+
+// And however what holders say comes to a follower, each worker's own in order but none in order with another's, as
+// holders come and go one after another: everything it asks is answered, as it comes to whichever holds the store.
+for (const seed of [1, 2, 3, 4]) {
+  let r = seed * 2654435761;
+  const random = () => ((r = (r * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+  const store = `shuffled-${seed}`;
+  const a = await worker();
+  await a.tell({ open: { name: store } });
+  await a.tell({ ask: 1, op: "create", args: [] });
+  const next = [];
+  for (let i = 0; i < 3; i++) {
+    const w = await worker();
+    await w.tell({ open: { name: store } });
+    await w.tell({ ask: 1, op: "identity", args: [] }); // in line
+    next.push(w);
+  }
+  const known = new Set(channels.get("zsp:" + store));
+  const due = new Map<Channel, number>(); // when what each sender said last comes to the follower
+  between = (from, to, _data, hear) => {
+    if (known.has(to)) return void setTimeout(hear);
+    const at = Math.max(performance.now() + random() * 40, due.get(from) ?? 0);
+    due.set(from, at);
+    setTimeout(hear, at - performance.now());
+  };
+  const f = await worker();
+  await f.tell({ open: { name: store } });
+  const asking: Promise<void>[] = [];
+  let id = 1;
+  const ask = () => asking.push(f.tell({ ask: id++, op: "identity", args: [] }));
+  ask();
+  for (const [i, w] of [a, ...next].entries()) {
+    ask();
+    if (i < next.length) {
+      void (random() < 0.5 ? w.tell({ ask: 9, op: "close", args: [] }) : w.tell({ away: true }));
+      await leads(next[i], 2);
+      ask();
+    }
+  }
+  const t = performance.now();
+  await Promise.race([Promise.all(asking), sleep(3 * 3000)]);
+  const unanswered = [...Array(id - 1).keys()].map((i) => i + 1).filter((i) => answered(f.said, i) === undefined);
+  assert.deepEqual(unanswered, [], `${seed}: unanswered after ${performance.now() - t} ms: ${JSON.stringify(f.said)}`);
+  await f.tell({ ask: id, op: "identity", args: [] });
+  assert.equal(answered(f.said, id)?.error, undefined, `${seed}: ${JSON.stringify(answered(f.said, id))}`);
+  between = undefined;
+  for (const w of [f, next[next.length - 1]]) await w.tell({ ask: 9, op: "close", args: [] });
 }
 
 // A node whose storage fails as it changes its space, as a scope is asked for, may have kept the change, for what was
@@ -1417,6 +1564,7 @@ let keepTimes = false; // every time asked for kept here, to be said to be up wh
 const afters: number[] = [];
 let tabSide: { onmessage: ((e: { data: Report }) => void) | null } | undefined;
 const lost = new Set<string>(); // ops asked of the worker that never reach it
+let throwing = false; // the next worker started throws before it says anything, as one that cannot be started
 const tabWorkers: TabWorker[] = [];
 // Stopped, as a browser stops a worker: nothing more reaches it, and what was still on its way to it down its pipes is
 // dropped with them, as it may be.
@@ -1430,6 +1578,7 @@ class TabWorker {
     tabSide = this;
     tabWorkers.push(this);
     void this.#w.then((w) => w.watch((r) => setTimeout(() => this.#stopped || this.onmessage?.({ data: r }))));
+    if (throwing) queueMicrotask(() => (this.onerror as (e: { message: string }) => void)({ message: "it could not be started" }));
   }
   postMessage(c: { connect?: MessagePort; after?: number; op?: string }): void {
     posted.push({ to: "worker", what: c });
@@ -1737,6 +1886,25 @@ for (const how of ["answered since", "back since"] as const) {
   assert.equal(adopting.space, undefined);
   assert.deepEqual(posted.slice(from).flatMap((x) => (x.to === "worker" && x.what.op ? [x.what.op] : [])), ["adopt"], "it asked more after adopting");
   await adopting.close();
+}
+
+// A worker that throws once it has started may have been doing what it was asked: Uncertain, unless it may be asked
+// again. One that throws as it starts did nothing: plainly failed.
+{
+  const device = await openDevice({ name: "threw" });
+  await device.create();
+  lost.add("scope").add("members");
+  const doing = device.scope().then(() => undefined, (e: Error) => e);
+  const again = device.members().then(() => undefined, (e: Error) => e);
+  (tabSide as unknown as { onerror: (e: { message: string }) => void }).onerror({ message: "it threw" });
+  assert.equal((await doing)?.name, "Uncertain", `asked of a worker that threw: ${await doing}`);
+  assert((await again) instanceof Error && (await again)!.name !== "Uncertain", `what may be asked again: ${await again}`);
+  lost.clear();
+  await device.close().catch(() => {});
+  throwing = true;
+  const never = await openDevice({ name: "never-started" }).then(() => undefined, (e: Error) => e);
+  throwing = false;
+  assert(never instanceof Error && never.name !== "Uncertain", `a worker that could not be started: ${never}`);
 }
 
 console.log("ok");

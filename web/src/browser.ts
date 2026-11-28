@@ -93,12 +93,14 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   let dead: Worker | undefined;
   let quitting: AbortController | undefined; // as the device closes: gives up on what its clients have still to deliver
   // Told that the node has stopped: whatever it was asked, its worker has answered already, before saying so; but a worker
-  // that could not be started, or threw, answers nothing, and what was asked of it is said to have failed here.
-  const fail = (error: Error, threw = false) => {
+  // that could not be started, or threw, answers nothing, and what was asked of it is said to have failed here: not done,
+  // if it never started; but one that had may have been doing it, which is Uncertain, unless it may be asked again.
+  const fail = (error: Error, threw = false, started = false) => {
     failed = true;
     quitting?.abort(); // what the device's clients deliver, as it closes, may never be: they give up on it, saying so
     if (threw) {
-      for (const a of answers.values()) a.reject(error);
+      const uncertain = new Uncertain(`${error.message}, as this was asked: it may or may not have been done`);
+      for (const a of answers.values()) a.reject(started && !again.has(a.op) ? uncertain : error);
       answers.clear();
     }
     options.onFailure?.(error);
@@ -106,7 +108,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   const start = () => {
     const w = (worker = new Worker(options.worker ?? new URL("./worker.js", import.meta.url), { type: "module", name: "zsp" }));
     failed = false;
-    w.onerror = (e) => w === worker && ((dead = w), fail(new Error(e.message || "the worker could not be started"), true));
+    w.onerror = (e) => w === worker && ((dead = w), fail(new Error(e.message || "the worker could not be started"), true, heard));
     const giving = credential;
     let heard = false;
     w.onmessage = (e: MessageEvent<Report>) => {
