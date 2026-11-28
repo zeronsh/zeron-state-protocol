@@ -501,6 +501,50 @@ loop_keeps_one_timeout_for_a_read_of_all :: proc(t: ^testing.T) {
 	}
 }
 
+// Waits of under a millisecond: asked of a tick, and to a timeout due that soon. core:nbio (dev-2026-11) on Windows
+// waited in whole milliseconds, truncated: such a wait was none, and the loop spun until it was over. It spun so at the
+// end of most waits, as the system wakes a little early, and the host with it: relayed_held_back_waits went round 1135
+// times in 50 ms on Windows, 1133 of them in a wait of under a millisecond.
+@(test)
+loop_waits_out_a_wait_of_under_a_millisecond :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	defer settle(t)
+
+	// A tick asked to wait half a millisecond, with something waiting all the while, for 30 ms.
+	waiting := nbio.timeout(time.Second, proc(_: ^nbio.Operation) {})
+	ticks := 0
+	start := time.tick_now()
+	for time.tick_since(start) < 30 * time.Millisecond {
+		testing.expect(t, nbio.tick(500 * time.Microsecond) == nil)
+		ticks += 1
+	}
+	nbio.remove(waiting)
+	// Waiting, at most 60; spinning, thousands.
+	testing.expectf(t, ticks < 300, "ticks of half a millisecond went round %d times in 30 ms", ticks)
+
+	// Twenty timeouts one after the other, each due 0.9 ms after the one before it, the loop ticked without a limit.
+	Chain :: struct {
+		left: int,
+	}
+	c := Chain{20}
+	next :: proc(_: ^nbio.Operation, c: ^Chain) {
+		c.left -= 1
+		if c.left > 0 {
+			nbio.timeout_poly(900 * time.Microsecond, c, next)
+		}
+	}
+	nbio.timeout_poly(900 * time.Microsecond, &c, next)
+	ticks = 0
+	start = time.tick_now()
+	for c.left > 0 && time.tick_since(start) < 5 * time.Second {
+		testing.expect(t, nbio.tick() == nil)
+		ticks += 1
+	}
+	// Waiting, some 20 to 40; spinning, thousands.
+	testing.expectf(t, c.left == 0 && ticks < 200, "%d timeouts left; the loop went round %d times for 20 of 0.9 ms", c.left, ticks)
+}
+
 // Whatever a test began on its loop, finished before the loop is let go of, after what the test closes on its way out:
 // on Windows the loops of every thread share one completion port, and what one left under way comes to another's.
 settle :: proc(t: ^testing.T) {

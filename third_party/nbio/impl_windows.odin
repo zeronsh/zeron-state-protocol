@@ -294,12 +294,26 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> (err: General_Error) {
 		if queue.len(l.completed) > 0 || mpsc_count(&l.completed_oob) > 0 {
 			actual = 0
 		} else if timeout >= 0 {
-			actual = win.DWORD(timeout / time.Millisecond)
+			actual = wait_ms(timeout)
 		}
 		if nt, ok := next_timeout.?; ok {
-			actual = min(actual, win.DWORD(nt / time.Millisecond))
+			actual = min(actual, wait_ms(nt))
 		}
 		return actual
+	}
+
+	// ZSP: a wait in whole milliseconds, rounded up, and short of INFINITE. Upstream truncated it: a wait of under a
+	// millisecond, as is left of any once the system wakes a little early, was no wait, and the loop spun until it was
+	// over; and one of more than some 49 days wrapped round to a short one.
+	wait_ms :: proc(d: time.Duration) -> win.DWORD {
+		if d <= 0 {
+			return 0
+		}
+		ms := d / time.Millisecond
+		if d % time.Millisecond != 0 {
+			ms += 1
+		}
+		return win.DWORD(min(ms, time.Duration(win.INFINITE - 1)))
 	}
 
 	check_timeouts :: proc(l: ^Event_Loop) -> (expires: Maybe(time.Duration)) {

@@ -64,6 +64,9 @@ Windows, `impl_windows.odin`:
 - `link_timeout`: an operation keeps the timeout it has. A send or receive of `all` that went only part of the way is
   executed again, and the release linked it a second timeout, which took the first's place and left it to fire at an
   operation done with by then.
+- `__tick`, `compute_timeout`: the wait given the completion port is rounded up to a whole millisecond, and kept short
+  of `INFINITE`. The release truncated it: a wait of under a millisecond, as is left of most once the system wakes a
+  little early, was none, and the loop spun until it was over; one of more than some 49 days wrapped round.
 - `check_timeouts`: the first timeout due is taken out of the tree before it is completed. The release walked the tree
   with an iterator holding the next node, which a callback removing that timeout freed under it.
 
