@@ -793,7 +793,10 @@ serve :: proc(dir: string, args: []string, relay: bool) -> int {
 	starting = false
 	say(os.stdout, to_hex(h.device[:]), " listening on ws://", address, "\n")
 	host.links_announce(&h)
-	return 0 if host.host_run(&h) else 1
+	bench_start(rawptr(&h)) // held until bench_report, as h is
+	ran := host.host_run(&h)
+	bench_report(&h)
+	return 0 if ran else 1
 }
 
 local_token :: proc(dir: string) -> string {
