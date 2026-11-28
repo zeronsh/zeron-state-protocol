@@ -4,7 +4,7 @@
 import type { Client, Host } from "./client.ts";
 import type { Connect, Member, Rights } from "./node.ts";
 
-export { Client, CallFault, columns } from "./client.ts";
+export { Client, CallFault, Undelivered, columns } from "./client.ts";
 export type { Answer, Asking, AuthorsColumn, Call, CallOptions, Change, Column, Device as Who, Editor, Entry, Event, Fault, Host, Is, Query, Row, State, Status, Stored, Table, TextColumn, Values, Window } from "./client.ts";
 export { where } from "./ask.ts";
 export * as mirror from "./mirror.ts";

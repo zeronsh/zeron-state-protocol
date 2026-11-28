@@ -399,6 +399,7 @@ interface Pending {
   scope: number;
   body: Uint8Array;
   rows: string[];
+  cells: number;
   done: () => void;
   fail: (e: Error) => void; // should it never be durable
 }
@@ -418,6 +419,32 @@ const handled = <T>(p: Promise<T>): Promise<T> => (p.catch(() => {}), p); // who
  * away, which leaves no time for anything to wait. Not for applications, which close or commit.
  */
 export const sealNow = Symbol("seal now");
+
+/** Whether a client has written what is not yet acknowledged: for a browser's device, as its tab is put away. */
+export const unacknowledged = Symbol("unacknowledged");
+
+/**
+ * On a host's connect: called with every client made on it, as a browser's device keeps those of its own, to seal what they
+ * typed as its tab is put away and deliver what they wrote before it closes.
+ */
+export const madeOn = Symbol("made on");
+
+/** What a client had written, and not seen acknowledged, when whoever waited for it gave up: never to be delivered by a client closed. */
+export class Undelivered extends Error {
+  /** Rows written to, of cells... */
+  readonly rows: number;
+  /** ...cells... */
+  readonly cells: number;
+  /** ...and bytes, as they were said. */
+  readonly bytes: number;
+  constructor(rows: number, cells: number, bytes: number, closed: boolean) {
+    super(`${closed ? "the client was closed and gave up on" : "gave up waiting for"} ${cells} cells of ${rows} rows, ${bytes} bytes, not yet acknowledged`);
+    this.name = "Undelivered";
+    this.rows = rows;
+    this.cells = cells;
+    this.bytes = bytes;
+  }
+}
 
 // ---------------------------------------------------------------- merging
 
@@ -532,6 +559,7 @@ export class Client {
   #barriers: Barrier[] = []; // by sequence number
   #closing: Promise<void> | undefined; // once closed: until all it wrote is acknowledged
   #early = new Set<Promise<void>>(); // editors' typing before their rows were here: until it is typed in them
+  #abandoned: Undelivered | undefined; // closed and given up on: what it would still have delivered is not
   #unacked = new Map<string, number>(); // rows in pending, and how often
   #out = codec.writer();
   #flushing = false;
@@ -563,6 +591,7 @@ export class Client {
           return () => clearTimeout(t);
         }),
     };
+    (host.connect as { [madeOn]?: (client: Client) => void })[madeOn]?.(this);
     this.#dial();
   }
 
@@ -642,9 +671,18 @@ export class Client {
    * it wrote is dropped. The pipe is let go of once all of that is acknowledged, durable on the node this client speaks to,
    * at once when nothing waits; until then the client dials again should the pipe be lost, as an open one does, and does
    * nothing else. Resolves then. Rejects only should what it wrote never be durable: no node to dial, one that refuses this
-   * client for good, or a scope it may no longer write in. Questions asked once are answered as far as they got.
+   * client for good, or a scope it may no longer write in; or should `signal` give up on it, when the client dials no more,
+   * and the error, Undelivered, says how much was never delivered. A promise that has not settled is the client still
+   * trying: nothing is ever dropped unsaid. Questions asked once are answered as far as they got.
    */
-  close(): Promise<void> {
+  close(options: { signal?: AbortSignal } = {}): Promise<void> {
+    const signal = options.signal;
+    if (signal) {
+      // Given up on, now or later: what it holds is told it never will be delivered, and it dials no more.
+      const giveUp = () => this.#giveUp((this.#abandoned = this.#undelivered(true)));
+      if (signal.aborted) queueMicrotask(giveUp);
+      else signal.addEventListener("abort", giveUp, { once: true });
+    }
     if (this.#closing) return this.#closing;
     this.#closed = true;
     const after = () => {
@@ -655,6 +693,7 @@ export class Client {
     };
     const deliver = (): Promise<void> => {
       this.#sealAll();
+      if (this.#abandoned) this.#giveUp(this.#undelivered(true)); // what was sealed since it was given up on, too
       this.#flush();
       if (this.#pending.length === 0) {
         this.#hangUp();
@@ -677,6 +716,23 @@ export class Client {
     const early = [...this.#early];
     after();
     return (this.#closing = handled(Promise.all(early).then(deliver)));
+  }
+
+  // How much is written and not yet acknowledged, as an error to give up on it with.
+  #undelivered(closed: boolean, upTo = Infinity): Undelivered {
+    const rows = new Set<string>();
+    let cells = 0, bytes = 0;
+    for (const p of this.#pending) {
+      if (p.seq > upTo) break;
+      for (const id of p.rows) rows.add(id);
+      cells += p.cells;
+      bytes += p.body.length;
+    }
+    return new Undelivered(rows.size, cells, bytes, closed);
+  }
+
+  [unacknowledged](): boolean {
+    return this.#pending.length > 0;
   }
 
   [sealNow](): void {
@@ -2168,7 +2224,7 @@ export class Client {
     }
     const body = codec.written(w).slice();
     const seq = ++this.#seq;
-    this.#pending.push({ seq, scope, body, rows, done: done ?? (() => {}), fail: fail ?? (() => {}) });
+    this.#pending.push({ seq, scope, body, rows, cells: cells.length, done: done ?? (() => {}), fail: fail ?? (() => {}) });
     if (this.#ready) {
       const framed = codec.writer();
       codec.putVarint(framed, seq);
@@ -2199,11 +2255,13 @@ export class Client {
 
   /**
    * Applies several changes as one: all visible in the same turn, all durable together or not at all. Resolves when they
-   * are durable on the node this client speaks to, and all this client wrote before them; rejects should they never be,
-   * the scope being one it may no longer write in, or the client closed with no node to deliver them to (close). A change
-   * of nothing is so a barrier: it resolves once all written before it is durable.
+   * are durable on the node this client speaks to, and all this client wrote before them; a change of nothing is so a
+   * barrier, resolving once all written before it is durable. Should they never be, the scope being one it may no longer
+   * write in, or the client closed with no node to deliver them to, it does not resolve, as it never did: close() says so.
+   * Should `signal` give up on it first, it rejects with Undelivered, saying how much was not yet acknowledged; what it
+   * wrote is not given up, but delivered still.
    */
-  write(scope: number, f: (change: Change) => void): Promise<void> {
+  write(scope: number, f: (change: Change) => void, options: { signal?: AbortSignal } = {}): Promise<void> {
     const s = this.#scopes.get(scope);
     if (!s || !(s.rights & 2)) throw new Error("this client may not write there");
     const cells: Written[] = [];
@@ -2272,7 +2330,7 @@ export class Client {
     const idOf = rowId;
     // Done here, so that what is refused throws here; and should it throw, as if it had never been.
     let resolve!: () => void, reject!: (e: Error) => void;
-    // Rejected only should it never be durable, and then handled, so that whoever did not wait for it is not thrown at.
+    // Rejected only as `signal` gives up on it, which whoever passed it is waiting for.
     const result: Promise<void> = new Promise<void>((done, failed) => ((resolve = done), (reject = (e) => (handled(result), failed(e)))));
     try {
       f({
@@ -2313,8 +2371,17 @@ export class Client {
       undo();
       throw e;
     }
-    if (cells.length > 0) this.#sendCells(cells, resolve, reject);
-    else this.#barrier().then(resolve, reject);
+    if (cells.length > 0) this.#sendCells(cells, resolve);
+    else this.#barrier().then(resolve, () => {});
+    const signal = options.signal;
+    if (signal) {
+      const upTo = this.#seq;
+      const giveUp = () => reject(this.#undelivered(false, upTo));
+      if (signal.aborted) queueMicrotask(giveUp);
+      else signal.addEventListener("abort", giveUp, { once: true });
+      const forget = () => signal.removeEventListener("abort", giveUp);
+      void result.then(forget, forget);
+    }
     const placing = new Set<Stored>();
     for (const id of rows) {
       const row = this.#rows.get(id);

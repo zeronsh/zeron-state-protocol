@@ -3286,4 +3286,35 @@ do
 	assert(flushed.done and flushed.ok, "flushed() with nothing to wait for waited")
 end
 
+-- A client closed while the node it speaks to does not come back, which nobody can tell from one that will: it goes on
+-- trying, nothing dropped, until flushed() gives up after so long, when it says how much was never delivered, and the
+-- client dials no more. sealed() given up on says so too.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	h.self.closed()
+	h.run()
+	h.client:close()
+	h.run()
+	assert(h.self.connects == 2, "it did not dial again to deliver what it wrote")
+	local flushed = waited(function()
+		return h.client:flushed(30)
+	end)
+	h.run()
+	assert(not flushed.done, "flushed() said so while it was still trying")
+	h.laters() -- thirty seconds on
+	h.run()
+	assert(flushed.done and flushed.ok == false and string.find(flushed.why, "2 cells of 1 rows", 1, true), tostring(flushed.why))
+	assert(h.self.closes == 1, "the pipe was not let go of once it was given up on")
+	h.laters()
+	h.run()
+	assert(h.self.connects == 2, "it dialled again once given up on")
+	assert(h.self.timers == 0, "a client given up on keeps something awake")
+end
+
 print("ok")

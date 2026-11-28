@@ -180,7 +180,7 @@ client:serve(1, "run", function(call, data) ... end)
 local answer = client:request(device, 1, "run", data)
 local copy = client:call(device, 1, "copy", first, { urgency = 6 }) -- a stream each way, behind what is urgent
 
-client:close() -- drops nothing, pipe or none; client:flushed() yields until all it wrote is durable
+client:close() -- drops nothing, pipe or none; client:flushed(timeout) yields until all it wrote is durable, or says what was not
 ```
 
 In a browser or Node, the device is the node, and the client is the Luau one, in TypeScript ([docs/web.md](docs/web.md)):

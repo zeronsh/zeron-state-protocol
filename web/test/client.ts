@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import * as codec from "../src/codec.ts";
-import { Client, columns as c, type Answer, type State } from "../src/client.ts";
+import { Client, Undelivered, columns as c, type Answer, type State } from "../src/client.ts";
 import * as text from "../src/text.ts";
 import * as ask from "../src/ask.ts";
 import { where } from "../src/ask.ts";
@@ -2096,7 +2096,7 @@ for (const why of ["no node", "no right"] as const) {
   }
   await tick();
   assert(closing.settled && closing.failed instanceof Error, `${why}: closing was not told it failed`);
-  assert(wrote.settled && wrote.failed instanceof Error, `${why}: what was written was not told it failed`);
+  assert(!wrote.settled, `${why}: a write that was never durable was said to be, or rejected, as no write ever was`);
   assert.equal(h.self.timers, 0, `${why}: a client closed keeps something awake`);
 }
 
@@ -2156,6 +2156,40 @@ for (const why of ["no node", "no right"] as const) {
   const nothing = state(h.client.write(1, () => {})); // with nothing to wait for, at once
   await tick();
   assert(nothing.settled);
+}
+
+// A client closed while the node it speaks to does not come back, which nobody can tell from one that will: it goes on
+// trying, nothing dropped, until whoever waits gives up, when it says how much was never delivered, and dials no more. A
+// barrier given up on says so too, and what it waited for is delivered all the same.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  void h.client.write(1, (change) => change.insert(Note, "a", 1, { title: "t" }));
+  h.run();
+  const quit = new AbortController();
+  const barrier = state(h.client.write(1, () => {}, { signal: quit.signal }));
+  quit.abort();
+  await tick();
+  assert(barrier.failed instanceof Undelivered && barrier.failed.cells === 2 && barrier.failed.rows === 1 && barrier.failed.bytes > 0, String(barrier.failed));
+  h.self.closed();
+  h.run();
+  void h.client.write(1, (change) => change.insert(Note, "a", 2, { title: "u" }));
+  const giveUp = new AbortController();
+  const closing = state(h.client.close({ signal: giveUp.signal }));
+  h.run();
+  assert.equal(h.self.connects, 2, "it did not dial again to deliver what it wrote");
+  await tick();
+  assert(!closing.settled, "said to be closed while it was still trying");
+  giveUp.abort();
+  await tick();
+  const e = closing.failed;
+  assert(e instanceof Undelivered && e.cells === 4 && e.rows === 2, `not told what was never delivered: ${e}`);
+  assert.equal(h.self.closes, 1, "the pipe was not let go of once it was given up on");
+  h.laters();
+  h.run();
+  assert.equal(h.self.connects, 2, "it dialled again once given up on");
+  assert.equal(h.self.timers, 0, "a client given up on keeps something awake");
 }
 
 console.log("ok");

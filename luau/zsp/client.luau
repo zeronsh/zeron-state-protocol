@@ -106,7 +106,7 @@ type Stored = {
 	dirty: { [number]: boolean }, -- slots with live text to send
 }
 type Said = { [string]: { [string]: boolean } }
-type Pending = { seq: number, scope: number, body: string, rows: { string }, done: (() -> ())? }
+type Pending = { seq: number, scope: number, body: string, rows: { string }, cells: number, done: (() -> ())? }
 -- Whoever waits for everything written up to a sequence number: told once each is acknowledged, or that one never will be.
 type Barrier = { seq: number, failed: string?, notify: (boolean, string?) -> () }
 type Page = {
@@ -468,9 +468,12 @@ function Client.close(self: Client)
 end
 
 -- Yields until all this client has written is acknowledged, durable on the node it speaks to, and, once it is closed,
--- until all close delivers is. Returns true; or false and why, should any of it never be. Called from a coroutine.
-function Client.flushed(self: Client): (boolean, string?)
+-- until all close delivers is. Returns true; or false and why, should any of it never be, or should `timeout` seconds
+-- pass first, when it says how much is not yet delivered; and a client closed then gives up on it, dialling no more. Not
+-- returning yet is the client still trying: nothing is ever dropped unsaid. Called from a coroutine.
+function Client.flushed(self: Client, timeout: number?): (boolean, string?)
 	local closing = self.closing
+	local up_to = self.seq
 	return self:_wait(function(notify)
 		if closing then
 			if closing.result then
@@ -481,20 +484,63 @@ function Client.flushed(self: Client): (boolean, string?)
 		else
 			self:_barrier(notify)
 		end
+	end, timeout, function(): string
+		local why = self:_undelivered(self.closed, if self.closed then math.huge else up_to)
+		if self.closed then
+			self:_give_up(why) -- given up on: it dials no more
+		end
+		return why
 	end)
 end
 
--- Yields the coroutine it is called from until `start` is told how it went, unless it is told at once.
-function Client._wait(self: Client, start: ((boolean, string?) -> ()) -> ()): (boolean, string?)
+-- How much is written and not yet acknowledged, as what is said of giving up on it.
+function Client._undelivered(self: Client, closed: boolean, up_to: number): string
+	local rows: { [string]: boolean } = {}
+	local nrows, cells, bytes = 0, 0, 0
+	for _, p in self.pending do
+		if p.seq > up_to then
+			break
+		end
+		for _, id in p.rows do
+			if not rows[id] then
+				rows[id] = true
+				nrows += 1
+			end
+		end
+		cells += p.cells
+		bytes += #p.body
+	end
+	return `{if closed then "the client was closed and gave up on" else "gave up waiting for"} {cells} cells of {nrows} rows, {bytes} bytes, not yet acknowledged`
+end
+
+-- Yields the coroutine it is called from until `start` is told how it went, unless it is told at once; or until `timeout`
+-- seconds pass, when it returns false and what `late` says.
+function Client._wait(self: Client, start: ((boolean, string?) -> ()) -> (), timeout: number?, late: (() -> string)?): (boolean, string?)
 	local thread = coroutine.running()
 	local result: { any }? = nil
 	local waiting = false
-	start(function(ok: boolean, why: string?)
+	local cancel: (() -> ())? = nil
+	local function told(ok: boolean, why: string?)
+		if result then
+			return
+		end
 		result = { ok, why }
+		if cancel then
+			cancel()
+		end
 		if waiting then
 			self:_resume(thread)
 		end
-	end)
+	end
+	if timeout then
+		cancel = self.host.after(timeout, function()
+			cancel = nil
+			if not result then
+				told(false, (late :: () -> string)())
+			end
+		end)
+	end
+	start(told)
 	if not result then
 		waiting = true
 		coroutine.yield()
@@ -2440,10 +2486,13 @@ function Client.text(self: Client, id: string, col: Column)
 		end,
 		-- Seals what has been written, and yields until it is acknowledged, durable on the node the client speaks to, and
 		-- all the client wrote before it. Returns true; or false and why, should it never be (Client.flushed).
-		sealed = function(): (boolean, string?)
+		-- Should `timeout` seconds pass first, it returns false, and how much is not yet acknowledged.
+		sealed = function(timeout: number?): (boolean, string?)
+			local up_to = math.huge
 			return self:_wait(function(notify)
 				local function now()
 					self:_seal(row, slot)
+					up_to = self.seq
 					self:_barrier(notify)
 				end
 				local waiting = applied
@@ -2452,6 +2501,8 @@ function Client.text(self: Client, id: string, col: Column)
 				else
 					now()
 				end
+			end, timeout, function(): string
+				return self:_undelivered(false, up_to)
 			end)
 		end,
 		close = function()
@@ -2578,7 +2629,7 @@ function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
 	end
 	self.seq += 1
 	local body = codec.string(w)
-	table.insert(self.pending, { seq = self.seq, scope = scope, body = body, rows = rows, done = done })
+	table.insert(self.pending, { seq = self.seq, scope = scope, body = body, rows = rows, cells = #cells, done = done })
 	if self.ready then
 		local framed = codec.writer()
 		codec.put_varint(framed, self.seq)
