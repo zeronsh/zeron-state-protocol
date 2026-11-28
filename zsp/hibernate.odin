@@ -26,6 +26,9 @@ session_save :: proc(s: ^Session, w: ^[dynamic]byte) -> bool {
 	// What was sent and is yet to be said to have been taken is kept, as so much made and none of it taken: what the peer
 	// says of it once this wakes is taken for it, not for what is sent after. Not its round trips, which are timed afresh.
 	in_flight := window_in_flight(s) if window_held(s) else 0
+	if in_flight > 2 * WINDOW_MAX {
+		return false // more than would be taken back: frames that are not held to the window, to a peer saying nothing
+	}
 	write_varint(w, u64(s.id))
 	write_u8(
 		w,
@@ -88,8 +91,8 @@ session_load :: proc(n: ^Node, bytes: []byte) -> (s: ^Session, ok: bool) {
 	if flags & 64 != 0 {
 		in_flight = read_varint(&r)
 	}
-	// So much made and not yet said to have been taken, none of it timed.
-	s.taken, s.window.counted, s.window.next = in_flight, in_flight, in_flight
+	// So much made and not yet said to have been taken, none of it timed, nor anything sent after until it has come.
+	s.taken, s.window.counted, s.window.next, s.window.slept = in_flight, in_flight, in_flight, in_flight
 	s.cursor = n.events.next
 	m := roster_member(&n.roster, s.peer)
 	taken := false // another session has its id: what was saved is not this node's

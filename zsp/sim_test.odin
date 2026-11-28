@@ -3563,6 +3563,105 @@ a_client_is_no_replica :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(session_output(ui)), 0)
 }
 
+// Woken with what was sent before a sleep yet to be said to have come, a relay times nothing until it has: what the peer
+// says of that, said after what is sent next, would be taken for what was delivered in a round trip of it. Nor does it
+// sleep with more on its way than it would take back. (Review 9 of the window, 1, 3.)
+@(test)
+woken_times_only_what_is_sent_after :: proc(t: ^testing.T) {
+	state := seeded(121)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	l := s.links[0]
+	at := l.b // the relay's end
+	out := session_output(l.a)
+	testing.expect(t, session_input(at, slice.clone(out, context.temp_allocator)))
+	session_sent(l.a, len(out))
+	sim_put(&s, s.nodes[0], 2)
+	out = session_output(l.a)
+	testing.expect(t, session_input(at, slice.clone(out, context.temp_allocator)))
+	session_sent(l.a, len(out))
+	testing.expect(t, node_sync(&s.nodes[1].node))
+	session_sent(at, len(session_output(at)))
+	in_flight := window_in_flight(at)
+	testing.expect(t, in_flight > 0, "nothing on its way")
+	saved := make([dynamic]byte, context.temp_allocator)
+	at.taken += 2 * WINDOW_MAX
+	testing.expect(t, !session_save(at, &saved), "it would sleep with more on its way than it would take back")
+	at.taken -= 2 * WINDOW_MAX
+	clear(&saved)
+	testing.expect(t, session_save(at, &saved))
+	sim_cut(&s, 0)
+	relay := &s.nodes[1].node
+	revived, ok := session_load(relay, saved[:])
+	testing.expect(t, ok)
+	if !ok {
+		return
+	}
+	defer session_close(revived)
+	took :: proc(t: ^testing.T, s: ^Session, n: u64) {
+		f: [dynamic]byte
+		defer delete(f)
+		at := frame_begin(&f, .Took)
+		write_varint(&f, n)
+		frame_end(&f, at)
+		testing.expect(t, session_input(s, f[:]))
+	}
+	// Something small goes once it wakes, before word of what went before.
+	relay.now = 2000
+	session_post(revived, u8(Message.Presence), {})
+	small := len(session_output(revived))
+	session_sent(revived, small)
+	testing.expect_value(t, revived.window.held, 0)
+	relay.now = 2005
+	took(t, revived, in_flight)
+	relay.now = 2020
+	took(t, revived, u64(small))
+	testing.expect_value(t, revived.window.rate, 0)
+	testing.expect_value(t, revived.window.size, 0)
+	// What is sent once that has come is timed.
+	session_post(revived, u8(Message.Presence), {})
+	session_sent(revived, len(session_output(revived)))
+	testing.expect_value(t, revived.window.held, 1)
+	free_all(context.temp_allocator)
+}
+
+// What the peer counts, as the host takes it, is less than before while less has been taken of what was made than a Took
+// frame made with it, that being counted out whole as it is made: the most it was is kept, so that what is timed next
+// is not taken to begin before it.
+// (Review 9 of the window, 2.)
+@(test)
+counted_goes_on :: proc(t: ^testing.T) {
+	state := seeded(122)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 1, ring = 256)
+	defer sim_destroy(&s)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	l := s.links[0]
+	at := l.b
+	sim_put(&s, s.nodes[0], 2)
+	out := session_output(l.a)
+	testing.expect(t, session_input(at, slice.clone(out, context.temp_allocator)))
+	session_sent(l.a, len(out))
+	session_post(at, u8(Message.Presence), {}) // something counted, and then what it took, which is not
+	before := at.took_out
+	out = session_output(at)
+	took := int(at.took_out - before)
+	testing.expect(t, took > 1 && len(out) > took, "no Took after something else")
+	most := at.window.counted
+	session_sent(at, 1) // less than the Took frame, which is counted out whole already
+	testing.expect(t, at.taken - min(at.took_out, at.taken) < most, "what the peer counts was not less for a while")
+	testing.expect(t, at.window.counted >= most, "what the peer counts went back")
+	session_sent(at, len(out) - 1)
+	testing.expect(t, at.window.counted >= most, "what the peer counts went back")
+	free_all(context.temp_allocator)
+}
+
 @(private)
 clear_used :: proc(n: ^Node) {
 	keys := make([dynamic]Key, context.temp_allocator)

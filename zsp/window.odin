@@ -36,7 +36,8 @@ Window :: struct {
 	samples:    [64]Window_Sample,
 	head, held: int,
 	next:       u64, // of what the peer counts, where the next is timed
-	counted:    u64, // of what the peer counts, how much the host had taken when it last took any
+	counted:    u64, // of what the peer counts, the most the host had taken when it last took any
+	slept:      u64, // of what the peer counts, so much was on its way when the session slept: nothing is timed until it has come
 	rate:       u64, // most delivered lately, bytes per ms
 	rate_at:    u64,
 	rtt:        u64, // least round trip, ms
@@ -85,11 +86,18 @@ window_open :: proc(s: ^Session, first := false) -> bool {
 @(private)
 window_sent :: proc(s: ^Session) {
 	w := &s.window
+	// What the peer counts, as the host has taken it: less, now and then, than before, while a Took frame is part taken,
+	// it being counted out whole as it is made. What was the most is kept: the first byte of what is taken now is
+	// past it, never before, and is not taken for what came before a sleep.
 	counted := s.taken - min(s.took_out, s.taken)
+	if counted <= w.counted {
+		return
+	}
 	first := w.counted + 1
-	fresh := counted > w.counted
 	w.counted = counted
-	if !window_held(s) || !fresh || counted < w.next {
+	// Nor timed while what was on its way before a sleep has yet to be said to have come: said to have come, it would be
+	// taken for what was delivered in a round trip of what was sent after.
+	if !window_held(s) || counted < w.next || s.acked < w.slept {
 		return
 	}
 	w.next = counted + WINDOW_SAMPLE
