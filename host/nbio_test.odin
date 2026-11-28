@@ -7,7 +7,7 @@ import "core:os"
 import "core:slice"
 import "core:testing"
 import "core:time"
-import "../third_party/nbio"
+import "../nbio"
 
 // Where the loop is kqueue's (macOS, the BSDs) it keeps what it has asked the system for in a map, by what each waits
 // on: a socket and which way. Here a few sockets at a time are waited on, of many, and one of them heard at a time,

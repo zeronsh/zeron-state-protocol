@@ -3,7 +3,7 @@ package host
 import "core:net"
 import "core:testing"
 import "core:time"
-import "../third_party/nbio"
+import "../nbio"
 
 // More at once than the event loop can give the system (a full io_uring ring, too many kqueue changes): what it
 // holds back is given all the same, without waiting for something else to wake it.

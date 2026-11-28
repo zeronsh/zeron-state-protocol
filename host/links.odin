@@ -6,7 +6,7 @@ import "core:net"
 import "core:slice"
 import "core:time"
 import "../pipe"
-import "../third_party/nbio"
+import "../nbio"
 import "../zsp"
 
 // Direct links between devices. Those who share a relay swap addresses through it, sealed to each

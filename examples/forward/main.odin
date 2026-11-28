@@ -39,7 +39,7 @@ import "core:strconv"
 import "core:strings"
 import "core:time"
 import "../../host"
-import "../../third_party/nbio"
+import "../../nbio"
 import "../../zsp"
 
 METHOD :: "forward"

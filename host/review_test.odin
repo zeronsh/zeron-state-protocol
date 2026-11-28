@@ -13,7 +13,7 @@ import "core:thread"
 import "core:time"
 import "../find"
 import "../pipe"
-import "../third_party/nbio"
+import "../nbio"
 import "../zsp"
 
 // Each a reproduction from adversarial review, kept so that what it found stays found.
