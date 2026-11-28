@@ -584,6 +584,77 @@ loop_ends_a_read_that_fails_as_it_is_made :: proc(t: ^testing.T) {
 	testing.expectf(t, r.done && r.error, "a read of a file opened only to write: ended %v, with an error %v", r.done, r.error)
 }
 
+// A read of all of a buffer longer than what is left of the file: it ends at the end of the file, with what there was
+// and no error, as on Linux and macOS; and one from the end itself ends with EOF. On Windows the loop took the end met
+// after some bytes for a failure (error 38, ERROR_HANDLE_EOF) where ReadFile said so as it was made, and where it said
+// so by a completion, read again for the rest, at the end again, for ever.
+@(test)
+loop_ends_a_read_of_all_at_the_end_of_the_file :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	defer settle(t)
+	dir, derr := os.make_directory_temp("", "zsp-nbio-*", context.temp_allocator)
+	testing.expect(t, derr == nil)
+	defer os.remove_all(dir)
+	path := fmt.tprintf("%s/short", dir)
+	content := "short"
+	testing.expect(t, os.write_entire_file(path, transmute([]byte)content) == nil)
+	handle, oerr := nbio.open_sync(path)
+	testing.expectf(t, oerr == nil, "could not open %s: %v", path, oerr)
+	defer nbio.close(handle)
+	Read :: struct {
+		done: bool,
+		err:  nbio.FS_Error,
+		n:    int,
+	}
+	for offset in ([]int{0, 2, 5}) {
+		r: Read
+		buf: [16]byte
+		nbio.read_poly(handle, offset, buf[:], &r, proc(op: ^nbio.Operation, r: ^Read) {
+			r^ = {true, op.read.err, op.read.read}
+		}, all = true)
+		start := time.tick_now()
+		for !r.done && time.tick_since(start) < 5 * time.Second {
+			testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
+		}
+		if offset < len(content) {
+			testing.expectf(t, r.done && r.err == nil && string(buf[:r.n]) == content[offset:],
+				"a read of all from %d: ended %v, with %v, %q", offset, r.done, r.err, string(buf[:r.n]))
+		} else {
+			testing.expectf(t, r.done && r.err == .EOF && r.n == 0, "a read of all from the end: ended %v, with %v, %d bytes", r.done, r.err, r.n)
+		}
+	}
+}
+
+// An open removed once the file is open, as it is as soon as it is made: the file is closed, as nobody is handed it to
+// close. On Windows the loop left it open, and so the file could not be removed (the loop opens files without sharing
+// their deletion); on Linux and macOS a removed operation's open was let go of already.
+@(test)
+loop_closes_what_a_removed_open_opened :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	defer settle(t)
+	dir, derr := os.make_directory_temp("", "zsp-nbio-*", context.temp_allocator)
+	testing.expect(t, derr == nil)
+	defer os.remove_all(dir)
+	path := fmt.tprintf("%s/opened", dir)
+	testing.expect(t, os.write_entire_file(path, transmute([]byte)string("opened")) == nil)
+	called := false
+	opening := nbio.open_poly(path, &called, proc(op: ^nbio.Operation, called: ^bool) {
+		called^ = true
+		if op.open.err == nil {
+			nbio.close(op.open.handle)
+		}
+	})
+	nbio.remove(opening)
+	for _ in 0 ..< 3 {
+		testing.expect(t, nbio.tick(0) == nil)
+	}
+	testing.expect(t, !called, "a removed open called back")
+	rerr := os.remove(path)
+	testing.expectf(t, rerr == nil, "the file a removed open opened is held open still: %v", rerr)
+}
+
 // A read of all, with a timeout, that comes in two pieces: read again for the rest, it keeps the timeout it has. On
 // Windows core:nbio (dev-2026-11) linked it a second, in the first's place, and the first, left behind, fired at the
 // read once it was done with, failing an assertion. Meaningful on Windows.

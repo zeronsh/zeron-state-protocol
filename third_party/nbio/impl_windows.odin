@@ -434,6 +434,11 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> (err: General_Error) {
 		maybe_callback :: proc(op: ^Operation) {
 			if op._impl.timeout == (^Operation)(REMOVED) {
 				debug(op.type, "done but removed")
+				// ZSP: a file opened for an open removed meanwhile is closed, as nobody is handed it to close (as
+				// let_go does on Linux and macOS). Upstream left it open, and the file held so.
+				if op.type == .Open && op.open.err == nil && op.open.handle != INVALID_HANDLE {
+					win.CloseHandle(win.HANDLE(op.open.handle))
+				}
 			} else {
 				debug(op.type, "done")
 				op.cb(op)
@@ -1207,12 +1212,20 @@ read_exec :: proc(op: ^Operation) -> Op_Result {
 			link_timeout(op, op.read.expires)
 			return .Pending
 		}
-		op.system_error = u16(err)
-		if win.System_Error(err) == .HANDLE_EOF && op.read.read == 0 {
-			op.read.err = .EOF
-		} else {
-			op.read.err = FS_Error(err)
+		if win.System_Error(err) == .HANDLE_EOF {
+			// ZSP: the end of the file, met as the read is made. After bytes read before it, that is no failure: the
+			// read is done with what it has, as on Linux and macOS, and read_callback is to see a read of nothing,
+			// done, rather than whatever this left in `over`. Upstream failed it with error 38.
+			if op.read.read == 0 {
+				op.read.err = .EOF
+			} else {
+				op._impl.over.Internal = nil
+				op._impl.over.InternalHigh = nil
+			}
+			return .Done
 		}
+		op.system_error = u16(err)
+		op.read.err = FS_Error(err)
 		return .Done
 	}
 
@@ -1231,6 +1244,14 @@ read_callback :: proc(op: ^Operation) -> Op_Result {
 	n, err := get_result(op._impl.over)
 	#partial switch err {
 	case .SUCCESS:
+		// ZSP: a read of nothing, of a buffer with room, is one at the end of the file (read_exec makes one so of the
+		// end met as a read is made): done, as below.
+		if n == 0 && op.read.read < len(op.read.buf) {
+			if op.read.read == 0 {
+				op.read.err = .EOF
+			}
+			return .Done
+		}
 	case .OPERATION_ABORTED:
 		// This error could also happen when the user calls close on the handle.
 		if check_timed_out(op, op.read.expires) {
@@ -1239,11 +1260,14 @@ read_callback :: proc(op: ^Operation) -> Op_Result {
 		}
 		fallthrough
 	case .HANDLE_EOF:
+		// ZSP: the end, after bytes or before any, ends the read: done with what it has. Upstream, after bytes, went on
+		// to read again for the rest, at the end again, for ever.
 		if op.read.read == 0 {
 			op.read.err = .EOF
-			return .Done
 		}
+		return .Done
 	case:
+		op.system_error = u16(err)
 		op.read.err = FS_Error(err)
 		return .Done
 	}
@@ -1311,6 +1335,7 @@ write_callback :: proc(op: ^Operation) -> Op_Result {
 		}
 		fallthrough
 	case:
+		op.system_error = u16(err) // ZSP: see Operation.system_error
 		op.write.err = FS_Error(err)
 		return .Done
 	}
@@ -1619,6 +1644,7 @@ sendfile_callback :: proc(op: ^Operation) -> Op_Result {
 		}
 		fallthrough
 	case:
+		op.system_error = u16(win.WSAGetLastError()) // ZSP: see Operation.system_error
 		op.sendfile.err = net._tcp_send_error()
 		return .Done
 	}
