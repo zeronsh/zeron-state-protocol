@@ -147,7 +147,10 @@ const Notes = m.map({ items: m.list(18, m.map({ n: c.number(16), body: c.text(17
 const Plain = { n: c.number(16), label: c.string(17) };
 
 function readData(path: string): Data {
-  const r = codec.reader(readFileSync(path));
+  // As a plain Uint8Array: of a Node Buffer, slice is a view, and each frame would be one of the whole file, held already,
+  // and so would whatever a client kept of it as it is sliced; of a Uint8Array, slice is a copy, as a frame from a pipe is.
+  const raw = readFileSync(path);
+  const r = codec.reader(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
   const out: Data = new Map();
   while (r.pos < r.len) {
     const name = new TextDecoder().decode(codec.bytes(r));
@@ -420,11 +423,16 @@ if (args.length >= 3 && cases[args[1]]) {
   if (args[4] === "alloc") {
     // What the case made, where nothing is collected while it is done (bench/mirror.py gives V8 a young space big enough
     // for that); had anything been, the heap would have been less than it was a step before.
-    const made = process.memoryUsage().heapUsed;
+    // (With what array buffers were made, which is not in the heap; nothing of either is let go of but by collecting.)
+    const usage = () => {
+      const m = process.memoryUsage();
+      return m.heapUsed + m.arrayBuffers;
+    };
+    const made = usage();
     let last = made, collected = 0;
     for (let k = 1; k <= count; k++) {
       one.step(s, data, warm + k);
-      const now = process.memoryUsage().heapUsed;
+      const now = usage();
       if (now < last) collected = 1;
       last = now;
     }

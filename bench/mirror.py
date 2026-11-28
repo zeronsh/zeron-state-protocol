@@ -213,7 +213,7 @@ def luau_exact(rows, case, data, n):
             made, collected = said(alloc, "alloc_kb"), said(alloc, "collected")
             if not collected:
                 break
-    held = said(luau_cli(rows, case, data, n, "memory", QUIET_MB), "heap_kb")
+    held = said(luau_cli(rows, case, data, n, "memory", 0), "heap_kb")  # collected at once: no heap made bigger is needed
     return made, collected, held
 
 
@@ -238,12 +238,13 @@ def main():
             runs = 5 if lang == "ts" else 3  # V8's numbers wander more
             base = [measure(*command(lang, rows, case, data, 0, quiet=quiet)) for _ in range(runs)]
             done = [measure(*command(lang, rows, case, data, n, quiet=quiet)) for _ in range(runs)]
-            _, _, _, mem = measure(*command(lang, rows, case, data, n, "memory"), counted=False)
             seconds = middle([said(r[3], "seconds") for r in done])
-            heap = said(mem, "heap_kb")
             exact = luau_exact(rows, case, data, n) if lang == "luau" else None
             if exact:
                 heap = exact[2]
+            else:
+                _, _, _, mem = measure(*command(lang, rows, case, data, n, "memory"), counted=False)
+                heap = said(mem, "heap_kb")
 
             def each(k):
                 a, b = middle([r[k] for r in base]), middle([r[k] for r in done])

@@ -426,7 +426,7 @@ local function paused()
 	end
 	-- And swept, all of it. What was made to wait for the round is all but all of what the round found was garbage, as this
 	-- is done twice (see below), and it is most of the heap: it is gone once the sweep is done, or nearly. (Waiting only
-	-- for the heap to grow is not enough: a sweep goes over pages of what is held first, freeing nothing for a while.)
+	-- for the heap to grow is not enough: a sweep may go over pages of what is held, freeing nothing, for a while.)
 	-- Where little was made, the heap may never come so low: so this ends, too, as the next round does, which a key made
 	-- now goes from only then.
 	local due = peak - made * EACH_KB * 0.85
