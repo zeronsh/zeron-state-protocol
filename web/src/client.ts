@@ -1201,8 +1201,8 @@ export class Client {
     // keep as long as anything is cut from it, where of a Uint8Array it is a copy, which is what what is kept is made of.
     let s = data.constructor === Uint8Array ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     if (this.#input.length > 0) {
-      this.#input.push(data.slice());
-      this.#inputBytes += data.length;
+      this.#input.push(s.slice());
+      this.#inputBytes += s.length;
       if (this.#inputBytes < this.#inputWants) return;
       s = new Uint8Array(this.#inputBytes);
       let at = 0;

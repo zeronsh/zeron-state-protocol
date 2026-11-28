@@ -226,7 +226,7 @@ function cellOf(row: string, kind: number, slot: number, n: number, body: string
     })
     .join("");
   assert(cells.length > 3000, "the text was written in a long cell");
-  for (const [shown, reused] of [[true, false], [false, false], [true, true]] as const) {
+  for (const [shown, reused] of [[true, false], [false, false], [true, "whole"], [true, "pieces"]] as const) {
     const r = harness();
     r.run();
     r.greet();
@@ -241,9 +241,14 @@ function cellOf(row: string, kind: number, slot: number, n: number, body: string
       // client's own, and not a view of what the host is done with. (A Buffer's slice is such a view.)
       const w = codec.writer();
       codec.putBytes(w, b(ch(CELLS) + "\x00" + cells));
-      const given = Buffer.from(codec.written(w));
-      r.self.receive(given);
-      given.fill(0);
+      const all = codec.written(w);
+      // Whole, or in three pieces, each written over once given, before the frame is all there.
+      const cuts = reused === "whole" ? [0, all.length] : [0, 7, all.length >> 1, all.length];
+      for (let i = 1; i < cuts.length; i++) {
+        const given = Buffer.from(all.subarray(cuts[i - 1], cuts[i]));
+        r.self.receive(given);
+        given.fill(0);
+      }
       r.run();
     } else r.tell(CELLS, "\x00" + cells);
     if (watch) {
