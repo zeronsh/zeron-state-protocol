@@ -6,10 +6,8 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 
-// What a process has open that it was handed: on Linux, anything, from what it says of each of its descriptors; on
-// macOS, what of a store at `dir` or of a node listening at those ports it has, as lsof says. There a socket is made
-// close-on-exec only once it is made, which another thread's fork may come between, as it may for any test beside this
-// one: what the node has open is had so all the same, before anything is started that could be handed it.
+// What of a node, with its store at `dir` and listening at those ports, a process has open: from what Linux says of each
+// of its descriptors.
 @(private)
 child_holds :: proc(pid: int, dir: string, tcp, udp: int) -> []string {
 	held := make([dynamic]string, context.temp_allocator)
@@ -20,8 +18,8 @@ child_holds :: proc(pid: int, dir: string, tcp, udp: int) -> []string {
 		append(&held, fmt.tprintf("what could not be told (%s: %v)", fds, err))
 		return held[:]
 	}
-	// Anything at all, on Linux, where every descriptor of this process is had close-on-exec as it is made: but what
-	// core:os opens in the child itself, /dev/null for what it is not given, which it does not close.
+	// What is the node's: a file of its store, one of its sockets, or anything of an event loop's (an io_uring, an
+	// eventfd), which only nbio makes. Not whatever else a test beside this one may have open, which is that test's.
 	ports := socket_inodes(tcp, udp)
 	for e in entries {
 		n, _ := strconv.parse_int(e.name)
@@ -29,14 +27,13 @@ child_holds :: proc(pid: int, dir: string, tcp, udp: int) -> []string {
 			continue
 		}
 		to, _ := os.read_link(e.fullpath, context.temp_allocator)
-		if to == "/dev/null" {
-			continue
-		}
-		mine := strings.has_prefix(to, real) || strings.has_prefix(to, dir)
+		mine := strings.has_prefix(to, real) || strings.has_prefix(to, dir) || strings.has_prefix(to, "anon_inode:")
 		for inode in ports {
 			mine ||= to == fmt.tprintf("socket:[%s]", inode)
 		}
-		append(&held, fmt.tprintf("its descriptor %d, %s%s", n, to, ", the node's" if mine else ""))
+		if mine {
+			append(&held, fmt.tprintf("its descriptor %d, %s", n, to))
+		}
 	}
 	return held[:]
 }

@@ -5,10 +5,8 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 
-// What a process has open that it was handed: on Linux, anything, from what it says of each of its descriptors; on
-// macOS, what of a store at `dir` or of a node listening at those ports it has, as lsof says. There a socket is made
-// close-on-exec only once it is made, which another thread's fork may come between, as it may for any test beside this
-// one: what the node has open is had so all the same, before anything is started that could be handed it.
+// What of a node, with its store at `dir` and listening at those ports, a process has open: from what lsof says of each
+// of its descriptors, on macOS.
 @(private)
 child_holds :: proc(pid: int, dir: string, tcp, udp: int) -> []string {
 	held := make([dynamic]string, context.temp_allocator)

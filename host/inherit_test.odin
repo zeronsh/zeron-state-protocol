@@ -75,11 +75,12 @@ host_hands_a_child_nothing :: proc(t: ^testing.T) {
 		host_destroy(&b)
 	}
 	// Bound as nothing else is, without any option that would let it share a port: had by nothing still.
-	if s, e := nbio.create_tcp_socket(.IP4); testing.expect(t, e == nil) {
+	// By core:net's sockets, which need no event loop, this thread's being let go of with the node's.
+	if s, e := net.create_socket(.IP4, .TCP); testing.expect(t, e == nil) {
 		testing.expectf(t, net.bind(s, listening) == nil, "the port the node listened on, %d, is held by the child", listening.port)
 		net.close(s)
 	}
-	if s, e := nbio.create_udp_socket(.IP4); testing.expect(t, e == nil) {
+	if s, e := net.create_socket(.IP4, .UDP); testing.expect(t, e == nil) {
 		testing.expectf(t, net.bind(s, {net.IP4_Any, udp}) == nil, "the node's UDP port, %d, is held by the child", udp)
 		net.close(s)
 	}
