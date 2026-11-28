@@ -367,6 +367,95 @@ link_outlasts_a_pause :: proc(t: ^testing.T) {
 	testing.expect(t, strings.has_suffix(string(n.got[1][:]), "\x04\x05\x06"))
 }
 
+// Acknowledgements late past a probe's time, as a busy machine's are, with nothing lost: the probe carries what was never
+// sent, and nothing is sent twice. Sending the oldest again instead cost a packet each time; through a relay, 8 KB.
+@(test)
+link_probes_with_what_is_new :: proc(t: ^testing.T) {
+	state := rand.create(10)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	n.delay = 500 // a relay on this machine
+	for i in 0 ..< 50 {
+		link_write(&n.links[i % 2], 0, {1, 2, 3})
+		for net_step(&n) {
+		}
+	}
+	a := &n.links[0]
+	s := a.streams[0]
+	// More than its window: some in flight, and more to send once it hears of that.
+	sent := make([dynamic]byte, context.temp_allocator)
+	append(&sent, ..n.got[1][:])
+	chunk: [8 << 10]byte
+	for &b in chunk {
+		b = byte(rand.uint32())
+	}
+	for link_room(a) > len(chunk) && f64(len(sent)) < 4 * a.window {
+		testing.expect(t, link_write(a, 0, chunk[:]))
+		append(&sent, ..chunk[:])
+	}
+	net_push(&n, 0)
+	testing.expect(t, a.in_flight > 0 && link_sendable(a), "nothing in flight, or nothing more to send")
+	// Nothing comes back until the probe is due: what is in flight is late, not lost.
+	n.now = link_timeout(a)
+	next, first := s.out_next, link_next(a)
+	net_push(&n, 0)
+	testing.expect(t, link_next(a) > first, "no probe")
+	for &p, i in link_sent(a) {
+		if a.sent_base + u64(i) >= first {
+			for c in link_chunks(a, &p) {
+				testing.expectf(t, c.lo >= next, "the probe sent %v..%v again, which was only late", c.lo, c.hi)
+			}
+		}
+	}
+	testing.expect(t, s.out_next > next, "the probe carried nothing new")
+	steps := 0
+	for net_step(&n) && steps < 100_000 {
+		steps += 1
+	}
+	testing.expect(t, steps < 100_000)
+	testing.expect(t, string(n.got[1][:]) == string(sent[:]))
+}
+
+// A tail lost, with more to send: the probe carries the new, and what it is answered with says the rest was lost.
+@(test)
+link_probe_finds_a_lost_tail :: proc(t: ^testing.T) {
+	state := rand.create(11)
+	context.random_generator = rand.default_random_generator(&state)
+	n: Net
+	net_init(t, &n)
+	defer net_destroy(&n)
+	n.delay = 500
+	for i in 0 ..< 50 {
+		link_write(&n.links[i % 2], 0, {1, 2, 3})
+		for net_step(&n) {
+		}
+	}
+	a := &n.links[0]
+	sent := make([dynamic]byte, context.temp_allocator)
+	append(&sent, ..n.got[1][:])
+	chunk: [8 << 10]byte
+	for &b in chunk {
+		b = byte(rand.uint32())
+	}
+	for link_room(a) > len(chunk) && f64(len(sent)) < 4 * a.window {
+		testing.expect(t, link_write(a, 0, chunk[:]))
+		append(&sent, ..chunk[:])
+	}
+	n.loss = 1
+	net_push(&n, 0) // all of it lost
+	n.loss = 0
+	testing.expect(t, a.in_flight > 0 && link_sendable(a))
+	steps := 0
+	for net_step(&n) && steps < 100_000 {
+		steps += 1
+	}
+	testing.expect(t, steps < 100_000)
+	testing.expect(t, string(n.got[1][:]) == string(sent[:]))
+	testing.expect_value(t, a.state, Link_State.Open)
+}
+
 // A link a relay carries, whose packets are larger than a datagram's, outlasts a pause with much in flight and then
 // sends all of it: its window, cut down while it waited and after, still holds one of its packets.
 @(test)

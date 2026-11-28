@@ -1745,16 +1745,21 @@ link_expire :: proc(l: ^Link, now: Time) {
 	}
 	l.waiting = now
 	l.want_probe = true
-	// Send the oldest unacknowledged again.
+	if l.probes > 2 {
+		l.window = 2 * link_floor(l)
+	}
+	// A probe asks for word of what is in flight, which is as likely only late as lost: on a busy machine the peer's
+	// acknowledgements wait their turn. So, as RFC 9002 has it, it carries what was never sent where there is some, and
+	// what it is answered with says what was lost. Only with nothing new to say is the oldest unacknowledged sent again.
+	if link_sendable(l) {
+		return
+	}
 	for &p in link_sent(l) {
 		if p.time != 0 {
 			size, probe := p.size, p.probe
 			link_lose(l, &p)
 			if !probe {
 				l.round_lost -= int(size) // a timeout is no measure of congestion
-			}
-			if l.probes > 2 {
-				l.window = 2 * link_floor(l)
 			}
 			break
 		}
