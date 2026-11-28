@@ -193,7 +193,10 @@ function holdDirectory(dir: string): [string, () => void] {
     }
   };
   const code = (e: unknown) => ((e as { errcode?: number }).errcode ?? 0) & 0xff;
-  const filled = () => (lstatSync(path, { throwIfNoEntry: false })?.size ?? 0) > 0;
+  // As SQLite sees it: a file of one byte is to its Unix side one of none (unixFileSize), as it writes one byte into an
+  // empty database on some file systems (ticket #3260), and so is a database with no pages, which it plays no journal
+  // on, and which it holds as any other, its write a write. Windows' side sees what there is.
+  const filled = () => (lstatSync(path, { throwIfNoEntry: false })?.size ?? 0) > (process.platform === "win32" ? 0 : 1);
   for (let tries = 0; ; tries++) {
     // Something in it, which nothing writes and zspd pays no heed to, is emptied first: for SQLite makes of it what it
     // may, and of some of it a database it only reads, in which it begins a write, says so, and holds nothing. It is

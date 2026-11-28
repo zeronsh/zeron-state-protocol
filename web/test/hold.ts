@@ -158,6 +158,8 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
   const fs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
   const unwatched = { openSync: fs.openSync, truncateSync: fs.truncateSync };
   const contents = [
+    ["a byte", Buffer.from("x")],
+    ["a nul", Buffer.from([0])],
     ["filled", Buffer.from("x".repeat(4096))],
     ["begun", database.subarray(0, 512)],
     ["spoiled", spoiled],
