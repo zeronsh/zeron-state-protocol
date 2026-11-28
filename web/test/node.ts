@@ -72,6 +72,82 @@ const TMP = mkdtempSync(join(tmpdir(), "zsp-node-"));
   await node.close();
 }
 
+// A torn tail of the log that cannot be cut off as the node starts: storage has failed, and the node stops, rather than go
+// on writing after what it could not cut off and acknowledging it.
+{
+  let failing = false;
+  class Uncut extends MemoryVolume {
+    override async open(name: string, create: boolean): Promise<File | undefined> {
+      const f = await super.open(name, create);
+      if (!f || !name.endsWith(".log")) return f;
+      const truncate = f.truncate.bind(f);
+      f.truncate = (size) => {
+        if (failing) throw new Error("the disk cannot be written");
+        truncate(size);
+      };
+      return f;
+    }
+  }
+  const volume = new Uncut();
+  volume.openNow = undefined; // through open, which is watched
+  const first = await Node.open({ volume, module, log: () => {} });
+  first.create();
+  const client = new Client({ connect: first.connect });
+  while (!client.may(1, "write")) await new Promise((done) => setTimeout(done, 1));
+  await client.write(1, (change) => change.insert({}, "x", 1, {}));
+  await client.close();
+  await first.close();
+  let last: File | undefined; // the last segment written to, of those opened ahead of need too
+  for (const name of (await volume.list()).filter((name) => name.endsWith(".log")).sort()) {
+    const f = (await volume.open(name, false))!;
+    if (f.size() > 0) last?.close(), (last = f);
+    else f.close();
+  }
+  last!.write(new Uint8Array(64).fill(7), last!.size()); // torn, as by a write the power went out in
+  last!.close();
+  failing = true;
+  const node = await Node.open({ volume, module, log: () => {} });
+  let failure: Error | undefined;
+  node.onFailure = (e) => (failure = e);
+  let durable = false;
+  const again = new Client({ connect: node.connect });
+  for (let i = 0; i < 100 && !failure && !again.may(1, "write"); i++) await new Promise((done) => setTimeout(done, 5));
+  if (again.may(1, "write")) void again.write(1, (change) => change.insert({}, "x", 2, {})).then(() => (durable = true));
+  for (let i = 0; i < 100 && !failure; i++) await new Promise((done) => setTimeout(done, 5));
+  assert(failure && /storage failed/.test(failure.message), `it went on: ${failure}`);
+  assert(!durable, "and said something was durable after");
+  void again.close();
+  await node.close();
+}
+
+// A segment the node drops, whose file then cannot be removed in the background: storage has failed, and the node stops
+// at once, though it is idle, with nothing to make durable that would have found it so.
+{
+  class Unremovable extends MemoryVolume {
+    failing = false;
+    override async remove(name: string): Promise<void> {
+      if (this.failing) throw new Error("the disk cannot be written");
+      return super.remove(name);
+    }
+  }
+  const volume = new Unremovable();
+  const node = await Node.open({ volume, module, log: () => {} });
+  node.create();
+  const client = new Client({ connect: node.connect });
+  while (!client.may(1, "write")) await new Promise((done) => setTimeout(done, 1));
+  await client.write(1, (change) => change.insert({}, "x", 1, {}));
+  await node.settled();
+  let failure: Error | undefined;
+  node.onFailure = (e) => (failure = e);
+  volume.failing = true;
+  const ahead = Math.max(...(await volume.list()).filter((name) => name.endsWith(".log")).map((name) => parseInt(name, 16)));
+  node.store.logDrop(ahead); // as the node drops one it went on from, once a checkpoint has evacuated it
+  for (let i = 0; i < 100 && !failure; i++) await new Promise((done) => setTimeout(done, 5));
+  assert(failure && /storage failed/.test(failure.message), `it went on: ${failure}`);
+  void client.close();
+  await node.close();
+}
+
 // A scope is named by the number it is, and one the space has: 2^32 is not 0, which is every scope, nor 2^32 + 1 scope 1,
 // nor 1.5 scope 1; and a scope the space has not is no scope to admit to or revoke from.
 {

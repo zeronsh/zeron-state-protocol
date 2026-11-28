@@ -26,6 +26,7 @@ let failClose: string | undefined; // and whose close throws
 const heldForEver = new Set<string>(); // paths of files something else holds, and never lets go of
 const heldOnce = new Set<string>(); // and that it holds for one try more, as a worker just gone may
 let writes = 0; // to any file
+const flushes = new Map<string, number>(); // by path: how often each file was made durable
 const pauses = new Map<string, { reached: () => void; release: Promise<void> }>(); // by path: a file's next handle, held as it is had
 
 class Handle {
@@ -66,6 +67,7 @@ class Handle {
   flush(): void {
     this.#check();
     if (failFlush === "*" || failFlush === this.file.name) throw new DOMException("the disk is full", "QuotaExceededError");
+    flushes.set(this.file.path, (flushes.get(this.file.path) ?? 0) + 1);
   }
   close(): void {
     if (failClose === this.file.name) throw new DOMException("it could not be closed", "UnknownError");
@@ -1167,6 +1169,24 @@ for (const when of ["heard of", "not yet heard of"] as const) {
   failClose = "00000000.log";
   store.logDrop(0);
   failClose = undefined;
+  await store.close();
+}
+
+// As a store opens, the latest of each thing kept is made durable, as what a process killed as it kept it left may not be;
+// and the next sync of the log makes durable every segment it found, whose writes a process killed may have left so too.
+{
+  let store = await Store.open(await OpfsVolume.at("zsp/found"), 1 << 20);
+  for (const what of ["device", "space", "keys", "roster"] as const) store.keep(what, new Uint8Array(4)), store.keep(what, new Uint8Array(5));
+  assert(store.logWrite(0, new Uint8Array(10)));
+  await sleep(10); // its segment's file opened
+  assert(store.logSync());
+  await store.close();
+  const count = (of: RegExp) => [...flushes].reduce((n, [path, k]) => n + (of.test(path) ? k : 0), 0);
+  const kept = count(/^\/zsp\/found\/(device|space|keys|roster)\.[01]$/), logs = count(/^\/zsp\/found\/.*\.log$/);
+  store = await Store.open(await OpfsVolume.at("zsp/found"), 1 << 20);
+  assert.equal(count(/^\/zsp\/found\/(device|space|keys|roster)\.[01]$/) - kept, 4, "the latest of each thing kept was not made durable");
+  assert(store.logSync());
+  assert(count(/^\/zsp\/found\/.*\.log$/) > logs, "a sync of the log made nothing it found durable");
   await store.close();
 }
 

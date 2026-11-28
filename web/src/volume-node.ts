@@ -33,8 +33,11 @@ export class NodeVolume implements Volume {
     let names: string[];
     try {
       names = readdirSync(this.#at);
-    } catch {
-      return [];
+    } catch (e) {
+      // No directory is no store yet. Anything else, as too many files open or a disk that cannot be read, is not an empty
+      // one: opened as one, it would have none of the log, and lose all of it not yet in the tree.
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw e;
     }
     // What a lock file was made from, left by a process that ended in the moment it was being made: long done with.
     for (const name of names) {

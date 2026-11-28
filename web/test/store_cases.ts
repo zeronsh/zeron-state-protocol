@@ -3,7 +3,8 @@
 
 import assert from "node:assert/strict";
 import { Store } from "../src/store.ts";
-import { mkdtempSync, rmSync } from "node:fs";
+import fs, { mkdtempSync, rmSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryVolume, type File, type Volume } from "../src/volume.ts";
@@ -301,6 +302,221 @@ for (const volume of [new MemoryVolume(), new NodeVolume(mkdtempSync(join(tmpdir
   assert(s.failure, "it says that storage failed");
   s.letGo();
   assert.equal(volume.closed_, volume.open_, "a segment's file whose journal could not be told was left open");
+}
+
+// A volume whose journal fails, once told to: as a full disk, or one that cannot be written any more.
+class Unjournaled extends MemoryVolume {
+  failing = false;
+  override async open(name: string, create: boolean): Promise<File | undefined> {
+    const f = await super.open(name, create);
+    if (!f || name !== "journal") return f;
+    const write = f.write.bind(f), truncate = f.truncate.bind(f), flush = f.flush.bind(f);
+    const fail = () => {
+      if (this.failing) throw new Error("the disk cannot be written");
+    };
+    f.write = (b, at) => (fail(), write(b, at));
+    f.truncate = (size) => (fail(), truncate(size));
+    f.flush = () => (fail(), flush());
+    return f;
+  }
+}
+
+// A held segment dropped while the journal cannot be told so: storage has failed, and the segment is held still, as the next
+// start finds it; nothing more is made durable, a checkpoint no more than the log.
+{
+  const volume = new Unjournaled({ slow: true });
+  let s = await opened(volume);
+  assert(s.logWrite(50 * SEGMENT, bytes("a", 10))); // held, as is the next, their files not open
+  assert(s.logWrite(51 * SEGMENT, bytes("b", 10)));
+  assert(s.logSync()); // and so journaled
+  volume.failing = true;
+  assert.throws(() => s.logDrop(50), /cannot be written/);
+  assert(s.failure, "it did not say that storage failed");
+  assert.equal(read(s, 50), "a".repeat(10), "it let go of what the journal still says it holds");
+  assert(!s.logSync() && !s.pageSync(), "it made something durable after");
+  volume.failing = false;
+  s = await crashed(volume, s);
+  assert.equal(read(s, 50), "a".repeat(10), "as the next start finds it");
+}
+
+// Nor is a held segment cut short where the journal cannot be told so: it is as long as the next start finds it.
+{
+  const volume = new Unjournaled({ slow: true });
+  let s = await opened(volume);
+  assert(s.logWrite(50 * SEGMENT, bytes("a", 100)));
+  assert(s.logSync());
+  volume.failing = true;
+  assert.throws(() => s.logTruncate(50 * SEGMENT + 30), /cannot be written/);
+  assert(s.failure, "it did not say that storage failed");
+  assert.equal(read(s, 50), "a".repeat(100), "it was cut short though the journal does not say so");
+  assert(!s.logWrite(50 * SEGMENT + 30, bytes("c", 5)), "it was written to after");
+  volume.failing = false;
+  s = await crashed(volume, s);
+  assert.equal(read(s, 50), "a".repeat(100));
+}
+
+// Once something has failed in the background, as a segment's file that could not be given what was held of it, nothing
+// more is made durable: no checkpoint, no more than the log; and nothing more is written, dropped, cut short or kept.
+{
+  const volume = new MemoryVolume({ slow: true });
+  const s = await opened(volume);
+  assert(s.logWrite(0, bytes("a", 10)));
+  assert(s.logWrite(50 * SEGMENT, bytes("b", 10))); // held, its file not open
+  let told = 0;
+  s.onSettled = () => told++;
+  const open = volume.open.bind(volume);
+  volume.open = async (name, create) => {
+    if (name.endsWith(".log")) throw new Error("too many files open");
+    return open(name, create);
+  };
+  for (let i = 0; i < 50 && !s.failure; i++) volume.settle(), await turn();
+  assert(s.failure, "it says that storage failed");
+  assert(told > 0, "whoever was to be told was not");
+  assert(s.pageWrite(0, new Uint8Array(4096)) === false, "a page was written after");
+  assert(!s.pageSync(), "a checkpoint was made durable after");
+  assert(!s.logSync() && !s.logWrite(10, bytes("c", 5)) && !s.findWrite(0, new Uint8Array(4096)));
+  s.logDrop(0);
+  s.logTruncate(5);
+  assert.equal(read(s, 0), "a".repeat(10), "it was dropped or cut short after");
+  assert.throws(() => s.keep("roster", bytes("r", 4)), /storage has failed/);
+  s.letGo();
+}
+
+// A store's directory that cannot be listed, as with too many files open, is not opened as an empty one, which would have
+// none of the log: it fails to open. One that is not there yet is empty.
+{
+  const dir = mkdtempSync(join(tmpdir(), "zsp-store-"));
+  let s = await opened(new NodeVolume(dir));
+  assert(s.logWrite(0, bytes("a", 10)));
+  assert(s.logSync());
+  await s.close();
+  const readdir = fs.readdirSync;
+  for (const code of ["EMFILE", "EACCES", "EIO"]) {
+    fs.readdirSync = ((path: fs.PathLike, ...rest: unknown[]) => {
+      if (String(path).includes("zsp-store-")) throw Object.assign(new Error(`${code}: cannot list ${path}`), { code });
+      return (readdir as (...a: unknown[]) => unknown)(path, ...rest);
+    }) as typeof fs.readdirSync;
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(Store.open(new NodeVolume(dir), SEGMENT), new RegExp(code), `${code}: opened as empty`);
+    } finally {
+      fs.readdirSync = readdir;
+      syncBuiltinESMExports();
+    }
+  }
+  s = await opened(new NodeVolume(dir));
+  assert.equal(read(s, 0), "a".repeat(10), "and it opens as it was once it can be listed");
+  await s.close();
+  s = await opened(new NodeVolume(join(dir, "new")));
+  assert.equal(s.logEnd(), 0);
+  await s.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// Power lost, as on a disk that tears what it was writing: what was written to a file and not flushed is lost, and whatever
+// it was written over with it. And a process killed: what it wrote and did not flush is in the system's keeping still.
+class Tearing extends MemoryVolume {
+  killFlush?: RegExp; // the files whose flush never comes, the process killed first
+  #unflushed = new Set<string>();
+  constructor() {
+    super();
+    const now = this.openNow!;
+    this.openNow = (name, create) => this.#watched(name, now(name, create));
+  }
+  override async open(name: string, create: boolean): Promise<File | undefined> {
+    return this.#watched(name, await super.open(name, create));
+  }
+  #watched(name: string, f: File | undefined): File | undefined {
+    if (!f) return f;
+    const write = f.write.bind(f), truncate = f.truncate.bind(f), flush = f.flush.bind(f);
+    f.write = (b, at) => (this.#unflushed.add(name), write(b, at));
+    f.truncate = (size) => (this.#unflushed.add(name), truncate(size));
+    f.flush = () => {
+      if (this.killFlush?.test(name)) throw new Error("killed");
+      this.#unflushed.delete(name);
+      flush();
+    };
+    return f;
+  }
+  async cut(): Promise<void> {
+    for (const name of this.#unflushed) {
+      const f = (await super.open(name, false))!;
+      f.write(new Uint8Array(Math.max(1, f.size())).fill(0xee), 0);
+      f.flush();
+      f.close();
+    }
+    this.#unflushed.clear();
+    this.crash();
+  }
+}
+
+// A process killed as it kept something, the latest written but not flushed, then started again and killed as it kept the
+// next, over the one before; then power lost: what was kept is not lost, for the latest was made durable as it started.
+{
+  const volume = new Tearing();
+  let s = await opened(volume);
+  s.keep("roster", bytes("A", 8)); // durable
+  volume.killFlush = /^roster\./;
+  assert.throws(() => s.keep("roster", bytes("B", 8)), /killed/);
+  s.abandon();
+  volume.killFlush = undefined;
+  s = await opened(volume);
+  assert.deepEqual(s.kept("roster").latest, bytes("B", 8));
+  volume.killFlush = /^roster\./;
+  assert.throws(() => s.keep("roster", bytes("C", 8)), /killed/); // over A, which was all the disk had
+  s.abandon();
+  volume.killFlush = undefined;
+  await volume.cut();
+  s = await opened(volume);
+  assert(s.kept("roster").latest !== undefined, "a roster kept was lost, both its files");
+  s.letGo();
+}
+
+// A process killed with what it wrote to the log not yet flushed, then started again: what the node finds there, and so
+// counts on once the log is synced, is durable once it is, though nothing more was written to its segment.
+{
+  const volume = new Tearing();
+  let s = await opened(volume);
+  assert(s.logWrite(0, bytes("a", 10))); // never synced
+  s.abandon();
+  s = await opened(volume);
+  assert.equal(read(s, 0), "a".repeat(10));
+  assert(s.logSync());
+  s.abandon();
+  await volume.cut();
+  s = await opened(volume);
+  assert.equal(read(s, 0), "a".repeat(10), "what a sync said was durable was lost");
+  s.letGo();
+}
+
+// And so on a disk: as a store opens, the latest of each thing kept is made durable; and the next sync of the log makes
+// durable every segment it found.
+{
+  const dir = mkdtempSync(join(tmpdir(), "zsp-store-"));
+  let s = await opened(new NodeVolume(dir));
+  for (const what of ["device", "space", "keys", "roster"] as const) s.keep(what, bytes("k", 4)), s.keep(what, bytes("l", 4));
+  assert(s.logWrite(0, bytes("a", 10)));
+  assert(s.logSync());
+  await s.close();
+  const fsync = fs.fsyncSync;
+  let synced = 0;
+  fs.fsyncSync = (fd: number) => (synced++, fsync(fd));
+  syncBuiltinESMExports();
+  try {
+    const began = performance.now();
+    s = await opened(new NodeVolume(dir));
+    const took = performance.now() - began;
+    assert.equal(synced, 4, "the latest of each thing kept was not made durable as the store opened");
+    console.log(`     a store opened, the latest of each of four things kept made durable, in ${took.toFixed(1)} ms`);
+    synced = 0;
+    assert(s.logSync());
+    assert(synced >= 1, "a sync of the log made nothing it found durable");
+  } finally {
+    fs.fsyncSync = fsync;
+    syncBuiltinESMExports();
+  }
+  await s.close();
+  rmSync(dir, { recursive: true, force: true });
 }
 
 console.log("ok");
