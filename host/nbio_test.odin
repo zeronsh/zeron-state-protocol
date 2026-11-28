@@ -20,6 +20,7 @@ import "../third_party/nbio"
 loop_churn_loses_no_operation :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	SOCKETS :: 32
 	Churn :: struct {
 		sockets: [SOCKETS]net.UDP_Socket,
@@ -106,6 +107,7 @@ loop_churn_loses_no_operation :: proc(t: ^testing.T) {
 loop_gives_every_change_it_held_back :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	context.logger.lowest_level = .Error // the loop warns of each it holds back, thousands; what fails is still said
 	// Past what two calls give, whatever the loop's size: the define the tests build with, or the largest default.
 	N :: 3 * #config(ODIN_NBIO_QUEUE_SIZE, 2048) + 7
@@ -133,6 +135,7 @@ loop_gives_every_change_it_held_back :: proc(t: ^testing.T) {
 loop_ends_reads_and_writes_of_a_reset_connection :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
 	testing.expect(t, err == nil)
 	defer net.close(listener)
@@ -201,6 +204,7 @@ loop_ends_reads_and_writes_of_a_reset_connection :: proc(t: ^testing.T) {
 loop_keeps_what_the_system_said_of_a_refusal :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	// A port nothing listens at: one listened at, and let go of.
 	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
 	testing.expect(t, err == nil)
@@ -233,6 +237,7 @@ loop_keeps_what_the_system_said_of_a_refusal :: proc(t: ^testing.T) {
 loop_lets_a_timeout_remove_the_one_after_it :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	Timeouts :: struct {
 		later:             ^nbio.Operation,
 		first, last, gone: bool,
@@ -265,6 +270,7 @@ loop_lets_a_timeout_remove_the_one_after_it :: proc(t: ^testing.T) {
 loop_keeps_an_operation_kqueue_may_still_name :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	context.logger.lowest_level = .Error // the loop warns of each change it holds back
 	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
 	testing.expect(t, err == nil)
@@ -316,6 +322,7 @@ loop_keeps_an_operation_kqueue_may_still_name :: proc(t: ^testing.T) {
 loop_lets_go_of_what_a_removed_accept_took :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	listener, err := nbio.listen_tcp({net.IP4_Loopback, 0})
 	testing.expect(t, err == nil)
 	at, _ := net.bound_endpoint(listener)
@@ -357,6 +364,7 @@ loop_reads_nothing_for_a_removed_read :: proc(t: ^testing.T) {
 	}
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
 	testing.expect(t, err == nil)
 	defer net.close(listener)
@@ -420,6 +428,7 @@ loop_reads_nothing_for_a_removed_read :: proc(t: ^testing.T) {
 loop_ends_a_read_that_fails_as_it_is_made :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	dir, derr := os.make_directory_temp("", "zsp-nbio-*", context.temp_allocator)
 	testing.expect(t, derr == nil)
 	defer os.remove_all(dir)
@@ -449,6 +458,7 @@ loop_ends_a_read_that_fails_as_it_is_made :: proc(t: ^testing.T) {
 loop_keeps_one_timeout_for_a_read_of_all :: proc(t: ^testing.T) {
 	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
 	defer nbio.release_thread_event_loop()
+	defer settle(t)
 	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
 	testing.expect(t, err == nil)
 	defer net.close(listener)
@@ -484,4 +494,14 @@ loop_keeps_one_timeout_for_a_read_of_all :: proc(t: ^testing.T) {
 	for time.tick_since(start) < 600 * time.Millisecond {
 		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
 	}
+}
+
+// Whatever a test began on its loop, finished before the loop is let go of, after what the test closes on its way out:
+// on Windows the loops of every thread share one completion port, and what one left under way comes to another's.
+settle :: proc(t: ^testing.T) {
+	start := time.tick_now()
+	for nbio.num_waiting() > 0 && time.tick_since(start) < 5 * time.Second {
+		_ = nbio.tick(10 * time.Millisecond)
+	}
+	testing.expectf(t, nbio.num_waiting() == 0, "%d operations still waiting as the test ends", nbio.num_waiting())
 }
