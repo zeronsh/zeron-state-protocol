@@ -94,6 +94,12 @@ Session :: struct {
 	seq_in:    u64,
 	ack_at:    u64, // log position that makes seq_in durable
 	acked_in:  u64,
+	// What a sync under way, begun before seq_in came, makes durable: acknowledged once it is done, though more has come
+	// since, which the next sync makes durable. Else, while a sync is never done before more comes, nothing would be.
+	ack_prior: struct {
+		seq, at: u64,
+		refused: int, // of `refused`, those it says
+	},
 	refused:   [dynamic]Id, // rows something of which was not taken since
 	unacked:   [dynamic]Unacked,
 	reoffer:   [dynamic]Id, // kept for what was still to be sent of them, which may yet send nothing: offered again after
@@ -1992,6 +1998,9 @@ emit_row :: proc(s: ^Session, row: Id) {
 @(private)
 on_cells :: proc(s: ^Session, r: ^Reader) {
 	n := s.node
+	if f := &n.flight; f.log != 0 && s.seq_in > s.acked_in && s.ack_at <= f.log_upto {
+		s.ack_prior = {s.seq_in, s.ack_at, len(s.refused)}
+	}
 	seq := read_varint(r)
 	cells := make([dynamic]Cell, context.temp_allocator)
 	row: Id
@@ -2901,6 +2910,17 @@ pump :: proc(s: ^Session) {
 		frame_end(&s.out, at)
 		s.acked_in = s.seq_in
 		clear(&s.refused)
+		s.ack_prior = {}
+	} else if p := s.ack_prior; p.seq > s.acked_in && n.synced >= p.at {
+		at := frame_begin(&s.out, .Ack)
+		write_varint(&s.out, p.seq)
+		for row in s.refused[:p.refused] {
+			write_pair(&s.out, row)
+		}
+		frame_end(&s.out, at)
+		s.acked_in = p.seq
+		remove_range(&s.refused, 0, p.refused)
+		s.ack_prior = {}
 	}
 	took_send(s)
 }

@@ -25,6 +25,7 @@ File_Disk :: struct {
 	hold:    bool, // the directory, from before anything in it is read or written: see hold.odin
 	lock:    Maybe(Dir_Lock),
 	look:    bool, // only: nothing is made, nor opened to be written
+	host:    ^Host, // whose loop makes its fsyncs without waiting for them; none to make them as they are asked
 }
 
 // Nothing is created until there is something to keep: merely asking about a space leaves no trace. With `hold`, the
@@ -136,7 +137,7 @@ segment_file :: proc(d: ^File_Disk, number: u64) -> ^os.File {
 @(private)
 segments_close :: proc(d: ^File_Disk, first: u64, last := max(u64)) {
 	if d.active != nil && d.number >= first && d.number <= last {
-		os.close(d.active)
+		fsync_release(d.host, d.active)
 		d.active, d.number, d.dirty = nil, max(u64), false // what it held is not wanted
 	}
 	if d.reading != nil && d.read_no >= first && d.read_no <= last {
@@ -154,6 +155,24 @@ disk_sync :: proc(f: ^os.File, kind: Tick_Disk) -> bool {
 
 @(require_results)
 file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
+	disk := file_disk_waiting(d)
+	if d.host != nil {
+		disk.log_sync_start = proc(data: rawptr, token: u64) -> bool {
+			d := (^File_Disk)(data)
+			since := ticks_now()
+			defer ticks_disk(.Log_Sync_Start, since)
+			if d.active == nil || !d.dirty {
+				return fsync_start(d.host, nil, token)
+			}
+			d.dirty = false // what is written from now on is for the next
+			return fsync_start(d.host, d.active, token)
+		}
+	}
+	return disk
+}
+
+@(private)
+file_disk_waiting :: proc(d: ^File_Disk) -> zsp.Disk {
 	return {
 		data = d,
 		log_write = proc(data: rawptr, off: u64, bytes: []byte) -> bool {
@@ -167,7 +186,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 					if d.dirty && !disk_sync(d.active, .Roll_Sync) {
 						return false
 					}
-					os.close(d.active)
+					fsync_release(d.host, d.active)
 				}
 				f, err := os.open(segment_path(d, number), {.Read, .Write, .Create}, os.Permissions{.Read_User, .Write_User})
 				if err != nil {
@@ -276,7 +295,7 @@ file_disk_close :: proc(d: ^File_Disk) {
 	}
 	for f in ([]^os.File{d.tree, d.active, d.reading}) {
 		if f != nil {
-			os.close(f)
+			fsync_release(d.host, f)
 		}
 	}
 	if lock, held := d.lock.?; held {

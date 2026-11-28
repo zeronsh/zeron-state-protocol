@@ -382,3 +382,107 @@ older_store_is_made_again :: proc(t: ^testing.T) {
 	testing.expect_value(t, census(&s), want)
 	store_close(&s)
 }
+
+// Where the disk syncs without the store waiting, a sync counts only what was written before it began, and only once
+// the disk says it is done: what is written meanwhile waits for the next, begun as soon as that one is done; and one
+// that fails fails the store, counting nothing.
+@(test)
+async_sync_counts_only_what_it_began_with :: proc(t: ^testing.T) {
+	Asked :: struct {
+		using m: Memory_Disk,
+		tokens:  [dynamic]u64, // begun, not yet answered
+	}
+	a: Asked
+	defer memory_disk_destroy(&a.m)
+	defer delete(a.tokens)
+	disk := memory_disk(&a.m)
+	disk.data = &a
+	disk.log_sync_start = proc(data: rawptr, token: u64) -> bool {
+		append(&(^Asked)(data).tokens, token)
+		return true
+	}
+	s: Store
+	testing.expect(t, store_open(&s, disk))
+	defer store_close(&s)
+	body := [4]byte{1, 2, 3, 4}
+	cell :: proc(n: u64, body: []byte) -> Cell {return {row = {1 << 32, n}, slot = 16, kind = .Value, stamp = {n, 0}, body = body}}
+	testing.expect(t, store_commit(&s, {cell(1, body[:])}) == 1)
+	testing.expect(t, store_sync_start(&s))
+	first := store_tail(&s)
+	testing.expect_value(t, len(a.tokens), 1)
+	testing.expect(t, store_flying(&s) && s.synced < first) // nothing counted on yet
+	testing.expect(t, store_commit(&s, {cell(2, body[:])}) == 1)
+	testing.expect(t, store_sync_start(&s)) // one at a time: this waits for the first to be done
+	testing.expect_value(t, len(a.tokens), 1)
+	testing.expect(t, store_disk_synced(&s, a.tokens[0] + 1000, true)) // another's: passed over
+	testing.expect(t, s.synced < first)
+	testing.expect(t, store_disk_synced(&s, pop(&a.tokens), true))
+	testing.expect_value(t, s.synced, first) // as far as it reached, and no further
+	testing.expect_value(t, len(a.tokens), 1) // and the next begun at once
+	testing.expect(t, store_disk_synced(&s, pop(&a.tokens), true))
+	testing.expect_value(t, s.synced, store_tail(&s))
+	testing.expect(t, !store_flying(&s))
+	testing.expect(t, store_commit(&s, {cell(3, body[:])}) == 1)
+	testing.expect(t, store_sync_start(&s))
+	before := s.synced
+	testing.expect(t, !store_disk_synced(&s, pop(&a.tokens), false))
+	testing.expect(t, s.failed && s.synced == before)
+}
+
+// A client's writes are acknowledged as far as a sync under way reaches, once it is done, though more came meanwhile:
+// else, where something more comes before every sync is done, as from a client writing steadily, nothing would be.
+@(test)
+acknowledged_as_far_as_a_sync_reaches :: proc(t: ^testing.T) {
+	state := seeded(41)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 1, partial = 0, relays = 0, ring = 64)
+	defer sim_destroy(&s)
+	x := s.nodes[0]
+	@(static) tokens: [dynamic]u64
+	defer delete(tokens)
+	x.node.store.disk.log_sync_start = proc(_: rawptr, token: u64) -> bool {
+		append(&tokens, token)
+		return true
+	}
+	c := reader_open(x, "as ann")
+	defer reader_close(&c)
+	write :: proc(x: ^Sim_Node, c: ^Reader_Client, seq: u64) {
+		x.node.now += 1000
+		row := node_id(&x.node, 1)
+		body: [24]byte
+		list := list_tag(keyring_scope(&x.keys, 1), "a")
+		put_u64(body[:], list[0])
+		put_u64(body[8:], list[1])
+		w := make([dynamic]byte, context.temp_allocator)
+		at := frame_begin(&w, .Cells)
+		write_varint(&w, seq)
+		place := Cell{row, 1, .Place, node_stamp(&x.node), body[:]}
+		write_cell(&w, &place, false)
+		frame_end(&w, at)
+		session_input(c.s, w[:])
+	}
+	acked :: proc(c: ^Reader_Client) -> (seq: u64) {
+		out := session_output(c.s)
+		r := Reader{buf = out}
+		for r.pos < len(out) {
+			frame := read_bytes(&r)
+			if Message(frame[0]) == .Ack {
+				f := Reader{buf = frame[1:]}
+				seq = read_varint(&f)
+			}
+		}
+		session_sent(c.s, len(out))
+		return
+	}
+	_ = acked(&c)
+	write(x, &c, 1)
+	testing.expect(t, store_sync_start(&x.node.store) && len(tokens) == 1)
+	write(x, &c, 2) // while the sync is under way
+	testing.expect_value(t, acked(&c), 0)
+	testing.expect(t, store_disk_synced(&x.node.store, pop(&tokens), true))
+	testing.expect_value(t, acked(&c), 1) // what the sync reached, and not what came after
+	testing.expect(t, store_sync_start(&x.node.store))
+	testing.expect(t, store_disk_synced(&x.node.store, pop(&tokens), true))
+	testing.expect_value(t, acked(&c), 2)
+}

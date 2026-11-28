@@ -19,6 +19,11 @@ Disk :: struct {
 	// Storage that may answer "not yet", as a cache over object storage does: a page that is not yet here reads as
 	// EMPTY_PAGE, log_read returns false, and this counts both. Nil for storage that always answers. See lazy.odin.
 	missed:     proc(data: rawptr) -> int,
+	// Storage that can make what was written to the log durable without the caller waiting, as log_sync does with it:
+	// begins that, for everything written to the log so far, and says whether it could. Whoever drives the store then
+	// says how it ended, by store_disk_synced with the same token, once it has: never before this returns. Nil where
+	// a sync is had only by waiting for it. See Flight.
+	log_sync_start: proc(data: rawptr, token: u64) -> bool,
 }
 
 // A disk in memory, which can also forget everything that was not synced.

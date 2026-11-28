@@ -39,6 +39,7 @@ Tick_Disk :: enum u8 {
 	Page_Sync, // the page file's fsync, at a checkpoint
 	Log_Write,
 	Page_Write,
+	Log_Sync_Start, // the log's fsync begun, not waited for
 }
 
 Tick_Record :: struct {

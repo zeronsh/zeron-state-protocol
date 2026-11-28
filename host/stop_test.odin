@@ -17,7 +17,8 @@ Stopping :: struct {
 	dir:     string,
 	how:     enum {
 		Storage_Failed, // before the loop runs, as a callback marks it
-		Sync_Failed, // when the loop syncs what it has written
+		Sync_Failed, // when the loop syncs what it has written: the fsync it begins fails, once it is done
+		Sync_Refused, // the same, but where the fsync cannot even be begun
 		Stopped_Meanwhile, // by another thread, as a signal's does, while the loop is about to wait
 	},
 	h:       ^Host, // atomic
@@ -30,7 +31,7 @@ Stopping :: struct {
 // on Windows core:nbio's wake did not wake it from.
 @(test)
 host_stops_however_told :: proc(t: ^testing.T) {
-	for how in ([]type_of(Stopping{}.how){.Storage_Failed, .Sync_Failed, .Stopped_Meanwhile}) {
+	for how in ([]type_of(Stopping{}.how){.Storage_Failed, .Sync_Failed, .Sync_Refused, .Stopped_Meanwhile}) {
 		base, _ := os.temp_directory(context.temp_allocator)
 		dir, err := os.make_directory_temp(base, "zsp-stop-*", context.allocator)
 		testing.expect(t, err == nil)
@@ -56,6 +57,21 @@ host_stops_however_told :: proc(t: ^testing.T) {
 				cell := zsp.Cell{row = zsp.Id{1, 100}, slot = 1, kind = .Value, stamp = zsp.Stamp{1000, 1}, body = body[:]}
 				zsp.store_commit(&s.node.store, []zsp.Cell{cell}, 0, own = false)
 				s.node.store.disk.log_sync = proc(_: rawptr) -> bool {return false}
+				// As the disk would say it, once the loop goes on: begun, and failed.
+				s.node.store.disk.log_sync_start = proc(data: rawptr, token: u64) -> bool {
+					h := (^File_Disk)(data).host
+					fs := new(Fsync)
+					fs.host, fs.token, fs.ok = h, token, false
+					append(&h.fsyncing, fs)
+					fs.next, h.fsync_ready = h.fsync_ready, fs
+					return true
+				}
+				h.syncing, h.sync_due = true, time.tick_now()
+			case .Sync_Refused:
+				body := [1]byte{1}
+				cell := zsp.Cell{row = zsp.Id{1, 100}, slot = 1, kind = .Value, stamp = zsp.Stamp{1000, 1}, body = body[:]}
+				zsp.store_commit(&s.node.store, []zsp.Cell{cell}, 0, own = false)
+				s.node.store.disk.log_sync_start = proc(_: rawptr, _: u64) -> bool {return false}
 				h.syncing, h.sync_due = true, time.tick_now()
 			case .Stopped_Meanwhile:
 				// Called back first thing in the loop's next wait, before it sleeps: there another thread stops it.
@@ -87,4 +103,40 @@ host_stops_however_told :: proc(t: ^testing.T) {
 		os.remove_all(dir)
 		delete(dir)
 	}
+}
+
+// The log's fsync is the disk's to make while the loop goes on: a sync that is due is begun, not waited for, and what
+// it makes durable is counted on only once the system says it has; then the loop hears of it, and counts it.
+@(test)
+loop_does_not_wait_for_the_log_fsync :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-fsync-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer delete(dir)
+	defer os.remove_all(dir)
+	h: Host
+	testing.expect(t, host_init(&h, {dir = dir, full = true}))
+	defer host_destroy(&h)
+	space: zsp.Key32
+	crypto.rand_bytes(space[:])
+	s := space_open(&h, space)
+	body := [1]byte{1}
+	cell := zsp.Cell{row = zsp.Id{1, 100}, slot = 1, kind = .Value, stamp = zsp.Stamp{1000, 1}, body = body[:]}
+	zsp.store_commit(&s.node.store, []zsp.Cell{cell}, 0, own = false)
+	h.syncing, h.sync_due = true, time.tick_now()
+	host_settle(&h)
+	tail := zsp.store_tail(&s.node.store)
+	testing.expect(t, zsp.store_flying(&s.node.store), "the fsync is under way")
+	testing.expect(t, s.node.store.synced < tail, "and nothing is counted on before it is done")
+	start := time.tick_now()
+	for s.node.store.synced < tail && time.tick_since(start) < 10 * time.Second {
+		wait := time.Duration(10 * time.Millisecond)
+		if due, ok := host_deadline(&h); ok {
+			wait = min(wait, max(time.tick_diff(time.tick_now(), due), 0))
+		}
+		testing.expect(t, nbio.tick(wait) == nil)
+		host_settle(&h)
+	}
+	testing.expect_value(t, s.node.store.synced, tail)
+	testing.expect(t, !zsp.store_flying(&s.node.store) && !s.node.failed)
 }

@@ -55,6 +55,9 @@ Host :: struct {
 	methods:      map[string]Host_Method, // that the host answers itself, in-process: see host_serve
 	accepting:    ^nbio.Operation,
 	lock:         Dir_Lock, // of dir, held from host_init until host_destroy: see hold.odin
+	fsyncing:     [dynamic]^Fsync, // under way: see fsync.odin
+	fsync_ready:  ^Fsync, // done as soon as begun, for there was nothing to make durable
+	fsyncer:      Fsyncer,
 }
 
 Space :: struct {
@@ -123,6 +126,7 @@ space_open :: proc(h: ^Host, id: zsp.Key32) -> ^Space {
 		free(s)
 		return nil
 	}
+	s.disk.host = h
 	staging_clear(s.dir)
 	keys: ^zsp.Keyring
 	if !h.relay {
@@ -391,6 +395,7 @@ host_destroy :: proc(h: ^Host) {
 	for len(h.spaces) > 0 {
 		space_close(pop(&h.spaces))
 	}
+	fsync_drain(h) // each closed made all it had durable already: what was under way is only waited for
 	for d in h.dialers {
 		dialer_free(d)
 	}
@@ -429,10 +434,15 @@ host_settle :: proc(h: ^Host) {
 	if host_failed(h) {
 		return
 	}
+	// What the disk has made durable, which releases what waits for it: acknowledgements above all.
+	fsync_collect(h)
+	if host_failed(h) {
+		return
+	}
 	if h.syncing && time.tick_diff(h.sync_due, now) >= 0 {
 		h.syncing = false
 		for s in h.spaces {
-			if !zsp.node_sync(&s.node) {
+			if !zsp.node_sync_start(&s.node) {
 				report(.Error, "storage failed; stopping rather than acknowledging what may be lost")
 				sync.atomic_store(&h.stopping, true)
 				return
@@ -529,6 +539,9 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 	}
 	if h.syncing {
 		earliest(&due, &ok, h.sync_due)
+	}
+	if h.fsync_ready != nil {
+		earliest(&due, &ok, time.tick_now())
 	}
 	for d in h.dialers {
 		if t, set := dialer_deadline(d); set {

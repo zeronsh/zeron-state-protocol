@@ -3,6 +3,7 @@ package zsp
 import "base:runtime"
 import "core:hash/xxhash"
 import "core:slice"
+import "core:sync"
 
 // The store keeps every cell exactly once, sealed, in an append-only log, and indexes the log with
 // three trees in one page file:
@@ -64,6 +65,27 @@ Store :: struct {
 	evac:        Evacuation, // where storage may answer "not yet", of a segment, a step at a time
 	evacuated:   [dynamic]u64, // whose living have all been moved, to be dropped at the next checkpoint
 	dropped:     [dynamic]u64, // dropped, and their waste yet to be forgotten
+
+	flight:      Flight,
+}
+
+// What the disk is making durable while the store goes on, where it can (Disk.log_sync_start): so that a host's loop
+// is not held while it does. Nothing is counted on until the disk has said it is done: `synced`, and with it every
+// acknowledgement, moves only then, and only as far as the log reached when that sync was begun.
+Flight :: struct {
+	log:        u64, // the token of the log sync under way, or 0
+	log_upto:   u64, // the log's end when it was begun: what it makes durable
+	again:      bool, // more was written since it began, and is to be made durable once it is done
+}
+
+// Tokens for what is under way, never the same twice in a process, whichever store asks: so that what comes back for
+// a store that is gone, or for a sync that was overtaken, is known for that and passed over.
+@(private)
+flight_tokens: u64 // atomic
+
+@(private)
+flight_token :: proc() -> u64 {
+	return sync.atomic_add(&flight_tokens, 1) + 1
 }
 
 Header :: struct {
@@ -794,6 +816,66 @@ store_flush :: proc(s: ^Store) -> bool {
 @(require_results)
 store_unsynced :: proc(s: ^Store) -> bool {
 	return s.synced != store_tail(s)
+}
+
+// Begins making every commit so far durable, where the disk can without waiting (Disk.log_sync_start); else makes it
+// so now, as store_sync does. One is under way at a time: what is written meanwhile waits for the next, which begins
+// as soon as that one is done. False if the store has failed.
+store_sync_start :: proc(s: ^Store) -> bool {
+	if s.disk.log_sync_start == nil || store_lazy(s) || s.remote != nil {
+		return store_sync(s)
+	}
+	store_flush(s) or_return
+	f := &s.flight
+	switch {
+	case s.failed:
+		return false
+	case s.synced == store_tail(s):
+	case f.log != 0:
+		f.again ||= f.log_upto != store_tail(s)
+	case:
+		f.log, f.log_upto, f.again = flight_token(), store_tail(s), false
+		if !s.disk.log_sync_start(s.disk.data, f.log) {
+			f.log = 0
+			s.failed = true
+			return false
+		}
+	}
+	return true
+}
+
+// What the disk said of what it was making durable, by the token it was given. What the store no longer waits for is
+// passed over. False if the store has failed.
+store_disk_synced :: proc(s: ^Store, token: u64, ok: bool) -> bool {
+	f := &s.flight
+	switch {
+	case token == 0:
+		return !s.failed
+	case token == f.log:
+		f.log = 0
+		if !ok {
+			s.failed = true // and nothing it was to make durable is said to be
+			return false
+		}
+		s.synced = max(s.synced, f.log_upto)
+		if f.again {
+			store_sync_start(s) or_return
+		}
+	case:
+	}
+	return !s.failed
+}
+
+// Whether the disk is making something durable for a store: what a store_disk_synced with this token would be heard.
+@(require_results)
+store_awaits :: proc(s: ^Store, token: u64) -> bool {
+	return token != 0 && token == s.flight.log
+}
+
+// Whether the store is waiting for the disk.
+@(require_results)
+store_flying :: proc(s: ^Store) -> bool {
+	return s.flight.log != 0
 }
 
 // Makes every commit so far durable.
