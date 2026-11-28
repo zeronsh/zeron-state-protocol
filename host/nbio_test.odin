@@ -436,6 +436,57 @@ loop_lets_go_of_what_a_removed_accept_took :: proc(t: ^testing.T) {
 	testing.expectf(t, (rerr == nil && n == 0) || (rerr != nil && rerr != .Timeout && rerr != .Would_Block), "the peer's connection was left open: read %d bytes, %v", n, rerr)
 }
 
+// A read of all, removed when it has read part of what it wants but before the loop has heard so: it is done, and reads
+// no more. On io_uring the loop gave the ring the read again for the rest, after its removal was asked for: it read
+// what came after into a buffer its owner may have let go of, for nobody. Meaningful on Linux; elsewhere it must merely
+// work.
+@(test)
+loop_reads_no_more_for_a_removed_read_of_all :: proc(t: ^testing.T) {
+	testing.expect(t, nbio.acquire_thread_event_loop() == nil)
+	defer nbio.release_thread_event_loop()
+	defer settle(t)
+	listener, err := net.listen_tcp({net.IP4_Loopback, 0})
+	testing.expect(t, err == nil)
+	defer net.close(listener)
+	at, _ := net.bound_endpoint(listener)
+	peer, derr := net.dial_tcp(at)
+	testing.expect(t, derr == nil)
+	defer net.close(peer)
+	socket, _, aerr := net.accept_tcp(listener)
+	testing.expect(t, aerr == nil)
+	defer net.close(socket)
+	testing.expect(t, nbio.associate_socket(socket) == nil)
+	called := false
+	buf: [10]byte
+	reading := nbio.recv_poly(socket, {buf[:]}, &called, proc(_: ^nbio.Operation, called: ^bool) {
+		called^ = true
+	}, all = true)
+	testing.expect(t, nbio.tick(0) == nil) // given to the system, waiting
+	net.send_tcp(peer, {1, 2, 3, 4, 5}) // half of it, read by the system for it
+	time.sleep(20 * time.Millisecond)
+	nbio.remove(reading) // before the loop has heard of the half
+	// What comes after the removal, there before the loop next looks, stays for whoever reads next.
+	later := "later"
+	net.send_tcp(peer, transmute([]byte)later)
+	time.sleep(20 * time.Millisecond)
+	for _ in 0 ..< 5 {
+		testing.expect(t, nbio.tick(5 * time.Millisecond) == nil)
+	}
+	testing.expect(t, !called, "a removed read called back")
+	testing.expect(t, net.set_blocking(socket, false) == nil)
+	b: [16]byte
+	got := 0
+	for got < len(b) {
+		n, rerr := net.recv_tcp(socket, b[got:])
+		if rerr != nil || n == 0 {
+			break
+		}
+		got += n
+	}
+	// Whatever the system read for the read before its removal took is gone with it; what came after is there.
+	testing.expectf(t, got >= len(later) && string(b[got - len(later):got]) == later, "what came after a removed read is gone: %q", string(b[:got]))
+}
+
 // Reads removed in the same tick as they would have read: what is there for them stays there. core:nbio (dev-2026-11)
 // read on kqueue for a read removed in the tick it was ready, into a buffer its owner may have let go of. On io_uring
 // and Windows the system reads for the operation itself, before any removal can take: only kqueue's loop reads.

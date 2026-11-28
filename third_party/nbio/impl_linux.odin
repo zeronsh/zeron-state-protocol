@@ -883,7 +883,8 @@ recv_callback :: proc(op: ^Operation, res: i32) -> bool {
 				total += len(buf)
 			}
 
-			if op.recv.received < total {
+			// ZSP: not read again for the rest once removed (see removing).
+			if op.recv.received < total && !removing(op) {
 				recv_exec(op)
 				return false
 			}
@@ -963,7 +964,8 @@ send_callback :: proc(op: ^Operation, res: i32) -> bool {
 			total += len(buf)
 		}
 
-		if op.send.sent < total {
+		// ZSP: not sent again for the rest once removed (see removing).
+		if op.send.sent < total && !removing(op) {
 			assert(res > 0)
 			send_exec(op)
 			return false
@@ -999,12 +1001,21 @@ write_callback :: proc(op: ^Operation, res: i32) -> bool {
 
 	op.write.written += int(res)
 
-	if op.write.all && op.write.written < len(op.write.buf) {
+	// ZSP: not written again for the rest once removed (see removing).
+	if op.write.all && op.write.written < len(op.write.buf) && !removing(op) {
 		write_exec(op)
 		return false
 	}
 
 	return true
+}
+
+// ZSP: whether an operation has been removed, or is being: one of all that went part of the way as its removal was on
+// its way is done with what it has, and not given to the ring again for the rest. Upstream gave it again, and the
+// removal, finding nothing of it in the ring by then, left it there: reading on into, or writing from, a buffer its
+// owner may have let go of, for an operation nobody would be told the end of.
+removing :: #force_inline proc(op: ^Operation) -> bool {
+	return op._impl.removal != nil
 }
 
 read_exec :: proc(op: ^Operation) {
@@ -1038,7 +1049,8 @@ read_callback :: proc(op: ^Operation, res: i32) -> bool {
 
 	op.read.read += int(res)
 
-	if op.read.all && op.read.read < len(op.read.buf) {
+	// ZSP: not read again for the rest once removed (see removing).
+	if op.read.all && op.read.read < len(op.read.buf) && !removing(op) {
 		read_exec(op)
 		return false
 	}
