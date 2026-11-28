@@ -19,10 +19,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: |
-          mkdir -p build
-          odin build zspd -out:build/zspd.exe -debug -vet -strict-style -define:ODIN_NBIO_QUEUE_SIZE=256 -define:ZSP_CALL_ALIVE=1000
-          (cd relay && npm ci --silent)
+      - name: tools
+        run: |
+          mkdir -p ~/tools && cd ~/tools
+          curl -fsSLo lune.zip https://github.com/lune-org/lune/releases/download/v0.11.1/lune-0.11.1-windows-x86_64.zip
+          unzip -qo lune.zip
+          curl -fsSLo luau.zip https://github.com/luau-lang/luau/releases/download/0.748/luau-windows.zip
+          unzip -qo luau.zip
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+      - name: ./x test once, as CI runs it, which builds all it needs
+        run: |
+          set +e
+          ./x test > xtest.log 2>&1; echo "exit $?"; grep -E "^FAIL|failed:" xtest.log | cut -c1-200
       - name: fsync, by drive
         run: |
           echo "TEMP=$TEMP RUNNER_TEMP=$RUNNER_TEMP"
@@ -30,12 +38,12 @@ jobs:
       - name: e2e, temp on the system drive
         run: |
           set +e
-          for i in 1 2 3 4; do python tests/end_to_end.py > e2e-c-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-c-$i.log) ok $(grep -c '^FAIL' e2e-c-$i.log) fail"; grep -h "^FAIL" e2e-c-$i.log | cut -c1-150; done; grep -h "roster in" e2e-c-*.log | python tests/diag_sum.py
+          for i in 1 2 3 4; do (cd web && for t in text mirror_model mirror_interop store end_to_end browsers; do a=; [ $t = store ] && a=../build/node-small.wasm; node test/$t.ts $a > ../web-c-$i-$t.log 2>&1 & done; wait) & sleep 15; python tests/end_to_end.py > e2e-c-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-c-$i.log) ok $(grep -c '^FAIL' e2e-c-$i.log) fail"; grep -h "^FAIL" e2e-c-$i.log | cut -c1-150; wait; echo "  web: $(cat web-c-$i-*.log | grep -c '^FAIL') fail"; done; grep -h "roster in" e2e-c-*.log | python tests/diag_sum.py
       - name: e2e, temp on the runner's drive
         if: always()
         run: |
           set +e
-          for i in 1 2 3 4; do TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" python tests/end_to_end.py > e2e-d-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-d-$i.log) ok $(grep -c '^FAIL' e2e-d-$i.log) fail"; grep -h "^FAIL" e2e-d-$i.log | cut -c1-150; done; grep -h "roster in" e2e-d-*.log | python tests/diag_sum.py
+          for i in 1 2 3 4; do (cd web && for t in text mirror_model mirror_interop store end_to_end browsers; do a=; [ $t = store ] && a=../build/node-small.wasm; TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" node test/$t.ts $a > ../web-d-$i-$t.log 2>&1 & done; wait) & sleep 15; TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" python tests/end_to_end.py > e2e-d-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-d-$i.log) ok $(grep -c '^FAIL' e2e-d-$i.log) fail"; grep -h "^FAIL" e2e-d-$i.log | cut -c1-150; wait; echo "  web: $(cat web-d-$i-*.log | grep -c '^FAIL') fail"; done; grep -h "roster in" e2e-d-*.log | python tests/diag_sum.py
       - name: durations
         if: always()
         run: |
@@ -45,5 +53,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: diag-e2e
-          path: e2e-*.log
+          path: |
+            e2e-*.log
+            web-*.log
+            xtest.log
           retention-days: 7
