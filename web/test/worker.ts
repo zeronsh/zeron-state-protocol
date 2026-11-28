@@ -913,6 +913,66 @@ for (const [i, { before, next }] of [
   spy.close();
 }
 
+// A new leader that says so and then answers nothing is given up on as any holder is, asked after a silence and given up on
+// after as long again: though what was asked of the one before, which may have done it as it went, is said to have failed
+// as it is heard of, which is no word from the new one. On a clock the test moves, timers of a second and more.
+{
+  const timers = new Map<object, { at: number; f: () => void }>();
+  let now = 0;
+  const realSet = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  const turns = async () => {
+    for (let i = 0; i < 10; i++) await new Promise((done) => realSet(done, 0)); // what is said, heard
+  };
+  const advance = async (ms: number) => {
+    const until = now + ms;
+    for (;;) {
+      const due = [...timers].filter(([, t]) => t.at <= until).sort(([, x], [, y]) => x.at - y.at)[0];
+      if (!due) break;
+      timers.delete(due[0]);
+      now = due[1].at;
+      due[1].f();
+      await turns();
+    }
+    now = until;
+  };
+  globalThis.setTimeout = ((f: () => void, ms = 0, ...rest: unknown[]) => {
+    if (ms < 1000) return realSet(f, ms, ...rest);
+    const handle = {};
+    timers.set(handle, { at: now + ms, f });
+    return handle;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((h: unknown) => (timers.has(h as object) ? timers.delete(h as object) : realClear(h as ReturnType<typeof setTimeout>))) as typeof clearTimeout;
+  try {
+    void request("zsp:leader-lost", () => new Promise<void>(() => {})); // in line behind it, for good
+    let anyone = 0;
+    const leaders = new Channel("zsp:leader-lost"); // the one that went, and then the new one
+    leaders.onmessage = (e) => {
+      const d = e.data as { ask?: string; op?: string; anyone?: true };
+      if (d.anyone) anyone++;
+      if (d.ask && d.op === "create") leaders.postMessage({ taking: d.ask }); // and goes before it answers
+    };
+    const w = await worker();
+    await w.tell({ open: { name: "leader-lost" } });
+    void w.tell({ ask: 1, op: "create", args: [] });
+    void w.tell({ ask: 2, op: "member", args: [] });
+    await turns();
+    leaders.postMessage({ leader: true }); // the new one, which then answers nothing
+    await turns();
+    assert.match(answered(w.said, 1)?.error ?? "", /may or may not have been done/, JSON.stringify(w.said));
+    const locked = () => w.said.some((r) => "failed" in r && r.name === "StoreLocked");
+    await advance(3000);
+    assert.equal(anyone, 1, "the new leader was not asked whether it is there after a silence");
+    assert(!locked(), "given up on before it was asked whether it is there");
+    await advance(3000);
+    assert(locked(), "the new leader, asked and silent, was not given up on after as long again");
+    leaders.close();
+  } finally {
+    globalThis.setTimeout = realSet;
+    globalThis.clearTimeout = realClear;
+  }
+}
+
 // A worker holding the store that is stuck opening it, waiting on a file that never opens, does not say it is there, but
 // for once, as it is first asked: what waits on it is given up on. Many waiting on it ask whether it is there, as one does
 // at a time, for a worker that hears another ask need not ask too: what the holder says, every worker hears.

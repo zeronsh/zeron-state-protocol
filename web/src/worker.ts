@@ -291,7 +291,7 @@ async function hold(o: Options): Promise<void> {
     tellSpace();
     // What this worker itself was waiting to hear, it now answers: but what the one before may have done already, it says
     // may have been.
-    for (const [id, s] of unheard) if ("ask" in s) heard({ answer: id, ...(gone(id, s.op) ?? answer(s.op, s.args)) });
+    for (const [id, s] of unheard) if ("ask" in s) settle(id, gone(id, s.op) ?? answer(s.op, s.args));
   }
   // Held until the worker is gone with its tab, or the node is closed or put away; or until it stops of itself: then
   // every tab is told, at once, and another worker may have the store, and try, once its files are let go of.
@@ -552,6 +552,17 @@ function here(): void {
   channel.postMessage({ here: true } satisfies Shout);
 }
 
+// What was asked is answered: by whoever holds the store, or here, by this worker as it opens its node or as the one that
+// went may have done it. Only what is heard from the holder is word from it (heard).
+function settle(id: string, a: { value?: unknown; error?: string; name?: string }): void {
+  const done = waiting.get(id);
+  unheard.delete(id);
+  waiting.delete(id);
+  taken.delete(id);
+  if (!waitingOnHolder()) clearTimeout(silence), (silence = undefined); // nothing more to wait on it for
+  done?.({ value: a.value, error: a.error, name: a.name === "StoreLocked" ? a.name : undefined });
+}
+
 // Anything on the channel is of this origin; but what is not as a worker says it is ignored, rather than thrown at.
 function heard(s: Shout): void {
   if (typeof s !== "object" || s === null) return;
@@ -572,7 +583,7 @@ function heard(s: Shout): void {
     for (const [id, u] of [...unheard]) {
       if ("open" in u) continue;
       const lost = "ask" in u ? gone(id, u.op) : undefined;
-      if (lost) heard({ answer: id, ...lost });
+      if (lost) settle(id, lost); // no word from the new one, which is waited on as it was
       else channel.postMessage(u);
     }
   } else if ("by" in s) {
@@ -586,12 +597,7 @@ function heard(s: Shout): void {
     if (typeof s.taking === "string" && waiting.has(s.taking)) taken.add(s.taking);
   } else if ("answer" in s) {
     if (typeof s.answer !== "string") return;
-    const done = waiting.get(s.answer);
-    unheard.delete(s.answer);
-    waiting.delete(s.answer);
-    taken.delete(s.answer);
-    if (!waitingOnHolder()) clearTimeout(silence), (silence = undefined); // nothing more to wait on it for
-    done?.({ value: s.value, error: s.error, name: s.name === "StoreLocked" ? s.name : undefined });
+    settle(s.answer, s);
   } else if (device && "ask" in s) {
     if (typeof s.ask !== "string" || typeof s.op !== "string" || !Array.isArray(s.args)) return;
     // Said before it is done, so that should this worker go as it does it, the asker knows it may have been.
