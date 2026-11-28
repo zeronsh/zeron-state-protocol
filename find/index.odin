@@ -150,6 +150,12 @@ index_open :: proc(x: ^Index, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
 		pager_salt(x, best.salt)
 	}
 	whole := best.generation > 0 && catalogue_read(x, &best)
+	// The header read may be one only the system holds, written as its process was killed before it was made durable:
+	// power lost later would fall back to the other, whose pages free_find would let be written over. So it is made
+	// durable first; and an index that cannot be is made again.
+	if whole && !x.disk.sync(x.disk.data) {
+		whole = false
+	}
 	if whole {
 		x.forgot = best.forgot
 		x.upto, x.serial, x.next = best.upto, best.serial, best.next
