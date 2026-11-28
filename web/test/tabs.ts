@@ -468,8 +468,11 @@ const tests: Record<string, () => Promise<void>> = {
     await eventually(() => titles === "one,two,three,four", "one set as the old expires is presented", 20000);
     watching.close();
   },
-  // A tab whose timers are held back, as a hidden tab's are, types: what it typed is sealed when it should be, and so
-  // another tab that shows it never stops showing it, as it would live text whose writer has gone quiet unsealed.
+  // A tab whose timers are held back, as a hidden tab's are, types: what it typed is sealed when it should be, by its
+  // device's worker's timers, and so another tab comes to hold it sealed. Held back for good here, rather than a minute:
+  // a piece sealed by one of the tab's own timers would never be, and the reader never hold it, however fast or slow the
+  // machine. (Not that the reader never stops showing it: that the piece reaches it within the ten seconds it shows live
+  // text unconfirmed rests on the machine, as tab_late_seal shows: a busy runner once took longer.)
   async tab_held_seal() {
     const writer = await page();
     await call(writer, "device", "hs");
@@ -480,10 +483,42 @@ const tests: Record<string, () => Promise<void>> = {
     await call(reader, "watchText", "hs", "docs");
     await call(writer, "holdTimers");
     await call(writer, "type", "hs", "docs", ["typed ", "while ", "held back"]);
-    await eventually(async () => (await call<{ shown: string }>(reader, "textSeen")).shown === "typed while held back", "the reader sees it");
-    await sleep(13000); // longer than live text is shown unsealed
-    const seen = await call<{ shown: string; dropped: boolean }>(reader, "textSeen");
-    expectEqual(seen, { shown: "typed while held back", dropped: false }, "what a tab typed with its timers held back, after a while");
+    const seen = () => call<{ shown: string; now: string; dropped: boolean; sealed: boolean }>(reader, "textSeen");
+    await eventually(async () => (await seen()).shown === "typed while held back", "the reader sees it");
+    // However long the machine takes to say it: what is waited for is never done, if it leans on the tab's timers.
+    await eventually(async () => (await seen()).sealed, "what a tab typed with its timers held back is sealed", 60000);
+    expectEqual((await seen()).now, "typed while held back", "what the reader shows of it, sealed");
+  },
+  // What a tab typed is sealed later than another tab shows live text unconfirmed, as when the worker running the device
+  // is held up, as a busy machine's storage may hold it: the reader stops showing it, as it would live text whose writer
+  // went quiet, and shows it again, all of it, once it is sealed. Nothing typed is lost to a slow machine. (As
+  // tab_held_seal once failed on CI's Windows, its reader having nothing of the piece ten seconds on.)
+  async tab_late_seal() {
+    const writer = await page();
+    await call(writer, "device", "ls");
+    await call(writer, "create", "ls");
+    await call(writer, "put", "ls", "warm", ["its client ready"]);
+    const reader = await page();
+    await call(reader, "device", "ls");
+    await call(reader, "watchText", "ls", "docs");
+    // The writer's worker, which keeps its clients' time, says that a time asked for is up only once it is let: as when it
+    // is held up, as is the node it runs.
+    const worker = writer.workers[writer.workers.length - 1];
+    const evaluate = async (expression: string) =>
+      (await writer.cdp<{ result: { value: unknown } }>("Runtime.evaluate", { expression, returnByValue: true }, worker)).result.value;
+    const holding = await evaluate(`(() => { const post = self.postMessage.bind(self); const held = [];
+      self.postMessage = (m, t) => (m && typeof m === "object" && "due" in m ? void held.push(m) : post(m, t));
+      self.letTimers = () => { self.postMessage = post; for (const m of held.splice(0)) post(m); return true; };
+      return true; })()`);
+    expectEqual(holding, true, "the worker was reached");
+    await call(writer, "type", "ls", "docs", ["typed ", "and ", "sealed late"]);
+    const seen = () => call<{ shown: string; now: string; dropped: boolean; sealed: boolean }>(reader, "textSeen");
+    await eventually(async () => (await seen()).shown === "typed and sealed late", "the reader sees it");
+    await eventually(async () => (await seen()).dropped, "the reader stops showing live text unconfirmed for ten seconds", 30000);
+    expectEqual((await seen()).sealed, false, "nothing sealed it meanwhile");
+    expectEqual(await evaluate("self.letTimers()"), true, "the worker let its timers go");
+    await eventually(async () => (await seen()).sealed, "what was typed is sealed once the worker goes on");
+    expectEqual((await seen()).now, "typed and sealed late", "what the reader shows again, sealed");
   },
   // A tab that opens the device after a credential was given, and gives none, presents the newest given though it heard
   // of none being given; a tab that comes back from being frozen does not present what it gave as newer than what was

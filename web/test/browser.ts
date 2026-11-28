@@ -6,6 +6,7 @@ import { MemoryVolume } from "../src/volume.ts";
 import { loadModule } from "../src/wasm.ts";
 import { live } from "./live.ts";
 import { where } from "../src/ask.ts";
+import { binaryFromHex } from "../src/codec.ts";
 
 const devices = new Map<string, Device>();
 
@@ -76,7 +77,8 @@ const windows = new Map<string, { state?: State<typeof Note>; stop: () => void }
 const Doc = { body: columns.text(17) };
 const Big = { more: columns.string(18) };
 const editors: Editor[] = [];
-let shownText = "", textDropped = false;
+let shownText = "", textNow = "", textDropped = false, textRow = "";
+let textOf: Client | undefined;
 let pageNodeOf: Node | undefined;
 let pageNodeRows = 0;
 
@@ -341,12 +343,12 @@ const zsp = {
     return { write: median(writes), bulk, page: median(pages), token: median(tokens), across: far ? median(across) : NaN };
   },
   /**
-   * From now on this page's timers go off a minute late, as Chrome makes those of a tab hidden for long go off, to the
-   * minute, when the tab has used up its wake-ups: its clients' timers, kept by its device's worker, are not.
+   * From now on this page's timers never go off: held back for longer than any test waits, as Chrome holds back those of
+   * a tab hidden for long, to the minute, once it has used up its wake-ups. So whatever leans on one is never done; its
+   * device's clients keep time by its worker, whose timers are not held back.
    */
   async holdTimers(): Promise<void> {
-    const set = globalThis.setTimeout;
-    globalThis.setTimeout = ((f: () => void, ms?: number) => set(f, (ms ?? 0) + 60000)) as typeof setTimeout;
+    globalThis.setTimeout = (() => 0) as unknown as typeof setTimeout;
   },
   /** Starts a text in a new row of a list, and types into it; and leaves it open. */
   async type(name: string, list: string, words: string[]): Promise<void> {
@@ -359,14 +361,22 @@ const zsp = {
   },
   /** Watches the first text of a list: what it has shown, and whether it ever stopped showing it once it had. */
   async watchText(name: string, list: string): Promise<void> {
-    clientOf(name).window({ scope: 1, list, table: Doc, size: 1 }, (st) => {
-      const body = st.rows[0]?.body ?? "";
-      if (shownText && !body) textDropped = true;
-      shownText = body || shownText;
+    textOf = clientOf(name);
+    textOf.window({ scope: 1, list, table: Doc, size: 1 }, (st) => {
+      const row = st.rows[0];
+      textRow = row?.id ?? textRow;
+      textNow = row?.body ?? "";
+      if (shownText && !textNow) textDropped = true;
+      shownText = textNow || shownText;
     });
   },
-  async textSeen(): Promise<{ shown: string; dropped: boolean }> {
-    return { shown: shownText, dropped: textDropped };
+  /**
+   * What that text has shown, and shows now; whether it ever stopped showing it; and whether what is held of it is
+   * sealed, as a piece of it the node has, rather than only frames of what is being typed.
+   */
+  async textSeen(): Promise<{ shown: string; now: string; dropped: boolean; sealed: boolean }> {
+    const row = textOf && textRow ? Client.internals(textOf).rows.get(binaryFromHex(textRow)) : undefined;
+    return { shown: shownText, now: textNow, dropped: textDropped, sealed: (row?.slots.get(Doc.body.slot)?.size ?? 0) > 0 };
   },
   /** A node in this very page, rather than a worker: with a list of big rows, so many that it waits for room to send them. */
   async pageNode(rows: number, size = 2048): Promise<void> {
