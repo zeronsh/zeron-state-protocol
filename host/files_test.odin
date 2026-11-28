@@ -62,10 +62,10 @@ files_read_whole :: proc(t: ^testing.T) {
 				// read: each is replaced whole (see save). And one handed to it, as a roster to join by, is held to its
 				// signature.
 				size = size / 4 * (round / 128 % 4) / (64 << 10) * (64 << 10)
-				if size > 0 {
-					sync.atomic_add(&sh.shrunk, 1)
-				}
 				os.truncate(f, i64(size))
+				if size > 0 {
+					sync.atomic_add(&sh.shrunk, 1) // once it is so
+				}
 			}
 			for &x, i in chunk {
 				x = pattern(size + i)
