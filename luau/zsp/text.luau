@@ -110,11 +110,19 @@ local function has(t: Text, piece: string, offset: number, n: number): boolean
 	return p ~= nil and offset + n <= p.count
 end
 
+-- Strings put together with .. are made once, at their length; table.concat makes them twice, through a buffer. So what is
+-- most often joined, two parts or a few spans, is joined with ..
 local function joined(s: Span): string
-	if #s.parts > 1 then
-		s.parts = { table.concat(s.parts) }
+	local parts = s.parts
+	local n = #parts
+	if n == 2 then
+		parts[1] = parts[1] .. parts[2]
+		parts[2] = nil
+	elseif n > 2 then
+		parts = { table.concat(parts) }
+		s.parts = parts
 	end
-	return s.parts[1]
+	return parts[1]
 end
 
 -- A piece's span holding an element, and where it is among them.
@@ -846,19 +854,70 @@ function text.read(t: Text): string
 	if t.cache then
 		return t.cache
 	end
-	local out = {}
+	local live = 0
 	for _, b in t.blocks do
 		if b.visible > 0 then
 			for _, s in b.spans do
 				if not s.dead then
-					table.insert(out, joined(s))
+					live += 1
 				end
 			end
 		end
 	end
-	local s = table.concat(out)
-	t.cache = s
-	return s
+	local whole: string
+	if live <= 6 then
+		-- So few are joined with .., made once at its length; table.concat makes it twice, through a buffer.
+		local a, b, c, d, e, f = "", "", "", "", "", ""
+		local n = 0
+		for _, block in t.blocks do
+			if block.visible > 0 then
+				for _, s in block.spans do
+					if not s.dead then
+						n += 1
+						local parts = s.parts -- of one part, as most are, without calling joined, which is too long to be made part of this
+						local j = if #parts == 1 then parts[1] else joined(s)
+						if n == 1 then
+							a = j
+						elseif n == 2 then
+							b = j
+						elseif n == 3 then
+							c = j
+						elseif n == 4 then
+							d = j
+						elseif n == 5 then
+							e = j
+						else
+							f = j
+						end
+					end
+				end
+			end
+		end
+		whole = if n <= 1 then a
+			elseif n == 2 then a .. b
+			elseif n == 3 then a .. b .. c
+			elseif n == 4 then a .. b .. c .. d
+			elseif n == 5 then a .. b .. c .. d .. e
+			else a .. b .. c .. d .. e .. f
+	else
+		-- As long as it will be, so that it is made once and not again each time it would grow.
+		local out = table.create(live)
+		local n = 0
+		for _, block in t.blocks do
+			if block.visible > 0 then
+				for _, s in block.spans do
+					if not s.dead then
+						n += 1
+						local parts = s.parts
+						out[n] = if #parts == 1 then parts[1] else joined(s)
+					end
+				end
+			end
+		end
+		whole = table.concat(out)
+	end
+	t.cache = whole
+	return whole
 end
 
 -- How many bytes are there.
@@ -1083,6 +1142,25 @@ function text.position(t: Text, id: string): (number?, number)
 		return nil, 0
 	end
 	return s.label, offset
+end
+
+-- Where elements are along the text, deleted ones counted, as whole numbers from 1, and how many there are: for asking
+-- of many at once, made once. Each is nil for an element not here.
+function text.ordinals(t: Text): ((id: string) -> number?, number)
+	local start: { [Span]: number } = {}
+	local n = 0
+	for _, b in t.blocks do
+		for _, s in b.spans do
+			start[s] = n - s.offset
+			n += s.len
+		end
+	end
+	return function(id: string): number?
+		local piece, offset = uneid(id)
+		local p = t.pieces[piece]
+		local s = if p then span_of(p, offset) else nil
+		return if s then start[s] + offset + 1 else nil
+	end, n
 end
 
 -- Whether an element is here, and not deleted.

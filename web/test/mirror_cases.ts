@@ -3,7 +3,7 @@
 
 import * as codec from "../src/codec.ts";
 import { sha256 } from "../src/sha256.ts";
-import { Client, columns as c, type Cell, type Column, type Stored } from "../src/client.ts";
+import { Client, cells, columns as c, type Cell, type Column, type Stored } from "../src/client.ts";
 import * as m from "../src/mirror.ts";
 import { KEY } from "./peers.ts";
 import type { Random } from "./random.ts";
@@ -20,7 +20,7 @@ export const rows = (client: Client) => Client.internals(client).rows;
 
 export function latest(row: Stored, slot: number): Cell | undefined {
   let best: Cell | undefined;
-  for (const cell of row.slots.get(slot)?.values() ?? []) if (cell.kind === 3 && (!best || cell.stamp > best.stamp)) best = cell;
+  for (const cell of cells(row, slot)) if (cell.kind === 3 && (!best || cell.stamp > best.stamp)) best = cell;
   return best;
 }
 

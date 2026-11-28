@@ -7,6 +7,7 @@ import { loadModule } from "../src/wasm.ts";
 import { live } from "./live.ts";
 import { where } from "../src/ask.ts";
 import { binaryFromHex } from "../src/codec.ts";
+import { cells } from "../src/client.ts";
 
 const devices = new Map<string, Device>();
 
@@ -409,7 +410,7 @@ const zsp = {
    */
   async textSeen(): Promise<{ shown: string; now: string; dropped: boolean; sealed: boolean }> {
     const row = textOf && textRow ? Client.internals(textOf).rows.get(binaryFromHex(textRow)) : undefined;
-    return { shown: shownText, now: textNow, dropped: textDropped, sealed: (row?.slots.get(Doc.body.slot)?.size ?? 0) > 0 };
+    return { shown: shownText, now: textNow, dropped: textDropped, sealed: row !== undefined && cells(row, Doc.body.slot).length > 0 };
   },
   /** A node in this very page, rather than a worker: with a list of big rows, so many that it waits for room to send them. */
   async pageNode(rows: number, size = 2048): Promise<void> {

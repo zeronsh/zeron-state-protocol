@@ -106,30 +106,132 @@ of them.
 
 Nothing that nothing shows. A deleted item or node is deleted, with everything in it. What others put in a row or a key while it was
 being deleted is let go of by whoever next writes, as is any marker that no item has any longer. A record's key that has been let
-go of keeps a row with nothing in it but its name, so that it can be set again, as the same key, by anyone.
+go of keeps a row with nothing in it but its name, so that it can be set again, as the same key, by anyone. To let go of what others
+put in a deleted row later, an open document remembers the id of each row it has seen deleted, and nothing else of it.
 
 ## What it costs
 
 Nothing, to anything but the client that uses it: what is stored, sent and merged is rows and texts like any others, and a document
-is one list, so one window, however deep it goes. On the client, `./x bench mirror [rows]`, one list of maps:
+is one list, so one window, however deep it goes. On the client, one list of maps of a number and a string each, as a node sends
+it, and as `./x bench mirror table` measures every case (`bench/mirror.py` says how, at length): each a process of its own, perf
+counting only while the case itself is done, the middle of three runs (five in TypeScript). An opening is done once, with the
+collector going round in it as it would. A change is done 200 times (40 in a list of 100,000), after 3,000 not counted (600 where
+each copies a list of 100,000, 200 moves heard), so that it is as it is once a client has been going a while; with the collector
+kept from what is counted, which is the client's own work, and what each made, which is what collecting it will cost, measured
+beside. In Luau what is made and held is counted by the luau CLI, which can collect at once, as Lune cannot.
 
-| rows in the list | 2,000 | 20,000 |
-|---|---|---|
-| made, all at once | 73 ms | 1.3 s |
-| opened by another, from what a node sends | 68 ms | 0.81 s |
-| one changed, by `set` | 0.3 ms | 1.6 ms |
-| one changed, by `update` | 0.6 ms | 7.9 ms |
-| one moved, by `set` | 0.5 ms | 2.0 ms |
-| one moved, by `update` | 1.1 ms | 10 ms |
+| luau | rows | time | instructions | at most while | made each | held after | per row |
+|---|---|---|---|---|---|---|---|
+| made, all at once | 2,000 | 49 ms | 295 M | 13.8 MB |  | 3.4 MB |  |
+| opened by another, from what a node sends | 2,000 | 19 ms | 120 M | 900 KB |  | 2.9 MB | 1,521 B |
+| one changed, by set | 2,000 | 77 µs | 787 k |  | 73 KB | 0.0 KB |  |
+| one changed, by update | 2,000 | 296 µs | 3.6 M |  | 261 KB | 0.0 KB |  |
+| one moved, by set | 2,000 | 225 µs | 1.74 M |  | 207 KB | 302 KB |  |
+| one moved, by update | 2,000 | 361 µs | 4.52 M |  | 396 KB | 302 KB |  |
+| one changed by another, heard | 2,000 | 30 µs | 167 k |  | 34 KB | 0.0 KB |  |
+| one moved by another, heard | 2,000 | 209 µs | 2.32 M |  | 90 KB | 457 KB |  |
+| a window of plain rows, all of them, opened | 2,000 | 15 ms | 85.7 M | 3.8 MB |  | 2.1 MB | 1,092 B |
+| the same, every row read | 2,000 | 14 ms | 85.1 M | 3.6 MB |  | 2.1 MB | 1,092 B |
+| a document with a text in each item, opened | 2,000 | 20 ms | 120 M | 5.0 MB |  | 2.9 MB | 1,521 B |
+| a character typed in one of those texts | 2,000 | 180 µs | 1.07 M |  | 100 KB | 215 KB |  |
+| a character typed by another, heard live | 2,000 | 14 µs | 130 k |  | 38 KB | 1.0 KB |  |
+| a question of the document, answered and stopped (mirror.ask) | 2,000 | 4.74 ms | 49.8 M |  | 1.5 MB | 0.0 KB |  |
+| made, all at once | 20,000 | 959 ms | 5.07 G | 64.1 MB |  | 36.8 MB |  |
+| opened by another, from what a node sends | 20,000 | 283 ms | 1.27 G | 35.0 MB |  | 32.1 MB | 1,681 B |
+| one changed, by set | 20,000 | 474 µs | 6.81 M |  | 635 KB | 0.0 KB |  |
+| one changed, by update | 20,000 | 2.74 ms | 35 M |  | 2.6 MB | -8.0 KB |  |
+| one moved, by set | 20,000 | 1.01 ms | 10 M |  | 771 KB | 456 KB |  |
+| one moved, by update | 20,000 | 2.33 ms | 38 M |  | 2.8 MB | 456 KB |  |
+| one changed by another, heard | 20,000 | 71 µs | 686 k |  | 315 KB | 0.0 KB |  |
+| one moved by another, heard | 20,000 | 399 µs | 3.75 M |  | 407 KB | 551 KB |  |
+| a window of plain rows, all of them, opened | 20,000 | 247 ms | 918 M | 39.0 MB |  | 21.7 MB | 1,136 B |
+| the same, every row read | 20,000 | 165 ms | 902 M | 36.4 MB |  | 21.7 MB | 1,136 B |
+| a document with a text in each item, opened | 20,000 | 310 ms | 1.28 G | 35.0 MB |  | 32.1 MB | 1,681 B |
+| a character typed in one of those texts | 20,000 | 251 µs | 1.59 M |  | 382 KB | 215 KB |  |
+| a character typed by another, heard live | 20,000 | 71 µs | 652 k |  | 320 KB | 2.0 KB |  |
+| a question of the document, answered and stopped (mirror.ask) | 20,000 | 4.87 ms | 52.9 M |  | 1.8 MB | 1.0 KB |  |
+| made, all at once | 100,000 | 6.71 s | 33.9 G | 172.5 MB |  | 155.5 MB |  |
+| opened by another, from what a node sends | 100,000 | 1.72 s | 6.25 G | 142.6 MB |  | 158.6 MB | 1,663 B |
+| one changed, by set | 100,000 | 2.31 ms | 31.6 M |  | 3.1 MB | 0.0 KB |  |
+| one changed, by update | 100,000 | 9.68 ms | 172 M |  | 12.7 MB | 0.0 KB |  |
+| one moved, by set | 100,000 | 5.38 ms | 43.8 M |  | 3.1 MB | 103 KB |  |
+| one moved, by update | 100,000 | 13 ms | 183 M |  | 12.7 MB | 103 KB |  |
+| one changed by another, heard | 100,000 | 272 µs | 2.36 M |  | 1.5 MB | 0.0 KB |  |
+| one moved by another, heard | 100,000 | 1.35 ms | 8.44 M |  | 1.8 MB | 101 KB |  |
+| a window of plain rows, all of them, opened | 100,000 | 1.41 s | 4.55 G | 139.5 MB |  | 112.7 MB | 1,182 B |
+| the same, every row read | 100,000 | 1.36 s | 4.51 G | 139.3 MB |  | 112.7 MB | 1,182 B |
+| a document with a text in each item, opened | 100,000 | 1.95 s | 6.27 G | 43.4 MB |  | 158.6 MB | 1,663 B |
+| a character typed in one of those texts | 100,000 | 428 µs | 3.24 M |  | 1.6 MB | 44 KB |  |
+| a character typed by another, heard live | 100,000 | 223 µs | 2.32 M |  | 1.5 MB | 0.0 KB |  |
+| a question of the document, answered and stopped (mirror.ask) | 100,000 | 6.83 ms | 53.9 M |  | 2.1 MB | 0.0 KB |  |
 
-What is read of a row is kept until that row changes; a list in which items changed is patched where they are, and one in which items
-moved has them taken out and put back where their markers say, the rest keeping their order, for the order of what is there never
-changes. What is left that grows with a list is copying its array, which a new state must have, and, by `set`, looking along it for
-what is not the very same table. `update` must also give `f` a list it can change with `table.insert` and `table.remove`, which do
-not call metamethods, so a list it touches is a real array of a draft for each item, at about a third of a microsecond an item. For
+| ts | rows | time | instructions | at most while | made each | held after | per row |
+|---|---|---|---|---|---|---|---|
+| made, all at once | 2,000 | 102 ms | 489 M | 15.2 MB |  | 3.4 MB |  |
+| opened by another, from what a node sends | 2,000 | 41 ms | 277 M | 104 KB |  | 3.0 MB | 1,590 B |
+| one changed, by set | 2,000 | 119 µs | 1.22 M |  | 52 KB | 72 KB |  |
+| one changed, by update | 2,000 | 141 µs | 1.26 M |  | 54 KB | 71 KB |  |
+| one moved, by set | 2,000 | 553 µs | 3.99 M |  | 671 KB | 297 KB |  |
+| one moved, by update | 2,000 | 624 µs | 5.64 M |  | 774 KB | 297 KB |  |
+| one changed by another, heard | 2,000 | 28 µs | 135 k |  | 26 KB | 70 KB |  |
+| one moved by another, heard | 2,000 | 177 µs | 1.78 M |  | 175 KB | 338 KB |  |
+| a window of plain rows, all of them, opened | 2,000 | 34 ms | 190 M | 524 KB |  | 2.5 MB | 1,297 B |
+| the same, every row read | 2,000 | 27 ms | 189 M | 356 KB |  | 2.5 MB | 1,296 B |
+| a document with a text in each item, opened | 2,000 | 42 ms | 333 M | 232 KB |  | 3.0 MB | 1,591 B |
+| a character typed in one of those texts | 2,000 | 35 µs | 409 k |  | 31 KB | 117 KB |  |
+| a character typed by another, heard live | 2,000 | 20 µs | 104 k |  | 30 KB | 108 KB |  |
+| a question of the document, answered and stopped (mirror.ask) | 2,000 | 2.00 ms | 27.2 M |  | 2.2 MB | 76 KB |  |
+| made, all at once | 20,000 | 948 ms | 4.45 G | 164.0 MB |  | 34.8 MB |  |
+| opened by another, from what a node sends | 20,000 | 244 ms | 1.98 G | 35.9 MB |  | 31.2 MB | 1,635 B |
+| one changed, by set | 20,000 | 616 µs | 5.71 M |  | 332 KB | 74 KB |  |
+| one changed, by update | 20,000 | 724 µs | 5.75 M |  | 335 KB | 73 KB |  |
+| one moved, by set | 20,000 | 1.38 ms | 10.3 M |  | 969 KB | 238 KB |  |
+| one moved, by update | 20,000 | 2.09 ms | 24.5 M |  | 2.3 MB | 238 KB |  |
+| one changed by another, heard | 20,000 | 82 µs | 116 k |  | 165 KB | 70 KB |  |
+| one moved by another, heard | 20,000 | 292 µs | 3.04 M |  | 332 KB | 362 KB |  |
+| a window of plain rows, all of them, opened | 20,000 | 169 ms | 1.43 G | 35.1 MB |  | 24.4 MB | 1,279 B |
+| the same, every row read | 20,000 | 161 ms | 1.43 G | 34.9 MB |  | 24.4 MB | 1,279 B |
+| a document with a text in each item, opened | 20,000 | 259 ms | 2.07 G | 44.9 MB |  | 31.2 MB | 1,635 B |
+| a character typed in one of those texts | 20,000 | 86 µs | 388 k |  | 171 KB | 117 KB |  |
+| a character typed by another, heard live | 20,000 | 65 µs | 81.8 k |  | 169 KB | 108 KB |  |
+| a question of the document, answered and stopped (mirror.ask) | 20,000 | 2.37 ms | 27.8 M |  | 2.3 MB | 78 KB |  |
+| made, all at once | 100,000 | 3.78 s | 20.5 G | 401.2 MB |  | 156.9 MB |  |
+| opened by another, from what a node sends | 100,000 | 1.25 s | 7.87 G | 210.1 MB |  | 151.0 MB | 1,584 B |
+| one changed, by set | 100,000 | 2.57 ms | 26.6 M |  | 1.5 MB | 71 KB |  |
+| one changed, by update | 100,000 | 2.36 ms | 26.7 M |  | 1.5 MB | 71 KB |  |
+| one moved, by set | 100,000 | 3.20 ms | 37.7 M |  | 1.8 MB | 100 KB |  |
+| one moved, by update | 100,000 | 19 ms | 105 M |  | 8.3 MB | 99 KB |  |
+| one changed by another, heard | 100,000 | 381 µs | 106 k |  | 790 KB | 70 KB |  |
+| one moved by another, heard | 100,000 | 932 µs | 8.6 M |  | 1004 KB | 126 KB |  |
+| a window of plain rows, all of them, opened | 100,000 | 858 ms | 5.87 G | 152.6 MB |  | 120.2 MB | 1,260 B |
+| the same, every row read | 100,000 | 755 ms | 5.83 G | 151.9 MB |  | 120.2 MB | 1,260 B |
+| a document with a text in each item, opened | 100,000 | 1.27 s | 8.68 G | 215.3 MB |  | 151.0 MB | 1,584 B |
+| a character typed in one of those texts | 100,000 | 304 µs | 384 k |  | 797 KB | 80 KB |  |
+| a character typed by another, heard live | 100,000 | 279 µs | 86.4 k |  | 794 KB | 77 KB |  |
+| a question of the document, answered and stopped (mirror.ask) | 100,000 | 3.22 ms | 30.4 M |  | 2.9 MB | 71 KB |  |
+
+*At most* is the most the process held while opening, above what it held before; *held* is what the heap holds once the document is
+open and the collector has been round (in TypeScript with what array buffers hold, and without what V8 has compiled), or, after
+changes, what they left held more than before them; *per row* is what is held of an open document divided by its rows; *made* is
+what each change made for the collector.
+
+A row is held as one table (in TypeScript one object of a fixed shape), its cells under their slots' numbers, each one string of its
+kind, stamp and body, read from what came in one read; what only some rows need, as texts, editors and whose each cell is, is there
+only once they need it. A row's version, which no other state of any row has, says when what was read of it is to be read again. A
+window keeps its rows' keys and the rows in two arrays, and many rows at once are sorted among themselves as strings are and merged
+in. The document reads where each row is without a function made for it, reads the columns that are not made up straight from
+their cells, and places a list it reads from nothing by where its items' markers are along the text of its order, with no
+comparing; it keeps nothing of what it has read of what is gone.
+
+What is read of a row is kept until that row changes; a list in which items changed is patched where they are, each found by where
+its marker is, and one in which items moved has them taken out and put back where their markers say, the rest keeping their order,
+for the order of what is there never changes. What is left that grows with a list is copying its array, which a new state must have,
+and, by `set`, looking along it for what is not the very same table. `update` must also give `f` a list it can change with
+`table.insert` and `table.remove`, which do not call metamethods, so a list it touches is a real array of a draft for each item. For
 lists of many thousands, `set` costs the least.
 
-These were measured on Lune 0.11, which interprets Luau; every module asks for native code (`--!native`) where a host gives it.
+These were measured on Lune 0.11, which interprets Luau, and Node 24; every Luau module asks for native code (`--!native`) where a
+host gives it.
 
 A tree's order is read anew when anything in its shape changes, at some microseconds a node; what changes in its nodes is patched.
 

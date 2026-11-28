@@ -385,7 +385,7 @@ async function whose(a: Client, b: Client): Promise<void> {
 
 // Whether what a client holds of a row's text is live yet: said as it is typed, and not sealed.
 function isLive(x: Client, id: string, slot: number): boolean {
-  const t = Client.internals(x).rows.get(binaryOf(id))?.texts.get(slot);
+  const t = Client.internals(x).rows.get(binaryOf(id))?.texts?.get(slot); // texts: none until one is made
   return t !== undefined && text.provisional(t);
 }
 

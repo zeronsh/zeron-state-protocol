@@ -4,6 +4,7 @@
 -- same; and in which each change reads back as what was set. lune run luau/tests/mirror_model.luau
 
 local codec = require("../zsp/codec")
+local held_cells = require("../zsp/client").cells -- a row's cells, each as a table, however it is held
 local sha256 = require("../zsp/sha256")
 local text = require("../zsp/text")
 local zsp = require("../zsp")
@@ -500,7 +501,7 @@ end
 
 local function latest(row: any, slot: number): any
 	local best = nil
-	for _, c in row.slots[slot] or {} do
+	for _, c in held_cells(row, slot) do
 		if c.kind == 3 and (not best or c.stamp > best.stamp) then
 			best = c
 		end
@@ -545,11 +546,11 @@ local function model(client: any, schema: any): any
 	end
 	local function value(c: any, r: any): any
 		if c.text then
-			local t = r.texts[c.slot]
+			local t = if r.texts then r.texts[c.slot] else nil
 			if not t then
 				t = text.new()
 				local cells = {}
-				for _, cell in r.slots[c.slot] or {} do
+				for _, cell in held_cells(r, c.slot) do
 					table.insert(cells, cell)
 				end
 				table.sort(cells, function(a, b)
@@ -1507,12 +1508,12 @@ local ok, why = xpcall(function()
 				for id, w in wheres(peers[i].client) do
 					local row = peers[i].client.rows[id]
 					local here = false
-					for _, c in row.slots[1] or {} do
+					for _, c in held_cells(row, 1) do
 						here = here or string.sub(c.body, 1, 16) == tag
 					end
 					local empty = true -- a key that holds nothing, however it came to: as a deleted one is
-					for slot, cells in row.slots do
-						if slot >= 16 and slot < 255 then
+					for slot in row do
+						if type(slot) == "number" and slot >= 16 and slot < 255 then
 							local c = latest(row, slot)
 							empty = empty and (c == nil or c.body == "")
 						end

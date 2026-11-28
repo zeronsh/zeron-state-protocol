@@ -31,16 +31,33 @@ const scratchBytes = new Uint8Array(scratch.buffer);
 
 // ---------------------------------------------------------------- binary strings
 
-const CHUNK = 8192; // chars to a String.fromCharCode call, well within any engine's limit on arguments
+const CHUNK = 8192; // the most decoded through units that are kept for it
+
+// Bytes widened to UTF-16 code units, which decode to themselves: a string made at once, natively, which is half what
+// String.fromCharCode.apply costs; and of a byte each, as V8 keeps any string whose code units are all below 256.
+const asUnits = new TextDecoder("utf-16le");
+let units = new Uint16Array(256);
 
 // The bytes as a binary string.
 export function binary(bytes: Uint8Array, from = 0, to = bytes.length): string {
-  if (to - from <= CHUNK) return String.fromCharCode.apply(null, bytes.subarray(from, to) as unknown as number[]);
-  let s = "";
-  for (let at = from; at < to; at += CHUNK) {
-    s += String.fromCharCode.apply(null, bytes.subarray(at, Math.min(at + CHUNK, to)) as unknown as number[]);
+  const n = to - from;
+  if (n <= 0) return "";
+  if (n <= 24) {
+    // As ids and stamps are: what a plain array of so few is made into costs less than either.
+    const a = new Array<number>(n);
+    for (let i = 0; i < n; i++) a[i] = bytes[from + i];
+    return String.fromCharCode.apply(null, a);
   }
-  return s;
+  if (n <= CHUNK) {
+    if (units.length < n) units = new Uint16Array(Math.max(n, units.length * 2));
+    units.set(bytes.subarray(from, to)); // widened natively
+    return asUnits.decode(units.subarray(0, n));
+  }
+  // More, at once too, in units of its own that are not kept: pieces put together would be a rope, which V8 reads a
+  // character at a time only by going down it, each time.
+  const wide = new Uint16Array(n);
+  wide.set(bytes.subarray(from, to));
+  return asUnits.decode(wide);
 }
 
 // A binary string's bytes.

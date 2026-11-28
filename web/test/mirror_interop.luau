@@ -343,9 +343,10 @@ local function derive(...: string): string
 	return string.pack(">I4I4", 1, 0) .. string.sub(sha256(KEY .. "zsp-mirror\0board\0" .. table.concat({ ... }, "\0")), 1, 8)
 end
 
+local held_cells = (require :: any)(base .. "/client").cells -- a row's cells, each as a table, however it is held
 local function latest(row: any, slot: number): any
 	local best = nil
-	for _, c in row.slots[slot] or {} do
+	for _, c in held_cells(row, slot) do
 		if c.kind == 3 and (not best or c.stamp > best.stamp) then
 			best = c
 		end

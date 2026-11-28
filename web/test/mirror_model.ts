@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { where as q, type Where } from "../src/ask.ts";
 import * as codec from "../src/codec.ts";
 import * as text from "../src/text.ts";
-import { type Client, type Column, type Stored } from "../src/client.ts";
+import { cells, slotsHeld, type Client, type Column, type Stored } from "../src/client.ts";
 import * as m from "../src/mirror.ts";
 import { board, derive, document, hostile, latest, mutate, rows, words } from "./mirror_cases.ts";
 import { admit, drain, evaluate, hear, peer, rowsOf, run, sendCells, store, type Peer } from "./peers.ts";
@@ -92,11 +92,11 @@ function model(client: Client, schema: m.MapSchema): Any {
   };
   const value = (col: Column<any>, r: Stored): unknown => {
     if (col.text) {
-      let t = r.texts.get(col.slot);
+      let t = r.texts?.get(col.slot);
       if (!t) {
         t = text.create();
-        const cells = [...(r.slots.get(col.slot)?.values() ?? [])].sort((a, b) => (a.stamp < b.stamp ? -1 : a.stamp > b.stamp ? 1 : 0));
-        for (const cell of cells) text.apply(t, cell.kind, cell.stamp, cell.body);
+        const sorted = cells(r, col.slot).sort((a, b) => (a.stamp < b.stamp ? -1 : a.stamp > b.stamp ? 1 : 0));
+        for (const cell of sorted) text.apply(t, cell.kind, cell.stamp, cell.body);
       }
       return text.read(t);
     }
@@ -579,9 +579,9 @@ function quick(): void {
         for (const [id, w] of wheres(peers[i].client)) {
           const row = rows(peers[i].client).get(id)!;
           let here = false;
-          for (const cell of row.slots.get(1)?.values() ?? []) here ||= codec.binary(cell.body, 0, 16) === tag;
+          for (const cell of cells(row, 1)) here ||= codec.binary(cell.body, 0, 16) === tag;
           let empty = true; // a key that holds nothing, however it came to: as a deleted one is
-          for (const slot of row.slots.keys()) {
+          for (const slot of slotsHeld(row)) {
             if (slot >= 16 && slot < 255) {
               const cell = latest(row, slot);
               empty &&= cell === undefined || cell.body.length === 0;

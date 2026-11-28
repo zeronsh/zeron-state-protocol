@@ -11,6 +11,7 @@
 -- out of room. A list of values is a text of the values themselves.
 
 local codec = require("./codec")
+local cells = require("./client")
 local where = require("./ask").where
 local sha256 = require("./sha256")
 local text = require("./text")
@@ -110,6 +111,8 @@ end
 
 -- ---------------------------------------------------------------- what a row is in
 
+-- Each row's word on what it is in, as little as it says: only what its kind has, the rest as WHERE_NONE has it. Nothing
+-- of the cell itself is kept, which is read again whenever the row changes.
 type Where = {
 	owner: string,
 	field: string,
@@ -120,9 +123,10 @@ type Where = {
 	parent: string, -- of a node: ZERO for the top
 	from: string, -- of a node: what it was moved from,
 	back: string, -- and its marker there
-	body: string,
-	stamp: string,
+	stamp: string, -- of a node: of the cell, the later of two moves that make a loop being undone
 }
+local WHERE_NONE = table.freeze({ marker = "", present = false, key = "", parent = ZERO, from = ZERO, back = "", stamp = "" })
+local WHERE_META = table.freeze({ __index = WHERE_NONE })
 
 local function where_encode(owner: string, field: string, kind: number, extra: string?): string
 	local w = codec.writer()
@@ -133,37 +137,72 @@ local function where_encode(owner: string, field: string, kind: number, extra: s
 	return codec.string(w)
 end
 
-local function where_decode(body: string, stamp: string): Where?
-	local ok, w = pcall(function(): Where?
-		local r = codec.reader(body)
-		local out: Where = {
-			owner = codec.take(r, 16),
-			field = codec.bytes(r),
-			kind = codec.u8(r),
-			marker = "",
-			present = false,
-			key = "",
-			parent = ZERO,
-			from = ZERO,
-			back = "",
-			body = body,
+-- What a cell in slot 255 says, from byte `at` of `c` on (the cell's body), or nil if it says nothing that can be read.
+local function where_decode(c: string, at: number, stamp: string): Where?
+	local n = #c
+	if n < at + 17 then
+		return nil
+	end
+	local owner = string.sub(c, at, at + 15)
+	local p = at + 16
+	local len, scale = 0, 1
+	for k = 1, 11 do
+		local b = string.byte(c, p)
+		if not b or k == 11 then
+			return nil -- no more, or a length of more than ten bytes
+		end
+		p += 1
+		len += bit32.band(b, 127) * scale
+		if b < 128 then
+			break
+		end
+		scale *= 128
+	end
+	if len > 9007199254740991 or p + len > n then -- the field, and the kind after it
+		return nil
+	end
+	local field = string.sub(c, p, p + len - 1)
+	p += len
+	local kind = string.byte(c, p)
+	p += 1
+	local rest = n - p + 1
+	local out: any
+	if kind == ITEM and rest == 12 then
+		out = { owner = owner, field = field, kind = kind, marker = string.sub(c, p) }
+	elseif kind == ENTRY and rest >= 1 then
+		out = { owner = owner, field = field, kind = kind, present = string.byte(c, p) ~= 0, key = string.sub(c, p + 1) }
+	elseif kind == NODE and rest == 56 then
+		out = {
+			owner = owner,
+			field = field,
+			kind = kind,
+			parent = string.sub(c, p, p + 15),
+			marker = string.sub(c, p + 16, p + 27),
+			from = string.sub(c, p + 28, p + 43),
+			back = string.sub(c, p + 44, p + 55),
 			stamp = stamp,
 		}
-		local rest = codec.rest(r)
-		if out.kind == ITEM and #rest == 12 then
-			out.marker = rest
-		elseif out.kind == ENTRY and #rest >= 1 then
-			out.present = string.byte(rest) ~= 0
-			out.key = string.sub(rest, 2)
-		elseif out.kind == NODE and #rest == 56 then
-			out.parent, out.marker = string.sub(rest, 1, 16), string.sub(rest, 17, 28)
-			out.from, out.back = string.sub(rest, 29, 44), string.sub(rest, 45, 56)
-		elseif out.kind ~= MAP or rest ~= "" then
-			return nil
-		end
-		return out
-	end)
-	return if ok then w else nil
+	elseif kind == MAP and rest == 0 then
+		out = { owner = owner, field = field, kind = kind }
+	else
+		return nil
+	end
+	return (setmetatable :: any)(out, WHERE_META)
+end
+
+-- Whether two say the same: as their bodies would, but for how a writer chose to write a length; and, of a node, when it was
+-- said, for of two moves that make a loop the later is undone.
+local function same_where(a: Where, b: Where): boolean
+	return a.kind == b.kind
+		and (a.kind ~= NODE or a.stamp == b.stamp)
+		and a.owner == b.owner
+		and a.field == b.field
+		and a.marker == b.marker
+		and a.present == b.present
+		and a.key == b.key
+		and a.parent == b.parent
+		and a.from == b.from
+		and a.back == b.back
 end
 
 -- A marker's name, and the one after it in the same piece.
@@ -272,12 +311,23 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 	local list = "mirror/" .. options.name
 
 	-- Ids that are the same for everyone: of the document, of a map within a map, and of a record's entry.
+	-- The document's own is asked for at every read: it is made once, while the scope's key is the same. (A map within a
+	-- map keeps its own with what is read of it.)
+	local root_id, root_from = ZERO, ""
 	local function derive(...: string): string
 		local s = client.scopes[scope]
 		if not s then
 			return ZERO -- not yet known, or not to be read here: there is nothing, until there is
 		end
-		return string.pack(">I4I4", scope, 0) .. string.sub(sha256(s.key .. "zsp-mirror\0" .. options.name .. "\0" .. table.concat({ ... }, "\0")), 1, 8)
+		local parts = table.concat({ ... }, "\0")
+		if parts == "" and root_from == s.key then
+			return root_id
+		end
+		local id = string.pack(">I4I4", scope, 0) .. string.sub(sha256(s.key .. "zsp-mirror\0" .. options.name .. "\0" .. parts), 1, 8)
+		if parts == "" then
+			root_id, root_from = id, s.key
+		end
+		return id
 	end
 	local function key_of(owner: string, field: string): string
 		return owner .. field
@@ -292,11 +342,37 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 	local tree_up: { [string]: string } = {} -- of each tree node, as last read: the node it hangs from
 	local losing: { [string]: boolean } = {} -- trees with nodes beneath what is not there
 	local standing_in: { [string]: string } = {} -- of each map within a map: where it is, which its id says, row or no row
-	local versions: { [string]: any } = {} -- of each text that keeps an order, as last read
+	local versions: { [string]: { [number]: any } } = {} -- of each row, of each text in it that keeps an order, by slot, as last read
+	local remade: { [string]: { [number]: boolean } } = {} -- of each row, texts of order made anew: what was in them may be gone
+	local function set_version(id: string, slot: number, t: any)
+		local of = versions[id]
+		if not of then
+			of = {}
+			versions[id] = of
+		end
+		of[slot] = { t = t, v = if t then t.version else 0 }
+	end
+	-- Whether a text was made anew since it was last read: once, as it is read.
+	local function was_remade(id: string, slot: number): boolean
+		local of = remade[id]
+		if not (of and of[slot]) then
+			return false
+		end
+		of[slot] = nil
+		if next(of) == nil then
+			remade[id] = nil
+		end
+		return true
+	end
+	local seen: { [string]: number } = {} -- of each map row: the version of it last read
+	-- The document, and maps within maps, are there for everyone whether their own rows have come or not: what is in
+	-- them is. Whatever else holds anything holds it only while it is there itself.
+	local standing: { [string]: boolean } = {}
 	local dirty_rows: { [string]: boolean } = {}
 	local moved_in: { [string]: { [string]: any } } = {} -- of each list: what came, went or moved, and from which marker
 	local garbage: { [string]: { [string]: boolean } } = {} -- of each list: markers nothing has
 	local dead_rows: { [string]: boolean } = {} -- seen to be deleted: what is in them is no longer anywhere
+	local cleaning: { [string]: boolean } = {} -- of those, any that may still have something in them, to let go of
 	local emptied: { [string]: boolean } = {} -- keys let go of: what is put in them meanwhile is not anywhere either
 	local dirty_node: { [string]: boolean } = {}
 	local dirty_box: { [string]: boolean } = {} -- true if what is in it or its order may have changed; false if only its members
@@ -306,13 +382,13 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 	local current: any = nil
 	local stopped = false
 	local tag: string? = nil
-	local ME = {} -- what is read of a row, kept with it until it changes
 
+	local rows_held: { [string]: any } = client.rows -- as the client holds them, read straight
 	local function ours(id: string): boolean
 		if wheres[id] ~= nil then
 			return true
 		end
-		local row = client:held(id)
+		local row = rows_held[id]
 		if not row then
 			return false
 		end
@@ -322,10 +398,18 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			end
 			tag = client:_tag(scope, list)
 		end
-		for slot = 1, 15 do
-			for _, c in row.slots[slot] or {} :: any do
-				if string.sub(c.body, 1, 16) == tag then
-					return true
+		for slot, v in row do
+			if type(slot) == "number" and slot >= 1 and slot <= 15 then
+				if type(v) == "string" then
+					if string.find(v, tag :: string, 18, true) == 18 then
+						return true
+					end
+				else
+					for _, c in v do
+						if string.find(c, tag :: string, 18, true) == 18 then
+							return true
+						end
+					end
 				end
 			end
 		end
@@ -337,14 +421,23 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 	local mark_node: any
 	local changed_in: { [string]: { [string]: boolean } } = {} -- of each list and record: members that changed
 	local function mark_box(key: string, structural: boolean, member: string?)
-		if member then
-			changed_in[key] = changed_in[key] or {}
-			changed_in[key][member] = true
-		end
-		if structural then
-			dirty_box[key] = true
-		elseif dirty_box[key] == nil then
-			dirty_box[key] = false
+		-- Of a box not read yet, everything is read when it is: only of one that has been is anything marked. Which members
+		-- changed is read only by a list of maps or a record.
+		local st = boxes[key]
+		if st then
+			if member and (st.ids or st.keys) then
+				local set = changed_in[key]
+				if not set then
+					set = {}
+					changed_in[key] = set
+				end
+				set[member] = true
+			end
+			if structural then
+				dirty_box[key] = true
+			elseif dirty_box[key] == nil then
+				dirty_box[key] = false
+			end
 		end
 		mark_node(string.sub(key, 1, 16))
 	end
@@ -354,13 +447,15 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			return
 		end
 		marked[id] = true
-		dirty_node[id] = true
+		if nodes[id] ~= nil or tnodes[id] ~= nil then
+			dirty_node[id] = true -- of one not read yet, everything is read when it is
+		end
 		local up = tree_up[id]
 		if up and up ~= ZERO then
 			mark_node(up)
 		end
 		local w = wheres[id]
-		local box = if w then key_of(w.owner, w.field) else nil
+		local box = if w then w.owner .. w.field else nil
 		if box then
 			mark_box(box, false, id)
 		end
@@ -371,89 +466,202 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		end
 	end
 
-	local function latest(row: any, slot: number): any
-		local best: any = nil
-		for _, cell in row.slots[slot] or {} :: any do
-			if cell.kind == 3 and (not best or cell.stamp > best.stamp) then
-				best = cell
-			end
-		end
-		return best
-	end
+	local latest = cells.latest
+	local as_is, as_number = cells.same, cells.decode_number
 
 	local function where_of(row: any): Where?
 		local c = latest(row, WHERE)
-		return if c then where_decode(c.body, c.stamp) else nil
+		return if c then where_decode(c, 18, string.sub(c, 2, 17)) else nil
 	end
 
 	-- Whether a text that keeps an order has changed since it was last read.
-	local remade: { [string]: boolean } = {} -- texts of order made anew: what was in them may be gone
 	local function moved(id: string, slot: number): boolean
 		local t = client:held_text(id, slot)
-		local k = id .. string.char(slot)
-		local was = versions[k]
+		local of = versions[id]
+		local was = if of then of[slot] else nil
 		if not was or was.t ~= t or was.v ~= (if t then t.version else 0) then
 			if not was or was.t ~= t then
-				remade[k] = true -- a text made again is another, as when a value was written over it
+				-- A text made again is another, as when a value was written over it.
+				local r = remade[id]
+				if not r then
+					r = {}
+					remade[id] = r
+				end
+				r[slot] = true
 			end
-			versions[k] = { t = t, v = if t then t.version else 0 }
+			set_version(id, slot, t)
 			return true
 		end
 		return false
 	end
 
+	-- Where it was when the list was last read, to find it there: true if it was not in it then. Only of a list of maps
+	-- that has been read: one that has not is read whole.
+	local function moving(k: string, id: string, from: any)
+		local st = boxes[k]
+		if st and st.ids then
+			local mv = moved_in[k]
+			if not mv then
+				mv = {}
+				moved_in[k] = mv
+			end
+			if mv[id] == nil then
+				mv[id] = from
+			end
+		end
+	end
+
+	-- What was read of a row that is in nothing any more, and gone, and of what was in it: none of it is shown, and should the
+	-- row come again it is read anew. (What says what was in it is kept, for whoever writes next to let go of.)
+	local function clear(t: { [string]: any }, k: string)
+		if t[k] ~= nil then
+			t[k] = nil
+		end
+	end
+	local forget_map: (id: string, s: Schema) -> ()
+	-- What was read of what is in a row, or a map within one, by its schema: its lists, records, trees and maps.
+	local function forget_boxes(id: string, s: Schema)
+		for name, b in s.boxes do
+			local k = key_of(id, name)
+			for _, t in { boxes, dirty_box, changed_in, moved_in, losing, garbage } :: { { [string]: any } } do
+				clear(t, k)
+			end
+			if b.kind == "map" then
+				forget_map(derive(id, name), b)
+			end
+		end
+	end
+	local function forget_read(id: string)
+		for _, t in { nodes, schema_of, seen, tnodes, dirty_node, tree_up, versions, remade } :: { { [string]: any } } do
+			clear(t, id)
+		end
+	end
+	-- A map within a map of what is gone, which is there only while that is: whether its own row has come or not.
+	forget_map = function(id: string, s: Schema)
+		if standing[id] then
+			clear(standing, id)
+			clear(standing_in, id)
+			forget_read(id)
+			forget_boxes(id, s)
+		end
+	end
+	local function forget(id: string, old: Where)
+		local s = schema_of[id]
+		forget_read(id)
+		if s then
+			forget_boxes(id, s)
+		end
+		for k in owned[id] or {} :: any do
+			for _, t in { boxes, dirty_box, changed_in, moved_in, losing, garbage } :: { { [string]: any } } do
+				clear(t, k)
+			end
+		end
+	end
+	-- What is deleted needs, once nothing is in it, nothing more than to be known to be deleted.
+	local function cleaned(id: string)
+		local any = hangs[id] ~= nil
+		for k in owned[id] or {} :: any do
+			any = any or members[k] ~= nil
+		end
+		if not any then
+			clear(cleaning, id)
+			clear(owned, id)
+		end
+	end
+	local forgotten: { [string]: Where } = {} -- in this pass: let go of once all that came has been read
+
 	local function absorb()
 		table.clear(marked)
 		for id in dirty_rows do
-			local row = client:held(id)
+			local row = rows_held[id]
 			local w = if row and not row.dead then where_of(row) else nil
 			local old = wheres[id]
 			if old and old.kind == NODE and hangs[old.parent] and (not w or w.parent ~= old.parent) then
-				hangs[old.parent][id] = nil
+				local h = hangs[old.parent]
+				h[id] = nil
+				if next(h) == nil then
+					hangs[old.parent] = nil
+				end
 			end
 			if w and w.kind == NODE and w.parent ~= ZERO then
 				hangs[w.parent] = hangs[w.parent] or {}
 				hangs[w.parent][id] = true
+				if dead_rows[w.parent] then
+					cleaning[w.parent] = true -- hung from what is deleted: let go of by whoever next writes
+				end
 			end
-			if old and (not w or old.body ~= w.body) then
-				local k = key_of(old.owner, old.field)
-				if members[k] then
-					members[k][id] = nil
+			local differs = old ~= nil and (w == nil or not same_where(old, w))
+			if differs then
+				local o = old :: Where
+				local k = o.owner .. o.field
+				local m = members[k]
+				if m then
+					m[id] = nil
+					if next(m) == nil then
+						-- Nothing says it is in it: neither it nor its owner need say so.
+						members[k] = nil
+						local ks = owned[o.owner]
+						if ks then
+							ks[k] = nil
+							if next(ks) == nil then
+								owned[o.owner] = nil
+							end
+						end
+					end
 				end
-				-- Where it was when the list was last read, to find it there: true if it was not in it then.
-				moved_in[k] = moved_in[k] or {}
-				if moved_in[k][id] == nil then
-					moved_in[k][id] = if old.kind == ITEM then old.marker else true
-				end
-				if old.kind == ITEM and (not w or w.marker ~= old.marker) then
+				moving(k, id, if o.kind == ITEM then o.marker else true)
+				if o.kind == ITEM and (not w or w.marker ~= o.marker) then
 					-- A marker no longer anyone's, if it is still there: let go of when the list is next written.
 					local box = boxes[k]
-					local t = if box and box.ids and box.slot then client:held_text(old.owner, box.slot) else nil
-					if t and text.standing(t, old.marker) then
+					local t = if box and box.ids and box.slot then client:held_text(o.owner, box.slot) else nil
+					if t and text.standing(t, o.marker) then
 						garbage[k] = garbage[k] or {}
-						garbage[k][old.marker] = true
+						garbage[k][o.marker] = true
 					end
 				end
 				mark_box(k, true)
 			end
 			wheres[id] = w :: any
-			if w then
-				dead_rows[id] = nil -- it was only out of the list a while, and is back
+			-- A row that is here is not gone, whatever was seen of it, as when it was let go of from memory while it was
+			-- elsewhere, and is back.
+			if row and not row.dead and dead_rows[id] then
+				dead_rows[id] = nil
+				cleaning[id] = nil
 			end
-			emptied[id] = if w and w.kind == ENTRY and not w.present then true else nil
-			if w and (not old or old.body ~= w.body) then
-				local k = key_of(w.owner, w.field)
-				members[k] = members[k] or {}
-				members[k][id] = true
-				owned[w.owner] = owned[w.owner] or {}
-				owned[w.owner][k] = true
-				moved_in[k] = moved_in[k] or {}
-				if moved_in[k][id] == nil then
-					moved_in[k][id] = true
+			if w then
+				if w.kind == ENTRY and not w.present then
+					emptied[id] = true
+				elseif emptied[id] then
+					emptied[id] = nil
 				end
+			elseif emptied[id] then
+				emptied[id] = nil
+			end
+			if w and (old == nil or differs) then
+				local k = w.owner .. w.field
+				local m = members[k]
+				if not m then
+					m = {}
+					members[k] = m
+				end
+				m[id] = true
+				if dead_rows[w.owner] then
+					cleaning[w.owner] = true -- put in what is deleted: let go of by whoever next writes
+				end
+				local o = owned[w.owner]
+				if not o then
+					o = {}
+					owned[w.owner] = o
+				end
+				o[k] = true
+				moving(k, id, true)
 				mark_box(k, true)
 			end
-			mark_node(id)
+			-- What is in it is marked as having changed, and so on up. A row heard of for the first time is in nothing yet
+			-- but what it says, which is marked already, unless it is a map within a map or a node.
+			if old ~= nil or nodes[id] ~= nil or tnodes[id] ~= nil or standing_in[id] ~= nil or tree_up[id] ~= nil then
+				mark_node(id)
+			end
 			local s = schema_of[id]
 			if s then
 				for name, b in s.boxes do
@@ -472,15 +680,32 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			-- held is not known to be gone.
 			if old and not w and (if held then row ~= nil and row.dead else (not row or row.dead)) then
 				dead_rows[id] = true -- deleted, and perhaps let go of from memory already
+				cleaning[id] = true
 			end
 			-- What is in a row that comes or goes is there or not with it.
 			if (old == nil) ~= (w == nil) then
-				for k in owned[id] or {} :: any do
-					mark_box(k, true)
+				local ks = owned[id]
+				if ks then
+					for k in ks do
+						mark_box(k, true)
+					end
 				end
+			end
+			if old and not w and (not row or row.dead) and not standing[id] then
+				forgotten[id] = old
 			end
 		end
 		table.clear(dirty_rows)
+		-- What was in what went may have been marked as it went, too.
+		for id, old in forgotten do
+			forget(id, old)
+		end
+		table.clear(forgotten)
+		if next(cleaning) ~= nil then
+			for id in table.clone(cleaning) do
+				cleaned(id)
+			end
+		end
 	end
 
 	-- ------------------------------------------------ reading
@@ -489,55 +714,23 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 	local function decode(c: Column, row: any): any
 		if c.who then
 			-- Whose what is in the slot is, as the client says it: whoever wrote there last, or all who have, by name.
-			local last: any = nil
-			local names: { [string]: boolean } = {}
-			for _, cell in row.slots[c.slot] or {} :: any do
-				if not last or cell.stamp > last.stamp then
-					last = cell
-				end
-				if cell.author and cell.author.subject ~= "" then
-					names[cell.author.subject] = true
-				end
-			end
-			if c.who == "all" then
-				local all = {}
-				for name in names do
-					table.insert(all, name)
-				end
-				table.sort(all)
-				return table.freeze(all)
-			end
-			return if last and last.author and last.author.subject ~= "" then last.author.subject else nil
+			return cells.whose(row, c.slot, c.who == "all")
 		elseif c.text then
-			return text.read(client:held_text(row.id, c.slot) :: any)
+			return client:_read_text(row, c.slot)
 		end
 		local cell = latest(row, c.slot)
-		if not cell or cell.body == "" then
+		if not cell or #cell == 17 then
 			return nil
 		end
-		local ok, v = pcall(c.decode, cell.body)
+		local how = c.decode
+		if how == as_is then
+			return string.sub(cell, 18)
+		elseif how == as_number then
+			-- As the column reads its value: the first eight bytes, which there must be.
+			return if #cell >= 25 then string.unpack(">d", cell, 18) else nil
+		end
+		local ok, v = pcall(how, string.sub(cell, 18))
 		return if ok then v else nil
-	end
-
-	local function values_of(s: Schema, row: any): { any }
-		local c = row.views[ME]
-		if not c then
-			c = {}
-			row.views[ME] = c
-		end
-		local v = c[s]
-		if not v then
-			v = {}
-			for i, name in s.names do
-				local col = s.columns[name]
-				if col then
-					local x = decode(col, row)
-					v[i] = if x == nil then NIL else x
-				end
-			end
-			c[s] = v
-		end
-		return v
 	end
 
 	local function alive(id: string): any
@@ -547,46 +740,96 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 
 	-- The document, and maps within maps, are there for everyone whether their own rows have come or not: what is in
 	-- them is. Whatever else holds anything holds it only while it is there itself.
-	local standing: { [string]: boolean } = {}
 	local function holds(owner: string): boolean
 		return standing[owner] == true or alive(owner) ~= nil
 	end
 
 	local build_box: any
 
-	-- A map: the same table as before if nothing in it is other than it was.
+	-- A map: the same table as before if nothing in it is other than it was. What is in its own row is read again only if the
+	-- row has changed since it was last read, which its version says: versions are never the same for two states of rows.
+	-- A table with room for every field of a map and its id, and nothing in it: what a map is made from, so that it is made
+	-- once, as big as it will be, rather than grown field by field.
+	local shapes: { [Schema]: { [string]: any } } = {}
+	local function shape_of(s: Schema): { [string]: any }
+		local shape = shapes[s]
+		if not shape then
+			shape = { id = false }
+			for _, name in s.names do
+				shape[name] = false
+			end
+			for name in shape do
+				shape[name] = nil -- the room stays
+			end
+			shapes[s] = shape
+		end
+		return shape :: any
+	end
 	local function build_map(s: Schema, id: string): any
 		-- A map read as another's schema, as every map is while the scope is not known and all ids are nothing, is not this one.
 		local was = if schema_of[id] == s then nodes[id] else nil
 		if was and not dirty_node[id] and not plain then
 			return was
 		end
-		dirty_node[id] = nil
-		schema_of[id] = s
-		local row = alive(id)
-		local vals = if row then values_of(s, row) else nil
-		local parts = {}
-		local changed = was == nil
-		for i, name in s.names do
-			local b = s.boxes[name]
-			local v = if b then build_box(b, id, name) else (if vals then vals[i] else NIL)
+		if dirty_node[id] then
+			dirty_node[id] = nil
+		end
+		if schema_of[id] ~= s then
+			schema_of[id] = s
+		end
+		local row = rows_held[id]
+		if row and row.dead then
+			row = nil
+		end
+		local again = row ~= nil and (was == nil or plain or seen[id] ~= row.version) -- read the long way, read again
+		seen[id] = if row then row.version else nil
+		local names, inner, columns = s.names, s.boxes, s.columns
+		if was == nil then
+			-- Made for the first time: straight into what is given, which is made as big as it will be.
+			local out: { [string]: any } = table.clone(shape_of(s))
+			out.id = id
+			for _, name in names do
+				local b = inner[name]
+				local v = if b then build_box(b, id, name) elseif row then decode(columns[name], row) else nil
+				if v ~= nil and v ~= NIL then
+					out[name] = v
+				end
+			end
+			table.freeze(out)
+			nodes[id] = out
+			return out
+		end
+		local parts = table.create(#names)
+		local changed = false
+		for i, name in names do
+			local b = inner[name]
+			local pv = was[name]
+			local v
+			if b then
+				v = build_box(b, id, name)
+			elseif not row then
+				v = nil
+			elseif again then
+				v = decode(columns[name], row)
+			else
+				v = pv
+			end
 			if v == nil then
 				v = NIL
 			end
 			parts[i] = v
 			if not changed then
-				local pv = was[name]
 				changed = not alike(if pv == nil then NIL else pv, v)
 			end
 		end
 		if not changed then
 			return was
 		end
-		local out: { [string]: any } = { id = id }
-		for i, name in s.names do
-			if parts[i] ~= NIL then
-				out[name] = parts[i]
-			end
+		local out: { [string]: any } = table.clone(shape_of(s))
+		out.id = id
+		for i, name in names do
+			local v = parts[i]
+			out[name] = if v == NIL then nil else v
 		end
 		table.freeze(out)
 		nodes[id] = out
@@ -607,6 +850,55 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 	end
 
 	-- Where each is in a list of ids.
+	-- Where an item is among a list's ids, found by where its marker is, as they are in order: by place, and then by id. Nil
+	-- if it cannot be found so, as when what it is compared with has no place.
+	local function seek(ids: { string }, id: string, t: any): number?
+		local w = wheres[id]
+		if not (t and w and w.kind == ITEM) then
+			return nil
+		end
+		local l, o = text.position(t, w.marker)
+		if not l then
+			return nil
+		end
+		local lo, hi = 1, #ids
+		while lo <= hi do
+			local mid = (lo + hi) // 2
+			local m = ids[mid]
+			if m == id then
+				return mid
+			end
+			local wm = wheres[m]
+			local lm: number?, om: number = nil, 0
+			if wm and wm.kind == ITEM then
+				lm, om = text.position(t, wm.marker)
+			end
+			if lm == nil then
+				return nil
+			end
+			local less = if lm ~= l then (lm :: number) < l elseif om ~= o then om < o else m < id
+			if less then
+				lo = mid + 1
+			else
+				hi = mid - 1
+			end
+		end
+		return nil
+	end
+
+	-- The last found, which is found again first: what is typed in, or heard of, is often the same item again and again.
+	local last_ids: { string }?, last_id, last_at = nil, "", 0
+	local function find_in(ids: { string }, id: string, t: any): number?
+		if ids == last_ids and id == last_id and ids[last_at] == id then
+			return last_at
+		end
+		local at = seek(ids, id, t)
+		if at then
+			last_ids, last_id, last_at = ids, id, at
+		end
+		return at
+	end
+
 	local function index_of(ids: { string }): { [string]: number }
 		local out = {}
 		for i, id in ids do
@@ -636,6 +928,90 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		return if row then decode(of, row) else nil
 	end
 
+	-- The items of a list from nothing, in order: by where their markers are, and then by id. Each one's place is made one
+	-- number, the place of its marker's span among the text's spans and the offset in it, so that they are sorted as numbers
+	-- are, with no call for each comparison; and so are the few that share a place, by id.
+	local function order_of(mine: { [string]: boolean }, t: any): ({ string }, { [string]: boolean }, { [string]: boolean })
+		local hidden, dups = {}, {}
+		local ordinal: ((string) -> number?)?, total = nil, 0
+		if t then
+			ordinal, total = text.ordinals(t)
+		end
+		local n = 0
+		local of: { string }, at: { number } = {}, {}
+		for id in mine do
+			local row = rows_held[id]
+			if row and not row.dead then
+				local w = wheres[id]
+				local k = if ordinal and w and w.kind == ITEM then (ordinal :: any)(w.marker) else nil
+				if k then
+					n += 1
+					of[n], at[n] = id, k
+				else
+					hidden[id] = true
+				end
+			end
+		end
+		-- Each where its marker is: in an array as long as the text, if that is not much longer than the list; or else by
+		-- those places sorted, as numbers. Those that share a marker, which only a writer who minds nothing makes, by id.
+		-- (Made as long as they will be, as what is kept and copied is all of an array, however much of it is used.)
+		local ids: { string } = table.create(n) :: any
+		local by: { [number]: any }
+		local places: { number }
+		if total <= 4 * n + 64 then
+			by = table.create(total) :: any
+			places = nil :: any
+		else
+			by = {}
+			places = table.create(n) :: any
+		end
+		for i = 1, n do
+			local k = at[i]
+			local x = by[k]
+			if x == nil then
+				by[k] = of[i]
+				if places then
+					table.insert(places, k)
+				end
+			elseif type(x) == "string" then
+				by[k] = { x, of[i] }
+			else
+				table.insert(x, of[i])
+			end
+		end
+		local j = 0
+		local function put(x: any)
+			if type(x) == "string" then
+				j += 1
+				ids[j] = x
+			else
+				-- Sharing a marker: all but the first are given one of their own when the list is next written.
+				table.sort(x)
+				for i, id in x do
+					j += 1
+					ids[j] = id
+					if i > 1 then
+						dups[id] = true
+					end
+				end
+			end
+		end
+		if places then
+			table.sort(places)
+			for _, k in places do
+				put(by[k])
+			end
+		else
+			for k = 1, total do
+				local x = by[k]
+				if x ~= nil then
+					put(x)
+				end
+			end
+		end
+		return ids, hidden, dups
+	end
+
 	build_box = function(b: Schema, owner: string, field: string): any
 		local key = key_of(owner, field)
 		local st = boxes[key]
@@ -644,22 +1020,27 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			return st.out
 		end
 		local structural = d == true or st == nil or plain
-		dirty_box[key] = nil
+		if d ~= nil then
+			dirty_box[key] = nil
+		end
 		if b.kind == "map" then
-			local id = derive(owner, field)
+			local scoped = client.scopes[scope]
+			local from = if scoped then scoped.key else ""
+			local id = if st and st.from == from then st.id else derive(owner, field)
 			standing[id] = true
 			standing_in[id] = key
 			local out = build_map(b, id)
-			boxes[key] = { out = out }
+			boxes[key] = { out = out, id = id, from = from }
 			return out
 		elseif b.kind == "list" and b.of.kind then
 			local ids = if st then st.ids else {}
 			local hidden = if st then st.hidden else {}
+			local fresh_dups: { [string]: boolean }? = nil
 			local living = holds(owner)
 			if structural then
 				local t = if living then client:held_text(owner, b.slot) else nil
 				-- The text read, to know later whether it is still the one.
-				versions[owner .. string.char(b.slot)] = { t = t, v = if t then t.version else 0 }
+				set_version(owner, b.slot, t)
 				local function pos(id: string): (number?, number)
 					local w = wheres[id]
 					if not (t and w and w.kind == ITEM and alive(id)) then
@@ -680,8 +1061,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 				local redo = moved_in[key] or {}
 				moved_in[key] = nil
 				local mine = members[key] or {}
-				local again = remade[owner .. string.char(b.slot)]
-				remade[owner .. string.char(b.slot)] = nil
+				local again = was_remade(owner, b.slot)
 				if st and st.living == living and not again and not plain then
 					-- What did not move keeps its order, for the order of what is there never changes; what came,
 					-- moved, or had nowhere to be yet, is taken out and put in its place, in arrays as they were.
@@ -738,7 +1118,9 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					table.sort(gone, function(x: number, y: number): boolean
 						return x > y
 					end)
-					local new_ids = table.clone(ids)
+					-- The ids are this list's own, and changed where they are; what is shown is a new array.
+					local count = #ids
+					local new_ids = ids
 					local parts = table.clone(st.out)
 					for _, at in gone do
 						table.remove(new_ids, at)
@@ -781,21 +1163,34 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					-- What changed in place, too; where things are is known again when next it is asked.
 					local touched = changed_in[key]
 					changed_in[key] = nil
+					-- Each found where it is, by its marker; failing that, by a table of where each is, made once.
 					local fresh_index = nil
 					for id in touched or {} :: any do
-						if not redo[id] then
-							fresh_index = fresh_index or index_of(new_ids)
-							local at = fresh_index[id]
+						if not redo[id] and not hidden[id] then
+							local at = find_in(new_ids, id, t)
+							if not at then
+								fresh_index = fresh_index or index_of(new_ids)
+								at = fresh_index[id]
+							end
 							if at then
 								parts[at] = build_map(b.of, id)
 							end
 						end
 					end
-					local out = if #gone == 0 and #new_ids == #ids and same_list(st.out, parts) then st.out else table.freeze(parts)
+					local out = if #gone == 0 and #new_ids == count and same_list(st.out, parts) then st.out else table.freeze(parts)
 					-- Sharing a marker is looked for only beside what was put back: what moved is looked at again.
 					local dups = table.clone(st.dups or {})
 					for id in redo do
 						dups[id] = nil
+					end
+					-- What shared a marker with one that is gone, or has moved, may not now: each, of those few, is looked at again
+					-- beside what is before it now.
+					for id in dups do
+						local i = find_in(new_ids, id, t)
+						local before_it = if i and i > 1 then wheres[new_ids[i - 1]] else nil
+						if i and not (before_it and before_it.marker == wheres[id].marker) then
+							dups[id] = nil
+						end
 					end
 					local function beside(i: number)
 						for j = i, i + 1 do
@@ -819,38 +1214,28 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					boxes[key] = { out = out, ids = new_ids, hidden = hidden, living = living, index = fresh_index or false, slot = b.slot, dups = dups }
 					return out
 				end
-				ids, hidden = {}, {}
-				local at: { any } = {}
-				for id in mine do
-					if alive(id) then
-						local l, o = pos(id)
-						if l then
-							table.insert(at, { id = id, l = l, o = o })
-						else
-							hidden[id] = true
-						end
-					end
-				end
-				table.sort(at, function(x: any, y: any): boolean
-					if x.l ~= y.l then
-						return x.l < y.l
-					elseif x.o ~= y.o then
-						return x.o < y.o
-					end
-					return x.id < y.id
-				end)
-				for i, x in at do
-					ids[i] = x.id
-				end
+				ids, hidden, fresh_dups = order_of(mine, t)
 			end
 			local touched = changed_in[key]
 			changed_in[key] = nil
 			if not structural and st then
-				-- In the same order: only what changed is read again.
-				local index = st.index or index_of(ids)
+				-- In the same order: only what changed is read again, each found where it is by its marker, in the text as it was
+				-- read; failing that, by a table of where each is, made once and kept.
+				local index = st.index or nil
+				local read = if versions[owner] then versions[owner][b.slot] else nil
+				local t = if read then read.t else nil
 				local parts = nil
 				for id in touched or {} :: any do
-					local i = index[id]
+					local i = nil
+					if index then
+						i = index[id]
+					elseif not hidden[id] then
+						i = find_in(ids, id, t)
+						if not i then
+							index = index_of(ids)
+							i = (index :: any)[id]
+						end
+					end
 					if i then
 						local v = build_map(b.of, id)
 						if not rawequal(v, st.out[i]) then
@@ -860,15 +1245,15 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 					end
 				end
 				local out = if parts then table.freeze(parts) else st.out
-				boxes[key] = { out = out, ids = ids, hidden = hidden, living = living, index = index, slot = b.slot, dups = st.dups }
+				boxes[key] = { out = out, ids = ids, hidden = hidden, living = living, index = index or false, slot = b.slot, dups = st.dups }
 				return out
 			end
-			local parts = {}
+			local parts = table.create(#ids) -- as long as it will be: a copy of it is all of it, used or not
 			for i, id in ids do
 				parts[i] = build_map(b.of, id)
 			end
 			local out = if st and same_list(st.out, parts) then st.out else table.freeze(parts)
-			boxes[key] = { out = out, ids = ids, hidden = hidden, living = living, index = false, slot = b.slot, dups = sharing(ids) }
+			boxes[key] = { out = out, ids = ids, hidden = hidden, living = living, index = false, slot = b.slot, dups = fresh_dups or sharing(ids) }
 			return out
 		elseif b.kind == "list" then
 			if not structural and st then
@@ -1176,6 +1561,8 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			-- A row and everything in it, wherever that is, shown or not.
 			local deleting: { [string]: boolean } = {}
 			local spared: { [string]: boolean } = {} -- nodes the new state has, wherever they hung before
+			local written: { [string]: boolean } = {} -- rows the new state has, as written here: none is let go of after
+			local emptying: { [string]: boolean } = {} -- each once, whatever says it is in what
 			local function delete_row(id: string)
 				if deleting[id] or spared[id] then
 					return
@@ -1205,6 +1592,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			local write_map: any
 
 			local function write_value(of: any, old: any, new: any, id: string, made: boolean, where: string?)
+				written[id] = true
 				if of.kind then
 					write_map(of, old, new, id, made, where)
 					return
@@ -1237,6 +1625,7 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			local write_box: any
 
 			write_map = function(s: Schema, old: any, new: any, id: string, made: boolean, where: string?)
+				written[id] = true
 				if rawequal(old, new) and not made and not where and not plain then
 					return -- the very table that was read: nothing in it has changed
 				end
@@ -1259,8 +1648,21 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 								while a < #was and a < #nv and string.byte(was, a + 1) == string.byte(nv, a + 1) do
 									a += 1
 								end
+								-- Never parting a character's bytes: what others write meanwhile is of whole characters too.
+								while
+									a > 0
+									and (
+										(a < #was and bit32.band(string.byte(was, a + 1), 0xC0) == 0x80)
+										or (a < #nv and bit32.band(string.byte(nv, a + 1), 0xC0) == 0x80)
+									)
+								do
+									a -= 1
+								end
 								while z < #was - a and z < #nv - a and string.byte(was, #was - z) == string.byte(nv, #nv - z) do
 									z += 1
+								end
+								while z > 0 and bit32.band(string.byte(was, #was - z + 1), 0xC0) == 0x80 do
+									z -= 1
 								end
 								if #was - a - z > 0 then
 									text.delete(t, a, #was - a - z, fresh)
@@ -1270,6 +1672,10 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 								end
 							end)
 						end
+					elseif c.text and made and (nv == nil or nv == "") and (ov == nil or ov == "") then
+						-- Nor is an empty text written where the row is made here: one with no cells is empty, and an empty
+						-- value written over one not come yet would wipe what another typed in it meanwhile.
+						continue
 					elseif not alike(nv, ov) or made then
 						if nv ~= nil then
 							values[name] = nv
@@ -1682,12 +2088,25 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			-- What is in the document is there whether its own row is or not, so what is written is what differs from that.
 			write_map(schema, current, state, root, not exists)
 			-- What others put in keys that were being let go of meanwhile goes too; but not a map within it, which
-			-- is that key's for ever, and only emptied.
+			-- is that key's for ever, and only emptied. A key of a record within is let go of as any key is, and not
+			-- deleted, which would be for ever, as its id is its key's: so that it can be set again. Nothing the new state
+			-- has is let go of, as a key set again here is not.
 			local function empty(id: string)
+				if written[id] or emptying[id] then
+					return
+				end
+				emptying[id] = true
 				for k in owned[id] or {} :: any do
 					for m in members[k] or {} :: any do
 						local w = wheres[m]
-						if w and w.kind == MAP then
+						if written[m] then
+							continue
+						elseif w and w.kind == MAP then
+							empty(m)
+						elseif w and w.kind == ENTRY and m == derive(w.owner, w.field, w.key) then
+							if w.present then
+								change.set(m, { [W] = WHERE_COLUMN }, { [W] = where_encode(w.owner, w.field, ENTRY, "\0" .. w.key) })
+							end
 							empty(m)
 						else
 							delete_row(m)
@@ -1698,8 +2117,9 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 			for id in emptied do
 				empty(id)
 			end
-			-- What others put in rows that were being deleted meanwhile is let go of too.
-			for id in dead_rows do
+			-- What others put in rows that were being deleted meanwhile is let go of too: of those that may have anything in
+			-- them, not of every row ever deleted.
+			for id in cleaning do
 				for k in owned[id] or {} :: any do
 					for m in members[k] or {} :: any do
 						delete_row(m)
@@ -1945,6 +2365,25 @@ function mirror.open(client: any, options: { scope: number, name: string, schema
 		_mark = function(id: string)
 			dirty_rows[id] = true
 		end,
+		-- For tests: how much is kept of what was read, that it may be seen not to grow without end.
+		_sizes = function(): { [string]: number }
+			local out = {}
+			for name, t in { nodes = nodes, schema_of = schema_of, seen = seen, tnodes = tnodes, boxes = boxes, changed_in = changed_in, moved_in = moved_in, dirty_box = dirty_box, versions = versions, dirty_node = dirty_node, owned = owned, members = members, hangs = hangs, cleaning = cleaning, standing = standing, standing_in = standing_in, tree_up = tree_up, garbage = garbage, remade = remade } :: { [string]: { [string]: any } } do
+				local n = 0
+				for _ in t do
+					n += 1
+				end
+				out[name] = n
+			end
+			local keys = 0
+			for _, ks in owned do
+				for _ in ks do
+					keys += 1
+				end
+			end
+			out.owned_keys = keys
+			return out
+		end,
 	})
 end
 
@@ -2181,7 +2620,14 @@ function mirror.ask(
 			first = if found then found.first else 0,
 			totals = if found then found.totals else {},
 		})
-		if last and last.status == answer.status and last.total == answer.total and last.first == answer.first and rawequal(last.totals, answer.totals) and #last.rows == #rows then
+		if
+			last
+			and last.status == answer.status
+			and last.total == answer.total
+			and last.first == answer.first
+			and (rawequal(last.totals, answer.totals) or (next(last.totals) == nil and next(answer.totals) == nil))
+			and #last.rows == #rows
+		then
 			local same = true
 			for i, v in rows do
 				same = same and rawequal(last.rows[i], v) and (not last.keys or last.keys[i] == keys[i])
@@ -2200,6 +2646,16 @@ function mirror.ask(
 		codec.put_bytes(w, field)
 		codec.put_u8(w, kind)
 		return codec.string(w)
+	end
+
+	-- A question asked, kept to be stopped; or stopped at once, where what answered at once had this stopped.
+	local function kept(into: { any }, q: any): any
+		if stopped then
+			q.stop()
+		else
+			table.insert(into, q)
+		end
+		return q
 	end
 
 	-- Rows asked for by id, a thousand to a question, asked again only when they change.
@@ -2227,7 +2683,10 @@ function mirror.ask(
 				answers[`maps {n}`] = a
 				tell()
 			end)
-			table.insert(by_id, q)
+			kept(by_id, q)
+			if stopped then
+				return
+			end
 		end
 	end
 	-- The maps within each that answers, which are there whether their rows are or not, but say what they hold; and, in a
@@ -2289,7 +2748,10 @@ function mirror.ask(
 			maps_of_given()
 			tell()
 		end)
-		table.insert(questions, found_handle)
+		kept(questions, found_handle)
+		if stopped then
+			return true
+		end
 		if moved then
 			found_handle.move(moved.offset, moved.limit)
 		end
@@ -2298,11 +2760,17 @@ function mirror.ask(
 			answers.chain = a
 			tell()
 		end)
-		table.insert(questions, on_the_way)
+		kept(questions, on_the_way)
+		if stopped then
+			return true
+		end
 		-- Every node of a tree on the way: which are there, and where, is known only from all of them.
 		for i, t in p.trees do
 			local pages: { any } = {}
 			local function page(n: number)
+				if stopped then
+					return
+				end
 				pages[n] = true
 				local q: any
 				q = client:ask({
@@ -2322,25 +2790,51 @@ function mirror.ask(
 					maps_of_given()
 					tell()
 				end)
-				table.insert(questions, q)
+				kept(questions, q)
 			end
 			page(1)
 		end
 		return true
 	end
 
-	-- Ids are made with the scope's key: what is on the way is known once that is.
+	-- Ids are made with the scope's key: what is on the way is known once that is. A client that knows what it may do, and
+	-- may not read there, is told so, as a question of its own would be; and what answers comes should that change.
+	-- Said first, before what answers, which may come at once: as a record's are, with its keys.
+	local kind = place_of(schema, path, function()
+		return string.rep("\0", 16)
+	end).box.kind -- or an error, here rather than later
+	local none = if kind == "record" then table.freeze({}) else nil
+	local loading = table.freeze({ rows = table.freeze({}), keys = none, status = "loading", total = 0, first = 0, totals = table.freeze({}) })
+	local refused = table.freeze({ rows = table.freeze({}), keys = none, status = "denied", total = 0, first = 0, totals = table.freeze({}) })
+	local function say(what: any) -- and what is said is what what answers is the same as or not
+		last = what
+		observer(what)
+	end
+	local function denied(): boolean
+		return client.ready == true and not client.scopes[scope]
+	end
 	local waiting: { stop: (() -> ())? } = { stop = nil }
+	local said_denied = denied()
+	say(if said_denied then refused else loading)
 	if not start() then
 		waiting.stop = client:on("status", function()
+			if stopped then
+				return
+			end
+			if not start() then
+				if denied() ~= said_denied then
+					said_denied = not said_denied
+					say(if said_denied then refused else loading)
+				end
+				return
+			end
 			local unwait = waiting.stop
-			if start() and unwait then
+			if unwait then
 				waiting.stop = nil
 				unwait()
 			end
 		end)
 	end
-	observer(table.freeze({ rows = table.freeze({}), status = "loading", total = 0, first = 0, totals = {} }))
 
 	return table.freeze({
 		-- Another stretch of what answers.
