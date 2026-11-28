@@ -31,21 +31,19 @@ const HELD = new Set(["NoModificationAllowedError", "InvalidStateError"]);
 /**
  * Does something to a file, waiting for whatever holds it to let go: tried again a millisecond later, then two, then four,
  * and so on, until `within` is up and it is said that the store is locked. `wait` waits so long, or, should the volume be
- * let go of meanwhile, says it did not, and nothing more is tried. `held` is shared by everything done to the files of one
- * volume, as `within` is: a worker gone lets go of all its files at once, so the second file found held as the store opens
- * is waited for only as long as is left since the first was, not two seconds more, and so on; and is had afresh once
- * something is done to a file found held by nothing, when whatever held them has let go.
+ * let go of meanwhile, says it did not, and nothing more is tried. `within` is counted from when this file was first found
+ * held, this time, and from nothing before: once had, it was let go of, and whatever is found held after, however soon, is
+ * waited for as long again.
  */
-export async function take<H>(name: string, open: () => Promise<H>, wait: (ms: number) => Promise<boolean>, held: { since?: number } = {}, within = HELD_WITHIN): Promise<H> {
-  for (let delay = 1, tries = 0; ; delay = Math.min(delay * 2, LONGEST_WAIT), tries++) {
+export async function take<H>(name: string, open: () => Promise<H>, wait: (ms: number) => Promise<boolean>, within = HELD_WITHIN): Promise<H> {
+  let since: number | undefined; // when it was first found held
+  for (let delay = 1; ; delay = Math.min(delay * 2, LONGEST_WAIT)) {
     try {
-      const done = await open();
-      if (tries === 0) held.since = undefined; // held by nothing
-      return done;
+      return await open();
     } catch (e) {
       if (!HELD.has((e as { name?: unknown } | null)?.name as string)) throw e;
       const now = performance.now();
-      const until = (held.since ??= now) + within;
+      const until = (since ??= now) + within;
       if (now >= until) {
         throw new StoreLocked(`the store's file ${name} is held by something else, and was not let go of in ${within / 1000} s: another tab of this site may hold it, or the browser, until it is restarted`, { cause: e });
       }
@@ -70,7 +68,6 @@ export class OpfsVolume implements Volume {
   #closed = false;
   #waits = new Set<{ timer: ReturnType<typeof setTimeout>; done: (waited: boolean) => void }>(); // for a file held by another
   #files = new Set<OpfsFile>(); // open
-  #held: { since?: number } = {}; // see take
   /** How many things have been done to its files, tries included: that whoever uses it is getting on, not stuck. */
   steps = 0;
 
@@ -103,7 +100,7 @@ export class OpfsVolume implements Volume {
       throw e;
     }
     const file = handle as unknown as { createSyncAccessHandle(): Promise<SyncHandle> };
-    const h = await take(name, () => this.#step(file.createSyncAccessHandle()), (ms) => this.#wait(ms), this.#held);
+    const h = await take(name, () => this.#step(file.createSyncAccessHandle()), (ms) => this.#wait(ms));
     if (this.#closed) {
       h.close(); // let go of as it was had: closed with the rest
       throw new Error("the store was let go of as its file " + name + " was opened");
@@ -146,7 +143,7 @@ export class OpfsVolume implements Volume {
   // Removed as a file is opened, waiting for whatever holds it, which a file with a handle open cannot be.
   async remove(name: string): Promise<void> {
     try {
-      await take(name, () => this.#step(this.#dir.removeEntry(name)), (ms) => this.#wait(ms), this.#held);
+      await take(name, () => this.#step(this.#dir.removeEntry(name)), (ms) => this.#wait(ms));
     } catch (e) {
       if ((e as DOMException).name !== "NotFoundError") throw e;
     }

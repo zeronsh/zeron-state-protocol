@@ -23,6 +23,7 @@ let refused = 0; // how often a handle was asked for and the file was held
 let failFlush: string | undefined; // the name of a file whose flush throws, as a full disk's may, or "*" for every one
 let failClose: string | undefined; // and whose close throws
 const heldForEver = new Set<string>(); // paths of files something else holds, and never lets go of
+const heldOnce = new Set<string>(); // and that it holds for one try more, as a worker just gone may
 let writes = 0; // to any file
 const pauses = new Map<string, { reached: () => void; release: Promise<void> }>(); // by path: a file's next handle, held as it is had
 
@@ -84,7 +85,7 @@ class Entry {
   }
   async createSyncAccessHandle(): Promise<Handle> {
     await Promise.resolve();
-    if (this.handle || heldForEver.has(this.path)) {
+    if (this.handle || heldForEver.has(this.path) || heldOnce.delete(this.path)) {
       refused++;
       throw new DOMException(HELD, "NoModificationAllowedError");
     }
@@ -231,7 +232,7 @@ async function until(what: string, f: () => boolean, ms = 5000): Promise<void> {
   assert.equal(tries, 1);
   // Held for ever, it is said to be locked once `within` is up, and not before.
   const t = performance.now();
-  const e = await take("f", () => Promise.reject(new DOMException(HELD, "NoModificationAllowedError")), (ms) => sleep(ms).then(() => true), {}, 300).catch((e) => e);
+  const e = await take("f", () => Promise.reject(new DOMException(HELD, "NoModificationAllowedError")), (ms) => sleep(ms).then(() => true), 300).catch((e) => e);
   const took = performance.now() - t;
   assert(e instanceof StoreLocked && e.name === "StoreLocked", String(e));
   assert.equal((e.cause as DOMException).name, "NoModificationAllowedError");
@@ -266,24 +267,23 @@ async function until(what: string, f: () => boolean, ms = 5000): Promise<void> {
   another.close();
 }
 
-// The files of a store found held as it opens are waited for HELD_WITHIN in all, not each, for a worker gone lets go of all
-// of them at once: a second found held after the first was let go of, a second and a half on, is waited for half a second
-// more. One then found held by nothing, the next found held is waited for afresh.
+// A file found held is waited for HELD_WITHIN from when it was first found held, and from nothing before: once had, a file
+// found held after, as a segment is opened while the node runs, is waited for afresh, however long after the last was.
 {
-  const dir = await (await root.getDirectoryHandle("zsp")).getDirectoryHandle("episode", { create: true });
-  const [a, b] = await Promise.all(["a", "b"].map((n) => dir.getFileHandle(n, { create: true })));
   const volume = await OpfsVolume.at("zsp/episode");
-  const ha = await a.createSyncAccessHandle();
-  const hb = await b.createSyncAccessHandle();
-  setTimeout(() => ha.close(), 1500);
+  heldOnce.add("/zsp/episode/a");
   (await volume.open("a", true))!.close();
-  const t = performance.now();
-  await assert.rejects(volume.open("b", true), (e) => e instanceof StoreLocked);
-  const took = performance.now() - t;
-  assert(took < 800, `the second held file was waited for ${took} ms more`);
-  (await volume.open("c", true))!.close(); // held by nothing
-  setTimeout(() => hb.close(), 1500);
-  (await volume.open("b", true))!.close(); // and so waited for afresh
+  await sleep(HELD_WITHIN + 50); // the node getting on, longer than any file is waited for
+  heldOnce.add("/zsp/episode/b");
+  const before = refused;
+  (await volume.open("b", true))!.close();
+  assert.equal(refused, before + 1, "found held once, and had at the next try");
+  await sleep(HELD_WITHIN + 50);
+  const dir = await (await root.getDirectoryHandle("zsp")).getDirectoryHandle("episode");
+  const other = await (await dir.getFileHandle("a")).createSyncAccessHandle();
+  setTimeout(() => other.close(), 30);
+  await volume.remove("a"); // removed as found held afresh, too
+  assert(!dir.entries.has("a"));
 }
 
 // A file is removed once whatever holds it lets go, as it is opened; and a volume let go of closes what it has open, and what
