@@ -209,6 +209,13 @@ store_open :: proc(s: ^Store, disk: Disk, ring := 256) -> bool {
 		s.replay_at, s.replay_tail = s.checkpoint, s.checkpoint
 		return true
 	}
+	// The header read may be one only the system holds, written as its process was killed before it was made durable:
+	// power lost now would fall back to the other, whose pages it may no longer name and find_free would let be reused.
+	// So what is read is made durable before anything is reused: one sync, at open, of a store that has a checkpoint.
+	if best.generation > 0 && !s.disk.page_sync(s.disk.data) {
+		s.failed = true
+		return false
+	}
 	find_free(s)
 	replay(s) or_return
 	if best.generation == 0 && s.own && !s.unmarked {

@@ -442,10 +442,13 @@ file_disk_waiting :: proc(d: ^File_Disk) -> zsp.Disk {
 		},
 		page_sync = proc(data: rawptr) -> bool {
 			d := (^File_Disk)(data)
-			if d.tree == nil {
-				return true
+			if disk_owner_failed(d.host, d.id) {
+				return false
 			}
-			if !file_drained(d, d.tree) || disk_owner_failed(d.host, d.id) || !disk_sync(d, d.tree, .Page_Sync) {
+			if d.tree == nil || d.look {
+				return true // nothing to make durable; or, only looked at, nothing it holds is reused
+			}
+			if !file_drained(d, d.tree) || !disk_sync(d, d.tree, .Page_Sync) {
 				return false
 			}
 			size, err := os.file_size(d.tree)

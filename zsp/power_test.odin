@@ -422,3 +422,76 @@ a_failed_store_finishes_no_checkpoint :: proc(t: ^testing.T) {
 		store_close(&s)
 	}
 }
+
+// A header the process wrote, and was killed before it was made durable, is what a store opening again reads; power lost
+// after would fall back to the one before it. So before anything that one names is reused, what was read is made
+// durable: else the next checkpoint writes over pages the header fallen back to names, and what it held is gone (once
+// the log that would have rebuilt it is dropped, which is why the power sims found it only with small segments).
+@(test)
+a_header_read_is_made_durable_before_its_last_pages_are_reused :: proc(t: ^testing.T) {
+	p: Power_Disk
+	defer power_destroy(&p)
+	s: Store
+	testing.expect(t, store_open(&s, power_disk(&p)))
+	put :: proc(s: ^Store, stamp: u64) {
+		for n in u64(1) ..= 200 {
+			store_commit(s, {{row = {1 << 32, n}, slot = 16, kind = .Value, stamp = {stamp + n, 0}, body = power_body(stamp + n, 64)}})
+		}
+	}
+	put(&s, 0)
+	testing.expect(t, store_checkpoint(&s)) // durable
+	// Each header, with the pages as they were when it was written: what it names must be so still, if it is the one read.
+	snaps: [2]Memory_Disk
+	defer for &m in snaps {
+		memory_disk_destroy(&m)
+	}
+	snaps[s.generation % HEADER_PAGES] = memory_disk_copy(&p.kept)
+	// The next, made without waiting, as far as its header written and asked to be made durable.
+	put(&s, 1000)
+	testing.expect(t, store_checkpoint_start(&s))
+	for s.flight.step == .Durable && len(p.asks) > 0 {
+		testing.expect(t, power_answer(&p, &s, 0))
+	}
+	testing.expect(t, s.flight.step == .Header && len(p.asks) == 1)
+	snaps[(s.generation + 1) % HEADER_PAGES] = memory_disk_copy(&p.seen)
+	// Killed: the system keeps all it was given, the disk only what was synced; nothing asked is done.
+	store_close(&s)
+	clear(&p.asks)
+	testing.expect(t, store_open(&s, power_disk(&p)))
+	put(&s, 2000)
+	testing.expect(t, store_checkpoint_start(&s)) // its pages written, perhaps over what it read as free
+	store_close(&s)
+	// Power lost, as it may be: every page written lands but a header not made durable.
+	#reverse for w, i in p.writes {
+		if w.page && w.at < HEADER_PAGES {
+			delete(w.bytes)
+			ordered_remove(&p.writes, i)
+		}
+	}
+	power_fold(&p, true, p.seq)
+	best, _ := store_header(memory_disk(&p.kept))
+	snap := &snaps[best.generation % HEADER_PAGES]
+	testing.expect(t, best.generation > 0)
+	walk :: proc(t: ^testing.T, snap: ^Memory_Disk, now: ^Memory_Disk, no: Page_No) {
+		if no == 0 {
+			return
+		}
+		was, is := snap.pages[no], now.pages[no]
+		testing.expectf(t, was != nil && is != nil && was^ == is^, "page %d, named by the header read, was written over", no)
+		if was != nil && was.level > 0 {
+			for &e in was.branch[:was.count] {
+				walk(t, snap, now, e.child)
+			}
+		}
+	}
+	h, tail := store_header(memory_disk(snap))
+	testing.expect(t, h.generation == best.generation)
+	for root in ([]Page_No{h.shelf, h.cells, h.waste, h.outbox, h.repair, tail.used}) {
+		walk(t, snap, &p.kept, root)
+	}
+	// And back, from what power left: sound.
+	power_cut(&p)
+	testing.expect(t, store_open(&s, power_disk(&p)))
+	check_shelf(t, &s)
+	store_close(&s)
+}
