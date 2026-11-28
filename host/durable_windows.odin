@@ -15,9 +15,14 @@ file_durable :: proc(f: ^os.File) -> bool {
 // A directory's names, kept: here by the files' own flushes, not the directory's. A flush writes out a file's data and
 // what the system holds of it, metadata being cached until the file is flushed or written through ("File Caching");
 // a rename is made durable so by MoveFileEx's MOVEFILE_WRITE_THROUGH, which flushes the file moved once it has moved, as
-// save does by hand of a file renamed by its handle. A directory's own flush ([MS-FSA] 2.1.5.7) is a whole other
-// write, and slow where the disk is (on CI's, it doubled what the end-to-end tests took): nothing said to be durable
-// waits on it.
+// save does by hand of a file renamed by its handle. Names made or removed otherwise, a directory made (dir_make) or the
+// segments past a cut removed (log_truncate), are changes NTFS writes to its journal of metadata in the order they are
+// made, and a flush writes the journal out through the file's own changes, and so through every one before them: a
+// directory is kept by the first flush of a file made in it since, which comes before anything there is said to be
+// kept, and the segments removed by the flush of the one cut after them. A file system with no such journal, FAT or
+// exFAT, keeps a name no surer than its cached directory is written out, whenever that is. A directory's own flush
+// ([MS-FSA] 2.1.5.7) is a whole other write, and slow where the disk is (on CI's, it doubled what the end-to-end tests
+// took): nothing said to be durable waits on it.
 dir_durable :: proc(dir: string) -> bool {
 	return true
 }

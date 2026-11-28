@@ -5,15 +5,14 @@ import "core:strings"
 import "core:sys/posix"
 
 // How a sync went: F_FULLFSYNC's, which has the drive write out its cache, or an fsync's.
-@(private)
 Synced :: enum u8 {
 	Failed,
 	Fsync,
 	Full,
 }
 
-// Told of every sync made for durability, as it is made, should a test want to see which: nil but in tests.
-@(private)
+// Told of every sync made for durability, as it is made, should a test want to see which, here or in zspd: nil but in
+// tests.
 durable_hook: proc(fd: posix.FD, how: Synced) // atomic
 
 @(private)

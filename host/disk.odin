@@ -23,7 +23,6 @@ File_Disk :: struct {
 	read_no: u64,
 	dirty:   bool,
 	named:   bool, // a name made, or perhaps made, or removed in the directory since it was last synced: see disk_names
-	parent:  bool, // and the directory's own name made in its parent, the store being new
 	hold:    bool, // the directory, from before anything in it is read or written: see hold.odin
 	lock:    Maybe(Dir_Lock),
 	look:    bool, // only: nothing is made, nor opened to be written
@@ -61,10 +60,9 @@ file_disk_make :: proc(d: ^File_Disk) -> bool {
 		}
 		return file_remap(d)
 	}
-	d.parent ||= !os.exists(d.dir)
 	if d.hold && d.lock == nil {
-		d.lock = dir_hold(d.dir) or_return // which makes it
-	} else if err = os.make_directory_all(d.dir); err != nil && !os.is_dir(d.dir) {
+		d.lock = dir_hold(d.dir) or_return // which makes it, as dir_make does
+	} else if !dir_make(d.dir) {
 		return false
 	}
 	d.tree, err = os.open(path, {.Read, .Write, .Create}, os.Permissions{.Read_User, .Write_User})
@@ -72,7 +70,7 @@ file_disk_make :: proc(d: ^File_Disk) -> bool {
 		d.tree = nil
 		return false
 	}
-	d.named = true // the tree's name, and the directory's own, perhaps made just now
+	d.named = true // the tree's name, perhaps made just now: the directory's own was kept as it was made
 	return file_remap(d)
 }
 
@@ -149,20 +147,20 @@ segments_close :: proc(d: ^File_Disk, first: u64, last := max(u64)) {
 	}
 }
 
-// Keeps the names in the directory as they are, should any have been made or removed since this last did, and the
-// directory's own in the one it is in, which it may have been made in too: a sync of a file keeps what it holds, and not
-// that it is there to be found; nor does it keep a segment that was removed from coming back, as one beyond the log's end
-// would, after its tail was cut and written again, to be read as though it followed. Once for each file opened to be
-// written, which may or may not have been made then, and after any are removed; before anything kept is said to be.
+// Keeps the names in the directory as they are, should any have been made or removed since this last did: a sync of a
+// file keeps what it holds, and not that it is there to be found; nor does it keep a segment that was removed from coming
+// back, as one beyond the log's end would, after its tail was cut and written again, to be read as though it followed.
+// Once for each file opened to be written, which may or may not have been made then, and after any are removed; before
+// anything kept is said to be. The directory's own name was kept when it was made (dir_make).
 @(private)
 disk_names :: proc(d: ^File_Disk) -> bool {
 	if !d.named {
 		return true
 	}
-	if !dir_durable(d.dir) || (d.parent && !dir_durable(filepath.dir(d.dir))) {
+	if !dir_durable(d.dir) {
 		return false
 	}
-	d.named, d.parent = false, false
+	d.named = false
 	return true
 }
 
@@ -229,11 +227,17 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 					d.named = true
 				}
 			}
+			// The cut is kept by the next sync of the log, as a write is: the segment cut is the one the log goes on in,
+			// none being left past it. Before it is, a sync would keep the log as it was, a torn tail and all; and on
+			// Windows, where nothing syncs a directory, its flush is what keeps the segments removed above removed (see
+			// dir_durable).
 			if last == d.number {
 				os.truncate(d.active, i64(off % zsp.SEGMENT))
-			} else if f, err := os.open(segment_path(d, last), {.Write}); err == nil {
+				d.dirty = true
+			} else if f, err := os.open(segment_path(d, last), {.Read, .Write}); err == nil {
 				os.truncate(f, i64(off % zsp.SEGMENT))
-				os.close(f)
+				assert(d.active == nil, "the log writes in its last segment alone, and those past the cut are closed")
+				d.active, d.number, d.dirty = f, last, true
 			}
 		},
 		log_sync = proc(data: rawptr) -> bool {

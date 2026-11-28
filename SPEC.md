@@ -324,12 +324,19 @@ lock taken on a file system shared with other machines may not be seen by them, 
 disk of the machine's own, and an implementation refuses a store it can tell is not.
 
 What is durable survives a loss of power, as far as the machine can be made to promise it: before an Ack, every file written to is
-synced, and on Linux, the BSDs and macOS so is every directory a name was made in or removed from, and the one a new store's directory
-was made in. zspd syncs with
+synced, and on Linux, the BSDs and macOS so is every directory a name was made in or removed from; and every directory made, with each
+one above it made with it and the one they were made in, is synced as it is made, before anything is kept in it. zspd syncs with
 fsync on Linux and the BSDs, which writes through the drive's cache; on macOS with F_FULLFSYNC, for fsync there leaves what it wrote in
 the drive's cache, to be lost or written out of order; and on Windows with FlushFileBuffers of each file, which writes out its
 data and what the system holds of it, its name among that; a file put in another's place is flushed before it is renamed and again
-after, as MoveFileEx's MOVEFILE_WRITE_THROUGH makes a rename durable. On macOS
+after, as MoveFileEx's MOVEFILE_WRITE_THROUGH makes a rename durable. Any other name made or removed on Windows, a directory made or
+a segment cut from the log's end removed, is a change NTFS writes to its journal in the order it is made, and a file's flush writes the
+journal out through that file's own changes, and so through every change before them: a directory made is kept by the flush of the
+first file made in it, which comes before anything there is acknowledged, and a segment removed by that of the one cut after it. This
+rests on how NTFS keeps its journal, which no document promises to applications, as nothing documents what keeps a rename beyond
+MOVEFILE_WRITE_THROUGH. FAT and exFAT journal nothing: there a name, made by a rename or otherwise, is kept no surer than the
+system's cached copy of its directory is written out, whenever that is, and a store on them may lose a file that was acknowledged.
+On macOS
 a file system without F_FULLFSYNC (some network and FAT ones) is synced with fsync, and keeps what was acknowledged through a crash of
 the system, not a loss of power; and a drive that ignores being told to write out its cache, as some do, loses what it holds, which
 nothing can tell. A node in a browser keeps its store in the origin's private file system, synced with
