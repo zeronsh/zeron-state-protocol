@@ -52,7 +52,12 @@ files_read_whole :: proc(t: ^testing.T) {
 		size := 0
 		for round := 0; !sync.atomic_load(&sh.done); round += 1 {
 			if round % 64 == 63 {
-				size /= 3 // and shrinks now and then
+				// And shrinks now and then: to a whole number of pages, of any size a system has (4, 16 or 64 KiB). Shrunk
+				// within a page, the system zeroes the rest of that page, and a read that took the file to be longer
+				// meanwhile may copy those zeros, before the file grows past them again: bytes it never held, which
+				// Linux allows a read beside a truncation to see. No file a host keeps is shrunk where it is read: each is
+				// replaced whole (see save). And one handed to it, as a roster to join by, is held to its signature.
+				size = size / 3 / (64 << 10) * (64 << 10)
 				os.truncate(f, i64(size))
 			}
 			for &x, i in chunk {
