@@ -251,9 +251,11 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     // Once, however often asked: its node stopped as it should be, and then its worker let go of.
     close: () =>
       (closing ??= (async () => {
-        unlisten();
+        // Listened for until it is closed: a tab frozen or left as its worker closes the store stops the worker then, as
+        // ever, which would else be frozen holding it.
         const w = worker;
         if (w && state === "running") await ask<void>("close").catch(() => {});
+        unlisten();
         state = "closed";
         w?.terminate();
         worker = undefined;

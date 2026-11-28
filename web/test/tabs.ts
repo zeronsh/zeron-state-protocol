@@ -377,6 +377,25 @@ const tests: Record<string, () => Promise<void>> = {
     expectEqual(await within(10000, call(after, "put", "rk", "notes", ["four"]).then(() => "written")), "written", "written once the leader crashed");
     expectEqual((await call<string[]>(after, "titles", "rk", "notes", 4)).join(), "one,two,three,four");
   },
+  // The tab running the device is frozen as it closes it, its worker still letting go of a segment being opened: the
+  // worker is stopped, as a frozen tab's always is, rather than frozen holding the store; and another tab has it at once.
+  async tab_frozen_closing() {
+    const leader = await page();
+    await leader.preamble(files({ who: "closing", slowLog: 4000 }));
+    await call(leader, "device", "zc");
+    await call(leader, "create", "zc");
+    await leader.evaluate("window.__closed = window.zsp.close('zc'), 1");
+    const other = await page();
+    await sleep(50);
+    await leader.cdp("Page.setWebLifecycleState", { state: "frozen" });
+    const t = performance.now();
+    const said = await within(15000, call<string>(other, "deviceOrError", "zc"));
+    const took = performance.now() - t;
+    expectEqual(said, "ok", "opened while the other, frozen as it closed the device, let go of it");
+    if (took > 2500) throw new Error(`opened only after ${took.toFixed(0)} ms, the other frozen holding the store`);
+    await leader.cdp("Page.setWebLifecycleState", { state: "active" });
+    await leader.evaluate("window.__closed");
+  },
   // A tab's worker carries its pipe to the leader's, which never hears of it: the pipe is broken off, and the client
   // dials again, rather than waiting for ever.
   async tab_unheard() {
