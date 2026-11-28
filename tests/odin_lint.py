@@ -11,7 +11,8 @@ itself is sound (`m[k] = v`, or `map_insert` with its pointer let go of), as is 
   result assigned to `_`; and neither may be named but to call it, as `alias :: map_insert` would hide it;
 - what of core uses them: `core:strings`'s `Intern` and `intern_*`; `core:os` in a file built for WASI (its environment
   is kept with `map_entry`); `core:net`'s `enumerate_interfaces` in a file built for macOS, OpenBSD or NetBSD;
-  `core:nbio` (third_party/nbio is the copy to use, until #8642, #8644 and #8645 are fixed in a release);
+  `core:nbio` (third_party/nbio is the copy to use, until #8642, #8644, #8645 and #8647 are fixed in a
+  release);
   `core:text/i18n` (it interns); `core:container/topological_sort` (it keeps `map_insert`'s pointer).
 
 #8646. On Windows, core:os opens a file with `.Trunc` but not `.Create` asking TRUNCATE_EXISTING with FILE_GENERIC_WRITE,
@@ -39,7 +40,7 @@ OSES = {"windows", "darwin", "linux", "essence", "freebsd", "openbsd", "netbsd",
 ARCHES = {"amd64", "i386", "arm32", "arm64", "wasm32", "wasm64p32", "riscv64"}
 BSDS = {"darwin", "openbsd", "netbsd"}  # core:net's enumerate_interfaces gathers with map_entry on these
 BANNED_IMPORTS = {
-    "core:nbio": "core:nbio: import third_party/nbio, the copy fixed of it, until #8642, #8644 and #8645 are fixed in a release",
+    "core:nbio": "core:nbio: import third_party/nbio, the copy fixed of it, until #8642, #8644, #8645 and #8647 are fixed in a release",
     "core:text/i18n": "core:text/i18n interns its strings with strings.Intern, which uses map_entry",
     "core:container/topological_sort": "core:container/topological_sort writes through map_insert's pointer",
 }

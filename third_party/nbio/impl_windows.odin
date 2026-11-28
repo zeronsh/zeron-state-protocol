@@ -302,7 +302,7 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> (err: General_Error) {
 		return actual
 	}
 
-	// ZSP: a wait in whole milliseconds, rounded up, and short of INFINITE. Upstream truncated it: a wait of under a
+	// ZSP: a wait in whole milliseconds, rounded up, and short of INFINITE (odin-lang/Odin#8647). Upstream truncated it: a wait of under a
 	// millisecond, as is left of any once the system wakes a little early, was no wait, and the loop spun until it was
 	// over; and one of more than some 49 days wrapped round to a short one.
 	wait_ms :: proc(d: time.Duration) -> win.DWORD {

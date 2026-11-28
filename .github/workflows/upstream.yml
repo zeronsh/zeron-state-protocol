@@ -28,6 +28,8 @@ jobs:
           - { issue: "8645", os: windows-latest, odin: latest }
           - { issue: "8646", os: windows-latest, odin: pinned }
           - { issue: "8646", os: windows-latest, odin: latest }
+          - { issue: "8647", os: windows-latest, odin: pinned }
+          - { issue: "8647", os: windows-latest, odin: latest }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     defaults:

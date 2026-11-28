@@ -3,7 +3,7 @@
 **Temporary.** This is Odin's `core:nbio` as the `dev-2026-11` release has it (tag commit `e28f5d1ff420`, the release
 CI installs), with the changes below and nothing else. Every change is marked `ZSP:` in the source.
 
-Drop the copy, and import `core:nbio` again, once an Odin release fixes all three of:
+Drop the copy, and import `core:nbio` again, once an Odin release fixes all four of:
 
 - [odin-lang/Odin#8642](https://github.com/odin-lang/Odin/issues/8642): the runtime's `__dynamic_map_entry` can give
   back another key's slot, which on macOS and the BSDs loses kqueue operations;
@@ -11,6 +11,8 @@ Drop the copy, and import `core:nbio` again, once an Odin release fixes all thre
   peer reset never completes;
 - [odin-lang/Odin#8645](https://github.com/odin-lang/Odin/issues/8645): on Windows, a dial whose bind fails closes its
   socket twice, the second time whatever socket was given that handle meanwhile;
+- [odin-lang/Odin#8647](https://github.com/odin-lang/Odin/issues/8647): on Windows, a wait of under a millisecond is
+  truncated to none, and the loop spins through it;
 
 and has the rest below, or they are kept as fixes of ours.
 
@@ -65,8 +67,8 @@ Windows, `impl_windows.odin`:
   executed again, and the release linked it a second timeout, which took the first's place and left it to fire at an
   operation done with by then.
 - `__tick`, `compute_timeout`: the wait given the completion port is rounded up to a whole millisecond, and kept short
-  of `INFINITE`. The release truncated it: a wait of under a millisecond, as is left of most once the system wakes a
-  little early, was none, and the loop spun until it was over; one of more than some 49 days wrapped round.
+  of `INFINITE` (#8647). The release truncated it: a wait of under a millisecond, as is left of most once the system
+  wakes a little early, was none, and the loop spun until it was over; one of more than some 49 days wrapped round.
 - `check_timeouts`: the first timeout due is taken out of the tree before it is completed. The release walked the tree
   with an iterator holding the next node, which a callback removing that timeout freed under it.
 
@@ -94,6 +96,6 @@ by `NtCreateFile`, truncates so as asked). `./x selftest` shows that it finds ea
 ## Whether upstream has fixed them
 
 `.github/workflows/upstream.yml` runs a repro of each issue (`tests/upstream`) each night, with the release and with the
-newest nightly: #8642 on Linux and macOS, #8644, #8645 and #8646 on Windows. That they are still broken is no failure; one
-fixed upstream is said in the run's summary, as **FIXED UPSTREAM**. Once a release has #8642, #8644 and #8645, the
+newest nightly: #8642 on Linux and macOS, #8644, #8645, #8646 and #8647 on Windows. That they are still broken is no failure; one
+fixed upstream is said in the run's summary, as **FIXED UPSTREAM**. Once a release has #8642, #8644, #8645 and #8647, the
 copy can go; once one has #8646, host/files_test.odin may open with `.Trunc` again.

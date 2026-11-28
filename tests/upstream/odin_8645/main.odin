@@ -10,7 +10,7 @@
 // fail, a crash) is the repro's own failure. Meaningful on Windows only.
 //
 // Run by .github/workflows/upstream.yml; tests/upstream/run.sh runs it. The copy third_party/nbio is dropped once a
-// release has this fixed, with odin-lang/Odin#8642 and #8644.
+// release has this fixed, with odin-lang/Odin#8642, #8644 and #8647.
 package odin_8645
 
 import "core:fmt"

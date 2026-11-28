@@ -1,5 +1,5 @@
 // ZSP: a TEMPORARY copy of core:nbio, Odin dev-2026-11, with fixes of its own: see README.md beside it. Drop it, and
-// import core:nbio again, once an Odin release fixes odin-lang/Odin#8642, #8644 and #8645, and has the rest.
+// import core:nbio again, once an Odin release fixes odin-lang/Odin#8642, #8644, #8645 and #8647, and has the rest.
 /*
 package nbio implements a non-blocking I/O and event loop abstraction layer
 over several platform-specific asynchronous I/O APIs.

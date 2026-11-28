@@ -12,7 +12,7 @@
 // exit) is the repro's own failure.
 //
 // Run by .github/workflows/upstream.yml, not by ./x test; tests/upstream/run.sh runs it. The copy third_party/nbio is
-// dropped once a release has this fixed, with odin-lang/Odin#8644 and #8645.
+// dropped once a release has this fixed, with odin-lang/Odin#8644, #8645 and #8647.
 package odin_8642
 
 import "core:fmt"
