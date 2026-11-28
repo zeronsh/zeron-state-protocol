@@ -312,7 +312,7 @@ export class Store {
     }
     const f = this.#segments.get(n);
     if (f) {
-      f.close();
+      closing(f);
       this.#dirty.delete(f);
       this.#segments.delete(n);
       this.#removing.set(n, (this.#removing.get(n) ?? 0) + 1);

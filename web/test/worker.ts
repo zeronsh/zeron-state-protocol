@@ -115,7 +115,10 @@ class Dir {
     return e;
   }
   async removeEntry(name: string): Promise<void> {
-    if (!this.entries.delete(name)) throw new DOMException(name, "NotFoundError");
+    const e = this.entries.get(name);
+    if (!e) throw new DOMException(name, "NotFoundError");
+    if (e instanceof Entry && e.handle) throw new DOMException(HELD, "NoModificationAllowedError"); // as a browser's is
+    this.entries.delete(name);
   }
   async *[Symbol.asyncIterator](): AsyncIterator<[string, Dir | Entry]> {
     for (const pair of this.entries) yield pair;
@@ -228,7 +231,7 @@ async function until(what: string, f: () => boolean, ms = 5000): Promise<void> {
   assert.equal(tries, 1);
   // Held for ever, it is said to be locked once `within` is up, and not before.
   const t = performance.now();
-  const e = await take("f", () => Promise.reject(new DOMException(HELD, "NoModificationAllowedError")), (ms) => sleep(ms).then(() => true), 300).catch((e) => e);
+  const e = await take("f", () => Promise.reject(new DOMException(HELD, "NoModificationAllowedError")), (ms) => sleep(ms).then(() => true), {}, 300).catch((e) => e);
   const took = performance.now() - t;
   assert(e instanceof StoreLocked && e.name === "StoreLocked", String(e));
   assert.equal((e.cause as DOMException).name, "NoModificationAllowedError");
@@ -247,8 +250,9 @@ async function until(what: string, f: () => boolean, ms = 5000): Promise<void> {
   assert(refused > before, "it was never held");
   f.close();
   const another = await entry.createSyncAccessHandle();
+  const fresh = await OpfsVolume.at("zsp/held");
   const t = performance.now();
-  await assert.rejects(volume.open("tree", true), (e) => e instanceof StoreLocked);
+  await assert.rejects(fresh.open("tree", true), (e) => e instanceof StoreLocked);
   const took = performance.now() - t;
   assert(took >= HELD_WITHIN && took < HELD_WITHIN + 500, `said to be locked after ${took} ms`);
   const letGo = await OpfsVolume.at("zsp/held");
@@ -260,6 +264,47 @@ async function until(what: string, f: () => boolean, ms = 5000): Promise<void> {
   assert(!(e instanceof StoreLocked) && (e as DOMException).name === "NoModificationAllowedError", String(e));
   assert(performance.now() - at < 20, "it went on waiting once the volume was let go of");
   another.close();
+}
+
+// The files of a store found held as it opens are waited for HELD_WITHIN in all, not each, for a worker gone lets go of all
+// of them at once: a second found held after the first was let go of, a second and a half on, is waited for half a second
+// more. One then found held by nothing, the next found held is waited for afresh.
+{
+  const dir = await (await root.getDirectoryHandle("zsp")).getDirectoryHandle("episode", { create: true });
+  const [a, b] = await Promise.all(["a", "b"].map((n) => dir.getFileHandle(n, { create: true })));
+  const volume = await OpfsVolume.at("zsp/episode");
+  const ha = await a.createSyncAccessHandle();
+  const hb = await b.createSyncAccessHandle();
+  setTimeout(() => ha.close(), 1500);
+  (await volume.open("a", true))!.close();
+  const t = performance.now();
+  await assert.rejects(volume.open("b", true), (e) => e instanceof StoreLocked);
+  const took = performance.now() - t;
+  assert(took < 800, `the second held file was waited for ${took} ms more`);
+  (await volume.open("c", true))!.close(); // held by nothing
+  setTimeout(() => hb.close(), 1500);
+  (await volume.open("b", true))!.close(); // and so waited for afresh
+}
+
+// A file is removed once whatever holds it lets go, as it is opened; and a volume let go of closes what it has open, and what
+// is had as it is let go of, as when a worker is put away as it opens the store.
+{
+  const dir = await (await root.getDirectoryHandle("zsp")).getDirectoryHandle("removing", { create: true });
+  const held = await (await dir.getFileHandle("00000003.log", { create: true })).createSyncAccessHandle();
+  const volume = await OpfsVolume.at("zsp/removing");
+  setTimeout(() => held.close(), 30);
+  await volume.remove("00000003.log");
+  assert(!dir.entries.has("00000003.log"), "a file held a while was not removed");
+  const f = (await volume.open("tree", true))!;
+  const slow = pause("removing", "find");
+  const opening = volume.open("find", true).catch((e) => e);
+  await slow.reached;
+  volume.close();
+  assert.equal(open.size - [...open].filter((h) => !h.file.path.startsWith("/zsp/removing/")).length, 1, "only what is being had is open");
+  slow.release();
+  assert(String(await opening).includes("let go of"), "a file had as its volume was let go of was handed over");
+  assert.equal([...open].filter((h) => h.file.path.startsWith("/zsp/removing/")).length, 0, "a file of a volume let go of was left open");
+  void f;
 }
 
 // And a worker that, given the store's lock, finds a file of it held for ever tells its tab so, by name, and what it was asked
@@ -403,6 +448,7 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   const w = await worker();
   await w.tell({ open: { name: "away" } });
   await w.tell({ ask: 1, op: "create", args: [] });
+  await sleep(20); // and the segments it opens ahead opened, which, being opened, could be closed only as they come
   assert(held("away") > 10);
   void w.tell({ away: true });
   assert.equal(held("away"), 0, "files left open as it was put away");
@@ -495,6 +541,19 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   client.close();
   await node.close();
   heldForEver.clear();
+}
+
+// A store's name with a backslash is no store's, as the File System standard allows it in no name; and a segment dropped
+// whose file cannot be closed is dropped all the same.
+{
+  assert.throws(() => storePath("a\\b"), RangeError);
+  const store = await Store.open(await OpfsVolume.at("zsp/drop"), 1 << 20);
+  store.logWrite(0, new Uint8Array(10));
+  await sleep(10);
+  failClose = "00000000.log";
+  store.logDrop(0);
+  failClose = undefined;
+  await store.close();
 }
 
 console.log("ok");
