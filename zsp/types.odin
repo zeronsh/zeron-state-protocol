@@ -262,6 +262,13 @@ cell_written :: proc(c: ^Cell) -> u64 {
 	return bundle_at(c.body, 0).time if c.kind == .Bundle else c.stamp.time
 }
 
+// When the latest of what a cell writes or kills was: of a bundle, the last of what it names, for it kills them all. Its
+// author must have had the right to write then, however much later it put them together.
+@(require_results)
+cell_reach :: proc(c: ^Cell) -> u64 {
+	return bundle_at(c.body, int(get_u32(c.body)) - 1).time if c.kind == .Bundle else c.stamp.time
+}
+
 @(require_results)
 bundle_at :: proc "contextless" (body: []byte, i: int) -> Stamp {
 	at := 4 + i * 16

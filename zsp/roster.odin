@@ -1,5 +1,6 @@
 package zsp
 
+import "base:runtime"
 import "core:crypto"
 import "core:crypto/ed25519"
 import "core:hash"
@@ -224,15 +225,20 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 	}
 	history, wraps := 0, 0
 
-	r.scopes = make([]Scope_Info, read_count(&rd))
+	// Whoever brings a roster may have made it up. Until its signature is known to be good, nothing is made larger
+	// than a few times the bytes that say what it is, and nothing is done that takes more than a look at each part: what
+	// compares parts with one another comes after.
+	r.scopes = make([]Scope_Info, read_count(&rd, 35))
 	last: Scope
 	for &s in r.scopes {
 		s.id = Scope(read_varint(&rd))
 		s.flags = transmute(Scope_Flags)read_u8(&rd)
-		s.epoch = u32(read_varint(&rd))
-		if rd.bad || s.id <= last || s.id == max(Scope) || s.epoch == 0 || int(s.epoch) > len(rd.buf) - rd.pos {
+		epoch := read_varint(&rd)
+		// Each epoch has its commitment, and each but the last a time it was closed.
+		if rd.bad || s.id <= last || s.id == max(Scope) || epoch == 0 || epoch > u64(len(rd.buf) - rd.pos + 1) / 33 {
 			return
 		}
+		s.epoch = u32(epoch)
 		s.closed = make([]u64, s.epoch - 1)
 		for &c, i in s.closed {
 			c = read_varint(&rd)
@@ -244,25 +250,19 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 			return
 		}
 		s.commits = make([]Key32, s.epoch)
-		for &c, i in s.commits {
+		for &c in s.commits {
 			c = read_key32(&rd)
-			for other in s.commits[:i] {
-				if key_id(other) == key_id(c) {
-					return
-				}
-			}
 		}
 		last = s.id
 		history += int(s.epoch - 1)
 	}
-	r.members = make([]Member, read_count(&rd))
-	for &m, i in r.members {
+	r.members = make([]Member, read_count(&rd, 66))
+	for &m in r.members {
 		m.device = read_key32(&rd)
 		m.signer = read_key32(&rd)
-		for other in r.members[:i] {
-			if other.device == m.device || other.signer == m.signer {
-				return
-			}
+		// Nothing could be wrapped for it, and no roster be signed again.
+		if !x25519_sound(m.device) {
+			return
 		}
 		m.admin = slice.contains(r.admins, m.signer)
 		for &o in r.owners {
@@ -272,8 +272,8 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 			m.owner ||= o.device == m.device
 		}
 		m.subject = read_bytes(&rd)
-		m.grants = make([]Grant, read_count(&rd))
-		for &g, j in m.grants {
+		m.grants = make([]Grant, read_count(&rd, 3))
+		for &g in m.grants {
 			g.scope = Scope(read_varint(&rd))
 			bits := read_u8(&rd)
 			g.rights = transmute(Rights)bits
@@ -285,42 +285,95 @@ roster_parse :: proc(bytes: []byte, space: Key32, held: ^Roster = nil) -> (r: Ro
 			if .Write not_in g.rights && .Signed not_in info.flags {
 				return
 			}
-			if g.until == 0 {
-				wraps += 1
-				for other in m.grants[:j] {
-					if other.scope == g.scope && other.until == 0 {
-						return
-					}
-				}
-			}
+			wraps += 1 if g.until == 0 else 0
 		}
 	}
-	// An owner may read and write everywhere, whoever signs.
-	for &o in r.owners {
-		m := roster_member(&r, o.device)
-		if m == nil {
-			return
-		}
-		for s in r.scopes {
-			if member_rights(m, s.id) & {.Read, .Write} != {.Read, .Write} {
-				return
-			}
-		}
-	}
-	r.relays = make([]Relay, read_count(&rd))
+	r.relays = make([]Relay, read_count(&rd, 33))
 	for &l in r.relays {
 		l.key = read_key32(&rd)
 		l.url = string(read_bytes(&rd))
 	}
+	// One of small order shares nothing with anyone: no wrap could be made under it, nor opened.
 	r.eph = read_key32(&rd)
+	if !x25519_sound(r.eph) {
+		return
+	}
 	r.wraps = read_take(&rd, 48 * wraps)
 	r.history = read_take(&rd, 48 * history)
 	by := read_varint(&rd)
 	if !read_done(&rd) || by > u64(len(r.admins)) {
 		return
 	}
-	ok = ed25519_verify(space if by == 0 else r.admins[by - 1], body, sig)
+	ok = ed25519_verify(space if by == 0 else r.admins[by - 1], body, sig) && roster_sound(&r)
 	return
+}
+
+// What a roster must be that compares its parts with one another, each in about the time it takes to sort them.
+@(private)
+roster_sound :: proc(r: ^Roster) -> bool {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	less :: proc(a, b: Key32) -> bool {
+		a, b := a, b
+		return string(a[:]) < string(b[:])
+	}
+	// No two epochs' keys are called alike.
+	for s in r.scopes {
+		ids := make([]u32, len(s.commits), context.temp_allocator)
+		for c, i in s.commits {
+			ids[i] = key_id(c)
+		}
+		slice.sort(ids)
+		for i in 1 ..< len(ids) {
+			if ids[i] == ids[i - 1] {
+				return false
+			}
+		}
+	}
+	// No two members share a device or a signer.
+	keys := make([]Key32, len(r.members), context.temp_allocator)
+	for which in 0 ..< 2 {
+		for m, i in r.members {
+			keys[i] = m.device if which == 0 else m.signer
+		}
+		slice.sort_by(keys, less)
+		for i in 1 ..< len(keys) {
+			if keys[i] == keys[i - 1] {
+				return false
+			}
+		}
+	}
+	// A member has at most one grant in force in a scope.
+	scopes := make([dynamic]Scope, context.temp_allocator)
+	for m in r.members {
+		clear(&scopes)
+		for g in m.grants {
+			if g.until == 0 {
+				append(&scopes, g.scope)
+			}
+		}
+		slice.sort(scopes[:])
+		for i in 1 ..< len(scopes) {
+			if scopes[i] == scopes[i - 1] {
+				return false
+			}
+		}
+	}
+	// An owner may read and write everywhere, whoever signs: as every grant's scope is there, and is in force only
+	// once, it has as many such grants as there are scopes.
+	for &o in r.owners {
+		m := roster_member(r, o.device)
+		if m == nil {
+			return false
+		}
+		everywhere := 0
+		for g in m.grants {
+			everywhere += 1 if g.until == 0 && g.rights & {.Read, .Write} == {.Read, .Write} else 0
+		}
+		if everywhere != len(r.scopes) {
+			return false
+		}
+	}
+	return true
 }
 
 @(private)
@@ -335,18 +388,19 @@ charter_parse :: proc(r: ^Roster, bytes: []byte, proven: bool) -> bool {
 	rd := Reader{buf = body}
 	r.charter = bytes
 	r.term = read_varint(&rd)
-	_ = read_take(&rd, 32)
-	r.owners = make([]Owner, read_count(&rd))
+	sound := x25519_sound(read_key32(&rd))
+	r.owners = make([]Owner, read_count(&rd, 112))
 	for &o in r.owners {
 		o.device = read_key32(&rd)
 		o.signer = read_key32(&rd)
 		o.wrap = read_take(&rd, 48)
+		sound &&= x25519_sound(o.device)
 	}
-	r.admins = make([]Key32, read_count(&rd))
+	r.admins = make([]Key32, read_count(&rd, 32))
 	for &a in r.admins {
 		a = read_key32(&rd)
 	}
-	return read_done(&rd) && r.term > 0
+	return read_done(&rd) && r.term > 0 && sound
 }
 
 @(private)
@@ -391,14 +445,28 @@ roster_destroy :: proc(r: ^Roster) {
 	r^ = {}
 }
 
+// Halving, as every roster's scopes are in order: one made up may have a great many. Of a few, as most have, one
+// after another is quicker.
 @(require_results)
 roster_scope :: proc(r: ^Roster, scope: Scope) -> ^Scope_Info {
-	for &s in r.scopes {
-		if s.id == scope {
-			return &s
+	if len(r.scopes) <= 8 {
+		for &s in r.scopes {
+			if s.id == scope {
+				return &s
+			}
+		}
+		return nil
+	}
+	lo, hi := 0, len(r.scopes)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if r.scopes[mid].id < scope {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	return nil
+	return &r.scopes[lo] if lo < len(r.scopes) && r.scopes[lo].id == scope else nil
 }
 
 // Of whom a member goes by and whom it is believed about: another, if that is another.
@@ -452,7 +520,11 @@ roster_extends :: proc(old, new: ^Roster) -> bool {
 		}
 		for g, j in was.grants {
 			now := m.grants[j]
-			if now.scope != g.scope || (now.until != g.until && g.until != 0) || g.rights - now.rights != {} {
+			// Call, and Vouch where cells are nobody's, are taken away without ending the grant: nothing written
+			// hangs on them.
+			info := roster_scope(old, g.scope)
+			kept := Rights{.Read, .Write, .Vouch} if info != nil && .Signed in info.flags else Rights{.Read, .Write}
+			if now.scope != g.scope || (now.until != g.until && g.until != 0) || (g.rights - now.rights) & kept != {} {
 				return false
 			}
 		}
@@ -593,25 +665,28 @@ draft_signed :: proc(d: ^Draft, scope: Scope) -> bool {
 	return false
 }
 
-// Ends a device's rights in a scope, or everywhere, and rotates what it could read. An owner's do not end.
+// Ends a device's rights in a scope, or everywhere, and rotates what it could read. An owner's do not end; and an admin
+// whose rights end anywhere is one no longer, for whoever draws up rosters must hold every scope's keys.
 draft_revoke :: proc(d: ^Draft, device: Key32, scope: Scope = 0) {
 	for &m in d.members {
 		if m.device != device || m.owner {
 			continue
 		}
-		if scope == 0 {
-			m.admin = false
-		}
+		ended := false
 		for &g in m.grants {
 			if g.until != 0 || (scope != 0 && g.scope != scope) {
 				continue
 			}
 			g.until = d.now
+			ended = true
 			for &s in d.scopes {
 				if s.id == g.scope {
 					s.rotate = true
 				}
 			}
+		}
+		if scope == 0 || ended {
+			m.admin = false
 		}
 	}
 }
@@ -864,15 +939,18 @@ roster_unwrap :: proc(k: ^Keyring, r: ^Roster) -> bool {
 			rd := Reader{buf = r.charter}
 			_ = read_varint(&rd)
 			eph := read_key32(&rd)
-			wrap := wrap_key(k.secret, eph, eph, k.device) or_return
-			k.root = open_key(wrap, 0, o.wrap) or_return
+			wrap, _ := wrap_key(k.secret, eph, eph, k.device)
+			if root, opened := open_key(wrap, 0, o.wrap); opened {
+				k.root = root
+			}
 		}
 	}
 	me := roster_member(r, k.device)
 	if me == nil || !member_active(me) {
 		return false
 	}
-	wrap := wrap_key(k.secret, r.eph, r.eph, k.device) or_return
+	// A wrap that cannot be made, like one that does not open, is garbled, and takes nothing away.
+	wrap, _ := wrap_key(k.secret, r.eph, r.eph, k.device)
 	at := 0
 	for &m in r.members {
 		if &m == me {
@@ -976,7 +1054,7 @@ keyring_load :: proc(k: ^Keyring, bytes: []byte) -> bool {
 		s: Scope_Keys
 		s.scope = Scope(read_varint(&r))
 		s.list_key = read_key32(&r)
-		epochs := read_count(&r) // once: a range's end is found anew at each turn
+		epochs := read_count(&r, 32) // once: a range's end is found anew at each turn
 		for _ in 0 ..< epochs {
 			append(&s.epochs, read_key32(&r))
 		}

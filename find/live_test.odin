@@ -875,6 +875,129 @@ words_renewed_beneath_a_question :: proc(t: ^testing.T) {
 	testing.expect(t, renewed > 5)
 }
 
+// And where they are read afresh, and all of it done, within one go at what changed, what changed is judged once they
+// are: not against the column while it is empty.
+@(test)
+words_renewed_at_once :: proc(t: ^testing.T) {
+	state := rand.create(94)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	f: Finder
+	pages: Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+	f.settled, f.pace = true, false
+	c := client_open(&w, &f)
+	defer {
+		zsp.session_close(c.session)
+		finder_close(&f)
+		client_free(&c)
+		memory_disk_destroy(&pages)
+	}
+	write :: proc(t: ^testing.T, w: ^World, id: zsp.Id, text: string) {
+		w.node.now += 10
+		testing.expect(t, zsp.node_write(&w.node, {{id, 20, .Value, zsp.node_stamp(&w.node), transmute([]byte)text}}))
+	}
+	for i in 0 ..< 2 {
+		id := zsp.node_id(&w.node, 1)
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(1, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+		write(t, &w, id, "apple" if i == 0 else "noise")
+	}
+	q := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&q, 1)
+	append(&q, u8(Op.Match), u8(Kind.Words), 20, 0, 0, 0, 5)
+	append(&q, "apple")
+	append(&q, 1, 2, 1, 0, 0, 50, 0)
+	client_ask(t, &c, 1, q[:])
+	for i in 0 ..< 4 * DEAD {
+		write(t, &w, w.rows[1], fmt.tprintf("noise%d", i))
+		if i % 3 == 0 {
+			write(t, &w, w.rows[0], "apple" if i % 2 == 0 else "apple band")
+		}
+		for !finder_run(&f, 1 << 16) {
+		}
+		client_hear_out(t, &c, &f)
+		if !answer_check(t, &w, &f, &c, 1, q[:]) {
+			fmt.println("edit", i)
+			return
+		}
+	}
+}
+
+// And so of a question that joins another scope, where only that one changes: what it joins is read again, and the
+// question is answered afresh once it is, not judged meanwhile against what is being made.
+@(test)
+joined_words_renewed_at_once :: proc(t: ^testing.T) {
+	state := rand.create(96)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	f: Finder
+	pages: Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages), w.secret)
+	f.settled, f.pace = true, false
+	c := client_open(&w, &f)
+	defer {
+		zsp.session_close(c.session)
+		finder_close(&f)
+		client_free(&c)
+		memory_disk_destroy(&pages)
+	}
+	write :: proc(t: ^testing.T, w: ^World, id: zsp.Id, slot: zsp.Slot, body: []byte) {
+		w.node.now += 10
+		testing.expect(t, zsp.node_write(&w.node, {{id, slot, .Value, zsp.node_stamp(&w.node), body}}))
+	}
+	place :: proc(t: ^testing.T, w: ^World, scope: zsp.Scope) -> zsp.Id {
+		id := zsp.node_id(&w.node, scope)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(scope, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+		return id
+	}
+	target, noise := place(t, &w, 2), place(t, &w, 2)
+	write(t, &w, target, 20, transmute([]byte)string("orange"))
+	write(t, &w, noise, 20, transmute([]byte)string("noise"))
+	parent := place(t, &w, 1)
+	to: [16]byte
+	zsp.put_u64(to[:], target[0])
+	zsp.put_u64(to[8:], target[1])
+	write(t, &w, parent, 17, to[:])
+	q := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&q, 1)
+	append(&q, u8(Op.Ref), u8(Kind.Id), 17, 0, 2) // whose 17 is a row of scope 2
+	append(&q, u8(Op.Match), u8(Kind.Words), 20, 0, 0, 0, 5)
+	append(&q, "apple")
+	append(&q, 0, 0, 0, 50, 0)
+	client_ask(t, &c, 1, q[:])
+	for !finder_run(&f, 1 << 16) {
+	}
+	client_hear_out(t, &c, &f)
+	testing.expect(t, 1 in c.answers && c.answers[1].total == 0)
+	apple := false
+	for i in 0 ..< 4 * DEAD {
+		write(t, &w, noise, 20, transmute([]byte)fmt.tprintf("noise%d", i))
+		if i % 3 == 0 {
+			apple = !apple
+			write(t, &w, target, 20, transmute([]byte)string("apple" if apple else "orange"))
+		}
+		for !finder_run(&f, 1 << 16) {
+		}
+		client_hear_out(t, &c, &f)
+		if !testing.expectf(t, 1 in c.answers && c.answers[1].total == (1 if apple else 0), "edit %d: %v, and it holds %v", i, c.answers[1] if 1 in c.answers else Told{}, apple) {
+			return
+		}
+	}
+}
+
 // What is dear to answer is answered no more often than it is worth, but is in the end.
 @(test)
 dear_answers_are_paced :: proc(t: ^testing.T) {
@@ -1058,6 +1181,344 @@ what_a_roster_takes_is_not_answered :: proc(t: ^testing.T) {
 		}
 		testing.expect(t, answer_check(t, &w, &f, &c, 1, q[:]))
 	}
+}
+
+// A partial replica that can watch no more answers of what it holds, rather than wait for ever for rows it could not
+// ask for; and what it let go of after is only what it had asked for, not what another question had.
+@(test)
+what_cannot_be_watched_is_not_waited_for :: proc(t: ^testing.T) {
+	state := rand.create(111)
+	context.random_generator = rand.default_random_generator(&state)
+	w, p: World
+	world_make(t, &w, &p)
+	defer world_destroy(&w)
+	defer world_destroy(&p)
+	f, g: Finder
+	pages: [2]Memory_Disk
+	finder_open(&f, &w.node, memory_disk(&pages[0]), w.secret)
+	finder_open(&g, &p.node, memory_disk(&pages[1]), p.secret)
+	f.settled = true
+	elsewhere := client_open(&w, &f)
+	c := client_open(&p, &g)
+	filler := client_open(&p, &g)
+	for x in ([]^World{&w, &p}) {
+		x.node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+			zsp.session_accept(s, nil if s.role == .Peer else {{0, {.Read, .Write}, 0}})
+		}
+	}
+	for _ in 0 ..< 40 {
+		world_write(t, &w)
+	}
+	link := link_make(&p, &w)
+	defer {
+		zsp.session_close(link[0])
+		zsp.session_close(link[1])
+		zsp.session_close(c.session)
+		zsp.session_close(elsewhere.session)
+		finder_close(&f)
+		finder_close(&g)
+		client_free(&c)
+		client_free(&elsewhere)
+		client_free(&filler)
+		for &d in pages {
+			memory_disk_destroy(&d)
+		}
+	}
+	testing.expect(t, link_settle(t, link, &f, &g))
+	few := []byte{1, 0, 1, 2, 1, 0, 0, 5, 0} // the newest five
+	client_ask(t, &c, 1, few)
+	testing.expect(t, link_settle(t, link, &f, &g))
+	client_hear_out(t, &c, &g)
+	testing.expect(t, 1 in c.answers && len(c.answers[1].ids) == 5)
+	held := len(p.node.interests)
+	for i := 0; len(p.node.interests) < zsp.MAX_INTERESTS; i += 1 {
+		k := zsp.Key{1 << 32 | 99, u64(i), 0, 0, 0}
+		testing.expect(t, zsp.session_wants(filler.session, k, zsp.key_next(k), true))
+	}
+	all := []byte{1, 8, 1, 16, 0, 1, 2, 1, 0, 0, 50, 0} // every one with a value, newest first
+	client_ask(t, &c, 2, all, FETCH)
+	testing.expect(t, link_settle(t, link, &f, &g))
+	client_hear_out(t, &c, &g)
+	testing.expect_value(t, c.answers[2].flags, 32) // what is held, and not said to be settled: it is not all there is
+	zsp.session_close(filler.session)
+	testing.expect_value(t, len(p.node.interests), held)
+	unask := make([dynamic]byte, context.temp_allocator)
+	at := zsp.frame_begin(&unask, zsp.Message(UNASK))
+	zsp.write_varint(&unask, 2)
+	zsp.frame_end(&unask, at)
+	testing.expect(t, zsp.session_input(c.session, unask[:]))
+	testing.expect(t, link_settle(t, link, &f, &g))
+	testing.expect_value(t, len(p.node.interests), held)
+}
+
+// A question asked again, as when it is moved, holds what was watched of its answer from afar only while another is
+// asked to put it right: with nobody to ask, or nobody to be asked now that this holds everything, it is let go of.
+@(test)
+moved_questions_let_go_of_what_nobody_answers :: proc(t: ^testing.T) {
+	for round in 0 ..< 2 {
+		state := rand.create(114)
+		context.random_generator = rand.default_random_generator(&state)
+		w, p: World
+		world_make(t, &w, &p)
+		defer world_destroy(&w)
+		defer world_destroy(&p)
+		f, g: Finder
+		pages: [2]Memory_Disk
+		finder_open(&f, &w.node, memory_disk(&pages[0]), w.secret)
+		finder_open(&g, &p.node, memory_disk(&pages[1]), p.secret)
+		f.settled = true
+		elsewhere := client_open(&w, &f)
+		c := client_open(&p, &g)
+		for x in ([]^World{&w, &p}) {
+			x.node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+				zsp.session_accept(s, nil if s.role == .Peer else {{0, {.Read, .Write}, 0}})
+			}
+		}
+		for _ in 0 ..< 40 {
+			world_write(t, &w)
+		}
+		link := link_make(&p, &w)
+		defer {
+			zsp.session_close(c.session)
+			zsp.session_close(elsewhere.session)
+			finder_close(&f)
+			finder_close(&g)
+			client_free(&c)
+			client_free(&elsewhere)
+			for &d in pages {
+				memory_disk_destroy(&d)
+			}
+		}
+		testing.expect(t, link_settle(t, link, &f, &g))
+		client_ask(t, &c, 1, []byte{1, 0, 1, 2, 1, 0, 0, 5, 0}) // the newest five
+		testing.expect(t, link_settle(t, link, &f, &g))
+		client_hear_out(t, &c, &g)
+		testing.expectf(t, 1 in c.answers && c.answers[1].flags & 1 != 0 && len(c.answers[1].ids) > 0, "%v", c.answers[1] if 1 in c.answers else Told{})
+		shown := len(c.answers[1].ids)
+		watched :: proc(p: ^World, c: ^Client) -> (n: int) {
+			for it in p.node.interests {
+				n += 1 if it.session == c.session.id && it.watch.id == max(u64) && it.watch.data else 0 // in what an answer shows
+			}
+			return
+		}
+		testing.expect_value(t, watched(&p, &c), shown) // each of them, until it is held
+		if round == 0 {
+			zsp.session_close(link[0]) // nobody is left to ask
+			zsp.session_close(link[1])
+		} else {
+			g.settled = true // nor need anyone be
+		}
+		client_ask(t, &c, 1, []byte{1, 0, 1, 2, 1, 0, 100, 5, 0}) // moved past them all
+		for _ in 0 ..< 10 {
+			if round == 1 {
+				link_pass(t, link, max(int))
+				finder_run(&f)
+			}
+			finder_run(&g)
+		}
+		client_hear_out(t, &c, &g)
+		testing.expectf(t, watched(&p, &c) == 0, "round %d: %d watched still", round, watched(&p, &c))
+		if round == 1 {
+			testing.expect_value(t, len(p.node.calls), 0) // and the call that answered it is over
+			zsp.session_close(link[0])
+			zsp.session_close(link[1])
+		}
+	}
+}
+
+@(private, thread_local)
+phantoms_said, phantoms_unsound: int
+
+// A Fetch whose answer from afar is given up on, as one that names a row where a full replica says there is none, or
+// one that is no answer at all, asks another that can answer it, there and then: it is not answered with what is held while one can be asked.
+@(test)
+a_fetch_given_up_on_asks_another :: proc(t: ^testing.T) {
+	for round in 0 ..< 2 {
+		state := rand.create(115)
+		context.random_generator = rand.default_random_generator(&state)
+		good, p: World
+		for x in ([]^World{&good, &p}) {
+			for &b in x.secret {
+				b = byte(rand.uint32())
+			}
+			zsp.keyring_init(&x.keys, x.secret)
+		}
+		liar_secret, root: zsp.Key32
+		for &b in liar_secret {
+			b = byte(rand.uint32())
+		}
+		for &b in root {
+			b = byte(rand.uint32())
+		}
+		liar_keys: zsp.Keyring
+		zsp.keyring_init(&liar_keys, liar_secret)
+		defer zsp.keyring_destroy(&liar_keys)
+		none: zsp.Roster
+		d := zsp.draft_from(&none, 1)
+		scope := zsp.draft_scope(&d)
+		m := zsp.draft_grant(&d, good.keys.device, good.keys.signer, scope, {.Write})
+		m.owner = true
+		zsp.draft_grant(&d, p.keys.device, p.keys.signer, scope, {.Read, .Write})
+		zsp.draft_grant(&d, liar_keys.device, liar_keys.signer, scope, {.Read, .Write})
+		ok: bool
+		good.roster, ok = zsp.roster_sign(&good.keys, root, &d)
+		testing.expect(t, ok)
+		good.space = zsp.ed25519_public(root)
+		world_start(t, &good)
+		p.roster, p.space = slice.clone(good.roster), good.space
+		world_start(t, &p, false)
+		defer world_destroy(&good)
+		defer world_destroy(&p)
+		liar_disk: zsp.Memory_Disk
+		defer zsp.memory_disk_destroy(&liar_disk)
+		liar: zsp.Node
+		testing.expect(t, zsp.node_init(&liar, zsp.memory_disk(&liar_disk), good.space, &liar_keys, true, 64))
+		defer zsp.node_destroy(&liar)
+		testing.expect(t, zsp.node_adopt(&liar, good.roster))
+		for i in 0 ..< 3 {
+			good.node.now += 1000
+			id := zsp.node_id(&good.node, scope)
+			b: [24]byte
+			l := list_of(scope, 0)
+			zsp.put_u64(b[:], l[0])
+			zsp.put_u64(b[8:], l[1])
+			zsp.put_u64(b[16:], u64(i))
+			testing.expect(t, zsp.node_write(&good.node, {{id, zsp.PLACE, .Place, zsp.node_stamp(&good.node), b[:]}}))
+		}
+		p.node.now, liar.now = good.node.now, good.node.now
+		f, g: Finder
+		pages: [2]Memory_Disk
+		finder_open(&f, &good.node, memory_disk(&pages[0]), good.secret)
+		finder_open(&g, &p.node, memory_disk(&pages[1]), p.secret)
+		f.settled = true
+		elsewhere := client_open(&good, &f)
+		c := client_open(&p, &g)
+		accept :: proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+			zsp.session_accept(s, nil if s.role == .Peer else {{0, {.Read, .Write}, 0}})
+		}
+		good.node.host.authenticate, p.node.host.authenticate, liar.host.authenticate = accept, accept, accept
+		// One answers at once with a row that is nowhere.
+		phantoms_said, phantoms_unsound = 0, round
+		liar.host.questions = {
+			data = &liar,
+			called = proc(data: rawptr, call: u64, _: zsp.Key32, _: zsp.Scope, _: []byte) {
+				phantoms_said += 1
+				out := make([dynamic]byte, context.temp_allocator)
+				append(&out, 1 if phantoms_unsound == 0 else 9) // or what is no answer at all
+				zsp.write_varint(&out, 1)
+				zsp.write_varint(&out, 0)
+				zsp.write_varint(&out, 1)
+				zsp.write_key(&out, {1 << 32 | 9, 1, 42, 1 << 32 | 99, 777})
+				zsp.write_varint(&out, 0)
+				zsp.node_flow((^zsp.Node)(data), call, .Data, out[:])
+			},
+		}
+		lying := [2]^zsp.Session{zsp.session_open(&p.node, .Peer, true, liar_keys.device), zsp.session_open(&liar, .Peer, false, p.keys.device)}
+		link := link_make(&p, &good)
+		defer {
+			for x in ([]^zsp.Session{link[0], link[1], lying[0], lying[1], c.session, elsewhere.session}) {
+				zsp.session_close(x)
+			}
+			finder_close(&f)
+			finder_close(&g)
+			client_free(&c)
+			client_free(&elsewhere)
+			for &x in pages {
+				memory_disk_destroy(&x)
+			}
+		}
+		turn :: proc(t: ^testing.T, links: [2][2]^zsp.Session, f, g: ^Finder) {
+			for _ in 0 ..< 100 {
+				for l in links {
+					link_pass(t, l, max(int))
+				}
+				finder_run(f)
+				finder_run(g)
+			}
+		}
+		turn(t, {lying, link}, &f, &g)
+		testing.expect(t, lying[0].ready && link[0].ready)
+		client_ask(t, &c, 1, []byte{1, 0, 0, 0, 0, 50, 0}, FETCH)
+		turn(t, {lying, link}, &f, &g)
+		client_hear_out(t, &c, &g)
+		testing.expectf(t, phantoms_said == 1, "the one that names what is nowhere was asked %d times", phantoms_said) // first, as it was first reached
+		testing.expectf(t, 1 in c.answers && c.answers[1].flags & 1 != 0 && c.answers[1].total == 3 && len(c.answers[1].ids) == 3, "%v", c.answers[1] if 1 in c.answers else Told{})
+	}
+}
+
+@(private, thread_local)
+far_called: u64
+
+// An answer from afar that names a row where a full replica says there is none is no answer: what is here is.
+@(test)
+rows_said_to_be_where_none_is_are_not_waited_for :: proc(t: ^testing.T) {
+	state := rand.create(113)
+	context.random_generator = rand.default_random_generator(&state)
+	w, p: World
+	world_make(t, &w, &p)
+	defer world_destroy(&w)
+	defer world_destroy(&p)
+	g: Finder
+	pages: Memory_Disk
+	finder_open(&g, &p.node, memory_disk(&pages), p.secret)
+	c := client_open(&p, &g)
+	for x in ([]^World{&w, &p}) {
+		x.node.host.authenticate = proc(_: rawptr, s: ^zsp.Session, _: []byte) {
+			zsp.session_accept(s, nil if s.role == .Peer else {{0, {.Read, .Write}, 0}})
+		}
+	}
+	// It answers, at once, with a row that is nowhere.
+	w.node.host.questions = {
+		data = &w.node,
+		called = proc(data: rawptr, call: u64, _: zsp.Key32, _: zsp.Scope, _: []byte) {
+			far_called = call
+			out := make([dynamic]byte, context.temp_allocator)
+			append(&out, 1)
+			zsp.write_varint(&out, 1)
+			zsp.write_varint(&out, 0)
+			zsp.write_varint(&out, 1)
+			zsp.write_key(&out, {1 << 32 | 9, 1, 42, 1 << 32 | 99, 777})
+			zsp.write_varint(&out, 0)
+			zsp.node_flow((^zsp.Node)(data), call, .Data, out[:])
+		},
+	}
+	link := link_make(&p, &w)
+	defer {
+		zsp.session_close(link[0])
+		zsp.session_close(link[1])
+		zsp.session_close(c.session)
+		finder_close(&g)
+		client_free(&c)
+		memory_disk_destroy(&pages)
+	}
+	for _ in 0 ..< 20 {
+		link_pass(t, link, max(int))
+		finder_run(&g)
+	}
+	client_ask(t, &c, 1, []byte{1, 0, 0, 0, 0, 50, 0}, FETCH)
+	for _ in 0 ..< 100 {
+		link_pass(t, link, max(int))
+		finder_run(&g)
+	}
+	client_hear_out(t, &c, &g)
+	testing.expectf(t, 1 in c.answers && c.answers[1].flags & 1 == 0, "%v", c.answers[1] if 1 in c.answers else Told{})
+	// One that stays is put right by the next answer, which is taken: what is here is said meanwhile.
+	client_ask(t, &c, 2, []byte{1, 0, 0, 0, 0, 50, 0})
+	for _ in 0 ..< 100 {
+		link_pass(t, link, max(int))
+		finder_run(&g)
+	}
+	client_hear_out(t, &c, &g)
+	testing.expectf(t, 2 in c.answers && c.answers[2].flags & 1 == 0, "%v", c.answers[2] if 2 in c.answers else Told{})
+	right := make([dynamic]byte, context.temp_allocator)
+	append(&right, 1, 0, 0, 0, 0)
+	zsp.node_flow(&w.node, far_called, .Data, right[:])
+	for _ in 0 ..< 100 {
+		link_pass(t, link, max(int))
+		finder_run(&g)
+	}
+	client_hear_out(t, &c, &g)
+	testing.expectf(t, 2 in c.answers && c.answers[2].flags & 1 != 0 && c.answers[2].total == 0, "%v", c.answers[2] if 2 in c.answers else Told{})
 }
 
 // Pages that are not what was last written are known not to be, and the answers are right all the same.
@@ -1524,6 +1985,80 @@ what_comes_while_merging_is_there :: proc(t: ^testing.T) {
 		set_destroy(&got)
 		check_index(t, &w)
 	}
+}
+
+// Rows go that nothing said had gone while a scope's rows were being put in order, and some of that was done: it is
+// begun again from nothing, and nothing of what was gone over before is there after.
+@(test)
+what_goes_while_merging_is_gone :: proc(t: ^testing.T) {
+	state := rand.create(110)
+	context.random_generator = rand.default_random_generator(&state)
+	for keep in ([]int{0, 1}) {
+		w: World
+		world_make(t, &w)
+		defer world_destroy(&w)
+		put :: proc(t: ^testing.T, w: ^World) {
+			w.node.now += 1000
+			id := zsp.node_id(&w.node, 1)
+			append(&w.rows, id)
+			b := make([]byte, 24, context.temp_allocator)
+			l := list_of(1, 0)
+			zsp.put_u64(b, l[0])
+			zsp.put_u64(b[8:], l[1])
+			testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+		}
+		for _ in 0 ..< 300 {
+			put(t, &w)
+		}
+		index_follow(&w.x)
+		s := index_want_scope(&w.x, 1)
+		// Put in order as runs of 64, whatever RUN is built as, so that one tree is laid down while the other's runs are
+		// still being read side by side; and gone over so many steps at most, rather than for ever.
+		for steps := 0; s.filling == nil || s.ids.root == 0; steps += 1 {
+			if !testing.expectf(t, steps < 10_000 && !index_step(&w.x, 1), "no step found one tree laid down and the other not") {
+				return
+			}
+			if f := s.filling; f != nil && !f.merging {
+				for &b in f.bulk {
+					if len(b.edits) >= 64 {
+						bulk_run(&b)
+					}
+				}
+			}
+		}
+		zsp.store_lose(&w.node.store, w.rows[keep:])
+		index_finish(&w.x)
+		check_index(t, &w)
+		put(t, &w)
+		index_finish(&w.x)
+		check_index(t, &w)
+		testing.expect_value(t, tree_total(&w.x, s.ids).count, keep + 1)
+	}
+}
+
+// The least id a scope's row may have is a row's as any other is, when the index is first made.
+@(test)
+the_first_row_there_can_be_is_found :: proc(t: ^testing.T) {
+	state := rand.create(112)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	for i in 0 ..< 2 {
+		id := zsp.Id{2 << 32, u64(i)}
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(2, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		zsp.put_u64(b[16:], u64(i))
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+	}
+	index_follow(&w.x)
+	_ = index_want_scope(&w.x, 2)
+	index_finish(&w.x)
+	testing.expect_value(t, index_scope(&w.x, 2).all.count, 2)
+	check_index(t, &w)
 }
 
 // What cannot be synced is not made over and over; and what has fallen far behind is followed a little at a time.

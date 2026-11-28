@@ -4,7 +4,9 @@ package find
 import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
+import "core:math"
 import "core:math/rand"
+import "core:mem"
 import "core:slice"
 import "core:strings"
 import "core:testing"
@@ -1089,5 +1091,210 @@ answers_match_the_cells :: proc(t: ^testing.T) {
 		}
 		index_finish(&w.x)
 		check_index(t, &w)
+	}
+}
+
+// Each of a set a value may be one of is a condition, and no question has more than so many, however short each is; so
+// what is made of a question is not much larger than it, whatever it says.
+@(test)
+sets_are_conditions :: proc(t: ^testing.T) {
+	Largest :: struct {
+		backing: mem.Allocator,
+		most:    int,
+	}
+	among :: proc(n: int, claimed := -1) -> []byte {
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, 1)
+		append(&w, u8(Op.In), u8(Kind.Bytes), 16)
+		zsp.write_bytes(&w, nil)
+		zsp.write_varint(&w, u64(claimed if claimed >= 0 else n))
+		for _ in 0 ..< n {
+			zsp.write_bytes(&w, nil)
+		}
+		append(&w, 0, 0, 0, 10, 0) // no order, from the start, the first ten, no totals
+		return w[:]
+	}
+	parse :: proc(source: []byte) -> (ok: bool, most: int) {
+		l := Largest{backing = context.allocator}
+		allocator := mem.Allocator {
+			proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+				l := (^Largest)(data)
+				l.most = max(l.most, size)
+				return l.backing.procedure(l.backing.data, mode, size, alignment, old, old_size, loc)
+			},
+			&l,
+		}
+		arena: mem.Dynamic_Arena
+		mem.dynamic_arena_init(&arena, allocator, allocator)
+		defer mem.dynamic_arena_destroy(&arena)
+		_, ok = query_parse(source, mem.dynamic_arena_allocator(&arena))
+		return ok, l.most
+	}
+	ok, _ := parse(among(MAX_PREDS - 1))
+	testing.expect(t, ok)
+	big := among(60_000)
+	most: int
+	ok, most = parse(big)
+	testing.expect(t, !ok)
+	testing.expectf(t, most <= 2 * len(big) + 64 * 1024, "made %d bytes at once of a question of %d", most, len(big))
+	// And rows: so many as there are bytes for.
+	w := make([dynamic]byte, context.temp_allocator)
+	zsp.write_varint(&w, 1)
+	append(&w, u8(Op.Ids))
+	zsp.write_varint(&w, 1000)
+	for _ in 0 ..< 999 * 16 {
+		append(&w, 0)
+	}
+	append(&w, 0, 0, 0, 10, 0)
+	ok, _ = parse(w[:])
+	testing.expect(t, !ok)
+}
+
+// The least or the greatest of values that share their first sixteen bytes is of those alone, the last but one of all
+// such firsts too: not of those whose first sixteen bytes are all there can be.
+@(test)
+extremes_are_of_their_key_alone :: proc(t: ^testing.T) {
+	state := rand.create(12)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	values: [2][]byte
+	values[0] = make([]byte, 17, context.temp_allocator)
+	slice.fill(values[0][:15], 0xff)
+	values[0][15], values[0][16] = 0xfe, 'a'
+	values[1] = make([]byte, 16, context.temp_allocator)
+	slice.fill(values[1], 0xff)
+	for v, i in values {
+		w.node.now += 1000
+		id := zsp.node_id(&w.node, 2)
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(2, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		zsp.put_u64(b[16:], u64(i))
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}, {id, 16, .Value, zsp.node_stamp(&w.node), v}}))
+	}
+	for fn in ([]Fn{.Min, .Max}) {
+		source := []byte{2, u8(Op.All), 0, 0, 0, 10, 1, u8(fn), u8(Kind.Bytes), 16, 0, 1}
+		q, ok := query_parse(source)
+		testing.expect(t, ok)
+		index_follow(&w.x)
+		query_prepare(&w.x, &q)
+		index_finish(&w.x)
+		s := index_scope(&w.x, 2)
+		totals := query_totals(s, &q, &s.all)
+		testing.expect(t, len(totals) == 1 && len(totals[0].facets) == 1)
+		got := facet_bytes(s, &q.totals[0], totals[0].facets[0])
+		testing.expectf(t, string(got) == string(values[0 if fn == .Min else 1]), "%v of them is %x", fn, got)
+	}
+}
+
+// A question looks for so many words with letters wrong, or inside others, and has so much text to match in all, and
+// no more, however it is put: each such word goes over every word there is.
+@(test)
+words_to_look_through_all_for_are_few :: proc(t: ^testing.T) {
+	match :: proc(w: ^[dynamic]byte, flags: Word_Flags, text: string) {
+		append(w, u8(Op.Match), u8(Kind.Words), 20, 0, 0, transmute(u8)flags)
+		zsp.write_bytes(w, transmute([]byte)text)
+	}
+	question :: proc(matches: int, flags: Word_Flags, text: string) -> []byte {
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, 1)
+		append(&w, u8(Op.And))
+		zsp.write_varint(&w, u64(matches))
+		for _ in 0 ..< matches {
+			match(&w, flags, text)
+		}
+		append(&w, 0, 0, 0, 10, 0)
+		return w[:]
+	}
+	fuzzy := Word_Flags{edits = 1}
+	words :: proc(n: int) -> string {
+		return strings.repeat("words ", n, context.temp_allocator)
+	}
+	for c in ([]struct {
+			matches: int,
+			flags:   Word_Flags,
+			n:       int,
+			ok:      bool,
+		}{{1, fuzzy, MAX_SCANS, true}, {1, fuzzy, MAX_SCANS + 1, false}, {MAX_SCANS + 1, fuzzy, 1, false}, {1, {inside = true}, MAX_SCANS + 1, false}, {1, {}, 600, true}, {2, {}, 400, false}}) {
+		_, ok := query_parse(question(c.matches, c.flags, words(c.n)))
+		testing.expectf(t, ok == c.ok, "%d of %d words, %v: %v", c.matches, c.n, c.flags, ok)
+	}
+}
+
+// What is not a number comes after every number, as its key does: every row was made before it, and none after, though
+// the rows are gone over by when they were made.
+@(test)
+made_before_what_is_not_a_number :: proc(t: ^testing.T) {
+	state := rand.create(14)
+	context.random_generator = rand.default_random_generator(&state)
+	w: World
+	world_make(t, &w)
+	defer world_destroy(&w)
+	for secs, i in ([]u64{1000, 2000}) {
+		w.node.now = secs * 1000
+		id := zsp.node_id(&w.node, 2)
+		testing.expect_value(t, u32(id[0]), u32(secs))
+		append(&w.rows, id)
+		b := make([]byte, 24, context.temp_allocator)
+		l := list_of(2, 0)
+		zsp.put_u64(b, l[0])
+		zsp.put_u64(b[8:], l[1])
+		zsp.put_u64(b[16:], u64(i))
+		testing.expect(t, zsp.node_write(&w.node, {{id, 1, .Place, zsp.node_stamp(&w.node), b}}))
+	}
+	number :: proc(w: ^[dynamic]byte, v: f64) {
+		b: [8]byte
+		zsp.put_u64(b[:], transmute(u64)v)
+		zsp.write_bytes(w, b[:])
+	}
+	nan, inf := math.nan_f64(), math.inf_f64(1)
+	Case :: struct {
+		op:     Op,
+		flags:  u8,
+		bounds: []f64,
+		rows:   int,
+	}
+	for c in ([]Case {
+			{.Range, 2 | 8, {nan}, 2}, // made no later than what is not a number
+			{.Range, 2, {nan}, 2}, // before it
+			{.Range, 1 | 4, {nan}, 0}, // no earlier than it
+			{.Range, 1, {nan}, 0}, // after it
+			{.Range, 1 | 2 | 4 | 8, {1500, nan}, 1},
+			{.Range, 1 | 2 | 4 | 8, {inf, nan}, 0},
+			{.Range, 2 | 8, {-inf}, 0},
+			{.Range, 1 | 4, {-inf}, 2},
+			{.In, 0, {1000, nan}, 1},
+			{.In, 0, {nan}, 0},
+		}) {
+		source := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&source, 2)
+		append(&source, u8(c.op), u8(Kind.Created))
+		if c.op == .Range {
+			append(&source, c.flags)
+		} else {
+			zsp.write_varint(&source, u64(len(c.bounds)))
+		}
+		for v in c.bounds {
+			number(&source, v)
+		}
+		append(&source, 0, 0, 0, 10, 0)
+		q, ok := query_parse(source[:])
+		testing.expect(t, ok)
+		index_follow(&w.x)
+		query_prepare(&w.x, &q)
+		index_finish(&w.x)
+		s := index_scope(&w.x, 2)
+		rows := pred_rows(s, &q.where_)
+		testing.expectf(t, rows.count == c.rows, "%v %v of %v: %d rows", c.op, c.flags, c.bounds, rows.count)
+		testing.expectf(t, pred_most(s, &q.where_) >= c.rows, "%v %v of %v: at most %d", c.op, c.flags, c.bounds, pred_most(s, &q.where_))
+		if c.op == .Range && c.flags & 1 != 0 && c.bounds[0] != c.bounds[0] {
+			lo, hi := created_span(&q.where_)
+			testing.expectf(t, !key_less(lo, hi), "%v of %v: rows from %v to %v are gone over", c.flags, c.bounds, lo, hi) // none
+		}
+		set_destroy(&rows)
 	}
 }

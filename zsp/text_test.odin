@@ -3,6 +3,7 @@ package zsp
 
 import "core:math/rand"
 import "core:slice"
+import "core:strings"
 import "core:testing"
 
 @(private)
@@ -362,4 +363,99 @@ text_is_written_as_it_should_be :: proc(t: ^testing.T) {
 		plain_text_destroy(&plain)
 		free_all(context.temp_allocator)
 	}
+}
+
+// A piece too short to name itself is no piece of the text, and is bundled away with nothing in its place.
+@(test)
+short_pieces_are_bundled_away :: proc(t: ^testing.T) {
+	row := Id{1 << 32, 1}
+	x: Text
+	defer text_destroy(&x)
+	text_insert(&x, 0, transmute([]byte)string("hello"), 7)
+	body, _ := text_close(&x, {2 << 16, 2})
+	cells := []Cell{{row, DATA, .Piece, {1 << 16, 1}, nil}, {row, DATA, .Piece, {2 << 16, 2}, body}, {row, DATA, .Piece, {3 << 16, 3}, {1, 2, 3}}}
+	b := text_bundle(cells)
+	defer delete(b.body)
+	testing.expect_value(t, get_u32(b.body), 3)
+	y: Text
+	defer text_destroy(&y)
+	b.stamp = {4 << 16, 4}
+	testing.expect(t, cell_valid(&b) && text_apply(&y, &b) == .Changed)
+	testing.expect_value(t, text_string(&y), "hello")
+	// And what a bundle holds that cannot be read is passed over, however short it falls.
+	short := make([dynamic]byte, context.temp_allocator)
+	append(&short, ..b.body)
+	append(&short, 1)
+	broken := Cell{row, DATA, .Bundle, {5 << 16, 5}, short[:]}
+	again := text_bundle({broken})
+	defer delete(again.body)
+	z: Text
+	defer text_destroy(&z)
+	again.stamp = {6 << 16, 6}
+	testing.expect(t, cell_valid(&again) && text_apply(&z, &again) == .Changed)
+	testing.expect_value(t, text_string(&z), "hello")
+	// And one that names nothing, or is too short to say, as no bundle is, is gone with nothing in its place.
+	for none in ([][]byte{{}, {0, 0}, {0, 0, 0, 0}, {0, 0, 0, 9}}) {
+		nothing := text_bundle({{row, DATA, .Bundle, {7 << 16, 7}, none}, cells[1]})
+		defer delete(nothing.body)
+		testing.expect_value(t, get_u32(nothing.body), 2)
+		// Of its row and slot, alone as with others.
+		alone := text_bundle({{row, DATA, .Bundle, {7 << 16, 7}, none}})
+		defer delete(alone.body)
+		testing.expect(t, alone.row == row && alone.slot == DATA && get_u32(alone.body) == 1)
+	}
+}
+
+// What is no operation at all, or one that refers to what its own piece has yet to make, waits for nothing: it is never
+// to be, and is neither kept nor gone over again at every edit. What refers to another piece waits for it.
+@(test)
+nonsense_does_not_wait :: proc(t: ^testing.T) {
+	x: Text
+	defer text_destroy(&x)
+	insert :: proc(w: ^[dynamic]byte, left: []byte, s: string) {
+		append(w, 1)
+		append(w, ..left)
+		append(w, 0)
+		write_bytes(w, transmute([]byte)s)
+	}
+	piece :: proc(x: ^Text, id: u64, ops: []byte) -> Text_Result {
+		body := make([dynamic]byte, context.temp_allocator)
+		write_u64(&body, id)
+		append(&body, ..ops)
+		c := Cell{{1 << 32, 1}, DATA, .Piece, {id << 16, id}, body[:]}
+		return text_apply(x, &c)
+	}
+	ops := make([dynamic]byte, context.temp_allocator)
+	insert(&ops, {0}, "hello")
+	testing.expect_value(t, piece(&x, 1, ops[:]), Text_Result.Changed)
+	for i in 0 ..< 50 {
+		clear(&ops)
+		insert(&ops, {0}, "a")
+		switch i % 4 {
+		case 0:
+			append(&ops, 9, 9, 9) // no such operation
+		case 1:
+			append(&ops, 1, 0, 0, 0xff) // a length that does not end
+		case 2:
+			insert(&ops, {1, 5}, "b") // after what this piece never made
+		case 3:
+			append(&ops, 3, 1, 9, 1) // and the deletion of it
+		}
+		testing.expect_value(t, piece(&x, u64(i) + 2, ops[:]), Text_Result.Changed)
+	}
+	testing.expect_value(t, len(x.waiting), 0)
+	// But one that refers to a piece not yet here waits for it, and goes on once it is.
+	clear(&ops)
+	ref := make([dynamic]byte, context.temp_allocator)
+	append(&ref, 2)
+	write_u64(&ref, 99)
+	append(&ref, 0)
+	insert(&ops, ref[:], "!")
+	testing.expect_value(t, piece(&x, 98, ops[:]), Text_Result.Waiting)
+	testing.expect_value(t, len(x.waiting), 1)
+	clear(&ops)
+	insert(&ops, {0}, "?")
+	testing.expect_value(t, piece(&x, 99, ops[:]), Text_Result.Changed)
+	testing.expect_value(t, len(x.waiting), 0)
+	testing.expect_value(t, strings.count(text_string(&x), "!"), 1)
 }

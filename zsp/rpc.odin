@@ -14,6 +14,7 @@ import "core:strings"
 CALL_WINDOW :: 256 << 10 // bytes a side may send before the other grants more
 MAX_CALLS :: 4096
 MAX_METHOD :: 255
+MAX_SERVED :: 256 // methods a local client serves at once
 MAX_FLOW :: 1024 // of anything but data
 
 Flow :: enum u8 {
@@ -92,20 +93,31 @@ on_serve :: proc(s: ^Session, r: ^Reader) {
 	on := read_u8(r) == 1
 	method := string(read_bytes(r))
 	// Whether it may is asked when a call comes: rights come and go.
-	if r.bad || s.role != .Open || len(method) == 0 || len(method) > MAX_METHOD || len(n.serving) >= MAX_CALLS {
+	if r.bad || s.role != .Open || len(method) == 0 || len(method) > MAX_METHOD {
 		r.bad = true
 		return
 	}
+	served := 0
 	for x, i in n.serving {
-		if x.session == s.id && x.scope == scope && x.method == method {
+		if x.session != s.id {
+			continue
+		}
+		if x.scope == scope && x.method == method {
 			delete(x.method)
 			unordered_remove(&n.serving, i)
 			break
 		}
+		served += 1
 	}
-	if on {
-		append(&n.serving, Serving{s.id, scope, strings.clone(method)})
+	if !on {
+		return // which may always be said
 	}
+	// So many each, and not so many in all, so that none can keep others from serving.
+	if served >= MAX_SERVED {
+		r.bad = true
+		return
+	}
+	append(&n.serving, Serving{s.id, scope, strings.clone(method)})
 }
 
 // id, device, scope, method, for whom, first message
@@ -215,13 +227,16 @@ on_call :: proc(s: ^Session, r: ^Reader, lane: ^Lane = nil) {
 			}
 			to.session, to.host = 0, false
 		}
+		// One that may answer it: another that serves it too, and may not, does not stand in its way.
 		server: ^Session
 		for x in n.serving {
 			if x.scope == scope && x.method == method {
-				server = node_session(n, x.session)
+				if y := node_session(n, x.session); y != nil && .Call in session_rights(y, scope) {
+					server = y
+				}
 			}
 		}
-		if server == nil || .Call not_in session_rights(server, scope) {
+		if server == nil {
 			refuse(n, from, .Unserved)
 			return
 		}
@@ -425,6 +440,18 @@ on_flow :: proc(s: ^Session, r: ^Reader) {
 		r.bad = true
 		return
 	}
+	// What is passed on is taken as said by whoever it is told to: what cannot be is the fault of who said it.
+	#partial switch kind {
+	case .Credit:
+		credit := Reader{buf = payload}
+		_ = read_varint(&credit)
+		r.bad = credit.bad || credit.pos != len(payload)
+	case .Fault:
+		r.bad = len(payload) == 0
+	}
+	if r.bad {
+		return
+	}
 	side := int(tag & 1)
 	for &c, i in n.calls {
 		from := &c.ends[side]
@@ -438,6 +465,7 @@ on_flow :: proc(s: ^Session, r: ^Reader) {
 
 @(private)
 flow_pass :: proc(n: ^Node, i: int, side: int, kind: Flow, payload: []byte) {
+	payload := payload
 	c := &n.calls[i]
 	from, to := &c.ends[side], &c.ends[1 - side]
 	over := false
@@ -460,8 +488,13 @@ flow_pass :: proc(n: ^Node, i: int, side: int, kind: Flow, payload: []byte) {
 	case .Fault, .Cancel:
 		over = true
 	case .Credit:
+		// As much as it may be credited ahead, and no more, so that both ends count alike.
 		credit := Reader{buf = payload}
-		to.granted = min(to.granted + int(read_varint(&credit) & 0xff_ffff), 16 * CALL_WINDOW)
+		was := to.granted
+		to.granted = min(to.granted + int(min(read_varint(&credit), 16 * CALL_WINDOW)), 16 * CALL_WINDOW)
+		w := make([dynamic]byte, 0, 10, context.temp_allocator)
+		write_varint(&w, u64(max(to.granted - was, 0)))
+		payload = w[:]
 	case:
 		return
 	}

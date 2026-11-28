@@ -1700,3 +1700,762 @@ echoes_are_not_owed :: proc(t: ^testing.T) {
 	sim_settle(&s)
 	testing.expect_value(t, phone.node.outbox.root, 0)
 }
+
+// ---------------------------------------------------------------- the bug hunt
+
+// An admin gone bad cannot take the keys others have learnt with an ephemeral key no wrap can be made under: such a
+// roster is none, and a wrap that cannot be made, like one that does not open, takes nothing away.
+@(test)
+a_garbled_ephemeral_takes_no_keys :: proc(t: ^testing.T) {
+	state := seeded(83)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	owner, admin := s.nodes[0], s.nodes[1]
+	held := keyring_scope(&owner.keys, 1).epochs[0]
+	d := draft_from(&admin.node.roster, max(admin.node.clock, admin.node.now << 16))
+	bytes, ok := roster_sign(&admin.keys, nil, &d, context.temp_allocator)
+	r, sound := roster_parse(bytes, s.space)
+	testing.expect(t, ok && sound)
+	defer roster_destroy(&r)
+	at := int(uintptr(raw_data(r.wraps)) - uintptr(raw_data(r.bytes))) - 32
+	testing.expect(t, r.eph == (^Key32)(&bytes[at])^)
+	p_plus_1: Key32 // which is 1, and the top bit is no part of it either
+	p_plus_1[0] = 0xee
+	slice.fill(p_plus_1[1:], 0xff)
+	for low in ([]Key32{{}, {0 = 1}, p_plus_1}) {
+		evil := slice.clone(bytes, context.temp_allocator)
+		(^Key32)(&evil[at])^ = low
+		testing.expect(t, !node_adopt(&owner.node, resign(evil, admin.keys.seed)))
+		testing.expect(t, !node_adopt(&s.nodes[1].node, evil))
+		mine := keyring_scope(&owner.keys, 1)
+		testing.expect(t, mine != nil && mine.epochs[0] == held)
+	}
+	// However it comes to be unwrapped, what was learnt stays.
+	k: Keyring
+	keyring_init(&k, owner.secret)
+	defer keyring_destroy(&k)
+	testing.expect(t, roster_unwrap(&k, &r) && keyring_scope(&k, 1).epochs[0] == held)
+	r.eph = {}
+	testing.expect(t, roster_unwrap(&k, &r))
+	mine := keyring_scope(&k, 1)
+	testing.expect(t, mine != nil && mine.epochs[0] == held)
+}
+
+// A bundle is written when the last of what it names was, for what it names it kills: whoever may no longer write
+// cannot, by naming first something from before, kill what others wrote since. Nor is a bundle whose it says if
+// what it holds was written after its author could vouch for that.
+@(test)
+a_bundle_names_nothing_later_than_its_right :: proc(t: ^testing.T) {
+	state := seeded(84)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 3, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, c := s.nodes[0], s.nodes[2]
+	sim_link(&s, 0, 2)
+	sim_settle(&s)
+	at_a := s.links[0].a // what c sends, a hears here
+	regrant :: proc(s: ^Sim, rights: Rights) -> bool {
+		d := draft_from(&s.nodes[0].node.roster, max(s.nodes[0].node.clock, s.now << 16))
+		draft_grant(&d, s.nodes[2].keys.device, s.nodes[2].keys.signer, 2, rights)
+		bytes, ok := roster_sign(&s.nodes[0].keys, s.root, &d, context.temp_allocator)
+		return ok && node_adopt(&s.nodes[0].node, bytes) && node_adopt(&s.nodes[2].node, bytes)
+	}
+	later :: proc(s: ^Sim) {
+		s.now += 1000
+		sim_level(s)
+	}
+	piece :: proc(n: ^Node, text: ^Text, at: int, s: string, fresh: u64) -> Cell {
+		text_insert(text, at, transmute([]byte)s, fresh)
+		stamp := node_stamp(n)
+		body, _ := text_close(text, stamp)
+		return {slot = DATA, kind = .Piece, stamp = stamp, body = body}
+	}
+	testing.expect(t, regrant(&s, {.Write, .Vouch}))
+	could, _ := roster_parse(c.node.roster.bytes, s.space) // as c may say it still can: its node would not
+	defer roster_destroy(&could)
+	later(&s)
+	text: Text
+	defer text_destroy(&text)
+	row := node_id(&a.node, 2)
+	place: [24]byte
+	tag := list_tag(keyring_scope(&a.keys, 2), "docs")
+	put_u64(place[:], tag[0])
+	put_u64(place[8:], tag[1])
+	first := piece(&a.node, &text, 0, "Hello", 1)
+	first.row = row
+	testing.expect(t, node_write(&a.node, {{row, PLACE, .Place, node_stamp(&a.node), place[:]}, first}))
+	later(&s)
+	testing.expect(t, regrant(&s, {.Read}))
+	later(&s)
+	since := piece(&a.node, &text, 5, " world", 2)
+	since.row = row
+	testing.expect(t, node_write(&a.node, {since}))
+	sim_settle(&s)
+
+	// c may only read, and kills what a wrote since with a bundle that first names something from before.
+	names := make([dynamic]byte, context.temp_allocator)
+	write_u32(&names, 2)
+	write_stamp(&names, {row_born(row), 1})
+	write_stamp(&names, since.stamp)
+	evil := Cell{row, DATA, .Bundle, node_stamp(&c.node), names[:]}
+	testing.expect(t, cell_valid(&evil) && cell_seal(&c.keys, &could, &evil, 0, transmute([]byte)string("ceo")))
+	testing.expect(t, !cell_lawful(&a.node.roster, &evil))
+	testing.expect(t, session_input(at_a, raw_cells({evil})))
+	_, kept := store_cell(&a.node.store, row, DATA, .Piece, since.stamp)
+	_, taken := store_cell(&a.node.store, row, DATA, .Bundle, evil.stamp)
+	testing.expect(t, kept && !taken)
+	// Its own node, sealing that, names only what c may still kill.
+	trimmed := Cell{row, DATA, .Bundle, evil.stamp, names[:]}
+	testing.expect(t, cell_seal(&c.keys, &c.node.roster, &trimmed) && get_u32(trimmed.body) == 1)
+	testing.expect(t, cell_lawful(&a.node.roster, &trimmed))
+
+	// c may write and vouch again, then only write; and holds in a bundle, under an early name, what it wrote since.
+	later(&s)
+	testing.expect(t, regrant(&s, {.Write, .Vouch}))
+	later(&s)
+	testing.expect(t, regrant(&s, {.Write}))
+	later(&s)
+	vouched_until: u64
+	for g in roster_member(&a.node.roster, c.keys.device).grants {
+		if .Vouch in g.rights {
+			vouched_until = max(vouched_until, g.until)
+		}
+	}
+	held := make([dynamic]byte, context.temp_allocator)
+	write_u32(&held, 1)
+	write_stamp(&held, {row_born(row), 2})
+	write_stamp(&held, node_stamp(&c.node))
+	write_u64(&held, 77)
+	ops := make([dynamic]byte, context.temp_allocator)
+	append(&ops, 1, 0, 0)
+	write_bytes(&ops, transmute([]byte)string("forged"))
+	write_bytes(&held, ops[:])
+	forged := Cell{row, DATA, .Bundle, node_stamp(&c.node), held[:]}
+	testing.expect(t, cell_valid(&forged) && cell_seal(&c.keys, &c.node.roster, &forged, 0, transmute([]byte)string("ceo")))
+	testing.expect(t, cell_authentic(&a.node.roster, &forged))
+	by: By
+	// It may write, but what it holds is later than all it names, as nothing put together of what it names is: and so it
+	// would be taken for written before it was, by whoever looks again only at what came after a right ended. It is
+	// nothing of the text, nor of a bundle put together of it.
+	testing.expect(t, cell_open(&a.keys, &a.node.roster, &forged, &by))
+	nothing: Text
+	defer text_destroy(&nothing)
+	testing.expect_value(t, text_apply(&nothing, &forged), Text_Result.Same)
+	again := text_bundle({forged})
+	defer delete(again.body)
+	testing.expect_value(t, len(again.body), clear_size(.Bundle, again.body))
+	// What it holds from while it could vouch, it is believed about, as it would be had it written it then.
+	honest := make([dynamic]byte, context.temp_allocator)
+	write_u32(&honest, 1)
+	early := Stamp{vouched_until, 3}
+	write_stamp(&honest, early)
+	write_stamp(&honest, early)
+	write_u64(&honest, 78)
+	write_bytes(&honest, ops[:])
+	early_one := Cell{row, DATA, .Bundle, node_stamp(&c.node), honest[:]}
+	testing.expect(t, cell_valid(&early_one) && cell_seal(&c.keys, &c.node.roster, &early_one, 0, transmute([]byte)string("ceo")))
+	testing.expect(t, cell_open(&a.keys, &a.node.roster, &early_one, &by))
+	_, subject, vouched, known := cell_author(&a.node.roster, &early_one, by)
+	testing.expect(t, known && vouched && string(subject) == "ceo")
+}
+
+// What a peer says it holds of a row is made no larger than a little more than what it says.
+@(test)
+wants_cost_little :: proc(t: ^testing.T) {
+	state := seeded(86)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Want)
+	write_u8(&w, 0)
+	write_varint(&w, 1)
+	write_u64(&w, 1 << 32)
+	write_u64(&w, 1)
+	write_varint(&w, 200_000) // as many as there are bytes, not as many as there is room for
+	resize(&w, len(w) + 200_000)
+	frame_end(&w, at)
+	l := Largest{backing = context.temp_allocator}
+	{
+		context.temp_allocator = largest_allocator(&l)
+		_ = session_input(s.links[0].a, w[:])
+	}
+	testing.expectf(t, l.most <= 2 * len(w), "made %d bytes at once of a frame of %d", l.most, len(w))
+}
+
+// What a peer asks to be sent is queued as so many tasks as it said, however much the rows hold and however often it
+// asks: a run of cells a row lacks is one, and so is a range it holds nothing of.
+@(test)
+asking_queues_no_more_than_was_said :: proc(t: ^testing.T) {
+	state := seeded(87)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 1, 1, 0, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a := s.nodes[0]
+	sim_link(&s, 1, 0)
+	sim_settle(&s)
+	at_a := s.links[0].b
+	testing.expect(t, !at_a.peer_full)
+	row := node_id(&a.node, 1)
+	body: [24]byte
+	put_u64(body[:], 1 << 32 | 5)
+	put_u64(body[8:], 5)
+	cells := make([dynamic]Cell, context.temp_allocator)
+	append(&cells, Cell{row, PLACE, .Place, node_stamp(&a.node), body[:]})
+	for i in 0 ..< 49 {
+		append(&cells, Cell{row, DATA + Slot(i), .Value, node_stamp(&a.node), transmute([]byte)string("x")})
+	}
+	for _ in 0 ..< 100 {
+		append(&cells, Cell{node_id(&a.node, 1), PLACE, .Place, node_stamp(&a.node), body[:]})
+	}
+	testing.expect(t, node_write(&a.node, cells[:]))
+	tasks :: proc(s: ^Session) -> int {
+		return len(s.tasks) - s.task_head + len(s.first) - s.first_head
+	}
+	REPEATS :: 2000
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Want)
+	write_u8(&w, 1)
+	write_varint(&w, REPEATS)
+	for _ in 0 ..< REPEATS {
+		write_u64(&w, row[0])
+		write_u64(&w, row[1])
+		write_varint(&w, 1)
+		append(&w, 0, 0)
+		write_stamp(&w, {999, 999}) // that it holds what is not there
+	}
+	frame_end(&w, at)
+	before := tasks(at_a)
+	testing.expect(t, session_input(at_a, w[:]))
+	testing.expectf(t, tasks(at_a) - before <= REPEATS, "%d tasks of %d asked", tasks(at_a) - before, REPEATS)
+
+	watch := make([dynamic]byte, context.temp_allocator)
+	at = frame_begin(&watch, .Watch)
+	write_varint(&watch, 1)
+	append(&watch, 1)
+	write_key(&watch, scope_lo(1))
+	write_key(&watch, scope_hi(1))
+	write_varint(&watch, 0)
+	frame_end(&watch, at)
+	testing.expect(t, session_input(at_a, watch[:]))
+	recon := make([dynamic]byte, context.temp_allocator)
+	at = frame_begin(&recon, .Recon)
+	write_varint(&recon, 0)
+	write_key(&recon, scope_lo(1))
+	write_key(&recon, scope_hi(1))
+	append(&recon, u8(Part.Print))
+	write_varint(&recon, 0)
+	write_u64(&recon, 0)
+	write_u64(&recon, 0)
+	frame_end(&recon, at)
+	before = tasks(at_a)
+	for _ in 0 ..< 50 {
+		testing.expect(t, session_input(at_a, recon[:]))
+	}
+	testing.expectf(t, tasks(at_a) - before <= 50, "%d tasks of 50 asked", tasks(at_a) - before)
+	// Nor when it lists what it holds, listing nothing: what it lacks between what it named is one range.
+	list := make([dynamic]byte, context.temp_allocator)
+	at = frame_begin(&list, .Recon)
+	write_varint(&list, 0)
+	write_key(&list, scope_lo(1))
+	write_key(&list, scope_hi(1))
+	append(&list, u8(Part.List))
+	write_varint(&list, 0)
+	frame_end(&list, at)
+	before = tasks(at_a)
+	testing.expect(t, session_input(at_a, list[:]))
+	testing.expectf(t, tasks(at_a) - before <= 1, "%d tasks of a list of nothing", tasks(at_a) - before)
+	sim_settle(&s)
+
+	// And what is queued is sent as there is room for it, however much a row holds.
+	big := node_id(&a.node, 1)
+	testing.expect(t, node_write(&a.node, {{big, PLACE, .Place, node_stamp(&a.node), body[:]}}))
+	value := make([]byte, 4096, context.temp_allocator)
+	for i in 0 ..< 120 {
+		testing.expect(t, node_write(&a.node, {{big, DATA + Slot(i), .Value, node_stamp(&a.node), value}}))
+	}
+	sim_settle(&s)
+	for held in 0 ..< 2 {
+		clear(&w)
+		at = frame_begin(&w, .Want)
+		write_u8(&w, 1)
+		write_varint(&w, 1)
+		write_u64(&w, big[0])
+		write_u64(&w, big[1])
+		write_varint(&w, u64(held))
+		if held > 0 {
+			append(&w, 0, 0)
+			write_stamp(&w, {999, 999})
+		}
+		frame_end(&w, at)
+		testing.expect(t, session_input(at_a, w[:]))
+		out := session_output(at_a)
+		testing.expectf(t, len(out) <= OUT_HIGH + 3 * len(value), "%d bytes waiting at once, of a row of %d", len(out), 120 * len(value))
+		session_sent(at_a, len(out))
+		sim_settle(&s)
+	}
+	// And so is a range it lacks, a row of it at a time and within a row as there is room.
+	testing.expect(t, session_input(at_a, list[:]))
+	out := session_output(at_a)
+	testing.expectf(t, len(out) <= OUT_HIGH + 3 * len(value), "%d bytes waiting at once, of a range with a row of %d", len(out), 120 * len(value))
+	session_sent(at_a, len(out))
+	sim_settle(&s)
+}
+
+// A relay that starts again with its cells held against a roster it no longer has drops what is in no scope there is:
+// and keeps what is in one, however soon the rosters after it say so, for a scope that is there is never gone.
+@(test)
+a_scope_that_is_there_is_never_gone :: proc(t: ^testing.T) {
+	root, space := test_root()
+	admin, bob := test_keyring(), test_keyring()
+	defer keyring_destroy(&admin)
+	defer keyring_destroy(&bob)
+	now := u64(1_700_000_000_000)
+	none: Roster
+	d := draft_from(&none, now << 16)
+	one := draft_scope(&d)
+	m := draft_grant(&d, admin.device, admin.signer, one, {.Write})
+	m.owner = true
+	draft_grant(&d, bob.device, bob.signer, one, {.Write})
+	r1, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	w_disk: Memory_Disk
+	defer memory_disk_destroy(&w_disk)
+	writer: Node
+	testing.expect(t, node_init(&writer, memory_disk(&w_disk), space, &admin, true))
+	defer node_destroy(&writer)
+	writer.now = now
+	testing.expect(t, node_adopt(&writer, r1))
+	d = draft_from(&writer.roster, (now + 1000) << 16)
+	draft_revoke(&d, bob.device, one) // a sweep, a job where storage may answer "not yet"
+	r2, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	testing.expect(t, node_adopt(&writer, r2))
+	d = draft_from(&writer.roster, (now + 2000) << 16)
+	two := draft_scope(&d)
+	r3, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	testing.expect(t, node_adopt(&writer, r3))
+	writer.now = now + 3000
+	for scope in ([]Scope{one, two}) {
+		row := node_id(&writer, scope)
+		place: [24]byte
+		put_u64(place[:], u64(scope) << 32 | 1)
+		put_u64(place[8:], 1)
+		testing.expect(t, node_write(&writer, {{row, PLACE, .Place, node_stamp(&writer), place[:]}}))
+	}
+	relay_disk: Memory_Disk
+	defer memory_disk_destroy(&relay_disk)
+	lazy :: proc(m: ^Memory_Disk) -> Disk {
+		d := memory_disk(m)
+		d.missed = proc(_: rawptr) -> int {return 0}
+		return d
+	}
+	in_two :: proc(n: ^Node, scope: Scope) -> int {
+		return store_range(&n.store, scope_lo(scope), scope_hi(scope)).count
+	}
+	{
+		relay: Node
+		testing.expect(t, node_init(&relay, lazy(&relay_disk), space, nil, true))
+		defer node_destroy(&relay)
+		relay.now = writer.now
+		testing.expect(t, node_adopt(&relay, r1))
+		for node_retry(&relay) {}
+		testing.expect(t, store_checkpoint(&relay.store))
+		held, _ := roster_claims(r1, space)
+		testing.expect(t, node_adopt(&relay, r2) && node_adopt(&relay, r3) && relay.serial == held) // its sweep is yet to be done
+		accept :: proc(_: rawptr, s: ^Session, _: []byte) {session_accept(s)}
+		writer.host.authenticate, relay.host.authenticate = accept, accept
+		sw := session_open(&writer, .Peer, true, {0 = 9}, nil, true) // a relay, as dialled
+		sr := session_open(&relay, .Peer, false, admin.device)
+		for _ in 0 ..< 50 {
+			out := session_output(sw)
+			testing.expect(t, session_input(sr, out))
+			session_sent(sw, len(out))
+			back := session_output(sr)
+			testing.expect(t, session_input(sw, back))
+			session_sent(sr, len(back))
+			if len(out) == 0 && len(back) == 0 {
+				break
+			}
+		}
+		testing.expect(t, store_checkpoint(&relay.store))
+		testing.expect_value(t, in_two(&relay, two), 1)
+		session_close(sw)
+	}
+	relay: Node
+	testing.expect(t, node_init(&relay, lazy(&relay_disk), space, nil, true))
+	defer node_destroy(&relay)
+	relay.now = writer.now
+	testing.expect(t, node_resume(&relay, r2, r3))
+	for node_retry(&relay) {}
+	testing.expect_value(t, in_two(&relay, two), 1)
+}
+
+// A scope of a roster that lost to another drawn up at once is gone, and what was held in it: but a scope of that number
+// the roster after it makes is a scope as any other, though the sweep of the one that went was not done when it came.
+// What was written in it is kept, and what was written in the one that went is not.
+@(test)
+a_scope_made_again_is_not_the_one_that_went :: proc(t: ^testing.T) {
+	root, space := test_root()
+	admin := test_keyring()
+	defer keyring_destroy(&admin)
+	now := u64(1_700_000_000_000)
+	none: Roster
+	d := draft_from(&none, now << 16)
+	one := draft_scope(&d)
+	m := draft_grant(&d, admin.device, admin.signer, one, {.Write})
+	m.owner = true
+	r1, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	w_disk: Memory_Disk
+	defer memory_disk_destroy(&w_disk)
+	writer: Node
+	testing.expect(t, node_init(&writer, memory_disk(&w_disk), space, &admin, true))
+	defer node_destroy(&writer)
+	writer.now = now
+	testing.expect(t, node_adopt(&writer, r1))
+	// Two drawn up at once from the first: one with a second scope, and the other, which wins, without.
+	d = draft_from(&writer.roster, (now + 1000) << 16)
+	testing.expect_value(t, draft_scope(&d), 2)
+	lost, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	won: []byte
+	for {
+		d = draft_from(&writer.roster, (now + 1000) << 16)
+		d.scopes[0].rotate = true
+		won, _ = roster_sign(&admin, root, &d, context.temp_allocator)
+		a, _ := roster_claims(lost, space)
+		b, _ := roster_claims(won, space)
+		if b > a {
+			break
+		}
+	}
+	place :: proc(n: ^Node, scope: Scope) -> Id {
+		row := node_id(n, scope)
+		body: [24]byte
+		put_u64(body[:], u64(scope) << 32 | 1)
+		put_u64(body[8:], 1)
+		assert(node_write(n, {{row, PLACE, .Place, node_stamp(n), body[:]}}))
+		return row
+	}
+	testing.expect(t, node_adopt(&writer, lost))
+	writer.now = now + 2000
+	gone := place(&writer, 2)
+	// And one made at the first moment there is, as a row born then may be.
+	first := Id{2 << 32, 0x12345}
+	{
+		body: [24]byte
+		put_u64(body[:], 2 << 32 | 1)
+		put_u64(body[8:], 1)
+		testing.expect(t, node_write(&writer, {{first, PLACE, .Place, {time = 0, salt = 42}, body[:]}}))
+	}
+	relay_disk: Memory_Disk
+	defer memory_disk_destroy(&relay_disk)
+	lazy := memory_disk(&relay_disk)
+	lazy.missed = proc(_: rawptr) -> int {return 0}
+	relay: Node
+	testing.expect(t, node_init(&relay, lazy, space, nil, true))
+	defer node_destroy(&relay)
+	relay.now = writer.now
+	testing.expect(t, node_adopt(&relay, r1))
+	for node_retry(&relay) {}
+	testing.expect(t, node_adopt(&relay, lost))
+	for node_retry(&relay) {}
+	accept :: proc(_: rawptr, s: ^Session, _: []byte) {session_accept(s)}
+	writer.host.authenticate, relay.host.authenticate = accept, accept
+	sync :: proc(t: ^testing.T, writer, relay: ^Node, admin: Key32) {
+		sw := session_open(writer, .Peer, true, {0 = 9}, nil, true) // a relay, as dialled
+		sr := session_open(relay, .Peer, false, admin)
+		for _ in 0 ..< 50 {
+			out := session_output(sw)
+			testing.expect(t, session_input(sr, out))
+			session_sent(sw, len(out))
+			back := session_output(sr)
+			testing.expect(t, session_input(sw, back))
+			session_sent(sr, len(back))
+			if len(out) == 0 && len(back) == 0 {
+				break
+			}
+		}
+		session_close(sw)
+		session_close(sr)
+	}
+	sync(t, &writer, &relay, admin.device)
+	testing.expect(t, row_places(&relay.store, gone).count > 0 && row_places(&relay.store, first).count > 0)
+	// The one that won comes, and with it the sweep of the scope that went, a job; and before it is done, the roster
+	// after it, which makes a second scope again.
+	testing.expect(t, node_adopt(&writer, won))
+	d = draft_from(&writer.roster, (now + 3000) << 16)
+	testing.expect_value(t, draft_scope(&d), 2)
+	r3, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	testing.expect(t, node_adopt(&writer, r3))
+	writer.now = now + 4000
+	kept := place(&writer, 2)
+	testing.expect(t, node_adopt(&relay, won) && len(relay.sweep.plans) > 0)
+	testing.expect(t, node_adopt(&relay, r3) && len(relay.sweep.plans) > 0)
+	sync(t, &writer, &relay, admin.device)
+	testing.expect(t, row_places(&relay.store, kept).count > 0)
+	for node_retry(&relay) {}
+	testing.expect(t, len(relay.sweep.plans) == 0)
+	testing.expect(t, row_places(&relay.store, kept).count > 0)
+	testing.expect_value(t, row_places(&relay.store, gone).count, 0)
+	testing.expect_value(t, row_places(&relay.store, first).count, 0)
+	testing.expect_value(t, store_range(&relay.store, scope_lo(2), scope_hi(2)).count, 1)
+}
+
+// What a relay holds that it had not yet said it held against any roster, as while its first sweep was a job, or
+// before its log was first written down, is looked at as what was held against a roster not there to compare with:
+// so what is in a scope the roster it starts again with has not is dropped, though nothing it compares with says so.
+@(test)
+what_was_held_against_no_roster_is_looked_at :: proc(t: ^testing.T) {
+	root, space := test_root()
+	admin := test_keyring()
+	defer keyring_destroy(&admin)
+	now := u64(1_700_000_000_000)
+	none: Roster
+	d := draft_from(&none, now << 16)
+	one := draft_scope(&d)
+	m := draft_grant(&d, admin.device, admin.signer, one, {.Write})
+	m.owner = true
+	r0, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	w_disk: Memory_Disk
+	defer memory_disk_destroy(&w_disk)
+	writer: Node
+	testing.expect(t, node_init(&writer, memory_disk(&w_disk), space, &admin, true))
+	defer node_destroy(&writer)
+	writer.now = now
+	testing.expect(t, node_adopt(&writer, r0))
+	accept :: proc(_: rawptr, s: ^Session, _: []byte) {session_accept(s)}
+	writer.host.authenticate = accept
+	for trigger in 0 ..< 2 {
+		// Two drawn up at once: one with a second scope, with the first's key renewed in the first round, so that the
+		// relay's first sweep is a job; and one that wins, without it. Then one after that.
+		d = draft_from(&writer.roster, (now + 1000 + 10_000 * u64(trigger)) << 16)
+		d.scopes[0].rotate = trigger == 0
+		testing.expect_value(t, draft_scope(&d), Scope(2))
+		lost, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+		won: []byte
+		for {
+			d = draft_from(&writer.roster, (now + 1000 + 10_000 * u64(trigger)) << 16)
+			d.scopes[0].rotate = true
+			won, _ = roster_sign(&admin, root, &d, context.temp_allocator)
+			a, _ := roster_claims(lost, space)
+			b, _ := roster_claims(won, space)
+			if b > a {
+				break
+			}
+		}
+		parsed, _ := roster_parse(won, space)
+		d = draft_from(&parsed, (now + 2000 + 10_000 * u64(trigger)) << 16)
+		after, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+		roster_destroy(&parsed)
+		// What the writer writes in the second scope, as the one that lost has it.
+		w2_disk: Memory_Disk
+		defer memory_disk_destroy(&w2_disk)
+		w2: Node
+		testing.expect(t, node_init(&w2, memory_disk(&w2_disk), space, &admin, true))
+		defer node_destroy(&w2)
+		w2.host.authenticate = accept
+		w2.now = writer.now
+		testing.expect(t, node_adopt(&w2, writer.roster.bytes) && node_adopt(&w2, lost))
+		w2.now += 3000
+		row := node_id(&w2, 2)
+		body: [24]byte
+		put_u64(body[:], 2 << 32 | 1)
+		put_u64(body[8:], 1)
+		testing.expect(t, node_write(&w2, {{row, PLACE, .Place, node_stamp(&w2), body[:]}}))
+		relay_disk: Memory_Disk
+		defer memory_disk_destroy(&relay_disk)
+		lazy := memory_disk(&relay_disk)
+		lazy.missed = proc(_: rawptr) -> int {return 0}
+		{
+			relay: Node
+			testing.expect(t, node_init(&relay, lazy, space, nil, true))
+			defer node_destroy(&relay)
+			relay.host.authenticate = accept
+			relay.now = w2.now
+			for node_retry(&relay) {}
+			testing.expect(t, node_adopt(&relay, lost))
+			testing.expect(t, trigger == 1 || relay.serial == 0) // its first sweep is yet to be done
+			sw := session_open(&w2, .Peer, true, {0 = 9}, nil, true)
+			sr := session_open(&relay, .Peer, false, admin.device)
+			for _ in 0 ..< 50 {
+				out := session_output(sw)
+				testing.expect(t, session_input(sr, out))
+				session_sent(sw, len(out))
+				back := session_output(sr)
+				testing.expect(t, session_input(sw, back))
+				session_sent(sr, len(back))
+				if len(out) == 0 && len(back) == 0 {
+					break
+				}
+			}
+			session_close(sw)
+			session_close(sr)
+			testing.expect(t, row_places(&relay.store, row).count > 0)
+			if trigger == 0 {
+				testing.expect(t, store_checkpoint(&relay.store)) // held against no roster, it says
+				testing.expect(t, node_adopt(&relay, won) && node_adopt(&relay, after))
+			} else {
+				testing.expect(t, store_sync(&relay.store)) // in its log alone
+			}
+		}
+		relay: Node
+		testing.expect(t, node_init(&relay, lazy, space, nil, true))
+		defer node_destroy(&relay)
+		relay.now = w2.now
+		if trigger == 0 {
+			for node_retry(&relay) {}
+		}
+		testing.expect_value(t, relay.serial, 0)
+		testing.expect(t, node_resume(&relay, won, after)) // in the second round, as its log is still to be read again
+		for node_retry(&relay) {}
+		serial, _ := roster_claims(after, space)
+		testing.expect_value(t, relay.serial, serial)
+		testing.expectf(t, row_places(&relay.store, row).count == 0, "round %d: what is in a scope there is not was kept", trigger)
+		testing.expect_value(t, store_range(&relay.store, scope_lo(2), scope_hi(2)).count, 0)
+	}
+}
+
+// Of two rosters drawn up at once, what was sealed under a key only the one that lost had is dropped wherever it was
+// held, by a node that sweeps as it takes a roster as by one whose sweep is a job: that made at the first moment there
+// is too.
+@(test)
+the_first_moment_is_swept_too :: proc(t: ^testing.T) {
+	root, space := test_root()
+	admin := test_keyring()
+	defer keyring_destroy(&admin)
+	now := u64(1_700_000_000_000)
+	none: Roster
+	d := draft_from(&none, now << 16)
+	one := draft_scope(&d)
+	m := draft_grant(&d, admin.device, admin.signer, one, {.Write})
+	m.owner = true
+	r1, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	w_disk: Memory_Disk
+	defer memory_disk_destroy(&w_disk)
+	writer: Node
+	testing.expect(t, node_init(&writer, memory_disk(&w_disk), space, &admin, true))
+	defer node_destroy(&writer)
+	writer.now = now
+	testing.expect(t, node_adopt(&writer, r1))
+	// Two drawn up at once, each with a new key for the scope.
+	d = draft_from(&writer.roster, (now + 1000) << 16)
+	d.scopes[0].rotate = true
+	lost, _ := roster_sign(&admin, root, &d, context.temp_allocator)
+	won: []byte
+	for {
+		d = draft_from(&writer.roster, (now + 1000) << 16)
+		d.scopes[0].rotate = true
+		won, _ = roster_sign(&admin, root, &d, context.temp_allocator)
+		a, _ := roster_claims(lost, space)
+		b, _ := roster_claims(won, space)
+		if b > a {
+			break
+		}
+	}
+	testing.expect(t, node_adopt(&writer, lost))
+	writer.now = now + 2000
+	body: [24]byte
+	put_u64(body[:], 1 << 32 | 1)
+	put_u64(body[8:], 1)
+	first, later := Id{1 << 32, 0xaaaa}, node_id(&writer, one)
+	testing.expect(t, node_write(&writer, {{first, PLACE, .Place, {time = 0, salt = 88}, body[:]}}))
+	testing.expect(t, node_write(&writer, {{later, PLACE, .Place, node_stamp(&writer), body[:]}}))
+	accept :: proc(_: rawptr, s: ^Session, _: []byte) {session_accept(s)}
+	writer.host.authenticate = accept
+	for lazy in ([]bool{false, true}) {
+		relay_disk: Memory_Disk
+		defer memory_disk_destroy(&relay_disk)
+		disk := memory_disk(&relay_disk)
+		if lazy {
+			disk.missed = proc(_: rawptr) -> int {return 0}
+		}
+		relay: Node
+		testing.expect(t, node_init(&relay, disk, space, nil, true))
+		defer node_destroy(&relay)
+		relay.host.authenticate = accept
+		relay.now = writer.now
+		testing.expect(t, node_adopt(&relay, lost))
+		for node_retry(&relay) {}
+		sw := session_open(&writer, .Peer, true, {0 = 9}, nil, true)
+		sr := session_open(&relay, .Peer, false, admin.device)
+		for _ in 0 ..< 50 {
+			out := session_output(sw)
+			testing.expect(t, session_input(sr, out))
+			session_sent(sw, len(out))
+			back := session_output(sr)
+			testing.expect(t, session_input(sw, back))
+			session_sent(sr, len(back))
+			if len(out) == 0 && len(back) == 0 {
+				break
+			}
+		}
+		session_close(sw)
+		session_close(sr)
+		testing.expect(t, row_places(&relay.store, first).count > 0 && row_places(&relay.store, later).count > 0)
+		testing.expect(t, node_adopt(&relay, won))
+		for node_retry(&relay) {}
+		testing.expectf(t, row_places(&relay.store, first).count == 0, "lazy %v: made at the first moment, and kept", lazy)
+		testing.expectf(t, row_places(&relay.store, later).count == 0, "lazy %v: made later, and kept", lazy)
+	}
+}
+
+@(private, thread_local)
+signalled: [dynamic]Key32
+
+// A signal, of whatever kind, is taken only from a member, and only through a relay this device dialled: not from one
+// who is no member, though it seals it soundly, nor from one who brings it as if it were a relay.
+@(test)
+signals_are_from_members_through_relays :: proc(t: ^testing.T) {
+	state := seeded(85)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, 2, 0, 1, 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_link(&s, 0, 2)
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	via_relay, direct := s.links[0].a, s.links[1].a
+	testing.expect(t, via_relay.peer_relay && !direct.peer_relay)
+	defer delete(signalled)
+	a.node.host.signal = proc(_: rawptr, from: Key32, _: []byte) {
+		append(&signalled, from)
+	}
+	stranger := test_keyring()
+	defer keyring_destroy(&stranger)
+	signal :: proc(from: ^Keyring, to: Key32, stamp: Stamp) -> []byte {
+		to := to
+		key, _ := signal_key(from, to)
+		bind: [64]byte
+		copy(bind[:], from.device[:])
+		copy(bind[32:], to[:])
+		iv := aead_nonce(stamp, 0, LIVE_KIND + 1)
+		w := make([dynamic]byte, context.temp_allocator)
+		at := frame_begin(&w, .Signal)
+		append(&w, ..from.device[:])
+		write_u8(&w, u8(Post.Plain))
+		write_stamp(&w, stamp)
+		aead_append(&w, key, &iv, bind[:], transmute([]byte)string("here"))
+		frame_end(&w, at)
+		return w[:]
+	}
+	stamp := node_stamp(&a.node)
+	for x in ([]struct {
+			from:    ^Keyring,
+			session: ^Session,
+		}{{&stranger, via_relay}, {&stranger, direct}, {&b.keys, direct}, {&b.keys, via_relay}}) {
+		testing.expect(t, session_input(x.session, signal(x.from, a.keys.device, stamp)))
+	}
+	testing.expect_value(t, len(signalled), 1)
+	testing.expect(t, len(signalled) == 1 && signalled[0] == b.keys.device)
+}

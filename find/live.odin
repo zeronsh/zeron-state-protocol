@@ -34,6 +34,7 @@ Finder :: struct {
 	backs:   [dynamic]^Held, // columns by which questions ask what refers to a row, each once
 	before:  map[u32][dynamic]Anchor, // what rows being gone over had there
 	changed: [dynamic]Changed,
+	batch:   u64, // of those, counted
 	settled: bool, // this node is a full replica
 	again:   [dynamic]^zsp.Session, // to be told everything afresh
 	calls:   [dynamic]Called, // questions from partial replicas, not yet looked at
@@ -111,6 +112,7 @@ Live :: struct {
 	stale:   bool, // the page may have changed
 	renew:   bool, // and so may all of it
 	waited:  int, // the last said of how much of the index is made
+	judged:  u64, // the batch of changes it was last found whole for
 }
 
 finder_open :: proc(f: ^Finder, n: ^zsp.Node, disk: Disk, key: zsp.Key32) {
@@ -173,8 +175,12 @@ finder_asked :: proc(f: ^Finder, s: ^zsp.Session, type: u8, payload: []byte) -> 
 			// The client holds what was shown until it is answered anew.
 			l.shown, old.shown = old.shown, nil
 			l.lives, old.lives = old.lives, nil
-			l.far.keys, old.far.keys = old.far.keys, nil
-			l.far.before, old.far.call = old.far.call, 0
+			if l.far.source != nil {
+				// And what was watched of the answer from afar, until the next replaces it. (Asked of nobody, it is let
+				// go of with the question it was of.)
+				l.far.keys, old.far.keys = old.far.keys, nil
+				l.far.before, old.far.call = old.far.call, 0
+			}
 			l.moved = true
 		}
 		if old != nil {
@@ -474,6 +480,7 @@ finder_after :: proc(data: rawptr, s: ^Scope, row: u32, id: zsp.Id, slots: ^Slot
 finder_done :: proc(data: rawptr) {
 	f := (^Finder)(data)
 	if len(f.changed) > 0 {
+		f.batch += 1
 		for l in f.others {
 			if l.joined {
 				live_touched(l)
@@ -516,6 +523,15 @@ live_changed :: proc(l: ^Live, c: ^Changed) {
 	if c.s.id != l.q.scope {
 		return
 	}
+	if l.judged != l.f.batch {
+		// What it asks of may be being made again, and what is in it now mean nothing: answered afresh. (Once a batch,
+		// which nothing is made again during.)
+		if !query_ready(&l.f.x, &l.q) {
+			l.renew = true
+			return
+		}
+		l.judged = l.f.batch
+	}
 	was := set_has(&l.rows, c.row)
 	now := !c.gone && pred_holds(c.s, &l.q.where_, c.row)
 	if now && !was {
@@ -557,8 +573,16 @@ live_ordered :: proc(l: ^Live, c: ^Changed) -> bool {
 // Asks a question again of the rows it may hold for, or not, because of others that have changed.
 @(private)
 live_touched :: proc(l: ^Live) {
-	if !l.ready || l.renew || l.far.have || !query_ready(&l.f.x, &l.q) {
+	if !l.ready || l.renew || l.far.have {
 		return
+	}
+	if l.judged != l.f.batch {
+		// What it joins may be being made again, as what it asks of may: answered afresh, as live_changed has it.
+		if !query_ready(&l.f.x, &l.q) {
+			l.renew = true
+			return
+		}
+		l.judged = l.f.batch
 	}
 	s := index_scope(&l.f.x, l.q.scope)
 	touched: Set
@@ -599,11 +623,11 @@ pred_touched :: proc(f: ^Finder, s: ^Scope, p: ^Pred, out: ^Set) -> bool {
 	cost := 0
 	refers :: proc(x: ^Index, p: ^Pred, id: zsp.Id, out: ^Set, cost: ^int) -> bool {
 		key := Key{id[0], id[1]}
-		cost^ += tree_between(x, p.held.by_key, key, key_next(key)).count
+		cost^ += tree_between(x, p.held.by_key, key, key, through = true).count
 		if cost^ > TOUCHED + p.held.scope.all.count / 64 {
 			return false
 		}
-		tree_subs(x, p.held.by_key, key, key_next(key), out)
+		tree_subs(x, p.held.by_key, key, key, out, through = true)
 		return true
 	}
 	referred :: proc(s: ^Scope, key: Key, out: ^Set) {
@@ -978,35 +1002,8 @@ far_run :: proc(l: ^Live) {
 		}
 		far_drop(l)
 	}
-	reach := zsp.node_reach(f.n)
-	#reverse for device, i in far.tried {
-		if !slice.contains(reach, device) {
-			unordered_remove(&far.tried, i) // it may come back otherwise minded
-		}
-	}
-	if far.call == 0 {
-		for device in reach {
-			if slice.contains(far.tried[:], device) {
-				continue
-			}
-			if far.call = zsp.node_call(f.n, device, l.q.scope, far.source); far.call != 0 {
-				far.device = device
-				break
-			}
-		}
-	}
-	if far.have {
-		near_drop(l) // another answers, and what was fetched for the question is held no longer than anything
-	} else {
-		near_run(l, start = far.call == 0) // and while one is being asked, whether what was fetched is still confirmed
-	}
-	far_past(l)
-	if far.call != 0 && far.spent > 0 {
-		w := make([dynamic]byte, context.temp_allocator)
-		zsp.write_varint(&w, u64(far.spent))
-		zsp.node_flow(f.n, far.call, .Credit, w[:])
-		far.spent = 0
-	}
+	// An answer given up on is so before another is asked: so that, in the same turn, another is, or what was fetched
+	// is watched for it, rather than what is held being said to be the answer.
 	if far.next != nil {
 		next := far.next
 		far.next = nil
@@ -1026,10 +1023,64 @@ far_run :: proc(l: ^Live) {
 			far.due = true
 		}
 	}
+	if far.due && l.once && far_missing(l) {
+		// It named a row where a full replica says there is none: it will not come there, and the answer is not one. (An
+		// answer that stays is put right by the next, as what is here is said meanwhile: it is waited for.)
+		zsp.node_flow(f.n, far.call, .Cancel)
+		far.call = 0
+		append(&far.tried, far.device)
+		far_drop(l)
+	}
+	reach := zsp.node_reach(f.n)
+	#reverse for device, i in far.tried {
+		if !slice.contains(reach, device) {
+			unordered_remove(&far.tried, i) // it may come back otherwise minded
+		}
+	}
+	if far.call == 0 {
+		for device in reach {
+			if slice.contains(far.tried[:], device) {
+				continue
+			}
+			if far.call = zsp.node_call(f.n, device, l.q.scope, far.source); far.call != 0 {
+				far.device = device
+				break
+			}
+		}
+	}
+	if far.call == 0 && !far.have && len(far.keys) > 0 {
+		far_drop(l) // what was watched of an answer from afar that nobody is now asked to put right
+	}
+	if far.have {
+		near_drop(l) // another answers, and what was fetched for the question is held no longer than anything
+	} else {
+		near_run(l, start = far.call == 0) // and while one is being asked, whether what was fetched is still confirmed
+	}
+	far_past(l)
+	if far.call != 0 && far.spent > 0 {
+		w := make([dynamic]byte, context.temp_allocator)
+		zsp.write_varint(&w, u64(far.spent))
+		zsp.node_flow(f.n, far.call, .Credit, w[:])
+		far.spent = 0
+	}
 	if far.due && far_whole(l) {
 		far.due, far.have = false, true
 		far_say(l)
 	}
+}
+
+// Whether a row of an answer from afar is not where it was said to be, as a full replica has confirmed.
+@(private)
+far_missing :: proc(l: ^Live) -> bool {
+	for k in l.far.keys {
+		if zsp.is_graveyard(zsp.key_list(k)) || zsp.row_places(&l.f.n.store, zsp.key_row(k)).count > 0 {
+			continue
+		}
+		if _, sure, _ := zsp.session_wanted(l.session, k, zsp.key_next(k)); sure {
+			return true
+		}
+	}
+	return false
 }
 
 // Nobody to ask can read, but what it is about may be had from one that holds everything, as a relay does: the lists
@@ -1157,16 +1208,25 @@ far_wants :: proc(l: ^Live, r: ^zsp.Reader) -> bool {
 		append(&keys, k)
 		new[k], rows[zsp.key_row(k)] = true, true
 	}
+	// Only what is wanted is said to be, so that what is let go of is this answer's alone.
+	had := make([dynamic]zsp.Key, 0, n)
 	for k in l.far.keys {
 		if k in new {
 			delete_key(&new, k)
+			append(&had, k)
 		} else {
 			zsp.session_unwants(l.session, k, zsp.key_next(k), true)
 		}
 	}
+	delete(l.far.keys)
+	l.far.keys = had
 	for k in keys {
 		if k in new {
-			zsp.session_wants(l.session, k, zsp.key_next(k), true)
+			if !zsp.session_wants(l.session, k, zsp.key_next(k), true) {
+				delete(keys)
+				return false // no more may be watched, and so the rows would never come: as if nobody could answer
+			}
+			append(&l.far.keys, k)
 		}
 	}
 	delete(l.far.keys)
@@ -1300,7 +1360,8 @@ live_wants :: proc(l: ^Live, page: []zsp.Id) {
 		}
 	}
 	for w in want[:count] {
-		zsp.session_wants(l.session, w[0], w[1])
-		append(&l.lives, w)
+		if zsp.session_wants(l.session, w[0], w[1]) { // else no more may be watched, and none of it is to come
+			append(&l.lives, w)
+		}
 	}
 }

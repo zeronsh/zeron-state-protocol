@@ -119,18 +119,21 @@ signature (64, Ed25519 over everything before it)
 
 A serial is term × 2⁴⁴ + count × 2²⁰ + 20 random bits, its term being the charter's. Of two valid rosters the higher serial wins: a new charter
 outranks whatever was signed under an old one, however high it counts; and of two rosters drawn up at once, all agree which it is, and the other's
-change is to be made again. An admin carries the charter over untouched, and must hold every scope's keys. With all but the charter an admin is
+change is to be made again. An admin carries the charter over untouched, and must hold every scope's keys: one whose rights end in a scope is an admin no longer, which only an owner can say. With all but the charter an admin is
 trusted: who is who, who may do what, and when that ended.
 
 But no admin can shut an owner out. A roster is invalid unless every owner in its charter is a member, with the charter's signer, and Read and Write in force
-in every scope. No two members share a device or a signer. A key that does not match its commitment is as good as none; a device keeps, sealed for itself, the keys it
+in every scope. No two members share a device or a signer. No key that a secret is shared with, the charter's ephemeral key, the roster's, or a
+device, is one of small order (0, 1, −1, p, p + 1 or either point of order 8, whatever its top bit), with which nothing can be wrapped: a roster with
+one is invalid. A key that does not match its commitment is as good as none; a device keeps, sealed for itself, the keys it
 has learnt, so that nothing garbled later takes them away; and an owner signs although a key was kept from it, declaring that epoch **void** by
 closing it no later than the one before (the first, at 0), with 32 zero bytes for its key in `history`. Nothing sealed under a void epoch is acceptable; what honest
 members sealed under it they seal again.
 
 Rights are bits: 1 Read, 2 Write, 4 Call, 8 Vouch: to be believed about for whom one writes and calls (§4, §12); a grant with any other is invalid. Every grant includes Read. Scope flag 1 is **signed**; a grant without Write is
 invalid in a scope that is not signed. `until` is zero for a grant in force, and otherwise the stamp time at which it ended;
-a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed; and so does taking Vouch away in a signed scope. `closed`
+a member has at most one in force per scope. Taking Write away ends the grant and adds another, so that what it allowed stays allowed; and so does taking Vouch away in a signed scope. Anything else is
+taken away in place, nothing written hanging on it. `closed`
 says when each earlier epoch ended. Both should be no less than any stamp the signer has seen. No device appears twice.
 `subject` is the consumer's name for whomever the device belongs to, opaque here. A roster that does not begin `"zsp-r1"` is none. A roster is at most 2²² − 64 bytes. Members are never removed, only their grants
 ended, so that a member's index is for ever.
@@ -162,8 +165,8 @@ row ‖ slot ‖ kind ‖ clear prefix. The bracketed parts exist in signed scop
 the signature, by that member's signer, covers row ‖ slot ‖ kind ‖ stamp ‖ body short of the signature. In a signed scope the plaintext is
 `as` (bytes, at most 64) ‖ what was written: for whom its author wrote it, if for another than its device belongs to, and otherwise nothing.
 
-**Whose a cell is**, in a signed scope: that of whom `as` names, if a grant of the author's there includes Vouch, with `until` zero or no less than when it was written, and `as` is not
-empty; otherwise its author's `subject`. Nothing is refused over it, and a relay sees none of it. In an unsigned scope a cell is nobody's. A host says for whom a local client is as it accepts it, and a node writes nothing there for
+**Whose a cell is**, in a signed scope: that of whom `as` names, if a grant of the author's there includes Vouch, with `until` zero or no less than when it was written
+(of a bundle, when the last of what it names was), and `as` is not empty; otherwise its author's `subject`. Nothing is refused over it, and a relay sees none of it. In an unsigned scope a cell is nobody's. A host says for whom a local client is as it accepts it, and a node writes nothing there for
 anybody else without Vouch: that is *denied*. What is sealed again keeps its `as`.
 
 A replica accepts a cell from a peer only if
@@ -175,14 +178,17 @@ A replica accepts a cell from a peer only if
 - where the replica holds the scope's key, the seal opens. Otherwise garbage could win by claiming a late stamp.
 
 A cell was **written** at its stamp time, but a bundle when the first of what it names was: its author may put together what it had a right to write after that right has ended,
-as may well be before it hears. Whoever opens a bundle in a signed scope passes over what its author had no right to write at that stamp's time, or has none now.
+as may well be before it hears. Yet a bundle kills all it names, and so in a signed scope its author's grant must also stand at the time of the last of them, or
+it is not acceptable: whoever may no longer write cannot, by naming first something from before, kill what was written since. Whoever opens a bundle in a signed scope passes over what its author had no right to write at that stamp's time, or has none now.
 
 In a signed scope authority travels with the cell, so anyone may carry it. In an unsigned scope, to hold the key is to be a writer.
 
 On adopting a roster, and on starting with one it has not yet held its cells against, a replica looks again at cells later than any epoch or grant
 it ends. In an unsigned scope, one that is no longer acceptable is sealed again, with the same stamp, under the key in force at that stamp's
-time, by a replica that can open it, since someone may merely not have heard; in a signed scope, by its author alone, for a void key; otherwise it is dropped.
-A roster that does not extend the one held (a prefix of whose members, grants, keys and times it keeps) won over it: then everything held is looked at. A partial replica that may have written there offers again
+time, by a replica that can open it, since someone may merely not have heard; in a signed scope, by its author alone, for a void key, or for a bundle that names more than its author may still kill, which it puts together again, with
+the same stamp, of only what it may name and had the right to write; otherwise it is dropped.
+A roster that does not extend the one held (a prefix of whose members, grants, keys and times it keeps, the grants with all their rights but Call, and
+Vouch where a scope is not signed) won over it: then everything held is looked at, and so it is by one that starts with its cells held against a roster it no longer has to compare with. A partial replica that may have written there offers again
 all it holds in that scope, for who took it may be gone. Then, whatever the roster changed, each device watches afresh, partial ones under new ids. A device's clock moves past
 the end of everything that has ended, but for what is too far ahead. Where a cell is
 held already, another body for the same identity is ignored.
@@ -202,8 +208,8 @@ Orders are public to it, so derive them from time or rank rather than content.
 A slot holding text is at most one `Value` (a whole text) and `Piece`s and `Bundle`s with later stamps. The text is a function of
 that set alone. Elements are UTF-8 bytes; applications edit at character boundaries.
 
-A piece's open body is id (8, random, nonzero) ‖ operations. A bundle's, after its clear prefix, is any number of
-stamp (16) ‖ id (8) ‖ operations (bytes), ascending by stamp. A `Value` acts as a piece whose id is its salt, or 1 if that is zero, and whose one operation
+A piece's open body is id (8, random, nonzero) ‖ operations; one shorter than an id is no piece of the text. A bundle's, after its clear prefix, is any number of
+stamp (16) ‖ id (8) ‖ operations (bytes), ascending by stamp. None is later than the last stamp the bundle names, as none is that was put together of what it names: it is no part of the text, nor of any bundle put together of the bundle, as it would else be taken for written before the bundle was. A `Value` acts as a piece whose id is its salt, or 1 if that is zero, and whose one operation
 inserts its body into an empty text.
 
 ```
@@ -219,7 +225,8 @@ element, other than `left`, that hangs beneath `left`, however far down (everyth
 Each further element hangs on the right of the one before it. The text is the tree read in order: for each element, what hangs on its left, then itself,
 then what hangs on its right; what hangs on one side, each with all beneath it, in order of piece id and then of number. Whatever anyone says of
 neighbours, then, the text is a function of the set of pieces alone, and where they were honest the insertion is where it was typed. Operations apply in
-order within a piece; one that refers to what is not yet present waits, with the rest of its piece, until it is. (Two open pieces may refer to each
+order within a piece; one that refers to what is not yet present waits, with the rest of its piece, until it is. What is no operation, or refers to what its own
+piece has yet to make, never will be, and nor will the rest of its piece. (Two open pieces may refer to each
 other, so pieces are never applied all-or-nothing.)
 
 Nobody need walk the tree: siblings, each with all beneath it, lie one stretch after another, so a place is found by halving; and an ancestor at any
@@ -448,9 +455,11 @@ slow to arrive, or whose pipe was full, sees the rest as it is typed.
 A call is a stream of messages each way. `device` is the callee's on the way out and the caller's on arrival. For whom is at most 64 bytes: what a client says of that is disregarded, and its node says whom its host accepted it for, or nothing; the
 last node tells its own client the same if the calling device has Vouch in that scope, and otherwise the device's `subject`. Who may not vouch may not call for another: *denied*. Ids belong to whoever sent
 Call on that session. A call ends when both sides have sent End, or on Fault or Cancel. Each side may have 256 KiB of messages outstanding beyond what the
-other has credited, and may be credited ahead of what it has sent up to 4 MiB; the first message counts. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
+other has credited, and may be credited ahead of what it has sent up to 4 MiB, a node passing on of a credit what it comes to within that; the first message counts. A Flow
+whose payload is not what its kind says, as a credit that is not one varint or a fault without its code, is the sender's session's fault. One message is at most 256 KiB, and a method's name from 1 to 255 bytes (§15 has the use of none).
 What answers a call at a device is the device's affair: a local client that serves the method, or the host itself in its stead; to the caller
-they are alike.
+they are alike. (Here a local client serves at most 256 methods at once, and whether it may answer is asked as a call comes: of those that serve
+a method, one that may not call in the scope is passed over.)
 
 What a node committed before a call it sends on its way before it, and so does a relay: whoever is called has what the call is about, unless so much was committed at once that one of them has to
 compare afresh (§9). Both devices need the Call right in the scope, and both check. A call takes a direct session with the device if there is one, one that
@@ -488,8 +497,9 @@ docs/relay-storage.md.)
 | 0 | stamp (16) ‖ XChaCha20-Poly1305 under derive(X25519 of the two devices, "zsp-signal"), nonce stamp ‖ 0 ‖ 0x41 ‖ 0 (6), associated data from ‖ to |
 | 7 | a link's packet (§14), as over UDP |
 
-Others are passed over. Devices with no direct link reach each other by a **link through a relay**: the same link as over UDP, its packets in signals
-of kind 7, taken only from members and only through a relay the receiver dialled. Whoever has a call to make and no session for it dials; the other
+Others are passed over, as is a signal of any kind from a device that is not a member, or that comes other than through a relay the receiver
+dialled. Devices with no direct link reach each other by a **link through a relay**: the same link as over UDP, its packets in signals
+of kind 7. Whoever has a call to make and no session for it dials; the other
 answers. Over it runs a calls session (§8). Its packets are at most 8192 bytes; it needs no probing of its path's size, and no NAT keeps it. A
 packet that comes newest yet by another relay both are present at moves the link there, and an end whose relay has gone, or whose peer has gone
 from it, sends by another: a link outlives a relay, and its calls with it. A link whose calls have been over for 30 seconds is closed.
@@ -630,14 +640,16 @@ The flags of a match: 1, the last word may be only begun; 2, words may be parts 
 five letters at most one. A word is a run of letters and digits, without case or marks, the first 64 bytes of which count; an apostrophe between letters is
 passed over; scripts that write no spaces are taken in overlapping pairs. How well a row answers is Okapi BM25 (k₁ 1.2, b 0.75), its sole use being an order.
 
-A question has at most 8 orders, 64 totals, none of kind 6, sums only of kind 3, 4096 conditions 32 deep, and 4096 bytes of text to match, or it is *faulty*. A limit or a `top` above 1000 is taken for
+A question has at most 8 orders, 64 totals, none of kind 6, sums only of kind 3, 4096 conditions 32 deep (each value of a 5 counting as one), 4096 bytes of text to match in all, and 32 words of it to be matched with a letter
+wrong or as parts of words, each of which goes over every word there is, or it is *faulty*. A limit or a `top` above 1000 is taken for
 1000. An answer is at most 256 KiB: a question whose answer is longer is *faulty*, and is asked no longer. A session has at most 1024 questions.
 
 **Passing on.** A partial replica has a full one answer. It calls (§12) the device by the method with no name, which is for nodes themselves: no client may call or
 serve it, and it needs Read where others need Call, in every scope the question is about. The first message is the question. Each message back is an Answer without its id, and with
 each row's key, as in a Watch, in place of its id, any key of it. The partial replica watches those
 places, data and live, and answers its client once it holds the rows. It believes nothing else that would not be an answer to what it asked. A device that will not answer faults *unserved*, and another is asked; until one
-does, and when none can be reached, the answer is of what is held. A Fetch waits for the other, if one can be reached, and for its rows to be confirmed.
+does, and when none can be reached, the answer is of what is held. A Fetch waits for the other, if one can be reached, and for its rows to be confirmed: an answer
+that names a row where a full replica confirms there is none is no answer to it, and another is asked. A question that stays waits for the next answer.
 
 With none to ask that can read, but a full replica that may be sent the scope and holds what it cannot, as a relay, a partial replica watches, data and
 live, a list the question's rows must all be in, if it names one at its top and joins no others, and answers as it would were it full; the answer is

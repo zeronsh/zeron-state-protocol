@@ -142,6 +142,42 @@ tree_matches_model :: proc(t: ^testing.T) {
 					s.at += 1
 				})
 				testing.expect(t, s.ok && s.at == len(all))
+				// And up to it, from the first.
+				s = Seen{all[:], 0, true}
+				tree_each(&p, tr, KEY_MIN, probe.key, &s, proc(data: rawptr, e: ^Entry) {
+					s := (^Seen)(data)
+					s.ok &&= s.at < len(s.all) && s.all[s.at] == e^
+					s.at += 1
+				})
+				testing.expect(t, s.ok && s.at == first)
+				subs: Set
+				tree_subs(&p, tr, KEY_MIN, probe.key, &subs)
+				unlike := make(map[u32]bool, context.temp_allocator)
+				for e in all[:first] {
+					unlike[e.sub] = true
+				}
+				testing.expect_value(t, subs.count, len(unlike))
+				set_destroy(&subs)
+				// And of one key alone, through it.
+				same := 0
+				for e in all {
+					same += 1 if e.key == probe.key else 0
+				}
+				testing.expect_value(t, tree_between(&p, tr, probe.key, probe.key, through = true).count, same)
+				s = Seen{all[:], first, true}
+				tree_each(&p, tr, probe.key, probe.key, &s, proc(data: rawptr, e: ^Entry) {
+					s := (^Seen)(data)
+					s.ok &&= s.at < len(s.all) && s.all[s.at] == e^
+					s.at += 1
+				}, through = true)
+				testing.expect(t, s.ok && s.at == first + same)
+				tree_subs(&p, tr, probe.key, probe.key, &subs, through = true)
+				clear(&unlike)
+				for e in all[first:][:same] {
+					unlike[e.sub] = true
+				}
+				testing.expect_value(t, subs.count, len(unlike))
+				set_destroy(&subs)
 			}
 			cursor_destroy(&c)
 		}
@@ -149,6 +185,95 @@ tree_matches_model :: proc(t: ^testing.T) {
 		tree_clear(&p, &tr)
 		testing.expect_value(t, len(p.free) + len(p.pending) + HEADERS, int(p.next))
 	}
+}
+
+// A range through one of the last keys there can be has that key's entries, and none of the key after it: KEY_MAX's
+// among them, which a range up to KEY_MAX includes.
+@(test)
+ranges_through_the_last_keys :: proc(t: ^testing.T) {
+	m: Memory_Disk
+	defer memory_disk_destroy(&m)
+	p: Pager
+	key: zsp.Key32
+	pager_open(&p, memory_disk(&m), key)
+	defer pager_close(&p)
+	tr := Tree{width = .Varint}
+	last := [3]Key{{max(u64), max(u64) - 2}, {max(u64), max(u64) - 1}, KEY_MAX}
+	edits := make([dynamic]Edit, context.temp_allocator)
+	for i in u32(0) ..< 5000 {
+		append(&edits, Edit{entry = {key = {u64(i), 0}, sub = i}})
+	}
+	for k, i in last {
+		for sub in u32(0) ..< u32(700 * (i + 1)) {
+			append(&edits, Edit{entry = {key = k, sub = sub * 3 + u32(i), val = u64(i)}})
+		}
+	}
+	tree_apply(&p, &tr, edits[:])
+	testing.expect(t, page_get(&p, tr.root).level > 0)
+	for k, i in last {
+		want := 700 * (i + 1)
+		testing.expect_value(t, tree_between(&p, tr, k, k, through = true).count, want)
+		Seen :: struct {
+			key:   Key,
+			count: int,
+			ok:    bool,
+		}
+		s := Seen{k, 0, true}
+		tree_each(&p, tr, k, k, &s, proc(data: rawptr, e: ^Entry) {
+			s := (^Seen)(data)
+			s.ok &&= e.key == s.key
+			s.count += 1
+		}, through = true)
+		testing.expect(t, s.ok)
+		testing.expect_value(t, s.count, want)
+		subs: Set
+		tree_subs(&p, tr, k, k, &subs, through = true)
+		testing.expect_value(t, subs.count, want)
+		it := set_iterator(&subs)
+		for sub in set_next(&it) {
+			testing.expect_value(t, sub % 3, u32(i))
+		}
+		set_destroy(&subs)
+	}
+	// And from the first, through the last but one.
+	testing.expect_value(t, tree_between(&p, tr, KEY_MIN, last[1], through = true).count, 5000 + 700 + 1400)
+	subs: Set
+	defer set_destroy(&subs)
+	tree_subs(&p, tr, KEY_MIN, last[1], &subs, through = true)
+	testing.expect_value(t, subs.count, 5000)
+	tree_clear(&p, &tr)
+}
+
+// What comes before all there was, put in one edit at a time, is found by what it is, as by any other.
+@(test)
+a_new_first_is_found :: proc(t: ^testing.T) {
+	m: Memory_Disk
+	defer memory_disk_destroy(&m)
+	p: Pager
+	key: zsp.Key32
+	pager_open(&p, memory_disk(&m), key)
+	defer pager_close(&p)
+	tr: Tree
+	edits := make([dynamic]Edit, context.temp_allocator)
+	for i in 0 ..< 3000 {
+		append(&edits, Edit{entry = {key = number_key(f64(1000 + i)), sub = u32(i)}})
+	}
+	tree_apply(&p, &tr, edits[:])
+	testing.expect(t, page_get(&p, tr.root).level > 0)
+	for i in 0 ..< 3 {
+		first := Edit{entry = {key = number_key(f64(10 - i)), sub = u32(5000 + i)}}
+		tree_apply(&p, &tr, {first})
+		subs: Set
+		defer set_destroy(&subs)
+		tree_subs(&p, tr, KEY_MIN, number_key(500), &subs)
+		testing.expect_value(t, subs.count, i + 1)
+		found := 0
+		tree_each(&p, tr, number_key(f64(10 - i)), number_key(f64(11 - i)), &found, proc(data: rawptr, e: ^Entry) {
+			(^int)(data)^ += 1
+		})
+		testing.expect_value(t, found, 1)
+	}
+	tree_clear(&p, &tr)
 }
 
 @(test)
@@ -162,4 +287,57 @@ numbers_sort_as_numbers :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, number_key(-0.0) == number_key(0))
+}
+
+// A page that cannot be read is read as empty, and the pager says it failed, so that the index is made again: whatever
+// goes over the tree meanwhile finds less than there was, and goes no further than there is.
+@(test)
+unreadable_pages_are_empty :: proc(t: ^testing.T) {
+	for round in 0 ..< 2 {
+		m: Memory_Disk
+		defer memory_disk_destroy(&m)
+		p: Pager
+		key: zsp.Key32
+		pager_open(&p, memory_disk(&m), key)
+		defer pager_close(&p)
+		tr := Tree{width = .Varint}
+		edits := make([dynamic]Edit, context.temp_allocator)
+		for i in u32(0) ..< (30000 if round == 0 else 2000) {
+			append(&edits, Edit{entry = {key = {u64(i) * 1600003, u64(i) * 9176}, sub = i, val = u64(i)}})
+		}
+		tree_apply(&p, &tr, edits[:])
+		root := page_get(&p, tr.root)
+		testing.expect(t, root.level >= (2 if round == 0 else 1))
+		// Every page but the root and the last of each level is as one that failed to be read.
+		keep := make(map[u32]bool, context.temp_allocator)
+		keep[tr.root] = true
+		for pg := root; pg.level > 0; {
+			last := children(pg)[pg.count - 1].child
+			if round == 0 {
+				keep[last] = true
+			}
+			pg = page_get(&p, last)
+		}
+		for no, f in p.dirty {
+			if no not_in keep {
+				f.page = {}
+			}
+		}
+		for no, f in p.open {
+			if no not_in keep {
+				f.page = {}
+			}
+		}
+		p.failed = true
+		if round == 0 {
+			c := cursor_make(&p, tr)
+			cursor_seek(&c, KEY_MAX, max(u32))
+			for _ in cursor_prev(&c) {
+			}
+			cursor_destroy(&c)
+		} else {
+			tree_apply(&p, &tr, {{entry = {key = {0, 0}}, gone = true}})
+		}
+		testing.expect(t, p.failed)
+	}
 }

@@ -931,6 +931,15 @@ network_converges_through_remote_relays :: proc(t: ^testing.T) {
 	sim_worlds(t, .Remote)
 }
 
+// Worlds in which a relay started again with more than one roster still to look over, the one it held its cells against
+// being neither of the two its host kept: and so not known to have been drawn up at once with another that won. Cells
+// sealed under a key only that one had were kept.
+@(test)
+network_converges_seeds_3136_and_3951 :: proc(t: ^testing.T) {
+	sim_worlds(t, .Slow, 3136, 1)
+	sim_worlds(t, .Remote, 3951, 1)
+}
+
 @(private)
 sim_worlds :: proc(t: ^testing.T, lazy: Sim_Storage, first := #config(ZSP_FIRST_SEED, 0), seeds := #config(ZSP_SEEDS, 6)) {
 	missed, writes, reads := 0, 0, 0
@@ -3016,7 +3025,7 @@ missing_only_theirs_is_missing_nothing :: proc(t: ^testing.T) {
 }
 
 // What is queued to be sent is not queued again: a row, nor what a Fill still to come will send; but what a step undone
-// took back is, and what goes first is not taken to be sent by what goes after it.
+// took back is, and so is what one begun has passed, and what goes first is not taken to be sent by what goes after it.
 @(test)
 queued_once :: proc(t: ^testing.T) {
 	state := seeded(108)
@@ -3031,22 +3040,32 @@ queued_once :: proc(t: ^testing.T) {
 	key := Key{list_lo(list)[0], list_lo(list)[1], 7, 1, 2}
 	other := Key{list_lo(list)[0], list_lo(list)[1], 9, 3, 4}
 	base := len(at.tasks)
-	push_row(at, key)
-	push_row(at, key)
+	push_row(at, key_row(key), false)
+	push_row(at, key_row(key), false)
 	testing.expect_value(t, len(at.tasks) - base, 1)
 	// Taken back, as by a step undone: then queued again.
 	resize(&at.tasks, base)
-	push_row(at, key)
+	push_row(at, key_row(key), false)
 	testing.expect_value(t, len(at.tasks) - base, 1)
+	// Begun, it sent some of the row as it was then: the rest is not all of it.
+	at.tasks[base].lo = key_next(Key{key[0], key[1], 0, 0, 0})
+	push_row(at, key_row(key), false)
+	testing.expect_value(t, len(at.tasks) - base, 2)
 	// What a Fill still to come will send.
 	queue(at, false, {kind = .Fill, lo = list_lo(list), hi = list_hi(list)})
-	push_row(at, other)
-	testing.expect_value(t, len(at.tasks) - base, 2)
+	push_range(at, other, key_next(other), 0, false)
+	push_range(at, key, list_hi(list), 0, false)
+	testing.expect_value(t, len(at.tasks) - base, 3)
+	// But not what it has gone past.
+	at.tasks[len(at.tasks) - 1].lo = key_next(other)
+	push_range(at, key, list_hi(list), 0, false)
+	testing.expect_value(t, len(at.tasks) - base, 4)
 	// Hurried: only what goes first counts.
 	at.hurrying = true
-	push_row(at, key)
+	push_row(at, key_row(other), true)
+	push_range(at, other, key_next(other), 0, false)
 	at.hurrying = false
-	testing.expect_value(t, len(at.first), 1)
+	testing.expect_value(t, len(at.first), 2)
 	clear(&at.tasks)
 	clear(&at.first)
 	at.task_head, at.first_head = 0, 0

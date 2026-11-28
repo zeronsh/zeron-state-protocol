@@ -191,6 +191,10 @@ text_apply :: proc(t: ^Text, c: ^Cell) -> Text_Result {
 		return text_piece(t, get_u64(c.body), c.stamp, c.body[8:])
 	case .Bundle:
 		r := Reader{buf = c.body, pos = clear_size(.Bundle, c.body)}
+		if r.pos > len(r.buf) || get_u32(c.body) == 0 {
+			return .Same
+		}
+		last := bundle_at(c.body, int(get_u32(c.body)) - 1)
 		out := Text_Result.Same
 		for r.pos < len(r.buf) {
 			stamp := read_stamp(&r)
@@ -199,7 +203,9 @@ text_apply :: proc(t: ^Text, c: ^Cell) -> Text_Result {
 			if r.bad {
 				break
 			}
-			if !stamp_less(t.base, stamp) {
+			// Nor anything later than the last it names, as nothing put together of what it names is: it would be
+			// taken for written before the bundle was.
+			if !stamp_less(t.base, stamp) || stamp_less(last, stamp) {
 				continue
 			}
 			switch text_piece(t, id, stamp, ops) {
@@ -230,7 +236,7 @@ text_live :: proc(t: ^Text, piece: u64, offset: int, bytes: []byte) -> Text_Resu
 	if !known {
 		no = piece_make(t, piece)
 	}
-	if text_ops(t, no, bytes[int(p.fed) - offset:]) == 0 {
+	if done, _ := text_ops(t, no, bytes[int(p.fed) - offset:]); done == 0 {
 		if !known { // none of it could be put anywhere, so there is none of it
 			delete_key(&t.numbers, piece)
 			pop(&t.pieces)
@@ -292,8 +298,9 @@ text_piece :: proc(t: ^Text, id: u64, stamp: Stamp, ops: []byte) -> Text_Result 
 	shown_free(p)
 	p.stamp = stamp
 	fed := int(p.fed)
-	at := fed + text_ops(t, no, ops[fed:])
-	if at < len(ops) {
+	done, bad := text_ops(t, no, ops[fed:])
+	at := fed + done
+	if at < len(ops) && !bad { // what is not operations at all waits for nothing
 		rest := make([]byte, len(ops) - at)
 		copy(rest, ops[at:])
 		append(&t.waiting, Waiting{no, rest, 0})
@@ -312,22 +319,25 @@ text_piece :: proc(t: ^Text, id: u64, stamp: Stamp, ops: []byte) -> Text_Result 
 text_retry :: proc(t: ^Text) {
 	for i := 0; i < len(t.waiting); {
 		w := &t.waiting[i]
-		n := text_ops(t, w.piece, w.rest[w.at:])
+		n, bad := text_ops(t, w.piece, w.rest[w.at:])
 		w.at += n
-		if w.at == len(w.rest) {
+		if w.at == len(w.rest) || bad {
 			delete(w.rest)
 			unordered_remove(&t.waiting, i)
+			if n == 0 {
+				continue // what takes its place is yet to be gone over
+			}
 		}
 		i = 0 if n > 0 else i + 1
 	}
 }
 
-// Integrates operations in order until one refers to what is not here yet. Returns the bytes consumed.
+// Integrates operations in order until one refers to what is not here yet. Returns the bytes consumed, and whether what
+// follows them is no operation at all, and so is never to be.
 @(private)
-text_ops :: proc(t: ^Text, no: u32, ops: []byte) -> int {
+text_ops :: proc(t: ^Text, no: u32, ops: []byte) -> (done: int, bad: bool) {
 	r := Reader{buf = ops}
 	id := t.pieces[no].id
-	done := 0
 	for r.pos < len(r.buf) {
 		op := Op(read_u8(&r))
 		first, right: Ref
@@ -352,6 +362,7 @@ text_ops :: proc(t: ^Text, no: u32, ops: []byte) -> int {
 			r.bad = true
 		}
 		if r.bad {
+			bad = true
 			break
 		}
 		a, b: Spot
@@ -360,9 +371,11 @@ text_ops :: proc(t: ^Text, no: u32, ops: []byte) -> int {
 		} else {
 			have: bool
 			if a, have = text_spot(t, first, count); !have {
+				bad = first.piece == id // what this piece has yet to make, it never will before it is wanted
 				break
 			}
 			if b, have = text_spot(t, right, 1); !have {
+				bad = right.piece == id
 				break
 			}
 		}
@@ -381,7 +394,7 @@ text_ops :: proc(t: ^Text, no: u32, ops: []byte) -> int {
 		p.fed += u32(r.pos - done)
 		done = r.pos
 	}
-	return done
+	return
 }
 
 // Where elements are, if they are here.
@@ -1118,23 +1131,35 @@ text_bundle :: proc(cells: []Cell, allocator := context.allocator) -> (out: Cell
 	inner := make([dynamic]Inner, context.temp_allocator)
 	names := make([dynamic]Stamp, context.temp_allocator)
 	for &c in cells {
+		out.row, out.slot = c.row, c.slot
 		#partial switch c.kind {
 		case .Piece:
 			append(&names, c.stamp)
-			append(&inner, Inner{c.stamp, get_u64(c.body), c.body[8:]})
+			if len(c.body) >= 8 { // else it is no piece of any text, and is gone with nothing in its place
+				append(&inner, Inner{c.stamp, get_u64(c.body), c.body[8:]})
+			}
 		case .Bundle:
 			append(&names, c.stamp)
+			if len(c.body) < clear_size(.Bundle, c.body) || get_u32(c.body) == 0 {
+				continue // no bundle, and nothing of the text: gone with nothing in its place, as a piece too short is
+			}
 			for i in 0 ..< int(get_u32(c.body)) {
 				append(&names, bundle_at(c.body, i))
 			}
 			r := Reader{buf = c.body, pos = clear_size(.Bundle, c.body)}
+			last := bundle_at(c.body, int(get_u32(c.body)) - 1)
 			for r.pos < len(r.buf) {
 				stamp := read_stamp(&r)
 				id := read_u64(&r)
-				append(&inner, Inner{stamp, id, read_bytes(&r)})
+				ops := read_bytes(&r)
+				if r.bad {
+					break // what cannot be read was nothing of the text, nor will be
+				}
+				if !stamp_less(last, stamp) { // and what is later than it names was nothing of it either
+					append(&inner, Inner{stamp, id, ops})
+				}
 			}
 		}
-		out.row, out.slot = c.row, c.slot
 	}
 	slice.sort_by(names[:], proc(a, b: Stamp) -> bool {return stamp_less(a, b)})
 	slice.sort_by(inner[:], proc(a, b: Inner) -> bool {return stamp_less(a.stamp, b.stamp)})

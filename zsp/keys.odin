@@ -151,14 +151,19 @@ cell_seal :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, epoch := 0, as: []byte = ni
 	if keys == nil || info == nil || keys.epochs[(epoch if epoch != 0 else len(keys.epochs)) - 1] == {} {
 		return false
 	}
+	author: u64
+	if .Signed in info.flags {
+		author = author_index(k, r) or_return
+		if c.kind == .Bundle {
+			bundle_trim(r, c, author) or_return
+		}
+	}
 	n := clear_size(c.kind, c.body)
 	iv := aead_nonce(c.stamp, c.slot, u8(c.kind))
 	w := make([dynamic]byte, 0, len(c.body) + TAG + SIGNATURE + 10, context.temp_allocator)
 	append(&w, ..c.body[:n])
 	if .Signed in info.flags {
-		write_varint(&w, author_index(k, r) or_return)
-	}
-	if .Signed in info.flags {
+		write_varint(&w, author)
 		// For whom, first: under the seal, where a relay does not see it, and under the signature.
 		plain := make([dynamic]byte, 0, len(c.body) - n + len(as) + 1, context.temp_allocator)
 		write_bytes(&plain, as)
@@ -225,6 +230,27 @@ cell_open :: proc(k: ^Keyring, r: ^Roster, c: ^Cell, by: ^By = nil) -> bool {
 	return true
 }
 
+// Names in an open bundle nothing its author can no longer kill: what it had no right to write when it was written. So
+// a bundle that came to name more than that, put together by a device that had not heard, is put together again of
+// what it may, as it is sealed again. False if that is nothing.
+@(private)
+bundle_trim :: proc(r: ^Roster, c: ^Cell, author: u64) -> bool {
+	scope := row_scope(c.row)
+	names := int(get_u32(c.body))
+	keep := names
+	for keep > 0 && !author_allowed(r, author, scope, bundle_at(c.body, keep - 1).time) {
+		keep -= 1 // a right allows all up to some time, if not all there is: so those it may kill come first
+	}
+	if keep < names && keep > 0 {
+		body := make([]byte, len(c.body) - (names - keep) * 16, context.temp_allocator)
+		put_u32(body, u32(keep))
+		copy(body[4:], c.body[4:][:keep * 16])
+		copy(body[4 + keep * 16:], c.body[4 + names * 16:])
+		c.body = body
+	}
+	return keep > 0
+}
+
 // Leaves out of an open bundle what its author had no right to write when it did, which would not have been taken
 // had it come by itself.
 @(private)
@@ -260,7 +286,7 @@ cell_author :: proc(r: ^Roster, c: ^Cell, by: By) -> (device: Key32, subject: []
 	}
 	m := &r.members[by.member - 1]
 	subject = m.subject
-	if len(by.as) > 0 && member_vouches(m, row_scope(c.row), cell_written(c)) {
+	if len(by.as) > 0 && member_vouches(m, row_scope(c.row), cell_reach(c)) {
 		subject, vouched = by.as, true
 	}
 	return m.device, subject, vouched, true
@@ -302,7 +328,7 @@ cell_lawful :: proc(r: ^Roster, c: ^Cell) -> bool {
 	rd := Reader{buf = c.body, pos = clear_size(c.kind, c.body)}
 	if .Signed in info.flags {
 		author := read_varint(&rd)
-		if rd.bad || len(c.body) - rd.pos < SIGNATURE || !author_allowed(r, author, scope, cell_written(c)) {
+		if rd.bad || len(c.body) - rd.pos < SIGNATURE || !author_allowed(r, author, scope, cell_reach(c)) {
 			return false
 		}
 	}

@@ -1,6 +1,7 @@
 #+build !js
 package zsp
 
+import "core:fmt"
 import "core:math/rand"
 import "core:strings"
 import "core:testing"
@@ -231,6 +232,126 @@ calls_between_devices :: proc(t: ^testing.T) {
 		testing.expect(t, len(b.node.calls) == 0 && len(b.node.serving) == 0)
 		free_all(context.temp_allocator)
 	}
+}
+
+// Serving is for those who may: one that may not call does not stand in the way of one that may, nor can any client
+// serve so much that others cannot, or cannot cease to.
+@(test)
+serving_is_for_those_who_may :: proc(t: ^testing.T) {
+	state := seeded(22)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 64)
+	defer sim_destroy(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	b.node.host.authenticate = proc(_: rawptr, s: ^Session, credential: []byte) {
+		session_accept(s, {{0, {.Read} if string(credential) == "reader" else {.Read, .Write, .Call}, 0}})
+	}
+	ca, cb := Caller{s = sim_client(&s, a)}, Caller{s = sim_client(&s, b)}
+	reader := Caller{s = session_open(&b.node, .Open, false)}
+	defer caller_destroy(&ca)
+	defer caller_destroy(&cb)
+	defer caller_destroy(&reader)
+	hello := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&hello, .Hello)
+	append(&hello, VERSION, 0)
+	zero: Key32
+	append(&hello, ..zero[:])
+	write_varint(&hello, 0)
+	write_bytes(&hello, transmute([]byte)string("reader"))
+	frame_end(&hello, at)
+	testing.expect(t, session_input(reader.s, hello[:]) && .Call not_in session_rights(reader.s, 1))
+	testing.expect(t, caller_serve(&cb, 1, "echo") && caller_serve(&reader, 1, "echo"))
+	caller_call(&ca, 1, b.keys.device, 1, "echo", "hi")
+	settle(&s, &ca, &cb, &reader)
+	testing.expect(t, len(cb.calls) == 1 && len(reader.calls) == 0 && len(ca.faults) == 0)
+	full := true
+	for i in 0 ..< MAX_CALLS {
+		full &&= caller_serve(&reader, 1, fmt.tprint(i))
+	}
+	testing.expect(t, !full)
+	unserve := make([dynamic]byte, context.temp_allocator)
+	at = frame_begin(&unserve, .Serve)
+	write_varint(&unserve, 1)
+	write_u8(&unserve, 0)
+	write_bytes(&unserve, transmute([]byte)string("echo"))
+	frame_end(&unserve, at)
+	testing.expect(t, session_input(cb.s, unserve[:]) && caller_serve(&cb, 1, "another"))
+	session_close(ca.s)
+	session_close(cb.s)
+	if !reader.s.closing {
+		session_close(reader.s)
+	}
+}
+
+// What a peer says in a call that cannot be read is its fault, not that of the client it would be passed to; and credit
+// is passed on as it counts.
+@(test)
+flows_are_sound_when_passed_on :: proc(t: ^testing.T) {
+	state := seeded(23)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 64)
+	defer sim_destroy(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	sim_link(&s, 0, 1)
+	sim_settle(&s)
+	ca, cb := Caller{s = sim_client(&s, a)}, Caller{s = sim_client(&s, b)}
+	defer caller_destroy(&ca)
+	defer caller_destroy(&cb)
+	testing.expect(t, caller_serve(&cb, 1, "echo"))
+	settle(&s, &ca, &cb)
+	caller_call(&ca, 1, b.keys.device, 1, "echo", "hi")
+	settle(&s, &ca, &cb)
+	testing.expect_value(t, len(cb.calls), 1)
+	peer := s.links[0].b // b's, of a
+	flow :: proc(tag: u64, kind: Flow, payload: []byte) -> []byte {
+		w := make([dynamic]byte, context.temp_allocator)
+		at := frame_begin(&w, .Flow)
+		write_varint(&w, tag)
+		write_u8(&w, u8(kind))
+		append(&w, ..payload)
+		frame_end(&w, at)
+		return w[:]
+	}
+	tag: u64
+	for c in b.node.calls {
+		if c.ends[CALLER].session == peer.id {
+			tag = c.ends[CALLER].id << 1 | CALLER
+		}
+	}
+	// A credit of more than may be had is passed on as what it comes to; one that is no number is the peer's fault.
+	huge := make([dynamic]byte, context.temp_allocator)
+	write_varint(&huge, 1 << 40)
+	testing.expect(t, session_input(peer, flow(tag, .Credit, huge[:])))
+	out := session_output(cb.s)
+	r := Reader{buf = out}
+	credited := false
+	for r.pos < len(out) {
+		frame := read_bytes(&r)
+		if Message(frame[0]) == .Flow {
+			f := Reader{buf = frame[1:]}
+			_ = read_varint(&f)
+			if Flow(read_u8(&f)) == .Credit {
+				credit := read_varint(&f)
+				testing.expect(t, credit <= 16 * CALL_WINDOW && !f.bad && f.pos == len(f.buf))
+				credited = true
+			}
+		}
+	}
+	testing.expect(t, credited)
+	session_sent(cb.s, len(out))
+	for bad, i in ([][]byte{{}, {0x80}, {1, 2}, {}}) {
+		testing.expect(t, !session_input(peer, flow(tag, .Fault if i == 3 else .Credit, bad)) && peer.fault == .Malformed) // a fault says why
+		sim_cut(&s, 0)
+		sim_link(&s, 0, 1)
+		sim_settle(&s)
+		peer = s.links[0].b
+	}
+	session_close(ca.s)
+	session_close(cb.s)
 }
 
 @(private)

@@ -56,6 +56,78 @@ review_lane_with_no_call_is_let_go :: proc(t: ^testing.T) {
 	testing.expectf(t, l == nil || l.over, "the lane stays: %v", l^ if l != nil else Lane{})
 }
 
+@(private, thread_local)
+lane_called: int
+
+// Calls that came whole on a lane the other end finished before the session was ready are answered once it is.
+@(test)
+review_lane_finished_before_ready_is_taken :: proc(t: ^testing.T) {
+	state := seeded(104)
+	context.random_generator = rand.default_random_generator(&state)
+	s: Sim
+	sim_init(t, &s, full = 2, partial = 0, relays = 0, ring = 64)
+	defer sim_destroy(&s)
+	sim_level(&s)
+	a, b := s.nodes[0], s.nodes[1]
+	testing.expect(t, test_amend(&s, a, proc(s: ^Sim, d: ^Draft) {_ = draft_scope(d)})) // so that b waits for it
+	lane_called = 0
+	b.node.host.method = proc(_: rawptr, call: u64, _: Caller_Info, _: Scope, _: string, _: []byte) -> Maybe(Call_Fault) {
+		lane_called += 1
+		return nil
+	}
+	sa := session_open(&a.node, .Calls, true, b.keys.device)
+	sb := session_open(&b.node, .Calls, false, a.keys.device)
+	defer session_close(sa)
+	defer session_close(sb)
+	pass :: proc(from, to: ^Session) {
+		out := session_output(from)
+		copied := make([]byte, len(out), context.temp_allocator)
+		copy(copied, out)
+		session_sent(from, len(out))
+		session_input(to, copied)
+	}
+	pass(sa, sb)
+	testing.expect(t, !sb.ready)
+	w := make([dynamic]byte, context.temp_allocator)
+	at := frame_begin(&w, .Call)
+	write_varint(&w, 1)
+	append(&w, ..b.keys.device[:])
+	write_varint(&w, 1)
+	write_bytes(&w, transmute([]byte)string("ping"))
+	write_bytes(&w, nil)
+	append(&w, "hello")
+	frame_end(&w, at)
+	at = frame_begin(&w, .Flow)
+	write_varint(&w, 1 << 1 | CALLER)
+	write_u8(&w, u8(Flow.End))
+	frame_end(&w, at)
+	testing.expect(t, session_lane_input(sb, 2, URGENCY, w[:]))
+	session_lane_heard(sb, 2, given_up = false)
+	// And on another, a whole call and then a frame cut short: the call is taken, and what was cut short ends the lane.
+	clear(&w)
+	at = frame_begin(&w, .Call)
+	write_varint(&w, 2)
+	append(&w, ..b.keys.device[:])
+	write_varint(&w, 1)
+	write_bytes(&w, transmute([]byte)string("ping"))
+	write_bytes(&w, nil)
+	append(&w, "again")
+	frame_end(&w, at)
+	append(&w, 9, u8(Message.Flow), 2 << 1 | CALLER) // of nine bytes, three
+	testing.expect(t, session_lane_input(sb, 6, URGENCY, w[:]))
+	session_lane_heard(sb, 6, given_up = false)
+	testing.expect(t, !sb.ready && lane_called == 0)
+	for _ in 0 ..< 4 {
+		pass(sb, sa)
+		pass(sa, sb)
+	}
+	testing.expect(t, sb.ready)
+	testing.expect_value(t, lane_called, 2)
+	l := lane_find(sb, 6)
+	testing.expect(t, l == nil || (l.over && len(l.input) == 0))
+	testing.expect_value(t, sb.lane_held, 0)
+}
+
 // A relay holds no more than LINK_QUEUE for a device, whatever kind of signal, however large.
 @(test)
 review_relay_signals_are_bounded :: proc(t: ^testing.T) {
