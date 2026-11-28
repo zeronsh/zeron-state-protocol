@@ -120,25 +120,30 @@ rather than go on with what may be lost, every tab is told, and what was asked o
 whose node stopped, or could not start, breaks the pipes it carried, and gets in line for the store again when its tab next wants
 the device, as its clients dialling again do: so the device runs again once it can, and is tried no more often than they dial.
 A store is named by a path of the origin's file system, under `zsp/`, whose empty parts are none: `"notes"`, `"notes/"` and
-`"/notes"` are one store, with one lock; a name of no parts, or with `.` or `..`, is a `RangeError`.
+`"/notes"` are one store, with one lock; a name of no parts, or with `.`, `..` or a backslash, is a `RangeError`.
 
 **The store's lock is let go of only once none of its files is open, or being opened.** Each file is held by its handle until
 it is closed, and the next to have the lock would find it held. So a worker whose node fails, whether as it opens or after,
 tells every tab at once, closes what it has open, and lets go of the lock once whatever was being opened has been had, and
-closed; one asked to close the device as it opens it closes it once it has, and only then says it is closed; one in line gives
-up its place. Chromium lets go of the lock as soon as the worker that held it is gone, which may be before it has let go of
+closed, whatever stopping the node throws; one closed, or put away, as it opens the store gives up opening it, closes at once
+what it has of it, tells nobody it failed, and only then says it is closed; one in line gives up its place. A tab frozen or left
+as its device closes stops its worker, as ever. Chromium lets go of the lock as soon as the worker that held it is gone, which may be before it has let go of
 that worker's files, and a worker given the lock may find a file held still: it tries again a millisecond later, then two,
 then four, up to a quarter of a second apart, holding the lock throughout. Measured in Chrome 151 it was never needed, the
 files let go of before the lock every time, whether the worker was stopped mid-task or not, its tab closed, reloaded, frozen or
 left, or its renderer crashed; but Chromium has been seen to hold a file for more than a second, and for ever, until it is
-restarted. Held for two seconds, the store is said to be locked: `open` rejects with `StoreLocked`, exported, whose message says
+restarted. Held for two seconds, in all, for a worker gone lets go of all its files at once, the store is said to be locked: `open` rejects with `StoreLocked`, exported, whose message says
 so, and `onFailure` is told it, as every tab is; nothing was opened and nothing is lost, and the next `open`, or the next time a
-tab wants the device, tries again. So it is, too, when whatever holds the store's lock answers nothing: a live holder answers
-what it is asked at once, or once it has opened the store, and says it is there when asked; one that has said nothing for
-three seconds is asked, and one silent for as long again is taken to be hung, as a tab whose worker hangs is, or a crashed
-renderer the browser has not let go of (Chrome on Linux has been seen to keep one, and its lock, until it is restarted).
-What was asked of it fails with `StoreLocked`, and its tab is told; the worker stays in line, and runs the device should the
-store ever be let go of. An application may tell its user that another tab, or the browser, holds the store, and to close
+tab wants the device, tries again; a segment of the log found held so as it is opened later stops the node as `StoreLocked`
+too. So it is, too, when whatever holds the store's lock answers nothing: a live holder answers what it is asked at once, or
+once it has opened the store, and says it is there when asked while it gets on with opening it, or letting it go (one stuck,
+waiting on a file or a fetch that never ends, is not there for anything that waits on it). What has waited on it for three
+seconds, an ask, or a pipe sent something and answered nothing, has it asked whether it is there, unless another worker has
+just asked, for what it says every worker hears, which it says once a second at most; and silent for as long again it is
+taken to be hung, as a tab whose worker hangs is, or a crashed renderer the browser has not let go of (Chrome on Linux has been
+seen to keep one, and its lock, until it is restarted). What was asked of it fails with `StoreLocked`, every pipe carried to
+it is broken, and the tab is told; the worker stays in line, and runs the device should the store ever be let go of. With
+nothing waiting, nothing is asked, and no timer is set. An application may tell its user that another tab, or the browser, holds the store, and to close
 the one or restart the other.
 
 ```ts
@@ -220,7 +225,7 @@ builds `web/dist` (zsp.js, worker.js and node.wasm, side by side: each finds the
 | `test/node.ts` | a device on its own |
 | `test/end_to_end.ts` | `test/live.ts`, which is `luau/tests/live.luau`, over every way devices meet: the client of zspd; partial and full web devices with zspd devices through zspd's relay and the Durable Object; two partial web devices; structured state, with and without a full replica that can read; a space a web device governs; keepalive; direct links, and beacons with no relay; and a partial device's windows, offline life, keeping and letting go, and questions with nobody to ask |
 | `test/browsers.ts` | headless Chrome: the live suite against a zspd device and between browser devices through the Durable Object, partial as browsers' are; tabs sharing a device and handing it on; a device the same after a restart, with no relay; a partial device's first window, offline life and restart, and its store opened full and partial again |
-| `test/worker.ts` | `src/worker.ts` and the store in Node, with the origin's file system, Web Locks and BroadcastChannel as a browser has them: a file held by another waited for, and the store said to be locked, as it is when whatever holds its lock answers nothing; the lock let go of only once no file is open or being opened, whether the node fails as it opens or in its first turn, or is closed as it opens; a file that cannot be closed keeping none other open; one store however its name is written; a place in line given up; and every file closed at once as the worker is put away |
-| `test/tabs.ts` | headless Chrome, with tabs as browsers treat them: the tab running the device frozen, put in the back/forward cache, or next in line while frozen; a tab loaded again and again, left and gone back to, and its worker killed, with files held after the lock is had as Chromium has held them, and for ever; a node that fails as it opens; the tab running the device hung, or its renderer crashed; a pipe the leader never heard of; credentials changed by any tab, through a hand-over and after; a tab whose timers are held back sealing what it types; and a node in a hidden page answering at once |
+| `test/worker.ts` | `src/worker.ts` and the store in Node, with the origin's file system, Web Locks and BroadcastChannel as a browser has them: a file held by another waited for, two seconds in all, and the store said to be locked, as it is when whatever holds its lock answers nothing, or is stuck, to asks and pipes alike, asked once by many; the lock let go of, and nothing more said there, whatever stopping a node, or closing it, throws; the lock let go of only once no file is open or being opened, whether the node fails as it opens or in its first turn, or is closed as it opens; a file that cannot be closed keeping none other open; one store however its name is written; a place in line given up; and every file closed at once as the worker is put away |
+| `test/tabs.ts` | headless Chrome, with tabs as browsers treat them: the tab running the device frozen, put in the back/forward cache, or next in line while frozen; a tab loaded again and again, left and gone back to, and its worker killed, with files held after the lock is had as Chromium has held them, and for ever; a node that fails as it opens; the tab running the device frozen as it closes it, hung, or its renderer crashed; a pipe the leader never heard of; credentials changed by any tab, through a hand-over and after; a tab whose timers are held back sealing what it types; and a node in a hidden page answering at once |
 
 Chrome is found where the platform keeps it, or at `$CHROME`; without it, `test/browsers.ts` and `test/tabs.ts` say so and pass, but in CI they fail.
