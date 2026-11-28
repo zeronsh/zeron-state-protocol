@@ -593,6 +593,28 @@ async function firstTurnWrites(store: string): Promise<void> {
   assert(performance.now() - t < 7500, "given up on only after it should have been");
 }
 
+// And so does a pipe its tab carried meanwhile, to the next holder: should that answer nothing, the tab is told the store is
+// locked, though none of its clients dials again, rather than the pipe being broken unanswered and waited on no more.
+{
+  const w = await worker();
+  await w.tell({ open: { name: "relisten-pipe" } });
+  const segment = pause("relisten-pipe", "00000001.log");
+  await w.tell({ ask: 1, op: "identity", args: [] });
+  await segment.reached;
+  await w.tell({ ask: 2, op: "create", args: [] });
+  failFlush = "*";
+  void w.tell({ ask: 3, op: "scope", args: [] }); // which the node fails to keep, and so stops
+  await until("the node has failed", () => w.said.some((r) => "failed" in r));
+  failFlush = undefined;
+  void request("zsp:relisten-pipe", () => new Promise<void>(() => {})); // next in line, and answering nothing
+  const { port1, port2 } = new MessageChannel();
+  await w.tell({ connect: port2 }); // in line again, behind it
+  await sleep(20);
+  segment.release();
+  await until("the tab is told the store is locked", () => w.said.some((r) => "failed" in r && r.name === "StoreLocked"), 10000);
+  port1.close();
+}
+
 // A worker whose node is stopped without its files being closed, by what throws, lets go of them and the lock all the same
 // as it leaves; and one whose node's close fails lets go of the lock, and says it holds the store no more.
 {

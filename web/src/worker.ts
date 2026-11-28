@@ -285,6 +285,7 @@ async function hold(o: Options): Promise<void> {
   else if (!stopped) {
     device = node;
     breakCarried();
+    awaiting.clear(); // waiting on this worker, which is here now
     channel.postMessage({ leader: true } satisfies Shout);
     tellSpace();
     // What this worker itself was waiting to hear, it now answers: but what the one before may have done already, it says
@@ -346,6 +347,7 @@ const away = () => void leave();
 // Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
 function fail(f: Failure): void {
   failedAsks(f);
+  awaiting.clear(); // waiting on this worker, which has failed
   breakCarried(); // to one that is gone, or none: every client dials again, and so this worker is wanted, and tries again
   tellAll({ failed: f.message, name: f.name });
 }
@@ -468,8 +470,11 @@ function shout(id: string, s: Shout): void {
 // holder says, every worker hears.
 //
 // Only another worker is waited on so: one holding the store answers what is asked of it, or says it failed, itself, and
-// one leaving waits on nobody. So this is done only while this worker neither holds the store nor is leaving, and all of
-// it is let go of as it comes to hold it, or leaves: what was waiting on another is not waited on, and told, after.
+// one leaving waits on nobody. So the silence is kept only while this worker neither holds the store nor is leaving, and
+// let go of as it comes to hold it, or leaves. What waits on the holder is kept whoever that is, but by one leaving: what
+// waited on another is let go of as this worker comes to hold the store, that one having let go of it; and what waited on
+// this one, as it opens its node or says it failed, which answers it. Asked, or a pipe carried, as a node that failed lets
+// go of the store, it waits on the next holder, as it would once this worker held the store no more.
 const waitingOnHolder = () => waiting.size > 0 || awaiting.size > 0;
 const listening = () => !holding && !leaving;
 function listen(): void {
@@ -503,7 +508,7 @@ function listen(): void {
 // A pipe carried to the leader has been sent something it has not answered, as of `at`, or now: waited on, if another holds
 // the store.
 function awaited(name: string, at = quiets): void {
-  if (!listening()) return;
+  if (leaving) return;
   awaiting.set(name, at);
   listen();
 }
