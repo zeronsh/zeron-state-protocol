@@ -575,9 +575,7 @@ join :: proc(dir, space, relay_key, url: string) -> bool {
 	_ = parse_hex(space, 32) or_return
 	_ = parse_hex(relay_key, 32) or_return
 	relay_url(space_url(url, space)) or_return
-	if err := os.make_directory_all(in_dir(dir, space)); err != nil && !os.is_dir(in_dir(dir, space)) {
-		return false
-	}
+	host.dir_make(in_dir(dir, space)) or_return
 	host.save(in_dir(dir, "space"), transmute([]byte)space) or_return
 	return host.save(in_dir(dir, "relay"), transmute([]byte)strings.concatenate({relay_key, " ", space_url(url, space)}, context.temp_allocator))
 }

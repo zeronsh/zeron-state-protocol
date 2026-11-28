@@ -1,6 +1,5 @@
 package host
 
-import "core:os"
 import "core:path/filepath"
 
 // A store's directory is one node's at a time. Two writing one log at once each write over what the other wrote, at the
@@ -74,11 +73,9 @@ dir_try :: proc(dir: string) -> (lock: Dir_Lock, held: Hold, kind: string) {
 		held = .Remote
 		return
 	}
-	if !there {
-		if err := os.make_directory_all(at); err != nil && !os.is_dir(at) {
-			held = .Failed
-			return
-		}
+	if !there && !dir_make(at) {
+		held = .Failed
+		return
 	}
 	lock, held = dir_lock(file_in(at, LOCK_FILE))
 	return
@@ -138,11 +135,9 @@ dir_starting :: proc(dir: string) -> (lock: File_Lock, ok: bool) {
 		hold_report(dir, .Remote, kind)
 		return
 	}
-	if !there {
-		if err := os.make_directory_all(at); err != nil && !os.is_dir(at) {
-			report(.Error, "could not make ", dir)
-			return
-		}
+	if !there && !dir_make(at) {
+		report(.Error, "could not make ", dir)
+		return
 	}
 	// Said when it waits, as it may for long: else a node that does looks as though it hangs.
 	lock, ok = file_lock(file_in(at, START_FILE), proc(_: string) {

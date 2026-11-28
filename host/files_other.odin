@@ -36,20 +36,13 @@ read_file :: proc(path: string, allocator := context.allocator) -> (data: []byte
 // one, is neither written into nor taken for it, and a reader finds one whole version or another.
 save :: proc(path: string, bytes: []byte) -> bool {
 	s := staging_make(path) or_return
-	ok := write_file(s.fd, bytes) && sync_file(s.fd) && posix.rename(s.name, strings.clone_to_cstring(path, context.temp_allocator)) == 0
+	ok := write_file(s.fd, bytes) && fd_durable(s.fd) != .Failed && posix.rename(s.name, strings.clone_to_cstring(path, context.temp_allocator)) == 0
 	if !ok {
 		posix.unlink(s.name)
 	}
 	posix.close(s.fd)
-	if ok {
-		// The name is the directory's to remember.
-		dir := strings.clone_to_cstring(filepath.dir(path), context.temp_allocator)
-		if d := open_file(dir, {.CLOEXEC, .DIRECTORY}); d >= 0 {
-			sync_file(d)
-			posix.close(d)
-		}
-	}
-	return ok
+	// The name is the directory's to remember: what was saved is not kept until it is.
+	return ok && dir_durable(filepath.dir(path))
 }
 
 // A staging file, made and held, until it is let go of: by its file's being closed.
@@ -146,18 +139,6 @@ write_file :: proc(fd: posix.FD, bytes: []byte) -> bool {
 		rest = rest[n:]
 	}
 	return true
-}
-
-@(private = "file")
-sync_file :: proc(fd: posix.FD) -> bool {
-	for {
-		if posix.fsync(fd) == .OK {
-			return true
-		}
-		if posix.errno() != .EINTR {
-			return false
-		}
-	}
 }
 
 // Holds a file's lock against every other that takes it, in another process or in another thread of this one, until let
