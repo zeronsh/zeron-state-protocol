@@ -2012,8 +2012,19 @@ what_goes_while_merging_is_gone :: proc(t: ^testing.T) {
 		}
 		index_follow(&w.x)
 		s := index_want_scope(&w.x, 1)
-		for s.filling == nil || s.ids.root == 0 {
-			testing.expect(t, !index_step(&w.x, 1))
+		// Put in order as runs of 64, whatever RUN is built as, so that one tree is laid down while the other's runs are
+		// still being read side by side; and gone over so many steps at most, rather than for ever.
+		for steps := 0; s.filling == nil || s.ids.root == 0; steps += 1 {
+			if !testing.expectf(t, steps < 10_000 && !index_step(&w.x, 1), "no step found one tree laid down and the other not") {
+				return
+			}
+			if f := s.filling; f != nil && !f.merging {
+				for &b in f.bulk {
+					if len(b.edits) >= 64 {
+						bulk_run(&b)
+					}
+				}
+			}
 		}
 		zsp.store_lose(&w.node.store, w.rows[keep:])
 		index_finish(&w.x)
