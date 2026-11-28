@@ -57,11 +57,22 @@ const origin = `http://127.0.0.1:${(site.address() as AddressInfo).port}/`;
 let chrome: Chrome | undefined;
 const said: string[] = []; // what pages and their workers said
 const pages: Page[] = [];
+// Waits for a page's script to have defined window.zsp, for so long at most: one that never does, as a script served
+// empty or cut short does not, fails saying so, rather than waiting until the test's own time is up.
+async function ready(p: Page, ms = 30000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, fail) => (timer = setTimeout(() => fail(new Error(`the page never defined window.zsp, in ${ms / 1000} s`)), ms)));
+  try {
+    await Promise.race([p.evaluate("new Promise((done) => { const go = () => window.zsp ? done() : setTimeout(go, 10); go(); })"), late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 async function page(path = ""): Promise<Page> {
   const t = performance.now();
   const p = await chrome!.open(origin + path, (line) => (said.push(line), console.log("     page: " + line)));
   if (process.env.TRACE) console.log("     opened in", performance.now() - t);
-  await p.evaluate("new Promise((done) => { const go = () => window.zsp ? done() : setTimeout(go, 10); go(); })");
+  await ready(p);
   pages.push(p);
   return p;
 }
