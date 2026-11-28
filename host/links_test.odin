@@ -12,9 +12,10 @@ import "../zsp"
 // as what arrives by IPv4, so that a loop slow for a moment drops no more of it.
 @(test)
 both_families_are_heard :: proc(t: ^testing.T) {
-	// Whether this machine has IPv6 at all: its loopback, at a port of its own.
-	probe, perr := nbio.create_udp_socket(.IP6)
-	has6 := perr == nil && net.bind(probe, {net.IP6_Loopback, 0}) == nil
+	// Whether this machine has IPv6 at all: its loopback, at a port of its own. A plain socket, for this thread has no
+	// event loop to tie one of nbio's to (on Windows nbio asserts it can).
+	probe, perr := net.make_bound_udp_socket(net.IP6_Loopback, 0)
+	has6 := perr == nil
 	if perr == nil {
 		net.close(probe)
 	}
