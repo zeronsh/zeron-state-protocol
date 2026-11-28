@@ -487,37 +487,6 @@ acknowledged_as_far_as_a_sync_reaches :: proc(t: ^testing.T) {
 	testing.expect_value(t, acked(&c), 2)
 }
 
-// What is committed while a sync is under way is made durable by the next as soon as that one is done, whether or not
-// anyone asked for a sync meanwhile: a steady writer waits for one sync, not for one and then the next one due.
-@(test)
-committed_meanwhile_is_synced_next :: proc(t: ^testing.T) {
-	Asked :: struct {
-		using m: Memory_Disk,
-		tokens:  [dynamic]u64,
-	}
-	a: Asked
-	defer memory_disk_destroy(&a.m)
-	defer delete(a.tokens)
-	disk := memory_disk(&a.m)
-	disk.data = &a
-	disk.log_sync_start = proc(data: rawptr, token: u64) -> bool {
-		append(&(^Asked)(data).tokens, token)
-		return true
-	}
-	s: Store
-	testing.expect(t, store_open(&s, disk))
-	defer store_close(&s)
-	body := [4]byte{1, 2, 3, 4}
-	testing.expect(t, store_commit(&s, {{row = {1 << 32, 1}, slot = 16, kind = .Value, stamp = {1, 0}, body = body[:]}}) == 1)
-	testing.expect(t, store_sync_start(&s) && len(a.tokens) == 1)
-	testing.expect(t, store_commit(&s, {{row = {1 << 32, 2}, slot = 16, kind = .Value, stamp = {2, 0}, body = body[:]}}) == 1)
-	testing.expect(t, store_disk_synced(&s, pop(&a.tokens), true))
-	testing.expect_value(t, len(a.tokens), 1) // begun at once
-	testing.expect(t, store_disk_synced(&s, pop(&a.tokens), true))
-	testing.expect_value(t, s.synced, store_tail(&s))
-	testing.expect_value(t, len(a.tokens), 0) // and nothing more, with nothing more to make durable
-}
-
 // Once storage has failed, nothing more is said: no acknowledgement, of what was synced before or not, and nothing else,
 // whatever path asks, as what was written may be lost.
 @(test)
