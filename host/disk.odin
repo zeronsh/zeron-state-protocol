@@ -22,6 +22,7 @@ File_Disk :: struct {
 	reading: ^os.File, // the segment last read, if another
 	read_no: u64,
 	dirty:   bool,
+	named:   bool, // a name made, or perhaps made, or removed in the directory since it was last synced: see disk_names
 	hold:    bool, // the directory, from before anything in it is read or written: see hold.odin
 	lock:    Maybe(Dir_Lock),
 	look:    bool, // only: nothing is made, nor opened to be written
@@ -69,6 +70,7 @@ file_disk_make :: proc(d: ^File_Disk) -> bool {
 		d.tree = nil
 		return false
 	}
+	d.named = true // the tree's name, and the directory's own, perhaps made just now
 	return file_remap(d)
 }
 
@@ -145,9 +147,21 @@ segments_close :: proc(d: ^File_Disk, first: u64, last := max(u64)) {
 	}
 }
 
+// Keeps the names in the directory as they are, should any have been made or removed since this last did, and the
+// directory's own in the one it is in, which it may have been made in too: a sync of a file keeps what it holds, and not
+// that it is there to be found; nor does it keep a segment that was removed from coming back, as one beyond the log's end
+// would, after its tail was cut and written again, to be read as though it followed. Once for each file opened to be
+// written, which may or may not have been made then, and after any are removed; before anything kept is said to be.
 @(private)
-disk_sync :: proc(f: ^os.File) -> bool {
-	return os.sync(f) == nil
+disk_names :: proc(d: ^File_Disk) -> bool {
+	if !d.named {
+		return true
+	}
+	if !dir_durable(d.dir) || !dir_durable(filepath.dir(d.dir)) {
+		return false
+	}
+	d.named = false
+	return true
 }
 
 @(require_results)
@@ -162,7 +176,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			number := off / zsp.SEGMENT
 			if number != d.number {
 				if d.active != nil {
-					if d.dirty && !disk_sync(d.active) {
+					if d.dirty && !file_durable(d.active) {
 						return false
 					}
 					os.close(d.active)
@@ -172,7 +186,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 					d.active, d.number = nil, max(u64)
 					return false
 				}
-				d.active, d.number = f, number
+				d.active, d.number, d.named = f, number, true
 			}
 			n, err := os.write_at(d.active, bytes, i64(off % zsp.SEGMENT))
 			d.dirty = true
@@ -200,6 +214,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			d := (^File_Disk)(data)
 			segments_close(d, segment, segment)
 			os.remove(segment_path(d, segment))
+			d.named = true
 		},
 		log_truncate = proc(data: rawptr, off: u64) {
 			d := (^File_Disk)(data)
@@ -209,6 +224,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			for f in files {
 				if number, ok := segment_number(f.name); ok && number > last {
 					os.remove(segment_path(d, number))
+					d.named = true
 				}
 			}
 			if last == d.number {
@@ -220,14 +236,13 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 		},
 		log_sync = proc(data: rawptr) -> bool {
 			d := (^File_Disk)(data)
-			if d.active == nil || !d.dirty {
-				return true
+			if d.active != nil && d.dirty {
+				if !file_durable(d.active) {
+					return false
+				}
+				d.dirty = false
 			}
-			if !disk_sync(d.active) {
-				return false
-			}
-			d.dirty = false
-			return true
+			return disk_names(d)
 		},
 		page = proc(data: rawptr, no: zsp.Page_No) -> ^zsp.Page {
 			d := (^File_Disk)(data)
@@ -251,7 +266,7 @@ file_disk :: proc(d: ^File_Disk) -> zsp.Disk {
 			if d.tree == nil {
 				return true
 			}
-			if !disk_sync(d.tree) {
+			if !file_durable(d.tree) || !disk_names(d) {
 				return false
 			}
 			size, err := os.file_size(d.tree)
@@ -345,7 +360,7 @@ pages_file :: proc(p: ^Pages_File, dir: string) -> find.Disk {
 		},
 		sync = proc(data: rawptr) -> bool {
 			p := (^Pages_File)(data)
-			return p.file == nil || os.sync(p.file) == nil
+			return p.file == nil || file_durable(p.file)
 		},
 		close = proc(data: rawptr) {
 			p := (^Pages_File)(data)

@@ -73,8 +73,11 @@ save :: proc(path: string, bytes: []byte) -> bool {
 	whole := full_path(path) or_return // as a rename by handle takes it
 	s := staging_make(path) or_return
 	if write_file(s.handle, bytes) && win32.FlushFileBuffers(s.handle) && rename_file(s.handle, whole) {
+		// Its new name is not kept until it is written out: by the file's flush, should that keep it, and the
+		// directory's, which does (see dir_durable). Whatever they say, the file has its place now: it is not dropped.
+		kept := win32.FlushFileBuffers(s.handle)
 		win32.CloseHandle(s.handle)
-		return true
+		return bool(kept) && dir_durable(filepath.dir(path))
 	}
 	staging_drop(s)
 	return false

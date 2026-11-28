@@ -323,6 +323,25 @@ and every other part of its own, for as long as it runs a node on it, and one th
 lock taken on a file system shared with other machines may not be seen by them, or may be lost while held, so a store is kept on a
 disk of the machine's own, and an implementation refuses a store it can tell is not.
 
+What is durable survives a loss of power, as far as the machine can be made to promise it: before an Ack, every file written to is
+synced, and on Linux, the BSDs and macOS so is every directory a name was made in or removed from, and the one a new store's directory
+was made in. zspd syncs with
+fsync on Linux and the BSDs, which writes through the drive's cache; on macOS with F_FULLFSYNC, for fsync there leaves what it wrote in
+the drive's cache, to be lost or written out of order; and on Windows with FlushFileBuffers of each file, which writes out its
+data and what the system holds of it, its name among that; a file put in another's place is flushed before it is renamed and again
+after, as MoveFileEx's MOVEFILE_WRITE_THROUGH makes a rename durable. On macOS
+a file system without F_FULLFSYNC (some network and FAT ones) is synced with fsync, and keeps what was acknowledged through a crash of
+the system, not a loss of power; and a drive that ignores being told to write out its cache, as some do, loses what it holds, which
+nothing can tell. A node in a browser keeps its store in the origin's private file system, synced with
+FileSystemSyncAccessHandle.flush(), which the File System standard asks only to pass what was written to the file system, and which no
+browser follows with a sync of a directory. Chrome flushes with fdatasync on Linux and Android and FlushFileBuffers on Windows, but on
+macOS with F_BARRIERFSYNC, which orders writes and makes none durable, and in an Incognito window keeps the store in memory; Firefox and
+Safari flush with fsync, which on macOS stops short of the drive, and Firefox in a private window holds back the end of what was
+written, encrypted a block at a time. So an Ack from a browser says, outside a private window, that what it acknowledges survives
+the page and a crash of the browser, and does not say that it survives a loss of power, nor in a private window anything more than
+that the page has it; and a browser may clear the whole store when short of room, unless the page
+was granted `navigator.storage.persist()`.
+
 A peer that is a full replica is sent everything its dialler commits, and everything a partial replica, or one becoming
 partial, commits, whoever dialled: what such a one owes is what it has not yet said. Otherwise a session is sent what it watches. A partial replica keeps owing a row
 named in an Ack.
