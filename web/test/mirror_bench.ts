@@ -159,13 +159,15 @@ function readData(path: string): Data {
 
 const rowsOf = (data: Data) => Number(new TextDecoder().decode(data.get("rows")![0]));
 
-// What the heap holds once collected.
+// What the heap holds once collected, and the bytes of array buffers with it: what a buffer holds is not in the heap,
+// and is held all the same.
 function settled(): number {
   const gc = (globalThis as { gc?: () => void }).gc;
   if (!gc) throw new Error("run with --expose-gc");
   gc();
   gc();
-  return process.memoryUsage().heapUsed;
+  const m = process.memoryUsage();
+  return m.heapUsed + m.arrayBuffers;
 }
 
 // Counting by perf, when bench/mirror.py runs it so (perf stat -D -1 --control): only what is between counting(true) and
