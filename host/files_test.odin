@@ -1,6 +1,5 @@
 package host
 
-import "base:runtime"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -45,7 +44,6 @@ files_read_whole :: proc(t: ^testing.T) {
 	}
 	sh := Shared{path = path}
 	writer := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
-		context = runtime.default_context()
 		// Emptied by a truncation of its own, not by opening it so: core:os on Windows asks for FILE_GENERIC_WRITE, which
 		// TRUNCATE_EXISTING refuses as an invalid parameter, wanting GENERIC_WRITE itself, so that the writer never began
 		// (odin-lang/Odin#8646).

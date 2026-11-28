@@ -96,9 +96,9 @@ check) # every platform, no code generated
 	for t in linux_amd64 linux_arm64 darwin_arm64 windows_amd64 freebsd_amd64; do
 		r=0; odin check zspd -target:$t $STRICT && odin check examples/forward -target:$t $STRICT || r=1; said $r $t
 	done
-	# What the runtime's map_entry breaks, and core:os's open with .Trunc on Windows, used nowhere: tests/odin_lint.py
-	# says what it holds each .odin file to.
-	r=0; $PYTHON tests/odin_lint.py || r=1; said $r "none of what odin-lang/Odin#8642 and #8646 break"
+	# What the runtime's map_entry breaks, and core:os's open with .Trunc on Windows, used nowhere, and no test's logger
+	# set but through tests/testlog: tests/odin_lint.py says what it holds each .odin file to.
+	r=0; $PYTHON tests/odin_lint.py || r=1; said $r "none of what odin-lang/Odin#8642 and #8646 break, and no test's logger set but through testlog"
 	r=0; odin check relay/wasm -target:js_wasm32 -no-entry-point $STRICT || r=1; said $r js_wasm32
 	r=0; odin check web/wasm -target:js_wasm32 -no-entry-point $STRICT || r=1; said $r "js_wasm32 web"
 	r=0; luau-analyze luau/zsp/init.luau examples/luau/workspace.luau || r=1; said $r luau
@@ -119,6 +119,9 @@ test)
 		(odin test $p -out:build/$p-test$EXE $STRICT $SMALL $one -define:ZSP_FIND_ASK=2 -define:ZSP_FIND_WALK=4 -define:ZSP_FIND_DEAD=8 -define:ZSP_FIND_TOUCHED=3 -define:ZSP_FIND_RUN=64 -define:ZSP_FIND_HOT=0 >build/$p.log 2>&1 || echo $p >>build/failed; cat build/$p.log) &
 		pids="$pids $!:$p"
 	done
+	# And quiet's, through which alone a test quiets what is said (tests/testlog): that it loses none of its failures.
+	(odin test tests/testlog -out:build/testlog-test$EXE $STRICT >build/testlog.log 2>&1 || echo testlog >>build/failed; cat build/testlog.log) &
+	pids="$pids $!:testlog"
 	# And what shows only at the sizes a relay runs with, where CHECKPOINT_TAIL is larger than an extent.
 	(odin test zsp -out:build/zsp-sized-test$EXE $STRICT -define:ODIN_TEST_NAMES=$SIZED >build/zsp-sized.log 2>&1 || echo zsp-sized >>build/failed; cat build/zsp-sized.log) &
 	pids="$pids $!:zsp-sized"
@@ -182,7 +185,8 @@ test)
 	fi
 	;;
 selftest) # that ./x test says every kind of test that fails: with one made to fail in each, it fails, naming each
-	# And that ./x check's lint finds each use of what odin-lang/Odin#8642 and #8646 break, however written.
+	# And that ./x check's lint finds each use of what odin-lang/Odin#8642 and #8646 break, and each test's logger set but
+	# through tests/testlog, however written.
 	$PYTHON tests/odin_lint.py --selftest
 	if ZSP_FAIL=1 ./x test >build/selftest.log 2>&1; then
 		echo "FAIL ./x test passed with a failure put in each kind of test: see build/selftest.log"
@@ -190,7 +194,7 @@ selftest) # that ./x test says every kind of test that fails: with one made to f
 	fi
 	# Exactly those: each kind, and nothing that did not fail. mirror_model runs beside the rest, so that what waits for
 	# such a job is held to it too.
-	expected="end_to_end forward luau-client mirror_model mirror_model-plain relay_settle web-client web-tabs web-text zsp"
+	expected="end_to_end forward luau-client mirror_model mirror_model-plain relay_settle testlog web-client web-tabs web-text zsp"
 	said=$(LC_ALL=C sort -u build/failed | tr '\n' ' ' | sed 's/ $//')
 	if [ "$said" != "$expected" ]; then
 		echo "FAIL ./x test said '$said' failed, not '$expected'"
@@ -219,7 +223,22 @@ selftest) # that ./x test says every kind of test that fails: with one made to f
 		fi
 		exit 1
 	fi
-	echo "ok   ./x test says every failure put in it, and nothing else"
+	# And testlog's, each a test quieted as much as it can be, failing: each said to have failed, as what it said, and no
+	# other. Quieted, they fail all the same.
+	quieted="quieted_below_errors_still_fails quieted_code_under_test_still_fails quieted_in_a_thread_still_fails"
+	for name in $quieted; do
+		if ! grep -q "^ - testlog\.$name[[:space:]].*failing, as ZSP_FAIL asks" build/testlog.log; then
+			echo "FAIL testlog.$name, quieted, did not fail the run as it should: see build/testlog.log"
+			cat build/testlog.log
+			exit 1
+		fi
+	done
+	if [ "$(grep -c '^ - testlog\.' build/testlog.log)" != 3 ]; then
+		echo "FAIL testlog's tests failed otherwise than its quieted ones, as ZSP_FAIL asks: see build/testlog.log"
+		cat build/testlog.log
+		exit 1
+	fi
+	echo "ok   ./x test says every failure put in it, and nothing else, a test's quieted through testlog among them"
 	;;
 build)
 	# Whole-program optimisation, in parallel where the linker speaks the compiler's own LLVM.

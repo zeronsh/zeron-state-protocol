@@ -1,6 +1,5 @@
 package host
 
-import "base:runtime"
 import "core:crypto"
 import "core:encoding/hex"
 import "core:os"
@@ -9,42 +8,8 @@ import "core:sync"
 import "core:testing"
 import "core:thread"
 import "core:time"
+import "../tests/testlog"
 import "../zsp"
-
-// What the host said, at any level, while a test listened: kept, rather than failing the test as what is said at error
-// level does. What the test itself says is passed on to the test's own logger, as its failures are.
-@(private = "file")
-Heard :: struct {
-	said: [dynamic]string,
-	test: runtime.Logger,
-}
-
-@(private = "file")
-listening :: proc(heard: ^Heard) -> runtime.Logger {
-	heard.test = context.logger
-	return {
-		data = heard,
-		lowest_level = .Debug,
-		procedure = proc(data: rawptr, level: runtime.Logger_Level, text: string, options: runtime.Logger_Options, location := #caller_location) {
-			heard := (^Heard)(data)
-			if strings.has_suffix(location.file_path, "_test.odin") {
-				heard.test.procedure(heard.test.data, level, text, options, location)
-			} else {
-				append(&heard.said, strings.clone(text, context.temp_allocator))
-			}
-		},
-	}
-}
-
-@(private = "file")
-heard_of :: proc(heard: ^Heard, what: string) -> bool {
-	for s in heard.said {
-		if strings.contains(s, what) {
-			return true
-		}
-	}
-	return false
-}
 
 // A store's directory is one node's: a second, as one in another process or in this one, is told it is in use, and
 // leaves everything there as it was; once the first is done, it may. Two at once would each write over what the other
@@ -56,45 +21,46 @@ hold_one_node_to_a_store :: proc(t: ^testing.T) {
 	testing.expect(t, err == nil)
 	defer delete(dir)
 	defer os.remove_all(dir)
-	heard: Heard
-	defer delete(heard.said)
-	logger := context.logger
-	context.logger = listening(&heard)
+	a, b: Host
+	resumed: bool
+	{
+		// What the host says, at any level, kept, rather than failing the test as what is said at error level does:
+		// what the test itself says is passed on, as its failures are.
+		heard: testlog.Quiet
+		defer testlog.destroy(&heard)
+		context.logger = testlog.quiet(t, &heard, .Code_Under_Test, keep = true)
 
-	a: Host
-	if !testing.expect(t, host_init(&a, {dir = dir, full = true}), "the first node does not start") {
-		context.logger = logger
-		return
-	}
-	key, _ := read_file(file_in(dir, "device.key"), context.temp_allocator)
-	b: Host
-	second := host_init(&b, {dir = dir, full = true})
-	if second {
-		host_destroy(&b)
-	}
-	testing.expect(t, !second, "a second node starts on a store in use")
-	testing.expect(t, heard_of(&heard, "in use by another process"), "and is not told it is in use")
-	// Nor does anything else that would keep a store there, nor make the device's key there.
-	if lock, held := dir_hold(dir); held {
-		dir_unlock(lock)
-		testing.expect(t, false, "the directory is held twice")
-	}
-	other, _ := os.make_directory_temp(base, "zsp-hold-*", context.temp_allocator)
-	defer os.remove_all(other)
-	if lock, held := dir_hold(other); testing.expect(t, held) {
+		if !testing.expect(t, host_init(&a, {dir = dir, full = true}), "the first node does not start") {
+			return
+		}
+		key, _ := read_file(file_in(dir, "device.key"), context.temp_allocator)
+		second := host_init(&b, {dir = dir, full = true})
+		if second {
+			host_destroy(&b)
+		}
+		testing.expect(t, !second, "a second node starts on a store in use")
+		testing.expect(t, testlog.heard(&heard, "in use by another process"), "and is not told it is in use")
+		// Nor does anything else that would keep a store there, nor make the device's key there.
+		if lock, held := dir_hold(dir); held {
+			dir_unlock(lock)
+			testing.expect(t, false, "the directory is held twice")
+		}
+		other, _ := os.make_directory_temp(base, "zsp-hold-*", context.temp_allocator)
+		defer os.remove_all(other)
+		if lock, held := dir_hold(other); testing.expect(t, held) {
+			_, made := device_secret(other)
+			testing.expect(t, !made, "a device's key is made in a directory another holds, who may be making it")
+			testing.expect(t, !os.exists(file_in(other, "device.key")))
+			dir_unlock(lock)
+		}
 		_, made := device_secret(other)
-		testing.expect(t, !made, "a device's key is made in a directory another holds, who may be making it")
-		testing.expect(t, !os.exists(file_in(other, "device.key")))
-		dir_unlock(lock)
-	}
-	_, made := device_secret(other)
-	testing.expect(t, made && os.exists(file_in(other, "device.key")), "nor once it is let go of")
-	kept, _ := read_file(file_in(dir, "device.key"), context.temp_allocator)
-	testing.expect(t, string(kept) == string(key), "the device's key was changed")
+		testing.expect(t, made && os.exists(file_in(other, "device.key")), "nor once it is let go of")
+		kept, _ := read_file(file_in(dir, "device.key"), context.temp_allocator)
+		testing.expect(t, string(kept) == string(key), "the device's key was changed")
 
-	host_destroy(&a)
-	resumed := host_init(&b, {dir = dir, full = true})
-	context.logger = logger
+		host_destroy(&a)
+		resumed = host_init(&b, {dir = dir, full = true})
+	}
 	testing.expect(t, resumed, "the store is not let go of when its node is done")
 	if resumed {
 		host_destroy(&b)
@@ -110,11 +76,9 @@ hold_a_space_while_open :: proc(t: ^testing.T) {
 	testing.expect(t, err == nil)
 	defer delete(dir)
 	defer os.remove_all(dir)
-	heard: Heard
-	defer delete(heard.said)
-	logger := context.logger
-	context.logger = listening(&heard)
-	defer context.logger = logger
+	heard: testlog.Quiet
+	defer testlog.destroy(&heard)
+	context.logger = testlog.quiet(t, &heard, .Code_Under_Test, keep = true)
 
 	h: Host
 	if !testing.expect(t, host_init(&h, {dir = dir, relay = true, full = true})) {
@@ -128,7 +92,7 @@ hold_a_space_while_open :: proc(t: ^testing.T) {
 	testing.expect(t, held)
 	s := space_open(&h, space)
 	testing.expect(t, s == nil, "a space is opened in a directory another holds")
-	testing.expect(t, heard_of(&heard, "in use by another process"))
+	testing.expect(t, testlog.heard(&heard, "in use by another process"))
 	if held {
 		dir_unlock(other)
 	}
@@ -233,7 +197,6 @@ hold_start_against_another_thread :: proc(t: ^testing.T) {
 	}
 	second := Second{dir = dir}
 	waiter := thread.create_and_start_with_poly_data(&second, proc(s: ^Second) {
-		context = runtime.default_context()
 		if lock, held := dir_starting(s.dir); held {
 			sync.atomic_store(&s.done, true)
 			dir_started(lock)
@@ -258,10 +221,12 @@ hold_no_path :: proc(t: ^testing.T) {
 		dir_unlock(lock)
 	}
 	testing.expectf(t, held == .Failed, "an empty path is held: %v", held)
-	logger := context.logger
-	context.logger = runtime.Logger{} // what it says of it is meant
-	_, starting := dir_starting("")
-	context.logger = logger
+	starting: bool
+	{
+		quieted: testlog.Quiet
+		context.logger = testlog.quiet(t, &quieted, .Code_Under_Test) // what it says of it is meant
+		_, starting = dir_starting("")
+	}
 	testing.expect(t, !starting, "a node is started where the process happens to be")
 }
 
@@ -309,10 +274,13 @@ hold_start_never_a_link :: proc(t: ^testing.T) {
 	if !testing.expect(t, linked, "no link could be made") {
 		return
 	}
-	logger := context.logger
-	context.logger = runtime.Logger{}
-	lock, starting := dir_starting(dir)
-	context.logger = logger
+	lock: File_Lock
+	starting: bool
+	{
+		quieted: testlog.Quiet
+		context.logger = testlog.quiet(t, &quieted, .Code_Under_Test)
+		lock, starting = dir_starting(dir)
+	}
 	if starting {
 		dir_started(lock)
 	}

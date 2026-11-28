@@ -1,8 +1,6 @@
 package host
 
-import "base:runtime"
 import "core:encoding/hex"
-import "core:log"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
@@ -13,6 +11,7 @@ import "core:thread"
 import "core:time"
 import "../find"
 import "../pipe"
+import "../tests/testlog"
 import "../third_party/nbio"
 import "../zsp"
 
@@ -310,11 +309,12 @@ review_unkept_keys_stop_the_host :: proc(t: ^testing.T) {
 		second, again := zsp.roster_sign(&s.keys, root, &more, context.temp_allocator)
 		testing.expect(t, again)
 		checkpoint := s.node.serial_kept
-		logger := context.logger
-		context.logger = log.nil_logger() // what the host says of it is meant, and the test's own is said after
-		_ = zsp.node_adopt(&s.node, second)
-		host_settle(&h)
-		context.logger = logger
+		{
+			quieted: testlog.Quiet
+			context.logger = testlog.quiet(t, &quieted, .Code_Under_Test) // what the host says of it is meant
+			_ = zsp.node_adopt(&s.node, second)
+			host_settle(&h)
+		}
 		testing.expectf(t, s.node.failed, "%s not kept, and the node goes on", what)
 		testing.expectf(t, s.node.serial_kept == checkpoint, "%s not kept, and a checkpoint says the roster was taken", what)
 		if what == "keys" {
@@ -434,8 +434,9 @@ review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
 		return b
 	}
 	testing.expect(t, save(sh.path, version(0)))
+	// Each thread with a context of its own, as core:thread gives one not given any: temporary memory of its own, and a
+	// logger that says nothing, which nothing here says anything to.
 	ours := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
-		context = runtime.default_context() // temporary memory of its own
 		for !sync.atomic_load(&sh.done) {
 			data, ok := read_file(sh.path, context.temp_allocator)
 			if !ok {
@@ -450,7 +451,6 @@ review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
 	// held a moment, and let be a moment. One that let it be no longer than it takes to open it again would keep any
 	// replacement out on Windows, which nothing could wait for the moment between without spinning.
 	theirs := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
-		context = runtime.default_context()
 		for !sync.atomic_load(&sh.done) {
 			if f, ferr := os.open(sh.path, {.Read}); ferr == nil {
 				buf: [64]byte
@@ -462,7 +462,6 @@ review_keeping_and_reading_at_once :: proc(t: ^testing.T) {
 		}
 	})
 	other := thread.create_and_start_with_poly_data(&sh, proc(sh: ^Shared) {
-		context = runtime.default_context()
 		for i := 0; !sync.atomic_load(&sh.done); i += 1 {
 			b := make([]byte, 4096 + 201 + i % 50, context.temp_allocator)
 			for &x in b {
