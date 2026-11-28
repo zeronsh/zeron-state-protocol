@@ -171,7 +171,10 @@ a write's own promise never rejects, as it never did, but for a signal it is giv
 settled is the client still trying, and nothing is ever dropped unsaid.** A node that will not come back cannot be told from one
 that will, so it is the application's to give up: `close({ signal })` and `write(scope, f, { signal })` take an AbortSignal, and
 given up on they reject with `Undelivered`, which says how many rows, cells and bytes were not acknowledged; a client closed and
-given up on dials no more, and what it held is never delivered. The Luau client's `close()` and `commit()` never yield, and never
+given up on, or refused for good by its node, dials no more, and what it held, or seals after, is never delivered, and said not
+to be. What is sealed in a scope the client may no longer write in, its right taken away as an editor typed there, is never
+delivered either, and never said to be: whatever waits on it, a commit, the editor closed, a barrier, the client closed, is told
+so; and so the client's close says, should anything it wrote never be delivered. The Luau client's `close()` and `commit()` never yield, and never
 drop anything either; `client:flushed(timeout)` and `editor:sealed(timeout)` yield until the same is so, returning `true`, or
 `false` and why, how much was not delivered should `timeout` seconds pass first, after which a client closed dials no more.
 
@@ -192,7 +195,10 @@ on macOS has been seen to freeze it, where on Linux it has not. One caught holdi
 tests catch one, is to every other tab what any holder that answers nothing is: what they ask is said to
 fail, the store being locked, within three silences at most, what they write waits, dropped by nothing, and the store is had
 again once the tab is thawed or thrown away. And
-`device.close()` closes every client, what it wrote delivered and durable, before it stops the node.
+`device.close()` closes every client, what it wrote delivered and durable, before it stops the node. It always settles, and always stops its worker: resolved once all is delivered, or rejected
+with `Undelivered`, how much its clients never delivered, should it be closed while its tab is away, be put away or fail as it
+closes, have failed before, or be of no space, when they give up on it at once. A worker put away as it drains takes no new pipe,
+and one whose leader never says it has closed what was carried to it gives up on that leader as on any that answers nothing.
 
 **A tab that is frozen, or put away in the back/forward cache, lets go of the device.** A browser freezes a tab hidden for long,
 and keeps one left for another page to go back to, and a frozen worker answers nothing while it holds the store's lock and its

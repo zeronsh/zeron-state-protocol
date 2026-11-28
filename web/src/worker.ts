@@ -632,6 +632,8 @@ function heard(s: Shout): void {
 // A tab's client wants a pipe: to the node here, or carried to the leader.
 function connect(port: MessagePort): void {
   const toTab = (say: Say) => ("data" in say ? port.postMessage(say, [say.data.buffer as ArrayBuffer]) : port.postMessage(say));
+  // Draining, as its tab is put away, it takes no pipe it would then wait on: its tab dials those of the next worker.
+  if (drained) return toTab({ close: true }), port.close();
   const pipe = {};
   if (device) {
     tabPipes.add(pipe);
@@ -680,6 +682,9 @@ function connect(port: MessagePort): void {
     port.close(); // nothing more is to come from the client, nor go to it
     if (heardBack) far.postMessage({ close: true } satisfies Say);
     else early.push({ close: true });
+    // Waited on, as anything said to the leader is, till it says it has closed its end: should it say nothing, it is asked
+    // whether it is there, and given up on, the pipe broken, so that nothing waits on it for ever.
+    awaited(name);
   };
   port.onmessage = (e: MessageEvent<Say>) => {
     const say = e.data;

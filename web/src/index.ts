@@ -65,6 +65,10 @@ export interface Device {
   readonly connect: Connect;
   /** A client of the node. */
   client(host?: Partial<Omit<Host, "connect">>): Client;
-  /** Stops the node, which makes what it was given durable. */
+  /**
+   * Stops the node, which makes what it was given durable. In a browser, its clients, every one made on its connect, are
+   * closed first, what they wrote delivered; should that not be possible, it rejects with Undelivered, saying how much was
+   * not, the node stopped all the same.
+   */
   close(): Promise<void>;
 }

@@ -1,7 +1,15 @@
 // A device in a browser. Its node runs in a worker, where its store, a directory of the origin's private file system,
 // may be read and written synchronously; tabs of one origin share it, whichever of them happens to run it (./worker.ts).
 
-import { Client, madeOn, sealNow, unacknowledged } from "./client.ts";
+import { Client, madeOn, sealNow, unacknowledged, Undelivered } from "./client.ts";
+
+// A device's close, settled however it goes: rejected, should anything its clients wrote never be delivered, but never
+// thrown at whoever does not wait for it.
+const handledClose = (f: () => Promise<void>): Promise<void> => {
+  const p = f();
+  p.catch(() => {});
+  return p;
+};
 import type { Device, Relay } from "./index.ts";
 import type { Connect, Member, Rights } from "./node.ts";
 import { storePath } from "./volume-opfs.ts";
@@ -77,14 +85,19 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     }
   };
 
+  let failed = false; // the worker could not be started, or its storage failed, or the store is locked: once is enough
+  let dead = false; // the worker could not be started, or threw: nothing it is asked is answered
+  let quitting: AbortController | undefined; // as the device closes: gives up on what its clients have still to deliver
   const fail = (error: Error) => {
+    failed = true;
+    quitting?.abort(); // what the device's clients deliver, as it closes, may never be: they give up on it, saying so
     for (const a of answers.values()) a.reject(error);
     answers.clear();
     options.onFailure?.(error);
   };
   const start = () => {
     const w = (worker = new Worker(options.worker ?? new URL("./worker.js", import.meta.url), { type: "module", name: "zsp" }));
-    w.onerror = (e) => w === worker && fail(new Error(e.message || "the worker could not be started"));
+    w.onerror = (e) => w === worker && ((dead = true), fail(new Error(e.message || "the worker could not be started")));
     const giving = credential;
     let heard = false;
     w.onmessage = (e: MessageEvent<Report>) => {
@@ -122,21 +135,26 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   // Told to go, the worker is stopped then and there, unless something sent it is still to be had: then each pipe has been
   // closed, behind what it carried, and the worker goes itself once it has had all of that, made durable, every pipe closed;
   // for a worker stopped drops what is still on its way to it.
-  const stop = (drain = false) => {
-    worker?.postMessage({ away: true, ...(drain ? { drain: true as const } : {}) } satisfies Command);
-    if (!drain) worker?.terminate();
-    worker = undefined;
+  const stop = (w = worker, drain = false) => {
+    if (w === worker) worker = undefined;
+    w?.postMessage({ away: true, ...(drain ? { drain: true as const } : {}) } satisfies Command);
+    if (!drain) w?.terminate();
   };
   const away = () => {
     if (state !== "running") return;
     state = "away";
+    quitting?.abort(); // closing, it can deliver nothing more now
+    // Let go of first, before anything a client does as it is told its pipe is broken: a pipe dialled then waits for the
+    // worker started once the tab is back, rather than reach this one, which would wait for it to be closed for ever.
+    const w = worker;
+    worker = undefined;
     // What editors have typed is sealed and sent now, whatever else is listening, for nothing after this is sure to be
     // run: each client keeps it till it is acknowledged, and says it again to the worker started when the tab is back.
     each((c) => c[sealNow]());
     let owed = false;
     each((c) => (owed ||= c[unacknowledged]()));
     if (owed) for (const close of [...pipes.values()]) close();
-    stop(owed);
+    stop(w, owed);
     for (const [id, a] of answers) {
       if (a.op === "close") answers.delete(id), a.resolve(undefined); // stopped, as a closed tab's is
       else if (a.op === "credential") answers.delete(id), a.resolve(undefined); // given anew by the next worker, not taken by this
@@ -286,13 +304,15 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     client: (host = {}) => new Client({ after, ...host, connect }),
     // Once, however often asked: its node stopped as it should be, and then its worker let go of.
     close: () =>
-      (closing ??= (async () => {
-        // Its clients first, what they wrote and their editors typed delivered, and durable, before the node is stopped:
-        // while the worker runs, which it does not while the tab is away, when what a client holds is told it failed
-        // once there is no device to deliver it to.
+      (closing ??= handledClose(async () => {
+        // Its clients first, what they wrote and their editors typed delivered, and durable, before the node is stopped. That
+        // is given up on, each client saying how much it never delivered, should it be put away or fail meanwhile, or be
+        // away, failed or of no space already, when nothing can be delivered.
+        const quit = (quitting = new AbortController());
+        if (state !== "running" || !worker || failed || space === undefined) quit.abort();
         const delivered: Promise<void>[] = [];
-        each((c) => delivered.push(c.close()));
-        if (worker && state === "running") await Promise.allSettled(delivered);
+        each((c) => delivered.push(c.close({ signal: quit.signal })));
+        const settled = await Promise.allSettled(delivered);
         // Nothing is due any more, though its worker said so before it heard: a client told so would dial again, or the
         // like, on a device going.
         stopping = true;
@@ -300,14 +320,23 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
         // Listened for until it is closed: a tab frozen or left as its worker closes the store stops the worker then, as
         // ever, which would else be frozen holding it.
         const w = worker;
-        if (w && state === "running") await ask<void>("close").catch(() => {});
+        if (w && state === "running" && !dead) await ask<void>("close").catch(() => {});
         unlisten();
         state = "closed";
         w?.terminate();
         worker = undefined;
         for (const breakOff of [...pipes.keys()]) breakOff(); // its clients told, as the worker that carried their pipes is gone
+        for (const port of ports.splice(0)) port.close(); // dialled while away, for a worker that will never be
         for (const a of answers.values()) a.reject(new Error("the device is closed"));
         answers.clear();
-      })()),
+        // Closed all the same: but what its clients never delivered is said, all of it, rather than nothing.
+        const lost = settled.flatMap((r) => (r.status === "rejected" ? [r.reason as Error] : []));
+        if (lost.length === 0) return;
+        if (lost.every((e) => e instanceof Undelivered)) {
+          const all = lost as Undelivered[];
+          throw new Undelivered(all.reduce((n, e) => n + e.rows, 0), all.reduce((n, e) => n + e.cells, 0), all.reduce((n, e) => n + e.bytes, 0), true);
+        }
+        throw lost.find((e) => !(e instanceof Undelivered)) ?? lost[0];
+      })),
   };
 }

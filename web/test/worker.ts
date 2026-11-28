@@ -196,7 +196,14 @@ Object.defineProperty(globalThis, "FileSystemFileHandle", { value: Entry, config
 
 // A worker of its own, as each tab has: what it says to its tab, and a way to tell it something as its tab would.
 let workers = 0;
-async function worker() {
+// One at a time, for each takes `self` as it is while its module is evaluated: two at once would both take the second's.
+let making: Promise<unknown> = Promise.resolve();
+function worker(): Promise<{ said: Report[]; tell: (data: unknown) => Promise<void>; watch: (f: (r: Report) => void) => void }> {
+  const made = making.then(workerNow);
+  making = made.catch(() => {});
+  return made;
+}
+async function workerNow() {
   const said: Report[] = [];
   let onSaid: ((r: Report) => void) | undefined;
   const scope = { location: { href: "file:///" }, onmessage: null as ((e: { data: unknown }) => Promise<void>) | null, postMessage: (r: Report) => (said.push(r), onSaid?.(r)) };
@@ -1158,6 +1165,9 @@ class TabWorker {
     this.#stopped = true;
     for (const end of this.#ends) end.close();
   }
+  get stopped(): boolean {
+    return this.#stopped;
+  }
 }
 Object.defineProperty(globalThis, "Worker", { value: TabWorker, configurable: true });
 const { open: openDevice } = await import("../src/browser.ts");
@@ -1315,6 +1325,83 @@ async function bodyOf(device: Awaited<ReturnType<typeof openDevice>>, id: string
   await device.close();
   const again = await openDevice({ name: "tab-made" });
   assert.equal(await bodyOf(again, id), "typed by a client made on connect", "what a client made on connect typed was lost as the device closed");
+  await again.close();
+}
+
+// A device closed settles, however it goes, and its worker is stopped: delivered, or saying what its clients never
+// delivered, never waiting for ever. Closed as its tab is away; put away as it closes; its worker gone before; and of no
+// space, what an editor typed waiting for a row that is never there.
+const settles = (p: Promise<void>) => Promise.race([p.then(() => "resolved", (e: Error) => `rejected: ${e.name}`), sleep(5000).then(() => "hangs")]);
+for (const how of ["closed away", "away as it closes", "its worker gone", "of no space"] as const) {
+  const store = "settles-" + how.replace(/ /g, "-");
+  let device: Awaited<ReturnType<typeof openDevice>>;
+  if (how === "of no space") {
+    device = await openDevice({ name: store });
+    const editor = device.client().text("00000001" + Math.floor(Date.now() / 1000).toString(16).padStart(8, "0") + "0102030405060708", Notes.body);
+    editor.append("typed where there is no space");
+  } else ({ device } = await typing(store, "typed as the device closed"));
+  const w = tabWorkers[tabWorkers.length - 1];
+  if (how === "closed away") tabDocument.dispatchEvent(new Event("freeze"));
+  if (how === "its worker gone") {
+    w.terminate();
+    (w as unknown as { onerror: (e: { message: string }) => void }).onerror({ message: "it was stopped" });
+  }
+  const closing = device.close();
+  if (how === "away as it closes") tabDocument.dispatchEvent(new Event("freeze"));
+  const came = await settles(closing);
+  assert.notEqual(came, "hangs", `${how}: the device's close never settled`);
+  assert(w.stopped || how === "closed away" || how === "away as it closes", `${how}: its worker was not stopped`);
+  if (how === "closed away" || how === "away as it closes") tabDocument.dispatchEvent(new Event("resume"));
+  console.log(`     a device ${how}: its close ${came}`);
+}
+
+// A client told its pipe is broken as its tab freezes, that dials again there and then, as one listening for its status
+// may: its pipe waits for the next worker, never reaching the one going, which would else wait for it to close for ever,
+// holding the store.
+{
+  const { device, client } = await typing("redial-away", "typed as the tab froze");
+  client.on("status", (up) => void (up || device.connect(() => {}, () => {})));
+  tabDocument.dispatchEvent(new Event("freeze"));
+  await until("the worker lets go of the store", () => !locks.has("zsp:redial-away"), 5000);
+  tabDocument.dispatchEvent(new Event("resume"));
+  await device.close().catch(() => {});
+}
+
+// A follower whose tab freezes with something not yet acknowledged, nothing more to send but the close, which its leader,
+// frozen by then, never answers: the follower is not left waiting on it for ever, the store's line and all, but asks whether
+// the leader is there, and gives up on it, as on anything that waits on a holder that answers nothing.
+{
+  const leader = await openDevice({ name: "frozen-echo" });
+  await leader.create();
+  const follower = await openDevice({ name: "frozen-echo" });
+  const client = follower.client();
+  await until("the follower's client may write", () => client.may(1, "write"));
+  // The leader's end of the pipe says nothing more, though it hears: what the client writes now is had, never acknowledged.
+  for (const [n, set] of channels) if (n.startsWith("zsp:frozen-echo:")) [...set][1].postMessage = () => {};
+  void client.write(1, (change) => change.insert(Notes, "notes", 1, { title: "had, never acknowledged" }));
+  // Waited on until the leader is heard from after, as it is, answering whether it is there: and then not.
+  await sleep(2 * 3000 + 1000);
+  // Then the leader freezes: it hears nothing more on the store's channel, and says nothing.
+  for (const c of [...(channels.get("zsp:frozen-echo") ?? [])].slice(0, 1)) (c.onmessage = null), (c.postMessage = () => {});
+  const pipeLocks = () => [...locks].filter((n) => n.startsWith("zsp:frozen-echo:"));
+  tabDocument.dispatchEvent(new Event("freeze")); // the follower's tab, with that to deliver
+  await until("the follower's pipes are let go of", () => pipeLocks().length === 0, 3 * 3000 + 3000);
+  tabDocument.dispatchEvent(new Event("resume"));
+}
+
+// A tab closed as what an editor typed waits for its row, not yet looked for: it is typed in the row as held and sealed, and
+// delivered, durable, before the worker goes, and there when the store is opened again.
+{
+  const device = await openDevice({ name: "early-closed" });
+  await device.create();
+  const client = device.client();
+  await until("the client may write", () => client.may(1, "write"));
+  let id = "";
+  await client.write(1, (change) => (id = change.insert(Notes, "notes", 1, { title: "t" }))); // and so held no longer
+  client.text(id, Notes.body).append("typed as the tab closed");
+  page.dispatchEvent(new Event("pagehide")); // at once: the row not yet looked for
+  const again = await openDevice({ name: "early-closed" });
+  assert.equal(await bodyOf(again, id), "typed as the tab closed", "what was typed before its row was looked for was lost as the tab closed");
   await again.close();
 }
 
