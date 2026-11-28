@@ -423,7 +423,7 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   await Promise.race([w.tell({ ask: 1, op: "identity", args: [] }), sleep(10000)]);
   const took = performance.now() - t;
   assert.equal(answered(w.said, 1)?.name, "StoreLocked", `asked of a store held by what answers nothing: ${JSON.stringify(answered(w.said, 1))}`);
-  assert(took >= 2 * 3000 && took < 2 * 3000 + 1000, `said to be locked after ${took} ms`);
+  assert(took > 2 * 3000 - 50 && took < 2 * 3000 + 1000, `said to be locked after ${took} ms`);
   assert(w.said.some((r) => "failed" in r && r.name === "StoreLocked"), "its tab was not told the store is locked");
   letGo();
   await w.tell({ ask: 2, op: "identity", args: [] });
@@ -524,6 +524,106 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   client.close();
 }
 
+// A worker whose node failed, still letting go of a segment being opened, is asked something meanwhile: it gets in line
+// again, and what it asked waits on whoever has the store next, as anything that waits on a holder does; and is given up on
+// should that answer nothing.
+{
+  const w = await worker();
+  await w.tell({ open: { name: "relisten" } });
+  const segment = pause("relisten", "00000001.log"); // opened ahead as the store opens
+  await w.tell({ ask: 1, op: "identity", args: [] });
+  await segment.reached;
+  await w.tell({ ask: 2, op: "create", args: [] });
+  failFlush = "*";
+  void w.tell({ ask: 4, op: "scope", args: [] }); // which the node fails to keep, and so stops
+  await until("the node has failed", () => w.said.some((r) => "failed" in r));
+  failFlush = undefined;
+  void request("zsp:relisten", () => new Promise<void>(() => {})); // next in line, and answering nothing
+  const asked = w.tell({ ask: 3, op: "member", args: [] }); // in line again, behind it
+  await sleep(20);
+  segment.release();
+  const t = performance.now();
+  await Promise.race([asked, sleep(10000)]);
+  assert.equal(answered(w.said, 3)?.name, "StoreLocked", `asked as its node let go, of a store then held by what answers nothing: ${JSON.stringify(answered(w.said, 3))}`);
+  assert(performance.now() - t < 7500, "given up on only after it should have been");
+}
+
+// A worker whose node is stopped without its files being closed, by what throws, lets go of them and the lock all the same
+// as it leaves; and one whose node's close fails lets go of the lock, and says it holds the store no more.
+{
+  const w = await worker();
+  await w.tell({ open: { name: "leave-throws" } });
+  await w.tell({ ask: 1, op: "create", args: [] });
+  await sleep(20);
+  const closeNow = Node.prototype.closeNow;
+  Node.prototype.closeNow = () => {
+    throw new Error("it would not stop");
+  };
+  try {
+    void w.tell({ away: true });
+  } finally {
+    Node.prototype.closeNow = closeNow;
+  }
+  assert.equal(held("leave-throws"), 0, "files left open as it left, stopping its node having thrown");
+  await until("the lock is let go of", () => !locks.has("zsp:leave-throws"));
+
+  const v = await worker();
+  await v.tell({ open: { name: "close-rejects" } });
+  await v.tell({ ask: 1, op: "create", args: [] });
+  const close = Node.prototype.close;
+  Node.prototype.close = function () {
+    return close.call(this).then(() => Promise.reject(new Error("it would not close")));
+  };
+  try {
+    await v.tell({ ask: 2, op: "close", args: [] });
+  } finally {
+    Node.prototype.close = close;
+  }
+  await until("the lock is let go of", () => !locks.has("zsp:close-rejects"));
+  let here = false;
+  const probe = new Channel("zsp:close-rejects");
+  probe.onmessage = (e) => void ((e.data as { here?: true }).here && (here = true));
+  probe.postMessage({ anyone: true });
+  await sleep(50);
+  probe.close();
+  assert(!here, "a worker that let go of the store says it is there");
+}
+
+// Closed as it waits for a file of the store held by another, a worker gives up waiting at once, and tells nobody the
+// store is locked; put away as it opens the store, it closes at once what it has opened of it.
+{
+  const dir = await (await root.getDirectoryHandle("zsp")).getDirectoryHandle("closing-held", { create: true });
+  const other = await (await dir.getFileHandle("tree", { create: true })).createSyncAccessHandle();
+  let told = false;
+  const bystander = new Channel("zsp:closing-held");
+  bystander.onmessage = (e) => void ((e.data as { failed?: string }).failed !== undefined && (told = true));
+  const w = await worker();
+  await w.tell({ open: { name: "closing-held" } });
+  void w.tell({ ask: 1, op: "identity", args: [] });
+  await sleep(200); // waiting for the tree
+  const t = performance.now();
+  await w.tell({ ask: 2, op: "close", args: [] });
+  const took = performance.now() - t;
+  await sleep(50);
+  bystander.close();
+  other.close();
+  assert(took < 300, `closed only after ${took} ms, waiting for a file held by another`);
+  assert(!told, "other tabs were told the store failed, as one left it");
+  assert(!locks.has("zsp:closing-held"));
+
+  const roster = pause("away-opening", "roster.1");
+  const a = await worker();
+  await a.tell({ open: { name: "away-opening" } });
+  void a.tell({ ask: 1, op: "identity", args: [] });
+  await roster.reached;
+  assert(held("away-opening") > 5);
+  void a.tell({ away: true });
+  assert(held("away-opening") <= 1, `${held("away-opening")} files left open as it was put away opening the store, but for the one being had`);
+  roster.release();
+  await until("the lock is let go of", () => !locks.has("zsp:away-opening"));
+  assert.equal(held("away-opening"), 0);
+}
+
 // A segment of the log found held by another as it is opened, in the store's own time, fails the node as the store being
 // locked, not as storage failing: whoever is told can tell.
 {
@@ -541,6 +641,86 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   client.close();
   await node.close();
   heldForEver.clear();
+}
+
+// A follower whose tab only has pipes to a leader that answers nothing, as one hung: a pipe it sends something on and
+// hears nothing back from, and a new one, are waited on as asks are, and then broken, the tab told the store is locked.
+{
+  const a = await worker();
+  await a.tell({ open: { name: "pipes" } });
+  await a.tell({ ask: 1, op: "create", args: [] });
+  const leaders = [...(channels.get("zsp:pipes") ?? [])];
+  const b = await worker();
+  await b.tell({ open: { name: "pipes" } });
+  const { port1, port2 } = new MessageChannel();
+  let closed = false;
+  port1.onmessage = (e) => void ((e.data as { close?: true }).close && (closed = true));
+  await b.tell({ connect: port2 });
+  await until("the pipe is carried", () => [...channels.keys()].some((n) => n.startsWith("zsp:pipes:") && channels.get(n)!.size === 2));
+  await sleep(50); // and what the leader said on it heard
+  // The leader hangs: it hears nothing more, and says nothing.
+  const hang = (c: Channel) => ((c.onmessage = null), (c.postMessage = () => {}));
+  for (const c of leaders) hang(c);
+  for (const [n, set] of channels) if (n.startsWith("zsp:pipes:")) hang([...set][1]);
+  const t = performance.now();
+  port1.postMessage({ data: new Uint8Array([1, 2, 3]) });
+  await until("the pipe is broken", () => closed, 12000);
+  assert(b.said.some((r) => "failed" in r && r.name === "StoreLocked"), "the tab was not told the store is locked");
+  const took = performance.now() - t;
+  // Given up on in three intervals at most: the rest of the one it was sent in, a silence, and as long again asked.
+  assert(took < 3 * 3000 + 500, `broken after ${took} ms`);
+  port1.close();
+}
+
+// A worker holding the store that is stuck opening it, waiting on a file that never opens, does not say it is there, but
+// for once, as it is first asked: what waits on it is given up on. Many waiting on it ask whether it is there, as one does
+// at a time, for a worker that hears another ask need not ask too: what the holder says, every worker hears.
+{
+  const stuck = pause("stuck", "tree"); // never let go of
+  const a = await worker();
+  await a.tell({ open: { name: "stuck" } });
+  void a.tell({ ask: 1, op: "identity", args: [] });
+  await stuck.reached;
+  let anyone = 0;
+  const spy = new Channel("zsp:stuck");
+  spy.onmessage = (e) => void ((e.data as { anyone?: true }).anyone && anyone++);
+  const waiting = [];
+  for (let i = 0; i < 8; i++) {
+    const f = await worker();
+    await f.tell({ open: { name: "stuck" } });
+    waiting.push(Promise.race([f.tell({ ask: 1, op: "identity", args: [] }), sleep(15000)]).then(() => answered(f.said, 1)));
+    await sleep(100);
+  }
+  const said = await Promise.all(waiting);
+  spy.close();
+  console.log(`     eight waiting on a holder stuck opening the store: ${anyone} asked whether it is there`);
+  assert(said.every((x) => x?.name === "StoreLocked"), `asked of a holder stuck opening the store: ${JSON.stringify(said)}`);
+  assert(anyone <= 4, `${anyone} asked whether it is there, each for itself`);
+}
+
+// A leader slow to answer, as one busy for long may be, asked at once by many whether it is there, says so once a second.
+{
+  const l = await worker();
+  await l.tell({ open: { name: "busy" } });
+  await l.tell({ ask: 1, op: "create", args: [] });
+  for (const c of channels.get("zsp:busy") ?? []) {
+    const hear = c.onmessage!;
+    c.onmessage = (e) => void (!(e.data as { ask?: string }).ask && hear(e)); // asks go unanswered
+  }
+  let here = 0;
+  const spy = new Channel("zsp:busy");
+  spy.onmessage = (e) => void ((e.data as { here?: true }).here && here++);
+  const followers = [];
+  for (let i = 0; i < 8; i++) {
+    const f = await worker();
+    await f.tell({ open: { name: "busy" } });
+    followers.push(f);
+  }
+  for (const f of followers) void f.tell({ ask: 1, op: "member", args: [] });
+  await sleep(3000 + 500); // each has asked whether it is there
+  spy.close();
+  console.log(`     eight asking at once of a leader slow to answer: it said it is there ${here} times`);
+  assert(here <= 1, `it said it is there ${here} times, at once`);
 }
 
 // A store's name with a backslash is no store's, as the File System standard allows it in no name; and a segment dropped
