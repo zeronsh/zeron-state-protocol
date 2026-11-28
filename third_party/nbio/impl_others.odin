@@ -61,9 +61,6 @@ _Open :: struct {}
 
 _Stat :: struct {}
 
-@(private="package")
-_Sync :: struct {} // ZSP: Linux alone has Sync
-
 _Splice :: struct {}
 
 _Remove :: struct {}
@@ -178,8 +175,6 @@ _exec :: proc(op: ^Operation) {
 		op.open.err = .Unsupported
 	case .Stat:
 		op.stat.err = .Unsupported
-	case .Sync: // ZSP
-		op.sync.err = .Unsupported
 	case .None, ._Link_Timeout, ._Remove, ._Splice:
 		fallthrough
 	case:

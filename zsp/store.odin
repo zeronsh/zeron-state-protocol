@@ -390,8 +390,12 @@ replay :: proc(s: ^Store) -> bool {
 	}
 	ring_clear(&s.events)
 	s.buf_base = tail
-	// What was only found there may be in the system's keeping rather than the disk's: whoever wrote it died.
+	// What was only found there may be in the system's keeping rather than the disk's: whoever wrote it died. It is
+	// counted on only once a sync has made it durable, every segment of it.
 	s.synced = s.checkpoint
+	if tail > s.checkpoint && s.disk.log_replayed != nil {
+		s.disk.log_replayed(s.disk.data, s.checkpoint)
+	}
 	return true
 }
 
@@ -875,7 +879,7 @@ store_disk_synced :: proc(s: ^Store, token: u64, ok: bool) -> bool {
 		return !s.failed
 	case token == f.log:
 		f.log = 0
-		if !ok {
+		if !ok || s.failed {
 			s.failed = true // and nothing it was to make durable is said to be
 			return false
 		}
@@ -887,7 +891,7 @@ store_disk_synced :: proc(s: ^Store, token: u64, ok: bool) -> bool {
 		}
 	case token == f.pages:
 		f.pages = 0
-		if !ok {
+		if !ok || s.failed {
 			s.failed = true
 			return false
 		}
@@ -1114,6 +1118,9 @@ flight_advance :: proc(s: ^Store) -> bool {
 @(private)
 flight_land :: proc(s: ^Store) -> bool {
 	f := &s.flight
+	if s.failed {
+		return false // nothing more is written, or counted on
+	}
 	switch f.step {
 	case .None:
 		return !s.failed

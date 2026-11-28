@@ -60,10 +60,7 @@ host_stops_however_told :: proc(t: ^testing.T) {
 				// As the disk would say it, once the loop goes on: begun, and failed.
 				s.node.store.disk.log_sync_start = proc(data: rawptr, token: u64) -> bool {
 					h := (^File_Disk)(data).host
-					fs := new(Fsync)
-					fs.host, fs.token, fs.ok = h, token, false
-					append(&h.fsyncing, fs)
-					fs.next, h.fsync_ready = h.fsync_ready, fs
+					append(&h.disk.answers, Disk_Answer{token, false})
 					return true
 				}
 				h.syncing, h.sync_due = true, time.tick_now()
@@ -210,8 +207,8 @@ loop_does_not_wait_for_a_segment_it_goes_on_from :: proc(t: ^testing.T) {
 	start := time.tick_now()
 	for zsp.store_flying(&s.node.store) && time.tick_since(start) < 10 * time.Second {
 		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
-		fsync_collect(&h)
+		disk_collect(&h)
 	}
 	testing.expect_value(t, s.node.store.synced, tail)
-	testing.expect(t, len(h.fsyncing) == 0 && !s.node.failed)
+	testing.expect(t, !disk_busy(&h, s.disk.active) && !s.node.failed)
 }

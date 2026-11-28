@@ -55,9 +55,7 @@ Host :: struct {
 	methods:      map[string]Host_Method, // that the host answers itself, in-process: see host_serve
 	accepting:    ^nbio.Operation,
 	lock:         Dir_Lock, // of dir, held from host_init until host_destroy: see hold.odin
-	fsyncing:     [dynamic]^Fsync, // under way: see fsync.odin
-	fsync_ready:  ^Fsync, // done as soon as begun, for there was nothing to make durable
-	fsyncer:      Fsyncer,
+	disk:         Disk_Queue, // what the disk is doing that the loop does not wait for: see disk_queue.odin
 }
 
 Space :: struct {
@@ -395,7 +393,7 @@ host_destroy :: proc(h: ^Host) {
 	for len(h.spaces) > 0 {
 		space_close(pop(&h.spaces))
 	}
-	fsync_drain(h) // each closed made all it had durable already: what was under way is only waited for
+	disk_end(h) // each closed made all it had durable already: what was under way is only waited for
 	for d in h.dialers {
 		dialer_free(d)
 	}
@@ -435,7 +433,10 @@ host_settle :: proc(h: ^Host) {
 		return
 	}
 	// What the disk has made durable, which releases what waits for it: acknowledgements above all.
-	fsync_collect(h)
+	disk_collect(h)
+	for s in h.spaces {
+		file_disk_settle(&s.disk)
+	}
 	if host_failed(h) {
 		return
 	}
@@ -465,6 +466,10 @@ host_settle :: proc(h: ^Host) {
 		ticks_mark(.Found)
 		relayed_run(s, now)
 		ticks_mark(.Relayed)
+	}
+	// Retaining or saving an index may have found storage failed: nothing goes out after that.
+	if host_failed(h) {
+		return
 	}
 	links_flush(h)
 	ticks_mark(.Links_Flush)
@@ -540,7 +545,7 @@ host_deadline :: proc(h: ^Host) -> (due: time.Tick, ok: bool) {
 	if h.syncing {
 		earliest(&due, &ok, h.sync_due)
 	}
-	if h.fsync_ready != nil {
+	if len(h.disk.answers) > 0 {
 		earliest(&due, &ok, time.tick_now())
 	}
 	for d in h.dialers {

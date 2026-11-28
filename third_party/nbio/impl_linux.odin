@@ -134,9 +134,6 @@ _Stat :: struct {
 }
 
 @(private="package")
-_Sync :: struct {}
-
-@(private="package")
 _init :: proc(l: ^Event_Loop, alloc: mem.Allocator) -> (err: General_Error) {
 	params := uring.DEFAULT_PARAMS
 	params.flags += {.SUBMIT_ALL, .COOP_TASKRUN, .SINGLE_ISSUER}
@@ -361,7 +358,6 @@ _exec :: proc(op: ^Operation) {
 	case .Send_File:     sendfile_exec(op)
 	case .Open:          open_exec(op)
 	case .Stat:          stat_exec(op)
-	case .Sync:          sync_exec(op)
 	case ._Splice:
 		// This is only reachable when the queue was full the last tick.
 		// And if that's the case, it would still be full for the real sendfile (splice B) and will be enqueued there.
@@ -531,10 +527,6 @@ handle_completed :: proc(op: ^Operation, res: i32) {
 		open_callback(op, res)
 	case .Stat:
 		stat_callback(op, res)
-	case .Sync:
-		if res < 0 {
-			op.sync.err = FS_Error(linux.Errno(-res))
-		}
 	case .Send_File:
 		if !sendfile_callback(op, res) { return }
 	case ._Splice:
@@ -1390,12 +1382,6 @@ open_callback :: proc(op: ^Operation, res: i32) {
 	}
 
 	op.open.handle = Handle(res)
-}
-
-// ZSP: fsync(2), not fdatasync: as the system's own fsync, which is what os.sync calls here.
-sync_exec :: proc(op: ^Operation) {
-	assert(op.type == .Sync)
-	enqueue(op, uring.fsync(&op.l.ring, u64(uintptr(op)), op.sync.handle, {}))
 }
 
 stat_exec :: proc(op: ^Operation) {

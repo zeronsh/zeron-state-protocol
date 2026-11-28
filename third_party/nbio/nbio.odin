@@ -71,7 +71,6 @@ Specifics :: struct #raw_union {
 	sendfile: Send_File `raw_union_tag:"type=.Send_File"`,
 	open:     Open      `raw_union_tag:"type=.Open"`,
 	stat:     Stat      `raw_union_tag:"type=.Stat"`,
-	sync:     Sync      `raw_union_tag:"type=.Sync"`, // ZSP: see Sync
 
 	_remove:       _Remove       `raw_union_tag:"type=._Remove"`,
 	_link_timeout: _Link_Timeout `raw_union_tag:"type=._Link_Timeout"`,
@@ -92,7 +91,6 @@ Operation_Type :: enum i32 {
 	Send_File,
 	Open,
 	Stat,
-	Sync, // ZSP
 
 	_Link_Timeout,
 	_Remove,

@@ -142,9 +142,6 @@ _Open :: struct {}
 _Stat :: struct {}
 
 @(private="package")
-_Sync :: struct {} // ZSP: Linux alone has Sync
-
-@(private="package")
 _init :: proc(l: ^Event_Loop, alloc: mem.Allocator) -> (err: General_Error) {
 	l.allocator = alloc
 
@@ -419,7 +416,7 @@ __tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> (err: General_Error) {
 			poll_callback(op)
 		case .Timeout, .Open, .Stat, .Close:
 			// no-op.
-		case .None, ._Link_Timeout, ._Remove, ._Splice, .Sync: // ZSP: Sync is Linux's alone
+		case .None, ._Link_Timeout, ._Remove, ._Splice:
 			fallthrough
 		case:
 			unreachable()
@@ -481,7 +478,7 @@ _exec :: proc(op: ^Operation) {
 	case .Poll:      result = poll_exec(op)
 	case .Open:      open_exec(op); result = .Done
 	case .Stat:      stat_exec(op); result = .Done
-	case .None, ._Link_Timeout, ._Remove, ._Splice, .Sync: // ZSP: Sync is Linux's alone
+	case .None, ._Link_Timeout, ._Remove, ._Splice:
 		unreachable()
 	}
 
@@ -804,7 +801,7 @@ _remove :: proc(target: ^Operation) {
 	case ._Remove:
 		panic("can't remove a removal")
 
-	case .None, ._Splice, ._Link_Timeout, .Sync: // ZSP: Sync is Linux's alone
+	case .None, ._Splice, ._Link_Timeout:
 		fallthrough
 	case:
 		unreachable()
@@ -963,7 +960,7 @@ operation_handle :: proc(op: ^Operation) -> win.HANDLE {
 	case .Poll:            return g.afd
 	case .Stat:            return win.HANDLE(uintptr(op.stat.handle))
 
-	case .Timeout, .Open, ._Splice, ._Link_Timeout, ._Remove, .None, .Sync: // ZSP: Sync is Linux's alone
+	case .Timeout, .Open, ._Splice, ._Link_Timeout, ._Remove, .None:
 		return win.INVALID_HANDLE
 	case:
 		unreachable()
