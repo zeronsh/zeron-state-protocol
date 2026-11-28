@@ -33,7 +33,7 @@ export interface Options {
  */
 export type Command =
   | { open: Options }
-  | { away: true }
+  | { away: true; drain?: true }
   | { connect: MessagePort }
   | { ask: number; op: Op; args: unknown[] }
   | { after: number; ms: number }
@@ -130,7 +130,7 @@ function tellAll(r: Report & Shout): void {
 
 tab.onmessage = async (e: MessageEvent<Command>) => {
   const c = e.data;
-  if ("away" in c) away();
+  if ("away" in c) c.drain ? drainAway() : away();
   else if ("open" in c) open(c.open);
   else if ("connect" in c) connect(c.connect);
   else if ("after" in c) {
@@ -344,6 +344,24 @@ function stopNow(node: Node | undefined): void {
 }
 
 const away = () => void leave();
+
+// Its tab's pipes still open, here or carried to the leader: by one way and another of letting go of each.
+const tabPipes = new Set<object>();
+let drained: (() => void) | undefined; // what is done once there are none, as this worker goes at its tab's word
+function tabPipeEnded(pipe: object): void {
+  tabPipes.delete(pipe);
+  const then = drained;
+  if (then && tabPipes.size === 0) (drained = undefined), then();
+}
+
+// Put away by a tab that has what it wrote still to be acknowledged: it has closed every pipe, each close behind what the
+// pipe carried, and is not stopping this worker, which goes itself once it has had all of that, every pipe closed. What
+// came to the node here is then made durable, as the node is stopped (leave); what was carried to the leader has been
+// heard by it, its close with it.
+function drainAway(): void {
+  drained = () => void leave().then(() => (tab as { close?: () => void }).close?.());
+  if (tabPipes.size === 0) tabPipeEnded({});
+}
 
 // Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
 function fail(f: Failure): void {
@@ -614,8 +632,10 @@ function heard(s: Shout): void {
 // A tab's client wants a pipe: to the node here, or carried to the leader.
 function connect(port: MessagePort): void {
   const toTab = (say: Say) => ("data" in say ? port.postMessage(say, [say.data.buffer as ArrayBuffer]) : port.postMessage(say));
+  const pipe = {};
   if (device) {
-    const wire = attach(toTab, () => port.close());
+    tabPipes.add(pipe);
+    const wire = attach(toTab, () => (port.close(), tabPipeEnded(pipe)));
     port.onmessage = (e: MessageEvent<Say>) => (wire ? onSay(wire, e.data) : undefined);
     return;
   }
@@ -634,9 +654,11 @@ function connect(port: MessagePort): void {
   // Held for as long as the pipe is: the leader waits for it, and so learns when this end has gone, tab and all.
   let letGo!: () => void;
   const held = new Promise<void>((done) => (letGo = done));
+  tabPipes.add(pipe);
   const breakOff = () => {
     if (!open) return;
     open = false;
+    tabPipeEnded(pipe);
     clearTimeout(unanswered);
     carried.delete(breakOff);
     unheard.delete(name);

@@ -1,7 +1,7 @@
 // A device in a browser. Its node runs in a worker, where its store, a directory of the origin's private file system,
 // may be read and written synchronously; tabs of one origin share it, whichever of them happens to run it (./worker.ts).
 
-import { Client, sealNow } from "./client.ts";
+import { Client, madeOn, sealNow, unacknowledged } from "./client.ts";
 import type { Device, Relay } from "./index.ts";
 import type { Connect, Member, Rights } from "./node.ts";
 import { storePath } from "./volume-opfs.ts";
@@ -59,15 +59,15 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   let state: "running" | "away" | "closed" = "running";
   let asked = 0;
   const answers = new Map<number, { op: Op; args: unknown[]; resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-  const pipes = new Set<() => void>(); // how to break each of this tab's pipes
+  const pipes = new Map<() => void, () => void>(); // how to break each of this tab's pipes, and how to close it, saying so
   const ports: MessagePort[] = []; // pipes asked for while away
   let ticks = 0;
   const timers = new Map<number, { f: () => void; due: number }>(); // the tab's clients', kept by the worker
   let space: string | undefined;
   let closing: Promise<void> | undefined;
   let stopping = false; // nothing is due any more: the device's clients have delivered what they wrote, and it is closing
-  // Its clients, as device.client() made them: sealed as the tab is put away, and closed, what they wrote delivered, as
-  // the device is. Held no longer than whoever made them holds them.
+  // Its clients, every one made on its connect, device.client() or not: sealed as the tab is hidden or put away, and
+  // closed, what they wrote delivered, as the device is. Held no longer than whoever made them holds them.
   const clients = new Set<WeakRef<Client>>();
   const each = (f: (c: Client) => void) => {
     for (const ref of [...clients]) {
@@ -119,9 +119,12 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   // What may be asked again of the next worker, as having been done or not it is the same; anything else may have been
   // done, and is not done twice.
   const again = new Set<Op>(["identity", "member", "members", "usage"]);
-  const stop = () => {
-    worker?.postMessage({ away: true } satisfies Command);
-    worker?.terminate();
+  // Told to go, the worker is stopped then and there, unless something sent it is still to be had: then each pipe has been
+  // closed, behind what it carried, and the worker goes itself once it has had all of that, made durable, every pipe closed;
+  // for a worker stopped drops what is still on its way to it.
+  const stop = (drain = false) => {
+    worker?.postMessage({ away: true, ...(drain ? { drain: true as const } : {}) } satisfies Command);
+    if (!drain) worker?.terminate();
     worker = undefined;
   };
   const away = () => {
@@ -130,13 +133,16 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     // What editors have typed is sealed and sent now, whatever else is listening, for nothing after this is sure to be
     // run: each client keeps it till it is acknowledged, and says it again to the worker started when the tab is back.
     each((c) => c[sealNow]());
-    stop();
+    let owed = false;
+    each((c) => (owed ||= c[unacknowledged]()));
+    if (owed) for (const close of [...pipes.values()]) close();
+    stop(owed);
     for (const [id, a] of answers) {
       if (a.op === "close") answers.delete(id), a.resolve(undefined); // stopped, as a closed tab's is
       else if (a.op === "credential") answers.delete(id), a.resolve(undefined); // given anew by the next worker, not taken by this
       else if (!again.has(a.op)) answers.delete(id), a.reject(new Error("the tab was put away as this was asked, which may or may not have been done"));
     }
-    for (const breakOff of [...pipes]) breakOff(); // every client here dials again, once the tab is back
+    for (const breakOff of [...pipes.keys()]) breakOff(); // every client here dials again, once the tab is back
   };
   const back = () => {
     if (state !== "away") return;
@@ -146,16 +152,23 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   };
   const hidden = () => away();
   const shown = (e: PageTransitionEvent) => e.persisted && back();
+  // Hidden, a page may be frozen or thrown away later, unasked, with time now to make sure of what it has: what editors
+  // have typed is sealed and sent, and the worker makes it durable, while the tab is still running.
+  const unseen = () => {
+    if (document.visibilityState === "hidden") each((c) => c[sealNow]());
+  };
   const listening = typeof document !== "undefined" && typeof addEventListener === "function";
   const unlisten = () => {
     if (!listening) return;
     document.removeEventListener("freeze", hidden);
+    document.removeEventListener("visibilitychange", unseen);
     document.removeEventListener("resume", back);
     removeEventListener("pagehide", hidden);
     removeEventListener("pageshow", shown);
   };
   if (listening) {
     document.addEventListener("freeze", hidden);
+    document.addEventListener("visibilitychange", unseen);
     document.addEventListener("resume", back);
     addEventListener("pagehide", hidden);
     addEventListener("pageshow", shown);
@@ -185,7 +198,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     };
   };
 
-  const connect: Connect = (receive, closed) => {
+  const connect: Connect & { [madeOn]?: (c: Client) => void } = (receive, closed) => {
     if (state === "closed") return undefined;
     const { port1, port2 } = new MessageChannel();
     let open = true;
@@ -199,7 +212,13 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       end();
       closed();
     };
-    pipes.add(breakOff);
+    // Closed from this end, saying so to the worker behind all that was sent: its client told it is broken, all the same.
+    const closeSaying = () => {
+      if (!open) return;
+      port1.postMessage({ close: true } satisfies Say);
+      breakOff();
+    };
+    pipes.set(breakOff, closeSaying);
     port1.onmessage = (e: MessageEvent<Say>) => {
       const say = e.data;
       if (!open) return;
@@ -228,6 +247,8 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       },
     };
   };
+
+  connect[madeOn] = (c) => void clients.add(new WeakRef(c)); // every client made on it is this device's to see to
 
   return {
     id: identity.id,
@@ -262,11 +283,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       if (at !== undefined && credential === c) (credentialAt = at), (taken = true); // as given: no earlier than any it knew of
     },
     connect,
-    client: (host = {}) => {
-      const c = new Client({ after, ...host, connect });
-      clients.add(new WeakRef(c));
-      return c;
-    },
+    client: (host = {}) => new Client({ after, ...host, connect }),
     // Once, however often asked: its node stopped as it should be, and then its worker let go of.
     close: () =>
       (closing ??= (async () => {
@@ -288,7 +305,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
         state = "closed";
         w?.terminate();
         worker = undefined;
-        for (const breakOff of [...pipes]) breakOff(); // its clients told, as the worker that carried their pipes is gone
+        for (const breakOff of [...pipes.keys()]) breakOff(); // its clients told, as the worker that carried their pipes is gone
         for (const a of answers.values()) a.reject(new Error("the device is closed"));
         answers.clear();
       })()),

@@ -1113,6 +1113,7 @@ for (const when of ["heard of", "not yet heard of"] as const) {
 // posts it; and its page and document, which the tab hears freeze, hide and show.
 const page = new EventTarget();
 const tabDocument = new EventTarget();
+Object.defineProperty(tabDocument, "visibilityState", { value: "visible", writable: true });
 Object.assign(globalThis, { document: tabDocument, addEventListener: page.addEventListener.bind(page), removeEventListener: page.removeEventListener.bind(page) });
 const posted: { to: "worker" | "pipe"; what: any; cells?: number[] }[] = [];
 const workerEnds = new WeakSet<MessagePort>(); // of pipes: what the worker posts down them is not the tab's
@@ -1127,25 +1128,36 @@ let dials = 0;
 let keepTimes = false; // every time asked for kept here, to be said to be up when the test says
 const afters: number[] = [];
 let tabSide: { onmessage: ((e: { data: Report }) => void) | null } | undefined;
+const tabWorkers: TabWorker[] = [];
+// Stopped, as a browser stops a worker: nothing more reaches it, and what was still on its way to it down its pipes is
+// dropped with them, as it may be.
 class TabWorker {
   onmessage: ((e: { data: Report }) => void) | null = null;
   onerror: unknown = null;
   #w = worker();
+  #ends: MessagePort[] = [];
+  #stopped = false;
   constructor() {
     tabSide = this;
-    void this.#w.then((w) => w.watch((r) => setTimeout(() => this.onmessage?.({ data: r }))));
+    tabWorkers.push(this);
+    void this.#w.then((w) => w.watch((r) => setTimeout(() => this.#stopped || this.onmessage?.({ data: r }))));
   }
   postMessage(c: { connect?: MessagePort; after?: number }): void {
     posted.push({ to: "worker", what: c });
+    if (this.#stopped) return;
     if (c.connect) {
       dials++;
       if (refusePipes) return void c.connect.postMessage({ close: true });
       workerEnds.add(c.connect);
+      this.#ends.push(c.connect);
     }
     if (c.after !== undefined && keepTimes) return void afters.push(c.after);
-    void this.#w.then((w) => setTimeout(() => w.tell(c)));
+    void this.#w.then((w) => setTimeout(() => this.#stopped || w.tell(c)));
   }
-  terminate(): void {}
+  terminate(): void {
+    this.#stopped = true;
+    for (const end of this.#ends) end.close();
+  }
 }
 Object.defineProperty(globalThis, "Worker", { value: TabWorker, configurable: true });
 const { open: openDevice } = await import("../src/browser.ts");
@@ -1178,10 +1190,10 @@ const cellKinds = (data: unknown): number[] => {
   return kinds;
 };
 // A device of a space of its own, a client of it, and an editor of a row with something typed in it, not yet sealed.
-async function typing(name: string, typed: string) {
+async function typing(name: string, typed: string, made = (device: Awaited<ReturnType<typeof openDevice>>) => device.client()) {
   const device = await openDevice({ name });
   await device.create();
-  const client = device.client();
+  const client = made(device);
   await until("the client may write", () => client.may(1, "write"));
   let id = "";
   await client.write(1, (change) => (id = change.insert(Notes, "notes", 1, { title: "t" })));
@@ -1247,6 +1259,62 @@ async function bodyOf(device: Awaited<ReturnType<typeof openDevice>>, id: string
   await device.close();
   const again = await openDevice({ name: "tab-closed" });
   assert.equal(await bodyOf(again, id), "typed as the device closed", "what was typed was lost as the device closed");
+  await again.close();
+}
+
+// A tab hidden: what its device's editors typed is sealed and delivered, and durable, while it still runs, before it is
+// frozen or thrown away, which the browser may then do unasked. Another tab of the store has it, as soon as the device's
+// clients have nothing more waiting, though the tab is never frozen nor shown again.
+{
+  const { device, client, id } = await typing("tab-unseen", "typed before the tab was hidden");
+  (tabDocument as unknown as { visibilityState: string }).visibilityState = "hidden";
+  tabDocument.dispatchEvent(new Event("visibilitychange"));
+  await client.write(1, () => {}); // all it has written, sealed, durable
+  const other = await openDevice({ name: "tab-unseen" });
+  assert.equal(await bodyOf(other, id), "typed before the tab was hidden", "what was typed before the tab was hidden was not durable then");
+  await other.close();
+  (tabDocument as unknown as { visibilityState: string }).visibilityState = "visible";
+  await device.close();
+}
+
+// A tab frozen with what its device's editors typed not yet acknowledged, and then thrown away, never back: its worker is
+// not stopped with that on its way, but has it, makes it durable and goes itself, and the next tab of the store has it.
+{
+  const { id } = await typing("tab-discarded", "typed as the tab froze, for good");
+  tabDocument.dispatchEvent(new Event("freeze")); // and never resumed
+  const next = await openDevice({ name: "tab-discarded" });
+  assert.equal(await bodyOf(next, id), "typed as the tab froze, for good", "what was typed as the tab froze was lost with it");
+  await next.close();
+}
+
+// A write a follower's application was told is durable is durable at the leader's node: the follower's tab gone right after
+// takes nothing of it with it, and it is there when the store is opened again.
+{
+  const leader = await openDevice({ name: "tab-follower" });
+  await leader.create();
+  const follower = await openDevice({ name: "tab-follower" });
+  const client = follower.client();
+  await until("the follower's client may write", () => client.may(1, "write"));
+  let id = "";
+  await client.write(1, (change) => (id = change.insert(Notes, "notes", 1, { title: "acknowledged" })));
+  tabWorkers[tabWorkers.length - 1].terminate(); // the follower's tab, gone
+  await leader.close();
+  const again = await openDevice({ name: "tab-follower" });
+  const reader = again.client();
+  await until("the reader is up", () => reader.ready);
+  const answer = await reader.fetch({ scope: 1, table: Notes, where: where.ids([id]) });
+  assert.equal(answer.rows[0]?.title, "acknowledged", "a write acknowledged to a follower was lost as the follower went");
+  await reader.close();
+  await again.close();
+}
+
+// A client made on a device's connect, not by device.client(), is the device's to see to all the same: closed, what it
+// typed durable, before the device closes.
+{
+  const { device, id } = await typing("tab-made", "typed by a client made on connect", (d) => new Client({ connect: d.connect }));
+  await device.close();
+  const again = await openDevice({ name: "tab-made" });
+  assert.equal(await bodyOf(again, id), "typed by a client made on connect", "what a client made on connect typed was lost as the device closed");
   await again.close();
 }
 
