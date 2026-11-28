@@ -689,14 +689,19 @@ live_text_never_starves_the_rest :: proc(t: ^testing.T) {
 		other := node_id(&w.node, 1)
 		node_write(&w.node, {{other, PLACE, .Place, node_stamp(&w.node), place[:]}, {other, DATA + 1, .Value, node_stamp(&w.node), make([]byte, 1024, context.temp_allocator)}})
 	}
-	full := s.links[0].a // the writer's node toward the reader's
+	full, peer := s.links[0].a, s.links[0].b // the writer's node toward the reader's, and the reader's
 	began := full.cursor
 	for _ in 0 ..< 200 {
 		if !full.typing_due && len(full.out) - full.sent > OUT_LIVE {
 			full.typing_due = true // a key pressed, and dropped for want of room
 		}
 		out := session_output(full)
-		session_sent(full, min(len(out), 4096))
+		n := min(len(out), 4096)
+		testing.expect(t, session_input(peer, out[:n]))
+		session_sent(full, n)
+		back := session_output(peer) // and what the reader's node says of it, as it would: what it took
+		testing.expect(t, session_input(full, back))
+		session_sent(peer, len(back))
 	}
 	testing.expectf(t, full.cursor > began, "nothing more was made of the rest: %d of %d changes said", full.cursor - began, w.node.store.events.next - began)
 	free_all(context.temp_allocator)
