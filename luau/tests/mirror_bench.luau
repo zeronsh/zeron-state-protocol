@@ -409,16 +409,17 @@ end
 -- case that makes less than that (ZSP_QUIET makes it more) is not collected while it is done.
 -- (The churning is of tables of 16 KiB arrays, which the system gives and takes back: churned as many small tables, the
 -- heap would be left with as many small holes, which what is measured then would be slower to allocate in.)
--- What each table churned in waiting for the collector holds, in KB: 1024 values of 16 bytes, and what a table is.
-local EACH_KB = 16.1
+-- What each table churned in waiting for the collector holds, in KB: 1024 values of 16 bytes, and what a table is (16.05).
+local EACH_KB = 16
 
 local function paused()
 	-- A round gone through: a key held by nothing else is gone from a weak table only then.
 	local probe = setmetatable({}, { __mode = "k" }) :: any
 	probe[{}] = true
 	local junk = nil
-	local made = 0
+	local made, peak = 0, gcinfo()
 	while next(probe) ~= nil do
+		peak = gcinfo() -- before the table whose making may end the round and begin its sweep at once
 		junk = table.create(1024, true)
 		made += 1
 		assert(made < 10000000, "the collector never went round")
@@ -426,27 +427,32 @@ local function paused()
 	-- And swept, all of it. What was made to wait for the round is all but all of what the round found was garbage, as this
 	-- is done twice (see below), and it is most of the heap: it is gone once the sweep is done, or nearly. (Waiting only
 	-- for the heap to grow is not enough: a sweep goes over pages of what is held first, freeing nothing for a while.)
-	local due = gcinfo() - made * EACH_KB * 0.9
-	while gcinfo() > due do
-		made += 1
-		assert(made < 20000000, "what was made was never swept")
-		for _ = 1, 16 do
-			junk = table.create(1024, true)
-		end
+	-- Where little was made, the heap may never come so low: so this ends, too, as the next round does, which a key made
+	-- now goes from only then.
+	local due = peak - made * EACH_KB * 0.85
+	local next_round = setmetatable({}, { __mode = "k" }) :: any
+	next_round[{}] = true
+	local swept = 0
+	while gcinfo() > due and next(next_round) ~= nil do
+		junk = table.create(1024, true)
+		swept += 1
+		assert(swept < 10000000, "what was made was never swept")
 	end
-	-- Then the heap only grows, for as long as it takes to be twice what it was. A quarter of what it is, at most 16 MB,
-	-- rising and never falling, is taken for that: where the heap is small, a round can come sooner than 16 MB.
-	local last, rising = gcinfo(), 0
-	local enough = math.clamp(last // 1024, 4, 64) -- in steps of 256 KB
+	-- Then the heap only grows, for as long as it takes to be twice what it was. A quarter of what it is, at most 32 MB,
+	-- rising and never falling, is taken for that: where the heap is small, a round can come sooner than 32 MB. (A quarter
+	-- of what it is as it falls, too.)
+	local last, rising, steps = gcinfo(), 0, 0
+	local enough = math.clamp(last // 1024, 4, 128) -- in steps of 256 KB
 	while rising < enough do
-		made += 1
-		assert(made < 10000000, "the heap never only grew")
+		steps += 1
+		assert(steps < 10000000, "the heap never only grew")
 		for _ = 1, 16 do
 			junk = table.create(1024, true)
 		end
 		local g = gcinfo()
 		if g < last then
 			rising = 0
+			enough = math.clamp(g // 1024, 4, 128)
 		else
 			rising += 1
 		end
