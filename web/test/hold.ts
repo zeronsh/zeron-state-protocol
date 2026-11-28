@@ -234,9 +234,11 @@ const killed = (p: ChildProcess) => new Promise<void>((done) => (p.exitCode !== 
     }
   }
   // As one of another's would be, which this process may not make its own: here, as its mode cannot be changed.
-  if (process.getuid?.() !== 0) {
-    const dir = join(TMP, "not-mine");
+  for (const content of process.getuid?.() !== 0 ? ["", "something"] : []) {
+    // Empty, and with something in it, which, unwritable, cannot be emptied either.
+    const dir = join(TMP, "not-mine" + (content ? "-filled" : ""));
     zspd("create", dir);
+    writeFileSync(join(dir, LOCK), content);
     chmodSync(join(dir, LOCK), 0o444);
     const unchanged = fs.chmodSync;
     for (const chmod of [

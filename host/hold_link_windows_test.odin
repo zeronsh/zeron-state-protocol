@@ -22,3 +22,15 @@ read_only_for_test :: proc(path: string) -> bool {
 writable_for_test :: proc(path: string) -> bool {
 	return win32.GetFileAttributesW(win32.utf8_to_wstring(path, context.temp_allocator)) & win32.FILE_ATTRIBUTE_READONLY == 0
 }
+
+// Whether a file or directory is marked read-only still; and marks it so no longer.
+@(private)
+read_only_still_for_test :: proc(path: string) -> bool {
+	return win32.GetFileAttributesW(win32.utf8_to_wstring(path, context.temp_allocator)) & win32.FILE_ATTRIBUTE_READONLY != 0
+}
+
+@(private)
+not_read_only_for_test :: proc(path: string) {
+	name := win32.utf8_to_wstring(path, context.temp_allocator)
+	win32.SetFileAttributesW(name, win32.GetFileAttributesW(name) & ~win32.FILE_ATTRIBUTE_READONLY)
+}

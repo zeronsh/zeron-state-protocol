@@ -236,9 +236,13 @@ dir_lock :: proc(path: string) -> (lock: Dir_Lock, held: Hold) {
 	// Shared for reading and writing, as SQLite opens it, but never for deleting: a lock file removed while held, and made
 	// again, would be held again by another. One someone else has open otherwise, as a scanner may, is waited for a while.
 	// Writable, as a lock is held only of a file open to be written: one marked read-only is no longer.
-	if attributes := win32.GetFileAttributesW(name); attributes != win32.INVALID_FILE_ATTRIBUTES && attributes & win32.FILE_ATTRIBUTE_READONLY != 0 {
-		if attributes & win32.FILE_ATTRIBUTE_REPARSE_POINT != 0 || !win32.SetFileAttributesW(name, attributes & ~win32.FILE_ATTRIBUTE_READONLY) {
-			return lock, .Unwritable if attributes & win32.FILE_ATTRIBUTE_REPARSE_POINT == 0 else .Failed
+	// Nothing is changed of what is no file, a directory or a link, which is refused as it is.
+	if attributes := win32.GetFileAttributesW(name); attributes != win32.INVALID_FILE_ATTRIBUTES {
+		if attributes & (win32.FILE_ATTRIBUTE_DIRECTORY | win32.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+			return lock, .Failed
+		}
+		if attributes & win32.FILE_ATTRIBUTE_READONLY != 0 && !win32.SetFileAttributesW(name, attributes & ~win32.FILE_ATTRIBUTE_READONLY) {
+			return lock, .Unwritable
 		}
 	}
 	handle := win32.INVALID_HANDLE_VALUE

@@ -343,3 +343,25 @@ hold_read_only_lock_file :: proc(t: ^testing.T) {
 	testing.expectf(t, again == .In_Use, "a lock file made read-only is held twice: %v", again)
 	dir_unlock(lock)
 }
+
+// A lock file that is no file, as a directory marked read-only, is refused as it is, and nothing of it changed.
+@(test)
+hold_lock_file_no_file :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-hold-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer delete(dir)
+	defer os.remove_all(dir)
+	path := file_in(dir, LOCK_FILE)
+	testing.expect(t, os.make_directory(path) == nil)
+	defer not_read_only_for_test(path)
+	if !testing.expect(t, read_only_for_test(path), "the directory could not be made read-only") {
+		return
+	}
+	lock, held, _ := dir_try(dir)
+	if held == .Held {
+		dir_unlock(lock)
+	}
+	testing.expectf(t, held == .Failed, "a directory is held as a lock file: %v", held)
+	testing.expect(t, read_only_still_for_test(path), "what is no lock file was changed")
+}

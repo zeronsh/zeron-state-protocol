@@ -226,7 +226,9 @@ function holdDirectory(dir: string): [string, () => void] {
       release = take();
     } catch (e) {
       if (code(e) === 5 || code(e) === 6) throw inUse(); // SQLITE_BUSY, by another; SQLITE_LOCKED, by this one
-      if (code(e) === 8 && !filled()) throw unwritable(); // SQLITE_READONLY, of a file with nothing in it
+      // SQLITE_READONLY, of a file with nothing in it, or that what is in it was not let go of: which is what this
+      // process cannot write, a journal being played only by one that can.
+      if (code(e) === 8 && (tries === 4 || !filled())) throw unwritable();
       // Anything else, with something in it still, is what is in it, whatever SQLite made of it, and is emptied once
       // nobody holds it; with nothing in it, it is no such thing.
       if (tries === 4 || !filled()) throw e;
