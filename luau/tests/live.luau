@@ -38,8 +38,52 @@ local function guarded(f: any): any
 	end
 end
 
+-- A node that is slow to say what it holds is durable, as on a slow disk, is had by holding back what it says so with,
+-- its Ack frames, for `ack_delay` seconds: all else it says comes at once, in order, and every Ack as late as any other.
+local function acks_held(self: any, receive: (any) -> ()): (any) -> ()
+	local carry = ""
+	return function(message: any)
+		if self.ack_delay <= 0 and carry == "" then
+			receive(message)
+			return
+		end
+		local s = carry .. (if type(message) == "string" then message else buffer.tostring(message))
+		local at = 1
+		while at <= #s do
+			local n, scale, p = 0, 1, at
+			while true do
+				local b = string.byte(s, p)
+				if not b then
+					break
+				end
+				p += 1
+				n += b % 128 * scale
+				if b < 128 then
+					break
+				end
+				scale *= 128
+			end
+			if p + n - 1 > #s or n == 0 then
+				break
+			end
+			local frame, kind = string.sub(s, at, p + n - 1), string.byte(s, p)
+			at = p + n
+			if kind == 8 and self.ack_delay > 0 then -- Ack
+				task.delay(self.ack_delay, guarded(function()
+					receive(frame)
+				end))
+			else
+				receive(frame)
+			end
+		end
+		carry = string.sub(s, at)
+	end
+end
+
 local function host(address: string, token: string)
-	return {
+	local self: any
+	self = {
+		ack_delay = 0,
 		credential = token,
 		linger = 0.2,
 		now = function(): number
@@ -62,13 +106,14 @@ local function host(address: string, token: string)
 			end
 			table.insert(sockets, socket)
 			task.spawn(guarded(function()
+				local take = acks_held(self, receive)
 				while true do
 					local message = socket:next()
 					if message == nil then
 						closed()
 						return
 					end
-					receive(message)
+					take(message)
 				end
 			end))
 			return {
@@ -81,6 +126,7 @@ local function host(address: string, token: string)
 			}
 		end,
 	}
+	return self
 end
 
 local function eventually(what: string, f: () -> boolean)
@@ -96,7 +142,8 @@ end
 
 local args = process.args
 local a = zsp.connect(host(args[1], args[2]))
-local b = zsp.connect(host(args[3], args[4]))
+local b_host = host(args[3], args[4])
+local b = zsp.connect(b_host)
 eventually("both connect", function()
 	return a.ready and b.ready
 end)
@@ -633,10 +680,19 @@ do
 	w.stop()
 end
 
--- A window nobody observes is let go.
+-- A window nobody observes is let go: what it showed, once what was written there is durable, however late the node
+-- says so. Rows written in it are held until then, as they must be: so first that, and only then the window's linger.
+-- (On a slow disk, as Windows runners have, what b wrote last was said to be durable after the window had lingered.)
+b_host.ack_delay = 0.5
+b:write(1, function(change)
+	change.insert(Message, "chat", 999, { author = "bob", stars = 1 })
+end)
 theirs.stop()
 window.stop()
 assert(next(b.windows) ~= nil)
+eventually("what b wrote is durable", function()
+	return #b.pending == 0
+end)
 task.wait(0.3)
 assert(next(b.windows) == nil and next(b.pages) == nil)
 local held = 0
