@@ -187,9 +187,9 @@ comes back. What could still be lost is only what was typed after the tab was hi
 as the tab is hidden, it takes a few milliseconds (1.5 to 8 ms in headless Chrome, `test/tabs.ts`), long before a browser freezes a
 hidden page, which Chrome does only once it has been hidden for minutes, and which its own rules keep it from doing to one holding
 a Web Lock that others wait on (Chromium's freezing policy, `kHoldingWebLock`); so what is left to do as it freezes is nothing, but
-what was typed since, and a worker told to go then, which Chrome
-does not freeze with its tab at once, is done with it in milliseconds. One caught holding the store all the same, frozen, or paused
-in a debugger as the tests catch one, is to every other tab what any holder that answers nothing is: what they ask is said to
+what was typed since, and a worker told to go then is done with it in milliseconds, unless frozen with its tab first, as Chrome
+on macOS has been seen to freeze it, where on Linux it has not. One caught holding the store so, frozen or paused in a debugger as the
+tests catch one, is to every other tab what any holder that answers nothing is: what they ask is said to
 fail, the store being locked, within three silences at most, what they write waits, dropped by nothing, and the store is had
 again once the tab is thawed or thrown away. And
 `device.close()` closes every client, what it wrote delivered and durable, before it stops the node.

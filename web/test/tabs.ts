@@ -441,9 +441,9 @@ const tests: Record<string, () => Promise<void>> = {
     expectEqual(await call<string[]>(other, "bodies", "hd", "docs"), ["typed before the tab was hidden"], "what was typed before the tab was hidden, after it was thrown away");
   },
   // A tab frozen as its worker has yet to make durable what was typed after the tab was hidden, which is as late as it can
-  // be typed: whether the worker has done so and let go of the store before it is frozen, or is frozen first, holding the
-  // store, every other tab is answered in time, as of any holder frozen: written to, or told the store is locked, never
-  // left waiting. Thawed, the worker goes on, and what was typed is there.
+  // be typed: whether the worker has done so and let go of the store before it is frozen, as on Linux, or is frozen first,
+  // holding the store, as Chrome on macOS has been seen to freeze it, every other tab is answered in time, as of any holder
+  // frozen, or told the store is locked, never left waiting. Thawed, the worker goes on, and what was typed is there.
   async tab_frozen_draining() {
     const leader = await page();
     await call(leader, "device", "fd");
@@ -454,13 +454,19 @@ const tests: Record<string, () => Promise<void>> = {
     await call(follower, "put", "fd", "notes", ["one"]);
     await call(leader, "type", "fd", "docs", ["typed after the tab was hidden"]);
     await leader.cdp("Page.setWebLifecycleState", { state: "frozen" });
+    // Asked something, it is answered, or told the store is locked within three silences, the worker frozen holding it, as
+    // Chrome on macOS has been seen to freeze it; and what it writes waits, never dropped, till the store is had.
     const t = performance.now();
-    const said = await within(15000, call<string>(follower, "putOrError", "fd", "notes", ["two"]));
+    void call(follower, "put", "fd", "notes", ["two"]).catch(() => {});
+    const said = await within(15000, call<string>(follower, "memberOrError", "fd"));
     const took = performance.now() - t;
     console.log(`     another tab, its leader frozen as it drained, was answered in ${took.toFixed(0)} ms: ${said}`);
-    if (said !== "written" && !said.startsWith("StoreLocked (StoreLocked): ")) throw new Error(`another tab, its leader frozen as it drained: ${said}`);
+    const locked = said.startsWith("error: the store is held by something that does not answer");
+    if (!locked && !["true", "false"].includes(said)) throw new Error(`another tab, its leader frozen as it drained: ${said}`);
+    if (locked && took > 3 * 3000 + 3000) throw new Error(`told the store is locked only after ${took.toFixed(0)} ms`);
     await leader.cdp("Page.setWebLifecycleState", { state: "active" });
     await eventually(async () => (await call<string>(follower, "putOrError", "fd", "notes", ["three"])) === "written", "written once the leader thawed", 20000);
+    expectEqual((await call<string[]>(follower, "titles", "fd", "notes", 3)).join(), "one,two,three", "what it wrote meanwhile, once the leader thawed");
     let seen: string[] = [];
     await eventually(async () => (seen = await call<string[]>(follower, "bodies", "fd", "docs")).join() === "typed after the tab was hidden", "what was typed after the tab was hidden, once it thawed", 20000).catch((e) => {
       throw new Error(`${e.message}: ${JSON.stringify(seen)}`);
