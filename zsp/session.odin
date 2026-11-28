@@ -724,6 +724,8 @@ on_roster :: proc(s: ^Session, r: ^Reader) -> Fault {
 @(private)
 session_authorize :: proc(s: ^Session) {
 	n := s.node
+	// Whatever it may read now: what a relay was keeping of live text for it was had under what it might read before.
+	live_owed_clear(s)
 	before := slice.clone(s.grants[:], context.temp_allocator)
 	if s.role != .Open {
 		// A device that does not belong has no peers, as on_roster says: neither a relay nor anyone. (One that knows no
@@ -749,7 +751,6 @@ session_authorize :: proc(s: ^Session) {
 		if .Read not_in session_rights(s, key_scope(w.lo)) || (s.role == .Open && keyring_scope(n.keys, key_scope(w.lo)) == nil) {
 			append(&s.tasks, Task{kind = .Synced, watch = w.id, lo = w.lo, hi = w.hi, denied = true})
 			on_unwatch(s, w.id)
-			live_owed_clear(s) // what it was owed of live text was had under what it may no longer read
 		}
 	}
 	if s.role == .Calls {
@@ -1095,6 +1096,9 @@ hurried :: proc(s: ^Session, id: u64) -> bool {
 
 @(private)
 on_unwatch :: proc(s: ^Session, id: u64) {
+	// What a relay was keeping of live text for it may have been of this watch, which is no more: it goes. What still
+	// matters of it comes once sealed.
+	live_owed_clear(s)
 	for w, i in s.watches {
 		if w.id == id {
 			unordered_remove(&s.watches, i)

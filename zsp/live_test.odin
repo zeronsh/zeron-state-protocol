@@ -730,6 +730,22 @@ a_relay_keeps_so_much_live_text_at_most :: proc(t: ^testing.T) {
 	}
 	testing.expectf(t, most <= LIVE_OWED + 4096, "kept %d of live text", most)
 	testing.expect(t, gave_up, "never gave up")
+	// Owing live text, it does not sleep; and what it owes goes with a watch let go of, and when what it may read is
+	// judged again. (Neon on #41, P41-1.)
+	l := Live{row = {1, 9}, slot = DATA, piece = 7, body = body[:1024]}
+	testing.expect(t, send_live(at, &l) && len(at.live_owed) > 0)
+	saved := make([dynamic]byte, context.temp_allocator)
+	testing.expect(t, !session_save(at, &saved), "a relay would sleep owing live text")
+	f: [dynamic]byte
+	defer delete(f)
+	frame := frame_begin(&f, .Unwatch)
+	write_varint(&f, 12345)
+	frame_end(&f, frame)
+	testing.expect(t, session_input(at, f[:]))
+	testing.expectf(t, len(at.live_owed) == 0, "kept %d of live text for a watch let go of", len(at.live_owed))
+	testing.expect(t, send_live(at, &l) && len(at.live_owed) > 0)
+	session_authorize(at)
+	testing.expectf(t, len(at.live_owed) == 0, "kept %d of live text through what it may read being judged again", len(at.live_owed))
 	clear(&at.out)
 	at.sent = 0
 	free_all(context.temp_allocator)
