@@ -239,7 +239,7 @@ function contend(): void {
     if (line === giveUp) line = undefined; // had: nothing to give up now but the store itself
     if (leaving) return;
     holding = true;
-    unlisten(); // what waited on whoever held the store waits on this worker now, which answers it or says it failed
+    holderChanged(); // what waited on whoever held the store waits on this worker now, which answers it or says it failed
     saidStage = -1; // and, holding it anew, it has said nothing of how far it has got
     try {
       await hold(o);
@@ -285,7 +285,7 @@ async function hold(o: Options): Promise<void> {
   else if (!stopped) {
     device = node;
     breakCarried();
-    awaiting.clear(); // waiting on this worker, which is here now
+    holderChanged(); // what waited on this worker has it here now
     channel.postMessage({ leader: true } satisfies Shout);
     tellSpace();
     // What this worker itself was waiting to hear, it now answers: but what the one before may have done already, it says
@@ -347,8 +347,8 @@ const away = () => void leave();
 // Every tab hears that the node has stopped, its storage having failed; this one too, which hears nothing it says.
 function fail(f: Failure): void {
   failedAsks(f);
-  awaiting.clear(); // waiting on this worker, which has failed
   breakCarried(); // to one that is gone, or none: every client dials again, and so this worker is wanted, and tries again
+  holderChanged(); // what waited on this worker is answered: it failed
   tellAll({ failed: f.message, name: f.name });
 }
 
@@ -442,7 +442,6 @@ function answer(op: Op, args: unknown[]): { value?: unknown; error?: string } {
 function failedAsks(f: Failure): void {
   for (const [id, done] of waiting) unheard.delete(id), taken.delete(id), done({ error: f.message, name: f.name });
   waiting.clear();
-  if (!waitingOnHolder()) clearTimeout(silence), (silence = undefined);
 }
 
 // What a leader that has gone was doing as it went, and may have done: unless it may be done again, it is said to have
@@ -471,10 +470,9 @@ function shout(id: string, s: Shout): void {
 //
 // Only another worker is waited on so: one holding the store answers what is asked of it, or says it failed, itself, and
 // one leaving waits on nobody. So the silence is kept only while this worker neither holds the store nor is leaving, and
-// let go of as it comes to hold it, or leaves. What waits on the holder is kept whoever that is, but by one leaving: what
-// waited on another is let go of as this worker comes to hold the store, that one having let go of it; and what waited on
-// this one, as it opens its node or says it failed, which answers it. Asked, or a pipe carried, as a node that failed lets
-// go of the store, it waits on the next holder, as it would once this worker held the store no more.
+// let go of as it comes to hold it, or leaves. What waits on the holder is kept whoever that is, but by one leaving, and let
+// go of as that holder is waited on no more (holderChanged). Asked, or a pipe carried, as a node that failed lets go of the
+// store, it waits on the next holder, as it would once this worker held the store no more.
 const waitingOnHolder = () => waiting.size > 0 || awaiting.size > 0;
 const listening = () => !holding && !leaving;
 function listen(): void {
@@ -497,9 +495,9 @@ function listen(): void {
       return look();
     }
     const f: Failure = { message: "the store is held by something that does not answer: another tab of this site, hung, or the browser, until it is restarted", name: "StoreLocked" };
-    awaiting.clear();
     failedAsks(f);
     breakCarried(); // and so every client dials again, and is told so again should it be so still
+    unlisten(); // and nothing waits on it any more
     tell({ failed: f.message, name: f.name });
   };
   look();
@@ -518,6 +516,15 @@ function unlisten(): void {
   silence = undefined;
   awaiting.clear();
   holderHeard = probeHeard = false;
+}
+
+// Whoever held the store is waited on no more, however it went: it said it failed, another has opened the store since, or
+// it was this worker, which has come to hold the store, opened its node or failed. All of waiting on it ends here, what
+// waited on it, the silence, and that it was asked whether it is there and said nothing; and what is still waiting, asks
+// said again to the next, waits on that one afresh, asked whether it is there before it is given up on.
+function holderChanged(): void {
+  unlisten();
+  listen();
 }
 
 // Asked whether it is there, the worker that holds the store says so if it is running the node, or if it has got on with
@@ -545,6 +552,7 @@ function heard(s: Shout): void {
     const f: Failure = { message: s.failed, ...(s.name === "StoreLocked" ? { name: s.name } : {}) };
     failedAsks(f);
     breakCarried();
+    holderChanged();
     tell({ failed: f.message, name: f.name });
   } else if ("space" in s) {
     if (s.space !== undefined && typeof s.space !== "string") return;
@@ -557,6 +565,7 @@ function heard(s: Shout): void {
       if (lost) heard({ answer: id, ...lost });
       else channel.postMessage(u);
     }
+    holderChanged();
   } else if ("by" in s) {
     heardGiven(s);
   } else if ("credentials" in s) {

@@ -826,6 +826,35 @@ async function firstTurnWrites(store: string): Promise<void> {
   port1.close();
 }
 
+// A holder that says it failed is waited on no more, and the one after it is waited on afresh: asked whether it is there
+// before anything waiting on it is given up on, though the one before was asked and said nothing.
+{
+  let failedGone!: () => void;
+  void request("zsp:handoff", () => new Promise<void>((done) => (failedGone = done))); // says nothing, and then that it failed
+  void request("zsp:handoff", () => new Promise<void>(() => {})); // the next, there, opening the store slowly
+  let anyone = 0;
+  let next = false;
+  const holders = new Channel("zsp:handoff");
+  holders.onmessage = (e) => void ((e.data as { anyone?: true }).anyone && (anyone++, next && holders.postMessage({ here: true })));
+  const w = await worker();
+  await w.tell({ open: { name: "handoff" } });
+  const first = new MessageChannel();
+  await w.tell({ connect: first.port2 });
+  await until("the holder is asked whether it is there", () => anyone === 1, 2 * 3000);
+  await sleep(500);
+  holders.postMessage({ failed: "the disk is full" });
+  next = true;
+  failedGone();
+  await until("its tab is told", () => w.said.some((r) => "failed" in r));
+  const again = new MessageChannel(); // as its client dials again
+  await w.tell({ connect: again.port2 });
+  await until("the next holder is asked whether it is there", () => anyone === 2, 2 * 3000);
+  assert(!w.said.some((r) => "failed" in r && r.name === "StoreLocked"), `given up on the next holder, never asked: ${JSON.stringify(w.said)}`);
+  await w.tell({ ask: 1, op: "close", args: [] });
+  holders.close();
+  for (const c of [first, again]) c.port1.close();
+}
+
 // A worker holding the store that is stuck opening it, waiting on a file that never opens, does not say it is there, but
 // for once, as it is first asked: what waits on it is given up on. Many waiting on it ask whether it is there, as one does
 // at a time, for a worker that hears another ask need not ask too: what the holder says, every worker hears.
