@@ -76,6 +76,7 @@ const windows = new Map<string, { state?: State<typeof Note>; stop: () => void }
 
 const Doc = { body: columns.text(17) };
 const Big = { more: columns.string(18) };
+let hiddenTook = -1; // ms, see timeHidden
 const editors: Editor[] = [];
 let shownText = "", textNow = "", textDropped = false, textRow = "";
 let textOf: Client | undefined;
@@ -358,6 +359,38 @@ const zsp = {
     const editor = c.text(id, Doc.body);
     editors.push(editor);
     for (const w of words) editor.append(w);
+  },
+  /** Writes, as put does, or says why it could not: StoreLocked by name. */
+  async putOrError(name: string, list: string, titles: string[]): Promise<string> {
+    try {
+      await zsp.put(name, list, titles);
+      return "written";
+    } catch (e) {
+      return `${(e as Error).name}${e instanceof StoreLocked ? " (StoreLocked)" : ""}: ${(e as Error).message}`;
+    }
+  },
+  /** The texts of a list of scope 1, once there are any, or none after a while. */
+  async bodies(name: string, list: string): Promise<string[]> {
+    let state: State<typeof Doc> | undefined;
+    const w = clientOf(name).window({ scope: 1, list, table: Doc, size: 100 }, (s) => (state = s));
+    for (let i = 0; i < 1000 && !(state && state.status !== "loading" && state.rows.length > 0); i++) await sleep(10);
+    w.stop();
+    return (state?.rows ?? []).map((r) => r.body);
+  },
+  /** How long, from when this tab is next hidden, until all its device's client wrote, and typed, is acknowledged. */
+  async timeHidden(name: string): Promise<void> {
+    const c = clientOf(name);
+    hiddenTook = -1;
+    const seen = () => {
+      if (document.visibilityState !== "hidden") return;
+      document.removeEventListener("visibilitychange", seen);
+      const t = performance.now();
+      void c.write(1, () => {}).then(() => (hiddenTook = performance.now() - t));
+    };
+    document.addEventListener("visibilitychange", seen);
+  },
+  async hiddenTook(): Promise<number> {
+    return hiddenTook;
   },
   /** Watches the first text of a list: what it has shown, and whether it ever stopped showing it once it had. */
   async watchText(name: string, list: string): Promise<void> {

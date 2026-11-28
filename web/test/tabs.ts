@@ -423,6 +423,80 @@ const tests: Record<string, () => Promise<void>> = {
     await leader.cdp("Page.setWebLifecycleState", { state: "active" });
     await leader.evaluate("window.__closed");
   },
+  // A tab hidden with text typed and not yet sealed: it is sealed, delivered and durable while the tab still runs, in a
+  // few milliseconds, before the tab can be frozen; and frozen then, and thrown away, never back, the next tab has it.
+  async tab_hidden_durable() {
+    const writer = await page();
+    await call(writer, "device", "hd");
+    await call(writer, "create", "hd");
+    await call(writer, "put", "hd", "warm", ["its client ready"]);
+    await call(writer, "timeHidden", "hd");
+    await call(writer, "type", "hd", "docs", ["typed ", "before ", "the tab was hidden"]);
+    const other = await page(); // and so the writer is hidden
+    await eventually(async () => (await call<number>(writer, "hiddenTook")) >= 0, "all it typed is acknowledged, the tab hidden");
+    console.log(`     sealed, delivered and durable ${(await call<number>(writer, "hiddenTook")).toFixed(1)} ms after the tab was hidden`);
+    await writer.cdp("Page.setWebLifecycleState", { state: "frozen" });
+    await gone(writer); // thrown away, frozen
+    expectEqual(await within(15000, call<string>(other, "deviceOrError", "hd")), "ok", "the next tab has the store");
+    expectEqual(await call<string[]>(other, "bodies", "hd", "docs"), ["typed before the tab was hidden"], "what was typed before the tab was hidden, after it was thrown away");
+  },
+  // A tab frozen as its worker has yet to make durable what was typed after the tab was hidden, which is as late as it can
+  // be typed: whether the worker has done so and let go of the store before it is frozen, or is frozen first, holding the
+  // store, every other tab is answered in time, as of any holder frozen: written to, or told the store is locked, never
+  // left waiting. Thawed, the worker goes on, and what was typed is there.
+  async tab_frozen_draining() {
+    const leader = await page();
+    await call(leader, "device", "fd");
+    await call(leader, "create", "fd");
+    await call(leader, "put", "fd", "warm", ["its client ready"]);
+    const follower = await page(); // and so the leader is hidden
+    await call(follower, "device", "fd");
+    await call(follower, "put", "fd", "notes", ["one"]);
+    await call(leader, "type", "fd", "docs", ["typed after the tab was hidden"]);
+    await leader.cdp("Page.setWebLifecycleState", { state: "frozen" });
+    const t = performance.now();
+    const said = await within(15000, call<string>(follower, "putOrError", "fd", "notes", ["two"]));
+    const took = performance.now() - t;
+    console.log(`     another tab, its leader frozen as it drained, was answered in ${took.toFixed(0)} ms: ${said}`);
+    if (said !== "written" && !said.startsWith("StoreLocked (StoreLocked): ")) throw new Error(`another tab, its leader frozen as it drained: ${said}`);
+    await leader.cdp("Page.setWebLifecycleState", { state: "active" });
+    await eventually(async () => (await call<string>(follower, "putOrError", "fd", "notes", ["three"])) === "written", "written once the leader thawed", 20000);
+    let seen: string[] = [];
+    await eventually(async () => (seen = await call<string[]>(follower, "bodies", "fd", "docs")).join() === "typed after the tab was hidden", "what was typed after the tab was hidden, once it thawed", 20000).catch((e) => {
+      throw new Error(`${e.message}: ${JSON.stringify(seen)}`);
+    });
+  },
+  // And one whose worker is caught mid-way, holding the store, as one frozen before it is done would be (paused, for a
+  // worker is not frozen with its tab at once, and is done in milliseconds): every other tab is told the store is locked,
+  // in time, as of any holder that answers nothing, never left waiting; and has the store once the tab is thrown away.
+  async tab_discarded_draining() {
+    const leader = await page();
+    await call(leader, "device", "dd");
+    await call(leader, "create", "dd");
+    await call(leader, "put", "dd", "warm", ["its client ready"]);
+    const follower = await page(); // and so the leader is hidden
+    await call(follower, "device", "dd");
+    await call(follower, "put", "dd", "notes", ["one"]);
+    await call(leader, "type", "dd", "docs", ["typed after the tab was hidden"]);
+    const worker = leader.workers[leader.workers.length - 1];
+    await leader.cdp("Debugger.enable", {}, worker);
+    await leader.cdp("Debugger.pause", {}, worker); // at whatever it next does, which is to hear its tab
+    await leader.cdp("Page.setWebLifecycleState", { state: "frozen" }); // which seals it, and closes its pipes behind it
+    // What it asks is answered, or said to fail as the store is locked, in time; and what it writes waits, never dropped, the
+    // client trying still, till the store is had again.
+    const t = performance.now();
+    void call(follower, "put", "dd", "notes", ["two"]).catch(() => {});
+    const said = await within(15000, call<string>(follower, "memberOrError", "dd"));
+    console.log(`     another tab, its leader stuck as it drained, was answered in ${(performance.now() - t).toFixed(0)} ms: ${said}`);
+    // Answered, should the worker have been done before it was paused, the store had by another; told the store is locked,
+    // in three intervals of hearing nothing at most, should it be caught holding it: never left waiting.
+    const locked = said.startsWith("error: the store is held by something that does not answer");
+    if (!locked && !["true", "false"].includes(said)) throw new Error(`another tab, its leader stuck as it drained: ${said}`);
+    if (locked && performance.now() - t > 3 * 3000 + 3000) throw new Error(`told the store is locked only after ${(performance.now() - t).toFixed(0)} ms`);
+    await gone(leader); // thrown away, never back
+    await eventually(async () => ["true", "false"].includes(await call<string>(follower, "memberOrError", "dd")), "answered once the leader was thrown away", 20000);
+    expectEqual((await call<string[]>(follower, "titles", "dd", "notes", 2)).join(), "one,two", "what it wrote meanwhile, once the leader was thrown away");
+  },
   // A tab's worker carries its pipe to the leader's, which never hears of it: the pipe is broken off, and the client
   // dials again, rather than waiting for ever.
   async tab_unheard() {
