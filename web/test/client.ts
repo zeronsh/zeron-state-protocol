@@ -2261,6 +2261,48 @@ for (const up of [true, false]) {
   assert.equal(h.self.closes, closes + 1);
 }
 
+// A right to write in one scope ends while what was written there, and in another, is yet to be said: what is there fails
+// at once, and is never said, for a node would refuse it; the rest is said, and delivered, and the client goes on.
+{
+  const h = harness();
+  h.run();
+  const both = (one: string) => h.tell(ROSTER, rep("\0", 8) + "\x01" + one + rep("k", 32) + "\x02\x07" + rep("k", 32));
+  both("\x07");
+  let one = false, two = false;
+  void h.client.write(1, (change) => change.insert(Note, "a", 1, { title: "one" })).then(() => (one = true));
+  void h.client.write(2, (change) => change.insert(Note, "a", 1, { title: "two" })).then(() => (two = true));
+  const from = h.self.said.length;
+  both("\x05"); // read and call in scope 1, and no more, before either was said
+  assert.deepEqual(cellsSaid(h, from).map((x) => x.seq), [2], "what may no longer be written was said, or what may was not");
+  ack(h, 2);
+  await tick();
+  assert(two && !one, `delivered: ${one}, ${two}`);
+  assert(h.client.ready && h.self.closes === 0, "the client was let go of");
+  const closing = state(h.client.close());
+  await tick();
+  assert(closing.settled && closing.failed instanceof Error && /no longer write/.test(closing.failed.message), `${closing.failed}`);
+}
+
+// What was said in a scope this client may no longer write in, its right having ended on the way, the node refuses, and
+// names its rows in the Ack: never durable, and so told; what was written elsewhere, acknowledged with it, is delivered.
+{
+  const h = harness();
+  h.run();
+  h.tell(ROSTER, rep("\0", 8) + "\x01\x07" + rep("k", 32) + "\x02\x07" + rep("k", 32));
+  let one = false, two = false;
+  void h.client.write(1, (change) => change.insert(Note, "a", 1, { title: "one" })).then(() => (one = true));
+  void h.client.write(2, (change) => change.insert(Note, "a", 1, { title: "two" })).then(() => (two = true));
+  h.run();
+  const first = h.self.said.find((x) => x.kind === CELLS)!;
+  h.tell(ACK, ch(2) + first.body.slice(2, 18)); // its seq, and then its first cell's tag, are a byte each
+  await tick();
+  assert(two && !one, `delivered: ${one}, ${two}`);
+  assert(h.client.ready && h.self.closes === 0, "the client was let go of");
+  const closing = state(h.client.close());
+  await tick();
+  assert(closing.settled && closing.failed instanceof Error && /no longer write/.test(closing.failed.message), `${closing.failed}`);
+}
+
 // And a text refused as the pipe came up again, sealed while it was down, is told so by its editor for as long as it is
 // asked, whatever else was told it first.
 {
@@ -2375,6 +2417,27 @@ for (const how of ["given up on", "refused"] as const) {
   await tick();
   assert(closing.settled && closing.failed instanceof Undelivered && closing.failed.cells === 1, `given up on, it said: ${closing.failed}`);
   assert.equal(cellsSaid(h, from).length, 0, "what it was given up on was sent all the same");
+}
+
+// A client closed and given up on as it dials again to deliver what it wrote says nothing on the pipe it dialled: not even
+// what it framed before it was given up on.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  void h.client.write(1, (change) => change.insert(Note, "a", 1, { title: "t" }));
+  h.run();
+  h.self.closed();
+  h.run();
+  const quit = new AbortController();
+  const closing = state(h.client.close({ signal: quit.signal })); // which dials at once, to deliver it
+  const from = h.self.said.length;
+  quit.abort(); // and gives up before it has said anything
+  h.run();
+  await tick();
+  h.run();
+  assert(closing.settled && closing.failed instanceof Undelivered, `its close said: ${closing.failed}`);
+  assert.equal(h.self.said.length, from, "a client given up on said more");
 }
 
 // A client a node refuses for good, with what an editor typed before its row was here still to be sealed: it never dials

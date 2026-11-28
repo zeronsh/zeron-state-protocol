@@ -3481,6 +3481,102 @@ for _, how in { "nothing typed", "refused" } do
 	assert(flushed.ok == (how == "nothing typed"), `{how}: {flushed.why}`)
 end
 
+-- A right to write in one scope ends while what was written there, and in another, is yet to be said: what is there fails
+-- at once, and is never said, for a node would refuse it; the rest is said, and delivered, and the client goes on.
+do
+	local h = harness()
+	h.run()
+	local function both(one: string)
+		h.tell(ROSTER, string.rep("\0", 8) .. "\1" .. one .. string.rep("k", 32) .. "\2\7" .. string.rep("k", 32))
+	end
+	both("\7")
+	local one, two = false, false
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 1, { title = "one" })
+	end, function()
+		one = true
+	end)
+	h.client:write(2, function(change)
+		change.insert(Note, "a", 1, { title = "two" })
+	end, function()
+		two = true
+	end)
+	local from = #h.self.said
+	both("\5") -- read and call in scope 1, and no more, before either was said
+	local sent = cells_said(h, from)
+	assert(#sent == 1 and sent[1].seq == 2, "what may no longer be written was said, or what may was not")
+	ack(h, 2)
+	h.run()
+	assert(two and not one, `delivered: {one}, {two}`)
+	assert(h.client.ready and h.self.closes == 0, "the client was let go of")
+	h.client:close()
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	h.run()
+	assert(flushed.done and flushed.ok == false and string.find(flushed.why, "no longer write", 1, true), `{flushed.why}`)
+end
+
+-- What was said in a scope this client may no longer write in, its right having ended on the way, the node refuses, and
+-- names its rows in the Ack: never durable, and so told; what was written elsewhere, acknowledged with it, is delivered.
+do
+	local h = harness()
+	h.run()
+	h.tell(ROSTER, string.rep("\0", 8) .. "\1\7" .. string.rep("k", 32) .. "\2\7" .. string.rep("k", 32))
+	local one, two = false, false
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 1, { title = "one" })
+	end, function()
+		one = true
+	end)
+	h.client:write(2, function(change)
+		change.insert(Note, "a", 1, { title = "two" })
+	end, function()
+		two = true
+	end)
+	h.run()
+	local first: Said? = nil
+	for _, x in h.self.said do
+		if x.kind == CELLS then
+			first = x
+			break
+		end
+	end
+	h.tell(ACK, "\2" .. string.sub((first :: Said).body, 3, 18)) -- its seq, and then its first cell's tag, are a byte each
+	h.run()
+	assert(two and not one, `delivered: {one}, {two}`)
+	assert(h.client.ready and h.self.closes == 0, "the client was let go of")
+	h.client:close()
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	h.run()
+	assert(flushed.done and flushed.ok == false and string.find(flushed.why, "no longer write", 1, true), `{flushed.why}`)
+end
+
+-- A client closed and given up on as it dials again to deliver what it wrote says nothing on the pipe it dialled: not even
+-- what it framed before it was given up on.
+do
+	local h = harness()
+	h.run()
+	h.greet()
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	h.self.closed()
+	h.run()
+	h.client:close() -- which dials at once, to deliver it
+	local flushed = waited(function()
+		return h.client:flushed(1)
+	end)
+	local from = #h.self.said
+	h.laters() -- and gives up before it has said anything
+	h.run()
+	assert(flushed.done and flushed.ok == false, "flushed() said what was given up on was delivered")
+	assert(#h.self.said == from, `a client given up on said {#h.self.said - from} frames more`)
+end
+
 -- A client a node refuses for good, with what an editor typed before its row was here still to be sealed: it never dials
 -- again, and flushed() says it never delivered it.
 do

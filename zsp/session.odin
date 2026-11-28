@@ -1995,6 +1995,7 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 	seq := read_varint(r)
 	cells := make([dynamic]Cell, context.temp_allocator)
 	row: Id
+	refused := false // a local client's frame with a cell where it may not write: refused whole, as frames are taken
 	for r.pos < len(r.buf) {
 		c, ok := read_cell(r, row)
 		if !ok {
@@ -2013,9 +2014,8 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 		if s.role == .Open {
 			scope := row_scope(c.row)
 			as, may := session_as(s, scope)
-			if !may || .Write not_in session_rights(s, scope) || !node_may_write(n, scope) || !cell_seal(n.keys, &n.roster, &c, 0, as) {
-				session_fail(s, .Denied)
-				return
+			if !refused && (!may || .Write not_in session_rights(s, scope) || !node_may_write(n, scope) || !cell_seal(n.keys, &n.roster, &c, 0, as)) {
+				refused = true
 			}
 		} else if _, held := tree_get(&n.store, n.cells, cell_key(c.row, c.slot, c.kind, c.stamp)); held {
 			continue // whatever it says, it goes no further: most often, it came by two roads
@@ -2030,6 +2030,24 @@ on_cells :: proc(s: ^Session, r: ^Reader) {
 			continue
 		}
 		append(&cells, c)
+	}
+	if refused {
+		// A scope it may no longer write in, its right having ended as it wrote, or one it never could: a right in one
+		// scope, not the client's. Its rows are named in the Ack, as a peer's refused rows are, and the session goes on,
+		// and so does what it wrote elsewhere. (Error 2 is for a client that may do nothing at all.)
+		for c in cells {
+			if len(s.refused) == 0 || s.refused[len(s.refused) - 1] != c.row {
+				append(&s.refused, c.row)
+			}
+		}
+		if len(s.refused) > MAX_REFUSED {
+			// More than an Ack may say: ended, to be dialled again, by when the client has heard where it may write.
+			session_fail(s, .Failed)
+			return
+		}
+		s.seq_in = seq
+		s.ack_at = store_tail(&n.store) // as durable as all that came before it
+		return
 	}
 	if record_size(cells[:]) > MAX_RECORD {
 		r.bad = true
