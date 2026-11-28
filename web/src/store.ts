@@ -95,7 +95,10 @@ export class Store {
   static readonly counts = { held: 0, journaled: 0, replayed: 0 };
   /** Called when something that was waiting for a file is done, should anyone want to know. */
   onSettled?: () => void;
-  /** Called with what went wrong in the background, which the node will meet next time it asks for durability. */
+  /**
+   * What went wrong, in the background or as the node asked for something: from then on nothing more is written, dropped,
+   * cut short or made durable, and the node, told by `onSettled`, stops. Set by `#failed`, once.
+   */
   failure?: unknown;
 
   private constructor(volume: Volume, segment: number) {
@@ -119,7 +122,9 @@ export class Store {
         const n = segmentNumber(name);
         if (n !== undefined) {
           const f = await open(name, false);
-          if (f) s.#segments.set(n, f);
+          // What was written to it before a process was killed may be in the system's keeping rather than the disk's, and
+          // what the node finds there it counts as durable once a sync says so: so the next sync makes it so.
+          if (f) s.#segments.set(n, f), s.#dirty.add(f);
         }
       }
       s.#tree = (await open("tree", true))!;
@@ -129,7 +134,12 @@ export class Store {
       for (const what of KEPT) {
         const a = (await open(what + ".0", true))!;
         const b = (await open(what + ".1", true))!;
-        s.#kept.set(what, [Store.#slot(a), Store.#slot(b)]);
+        const slots: [Slot, Slot] = [Store.#slot(a), Store.#slot(b)];
+        // The latest may be in the system's keeping, rather than the disk's, should a process have been killed as it kept it:
+        // made durable before the next is kept over the one before it, which may be the only one the disk has.
+        const latest = slots[0].generation >= slots[1].generation ? slots[0] : slots[1];
+        if (latest.generation > 0) latest.file.flush();
+        s.#kept.set(what, slots);
       }
     } catch (e) {
       for (const f of opened) closing(f);
@@ -165,6 +175,11 @@ export class Store {
 
   /** Keeps something whole, durably, the one it replaces becoming the one before. */
   keep(what: Kept, bytes: Uint8Array): void {
+    if (this.failure !== undefined) throw new Error("storage has failed", { cause: this.failure });
+    this.#failing(() => this.#keep(what, bytes));
+  }
+
+  #keep(what: Kept, bytes: Uint8Array): void {
     const [a, b] = this.#kept.get(what)!;
     const [hi, lo] = a.generation >= b.generation ? [a, b] : [b, a];
     const generation = hi.generation + 1;
@@ -185,7 +200,30 @@ export class Store {
 
   // ---------------------------------------------------------------- the log
 
+  // Storage has failed should f throw, and what it threw is thrown on.
+  #failing<T>(f: () => T): T {
+    try {
+      return f();
+    } catch (e) {
+      this.#failed(e);
+      throw e;
+    }
+  }
+
+  // Nothing more is done, once anything has failed, and the node is told so, to stop: a store left as it was is one that
+  // its next start finds as a crash would have left it.
+  #failed(e: unknown): void {
+    if (this.failure !== undefined) return;
+    this.failure = e;
+    this.onSettled?.();
+  }
+
   logWrite(off: number, bytes: Uint8Array): boolean {
+    if (this.failure !== undefined) return false;
+    return this.#failing(() => this.#logWrite(off, bytes));
+  }
+
+  #logWrite(off: number, bytes: Uint8Array): boolean {
     const n = Math.floor(off / this.segment);
     const at = off % this.segment;
     let f = this.#segments.get(n);
@@ -259,10 +297,11 @@ export class Store {
           closing(f);
           throw e;
         }
-        // The file has it all: it is the store's from now on, to be closed with it, whatever the journal can be told.
+        // The file has it all: it is the store's from now on, to be closed with it, whatever the journal can be told. Held
+        // until the journal is told it is not, so that what is in memory is as the next start would find it.
         this.#segments.set(n, f);
-        this.#held.delete(n);
         this.#forget(n, h);
+        this.#held.delete(n);
         this.onSettled?.();
         return;
       }
@@ -274,9 +313,7 @@ export class Store {
   // Runs file operations one after another, so that a removal and a making of one name are done in the order asked; and
   // none at all once the store is let go of, for the files may be another's by then.
   #after(f: () => Promise<void>): Promise<void> {
-    const next = this.#chain.then(() => (this.#abandoned ? undefined : f())).catch((e) => {
-      this.failure ??= e;
-    });
+    const next = this.#chain.then(() => (this.#abandoned ? undefined : f())).catch((e) => this.#failed(e));
     this.#chain = next;
     return next;
   }
@@ -305,10 +342,16 @@ export class Store {
   }
 
   logDrop(n: number): void {
+    if (this.failure !== undefined) return; // as it was, as a crash before this would have left it
+    this.#failing(() => this.#logDrop(n));
+  }
+
+  #logDrop(n: number): void {
     const h = this.#held.get(n);
     if (h) {
-      this.#held.delete(n);
+      // Dropped once the journal says so: should it not, it is held still, as the next start would find it.
       this.#forget(n, h);
+      this.#held.delete(n);
     }
     const f = this.#segments.get(n);
     if (f) {
@@ -331,16 +374,22 @@ export class Store {
   }
 
   logTruncate(off: number): void {
+    if (this.failure !== undefined) return;
+    this.#failing(() => this.#logTruncate(off));
+  }
+
+  #logTruncate(off: number): void {
     const last = Math.floor(off / this.segment);
-    for (const n of [...this.#segments.keys(), ...this.#held.keys()]) if (n > last) this.logDrop(n);
+    for (const n of [...this.#segments.keys(), ...this.#held.keys()]) if (n > last) this.#logDrop(n);
     const h = this.#held.get(last);
     if (h && h.length > off % this.segment) {
-      h.length = off % this.segment;
-      h.journaled = Math.min(h.journaled, h.length);
+      // Cut short once the journal says so: should it not, it is as long as the next start would find it.
       if (h.inJournal) {
-        this.#record(TRUNCATED, last, h.length);
+        this.#record(TRUNCATED, last, off % this.segment);
         this.#journal.flush();
       }
+      h.length = off % this.segment;
+      h.journaled = Math.min(h.journaled, h.length);
     }
     const f = this.#segments.get(last);
     if (f && f.size() > off % this.segment) f.truncate(off % this.segment), this.#dirty.add(f);
@@ -354,7 +403,7 @@ export class Store {
       if (this.#held.size > 0) this.#journalHeld();
       return true;
     } catch (e) {
-      this.failure ??= e;
+      this.#failed(e);
       return false;
     }
   }
@@ -386,10 +435,10 @@ export class Store {
     this.#journal.flush();
   }
 
-  // A segment is held no longer. With nothing held the journal says nothing; else it says that this one is not, durably,
-  // if it ever said it was.
+  // A segment is to be held no longer, and is let go of once this is done. With nothing else held the journal says nothing;
+  // else it says that this one is not, durably, if it ever said it was.
   #forget(n: number, h: Held): void {
-    if (this.#held.size === 0) {
+    if (this.#held.size === (this.#held.has(n) ? 1 : 0)) {
       if (this.#journalEnd > 0) {
         this.#journal.truncate(0);
         this.#journal.flush();
@@ -452,19 +501,23 @@ export class Store {
   }
 
   pageWrite(no: number, bytes: Uint8Array): boolean {
+    if (this.failure !== undefined) return false;
     const block = bytes.length === PAGE ? bytes : new Uint8Array(PAGE);
     if (block !== bytes) block.set(bytes);
     this.#pagesDirty = true;
-    return this.#tree.write(block, no * PAGE) === PAGE;
+    return this.#failing(() => this.#tree.write(block, no * PAGE) === PAGE);
   }
 
+  // A checkpoint, which counts on the log being durable as far as it says: never once anything has failed, as a sync of
+  // the log is not, for what failed may have been some of that.
   pageSync(): boolean {
+    if (this.failure !== undefined) return false;
     try {
       this.#tree.flush();
       this.#pagesDirty = false;
       return true;
     } catch (e) {
-      this.failure ??= e;
+      this.#failed(e);
       return false;
     }
   }
@@ -473,12 +526,16 @@ export class Store {
     return this.#find.read(into, no * PAGE) === into.length;
   }
 
+  // The questions' index can always be made again, so its own failures fail nothing else; but nothing more is written to
+  // a store that has failed.
   findWrite(no: number, bytes: Uint8Array): boolean {
+    if (this.failure !== undefined) return false;
     this.#findDirty = true;
     return this.#find.write(bytes, no * PAGE) === bytes.length;
   }
 
   findSync(): boolean {
+    if (this.failure !== undefined) return false;
     try {
       this.#find.flush();
       this.#findDirty = false;

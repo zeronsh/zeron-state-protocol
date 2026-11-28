@@ -883,7 +883,9 @@ export class Node {
     clearTimeout(this.#timer);
     let wait: number;
     try {
-      wait = this.#wasm.tick();
+      // Nothing more is done once storage has failed, whatever the node has heard of it: the store says so of itself, of
+      // what failed as the node asked for it, as a segment is dropped, and of what failed in the background.
+      wait = this.#store.failure === undefined ? this.#wasm.tick() : -2;
     } catch (e) {
       // Thrown through the node, which was in the midst of something, and so is in no state to go on in.
       this.#ticking = false;
@@ -891,7 +893,7 @@ export class Node {
       return;
     }
     this.#ticking = false;
-    if (wait === -2) {
+    if (wait === -2 || this.#store.failure !== undefined) {
       // Said as what it was, should the store have found a file of its held by another as it opened one in its own time.
       const cause = this.#store.failure;
       this.#fail(cause instanceof StoreLocked ? cause : new Error("storage failed: the node has stopped rather than lose what it said was durable", { cause }));
