@@ -3062,4 +3062,29 @@ for (const evil of ["future", "endless"]) {
   assert.equal(shown, before, "what is shown was shown again");
 }
 
+// What an editor typed, sealed as its tab is put away ([sealNow]) while the client stays open, is shown as this client's,
+// in a scope that says whose things are, as what commit() seals is: not left as nobody's until something else shows it.
+{
+  const Body = { body: c.text(17), by: c.author(17), writers: c.authors(17) };
+  const h = harness();
+  h.run();
+  h.tell(ROSTER, rep("\0", 8) + "\x02\x87" + rep("k", 32));
+  h.tell(AUTHOR, "\0" + rep("d", 32) + "\x02me");
+  let seen!: State<typeof Body>;
+  h.client.window({ scope: 2, list: "a", table: Body }, (x) => (seen = x));
+  h.run();
+  let id = "";
+  void h.client.write(2, (change) => (id = change.insert(Body, "a", 1, {})));
+  h.run();
+  h.tell(ACK, "\x01");
+  const editor = h.client.text(id, Body.body);
+  editor.append("hello");
+  h.run();
+  h.client[sealNow]();
+  h.run();
+  const row = seen.rows[0];
+  assert.equal(row.body, "hello");
+  assert(row.by === "me" && row.writers.length === 1 && row.writers[0] === "me", `what was sealed is ${row.by}'s`);
+}
+
 console.log("ok");

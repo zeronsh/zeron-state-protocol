@@ -1080,9 +1080,13 @@ export class Client {
     this.#flush();
   }
 
-  // What editors have typed and not yet sealed, sealed, as the client ends or its tab is put away.
+  // What editors have typed and not yet sealed, sealed, as the client ends or its tab is put away; and, of a client still
+  // open, the rows shown as they now are, as whose what is in them is may not be what it was. (All sealed first, as what
+  // is told of them may write, or let rows go.)
   #sealAll(): void {
-    for (const row of this.#rows.values()) for (const [slot, t] of row.texts ?? []) if (t.open !== "") this.#seal(row, slot);
+    const sealed = new Set<Stored>();
+    for (const row of this.#rows.values()) for (const [slot, t] of row.texts ?? []) if (t.open !== "" && this.#seal(row, slot)) sealed.add(row);
+    if (!this.#closed && sealed.size > 0) this.#placeAll(sealed);
   }
 
   // Resolves once everything written so far is acknowledged; rejects should any of it never be, once the rest is: what was

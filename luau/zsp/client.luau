@@ -3028,7 +3028,7 @@ function Client.text(self: Client, id: string, col: Column)
 			local up_to = math.huge
 			return self:_wait(function(notify)
 				local function now()
-					self:_seal(row, slot)
+					self:_seal_shown(row, slot)
 					up_to = self.seq
 					local refused = self.refused_texts[row.id .. string.char(slot)]
 					if refused then

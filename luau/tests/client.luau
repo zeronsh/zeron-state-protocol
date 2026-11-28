@@ -4712,4 +4712,38 @@ do
 	assert(shown == before, "what is shown was shown again")
 end
 
+-- What an editor seals by sealed() is shown as this client's, in a scope that says whose things are, as what commit() seals
+-- is: not left as nobody's until something else shows the row.
+do
+	local AUTHOR = 17
+	local Body = { body = zsp.text(17), by = zsp.author(17), writers = zsp.authors(17) }
+	local h = harness()
+	h.run()
+	h.tell(ROSTER, string.rep("\0", 8) .. "\2\135" .. string.rep("k", 32))
+	h.tell(AUTHOR, "\0" .. string.rep("d", 32) .. "\2me")
+	local seen: any = nil
+	h.client:window({ scope = 2, list = "a", table = Body }, function(st)
+		seen = st
+	end)
+	h.run()
+	local id = ""
+	h.client:write(2, function(change)
+		id = change.insert(Body, "a", 1, {})
+	end)
+	h.run()
+	ack(h, 1)
+	h.run()
+	local editor = h.client:text(id, Body.body)
+	editor.append("hello")
+	h.run()
+	local sealed = waited(function()
+		return editor.sealed()
+	end)
+	h.run()
+	local row = seen.rows[1]
+	assert(row.body == "hello", `the text is {row.body}`)
+	assert(row.by == "me" and #row.writers == 1 and row.writers[1] == "me", `what was sealed is {row.by}'s`)
+	local _ = sealed
+end
+
 print("ok")
