@@ -231,6 +231,7 @@ function contend(): void {
     if (leaving) return;
     holding = true;
     unlisten(); // what waited on whoever held the store waits on this worker now, which answers it or says it failed
+    saidStage = -1; // and, holding it anew, it has said nothing of how far it has got
     try {
       await hold(o);
     } finally {
@@ -508,7 +509,9 @@ function unlisten(): void {
 
 // Asked whether it is there, the worker that holds the store says so if it is running the node, or if it has got on with
 // opening the store, or letting it go, since it last said so: one stuck, waiting on a file that never opens, a fetch that
-// never ends, is not there for anything that waits on it. Said once a second at most, for every worker hears it.
+// never ends, is not there for anything that waits on it. Said once a second at most, for every worker hears it. How far
+// it has got is counted in part by its volume, had anew each time it comes to hold the store, and so may come to what it
+// said as it held it before: what it said then is let go of as it holds it again, and it says it is there when first asked.
 let saidStage = -1;
 let saidAt = -Infinity;
 function here(): void {

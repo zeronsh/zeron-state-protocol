@@ -785,6 +785,34 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   assert(anyone <= 4, `${anyone} asked whether it is there, each for itself`);
 }
 
+// And one that holds the store again, its node having failed, says it is there when first asked, whatever it said as it held
+// it before: though, stuck again, it has got as far now, counted from when it came to hold it, as it had then.
+{
+  const w = await worker();
+  let here = 0;
+  const probe = new Channel("zsp:said-again");
+  probe.onmessage = (e) => void ((e.data as { here?: true }).here && here++);
+  failFlush = "device.1"; // keeping its key, as a new device does once its store is open
+  const journal = pause("said-again", "journal"); // its third file: as far as, opening the store again, it gets by the first
+  await w.tell({ open: { name: "said-again" } });
+  void w.tell({ ask: 1, op: "identity", args: [] });
+  await journal.reached;
+  probe.postMessage({ anyone: true });
+  await until("it says it is there", () => here === 1);
+  journal.release();
+  await until("its node fails", () => w.said.some((r) => "failed" in r));
+  failFlush = undefined;
+  const tree = pause("said-again", "tree");
+  void w.tell({ ask: 2, op: "identity", args: [] });
+  await tree.reached;
+  // Asked until it may say so again, once a second.
+  for (const t = performance.now(); here === 1 && performance.now() - t < 5000; await sleep(100)) probe.postMessage({ anyone: true });
+  assert.equal(here, 2, "holding the store again, it did not say it is there when first asked");
+  tree.release();
+  await w.tell({ ask: 3, op: "close", args: [] });
+  probe.close();
+}
+
 // A leader slow to answer, as one busy for long may be, asked at once by many whether it is there, says so once a second.
 {
   const l = await worker();
