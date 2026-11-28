@@ -346,7 +346,8 @@ a_file_outlives_what_is_asked_of_it :: proc(t: ^testing.T) {
 	testing.expect(t, ferr == nil)
 	disk_sync_ask(&h, 1, f)
 	disk_sync_ask(&h, 2, f)
-	disk_release(&h, f)
+	id := disk_release(&h, f)
+	testing.expect(t, id != 0 && disk_known(&h, id))
 	testing.expect_value(t, len(power.given), 1) // one at a time
 	first := power.given[0]
 	clear(&power.given)
@@ -361,6 +362,9 @@ a_file_outlives_what_is_asked_of_it :: proc(t: ^testing.T) {
 	disk_done(&h, second)
 	disk_advance(&h)
 	testing.expect_value(t, len(h.disk.files), 0) // closed, now nothing is asked of it
+	// And known to be, though another file is given its handle's address, as the allocator may give it.
+	_ = disk_file(&h, f)
+	testing.expect(t, !disk_known(&h, id), "a file closed is not taken for whatever has its handle's address now")
 	testing.expect(t, len(h.disk.answers) == 2 && !h.disk.answers[0].ok && !h.disk.answers[1].ok, "the second fails, as the first did")
 	disk_end(&h)
 }

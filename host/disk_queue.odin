@@ -36,6 +36,7 @@ Disk_File :: struct {
 	queue:   [dynamic]^Disk_Op, // in order; the first is the thread's
 	failed:  bool, // an fsync of it failed: none after is said to have succeeded
 	closing: bool, // let go of: closed once its queue is empty
+	id:      u64, // never another's, as a handle's address may be once the handle is closed
 }
 
 // What the thread is given, and gives back. Guarded by `lock`, but for `files` and `answers`, the loop's alone.
@@ -48,6 +49,7 @@ Disk_Queue :: struct {
 	done:     ^Disk_Op,
 	stopping: bool,
 	files:    [dynamic]^Disk_File,
+	ids:      u64, // the last given a file
 	groups:   map[u64]Disk_Group, // syncs asked of several files at once, by token
 	answers:  [dynamic]Disk_Answer, // what is to be handed to the stores
 	// Where set, what would be given the thread is given this instead, which does it whenever, and says so by
@@ -86,7 +88,8 @@ disk_file :: proc(h: ^Host, f: ^os.File) -> ^Disk_File {
 		}
 	}
 	x := new(Disk_File)
-	x.file = f
+	h.disk.ids += 1
+	x.file, x.id = f, h.disk.ids
 	append(&h.disk.files, x)
 	return x
 }
@@ -257,13 +260,13 @@ disk_file_free :: proc(x: ^Disk_File) {
 	free(x)
 }
 
-// Closes a file once all asked of it is done; at once if nothing is.
+// Closes a file once all asked of it is done; at once if nothing is. What it is known by until then, or 0 if closed.
 @(private)
-disk_release :: proc(h: ^Host, f: ^os.File) {
+disk_release :: proc(h: ^Host, f: ^os.File) -> (pending: u64) {
 	if x := disk_find(h, f); x != nil {
 		if len(x.queue) > 0 {
 			x.closing = true
-			return
+			return x.id
 		}
 		for y, i in h.disk.files {
 			if y == x {
@@ -274,6 +277,7 @@ disk_release :: proc(h: ^Host, f: ^os.File) {
 		disk_file_free(x)
 	}
 	os.close(f)
+	return 0
 }
 
 // Waits until all asked of a file is done: for a sync that must be had now, which is made after it. False if any of it
@@ -308,19 +312,19 @@ disk_wait :: proc(h: ^Host) {
 // Waits until nothing asked is left to do of a file let go of, and so it is closed: before the file is removed, which on
 // Windows fails while a handle of it is open, and elsewhere would leave a sync of it to make of nothing.
 @(private)
-disk_drain_closing :: proc(h: ^Host, f: ^os.File) {
-	for disk_known(h, f) {
+disk_drain_closing :: proc(h: ^Host, id: u64) {
+	for disk_known(h, id) {
 		disk_wait(h)
 		disk_advance(h)
 	}
 }
 
-// Whether the host's thread has anything still to do of a file, let go of or not.
+// Whether a file let go of, by what disk_release said it is known by, is still to be closed.
 @(private)
-disk_known :: proc(h: ^Host, f: ^os.File) -> bool {
-	if h != nil {
+disk_known :: proc(h: ^Host, id: u64) -> bool {
+	if h != nil && id != 0 {
 		for x in h.disk.files {
-			if x.file == f {
+			if x.id == id {
 				return true
 			}
 		}

@@ -27,7 +27,7 @@ File_Disk :: struct {
 	look:    bool, // only: nothing is made, nor opened to be written
 	host:    ^Host, // whose loop makes its fsyncs without waiting for them; none to make them as they are asked
 	rolled:  [dynamic]Rolled, // segments the log has gone on from, written since last synced: made durable with it
-	released: [dynamic]Rolled, // segments' files let go of, that the host's thread may still have something to do of
+	released: [dynamic]Released, // segments' files let go of, that the host's thread may still have something to do of
 	unremoved: [dynamic]u64, // segments dropped whose files could not yet be removed, as on Windows one open elsewhere
 }
 
@@ -35,6 +35,12 @@ File_Disk :: struct {
 Rolled :: struct {
 	number: u64,
 	file:   ^os.File,
+}
+
+@(private)
+Released :: struct {
+	number: u64,
+	id:     u64, // as disk_release said: a closed handle's address may be another's by now
 }
 
 // Nothing is created until there is something to keep: merely asking about a space leaves no trace. With `hold`, the
@@ -168,10 +174,18 @@ file_let_go :: proc(d: ^File_Disk, f: ^os.File) {
 // The same, of a segment's file, which is waited for before the segment is removed.
 @(private)
 segment_let_go :: proc(d: ^File_Disk, number: u64, f: ^os.File) {
-	if d.host != nil && disk_busy(d.host, f) {
-		append(&d.released, Rolled{number, f})
+	if d.host == nil {
+		os.close(f)
+		return
 	}
-	file_let_go(d, f)
+	#reverse for r, i in d.released {
+		if !disk_known(d.host, r.id) {
+			unordered_remove(&d.released, i) // closed since
+		}
+	}
+	if id := disk_release(d.host, f); id != 0 {
+		append(&d.released, Released{number, id})
+	}
 }
 
 // Waits for all asked of a file to be done, before it is synced now: what failed of it fails this.
@@ -186,10 +200,10 @@ segment_remove :: proc(d: ^File_Disk, number: u64) {
 	path := segment_path(d, number)
 	#reverse for r, i in d.released {
 		// Its handles' last fsyncs made, and the handles closed, as they are once none is left: so that the file goes.
-		if r.number == number || !disk_known(d.host, r.file) {
-			if r.number == number {
-				disk_drain_closing(d.host, r.file)
-			}
+		if r.number == number {
+			disk_drain_closing(d.host, r.id)
+		}
+		if r.number == number || !disk_known(d.host, r.id) {
 			unordered_remove(&d.released, i)
 		}
 	}
