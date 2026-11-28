@@ -271,7 +271,7 @@ async function hold(o: Options): Promise<void> {
     if (!leaving) fail(failure(error)); // and else let go of as asked, which is no failure
     return;
   }
-  if (leaving) void node.closeNow().catch(() => {}), letGo!(); // closed or put away as it opened
+  if (leaving) stopNow(node), letGo!(); // closed or put away as it opened
   else if (!stopped) {
     device = node;
     breakCarried();
@@ -310,18 +310,23 @@ function leave(): Promise<void> {
   line?.abort();
   const d = device;
   device = undefined;
+  stopNow(d);
   try {
-    void d?.closeNow().catch(() => {});
-  } catch {
-    // stopped all the same, its files closed (Node.closeNow)
+    opening?.close();
   } finally {
-    try {
-      opening?.close();
-    } finally {
-      letGo?.();
-    }
+    letGo?.();
   }
   return held;
+}
+
+// Stops a node at once, as this worker leaves, whatever stopping it throws: its files are closed all the same
+// (Node.closeNow), and the store is let go of once they are, as ever.
+function stopNow(node: Node | undefined): void {
+  try {
+    void node?.closeNow().catch(() => {});
+  } catch {
+    // stopped all the same
+  }
 }
 
 const away = () => void leave();

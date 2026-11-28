@@ -587,6 +587,32 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   await sleep(50);
   probe.close();
   assert(!here, "a worker that let go of the store says it is there");
+
+  // And one put away as its node has just opened, before it runs it, lets go of the lock only once nothing of the store is
+  // open or being opened, whatever stopping the node throws.
+  const segment = pause("opened-away", "00000001.log"); // opened ahead as the store opens
+  const u = await worker();
+  const open = Node.open;
+  Node.open = async (o) => {
+    const node = await open.call(Node, o);
+    Node.prototype.closeNow = () => {
+      throw new Error("it would not stop");
+    };
+    void u.tell({ away: true });
+    return node;
+  };
+  try {
+    await u.tell({ open: { name: "opened-away" } });
+    await segment.reached;
+    await sleep(20);
+  } finally {
+    Node.open = open;
+    Node.prototype.closeNow = closeNow;
+  }
+  assert(locks.has("zsp:opened-away"), "the lock was let go of with a file of the store being opened");
+  segment.release();
+  await until("the lock is let go of", () => !locks.has("zsp:opened-away"));
+  assert.equal(held("opened-away"), 0);
 }
 
 // Closed as it waits for a file of the store held by another, a worker gives up waiting at once, and tells nobody the
