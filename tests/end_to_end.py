@@ -447,16 +447,38 @@ def test_luau():
     zspd("admit", a.dir, zspd("key", b.dir), signed, "vouch")
     zspd("subject", a.dir, zspd("key", a.dir), "ann")
     zspd("subject", a.dir, zspd("key", b.dir), "bob")
+    try:
+        p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "live.luau"), *luau_args(a, b)], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as e:
+        raise timed_out(e) from None
+    sys.stdout.write(p.stdout.replace("ok\n", ""))
+    assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stderr
+
+
+def test_luau_fails_at_once():
+    """A Luau test that fails while its sockets wait ends there and then, saying which assertion failed: Lune says an
+    error in the main thread and goes on as long as anything waits, so it went on until it was given up on, and said only
+    that it had timed out."""
+    _, (a, b) = space("lf", "lg")
+    env = dict(os.environ, ZSP_FAIL_CONNECTED="1")
+    began = time.monotonic()
+    try:
+        p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "live.luau"), *luau_args(a, b)], capture_output=True, text=True, timeout=60, env=env)
+    except subprocess.TimeoutExpired as e:
+        raise timed_out(e) from None
+    took = time.monotonic() - began
+    assert p.returncode == 1, (p.returncode, p.stdout, p.stderr)
+    assert re.search(r"live:\d+: failing once connected, as ZSP_FAIL_CONNECTED asks", p.stderr), p.stderr
+    print(f"     a Luau test that failed ended {took:.1f} s after it began")
+
+
+def luau_args(a, b):
+    """What a Luau test of two devices is run with: each one's address and token."""
     args = []
     for d in (a, b):
         with open(os.path.join(d.dir, "token")) as f:
             args += [d.address, f.read()]
-    try:
-        p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "live.luau"), *args], capture_output=True, text=True, timeout=60)
-    except subprocess.TimeoutExpired as e: # it waits on its sockets once something has gone wrong
-        raise timed_out(e) from None
-    sys.stdout.write(p.stdout.replace("ok\n", ""))
-    assert p.returncode == 0 and p.stdout.endswith("ok\n"), p.stderr
+    return args
 
 
 def timed_out(e):
@@ -470,12 +492,8 @@ def timed_out(e):
 
 def test_mirror():
     _, (a, b) = space("ma", "mb")
-    args = []
-    for d in (a, b):
-        with open(os.path.join(d.dir, "token")) as f:
-            args += [d.address, f.read()]
     try:
-        p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "mirror.luau"), *args], capture_output=True, text=True, timeout=120)
+        p = subprocess.run(["lune", "run", os.path.join(ROOT, "luau", "tests", "mirror.luau"), *luau_args(a, b)], capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired as e:
         raise timed_out(e) from None
     sys.stdout.write(p.stdout.replace("ok\n", ""))
