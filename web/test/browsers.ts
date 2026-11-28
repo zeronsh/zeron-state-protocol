@@ -311,6 +311,17 @@ const tests: Record<string, () => Promise<void>> = {
     await eventually("the writer may write", () => writer.may(1, "write"));
     for (let i = 0; i < 2000; i++) void writer.write(1, (c) => c.insert(Note, "feed", i, { title: "note " + i }));
     await writer.write(1, (c) => c.insert(Note, "feed", 2000, { title: "last" }));
+    // Until the relay has it all: written is not yet there, and a relay answers a window at once, however busy, with the
+    // end of what it has. Asked while the rest is on its way, the end of the list is where it was, and what comes after
+    // comes into the window, as into any that is answered, live: here, not the end of the list at once.
+    const { open: openNode } = await import("../src/nodejs.ts");
+    const check = await openNode({ dir: join(TMP, "bp-check"), udp: false, log: () => {} });
+    s.admit(check.key, "check", false);
+    await check.join(s.sid, relay);
+    const counter = check.client();
+    await eventually("the relay has it all", async () => (await counter.fetch({ scope: 1, table: {}, where: where.inList("feed"), limit: 1 })).total === 2001, 60000);
+    counter.close();
+    await check.close();
     const first = await page();
     await browserDevice(first, "bp", s, via, "ann", false);
     const opened = performance.now();
