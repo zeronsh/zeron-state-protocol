@@ -787,6 +787,58 @@ async function firstTurnWrites(store: string): Promise<void> {
   port1.close();
 }
 
+// A pipe its client lets go of waits for the leader to say it has closed its end, and nothing else the leader says ends that:
+// not its first word on the pipe, heard only after the client let go; not one that crossed the close; nor its being there
+// still, answering whether it is. Should the leader then answer nothing, the pipe is given up on, its lock let go of, and
+// the tab told the store is locked, as with anything else that waits on a holder that answers nothing.
+for (const how of ["heard of late", "crossed", "there"] as const) {
+  const store = "echo-" + how.replaceAll(" ", "-");
+  const a = await worker();
+  await a.tell({ open: { name: store } });
+  await a.tell({ ask: 1, op: "create", args: [] });
+  const main = [...channels.get("zsp:" + store)!][0];
+  const b = await worker();
+  await b.tell({ open: { name: store } });
+  // The leader hears nothing, for the first, until the client has let go of the pipe; and is frozen, saying nothing more,
+  // once it would say it has closed its end, or, for the last, once it has said it is there after.
+  let holdBack = how === "heard of late", frozen = false, armed = false;
+  const held: { data: unknown }[] = [];
+  const hear = main.onmessage!;
+  main.onmessage = (e) => void (frozen ? undefined : holdBack ? held.push(e) : hear(e));
+  const say = main.postMessage.bind(main);
+  main.postMessage = (data) => {
+    if (frozen) return;
+    say(data);
+    if (armed && "here" in (data as object)) frozen = true;
+  };
+  const { port1, port2 } = new MessageChannel();
+  await b.tell({ connect: port2 });
+  const far = [...channels].find(([n]) => n.startsWith(`zsp:${store}:`))!;
+  const pipe = far[0], farEnd = [...far[1]][0];
+  let heardBack = false;
+  const heardOnPipe = farEnd.onmessage!;
+  farEnd.onmessage = (e) => ((heardBack = true), heardOnPipe(e));
+  const leaderSays = Channel.prototype.postMessage;
+  // Its end of the pipe never says it has closed it.
+  Channel.prototype.postMessage = function (this: Channel, data: unknown) {
+    if (this.name !== pipe || this === farEnd || !(data as { close?: true }).close) return leaderSays.call(this, data);
+    if (how !== "there") frozen = true;
+    if (how === "crossed") leaderSays.call(this, { credit: 0 }); // what it said before it heard the close, heard after
+  };
+  if (how !== "heard of late") await until("the leader is heard from on the pipe", () => heardBack);
+  port2.onmessage!(new MessageEvent("message", { data: { close: true } })); // its client lets go of it, the worker hearing so now
+  armed = true;
+  if (holdBack) {
+    holdBack = false;
+    for (const e of held.splice(0)) hear(e);
+  }
+  await until(`${how}: the pipe's lock is let go of`, () => !locks.has(pipe), 5 * 3000);
+  assert(heardBack, `${how}: the leader was never heard from on the pipe`);
+  assert(b.said.some((r) => "failed" in r && r.name === "StoreLocked"), `${how}: the tab was not told the store is locked`);
+  Channel.prototype.postMessage = leaderSays;
+  port1.close();
+}
+
 // A worker closed, or put away, waits on nobody, and tells its tab nothing more: not one that held the store as a pipe its
 // tab carried went unanswered, as it opened the store slowly, which waited on itself; nor one in line behind a holder that
 // answers nothing, an ask of it unanswered. Neither asks whether anyone is there, nor says the store is locked.
@@ -1403,6 +1455,33 @@ for (const how of ["closed away", "away as it closes", "its worker gone", "of no
   const again = await openDevice({ name: "early-closed" });
   assert.equal(await bodyOf(again, id), "typed as the tab closed", "what was typed before its row was looked for was lost as the tab closed");
   await again.close();
+}
+
+// What failed before is not so now: a device whose worker said its store failed, and then did what it was asked as a node
+// does, or whose tab was put away and is back, a worker started anew, closes as one that never failed, delivering what its
+// editors typed, durable.
+for (const how of ["answered since", "back since"] as const) {
+  const name = "failed-" + how.replaceAll(" ", "-");
+  const { device, editor, id } = await typing(name, "typed");
+  tabSide!.onmessage!({ data: { failed: "the store failed for a while" } });
+  if (how === "answered since") await device.usage();
+  else tabDocument.dispatchEvent(new Event("freeze")), tabDocument.dispatchEvent(new Event("resume"));
+  editor.append(" since");
+  await device.close();
+  const again = await openDevice({ name });
+  assert.equal(await bodyOf(again, id), "typed since", `${how}: what was typed was not delivered`);
+  await again.close();
+}
+
+// And a worker started anew after one that threw is asked to close, as any other is, before it is stopped.
+{
+  const { device } = await typing("threw-before", "typed");
+  (tabWorkers[tabWorkers.length - 1] as unknown as { onerror: (e: { message: string }) => void }).onerror({ message: "it threw" });
+  tabDocument.dispatchEvent(new Event("freeze"));
+  tabDocument.dispatchEvent(new Event("resume"));
+  const from = posted.length;
+  await device.close().catch(() => {});
+  assert(posted.slice(from).some((x) => x.to === "worker" && x.what.op === "close"), "the worker started anew was not asked to close");
 }
 
 console.log("ok");

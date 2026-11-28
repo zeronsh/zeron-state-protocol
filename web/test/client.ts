@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import * as codec from "../src/codec.ts";
-import { Client, Undelivered, columns as c, type Answer, type State } from "../src/client.ts";
+import { Client, sealNow, Undelivered, columns as c, type Answer, type State } from "../src/client.ts";
 import * as text from "../src/text.ts";
 import * as ask from "../src/ask.ts";
 import { where } from "../src/ask.ts";
@@ -2219,6 +2219,142 @@ for (const why of ["no node", "no right"] as const) {
   assert(committed.settled && committed.failed instanceof Error, "a commit of what was never delivered said it was durable");
   assert(closed.settled && closed.failed instanceof Error, "the editor closed said what it typed was delivered");
   assert(closing.settled && closing.failed instanceof Error, "the client closed said all it wrote was delivered");
+}
+
+// A text refused in one scope, as the client closes, never cuts short the delivery of what it wrote in another, with its
+// pipe up or down: the pipe is kept until that is acknowledged, and the close then says what was refused.
+for (const up of [true, false]) {
+  const h = harness();
+  h.run();
+  const both = (rights: string) => h.tell(ROSTER, rep("\0", 8) + "\x01\x07" + rep("k", 32) + "\x02" + rights + rep("k", 32));
+  both("\x07");
+  let id = "";
+  void h.client.write(2, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  ack(h, 1);
+  const editor = h.client.text(id, Note.body);
+  h.run();
+  await answerFetch(h);
+  editor.append("typed as the right went");
+  h.run();
+  both("\x01"); // read only, now, in the editor's scope
+  const committed = state(editor.commit());
+  const wrote = state(h.client.write(1, (change) => change.insert(Note, "a", 2, { title: "u" })));
+  h.run();
+  await tick();
+  assert(committed.failed instanceof Error);
+  if (!up) h.self.closed(), h.run();
+  const { closes, connects } = h.self;
+  const closing = state(h.client.close());
+  h.run();
+  await tick();
+  h.run();
+  assert(!closing.settled && h.self.closes === closes, `${up}: the pipe was let go of with what was written in a scope it may write in unacknowledged`);
+  if (!up) {
+    assert.equal(h.self.connects, connects + 1);
+    both("\x01");
+  }
+  ack(h, cellsSaid(h).at(-1)!.seq);
+  await tick();
+  assert(wrote.settled && wrote.failed === undefined, `${up}: what was written where it may write was not delivered`);
+  assert(closing.settled && closing.failed instanceof Error && /no longer write/.test(closing.failed.message), `${up}: ${closing.failed}`);
+  assert.equal(h.self.closes, closes + 1);
+}
+
+// And a text refused as the pipe came up again, sealed while it was down, is told so by its editor for as long as it is
+// asked, whatever else was told it first.
+{
+  const h = harness();
+  h.run();
+  const both = (rights: string) => h.tell(ROSTER, rep("\0", 8) + "\x01\x07" + rep("k", 32) + "\x02" + rights + rep("k", 32));
+  both("\x07");
+  let id = "";
+  void h.client.write(2, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  ack(h, 1);
+  const editor = h.client.text(id, Note.body);
+  h.run();
+  await answerFetch(h);
+  editor.append("typed as the pipe went");
+  h.run();
+  h.self.closed();
+  h.run();
+  const committed = state(editor.commit());
+  h.run();
+  h.laters();
+  h.run();
+  both("\x01"); // read only, as the pipe comes up
+  await tick();
+  assert(committed.failed instanceof Error, "a commit of what was refused said it was durable");
+  const closed = state(editor.close());
+  await tick();
+  assert(closed.settled && closed.failed instanceof Error, "the editor closed said what it typed was delivered");
+}
+
+// A client closed with a signal given up on already is given up on before anything is sealed, sent or dialled: with its
+// pipe up, what an editor typed is never sent; with it down, it is never dialled.
+for (const up of [true, false]) {
+  const h = harness();
+  h.run();
+  h.greet();
+  let id = "";
+  void h.client.write(1, (change) => (id = change.insert(Note, "a", 1, { title: "t" })));
+  h.run();
+  ack(h, 1);
+  const editor = h.client.text(id, Note.body);
+  h.run();
+  await answerFetch(h);
+  editor.append("typed as it was given up on");
+  if (!up) h.self.closed(), h.run();
+  const { connects } = h.self;
+  const from = h.self.said.length;
+  const quit = new AbortController();
+  quit.abort();
+  const closing = state(h.client.close({ signal: quit.signal }));
+  h.run();
+  await tick();
+  h.laters();
+  h.run();
+  assert.equal(cellsSaid(h, from).length, 0, `${up}: what it was given up on was sent`);
+  assert.equal(h.self.connects, connects, `${up}: it dialled once given up on`);
+  assert(closing.settled && closing.failed instanceof Undelivered && closing.failed.cells === 1, `${up}: ${closing.failed}`);
+}
+
+// And one with nothing to deliver closes as it would have, nothing being lost.
+{
+  const h = harness();
+  h.run();
+  h.greet();
+  const quit = new AbortController();
+  quit.abort();
+  const closing = state(h.client.close({ signal: quit.signal }));
+  h.run();
+  await tick();
+  assert(closing.settled && closing.failed === undefined, `given up on with nothing to deliver: ${closing.failed}`);
+  assert.equal(h.self.closes, 1);
+}
+
+// A client given up on, or refused for good, its close waiting for an editor's row to come, sends nothing more as its tab
+// is put away.
+for (const how of ["given up on", "refused"] as const) {
+  const h = harness();
+  h.run();
+  h.greet();
+  const editor = h.client.text("00000001" + "6a0b1c2d" + "0102030405060708", Note.body);
+  editor.append("typed before the row was here");
+  h.run();
+  const from = h.self.said.length;
+  if (how === "refused") h.tell(ERROR, "\x02");
+  else {
+    const quit = new AbortController();
+    void h.client.close({ signal: quit.signal }).catch(() => {});
+    quit.abort();
+  }
+  h.client[sealNow]();
+  h.run();
+  await tick();
+  h.run();
+  assert.equal(cellsSaid(h, from).length, 0, `${how}: it sent what it typed as its tab was put away`);
 }
 
 // A client closed and given up on before what its editors typed was even sealed, as their rows were still looked for: what

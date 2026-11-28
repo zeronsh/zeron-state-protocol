@@ -155,6 +155,7 @@ let silence: ReturnType<typeof setTimeout> | undefined; // until what waits on w
 let holderHeard = false; // whoever holds the store, since this worker last looked
 let probeHeard = false; // another worker asking whether it is there, since this one last looked
 const awaiting = new Map<string, number>(); // pipes carried to the leader, sent something it has not answered, as of when
+const echoing = new Set<string>(); // of those, the pipes let go of, waiting for the leader to say it has closed its end
 let quiets = 0; // times this worker has begun to look whether whoever holds the store is there: when, for `awaiting`
 
 /** What went wrong, as a tab is told it: the error's name too, where it is one an application may tell apart. */
@@ -505,8 +506,9 @@ function listen(): void {
   };
   const quiet = () => {
     silence = undefined;
-    // What was sent it before it was last heard from, it has, being there; what since, it may yet answer.
-    if (holderHeard) for (const [n, at] of awaiting) if (at < quiets) awaiting.delete(n);
+    // What was sent it before it was last heard from, it has, being there; what since, it may yet answer. A pipe's close is
+    // had only once the holder says it has closed its end, there or not.
+    if (holderHeard) for (const [n, at] of awaiting) if (at < quiets && !echoing.has(n)) awaiting.delete(n);
     if (!waitingOnHolder()) return;
     if (holderHeard || !askedHolder) {
       if (!holderHeard && !probeHeard) channel.postMessage({ anyone: true } satisfies Shout);
@@ -665,6 +667,7 @@ function connect(port: MessagePort): void {
     carried.delete(breakOff);
     unheard.delete(name);
     awaiting.delete(name);
+    echoing.delete(name);
     far.postMessage({ close: true } satisfies Say);
     far.close();
     toTab({ close: true });
@@ -682,8 +685,10 @@ function connect(port: MessagePort): void {
     port.close(); // nothing more is to come from the client, nor go to it
     if (heardBack) far.postMessage({ close: true } satisfies Say);
     else early.push({ close: true });
-    // Waited on, as anything said to the leader is, till it says it has closed its end: should it say nothing, it is asked
-    // whether it is there, and given up on, the pipe broken, so that nothing waits on it for ever.
+    // Waited on, as anything said to the leader is, till it says it has closed its end, and nothing else it says ends that:
+    // should it say nothing, it is asked whether it is there, and given up on, the pipe broken, so that nothing waits on it
+    // for ever.
+    echoing.add(name);
     awaited(name);
   };
   port.onmessage = (e: MessageEvent<Say>) => {
@@ -697,7 +702,7 @@ function connect(port: MessagePort): void {
   far.onmessage = (e: MessageEvent<Say>) => {
     const say = e.data;
     holderHeard = true; // the leader, by the pipe
-    awaiting.delete(name);
+    if (!ending) awaiting.delete(name); // answered; but let go of, only its close is
     if (!heardBack) {
       heardBack = true;
       clearTimeout(unanswered);

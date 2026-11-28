@@ -3356,6 +3356,131 @@ do
 	assert(flushed.done and flushed.ok == false, "flushed() said all the client wrote was delivered")
 end
 
+-- An editor of a row of scope 2, as fetched, for the tests after.
+local function editing(h: any): any
+	local function both(rights: string)
+		h.tell(ROSTER, string.rep("\0", 8) .. "\1\7" .. string.rep("k", 32) .. "\2" .. rights .. string.rep("k", 32))
+	end
+	both("\7")
+	local id = ""
+	h.client:write(2, function(change)
+		id = change.insert(Note, "a", 1, { title = "t" })
+	end)
+	h.run()
+	ack(h, 1)
+	local editor = h.client:text(id, Note.body)
+	h.run()
+	local fetched = h.last(FETCH) :: any
+	local w = codec.writer()
+	codec.put_varint(w, codec.varint(codec.reader(fetched.body)))
+	codec.put_u8(w, 32)
+	for _ = 1, 4 do
+		codec.put_varint(w, 0)
+	end
+	h.tell(ANSWER, codec.string(w))
+	return editor, both
+end
+
+-- A text refused in one scope, as the client closes, never cuts short the delivery of what it wrote in another, with its
+-- pipe up or down: the pipe is kept until that is acknowledged, and flushed() then says what was refused.
+for _, up in { true, false } do
+	local h = harness()
+	h.run()
+	local editor, both = editing(h)
+	editor.append("typed as the right went")
+	h.run()
+	both("\1") -- read only, now, in the editor's scope
+	local sealed = waited(function()
+		return editor.sealed()
+	end)
+	local wrote = false
+	h.client:write(1, function(change)
+		change.insert(Note, "a", 2, { title = "u" })
+	end, function()
+		wrote = true
+	end)
+	h.run()
+	assert(sealed.done and sealed.ok == false)
+	if not up then
+		h.self.closed()
+		h.run()
+	end
+	local closes, connects = h.self.closes, h.self.connects
+	h.client:close()
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	h.run()
+	assert(not flushed.done and h.self.closes == closes, `{up}: the pipe was let go of with what was written in a scope it may write in unacknowledged`)
+	if not up then
+		assert(h.self.connects == connects + 1)
+		both("\1")
+	end
+	local sent = cells_said(h)
+	ack(h, sent[#sent].seq)
+	h.run()
+	assert(wrote, `{up}: what was written where it may write was not delivered`)
+	assert(flushed.done and flushed.ok == false and string.find(flushed.why, "no longer write", 1, true), `{up}: {flushed.why}`)
+	assert(h.self.closes == closes + 1)
+end
+
+-- And a text refused as the pipe came up again, sealed while it was down, is told so by its editor for as long as it is
+-- asked, whatever else was told it first.
+do
+	local h = harness()
+	h.run()
+	local editor, both = editing(h)
+	editor.append("typed as the pipe went")
+	h.run()
+	h.self.closed()
+	h.run()
+	local first = waited(function()
+		return editor.sealed()
+	end)
+	h.run()
+	h.laters()
+	h.run()
+	both("\1") -- read only, as the pipe comes up
+	h.run()
+	assert(first.done and first.ok == false, "sealed() said what was refused was durable")
+	local again = waited(function()
+		return editor.sealed()
+	end)
+	h.run()
+	assert(again.done and again.ok == false, "sealed() asked again said what was refused was durable")
+end
+
+-- flushed() called as a close waits for an editor's row to come is told however the close then ends: with nothing to
+-- deliver, or refused for good.
+for _, how in { "nothing typed", "refused" } do
+	local h = harness()
+	h.run()
+	h.greet()
+	local editor = h.client:text("\0\0\0\1" .. "\106\11\28\45" .. "\1\2\3\4\5\6\7\8", Note.body)
+	if how == "refused" then
+		editor.append("typed before the row was here")
+	end
+	h.run()
+	h.client:close()
+	local flushed = waited(function()
+		return h.client:flushed()
+	end)
+	if how == "refused" then
+		h.tell(ERROR, "\2")
+	end
+	local fetched = h.last(FETCH) :: any
+	local w = codec.writer()
+	codec.put_varint(w, codec.varint(codec.reader(fetched.body)))
+	codec.put_u8(w, 32)
+	for _ = 1, 4 do
+		codec.put_varint(w, 0)
+	end
+	h.tell(ANSWER, codec.string(w))
+	h.run()
+	assert(flushed.done, `{how}: flushed() was never told how the close ended`)
+	assert(flushed.ok == (how == "nothing typed"), `{how}: {flushed.why}`)
+end
+
 -- A client a node refuses for good, with what an editor typed before its row was here still to be sealed: it never dials
 -- again, and flushed() says it never delivered it.
 do

@@ -400,6 +400,7 @@ interface Pending {
   body: Uint8Array;
   rows: string[];
   cells: number;
+  texts: string[]; // editors' texts sealed in it, by row and slot: told why, should it never be durable
   done: () => void;
   fail: (e: Error) => void; // should it never be durable
 }
@@ -685,8 +686,9 @@ export class Client {
     let forget = () => {};
     if (signal) {
       // Given up on, now or later: what it holds is told it never will be delivered, and it dials no more.
+      // Given up on before it was closed, nothing is sealed, sent or dialled for first.
       const giveUp = () => this.#abandon(new Undelivered(0, 0, 0, true));
-      if (signal.aborted) queueMicrotask(giveUp);
+      if (signal.aborted) giveUp();
       else signal.addEventListener("abort", giveUp, { once: true }), (forget = () => signal.removeEventListener("abort", giveUp));
     }
     if (this.#closing) return void this.#closing.then(forget, forget), this.#closing;
@@ -706,6 +708,11 @@ export class Client {
         const why = this.#abandon(this.#abandoned);
         this.#hangUp();
         after();
+        // Given up on with nothing to give up, nothing is lost: unless something it wrote never was delivered.
+        if (why instanceof Undelivered && why.cells === 0) {
+          if (this.#owed) this.#take();
+          return this.#neverDelivered ? Promise.reject(this.#neverDelivered) : Promise.resolve();
+        }
         return Promise.reject(why);
       }
       this.#flush();
@@ -772,6 +779,7 @@ export class Client {
   }
 
   [sealNow](): void {
+    if (this.#abandoned) return; // nothing more is delivered
     // What editors typed before their rows were here is typed in them now, as held, as it would be were they looked for and
     // not found: there is no time to wait for them, the tab going.
     for (const row of this.#rows.values()) {
@@ -789,12 +797,13 @@ export class Client {
     for (const row of this.#rows.values()) for (const [slot, t] of row.texts) if (t.open !== "") this.#seal(row, slot);
   }
 
-  // Resolves once everything written so far is acknowledged; rejects should any of it never be.
+  // Resolves once everything written so far is acknowledged; rejects should any of it never be, once the rest is: what was
+  // refused never cuts short the delivery of anything else.
   #barrier(): Promise<void> {
-    if (this.#owed) return Promise.reject(this.#take()); // something written before it never will be
+    const owed = this.#owed && this.#take(); // something written before it never will be
     const last = this.#pending[this.#pending.length - 1];
-    if (!last) return Promise.resolve();
-    return new Promise((resolve, reject) => this.#barriers.push({ seq: last.seq, resolve, reject }));
+    if (!last) return owed ? Promise.reject(owed) : Promise.resolve();
+    return new Promise((resolve, reject) => this.#barriers.push({ seq: last.seq, failed: owed, resolve, reject }));
   }
 
   // Those waiting for what is no longer pending are told: all written before them is acknowledged, or some never will be.
@@ -815,6 +824,7 @@ export class Client {
     for (const b of this.#barriers) if (b.seq >= p.seq) (b.failed ??= e), (told = true);
     if (!told) this.#owed ??= e; // nobody waits for it yet: whoever next does is told
     this.#neverDelivered ??= e;
+    for (const t of p.texts) this.#refusedTexts.set(t, e); // and the editor of each text in it, whoever else is told
     p.fail(e);
     this.#unbar();
   }
@@ -861,6 +871,7 @@ export class Client {
     this.#typing = new Set();
     for (const row of typing) if (row.dirty.size > 0) this.#sendLive(row);
     const out = this.#out;
+    if (this.#abandoned) out.pos = 0; // a client given up on, or refused for good, sends nothing more
     if (out.pos > 0 && this.#wire) {
       // A piece at a time, for a pipe is a stream of bytes, and its messages may be no bigger than zspd's WebSockets take,
       // 8 MiB: a burst of writes bigger than that, said again every time the pipe is dialled, would break it every time.
@@ -2271,7 +2282,9 @@ export class Client {
     const w = codec.writer();
     let last = "";
     const rows: string[] = [];
+    const texts: string[] = [];
     for (const c of cells) {
+      if (c.kind === PIECE) texts.push(c.row + "/" + c.slot);
       const again = c.row === last;
       if (!again) {
         rows.push(c.row);
@@ -2286,7 +2299,7 @@ export class Client {
     }
     const body = codec.written(w).slice();
     const seq = ++this.#seq;
-    this.#pending.push({ seq, scope, body, rows, cells: cells.length, done: done ?? (() => {}), fail: fail ?? (() => {}) });
+    this.#pending.push({ seq, scope, body, rows, cells: cells.length, texts, done: done ?? (() => {}), fail: fail ?? (() => {}) });
     if (this.#ready) {
       const framed = codec.writer();
       codec.putVarint(framed, seq);

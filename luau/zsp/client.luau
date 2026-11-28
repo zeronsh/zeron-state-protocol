@@ -106,7 +106,8 @@ type Stored = {
 	dirty: { [number]: boolean }, -- slots with live text to send
 }
 type Said = { [string]: { [string]: boolean } }
-type Pending = { seq: number, scope: number, body: string, rows: { string }, cells: number, done: (() -> ())? }
+-- What was written and not yet acknowledged; and the editors' texts sealed in it, by row and slot, told why should it never be durable.
+type Pending = { seq: number, scope: number, body: string, rows: { string }, cells: number, texts: { string }, done: (() -> ())? }
 -- Whoever waits for everything written up to a sequence number: told once each is acknowledged, or that one never will be.
 type Barrier = { seq: number, failed: string?, notify: (boolean, string?) -> () }
 type Page = {
@@ -421,6 +422,14 @@ function Client.close(self: Client)
 	self.closed = true
 	local closing: { result: { any }?, waiters: { (boolean, string?) -> () } } = { result = nil, waiters = {} }
 	self.closing = closing
+	-- However it ends, whoever waits for it is told.
+	local function settle(ok: boolean, why: string?)
+		closing.result = { ok, why }
+		for _, notify in closing.waiters do
+			notify(ok, why)
+		end
+		closing.waiters = {}
+	end
 	local function after()
 		-- Nothing else is left to be done later: a closed client keeps nothing awake but the delivery of what it wrote.
 		for cancel in table.clone(self.timers) do
@@ -434,16 +443,13 @@ function Client.close(self: Client)
 		end
 	end
 	local function finished(ok: boolean, why: string?)
-		closing.result = { ok, why }
 		for cancel in table.clone(self.timers) do
 			cancel()
 		end
 		if self.wire then
 			self.hang_up()
 		end
-		for _, notify in closing.waiters do
-			notify(ok, why)
-		end
+		settle(ok, why)
 	end
 	local function deliver()
 		self:_seal_all()
@@ -454,7 +460,7 @@ function Client.close(self: Client)
 			local why = self:_abandon(self.abandoned, self.abandon_counted)
 			self.hang_up()
 			after()
-			closing.result = { false, why }
+			settle(false, why)
 			return
 		end
 		self:_flush()
@@ -464,7 +470,11 @@ function Client.close(self: Client)
 			-- At once: nothing to deliver; unless something it wrote never will be.
 			self.owed = nil
 			local lost = self.never_delivered
-			closing.result = if lost then { false, lost } else { true }
+			if lost then
+				settle(false, lost)
+			else
+				settle(true)
+			end
 			return
 		end
 		after()
@@ -594,20 +604,21 @@ function Client._seal_all(self: Client)
 	end
 end
 
--- Tells `notify` once everything written so far is acknowledged, or that some of it never will be: at once, if nothing is.
+-- Tells `notify` once everything written so far is acknowledged, or that some of it never will be, once the rest is: what
+-- was refused never cuts short the delivery of anything else. At once, if nothing is pending.
 function Client._barrier(self: Client, notify: (boolean, string?) -> ())
-	local owed = self.owed
-	if owed then
-		self.owed = nil
-		notify(false, owed) -- something written before it never will be
-		return
-	end
+	local owed = self.owed -- something written before it never will be
+	self.owed = nil
 	local last = self.pending[#self.pending]
 	if not last then
-		notify(true)
+		if owed then
+			notify(false, owed)
+		else
+			notify(true)
+		end
 		return
 	end
-	table.insert(self.barriers, { seq = last.seq, failed = nil, notify = notify })
+	table.insert(self.barriers, { seq = last.seq, failed = owed, notify = notify })
 end
 
 -- Those waiting for what is no longer pending are told: all written before them is acknowledged, or some never will be.
@@ -636,6 +647,9 @@ function Client._fail(self: Client, p: Pending, why: string)
 		self.owed = why -- nobody waits for it yet: whoever next does is told
 	end
 	self.never_delivered = self.never_delivered or why
+	for _, t in p.texts do
+		self.refused_texts[t] = why -- and the editor of each text in it, whoever else is told
+	end
 	self:_unbar()
 end
 
@@ -2676,7 +2690,11 @@ function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
 	local w = codec.writer()
 	local last = ""
 	local rows: { string } = {}
+	local texts: { string } = {}
 	for _, c in cells do
+		if c.kind == PIECE then
+			table.insert(texts, c.row .. string.char(c.slot))
+		end
 		local again = c.row == last
 		if not again then
 			table.insert(rows, c.row)
@@ -2693,7 +2711,7 @@ function Client._send_cells(self: Client, cells: { Written }, done: (() -> ())?)
 	end
 	self.seq += 1
 	local body = codec.string(w)
-	table.insert(self.pending, { seq = self.seq, scope = scope, body = body, rows = rows, cells = #cells, done = done })
+	table.insert(self.pending, { seq = self.seq, scope = scope, body = body, rows = rows, cells = #cells, texts = texts, done = done })
 	if self.ready then
 		local framed = codec.writer()
 		codec.put_varint(framed, self.seq)

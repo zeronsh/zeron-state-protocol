@@ -85,8 +85,11 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
     }
   };
 
-  let failed = false; // the worker could not be started, or its storage failed, or the store is locked: once is enough
-  let dead = false; // the worker could not be started, or threw: nothing it is asked is answered
+  // Of the worker as it is now: its storage failed, or the store is locked, as it last said, and it has answered nothing
+  // since; and the worker that could not be started, or threw, which answers nothing it is asked. A worker started anew is
+  // neither.
+  let failed = false;
+  let dead: Worker | undefined;
   let quitting: AbortController | undefined; // as the device closes: gives up on what its clients have still to deliver
   const fail = (error: Error) => {
     failed = true;
@@ -97,7 +100,8 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
   };
   const start = () => {
     const w = (worker = new Worker(options.worker ?? new URL("./worker.js", import.meta.url), { type: "module", name: "zsp" }));
-    w.onerror = (e) => w === worker && ((dead = true), fail(new Error(e.message || "the worker could not be started")));
+    failed = false;
+    w.onerror = (e) => w === worker && ((dead = w), fail(new Error(e.message || "the worker could not be started")));
     const giving = credential;
     let heard = false;
     w.onmessage = (e: MessageEvent<Report>) => {
@@ -116,7 +120,10 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
       const a = answers.get(r.answer);
       answers.delete(r.answer);
       if (r.error !== undefined) a?.reject(errorOf(r.error, r.name));
-      else a?.resolve(r.value);
+      else {
+        if (a && a.op !== "credential") failed = false; // done by a node: the store has come back, whatever failed before
+        a?.resolve(r.value);
+      }
     };
     w.postMessage({ open: { name, full: options.full, keep: options.keep, credential, credentialAt, credentialAgain: taken, wasm: options.wasm?.toString() } } satisfies Command);
     for (const [id, a] of answers) w.postMessage({ ask: id, op: a.op, args: a.args } satisfies Command);
@@ -320,7 +327,7 @@ export async function open(options: OpenOptions = {}): Promise<Device> {
         // Listened for until it is closed: a tab frozen or left as its worker closes the store stops the worker then, as
         // ever, which would else be frozen holding it.
         const w = worker;
-        if (w && state === "running" && !dead) await ask<void>("close").catch(() => {});
+        if (w && state === "running" && w !== dead) await ask<void>("close").catch(() => {});
         unlisten();
         state = "closed";
         w?.terminate();
