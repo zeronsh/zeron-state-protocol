@@ -913,9 +913,14 @@ Batch :: struct {
 }
 
 // What the system may hold for the host's UDP socket of what has come and is not yet read: a burst beyond it is lost
-// before the loop sees it, and sent again. Asked for, and what was granted said once (core:net's set_option gave it
-// whatever the low bytes of a pointer said: see third_party/nbio/socket_option.odin).
-UDP_RECEIVE_BUFFER :: 1 << 20
+// before the loop sees it, and sent again. Sized to hold, while the loop is away, all a peer's link may send it before
+// hearing from it, LINK_WINDOW (1 MiB) of stream data, which is some 750 datagrams of PACKET_MAX, with room over:
+// measured, Windows and macOS hold what they are granted in datagrams' bytes (1 MiB held 706 to 723 of them, 2 MiB
+// 1413 to 1444), where their defaults (64 KiB, 768 KiB) held 46 and 530. Linux grants twice what it is asked within
+// twice net.core.rmem_max (212992 by default, so 425984, some 185 datagrams), and no more without that raised: what was
+// granted is said once, at debug. core:net's set_option gave it whatever the low bytes of a pointer said (see
+// third_party/nbio/socket_option.odin).
+UDP_RECEIVE_BUFFER :: 2 << 20
 
 @(private)
 udp_receive_buffer :: proc(socket: net.UDP_Socket) {
