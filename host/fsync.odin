@@ -19,6 +19,7 @@ Fsync :: struct {
 	token: u64,
 	ok:    bool,
 	close: bool, // let go of meanwhile: closed once this is done
+	failed: bool, // another of the same token's failed: so has the sync it is part of
 	next:  ^Fsync, // of those done, waiting to be handed over (fsync_other.odin)
 }
 
@@ -78,6 +79,19 @@ fsync_collect :: proc(h: ^Host) {
 		if fs.close && fs.file != nil {
 			os.close(fs.file)
 		}
+		// One sync may be of several files: said done once all are, and failed if any failed.
+		rest := false
+		for x in h.fsyncing {
+			if x.token == fs.token {
+				x.failed ||= fs.failed || !fs.ok
+				rest = true
+			}
+		}
+		if rest {
+			free(fs)
+			continue
+		}
+		fs.ok &&= !fs.failed
 		for s in h.spaces {
 			if zsp.store_awaits(&s.node.store, fs.token) {
 				zsp.store_disk_synced(&s.node.store, fs.token, fs.ok)

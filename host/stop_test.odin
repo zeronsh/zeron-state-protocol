@@ -179,3 +179,39 @@ loop_does_not_wait_for_a_checkpoint :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.node.store.generation, generation + 1)
 	testing.expect(t, s.node.store.checkpoint == s.node.store.synced && !s.node.failed)
 }
+
+// A segment the log goes on from is made durable with the next sync of the log, not as the log goes on from it: and
+// what was written to it is counted on only once that sync is done, as what is written to the last is.
+@(test)
+loop_does_not_wait_for_a_segment_it_goes_on_from :: proc(t: ^testing.T) {
+	base, _ := os.temp_directory(context.temp_allocator)
+	dir, err := os.make_directory_temp(base, "zsp-fsync-*", context.allocator)
+	testing.expect(t, err == nil)
+	defer delete(dir)
+	defer os.remove_all(dir)
+	h: Host
+	testing.expect(t, host_init(&h, {dir = dir, full = true}))
+	defer host_destroy(&h)
+	space: zsp.Key32
+	crypto.rand_bytes(space[:])
+	s := space_open(&h, space)
+	body := make([]byte, 4000)
+	defer delete(body)
+	for i := u64(0); zsp.store_tail(&s.node.store) < zsp.SEGMENT + 4096; i += 1 {
+		cell := zsp.Cell{row = zsp.Id{1, 100 + i}, slot = 16, kind = .Value, stamp = zsp.Stamp{1000 + i, 1}, body = body}
+		zsp.store_commit(&s.node.store, []zsp.Cell{cell}, 0, own = false)
+		zsp.store_flush(&s.node.store)
+	}
+	testing.expect_value(t, len(s.disk.rolled), 1) // written, and not yet made durable
+	testing.expect(t, s.node.store.synced < zsp.SEGMENT)
+	testing.expect(t, zsp.store_sync_start(&s.node.store))
+	tail := zsp.store_tail(&s.node.store)
+	testing.expect(t, len(s.disk.rolled) == 0 && s.node.store.synced < tail)
+	start := time.tick_now()
+	for zsp.store_flying(&s.node.store) && time.tick_since(start) < 10 * time.Second {
+		testing.expect(t, nbio.tick(10 * time.Millisecond) == nil)
+		fsync_collect(&h)
+	}
+	testing.expect_value(t, s.node.store.synced, tail)
+	testing.expect(t, len(h.fsyncing) == 0 && !s.node.failed)
+}
