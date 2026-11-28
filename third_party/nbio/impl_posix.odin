@@ -101,6 +101,9 @@ _Open :: struct {}
 _Stat :: struct {}
 
 @(private="package")
+_Sync :: struct {} // ZSP: Linux alone has Sync
+
+@(private="package")
 _Splice :: struct {}
 
 @(private="package")
@@ -418,7 +421,7 @@ _exec :: proc(op: ^Operation) {
 		open_exec(op)
 	case .Stat:
 		stat_exec(op)
-	case .None, ._Link_Timeout, ._Remove, ._Splice:
+	case .None, ._Link_Timeout, ._Remove, ._Splice, .Sync: // ZSP: Sync is Linux's alone
 		fallthrough
 	case:
 		unreachable()
@@ -1395,7 +1398,7 @@ timeout_and_delete :: proc(target: ^Operation) {
 		target.stat.err = .Timeout
 		return
 
-	case .None, ._Link_Timeout, ._Remove, ._Splice:
+	case .None, ._Link_Timeout, ._Remove, ._Splice, .Sync: // ZSP: Sync is Linux's alone
 		return
 	}
 

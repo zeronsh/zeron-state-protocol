@@ -42,6 +42,11 @@ All platforms:
   an operation is no larger.
 - `impl_posix.odin`, `impl_linux.odin`: what a removed operation took hold of, all the same, is let go of: a socket
   accepted or connected, or a file opened, which nobody would otherwise ever close.
+- `ops.odin`, `nbio.odin`, `impl_linux.odin`: `Sync`, `sync_poly`, a file's fsync(2) made by io_uring
+  (`IORING_OP_FSYNC`, no flags: fsync, not fdatasync) without the loop waiting for it. Linux alone: elsewhere no system
+  has such a call, the other implementations never see one, and the host makes its fsyncs on a thread of its own
+  (`host/fsync_other.odin`). Not upstream's: an addition, which upstream may or may not want. Test:
+  `host/stop_test.odin`, `loop_does_not_wait_for_the_log_fsync`.
 
 kqueue (macOS, the BSDs), `impl_posix.odin`:
 - `add_pending` and `timeout_and_delete`: looked up, then assigned, rather than `map_entry` (#8642).

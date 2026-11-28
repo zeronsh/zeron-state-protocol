@@ -2471,3 +2471,45 @@ _put_user_data3 :: #force_inline proc(op: ^Operation, cb: $C, p: $T, p2: $T2, p3
 	intrinsics.unaligned_store((^T2)(rawptr(ptr + size_of(cb) + size_of(p))),               p2)
 	intrinsics.unaligned_store((^T3)(rawptr(ptr + size_of(cb) + size_of(p) + size_of(p2))), p3)
 }
+
+/*
+ZSP: makes durable all that was written to a file before it was asked, as fsync(2) does, without the loop waiting for
+it. Linux alone, where io_uring's IORING_OP_FSYNC does it on a kernel worker of its own: elsewhere there is no such
+call, and the embedder does it on a thread (see host/fsync_other.odin).
+
+The handle must stay open until the callback is called.
+*/
+Sync :: struct {
+	// Handle to make durable.
+	handle: Handle,
+
+	// An error, if it occurred.
+	err:    FS_Error,
+
+	// Implementation specifics, private.
+	_impl:  _Sync `fmt:"-"`,
+}
+
+/*
+ZSP: makes durable what was written to a handle, Linux alone: see Sync.
+
+Inputs:
+- handle: Handle to make durable, open until the callback is called
+- p:      User data, the callback will receive this as its second argument
+- cb:     The callback to be called when the operation finishes, `Operation.sync` will contain results
+- l:      Event loop to associate the operation with, defaults to the current thread's loop
+
+Returns: A non-nil pointer to the operation, alive until the callback is called
+*/
+sync_poly :: #force_inline proc(
+	handle: Handle,
+	p: $T,
+	cb: $C/proc(op: ^Operation, p: T),
+	l: ^Event_Loop = nil,
+) -> ^Operation where size_of(T) <= size_of(rawptr) * MAX_USER_ARGUMENTS, ODIN_OS == .Linux {
+	op := _prep(l, _poly_cb(C, T), .Sync)
+	op.sync.handle = handle
+	_put_user_data(op, cb, p)
+	exec(op)
+	return op
+}
