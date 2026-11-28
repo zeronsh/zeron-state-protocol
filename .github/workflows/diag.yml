@@ -29,10 +29,21 @@ jobs:
           for d in "$(python -c 'import tempfile; print(tempfile.gettempdir())')" "$RUNNER_TEMP"; do python tests/diag_fsync.py "$d"; done
       - name: e2e, temp on the system drive
         run: |
-          for i in 1 2 3; do python tests/end_to_end.py > e2e-c-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-c-$i.log) ok $(grep -c '^FAIL' e2e-c-$i.log) fail"; grep -h "^FAIL" e2e-c-$i.log | cut -c1-150; done; grep -h "roster in" e2e-c-*.log | python tests/diag_sum.py
+          set +e
+          for i in 1 2 3 4; do python tests/end_to_end.py > e2e-c-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-c-$i.log) ok $(grep -c '^FAIL' e2e-c-$i.log) fail"; grep -h "^FAIL" e2e-c-$i.log | cut -c1-150; done; grep -h "roster in" e2e-c-*.log | python tests/diag_sum.py
       - name: e2e, temp on the runner's drive
+        if: always()
         run: |
-          for i in 1 2 3; do TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" python tests/end_to_end.py > e2e-d-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-d-$i.log) ok $(grep -c '^FAIL' e2e-d-$i.log) fail"; grep -h "^FAIL" e2e-d-$i.log | cut -c1-150; done; grep -h "roster in" e2e-d-*.log | python tests/diag_sum.py
+          set +e
+          for i in 1 2 3 4; do TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP" python tests/end_to_end.py > e2e-d-$i.log 2>&1; echo "run $i: exit $? $(grep -c '^ok ' e2e-d-$i.log) ok $(grep -c '^FAIL' e2e-d-$i.log) fail"; grep -h "^FAIL" e2e-d-$i.log | cut -c1-150; done; grep -h "roster in" e2e-d-*.log | python tests/diag_sum.py
       - name: durations
+        if: always()
         run: |
           for f in e2e-*.log; do echo "== $f"; grep -h "^ok \|^FAIL" $f | awk '{print $2, $3}' | sort | tr '\n' ' '; echo; done
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-e2e
+          path: e2e-*.log
+          retention-days: 7
