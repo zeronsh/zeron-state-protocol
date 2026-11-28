@@ -455,20 +455,18 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   await until("the lock is let go of", () => !locks.has("zsp:away"));
 }
 
-// A node that fails in its first turn, as it opens, its storage failing: every tab is told, and the lock is let go of, for
-// another to have; not held for ever by a worker waiting to be told what it was told before it listened.
-{
-  // A device of a space, whose roster has changed since its trees were last made durable, as after a crash: the first
-  // thing it does, opened again, is write, and make that durable.
+// A device of a space, whose roster has changed since its trees were last made durable, as after a crash: the first thing
+// it does, opened again, is write, and make that durable.
+async function firstTurnWrites(store: string): Promise<void> {
   const other = await Node.open({ volume: new MemoryVolume(), module });
-  const node = await Node.open({ volume: await OpfsVolume.at("zsp/first"), module, full: true });
+  const node = await Node.open({ volume: await OpfsVolume.at(`zsp/${store}`), module, full: true });
   node.create();
   node.admit(other.key, 1);
   const c = new Client({ connect: node.connect });
   while (!c.may(1, "write")) await sleep(1);
   await c.write(1, (change) => change.insert({}, "x", 1, {}));
   await node.settled();
-  const tree = await (await (await root.getDirectoryHandle("zsp")).getDirectoryHandle("first")).getFileHandle("tree");
+  const tree = await (await (await root.getDirectoryHandle("zsp")).getDirectoryHandle(store)).getFileHandle("tree");
   const before = tree.data.slice();
   node.revoke(other.key, 1);
   await node.settled();
@@ -476,6 +474,12 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   await node.close();
   await other.close();
   tree.data = before;
+}
+
+// A node that fails in its first turn, as it opens, its storage failing: every tab is told, and the lock is let go of, for
+// another to have; not held for ever by a worker waiting to be told what it was told before it listened.
+{
+  await firstTurnWrites("first");
   failFlush = "*";
   const w = await worker();
   await w.tell({ open: { name: "first", full: true } });
@@ -483,6 +487,35 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   await until("the lock is let go of", () => !locks.has("zsp:first"), 2000);
   assert.equal(held("first"), 0);
   failFlush = undefined;
+}
+
+// But one put away as its store has just opened, before its node's first turn, which then fails on the files closed as it
+// was put away, tells nobody the store failed: neither its tab nor any other, for its letting go of the store is no failure.
+{
+  await firstTurnWrites("first-away");
+  const told: unknown[] = [];
+  const spy = new Channel("zsp:first-away");
+  spy.onmessage = (e) => void ((e.data as { failed?: string }).failed !== undefined && told.push(e.data));
+  const w = await worker();
+  const open = Store.open;
+  let opened = false;
+  Store.open = async (...args) => {
+    const store = await open.apply(Store, args);
+    opened = true;
+    void w.tell({ away: true });
+    return store;
+  };
+  try {
+    await w.tell({ open: { name: "first-away", full: true } });
+    await until("its store is opened", () => opened);
+  } finally {
+    Store.open = open;
+  }
+  await until("the lock is let go of", () => !locks.has("zsp:first-away"));
+  await sleep(20); // and what it said heard
+  spy.close();
+  assert.deepEqual(told, [], "another tab was told the store failed, as one put away let go of it");
+  assert(!w.said.some((r) => "failed" in r), JSON.stringify(w.said));
 }
 
 // ---------------------------------------------------------------- what goes wrong as the store is let go of

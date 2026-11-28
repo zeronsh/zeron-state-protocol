@@ -114,9 +114,17 @@ const unheard = new Map<string, Shout>(); // said to the leader, and not yet ans
 const taken = new Set<string>(); // asks of this worker's that the leader said it was doing
 const timers = new Map<number, ReturnType<typeof setTimeout>>(); // the tab's
 
-// What this worker tells its tab of itself, rather than as it is asked: nothing, once it is leaving, as its tab is going.
+// What this worker says of itself, rather than as it is asked: to its tab, and with tellAll to every other worker too. Once
+// it is leaving, nothing: the store is let go of, or is being, which is no failure nor anything else to tell, and its tab
+// is going. All a worker leaving still says is that it is there, asked while it holds the store and lets go of it, and
+// what credentials its tab gave, which are its tab's to give.
 function tell(r: Report): void {
   if (!leaving) tab.postMessage(r);
+}
+function tellAll(r: Report & Shout): void {
+  if (leaving) return;
+  tab.postMessage(r);
+  channel.postMessage(r);
 }
 
 tab.onmessage = async (e: MessageEvent<Command>) => {
@@ -336,15 +344,12 @@ const away = () => void leave();
 function fail(f: Failure): void {
   failedAsks(f);
   breakCarried(); // to one that is gone, or none: every client dials again, and so this worker is wanted, and tries again
-  tell({ failed: f.message, name: f.name });
-  channel.postMessage({ failed: f.message, name: f.name } satisfies Shout);
+  tellAll({ failed: f.message, name: f.name });
 }
 
 // Every tab hears what space the device is of, whichever tab changed it.
 function tellSpace(): void {
-  const space = device?.space;
-  tell({ space });
-  channel.postMessage({ space } satisfies Shout);
+  tellAll({ space: device?.space });
 }
 
 function breakCarried(): void {
