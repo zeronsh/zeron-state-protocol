@@ -114,6 +114,11 @@ const unheard = new Map<string, Shout>(); // said to the leader, and not yet ans
 const taken = new Set<string>(); // asks of this worker's that the leader said it was doing
 const timers = new Map<number, ReturnType<typeof setTimeout>>(); // the tab's
 
+// What this worker tells its tab of itself, rather than as it is asked: nothing, once it is leaving, as its tab is going.
+function tell(r: Report): void {
+  if (!leaving) tab.postMessage(r);
+}
+
 tab.onmessage = async (e: MessageEvent<Command>) => {
   const c = e.data;
   if ("away" in c) away();
@@ -135,11 +140,12 @@ let held: Promise<void> = Promise.resolve(); // resolves once this worker holds 
 let holding = false; // has the store's lock, and is opening it, running it or letting go of it
 let opening: OpfsVolume | undefined; // the store's directory, while this worker holds it
 let stage = 0; // how far it has got in opening the store, or letting it go: see here()
+// What waits on another worker holding the store (see listen): had only while this worker neither holds it nor is leaving.
 let silence: ReturnType<typeof setTimeout> | undefined; // until what waits on whoever holds the store is given up on
 let holderHeard = false; // whoever holds the store, since this worker last looked
 let probeHeard = false; // another worker asking whether it is there, since this one last looked
 const awaiting = new Map<string, number>(); // pipes carried to the leader, sent something it has not answered, as of when
-let quiets = 0; // times this worker has looked whether whoever holds the store is there
+let quiets = 0; // times this worker has begun to look whether whoever holds the store is there: when, for `awaiting`
 
 /** What went wrong, as a tab is told it: the error's name too, where it is one an application may tell apart. */
 export type Failure = { message: string; name?: string };
@@ -151,7 +157,7 @@ function open(o: Options): void {
   try {
     name = storePath(o.name); // what its lock, its channel and its directory are all named by
   } catch (e) {
-    return void tab.postMessage({ failed: failure(e).message } satisfies Report);
+    return void tell({ failed: failure(e).message });
   }
   options = { ...o, name };
   channel = new BroadcastChannel("zsp:" + name);
@@ -170,7 +176,7 @@ function give(credential: string | Uint8Array, at: number, anew: boolean): numbe
   mine = anew ? given : undefined;
   present();
   channel.postMessage(given satisfies Shout);
-  if (anew) tab.postMessage({ credentialAt: given.at } satisfies Report); // for its tab to give again, as of then, should it start another worker
+  if (anew) tell({ credentialAt: given.at }); // for its tab to give again, as of then, should it start another worker
   return given.at;
 }
 
@@ -224,6 +230,7 @@ function contend(): void {
     if (line === giveUp) line = undefined; // had: nothing to give up now but the store itself
     if (leaving) return;
     holding = true;
+    unlisten(); // what waited on whoever held the store waits on this worker now, which answers it or says it failed
     try {
       await hold(o);
     } finally {
@@ -290,9 +297,16 @@ async function hold(o: Options): Promise<void> {
 // it holds made durable, and every file closed, at once, for nothing after this is sure to be run; what is being opened is
 // given up, and what of it is open closed; a place in line is given up; and the lock is let go of once nothing is being
 // opened, unless the worker is stopped first, which lets go of it anyway. Resolves once it is. Chrome runs what was sent a
-// worker before it stops it, and so this; and whatever any of it throws, the rest is done.
+// worker before it stops it, and so this; and whatever any of it throws, the rest is done. Nothing here waits on whoever
+// holds the store any more: what this worker asked of it is answered no more, the pipes it carried to it are broken, and
+// its tab, going, is told nothing more but what it asks.
 function leave(): Promise<void> {
   leaving = true;
+  unlisten();
+  waiting.clear();
+  unheard.clear();
+  taken.clear();
+  breakCarried();
   line?.abort();
   const d = device;
   device = undefined;
@@ -316,14 +330,14 @@ const away = () => void leave();
 function fail(f: Failure): void {
   failedAsks(f);
   breakCarried(); // to one that is gone, or none: every client dials again, and so this worker is wanted, and tries again
-  tab.postMessage({ failed: f.message, name: f.name } satisfies Report);
+  tell({ failed: f.message, name: f.name });
   channel.postMessage({ failed: f.message, name: f.name } satisfies Shout);
 }
 
 // Every tab hears what space the device is of, whichever tab changed it.
 function tellSpace(): void {
   const space = device?.space;
-  tab.postMessage({ space } satisfies Report);
+  tell({ space });
   channel.postMessage({ space } satisfies Shout);
 }
 
@@ -349,6 +363,7 @@ async function ask(op: Op, args: unknown[]): Promise<{ value?: unknown; error?: 
   }
   if (device) return answer(op, args);
   if (!channel) return { error: "the device was never opened: its name names no store" };
+  if (leaving) return { error: "the device is closed" }; // and nothing waits on whoever holds the store
   contend();
   const id = crypto.randomUUID();
   return new Promise((done) => {
@@ -437,31 +452,53 @@ function shout(id: string, s: Shout): void {
 // sent something and answered nothing is waited on until the holder is heard from, by the pipe or as asked; with nothing
 // waiting, nothing is asked, and no timer is set. Asked by another worker meanwhile, this one need not ask too: what the
 // holder says, every worker hears.
+//
+// Only another worker is waited on so: one holding the store answers what is asked of it, or says it failed, itself, and
+// one leaving waits on nobody. So this is done only while this worker neither holds the store nor is leaving, and all of
+// it is let go of as it comes to hold it, or leaves: what was waiting on another is not waited on, and told, after.
 const waitingOnHolder = () => waiting.size > 0 || awaiting.size > 0;
+const listening = () => !holding && !leaving;
 function listen(): void {
-  if (silence !== undefined || holding || !waitingOnHolder()) return;
+  if (silence !== undefined || !listening() || !waitingOnHolder()) return;
   let askedHolder = false;
-  holderHeard = probeHeard = false;
-  silence = setTimeout(function quiet() {
+  // Each time it looks, anew: what was sent before, the holder has once it is heard from after.
+  const look = () => {
+    quiets++;
+    holderHeard = probeHeard = false;
+    silence = setTimeout(quiet, HEARD_WITHIN);
+  };
+  const quiet = () => {
     silence = undefined;
-    if (holding) return;
     // What was sent it before it was last heard from, it has, being there; what since, it may yet answer.
-    const since = quiets++;
-    if (holderHeard) for (const [n, at] of awaiting) if (at < since) awaiting.delete(n);
+    if (holderHeard) for (const [n, at] of awaiting) if (at < quiets) awaiting.delete(n);
     if (!waitingOnHolder()) return;
     if (holderHeard || !askedHolder) {
       if (!holderHeard && !probeHeard) channel.postMessage({ anyone: true } satisfies Shout);
       askedHolder = !holderHeard;
-      holderHeard = probeHeard = false;
-      silence = setTimeout(quiet, HEARD_WITHIN);
-      return;
+      return look();
     }
     const f: Failure = { message: "the store is held by something that does not answer: another tab of this site, hung, or the browser, until it is restarted", name: "StoreLocked" };
     awaiting.clear();
     failedAsks(f);
     breakCarried(); // and so every client dials again, and is told so again should it be so still
-    tab.postMessage({ failed: f.message, name: f.name } satisfies Report);
-  }, HEARD_WITHIN);
+    tell({ failed: f.message, name: f.name });
+  };
+  look();
+}
+
+// A pipe carried to the leader has been sent something it has not answered, as of `at`, or now: waited on, if another holds
+// the store.
+function awaited(name: string, at = quiets): void {
+  if (!listening()) return;
+  awaiting.set(name, at);
+  listen();
+}
+
+function unlisten(): void {
+  clearTimeout(silence);
+  silence = undefined;
+  awaiting.clear();
+  holderHeard = probeHeard = false;
 }
 
 // Asked whether it is there, the worker that holds the store says so if it is running the node, or if it has got on with
@@ -487,10 +524,10 @@ function heard(s: Shout): void {
     const f: Failure = { message: s.failed, ...(s.name === "StoreLocked" ? { name: s.name } : {}) };
     failedAsks(f);
     breakCarried();
-    tab.postMessage({ failed: f.message, name: f.name } satisfies Report);
+    tell({ failed: f.message, name: f.name });
   } else if ("space" in s) {
     if (s.space !== undefined && typeof s.space !== "string") return;
-    tab.postMessage({ space: s.space } satisfies Report);
+    tell({ space: s.space });
   } else if ("leader" in s) {
     breakCarried(); // to one that is gone
     for (const [id, u] of [...unheard]) {
@@ -537,6 +574,7 @@ function connect(port: MessagePort): void {
     port.onmessage = (e: MessageEvent<Say>) => (wire ? onSay(wire, e.data) : undefined);
     return;
   }
+  if (leaving) return toTab({ close: true }), port.close(); // carried nowhere: the device is closed
   contend();
   // The leader may not be listening on the pipe's own channel until it says so: until then what the tab says waits here.
   const name = channel.name + ":" + crypto.randomUUID();
@@ -569,7 +607,7 @@ function connect(port: MessagePort): void {
     if ("close" in say) breakOff();
     else if (heardBack) far.postMessage(say);
     else early.push(say);
-    if ("data" in say && open) awaiting.set(name, quiets), listen();
+    if ("data" in say && open) awaited(name);
   };
   far.onmessage = (e: MessageEvent<Say>) => {
     const say = e.data;
@@ -581,20 +619,24 @@ function connect(port: MessagePort): void {
       unheard.delete(name);
       for (const s of early.splice(0)) {
         far.postMessage(s);
-        if ("data" in s) awaiting.set(name, quiets); // sent only now, and so not yet answered
+        if ("data" in s) awaited(name); // sent only now, and so not yet answered
       }
-      listen();
     }
     if ("close" in say) breakOff();
     else if ("data" in say) toTab(say);
   };
   void navigator.locks.request(name, () => {
     if (open) {
-      awaiting.set(name, quiets);
+      awaited(name);
       shout(name, { open: name });
-      // Broken off unanswered, it is waited on still, until the holder is heard from or given up on: else a client that
-      // dials again only now and then would never wait long enough on a holder that answers nothing to be told so.
-      unanswered = setTimeout(() => (breakOff(), awaiting.set(name, quiets)), HEARD_WITHIN);
+      // Broken off unanswered, it is waited on still, as of when it was sent what it was, until the holder is heard from
+      // or given up on: else a client that dials again only now and then would never wait long enough on a holder that
+      // answers nothing to be told so.
+      unanswered = setTimeout(() => {
+        const at = awaiting.get(name);
+        breakOff();
+        if (at !== undefined) awaited(name, at);
+      }, HEARD_WITHIN);
     }
     return held;
   });

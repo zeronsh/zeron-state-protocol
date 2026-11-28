@@ -672,6 +672,67 @@ for (const how of ["letGo", "closeNow", "close"] as const) {
   port1.close();
 }
 
+// A worker closed, or put away, waits on nobody, and tells its tab nothing more: not one that held the store as a pipe its
+// tab carried went unanswered, as it opened the store slowly, which waited on itself; nor one in line behind a holder that
+// answers nothing, an ask of it unanswered. Neither asks whether anyone is there, nor says the store is locked.
+{
+  const tree = pause("unanswered-own", "tree");
+  const a = await worker();
+  await a.tell({ open: { name: "unanswered-own" } });
+  await tree.reached;
+  const { port1, port2 } = new MessageChannel();
+  let broken = false;
+  port1.onmessage = (e) => void ((e.data as { close?: true }).close && (broken = true));
+  await a.tell({ connect: port2 });
+  await until("the pipe is broken, unanswered", () => broken, 2 * 3000);
+  tree.release();
+  await a.tell({ ask: 1, op: "identity", args: [] });
+  assert.equal(answered(a.said, 1)?.error, undefined);
+
+  void request("zsp:mute-leaving", () => new Promise<void>(() => {}));
+  const b = await worker();
+  await b.tell({ open: { name: "mute-leaving" } });
+  void b.tell({ ask: 1, op: "identity", args: [] });
+
+  let anyone = 0;
+  const spies = ["zsp:unanswered-own", "zsp:mute-leaving"].map((name) => {
+    const spy = new Channel(name);
+    spy.onmessage = (e) => void ((e.data as { anyone?: true }).anyone && anyone++);
+    return spy;
+  });
+  await a.tell({ ask: 2, op: "close", args: [] });
+  void b.tell({ away: true });
+  await sleep(2 * 3000 + 500); // as long as what waits on a holder takes to be given up on
+  for (const spy of spies) spy.close();
+  port1.close();
+  assert.equal(anyone, 0, "a worker that left asked whether anyone holds the store");
+  for (const w of [a, b]) assert(!w.said.some((r) => "failed" in r), `a worker that left told its tab: ${JSON.stringify(w.said)}`);
+}
+
+// A pipe broken off unanswered by a holder that is there, opening the store slowly, is waited on only until the holder is
+// heard from after it was sent what it was: asked once whether it is there, it says so, and nothing more is asked of it.
+{
+  let opened!: () => void;
+  void request("zsp:heard-after", () => new Promise<void>((done) => (opened = done)));
+  let anyone = 0;
+  const holder = new Channel("zsp:heard-after");
+  holder.onmessage = (e) => void ((e.data as { anyone?: true }).anyone && (anyone++, holder.postMessage({ here: true })));
+  const w = await worker();
+  await w.tell({ open: { name: "heard-after" } });
+  const { port1, port2 } = new MessageChannel();
+  let broken = false;
+  port1.onmessage = (e) => void ((e.data as { close?: true }).close && (broken = true));
+  await w.tell({ connect: port2 });
+  await until("the pipe is broken, unanswered, and the holder asked whether it is there", () => broken && anyone > 0, 2 * 3000);
+  await sleep(2 * 3000 + 1000); // as long as asking again takes, were it waited on still
+  assert.equal(anyone, 1, "the holder was asked again whether it is there, having said so since the pipe was sent anything");
+  assert(!w.said.some((r) => "failed" in r), JSON.stringify(w.said));
+  await w.tell({ ask: 1, op: "close", args: [] });
+  holder.close();
+  opened();
+  port1.close();
+}
+
 // A worker holding the store that is stuck opening it, waiting on a file that never opens, does not say it is there, but
 // for once, as it is first asked: what waits on it is given up on. Many waiting on it ask whether it is there, as one does
 // at a time, for a worker that hears another ask need not ask too: what the holder says, every worker hears.
