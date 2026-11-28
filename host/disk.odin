@@ -23,6 +23,7 @@ File_Disk :: struct {
 	read_no: u64,
 	dirty:   bool,
 	named:   bool, // a name made, or perhaps made, or removed in the directory since it was last synced: see disk_names
+	parent:  bool, // and the directory's own name made in its parent, the store being new
 	hold:    bool, // the directory, from before anything in it is read or written: see hold.odin
 	lock:    Maybe(Dir_Lock),
 	look:    bool, // only: nothing is made, nor opened to be written
@@ -60,6 +61,7 @@ file_disk_make :: proc(d: ^File_Disk) -> bool {
 		}
 		return file_remap(d)
 	}
+	d.parent ||= !os.exists(d.dir)
 	if d.hold && d.lock == nil {
 		d.lock = dir_hold(d.dir) or_return // which makes it
 	} else if err = os.make_directory_all(d.dir); err != nil && !os.is_dir(d.dir) {
@@ -157,10 +159,10 @@ disk_names :: proc(d: ^File_Disk) -> bool {
 	if !d.named {
 		return true
 	}
-	if !dir_durable(d.dir) || !dir_durable(filepath.dir(d.dir)) {
+	if !dir_durable(d.dir) || (d.parent && !dir_durable(filepath.dir(d.dir))) {
 		return false
 	}
-	d.named = false
+	d.named, d.parent = false, false
 	return true
 }
 
