@@ -26,6 +26,7 @@ name :: proc(option: Socket_Option) -> (level: i32, opt: posix.Sock_Option, ok: 
 		}
 	case .Send_Buffer_Size:    return posix.SOL_SOCKET, .SNDBUF, true
 	case .Receive_Timeout:     return posix.SOL_SOCKET, .RCVTIMEO, true
+	case .IPv6_Only:           return posix.IPPROTO_IPV6, posix.Sock_Option(posix.IPV6_V6ONLY), true
 	}
 	return 0, nil, false
 }
@@ -84,7 +85,7 @@ _socket_option :: proc(s: net.Socket, option: Socket_Option) -> (value: Socket_O
 		} else {
 			value = time.Duration(x.tv_sec) * time.Second + time.Duration(x.tv_usec) * time.Microsecond
 		}
-	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay, .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size:
+	case .Reuse_Address, .Reuse_Port, .Broadcast, .TCP_Nodelay, .IPv6_Only, .Receive_Buffer_Size, .Receive_Buffer_Size_Forced, .Send_Buffer_Size:
 		if option == .Receive_Buffer_Size_Forced {
 			opt = .RCVBUF
 		}
