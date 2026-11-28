@@ -19,6 +19,9 @@ cancel a reset, both ways. Nothing is read from a socket that the call has no cr
 as the socket takes what came: so a slow end slows the other, and nothing piles up between them however fast the other
 end is. Everything happens on the host's one thread, in its event loop; between events the process sleeps.
 
+Whatever connection it resets, and whatever call or connection it refuses, it says why, as a warning: which connection,
+what the call or the system said, and how many bytes had gone each way by then.
+
 The roster has already said that the caller and this device may call in the scope by the time `serve_forward` hears
 of a call; this service asks besides whether it was told to allow the address, and a real one might ask for whom the
 call is (Caller.who).
@@ -28,6 +31,7 @@ package main
 import "base:runtime"
 import "core:encoding/hex"
 import "core:fmt"
+import "core:log"
 import "core:net"
 import "core:os"
 import "core:path/filepath"
@@ -79,11 +83,16 @@ Join :: struct {
 	heard_end: bool, // the call said all it will
 	shut:      bool, // and the socket was told, once all before it was written
 	over:      bool, // let go of, once nothing it handed the system is still the system's
+	accepted:  bool, // the connection came from a client here; else it was made, to where a call asked
+	peer:      net.Endpoint, // the client, or where it was made to
+	read:      int, // bytes read from the socket, into the call
+	written:   int, // bytes the socket has taken, from the call
 }
 
-join_new :: proc(sp: ^host.Space) -> ^Join {
+join_new :: proc(sp: ^host.Space, accepted: bool, peer: net.Endpoint) -> ^Join {
 	j := new(Join)
 	j.sp, j.data = sp, j
+	j.accepted, j.peer = accepted, peer
 	j.on_data = proc(h: ^host.Call_Handler, call: u64, bytes: []byte) -> bool {
 		j := (^Join)(h.data)
 		if j.heard_end || j.over {
@@ -102,9 +111,26 @@ join_new :: proc(sp: ^host.Space) -> ^Join {
 	j.on_fault = proc(h: ^host.Call_Handler, call: u64, fault: zsp.Call_Fault) {
 		j := (^Join)(h.data)
 		j.call = 0 // over, and forgotten by the host: nothing more is said in it
-		join_close(j)
+		if fault == .Cancelled {
+			join_reset(j, fmt.tprintf("call %d was cancelled by its other end", call))
+		} else {
+			join_reset(j, fmt.tprintf("call %d failed: %v", call, fault))
+		}
 	}
 	return j
+}
+
+// Resets a connection for something that went wrong, and says so, as a warning: why, which connection, and how far it
+// had got. A connection that ends as it should, both sides having said all, says nothing.
+join_reset :: proc(j: ^Join, why: string) {
+	log.warnf("forward: reset the connection %s %s%s: %s, after %d bytes read from it and %d written to it", "from" if j.accepted else "to", net.endpoint_to_string(j.peer, context.temp_allocator), fmt.tprintf(" (call %d)", j.call) if j.call != 0 else "", why, j.read, j.written)
+	join_close(j)
+}
+
+// What the system last said went wrong, as the reason a socket's operation gave: core:nbio maps it to an error of its
+// own, and on Windows that loses all but a few, so the number is said too.
+system_said :: proc(err: any) -> string {
+	return fmt.tprintf("%v (the system's last error then: %d)", err, net.last_platform_error())
 }
 
 // The socket is connected: bytes flow both ways from now on.
@@ -130,14 +156,15 @@ join_read :: proc(j: ^Join) {
 		case j.over:
 			join_free(j)
 		case op.recv.err != nil:
-			join_close(j)
+			join_reset(j, fmt.tprintf("reading it failed: %s", system_said(op.recv.err)))
 		case op.recv.received == 0:
 			j.eof = true
 			host.call_end(j.sp, j.call)
 			join_finish(j)
 		case !host.call_send(j.sp, j.call, j.buf[:op.recv.received]):
-			join_close(j)
+			join_reset(j, fmt.tprintf("the call would not take the %d bytes read (room for %d)", op.recv.received, host.call_room(j.sp, j.call)))
 		case:
+			j.read += op.recv.received
 			join_read(j)
 		}
 	})
@@ -151,7 +178,10 @@ join_write :: proc(j: ^Join) {
 	if len(j.out) == 0 {
 		if j.heard_end && !j.shut {
 			j.shut = true
-			net.shutdown(j.socket, .Send)
+			if err := net.shutdown(j.socket, .Send); err != nil {
+				// Not a reset, but the other end will wait for an end it is never told of.
+				log.warnf("forward: could not end what is said on the connection %s %v (call %d): %v", "from" if j.accepted else "to", net.endpoint_to_string(j.peer, context.temp_allocator), j.call, err)
+			}
 			join_finish(j)
 		}
 		return
@@ -164,9 +194,10 @@ join_write :: proc(j: ^Join) {
 			return
 		}
 		if op.send.err != nil {
-			join_close(j)
+			join_reset(j, fmt.tprintf("writing to it failed, %d of %d bytes taken: %s", op.send.sent, len(j.sending), system_said(op.send.err)))
 			return
 		}
+		j.written += op.send.sent
 		host.call_consumed(j.sp, j.call, op.send.sent)
 		clear(&j.sending)
 		join_write(j)
@@ -223,9 +254,10 @@ serve_forward :: proc(sp: ^host.Space, call: u64, from: host.Caller, scope: zsp.
 		allowed ||= parsed && a == to
 	}
 	if scope != forward.scope || !allowed {
+		log.warnf("forward: refused call %d, to %q in scope %d: not allowed", call, string(first), scope)
 		return nil, .Denied
 	}
-	j := join_new(sp)
+	j := join_new(sp, false, to)
 	j.call = call
 	// What the call says meanwhile waits in it, uncredited, for the connection.
 	j.dialling = nbio.dial_poly(to, j, proc(op: ^nbio.Operation, j: ^Join) {
@@ -238,7 +270,7 @@ serve_forward :: proc(sp: ^host.Space, call: u64, from: host.Caller, scope: zsp.
 			return
 		}
 		if op.dial.err != nil {
-			join_close(j) // refused: a reset, as a connection refused is
+			join_reset(j, fmt.tprintf("connecting failed: %s", system_said(op.dial.err))) // a reset, as a refusal is
 			return
 		}
 		join_attach(j, op.dial.socket)
@@ -250,6 +282,7 @@ serve_forward :: proc(sp: ^host.Space, call: u64, from: host.Caller, scope: zsp.
 accepted :: proc(op: ^nbio.Operation, c: ^Connect) {
 	c.accepting = nil
 	if op.accept.err != nil {
+		log.warnf("forward: could not accept a connection at %s: %s", net.endpoint_to_string(c.at, context.temp_allocator), system_said(op.accept.err))
 		// Tried again in a while, not at once: an error that lasts would have this spin.
 		c.accepting = nbio.timeout_poly(ACCEPT_AGAIN, c, proc(_: ^nbio.Operation, c: ^Connect) {
 			c.accepting = nbio.accept_poly(c.listener, c, accepted)
@@ -257,9 +290,10 @@ accepted :: proc(op: ^nbio.Operation, c: ^Connect) {
 		return
 	}
 	c.accepting = nbio.accept_poly(c.listener, c, accepted)
-	j := join_new(forward.space)
+	j := join_new(forward.space, true, op.accept.client_endpoint)
 	j.call = host.host_call(forward.space, c.device, forward.scope, METHOD, transmute([]byte)c.to, &j.handler, forward.urgency)
 	if j.call == 0 {
+		log.warnf("forward: refused the connection from %s at once: no call to %s could be made (no right, or no way there)", net.endpoint_to_string(op.accept.client_endpoint, context.temp_allocator), c.to)
 		net.close(op.accept.client) // no right, or no way there: refused at once
 		free(j)
 		return

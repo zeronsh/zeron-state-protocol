@@ -60,13 +60,15 @@ FORWARD = os.path.join(ROOT, "build", "forward" + (".exe" if os.name == "nt" els
 
 
 class Server:
-    """A TCP server on a thread: echoes each connection, or with `stalled`, never reads it."""
+    """A TCP server on a thread: echoes each connection, or with `stalled`, never reads it. How each echoed connection
+    ended, if not as it should, it notes, to be said should the test fail."""
 
     def __init__(self, stalled=False):
         self.stalled, self.stop = stalled, False
         self.sock = socket.create_server(("127.0.0.1", 0))
         self.port = self.sock.getsockname()[1]
         self.held = []
+        self.notes = []
         Thread(target=self.serve, daemon=True).start()
 
     def serve(self):
@@ -80,15 +82,20 @@ class Server:
                 continue
             Thread(target=self.echo, args=(c,), daemon=True).start()
 
-    @staticmethod
-    def echo(c):
+    def echo(self, c):
+        heard = said = 0
+        peer = None
         with c:
             try:
+                peer = c.getpeername()
                 while data := c.recv(1 << 16):
+                    heard += len(data)
                     c.sendall(data)
+                    said += len(data)
                 c.shutdown(socket.SHUT_WR)  # said all, once the other has
-            except OSError:
-                pass  # reset: a probe that gave up waiting, as reachable's first may
+            except OSError as e:
+                # Reset: as a probe that gave up waiting may be, as reachable's first may; noted all the same.
+                self.notes.append(f"the echo's connection from {peer} ended with {e!r}, having heard {heard} bytes and said {said}")
 
     def close(self):
         self.stop = True
@@ -97,8 +104,11 @@ class Server:
             c.close()
 
 
-def start(*args):
-    p = subprocess.Popen([FORWARD, *map(str, args)], stdout=subprocess.PIPE, text=True)
+def start(log, *args):
+    """A forward, what it says on stderr (why it reset or refused anything) kept in `log`, to be said should the test
+    fail."""
+    with open(log, "w") as said:
+        p = subprocess.Popen([FORWARD, *map(str, args)], stdout=subprocess.PIPE, stderr=said, text=True)
     key = re.match(r"(\w{64}) ready", p.stdout.readline())
     assert key, "forward did not start"
     return p, key[1]
@@ -144,14 +154,30 @@ def pattern(n, seed):
 
 
 def bulk(port, size):
-    """Sends `size` bytes and reads them back at once, each way on its own thread: whole, in order."""
+    """Sends `size` bytes and reads them back at once, each way on its own thread: whole, in order. What fails says
+    which way it failed, and how far each way had got."""
     data = pattern(size, size)
     got = bytearray()
+    sent = 0
     with connect(port) as s:
-        sender = Thread(target=lambda: (s.sendall(data), s.shutdown(socket.SHUT_WR)))
+        here = s.getsockname()
+
+        def send():
+            nonlocal sent
+            try:
+                while sent < size:
+                    sent += s.send(data[sent : sent + (1 << 18)])
+                s.shutdown(socket.SHUT_WR)
+            except OSError as e:
+                raise AssertionError(f"bulk from {here}: sending failed with {e!r}, {sent} of {size} bytes sent and {len(got)} read back") from e
+
+        sender = Thread(target=send)
         sender.start()
-        while chunk := s.recv(1 << 18):
-            got += chunk
+        try:
+            while chunk := s.recv(1 << 18):
+                got += chunk
+        except OSError as e:
+            raise AssertionError(f"bulk from {here}: reading back failed with {e!r}, {len(got)} of {size} bytes read back and {sent} sent") from e
         sender.join()
     assert hashlib.sha256(got).digest() == hashlib.sha256(data).digest(), f"{len(got)} of {size} bytes came back as sent"
 
@@ -229,11 +255,13 @@ def main(root, direct):
     nothing = unused()
     to = {name: f"127.0.0.1:{port}" for name, port in (("echo", echo.port), ("stalled", stalled.port), ("nothing", nothing), ("unallowed", 1))}
     procs = []
+    logs = {"B, which connects to what is called for": os.path.join(root, "b.log"), "A, which accepts and calls": os.path.join(root, "a.log")}
+    failed = True
     try:
-        served, b_key = start(b.dir, *(f"--allow={to[name]}" for name in ("echo", "stalled", "nothing")), *options)
+        served, b_key = start(logs["B, which connects to what is called for"], b.dir, *(f"--allow={to[name]}" for name in ("echo", "stalled", "nothing")), *options)
         procs.append(served)
         targets = [(b_key, to["echo"]), (b_key, to["stalled"]), (b_key, to["nothing"]), (b_key, to["unallowed"]), (c.key[:64], to["echo"])]
-        client, _ = start(a.dir, *(f"--connect=0/{device}/{where}" for device, where in targets), *options)
+        client, _ = start(logs["A, which accepts and calls"], a.dir, *(f"--connect=0/{device}/{where}" for device, where in targets), *options)
         procs.append(client)
         port, port_stalled, port_nothing, port_unallowed, port_c = listening(client, len(targets))
 
@@ -265,6 +293,7 @@ def main(root, direct):
         refused(port_c)
         # And all the while, the others go on.
         bulk(port, 1 << 20)
+        failed = False
         return sent
     finally:
         for p in procs:
@@ -272,6 +301,14 @@ def main(root, direct):
         relay.stop()
         echo.close()
         stalled.close()
+        if failed:
+            # What each forward said of what it reset or refused, and how the echo's connections ended: the cause of a
+            # connection here reset, named, whichever hop it was.
+            for name, log in logs.items():
+                if os.path.exists(log):
+                    with open(log) as f:
+                        print(f"--- forward {name} ({'direct' if direct else 'through the relay'}) said:\n{f.read()}", file=sys.stderr)
+            print("--- the echo server noted:", *echo.notes, sep="\n", file=sys.stderr)
 
 
 if __name__ == "__main__":
