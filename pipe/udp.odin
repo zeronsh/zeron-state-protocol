@@ -130,6 +130,11 @@ Link :: struct {
 	in_max:      u64, // our permission, as last told
 	in_window:   u64,
 	in_moved:    Time, // when it was last moved
+	// The most of stream 0 that any stream's header, as this end wrote it, says it waits for. What stream 0 has yet to
+	// send of that is its own, of out_max: the peer gives back the link's window only as it delivers, and it delivers
+	// nothing that waits for stream 0 until stream 0 has come so far; so were the window all taken by what waits,
+	// nothing would ever move again.
+	out_after:   u64,
 
 	// Sending.
 	datagrams:   [dynamic][]byte, // owned
@@ -198,7 +203,7 @@ Stream :: struct {
 	fin_lost:    bool, // to be said again
 	reset:       enum u8 {None, Due, Sent, Acked},
 	headed:      bool, // its first bytes, the header, are written
-	head_after:  Maybe(u64), // what the header is to say of stream 0
+	head_after:  Maybe(u64), // what the header is to say of stream 0, and once it is written, what it said
 
 	// Receiving.
 	in_next:     u64, // delivered, header included
@@ -593,6 +598,8 @@ stream_head :: proc(l: ^Link, s: ^Stream) {
 	head[0] = s.urgency
 	n := 1
 	v := s.head_after.? or_else stream_end(zero)
+	s.head_after = v
+	l.out_after = max(l.out_after, v)
 	for v >= 0x80 {
 		head[n] = byte(v) | 0x80
 		v >>= 7
@@ -662,12 +669,18 @@ stream_unlist :: proc(l: ^Link, s: ^Stream) {
 	s.list = .None
 }
 
-// How far a stream may send new bytes: what was written, what the peer permits of it and of the link.
+// How far a stream may send new bytes: what was written, what the peer permits of it and of the link. Of the link's,
+// what stream 0 has yet to send of what streams wait for is its alone, at any urgency, and so is RESERVE beyond that
+// from bulk: stream 0 then always reaches what waits for it, which the peer then delivers and gives the window back for.
 @(private)
 stream_allowed :: proc(l: ^Link, s: ^Stream) -> u64 {
 	link := l.out_max
-	if s.urgency > URGENT && s.id != 0 {
-		link = link - RESERVE if link > RESERVE else 0
+	if s.id != 0 {
+		owed := l.out_after - min(l.out_after, l.streams[0].out_next)
+		link = link - owed if link > owed else 0
+		if s.urgency > URGENT {
+			link = link - RESERVE if link > RESERVE else 0
+		}
 	}
 	credit := link - l.out_total if link > l.out_total else 0
 	return min(stream_end(s), s.out_limit, s.out_next + credit)
@@ -769,9 +782,28 @@ peer_done_add :: proc(l: ^Link, n: u64) {
 
 @(private)
 link_sweep :: proc(l: ^Link) {
+	owed := false // a stream let go of waited for as much of stream 0 as any, which it has yet to send
+	defer if owed {
+		most: u64
+		for s in l.streams[1:] {
+			if s.headed {
+				most = max(most, s.head_after.? or_else 0)
+			}
+		}
+		if most < l.out_after {
+			// Less of the window is stream 0's: those that waited for some of it may go on.
+			l.out_after = most
+			for s in l.streams {
+				stream_wake(l, s)
+			}
+		}
+	}
 	#reverse for s, i in l.streams {
 		if !stream_finished(s) || s.listed_due {
 			continue
+		}
+		if after, said := s.head_after.?; said && after >= l.out_after && after > l.streams[0].out_next {
+			owed = true
 		}
 		if s.list != .None {
 			stream_unlist(l, s)

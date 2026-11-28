@@ -548,8 +548,10 @@ A peer may have opened 256 streams at first, and as many more as are let go of, 
 
 Flow control is per stream and for the link: what a stream may send beyond what its receiver has delivered of it, at first 256 KiB, and what all
 of them may together, at first 1 MiB, the highest offset ever sent of each counted, a Reset's final size included. A receiver raises each when half
-of it is used and may double it, to 16 MiB and 32 MiB, while raising it again within two round trips. Of the link's window 64 KiB is kept for streams
-of urgency 3 or below. A sender should serve streams most urgent first, and within an urgency give a turn of a packet to each, first to those that
+of it is used and may double it, to 16 MiB and 32 MiB, while raising it again within two round trips. Of the link's window, what stream 0 has yet to
+send of the most that any open stream's header says it comes after is kept for stream 0, whatever is more urgent, and 64 KiB beyond that for
+streams of urgency 3 or below: a receiver raises the link's window only as it delivers, and delivers nothing of a stream until stream 0 has reached
+its `after`, so a window taken whole by what waits for stream 0 would never be raised again. A sender should serve streams most urgent first, and within an urgency give a turn of a packet to each, first to those that
 had lately nothing to send. Out-of-order data, held, is bounded by these windows.
 
 The device with the lesser key dials. Devices that share a relay swap candidate addresses, 18 bytes each (IPv6 or mapped IPv4, then port, big-endian), in signals of kind 0, and
